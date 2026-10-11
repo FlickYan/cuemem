@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, cast
 
 import httpx2
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ValidationError
 
@@ -27,6 +27,7 @@ from cuemem.config import ModelSpec, Settings
 from cuemem.core.trace import record_event
 from cuemem.errors import (
     CacheMissError,
+    ContentFilteredError,
     MissingAPIKeyError,
     StructuredOutputError,
 )
@@ -80,8 +81,12 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         use_cache: bool = True,
+        cache_scope: str | None = None,
     ) -> ChatResult:
-        """调用一次聊天补全。role 决定默认模型与参数，model 可显式指定模型别名。"""
+        """调用一次聊天补全。role 决定默认模型与参数，model 可显式指定模型别名。
+
+        cache_scope 标记缓存条目所属的记忆空间，遗忘时据此清理。
+        """
         alias, spec, params = self._prepare(
             role, model, temperature, max_tokens, response_format, tools, tool_choice
         )
@@ -111,12 +116,18 @@ class LLMClient:
         create = cast(Any, self._client(spec.provider).chat.completions.create)
         started = time.perf_counter()
         with self._semaphores[spec.provider]:
-            completion = create(
-                model=spec.model_id,
-                messages=messages,
-                extra_body=spec.extra_body or None,
-                **params,
-            )
+            try:
+                completion = create(
+                    model=spec.model_id,
+                    messages=messages,
+                    extra_body=spec.extra_body or None,
+                    **params,
+                )
+            except BadRequestError as exc:
+                if _is_content_filter(exc):
+                    record_event("llm_filtered", role=role, model=alias)
+                    raise ContentFilteredError(f"{alias} 的内容审核拒绝了请求：{exc}") from exc
+                raise
         latency_ms = (time.perf_counter() - started) * 1000
         result = _parse_completion(
             cast(ChatCompletion, completion),
@@ -132,6 +143,7 @@ class LLMClient:
                 key,
                 alias,
                 result.model_dump(mode="json", exclude={"role", "from_cache", "latency_ms"}),
+                scope=cache_scope,
             )
         self._account(role, alias, spec, result)
         return result
@@ -145,8 +157,38 @@ class LLMClient:
         model: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 3,
+        cache_scope: str | None = None,
+        fallback_model: str | None = None,
     ) -> Structured[T]:
-        """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。"""
+        """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。
+
+        fallback_model：内容审核拒绝时改用的模型（通常是另一家供应商的）。
+        """
+        try:
+            return self._structured(
+                role, messages, schema, model, max_tokens, max_attempts, cache_scope
+            )
+        except ContentFilteredError:
+            primary = model or (
+                self.settings.roles[role].model if role in self.settings.roles else None
+            )
+            if fallback_model is None or fallback_model == primary:
+                raise
+            record_event("llm_fallback", role=role, model=fallback_model)
+            return self._structured(
+                role, messages, schema, fallback_model, max_tokens, max_attempts, cache_scope
+            )
+
+    def _structured[T: BaseModel](
+        self,
+        role: str,
+        messages: list[Message],
+        schema: type[T],
+        model: str | None,
+        max_tokens: int | None,
+        max_attempts: int,
+        cache_scope: str | None,
+    ) -> Structured[T]:
         msgs = _with_schema_instruction(messages, schema)
         last_error = ""
         for attempt in range(1, max_attempts + 1):
@@ -156,6 +198,7 @@ class LLMClient:
                 model=model,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
+                cache_scope=cache_scope,
             )
             text = _strip_code_fence(result.content or "")
             if not text:
@@ -274,6 +317,18 @@ class LLMClient:
             cost=round(nominal, 6),
             latency_ms=round(result.latency_ms, 1),
         )
+
+
+def _is_content_filter(exc: BadRequestError) -> bool:
+    """内容审核拒绝的特征。
+
+    QwenCloud 返回 data_inspection_failed；DeepSeek 返回 Content Exists Risk。
+    """
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in ("data_inspection_failed", "inappropriate content", "Content Exists Risk")
+    )
 
 
 def _parse_completion(

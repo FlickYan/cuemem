@@ -1,4 +1,7 @@
-"""在线写入（同步、不调用 LLM）：追加原始轮次 → 切分为"轮" → 向量化 → 写入索引。"""
+"""在线写入（同步、不调用 LLM）：追加原始轮次 → 切分为"轮" → 向量化 → 写入索引。
+
+巩固（抽取事实、实体、摘要）不在这里做，而是登记成任务，由 write/consolidate.py 异步完成。
+"""
 
 from __future__ import annotations
 
@@ -96,23 +99,7 @@ class OnlineWriter:
             turns_added += self.db.add_turns(turns)
             units.extend(build_rounds(turns))
 
-        missing = set(self.db.missing_unit_ids(space_id, [u.id for u in units]))
-        new_units = [u for u in units if u.id in missing]
-        tokens = 0
-        if new_units:
-            with span("embed", texts=len(new_units)):
-                batch = self.embedder.embed([u.text for u in new_units], "document")
-            tokens = batch.tokens
-            self.vectors.upsert(
-                space_id,
-                [u.id for u in new_units],
-                batch.dense,
-                batch.sparse,
-                [_payload(u) for u in new_units],
-            )
-            # 先写向量、后写数据库：数据库里有这条记录，就说明向量一定已经写入；
-            # 中途失败时重跑会补齐（向量化命中缓存，不会重复计费）。
-            self.db.add_units(new_units)
+        new_units, tokens = self._index(space_id, units)
         return IngestReport(
             space_id=space_id,
             sessions=len(conversation.sessions),
@@ -121,6 +108,36 @@ class OnlineWriter:
             embed_tokens=tokens,
             elapsed_ms=(time.perf_counter() - started) * 1000,
         )
+
+    def reindex_sessions(self, space_id: str, session_ids: Sequence[str]) -> int:
+        """按数据库里现存的轮次重建这些会话的"轮"（遗忘部分轮次之后使用）。
+
+        调用方需先删除这些会话原有的"轮"；返回新写入的单元数。
+        """
+        units: list[MemoryUnit] = []
+        for session_id in session_ids:
+            units.extend(build_rounds(self.db.get_turns(space_id, session_id)))
+        new_units, _ = self._index(space_id, units)
+        return len(new_units)
+
+    def _index(self, space_id: str, units: Sequence[MemoryUnit]) -> tuple[list[MemoryUnit], int]:
+        missing = set(self.db.missing_unit_ids(space_id, [u.id for u in units]))
+        new_units = [u for u in units if u.id in missing]
+        if not new_units:
+            return [], 0
+        with span("embed", texts=len(new_units)):
+            batch = self.embedder.embed([u.text for u in new_units], "document")
+        self.vectors.upsert(
+            space_id,
+            [u.id for u in new_units],
+            batch.dense,
+            batch.sparse,
+            [_payload(u) for u in new_units],
+        )
+        # 先写向量、后写数据库：数据库里有这条记录，就说明向量一定已经写入；
+        # 中途失败时重跑会补齐（向量化命中缓存，不会重复计费）。
+        self.db.add_units(new_units)
+        return new_units, batch.tokens
 
 
 def _payload(unit: MemoryUnit) -> dict[str, Any]:

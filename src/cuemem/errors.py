@@ -23,3 +23,11 @@ class EmbeddingAPIError(CueMemError):
 
 class ConfigMismatchError(CueMemError):
     """数据目录与当前配置不兼容，例如更换了向量模型。"""
+
+
+class ConsolidationError(CueMemError):
+    """巩固（抽取事实等）失败。"""
+
+
+class ContentFilteredError(CueMemError):
+    """供应商的内容审核拒绝了这次请求（常见误伤：普通的生活对话也可能被判为不当内容）。"""

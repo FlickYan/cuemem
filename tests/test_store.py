@@ -103,3 +103,26 @@ def test_v1_database_is_migrated(tmp_path: Path) -> None:
     )
     assert db.add_turns([turn]) == 1
     assert db.get_turns("s")[0].speaker == "Alice"
+
+
+def test_llm_cache_gains_scope_column(tmp_path: Path) -> None:
+    """N3 之前建的响应缓存没有 scope 列：打开时自动补上，旧条目照常可读。"""
+    import sqlite3
+
+    from cuemem.llm.cache import ResponseCache
+
+    path = tmp_path / "llm.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE llm_cache (key TEXT PRIMARY KEY, model TEXT NOT NULL,"
+        " response TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute("INSERT INTO llm_cache (key, model, response) VALUES ('k', 'm', '{\"a\": 1}')")
+    conn.commit()
+    conn.close()
+
+    cache = ResponseCache(path)
+    assert cache.get("k") == {"a": 1}
+    cache.put("k2", "m", {"b": 2}, scope="space|ask")
+    assert cache.delete_scope("space|ask") == 1
+    assert cache.get("k2") is None and cache.get("k") == {"a": 1}

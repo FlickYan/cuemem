@@ -1,7 +1,8 @@
 """评测报告：把 results.jsonl 汇总成 Markdown 表格，并画"准确率–成本"散点图。
 
-图按可视化规范绘制：系列颜色按方法固定分配（不随排名变化），散点图最多 3 个系列色
-（ORACLE 是上限参照，用中性色空心点）；浅色、深色各渲染一张，Markdown 里用 <picture>
+图按可视化规范绘制：系列颜色按方法固定分配（不随排名变化），散点图最多 3 个系列色，
+分给三种可部署的方法（B1、B2、B2F）；B0（下限）与 ORACLE（上限）是参照点，用中性色空心
+标记，形状不同；消融变体只出现在表格里。浅色、深色各渲染一张，Markdown 里用 <picture>
 按读者的主题自动切换。图中文字用英文，避免 CI 环境缺少中文字体。
 """
 
@@ -21,7 +22,7 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.legend import Legend
-from matplotlib.ticker import FuncFormatter, LogLocator
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 from matplotlib.transforms import Bbox
 
 from cuemem.evals.metrics import bootstrap_ci, mean, percentile
@@ -30,9 +31,16 @@ METHOD_LABELS = {
     "B0": ("无记忆", "B0 No memory"),
     "B1": ("全上下文", "B1 Full context"),
     "B2": ("朴素检索", "B2 Naive RAG"),
+    "B2F": ("朴素检索 + 事实记忆", "B2F Naive RAG + facts"),
+    "B2F-keys": ("消融：只用事实增强键", "B2F keys only"),
+    "B2F-current": ("消融：只给当前事实（覆盖式更新）", "B2F current facts only"),
+    "B2F-plain": ("消融：事实不标有效期", "B2F no validity labels"),
+    "B2F-noprofile": ("消融：不给核心记忆", "B2F no core memory"),
     "ORACLE": ("只给证据会话（上限参照）", "Oracle: evidence only"),
 }
-METHOD_ORDER = ["B0", "B1", "B2", "ORACLE"]
+METHOD_ORDER = list(METHOD_LABELS)
+PLOTTED = {"B0", "B1", "B2", "B2F", "ORACLE"}  # 消融变体只进表格，不进图
+REFERENCE_MARKERS = {"B0": "s", "ORACLE": "o"}  # 参照点：中性色空心，形状区分
 
 TYPE_LABELS = {
     "single-session-user": "单会话 · 用户说过",
@@ -76,7 +84,7 @@ THEMES = {
         muted="#898781",
         grid="#e1e0d9",
         axis="#c3c2b7",
-        series={"B0": "#2a78d6", "B1": "#eb6834", "B2": "#1baf7a"},
+        series={"B2F": "#2a78d6", "B1": "#eb6834", "B2": "#1baf7a"},
     ),
     "dark": Theme(
         surface="#1a1a19",
@@ -85,7 +93,7 @@ THEMES = {
         muted="#898781",
         grid="#2c2c2a",
         axis="#383835",
-        series={"B0": "#3987e5", "B1": "#d95926", "B2": "#199e70"},
+        series={"B2F": "#3987e5", "B1": "#d95926", "B2": "#199e70"},
     ),
 }
 
@@ -129,7 +137,8 @@ def method_stats(rows: Sequence[dict[str, Any]]) -> list[MethodStats]:
         by_method[row["method"]].append(row)
     stats = []
     for method in sorted(by_method, key=_method_rank):
-        items = by_method[method]
+        # 按题目 ID 排序：结果按完成顺序写入，排序后 bootstrap 的重采样才与运行顺序无关
+        items = sorted(by_method[method], key=lambda r: r["sample_id"])
         correct = [1.0 if r["correct"] else 0.0 for r in items]
         types: dict[str, list[float]] = defaultdict(list)
         for r, c in zip(items, correct, strict=True):
@@ -140,7 +149,12 @@ def method_stats(rows: Sequence[dict[str, Any]]) -> list[MethodStats]:
         for r in items:
             for key, value in (r.get("retrieval") or {}).items():
                 retrieval[key].append(value)
-        latencies = [r["usage"]["latency_ms"] for r in items if r["usage"]["latency_ms"]]
+        # 延迟只统计真的调用了模型的题：命中本地缓存的回答没有意义上的延迟
+        latencies = [
+            r["usage"]["latency_ms"]
+            for r in items
+            if r["usage"]["latency_ms"] and r["usage"]["llm_cache_hits"] < r["usage"]["llm_calls"]
+        ]
         f1s = [r["f1"] for r in items if r.get("f1") is not None]
         stats.append(
             MethodStats(
@@ -304,9 +318,13 @@ def render_markdown(
                 cells = " | ".join(str(counts.get(key, 0)) for counts in attribution.values())
                 lines.append(f"| {label} | {cells} |")
 
-    ingest_cost = sum(r["cost"] for r in ingests)
-    histories = len({r["space_key"] for r in ingests})  # 续跑可能重复写入同一份历史
-    ingest_tokens = sum(r["embedding_tokens"] for r in ingests)
+    online = _latest_per_space([r for r in ingests if r.get("stage", "ingest") == "ingest"])
+    consolidated = _latest_per_space([r for r in ingests if r.get("stage") == "consolidate"])
+    if consolidated:
+        lines += ["", *_consolidation_section(consolidated)]
+    ingest_cost = sum(r["cost"] for r in online)
+    ingest_tokens = sum(r["embedding_tokens"] for r in online)
+    consolidate_cost = sum(r["cost"] for r in consolidated)
     answer_cost = sum(s.total_cost for s in stats)
     judge_cost = sum(s.judge_cost for s in stats)
     lines += [
@@ -318,11 +336,19 @@ def render_markdown(
     ]
     for s in stats:
         lines.append(f"| 回答 · {s.method} | ${s.total_cost:.4f} | {s.n} 题 |")
+    lines.append(
+        f"| 写入（向量化） | ${ingest_cost:.4f} | {len(online)} 份对话历史，"
+        f"{ingest_tokens:,} tokens；检索类方法需要，一次写入可服务多次提问 |"
+    )
+    if consolidated:
+        lines.append(
+            f"| 巩固（抽取、对账、摘要） | ${consolidate_cost:.4f} | "
+            f"{len(consolidated)} 份对话历史；只有 B2F 系列需要，同样是一次性成本 |"
+        )
+    total = answer_cost + ingest_cost + consolidate_cost + judge_cost
     lines += [
-        f"| 写入（向量化） | ${ingest_cost:.4f} | {histories} 份对话历史，"
-        f"{ingest_tokens:,} tokens；只有 B2 需要，一次写入可服务多次提问 |",
         f"| 判分 | ${judge_cost:.4f} | 评测本身的开销，不计入方法成本 |",
-        f"| **合计** | **${answer_cost + ingest_cost + judge_cost:.4f}** | |",
+        f"| **合计** | **${total:.4f}** | |",
         "",
         "## 说明",
         "",
@@ -330,14 +356,65 @@ def render_markdown(
         "判分模型与回答模型来自不同家族（D-008）。",
         "- 名义成本按高峰时段、未命中缓存的标价计算，便于不同时间的运行相互比较（D-010）；"
         "实际花费因缓存、错峰折扣会更低。",
-        '- "名义成本 / 题"只算回答本身；写入成本是一次性的，单独列出。',
+        '- "名义成本 / 题"只算回答本身；写入与巩固成本是一次性的，单独列出。',
         "- 置信区间为 bootstrap 95%（2000 次重采样，固定种子）。",
+        "- 延迟只统计实际调用了模型的题；全部命中本地缓存的方法显示为 —。",
     ]
     if errors:
         lines.append(
             f"- 有 {len(errors)} 个组合出错未计入结果，详见 `errors.jsonl`；重新运行会自动重试。"
         )
     return "\n".join(lines) + "\n"
+
+
+def _latest_per_space(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """续跑可能对同一份历史重复写入：每份历史只取最后一次。"""
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        latest[row["space_key"]] = row
+    return list(latest.values())
+
+
+def _consolidation_section(rows: Sequence[dict[str, Any]]) -> list[str]:
+    """写入路径（N3）的统计：抽取了多少事实、对账动作的分布、写入成本（每千条发言）。"""
+    sessions = sum(r["sessions"] for r in rows)
+    turns = sum(r["turns"] for r in rows)
+    facts = sum(r["facts_extracted"] for r in rows)
+    actions = {k: sum(r[k] for r in rows) for k in ("added", "superseded", "merged", "noop")}
+    total_actions = max(1, sum(actions.values()))
+    input_tokens = sum(r["input_tokens"] for r in rows)
+    output_tokens = sum(r["output_tokens"] for r in rows)
+    cost = sum(r["cost"] for r in rows)
+    calls = sum(r["llm_calls"] for r in rows)
+    rules: dict[str, int] = defaultdict(int)
+    for r in rows:
+        for key, value in r.get("rules", {}).items():
+            rules[key] += value
+    llm_decided = sum(v for k, v in rules.items() if k.endswith(":llm"))
+    per_k = 1000 / max(1, turns)
+    current = sum(r["facts_current"] for r in rows)
+    total = sum(r["facts_total"] for r in rows)
+    elapsed = [r["latency_ms"] for r in rows if r.get("latency_ms")]
+    share = " / ".join(f"{actions[k] / total_actions:.1%}" for k in actions)
+    return [
+        "## 写入路径：巩固（N3）",
+        "",
+        "| 项目 | 数值 | 说明 |",
+        "|---|---|---|",
+        f"| 对话历史 / 会话 / 发言 | {len(rows)} / {sessions:,} / {turns:,} | |",
+        f"| 抽取出的事实 | {facts:,}（每会话 {facts / max(1, sessions):.1f} 条） | |",
+        f"| 对账：新增 / 取代 / 合并 / 重放 | {share} | 取代 {actions['superseded']:,} 次 |",
+        f"| 由 LLM 裁决的对账 | {llm_decided:,}（占 {llm_decided / total_actions:.1%}） | "
+        "其余由规则直接判定 |",
+        f"| 事实：当前有效 / 全部 | {current:,} / {total:,} | 被取代的旧事实保留为历史 |",
+        f"| 实体 | {sum(r['entities'] for r in rows):,} | |",
+        f"| LLM 调用（抽取 + 对账 + 消歧） | {calls:,} | 含命中缓存的调用 |",
+        f"| 每千条发言的 token（输入 / 输出） | {input_tokens * per_k:,.0f} / "
+        f"{output_tokens * per_k:,.0f} | 抽取时助手回复只保留开头 |",
+        f"| 每千条发言的名义成本 | ${cost * per_k:.4f} | 含向量化 |",
+        f"| 每份历史的巩固耗时 p50 / p95 | {_seconds(percentile(elapsed, 50))} / "
+        f"{_seconds(percentile(elapsed, 95))} | 受供应商并发上限影响 |",
+    ]
 
 
 # ---------- 图 ----------
@@ -354,11 +431,11 @@ def plot_pareto(
     fig.patch.set_facecolor(theme.surface)
     ax.set_facecolor(theme.surface)
 
-    points = [s for s in stats if s.cost > 0]
+    points = [s for s in stats if s.cost > 0 and s.method in PLOTTED]
     for s in points:
         x, y = s.cost, s.accuracy * 100
         color = theme.series.get(s.method)
-        hollow = color is None  # ORACLE 等参照点：中性色空心点
+        hollow = color is None  # B0、ORACLE 等参照点：中性色空心点
         line_color = theme.ink2 if color is None else color
         ax.vlines(
             x, s.ci[0] * 100, s.ci[1] * 100, color=line_color, linewidth=0.9, alpha=0.6, zorder=2
@@ -366,7 +443,7 @@ def plot_pareto(
         ax.plot(
             x,
             y,
-            marker="o",
+            marker=REFERENCE_MARKERS.get(s.method, "o"),
             markersize=8,
             markerfacecolor=theme.surface if hollow else line_color,
             markeredgecolor=line_color
@@ -379,11 +456,16 @@ def plot_pareto(
         )
 
     ax.set_xscale("log")
-    ax.xaxis.set_major_locator(LogLocator(base=10))
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:g}"))
     if points:
         xs = [s.cost for s in points]
         ax.set_xlim(min(xs) / 3, max(xs) * 12)  # 右侧多留空间，让最贵那个点的标签能放在右边
+    low, high = ax.get_xlim()
+    # 跨度不到两个数量级时按 1-2-5 取主刻度，否则只取 10 的整数次幂；次刻度不标数字，
+    # 避免出现与美元格式不一致的科学计数法标签
+    subs = (1.0, 2.0, 5.0) if high / low < 100 else (1.0,)
+    ax.xaxis.set_major_locator(LogLocator(base=10, subs=subs))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:g}"))
+    ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_ylim(-4, 104)  # 上下留白，0% 与 100% 的点不会压在坐标轴上
     ax.set_yticks(range(0, 101, 20))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
@@ -433,10 +515,12 @@ def _place_labels(
         (-8, 5, "right", "bottom"),
         (-8, -5, "right", "top"),
     ]
+    centers = {s.method: to_px((s.cost, s.accuracy * 100)) for s in points}
     for s in sorted(points, key=lambda p: p.cost):
         anchor = (s.cost, s.accuracy * 100)
         own = Bbox.from_extents(*(to_px(anchor) - 9), *(to_px(anchor) + 9))
         others = [box for box in occupied if not _same(box, own)]
+        neighbours = [c for m, c in centers.items() if m != s.method]
         text = None
         for dx, dy, ha, va in candidates:
             if text is not None:
@@ -456,10 +540,20 @@ def _place_labels(
             inside = (
                 area.x0 <= box.x0 and box.x1 <= area.x1 and area.y0 <= box.y0 and box.y1 <= area.y1
             )
-            if inside and not any(box.overlaps(o) for o in others):
+            # 标签必须离自己的点最近：两个点挨得很近时，否则读者会把标签对到另一个点上
+            mine = _distance(box, centers[s.method])
+            ambiguous = any(_distance(box, c) < mine + 6 for c in neighbours)
+            if inside and not ambiguous and not any(box.overlaps(o) for o in others):
                 break
         if text is not None:
             occupied.append(text.get_window_extent(renderer))
+
+
+def _distance(box: Bbox, point: Any) -> float:
+    """点到矩形的距离（像素），点在矩形内时为 0。"""
+    dx = max(box.x0 - point[0], 0.0, point[0] - box.x1)
+    dy = max(box.y0 - point[1], 0.0, point[1] - box.y1)
+    return float((dx * dx + dy * dy) ** 0.5)
 
 
 def _same(a: Bbox, b: Bbox) -> bool:

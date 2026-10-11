@@ -107,3 +107,19 @@ vector_store:
 
 retrieval:
   naive_k: 8
+  fact_k: 10        # 事实增强检索（B2F）：放进上下文的事实条数
+  fact_pool: 50     # 事实增强检索：一次向量检索取回的候选数（轮与事实合计）
+
+# 异步巩固（N3）：抽取事实与实体、对账、会话摘要、核心记忆。相似度阈值针对 text-embedding-v4。
+consolidation:
+  assistant_chars: 600          # 抽取时每条助手回复只保留开头（记忆以用户为主，输入 token 少一大半）
+  max_session_chars: 24000      # 超长会话按轮次切成多个窗口分别抽取
+  workers: 8                    # 同一空间内并行抽取的会话数（受供应商并发上限约束）
+  fallback_model: deepseek-flash  # 供应商内容审核误拒（如 QwenCloud 的 data_inspection_failed）时改用的模型
+  duplicate_threshold: 0.93     # 陈述几乎相同 → 合并（只追加溯源）
+  conflict_threshold: 0.75      # 单值事实与已有事实相似 → 交给 LLM 判断是新增、取代还是更正
+  multi_conflict_threshold: 0.88
+  entity_merge_threshold: 0.90  # 实体描述相似度：高于它直接合并，介于两者之间交给 LLM 确认
+  entity_gray_threshold: 0.75
+  profile_max_chars: 1600       # 核心记忆上限（约 400 tokens）
+  profile_min_importance: 4

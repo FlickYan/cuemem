@@ -3,7 +3,7 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-> 进行中：N2 评测框架与三条基线已完成，下一步是 N3 写入路径。进度见下方表格与 [路线图](docs/roadmap.md)。
+> 进行中：N3 写入路径已完成（事实、实体、双时间轴有效期、核心记忆、遗忘），下一步是 N4 L1 快速召回。进度见下方表格与 [路线图](docs/roadmap.md)。
 
 ## 它要解决什么
 
@@ -56,8 +56,11 @@ flowchart LR
 uv sync                                  # 安装依赖，创建 .venv
 uv run cuemem configure                  # 交互式填写 API Key，写入 .env（需在真实终端里运行）
 uv run cuemem doctor --live              # 检查配置与各模型的连通性
-uv run cuemem ingest examples/toy_conversation.json
+uv run cuemem ingest examples/toy_conversation.json --consolidate   # 写入并巩固：抽取事实、实体、摘要
+uv run cuemem inspect facts --space demo     # 事实时间线：哪些已被取代、何时、被谁取代
+uv run cuemem inspect facts --space demo --valid-at 2025-06   # 2025 年 6 月时现实中成立的事实
 uv run cuemem ask "我现在在哪里工作？" --space demo --at 2025-10-10 --show-context
+uv run cuemem forget --space demo --session s4   # 遗忘一段会话：派生的事实、向量、缓存一并清除
 uv run cuemem usage --today              # 调用量与成本（名义成本 / 估算花费）
 uv run cuemem data download              # 下载评测数据集（LongMemEval_S、LoCoMo）
 uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4）；dev100 为正式开发集
@@ -89,8 +92,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N0 | 项目定位与总体设计 | 已完成 |
 | N1 | 工程骨架与基础设施 | 已完成 |
 | N2 | 评测框架与基线 | 已完成 |
-| N3 | 写入路径：结构化、带有效期的记忆 | 下一步 |
-| N4 | L1 快速召回 | 未开始 |
+| N3 | 写入路径：结构化、带有效期的记忆 | 已完成 |
+| N4 | L1 快速召回 | 下一步 |
 | N5 | L2 深度检索 | 未开始 |
 | N6 | 多模态记忆 | 未开始 |
 | N7 | 检索控制器（核心） | 未开始 |
@@ -102,14 +105,56 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 
 主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
 
+### N3 写入路径：LongMemEval_S 开发集（100 题）
+
+B2F 的检索算法与 B2 完全相同（dense top-10），区别只在用上了写入路径的产出：事实增强键、带有效期的事实、核心记忆（[D-023](docs/decisions.md)）。这样提升只可能来自写入路径。
+
+| 方法 | 准确率（95% 置信区间） | 平均输入 tokens | 每题名义成本 |
+|---|---|---|---|
+| B1 全上下文 | 72%（63–81） | 105,262 | $0.0317 |
+| B2 朴素检索 | 65%（55–74） | 4,830 | $0.0015 |
+| **B2F 朴素检索 + 事实记忆** | **80%（72–88）** | 6,280 | $0.0020 |
+| ORACLE 只给证据会话（上限参照） | 83%（75–90） | 6,645 | $0.0021 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/n3-dev100-facts/pareto-dark.png">
+  <img alt="N3：各方法的准确率与每题名义成本（对数坐标）" src="docs/results/n3-dev100-facts/pareto-light.png" width="720">
+</picture>
+
+1. **写入路径让朴素检索接近上限**：同一批题上，B2F 答对而 B2 答错的有 18 题，反过来只有 3 题（配对符号检验 p = 0.001）；与只给证据会话的 ORACLE 没有显著差异。每题回答成本约为全上下文的 1/16。
+2. **提升主要来自检索**：发言召回 87% → 96%，NDCG 58% → 80%，"检索未命中"的错题从 12 道降到 2 道。只用事实增强键、不把事实放进上下文的消融已经达到 78%。
+3. **分题型**：时间推理 48% → 72%（增强键带到 64%，再加上带绝对日期的事实到 72%）；知识更新 80% → 100%；偏好题 50% → 83%（主要来自核心记忆）。
+4. **一个被数据推翻的设计**：首轮里登记过的单值谓词（住址、工作）按规则直接取代。抽样核对发现精确率只有约 10%：抽取模型的谓词标签不稳定。错误的"已失效"标签还让 2 道知识更新题答错。改为由 LLM 确认后，知识更新题全部答对（[D-019](docs/decisions.md)）。
+5. **局限**：四个消融与完整版的差异都不显著（n = 100），"有效期标注本身是否有帮助"（H4）在这个开发集上还说不清。多会话计数题上，完整版（50%）反而不如只用增强键（62%）：上下文里的事实只是部分清单，偶尔还带着抽取时算错的日期，reader 却过于相信它们（留给 N5 的计数工具与溯源校验）。
+6. **写入成本**：每千条发言约 25.7 万输入 / 7.6 万输出 tokens，名义成本 $0.074（加上轮次向量化共约 $0.087）。LongMemEval 每份历史只问一道题，写入成本摊不薄：按题算总账，B2F 约 $0.045，反而高于全上下文的 $0.032。真实场景中一份记忆会被反复提问，写入是一次性成本（见下面的 LoCoMo）。
+
+**跨数据集检查：LoCoMo 前 3 段对话（385 题，不含对抗题）**。没有在 LoCoMo 上调过任何参数。B2 71.2% → **B2F 77.7%**（配对符号检验 +42 / −17，p = 0.002），ORACLE 87.5%。多跳题提升最大（42% → 61%），时间题持平（88%）。token F1 从 0.196 升到 0.238。这里一段对话平均被问约 128 次，巩固成本摊到每题约 $0.0002，B2F 每题总成本约 $0.0008。完整报告见 [docs/results/n3-locomo-3conv/report.md](docs/results/n3-locomo-3conv/report.md)。
+
+完整报告见 [docs/results/n3-dev100-facts/report.md](docs/results/n3-dev100-facts/report.md)，抽取模型对比见 [extractor-comparison.md](docs/results/n3-dev100-facts/extractor-comparison.md)。复现：`uv run cuemem eval run --split dev100 --methods B2,B2F --name dev100-n3`。首次约 40 分钟、约 $4，主要花在抽取上；缓存命中后几分钟即可跑完。
+
+在示例对话上（`examples/toy_conversation.json`，真实模型）：
+
+```text
+$ cuemem ask "我现在在哪工作？" --space demo --at 2025-10-10
+你现在在新加坡的一家电商公司工作，担任AI产品经理（2025年8月跳槽过去的）。
+$ cuemem ask "我换工作之前是做什么的？" --space demo --at 2025-10-10
+换工作之前，你在北京一家互联网公司做产品经理，当时在做短视频推荐相关的功能项目。
+$ cuemem forget --space demo --session s4 --yes     # 遗忘"跳槽到新加坡"那段对话
+已删除 4 条轮次（会话 s4）；事实 19 → 14 条（已按剩余日志重建）；清理向量缓存 10 条、LLM 缓存 3 条
+$ cuemem ask "我现在在哪工作？" --space demo --at 2025-10-10
+你在北京一家互联网公司工作，职位是产品经理。
+```
+
+N1 冒烟测试里答错的"我第一次提到想去旅行是什么时候"，现在也答对了：抽出的事实"用户计划在 2025 年底去巴厘岛旅行"作为检索键，把原对话带了出来。
+
 ### N2 基线：LongMemEval_S 开发集（100 题）
 
 | 方法 | 准确率（95% 置信区间） | 平均输入 tokens | 每题名义成本 |
 |---|---|---|---|
 | B0 无记忆 | 6%（2–11） | 458 | $0.0002 |
-| B1 全上下文 | 72%（63–80） | 105,262 | $0.0317 |
-| B2 朴素检索（dense top-10） | 65%（56–74） | 4,830 | $0.0016 |
-| ORACLE 只给证据会话（上限参照） | 83%（76–90） | 6,645 | $0.0021 |
+| B1 全上下文 | 72%（63–81） | 105,262 | $0.0317 |
+| B2 朴素检索（dense top-10） | 65%（55–74） | 4,830 | $0.0016 |
+| ORACLE 只给证据会话（上限参照） | 83%（75–90） | 6,645 | $0.0021 |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/n2-dev100-baselines/pareto-dark.png">
@@ -124,4 +169,4 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 
 完整报告见 [docs/results/n2-dev100-baselines/report.md](docs/results/n2-dev100-baselines/report.md)。复现：`uv run cuemem eval run --split dev100 --name dev100-baselines`，约 15 分钟、约 $4（缓存命中后重跑几乎免费）。
 
-N1 冒烟测试里还有一个典型失败：问"我第一次提到想去旅行是什么时候"，问题中的问法词稀释了关键词"旅行"，相关记忆只排第 7（共 9 条）；单独搜"旅行"时排第 1。查询改写（N5）、关键词检索（N4）与检索控制器（N7）都针对这类问题。
+置信区间在 N3 改为按题目 ID 排序后再做 bootstrap（与运行顺序无关），与最初发布的数字相比有 ±1 个百分点的变化。

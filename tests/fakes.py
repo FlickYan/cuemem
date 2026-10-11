@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOY_CONVERSATION = PROJECT_ROOT / "examples" / "toy_conversation.json"
 
 ChatReply = str | Callable[[dict[str, Any]], str]
+REJECT = "__REJECT__"  # 回复函数返回它时，模拟内容审核拒绝（HTTP 400）
 
 
 def chat_completion_body(
@@ -71,6 +72,17 @@ class FakeAPI:
             self.chat_requests.append(body)
             reply = self.chat_replies.pop(0) if len(self.chat_replies) > 1 else self.chat_replies[0]
             content = reply(body) if callable(reply) else reply
+            if content == REJECT:  # 模拟供应商的内容审核拒绝（QwenCloud 的报错格式）
+                return httpx2.Response(
+                    400,
+                    json={
+                        "error": {
+                            "code": "data_inspection_failed",
+                            "message": "Input text data may contain inappropriate content.",
+                            "type": "data_inspection_failed",
+                        }
+                    },
+                )
             deepseek = "deepseek" in request.url.host
             return httpx2.Response(
                 200,

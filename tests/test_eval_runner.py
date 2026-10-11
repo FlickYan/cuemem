@@ -174,3 +174,60 @@ def test_ingest_failure_only_affects_index_methods(
     assert {r["method"] for r in load_rows(summary.run_dir, "results.jsonl")} == {"B0"}
     errors = load_rows(summary.run_dir, "errors.jsonl")
     assert {(e["method"], e["stage"]) for e in errors} == {("B2", "ingest")}
+
+
+def with_extraction(extract: Any) -> Any:
+    """在 fake_model 的基础上，把巩固阶段的抽取请求交给 extract 处理。"""
+
+    def reply(body: dict[str, Any]) -> str:
+        first = body["messages"][0]
+        if first["role"] == "system" and first["content"].startswith("You build the long-term"):
+            return str(extract(body))
+        return fake_model(body)
+
+    return reply
+
+
+def test_fact_methods_consolidate_once_per_history(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    from scripted import ScriptedModel, echo_extraction
+
+    fake_api.chat_replies = [with_extraction(ScriptedModel(echo_extraction))]
+    config = RunConfig(
+        name="facts", dataset="longmemeval_s", split=None, methods=["B2", "B2F", "B2F-current"]
+    )
+    runner = EvalRunner(eval_settings, config, http_client=fake_api.client())
+    summary = runner.run(load_longmemeval(FIXTURES / "longmemeval_mini.json"))
+    assert (summary.completed, summary.errors) == (9, 0)
+
+    stages = load_rows(summary.run_dir, "ingest.jsonl")
+    consolidated = [r for r in stages if r["stage"] == "consolidate"]
+    assert len(consolidated) == 3  # 每份对话历史巩固一次，三个方法共用
+    assert all(r["sessions"] == 3 and r["facts_extracted"] == 3 for r in consolidated)
+    assert all(r["llm_calls"] == 3 and r["turns"] == 6 for r in consolidated)
+
+    rows = load_rows(summary.run_dir, "results.jsonl")
+    b2f = next(r for r in rows if r["sample_id"] == "q-ssu" and r["method"] == "B2F")
+    assert b2f["correct"] and b2f["retrieved_facts"]
+    assert b2f["retrieval"]["turn_recall_any"] == 1.0
+    b2 = next(r for r in rows if r["sample_id"] == "q-ssu" and r["method"] == "B2")
+    assert b2["retrieved_facts"] == []
+    assert b2["usage"]["llm_calls"] == 1  # 巩固的调用不计入回答成本
+
+    report = build_report(summary.run_dir).read_text(encoding="utf-8")
+    assert "## 写入路径：巩固（N3）" in report
+    assert "| 巩固（抽取、对账、摘要） |" in report
+    assert "| B2F 朴素检索 + 事实记忆 |" in report
+
+
+def test_consolidation_failure_only_affects_fact_methods(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    fake_api.chat_replies = [with_extraction(lambda body: "not json")]
+    config = RunConfig(name="cfail", dataset="longmemeval_s", split=None, methods=["B2", "B2F"])
+    runner = EvalRunner(eval_settings, config, http_client=fake_api.client())
+    summary = runner.run(load_longmemeval(FIXTURES / "longmemeval_mini.json"))
+    assert (summary.completed, summary.errors) == (3, 3)
+    errors = load_rows(summary.run_dir, "errors.jsonl")
+    assert {(e["method"], e["stage"]) for e in errors} == {("B2F", "consolidate")}

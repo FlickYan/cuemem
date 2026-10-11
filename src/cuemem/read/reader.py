@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from cuemem.core.models import Answer, Hit, SessionIn
 from cuemem.core.trace import span
 from cuemem.llm.client import LLMClient
+from cuemem.read.facts import MemoryView, Validity, format_facts
 
 # 评测基准以英文为主，提示词用英文；回答语言跟随问题
 READER_SYSTEM = """You are a personal assistant with long-term memory of past conversations with the user.
@@ -53,12 +54,20 @@ class Reader:
         self.llm = llm
         self.role = role
 
-    def answer(self, question: str, hits: Sequence[Hit], *, question_time: datetime) -> Answer:
+    def answer(
+        self,
+        question: str,
+        hits: Sequence[Hit],
+        *,
+        question_time: datetime,
+        cache_scope: str | None = None,
+    ) -> Answer:
         context, refs = format_memories(hits)
         output = self._read(
             question,
             f"Retrieved memories:\n{context or '(none)'}",
             question_time,
+            cache_scope=cache_scope,
             memories=len(hits),
         )
         # 只保留真实存在的引用编号，防止模型编造
@@ -71,6 +80,54 @@ class Reader:
             refs=refs,
             hits=list(hits),
             question_time=question_time,
+        )
+
+    def answer_with_memory(
+        self,
+        question: str,
+        view: MemoryView,
+        *,
+        question_time: datetime,
+        validity: Validity = "full",
+        show_facts: bool = True,
+        profile: bool = True,
+        cache_scope: str | None = None,
+    ) -> Answer:
+        """事实增强检索（B2F）的回答：核心记忆 + 带有效期的事实 + 原始对话片段。
+
+        系统提示与其他方法完全相同，事实的格式说明放在上下文里，保证方法之间只差"给它看什么"。
+        """
+        blocks: list[str] = []
+        if profile and view.core is not None and view.core.text:
+            # 多人对话（如 LoCoMo）的核心记忆按人分组，每组以"名字:"开头
+            who = "the user" if view.core.text.startswith("- ") else "the people in these chats"
+            blocks.append(f"About {who} (core memory, current facts):\n{view.core.text}")
+        facts = [fh for fh in view.facts if fh.fact.is_current or validity != "current"]
+        fact_refs: dict[str, str] = {}
+        if show_facts and facts:
+            text, fact_refs = format_facts(facts, validity=validity)
+            blocks.append(text)
+        context, round_refs = format_memories(view.rounds)
+        blocks.append(f"Retrieved conversation excerpts:\n{context or '(none)'}")
+        output = self._read(
+            question,
+            "\n\n".join(blocks),
+            question_time,
+            cache_scope=cache_scope,
+            memories=len(view.rounds),
+            facts=len(fact_refs),
+        )
+        refs = {**round_refs, **fact_refs}
+        citations = [c.strip("[] ") for c in output.citations if c.strip("[] ") in refs]
+        return Answer(
+            question=question,
+            answer=output.answer,
+            evidence_sufficient=output.evidence_sufficient,
+            citations=citations,
+            refs=refs,
+            hits=list(view.rounds),
+            question_time=question_time,
+            facts=facts if show_facts else [],
         )
 
     def answer_from_history(
@@ -91,7 +148,13 @@ class Reader:
         )
 
     def _read(
-        self, question: str, context_block: str, question_time: datetime, **span_attrs: object
+        self,
+        question: str,
+        context_block: str,
+        question_time: datetime,
+        *,
+        cache_scope: str | None = None,
+        **span_attrs: object,
     ) -> ReaderOutput:
         prompt = (
             f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
@@ -103,7 +166,9 @@ class Reader:
             {"role": "user", "content": prompt},
         ]
         with span("read", **span_attrs):
-            return self.llm.structured(self.role, messages, ReaderOutput).value
+            return self.llm.structured(
+                self.role, messages, ReaderOutput, cache_scope=cache_scope
+            ).value
 
 
 def format_history(sessions: Sequence[SessionIn]) -> str:

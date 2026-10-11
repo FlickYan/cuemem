@@ -2,8 +2,11 @@
 
 cuemem configure                      交互式填写 API Key（写入 .env）
 cuemem doctor [--live]                检查配置、API Key 与连通性
-cuemem ingest FILE [--space S]        导入对话
+cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
+cuemem consolidate --space S          巩固：抽取事实与实体、对账、摘要、核心记忆
 cuemem ask "问题" --space S [--at T]  检索记忆并回答
+cuemem inspect facts|entities|sources|profile --space S   记忆检查器
+cuemem forget --space S --session X   遗忘：删除会话及由它派生的一切
 cuemem spaces                         列出记忆空间
 cuemem usage [--today] [--run ID]     汇总调用量与成本
 cuemem data download [NAME...]       下载评测数据集
@@ -27,7 +30,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, T
 from rich.table import Table
 
 from cuemem.config import Settings, env_file_path, load_settings
-from cuemem.core.models import Answer, Conversation
+from cuemem.core.models import Answer, Conversation, Fact
 from cuemem.embed import build_embedder
 from cuemem.envfile import mask, read_env, update_env
 from cuemem.errors import CueMemError
@@ -42,6 +45,7 @@ from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.memory import MemorySystem
 from cuemem.store.sqlite import MemoryDB
+from cuemem.write.consolidate import ConsolidationReport
 
 app = typer.Typer(
     help="CueMem：线索驱动的多模态 Agent 长期记忆系统",
@@ -127,6 +131,9 @@ def ingest(
         typer.Argument(exists=True, dir_okay=False, help="对话 JSON，格式见 examples/"),
     ],
     space: Annotated[str | None, typer.Option(help="覆盖文件里的 space_id")] = None,
+    consolidate: Annotated[
+        bool, typer.Option("--consolidate", help="导入后立即巩固（抽取事实、实体与摘要）")
+    ] = False,
 ) -> None:
     """导入一段多会话对话（可重复执行，不会产生重复数据）。"""
     conversation = Conversation.model_validate_json(path.read_text(encoding="utf-8"))
@@ -139,7 +146,51 @@ def ingest(
             f"新增 {report.turns_added} 条轮次、{report.units_added} 个记忆单元，"
             f"耗时 {report.elapsed_ms:.0f} ms"
         )
+        if consolidate:
+            _print_consolidation(system.consolidate(report.space_id))
+        else:
+            console.print("[dim]提示：运行 cuemem consolidate 抽取事实与实体（需要 LLM）。[/dim]")
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+
+
+@app.command("consolidate")
+def consolidate_cmd(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    rebuild: Annotated[
+        bool, typer.Option("--rebuild", help="清空派生记忆后从原始日志全部重放（命中缓存）")
+    ] = False,
+) -> None:
+    """巩固：把原始对话整理成带有效期的事实、实体、会话摘要与核心记忆（幂等，可重复执行）。"""
+    with _open_system() as system:
+        _print_consolidation(system.consolidate(space, rebuild=rebuild))
+        _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+
+
+@app.command()
+def forget(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    session: Annotated[list[str] | None, typer.Option(help="要遗忘的会话 ID（可多次指定）")] = None,
+    turn: Annotated[list[str] | None, typer.Option(help="要遗忘的轮次 ID（可多次指定）")] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="不再确认，直接删除")] = False,
+) -> None:
+    """遗忘：删除原始轮次，并清除由它们派生的事实、摘要、向量与缓存（不可恢复）。"""
+    if not session and not turn:
+        console.print("[red]请用 --session 或 --turn 指定要遗忘的内容[/red]")
+        raise typer.Exit(1)
+    targets = ", ".join([*(session or []), *(turn or [])])
+    if not yes and not typer.confirm(f"将永久删除 {targets} 及其派生的全部记忆，确定吗？"):
+        raise typer.Exit(1)
+    with _open_system() as system:
+        report = system.forget(space, session_ids=session or [], turn_ids=turn or [])
+        if report.turns_deleted == 0:
+            console.print("没有找到要删除的内容。")
+            return
+        console.print(
+            f"已删除 {report.turns_deleted} 条轮次（会话 {', '.join(report.sessions_affected)}）；"
+            f"事实 {report.facts_before} → {report.facts_after} 条（已按剩余日志重建）；"
+            f"清理向量缓存 {report.embed_cache_purged} 条、LLM 缓存 {report.llm_cache_purged} 条；"
+            f"耗时 {report.elapsed_ms:.0f} ms"
+        )
 
 
 @app.command()
@@ -152,11 +203,19 @@ def ask(
         typer.Option(formats=DATETIME_FORMATS, help="提问时间，如 2025-10-10；默认为当前时间"),
     ] = None,
     show_context: Annotated[bool, typer.Option("--show-context", help="显示检索到的记忆")] = False,
+    mode: Annotated[
+        str, typer.Option(help="facts：事实增强检索（B2F，默认）；naive：朴素检索（B2）")
+    ] = "facts",
 ) -> None:
-    """检索记忆并回答问题（N1：朴素 dense 检索，即 B2 基线）。"""
+    """检索记忆并回答问题。"""
+    if mode not in ("facts", "naive"):
+        console.print("[red]--mode 只能是 facts 或 naive[/red]")
+        raise typer.Exit(1)
     with _open_system() as system:
         started = time.perf_counter()
-        answer = system.ask(space, question, question_time=at, k=k)
+        answer = system.ask(
+            space, question, question_time=at, k=k, mode="naive" if mode == "naive" else "facts"
+        )
         elapsed = (time.perf_counter() - started) * 1000
         if show_context:
             _print_hits(answer)
@@ -178,7 +237,7 @@ def spaces() -> None:
         console.print("还没有任何记忆空间。先运行 cuemem ingest。")
         return
     table = Table(title="记忆空间")
-    for column in ("空间", "会话", "轮次", "记忆单元", "创建时间"):
+    for column in ("空间", "会话", "轮次", "记忆单元", "事实（当前 / 全部）", "实体", "创建时间"):
         table.add_column(column)
     for r in rows:
         table.add_row(
@@ -186,6 +245,8 @@ def spaces() -> None:
             str(r["sessions"]),
             str(r["turns"]),
             str(r["units"]),
+            f"{r['current_facts']} / {r['facts']}",
+            str(r["entities"]),
             r["created_at"][:19],
         )
     console.print(table)
@@ -206,6 +267,116 @@ def usage(
         console.print("没有调用记录。")
         return
     _print_usage_rows(rows, detailed=True)
+
+
+# ---------- 记忆检查器 ----------
+
+inspect_app = typer.Typer(help="记忆检查器：事实时间线、实体、来源、核心记忆", no_args_is_help=True)
+app.add_typer(inspect_app, name="inspect")
+
+
+@inspect_app.command("facts")
+def inspect_facts(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    subject: Annotated[str | None, typer.Option(help="只看某个主语（实体名）")] = None,
+    current: Annotated[bool, typer.Option("--current", help="只看当前有效的事实")] = False,
+    valid_at: Annotated[
+        str | None, typer.Option("--valid-at", help="事件时间：那时现实中成立的事实，如 2025-06")
+    ] = None,
+    known_at: Annotated[
+        datetime | None,
+        typer.Option("--known-at", formats=DATETIME_FORMATS, help="记录时间：系统那时相信的事实"),
+    ] = None,
+) -> None:
+    """事实时间线：按主语分组、按时间排列，标出被取代的版本。"""
+    with _open_system() as system:
+        facts = system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
+        if subject:
+            facts = [f for f in facts if f.subject.casefold() == subject.casefold()]
+        if not facts:
+            console.print("没有符合条件的事实。还没巩固的话，先运行 cuemem consolidate。")
+            return
+        ids = {f.id: i for i, f in enumerate(facts, start=1)}
+        table = Table(title=f"事实时间线（{len(facts)} 条）")
+        for column in ("#", "主语", "谓词", "陈述", "事件时间", "说出时间", "状态", "ID"):
+            table.add_column(column, overflow="fold")
+        for fact in sorted(facts, key=lambda f: (f.subject, f.predicate, f.recorded_at)):
+            table.add_row(
+                str(ids[fact.id]),
+                fact.subject,
+                fact.predicate,
+                fact.statement,
+                _span_text(fact.valid_from, fact.valid_to),
+                f"{fact.recorded_at:%Y-%m-%d}",
+                _fact_status(fact, ids),
+                fact.id,
+            )
+        console.print(table)
+
+
+@inspect_app.command("entities")
+def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
+    """实体列表：名字、类型、别名、提及次数。"""
+    with _open_system() as system:
+        entities = system.entities(space)
+        if not entities:
+            console.print("没有实体。还没巩固的话，先运行 cuemem consolidate。")
+            return
+        table = Table(title=f"实体（{len(entities)} 个）")
+        for column in ("名字", "类型", "别名", "描述", "提及", "首次 / 最近"):
+            table.add_column(column, overflow="fold")
+        for e in sorted(entities, key=lambda e: (-e.mentions, e.name)):
+            table.add_row(
+                e.name,
+                e.type,
+                ", ".join(e.aliases) or "-",
+                e.description or "-",
+                str(e.mentions),
+                f"{e.first_seen:%Y-%m-%d} / {e.last_seen:%Y-%m-%d}",
+            )
+        console.print(table)
+
+
+@inspect_app.command("sources")
+def inspect_sources(
+    fact_id: Annotated[str, typer.Argument(help="事实 ID（见 inspect facts 的最后一列）")],
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+) -> None:
+    """溯源：一条事实来自哪些原始轮次，以及它的版本链。"""
+    with _open_system() as system:
+        found = system.db.get_facts(space, ids=[fact_id])
+        if not found:
+            console.print(f"[red]找不到事实 {fact_id}[/red]")
+            raise typer.Exit(1)
+        fact = found[0]
+        console.print(Panel(fact.statement, title=f"事实 {fact.id}", expand=False))
+        console.print(
+            f"主语 {fact.subject} · 谓词 {fact.predicate} · 宾语 {fact.object} · "
+            f"重要度 {fact.importance} · 事件时间 {_span_text(fact.valid_from, fact.valid_to)} · "
+            f"记录于 {fact.recorded_at:%Y-%m-%d %H:%M}"
+        )
+        chain = system.db.get_facts(space, superseded_by=[fact.id])
+        if fact.superseded_by:
+            chain += system.db.get_facts(space, ids=[fact.superseded_by])
+        for other in chain:
+            relation = "取代了" if other.superseded_by == fact.id else "被它取代"
+            console.print(f"[dim]{relation}：{other.statement}（{other.id}）[/dim]")
+        turns = system.db.get_turns(space, ids=fact.source_turn_ids)
+        for t in turns:
+            who = t.speaker or ("用户" if t.role == "user" else "助手")
+            console.print(f"[bold]{t.ts:%Y-%m-%d} · {t.session_id} · {who}[/bold]：{t.text}")
+
+
+@inspect_app.command("profile")
+def inspect_profile(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
+    """核心记忆（用户画像）：重要且当前有效的事实，每轮常驻上下文。"""
+    with _open_system() as system:
+        core = system.core_memory(space)
+        if core is None or not core.text:
+            console.print("还没有核心记忆。先运行 cuemem consolidate。")
+            return
+        title = f"核心记忆（{len(core.fact_ids)} 条事实，{len(core.text)} 字符）"
+        console.print(Panel(core.text, title=title, expand=False))
 
 
 # ---------- 评测 ----------
@@ -508,6 +679,38 @@ def _live_check(settings: Settings) -> None:
     ledger.close()
 
 
+def _print_consolidation(report: ConsolidationReport) -> None:
+    if report.sessions == 0 and not report.failed:
+        console.print("没有待巩固的会话（任务都已完成）。")
+        return
+    console.print(
+        f"巩固 {report.sessions} 个会话：抽取事实 {report.facts_extracted} 条 → "
+        f"新增 {report.added} · 取代 {report.superseded} · 合并 {report.merged} · "
+        f"重放 {report.noop}；新建实体 {report.entities_created} 个；"
+        f"LLM 调用 {report.llm_calls} 次；耗时 {report.elapsed_ms / 1000:.1f} 秒"
+    )
+    if report.failed:
+        console.print(
+            f"[yellow]{len(report.failed)} 个会话抽取失败，下次运行会重试：[/yellow]"
+            f"{', '.join(report.failed[:5])}"
+        )
+
+
+def _span_text(start: str | None, end: str | None) -> str:
+    if not start and not end:
+        return "-"
+    return f"{start or '?'} → {end or '至今'}"
+
+
+def _fact_status(fact: Fact, ids: dict[str, int]) -> str:
+    if fact.is_current:
+        return "[green]当前[/green]"
+    successor = f"#{ids[fact.superseded_by]}" if fact.superseded_by in ids else "新版本"
+    if fact.supersede_reason == "corrected":
+        return f"[yellow]已更正[/yellow]（见 {successor}）"
+    return f"[dim]已变化[/dim]（见 {successor}）"
+
+
 def _print_hits(answer: Answer) -> None:
     ref_of = {unit_id: ref for ref, unit_id in answer.refs.items()}
     table = Table(title=f"检索到的记忆（{len(answer.hits)} 条，按相关度排序）")
@@ -523,6 +726,25 @@ def _print_hits(answer: Answer) -> None:
             snippet[:80] + ("…" if len(snippet) > 80 else ""),
         )
     console.print(table)
+    if answer.facts:
+        facts = Table(title=f"检索到的事实（{len(answer.facts)} 条，含沿版本链补齐的）")
+        for column in ("编号", "说出时间", "状态", "分数", "陈述"):
+            facts.add_column(column, overflow="fold")
+        for fh in answer.facts:
+            fact = fh.fact
+            status = (
+                "当前"
+                if fact.is_current
+                else ("已更正" if fact.supersede_reason == "corrected" else "已变化")
+            )
+            facts.add_row(
+                ref_of.get(fact.id, "-"),
+                f"{fact.recorded_at:%Y-%m-%d}",
+                status,
+                "版本链" if fh.via_chain else f"{fh.score:.3f}",
+                fact.statement,
+            )
+        console.print(facts)
 
 
 def _print_usage_rows(rows: list[dict[str, Any]], *, detailed: bool = False) -> None:

@@ -44,6 +44,7 @@ from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.memory import MemorySystem
 from cuemem.read.reader import Reader
+from cuemem.write.extract import PIPELINE_VERSION
 from cuemem.write.online import build_rounds, build_turns
 
 
@@ -182,6 +183,7 @@ class EvalRunner:
         sessions = evalset.haystacks[space_key]
         space_id = f"{evalset.dataset}:{space_key}"
         system: MemorySystem | None = None
+        turns = sum(len(s.turns) for s in sessions)
         try:
             if any(m.needs_index for _, methods in items for m in methods):
                 system = MemorySystem.ephemeral(
@@ -193,17 +195,44 @@ class EvalRunner:
                 self._add_cost(usage)
                 self._append(
                     "ingest.jsonl",
-                    {"space_key": space_key, "units": report.units_added, **usage},
+                    {
+                        "space_key": space_key,
+                        "stage": "ingest",
+                        "units": report.units_added,
+                        "turns": turns,
+                        **usage,
+                    },
                 )
         except Exception as exc:  # 写入失败只影响需要索引的方法，其余方法照常评测
-            for sample, methods in items:
-                for method in methods:
-                    if method.needs_index:
-                        self._record_error(sample, method, exc, stage="ingest")
-            items = [(s, [m for m in ms if not m.needs_index]) for s, ms in items]
+            items = self._drop_failed(items, exc, "ingest", lambda m: m.needs_index)
             if system is not None:
                 system.close()
             system = None
+        if system is not None and any(
+            m.needs_consolidation for _, methods in items for m in methods
+        ):
+            try:
+                with start_trace("consolidate", space=space_id) as trace:
+                    consolidation = system.consolidate(space_id, strict=True)
+                usage = usage_from_trace(trace)
+                self._add_cost(usage)
+                self._append(
+                    "ingest.jsonl",
+                    {
+                        "space_key": space_key,
+                        "stage": "consolidate",
+                        "turns": turns,
+                        **consolidation.as_dict(),
+                        "facts_total": len(system.db.get_facts(space_id)),
+                        "facts_current": len(system.db.get_facts(space_id, current_only=True)),
+                        "entities": len(system.db.get_entities(space_id)),
+                        **usage,
+                    },
+                )
+            except Exception as exc:  # 巩固失败只影响需要事实记忆的方法
+                items = self._drop_failed(
+                    items, exc, "consolidate", lambda m: m.needs_consolidation
+                )
         try:
             for sample, methods in items:
                 for method in methods:
@@ -260,6 +289,15 @@ class EvalRunner:
                 [h.unit.session_id, h.unit.meta.get("turn_indices", []), round(h.score, 4)]
                 for h in output.hits
             ],
+            "retrieved_facts": [
+                [
+                    fh.fact.statement,
+                    "current" if fh.fact.is_current else fh.fact.supersede_reason,
+                    fh.fact.session_id,
+                    round(fh.score, 4),
+                ]
+                for fh in output.facts
+            ],
             "usage": usage,
             "judge_usage": judge_usage,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -285,6 +323,20 @@ class EvalRunner:
             evidence_turns=turns,
             relevant_units=relevant_units,
         )
+
+    def _drop_failed(
+        self,
+        items: list[tuple[Sample, list[Method]]],
+        exc: Exception,
+        stage: str,
+        affected: Callable[[Method], bool],
+    ) -> list[tuple[Sample, list[Method]]]:
+        """某个准备阶段失败：受影响的方法记为出错（下次重跑会重试），其余方法照常评测。"""
+        for sample, methods in items:
+            for method in methods:
+                if affected(method):
+                    self._record_error(sample, method, exc, stage=stage)
+        return [(s, [m for m in ms if not affected(m)]) for s, ms in items]
 
     def _record_error(self, sample: Sample, method: Method, exc: Exception, *, stage: str) -> None:
         self._append(
@@ -353,6 +405,11 @@ class EvalRunner:
                     "model": self.settings.embedding.model,
                     "dim": self.settings.embedding.dim,
                     "backend": self.settings.embedding.backend,
+                },
+                "retrieval": self.settings.retrieval.model_dump(),
+                "consolidation": {
+                    "pipeline_version": PIPELINE_VERSION,
+                    **self.settings.consolidation.model_dump(),
                 },
                 "git": _git_version(),
                 "created": now,

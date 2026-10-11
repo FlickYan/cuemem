@@ -50,3 +50,20 @@ def offline_settings(settings: Settings) -> Settings:
 @pytest.fixture
 def fake_api() -> FakeAPI:
     return FakeAPI()
+
+
+@pytest.fixture
+def n3_settings(offline_settings: Settings) -> Settings:
+    """巩固相关测试用的配置：哈希向量的相似度没有语义，把相似度阈值调到几乎只认精确匹配，
+    让对账与消歧的走向完全由规则和脚本化的模型决定。"""
+    consolidation = offline_settings.consolidation.model_copy(
+        update={
+            "duplicate_threshold": 0.9999,
+            "conflict_threshold": 0.9999,
+            "multi_conflict_threshold": 0.9999,
+            "entity_merge_threshold": 0.9999,
+            "entity_gray_threshold": 0.9998,
+            "workers": 2,
+        }
+    )
+    return offline_settings.model_copy(update={"consolidation": consolidation})

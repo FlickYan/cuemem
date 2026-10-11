@@ -26,6 +26,7 @@ class EmbeddingCache:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS embed_cache ("
                 " key TEXT PRIMARY KEY, dense BLOB NOT NULL, sparse_idx BLOB, sparse_val BLOB)"
@@ -71,6 +72,21 @@ class EmbeddingCache:
                 rows,
             )
             self._conn.commit()
+
+    def delete_many(self, keys: Sequence[str]) -> int:
+        """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。"""
+        deleted = 0
+        unique = list(dict.fromkeys(keys))
+        with self._lock:
+            for start in range(0, len(unique), 500):
+                chunk = unique[start : start + 500]
+                marks = ", ".join("?" for _ in chunk)
+                cursor = self._conn.execute(
+                    f"DELETE FROM embed_cache WHERE key IN ({marks})", chunk
+                )
+                deleted += max(cursor.rowcount, 0)
+            self._conn.commit()
+        return deleted
 
     def close(self) -> None:
         with self._lock:
@@ -134,6 +150,15 @@ class CachedEmbedder:
             else None
         )
         return EmbeddingBatch(dense=dense, sparse=sparse_out, tokens=tokens)
+
+    def cached(self, texts: Sequence[str], kind: EmbedKind) -> set[str]:
+        """返回 texts 中已经在缓存里的那些（测试与遗忘检查用）。"""
+        keys = {self._key(text, kind): text for text in texts}
+        return {keys[k] for k in self.cache.get_many(list(keys))}
+
+    def purge(self, texts: Sequence[str], kind: EmbedKind = "document") -> int:
+        """从缓存中删除这些文本的向量。"""
+        return self.cache.delete_many([self._key(text, kind) for text in texts])
 
     def _key(self, text: str, kind: EmbedKind) -> str:
         instruct = (self.instruct or "") if kind == "query" else ""

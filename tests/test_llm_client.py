@@ -120,3 +120,28 @@ def test_missing_api_key(
     monkeypatch.delenv("DEEPSEEK_API_KEY")
     with pytest.raises(MissingAPIKeyError, match="DEEPSEEK_API_KEY"):
         make_client(settings, fake_api).chat("reader", HELLO)
+
+
+def test_content_filter_falls_back_to_other_provider(settings: Settings, fake_api: FakeAPI) -> None:
+    from fakes import REJECT
+
+    from cuemem.errors import ContentFilteredError
+
+    class Out(BaseModel):
+        ok: bool
+
+    # 通义的内容审核误拒，DeepSeek 正常回答
+    fake_api.chat_replies = [
+        lambda body: REJECT if body["model"] == "qwen3.8-flash" else '{"ok": true}'
+    ]
+    client = LLMClient(settings, http_client=fake_api.client())
+    messages = [{"role": "user", "content": "hello"}]
+    with pytest.raises(ContentFilteredError):
+        client.structured("extractor", messages, Out)
+    result = client.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert result.value.ok and result.result.model_alias == "deepseek-flash"
+    assert [r["model"] for r in fake_api.chat_requests] == [
+        "qwen3.8-flash",
+        "qwen3.8-flash",
+        "deepseek-flash",
+    ]  # 被拒的请求不重试、不缓存

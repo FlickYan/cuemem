@@ -89,3 +89,62 @@ def test_configure_keeps_existing_values(env_path: Path) -> None:
     assert values["DEEPSEEK_API_KEY"] == "fake-old-111111111"
     assert "DASHSCOPE_API_KEY" not in values  # 没填就不写入，并提示未填写
     assert "未填写" in result.output
+
+
+def test_consolidate_inspect_and_forget(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fakes import FakeAPI
+    from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
+
+    from cuemem import cli
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake-qwen")
+    for name in ("DUPLICATE", "CONFLICT", "MULTI_CONFLICT", "ENTITY_MERGE", "ENTITY_GRAY"):
+        monkeypatch.setenv(f"CUEMEM_CONSOLIDATION__{name}_THRESHOLD", "0.9999")
+    api = FakeAPI()
+    api.chat_replies = [
+        ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
+    ]
+    original = MemorySystem.from_settings
+    monkeypatch.setattr(
+        cli.MemorySystem,
+        "from_settings",
+        lambda settings: original(settings, http_client=api.client()),
+    )
+    monkeypatch.setattr(cli.console, "width", 300)  # 表格不折行，便于断言
+
+    result = runner.invoke(app, ["ingest", str(TOY_CONVERSATION), "--consolidate"])
+    assert result.exit_code == 0, result.output
+    assert "巩固5个会话" in _flat(result.output)
+
+    result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--subject", "User"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "已变化" in flat and "当前" in flat and "新加坡一家电商公司" in flat
+
+    result = runner.invoke(
+        app, ["inspect", "facts", "--space", "demo", "--valid-at", "2025-06-01", "--current"]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(app, ["inspect", "entities", "--space", "demo"])
+    assert result.exit_code == 0 and "Max" in result.output
+
+    result = runner.invoke(app, ["inspect", "profile", "--space", "demo"])
+    assert result.exit_code == 0 and "林晓" in result.output
+
+    result = runner.invoke(app, ["spaces"])
+    assert result.exit_code == 0 and "demo" in result.output
+
+    result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4"], input="n\n")
+    assert result.exit_code == 1  # 没有确认，不删除
+    result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "已删除4条轮次" in _flat(result.output)
+    result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--current"])
+    assert "新加坡一家电商公司" not in _flat(result.output)

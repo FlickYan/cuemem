@@ -108,12 +108,58 @@ class VectorStore:
         query = models.SparseVector(indices=vector.indices, values=vector.values)
         return self._query(space_id, query, SPARSE, k, _build_filter(kinds, ts_range))
 
-    def count(self, space_id: str) -> int:
+    def count(self, space_id: str, *, kinds: Sequence[str] | None = None) -> int:
         name = self.collection_name(space_id)
         with self._lock:
             if not self._client.collection_exists(name):
                 return 0
-            return int(self._client.count(name).count)
+            return int(self._client.count(name, count_filter=_build_filter(kinds, None)).count)
+
+    def delete(self, space_id: str, unit_ids: Sequence[str]) -> None:
+        """按记忆单元 ID 删除向量点（遗忘、重建派生记忆时使用）。"""
+        name = self.collection_name(space_id)
+        if not unit_ids:
+            return
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return
+            self._client.delete(
+                name,
+                points_selector=models.PointIdsList(points=[point_uuid(u) for u in unit_ids]),
+            )
+
+    def set_payload(self, space_id: str, unit_ids: Sequence[str], payload: dict[str, Any]) -> None:
+        """更新若干点的 payload，例如事实被取代后把 current 改为 False，供过滤检索使用。"""
+        name = self.collection_name(space_id)
+        if not unit_ids:
+            return
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return
+            self._client.set_payload(
+                name, payload=payload, points=[point_uuid(u) for u in unit_ids]
+            )
+
+    def unit_ids(self, space_id: str, *, kinds: Sequence[str] | None = None) -> list[str]:
+        """列出空间里的全部记忆单元 ID（测试与一致性检查用）。"""
+        name = self.collection_name(space_id)
+        out: list[str] = []
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return out
+            offset = None
+            while True:
+                points, offset = self._client.scroll(
+                    name,
+                    scroll_filter=_build_filter(kinds, None),
+                    limit=256,
+                    offset=offset,
+                    with_payload=["unit_id"],
+                    with_vectors=False,
+                )
+                out.extend(str(p.payload["unit_id"]) for p in points if p.payload)
+                if offset is None:
+                    return out
 
     def delete_space(self, space_id: str) -> None:
         name = self.collection_name(space_id)

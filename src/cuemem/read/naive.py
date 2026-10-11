@@ -21,7 +21,8 @@ class NaiveRetriever:
     def search(self, space_id: str, query: str, k: int) -> list[Hit]:
         with span("retrieve", route="dense", k=k) as record:
             query_vec = self.embedder.embed([query], "query").dense[0]
-            vector_hits = self.vectors.search_dense(space_id, query_vec, k)
+            # 只检索"轮"：巩固之后空间里还有事实、摘要等单元，B2 保持原样以便对比
+            vector_hits = self.vectors.search_dense(space_id, query_vec, k, kinds=["round"])
             units = {u.id: u for u in self.db.get_units(space_id, [h.unit_id for h in vector_hits])}
             hits = [
                 Hit(unit=units[h.unit_id], score=h.score, route="dense", rank=rank)
