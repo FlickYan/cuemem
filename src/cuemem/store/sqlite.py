@@ -16,7 +16,7 @@ from typing import Any
 from cuemem.core.models import MemoryUnit, Turn
 from cuemem.errors import ConfigMismatchError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2：turns 增加 speaker 列
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS turns (
     text TEXT NOT NULL,
     ts TEXT NOT NULL,
     media_ids TEXT NOT NULL DEFAULT '[]',
+    speaker TEXT,
     UNIQUE (space_id, session_id, idx)
 );
 CREATE TABLE IF NOT EXISTS units (
@@ -69,6 +70,9 @@ class MemoryDB:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
+            if "speaker" not in columns:  # 从 v1 升级
+                self._conn.execute("ALTER TABLE turns ADD COLUMN speaker TEXT")
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
 
@@ -119,14 +123,15 @@ class MemoryDB:
                 t.text,
                 t.ts.isoformat(),
                 json.dumps(t.media_ids),
+                t.speaker,
             )
             for t in turns
         ]
         with self._lock:
             cursor = self._conn.executemany(
                 "INSERT OR IGNORE INTO turns"
-                " (id, space_id, session_id, idx, role, text, ts, media_ids)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " (id, space_id, session_id, idx, role, text, ts, media_ids, speaker)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             self._conn.commit()
@@ -189,7 +194,7 @@ class MemoryDB:
         return [rows[i] for i in ids if i in rows]
 
     def get_turns(self, space_id: str, session_id: str | None = None) -> list[Turn]:
-        sql = "SELECT id, space_id, session_id, idx, role, text, ts, media_ids FROM turns"
+        sql = "SELECT id, space_id, session_id, idx, role, text, ts, media_ids, speaker FROM turns"
         sql += " WHERE space_id = ?"
         args: list[Any] = [space_id]
         if session_id is not None:
@@ -208,6 +213,7 @@ class MemoryDB:
                 text=r[5],
                 ts=datetime.fromisoformat(r[6]),
                 media_ids=json.loads(r[7]),
+                speaker=r[8],
             )
             for r in fetched
         ]

@@ -1,0 +1,160 @@
+[
+ {
+  "question_id": "q-ssu",
+  "question_type": "single-session-user",
+  "question": "What breed is my dog?",
+  "question_date": "2023/06/01 (Thu) 10:00",
+  "answer": "golden retriever",
+  "answer_session_ids": [
+   "ssu-a"
+  ],
+  "haystack_session_ids": [
+   "ssu-a",
+   "ssu-b",
+   "ssu-c"
+  ],
+  "haystack_dates": [
+   "2023/05/20 (Sat) 09:00",
+   "2023/05/22 (Mon) 09:00",
+   "2023/05/25 (Thu) 09:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I just adopted a golden retriever named Max.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "Congratulations! Golden retrievers are friendly dogs."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Can you recommend a lightweight laptop?"
+    },
+    {
+     "role": "assistant",
+     "content": "Sure, look for something under 1.5 kg."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I love hiking on weekends."
+    },
+    {
+     "role": "assistant",
+     "content": "Hiking is a great way to relax."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q-tr",
+  "question_type": "temporal-reasoning",
+  "question": "How many days before June 1 did I adopt Max?",
+  "question_date": "2023/06/01 (Thu) 10:00",
+  "answer": 12,
+  "answer_session_ids": [
+   "tr-a"
+  ],
+  "haystack_session_ids": [
+   "tr-a",
+   "tr-b",
+   "tr-c"
+  ],
+  "haystack_dates": [
+   "2023/05/20 (Sat) 09:00",
+   "2023/05/22 (Mon) 09:00",
+   "2023/05/25 (Thu) 09:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I just adopted a golden retriever named Max.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "Congratulations! Golden retrievers are friendly dogs."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Can you recommend a lightweight laptop?"
+    },
+    {
+     "role": "assistant",
+     "content": "Sure, look for something under 1.5 kg."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I love hiking on weekends."
+    },
+    {
+     "role": "assistant",
+     "content": "Hiking is a great way to relax."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q-cat_abs",
+  "question_type": "single-session-user",
+  "question": "What is my cat's name?",
+  "question_date": "2023/06/01 (Thu) 10:00",
+  "answer": "You did not mention having a cat.",
+  "answer_session_ids": [
+   "abs-a"
+  ],
+  "haystack_session_ids": [
+   "abs-a",
+   "abs-b",
+   "abs-c"
+  ],
+  "haystack_dates": [
+   "2023/05/20 (Sat) 09:00",
+   "2023/05/22 (Mon) 09:00",
+   "2023/05/25 (Thu) 09:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I just adopted a golden retriever named Max."
+    },
+    {
+     "role": "assistant",
+     "content": "Congratulations! Golden retrievers are friendly dogs."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Can you recommend a lightweight laptop?"
+    },
+    {
+     "role": "assistant",
+     "content": "Sure, look for something under 1.5 kg."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I love hiking on weekends."
+    },
+    {
+     "role": "assistant",
+     "content": "Hiking is a great way to relax."
+    }
+   ]
+  ]
+ }
+]

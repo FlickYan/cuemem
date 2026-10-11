@@ -72,3 +72,34 @@ def test_vector_store_search_and_filters(tmp_path: Path) -> None:
     reopened.delete_space("s")
     assert reopened.count("s") == 0
     reopened.close()
+
+
+def test_v1_database_is_migrated(tmp_path: Path) -> None:
+    import sqlite3
+    from datetime import datetime
+
+    from cuemem.core.models import Turn
+
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE turns (id TEXT PRIMARY KEY, space_id TEXT NOT NULL, session_id TEXT NOT NULL,"
+        " idx INTEGER NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, ts TEXT NOT NULL,"
+        " media_ids TEXT NOT NULL DEFAULT '[]', UNIQUE (space_id, session_id, idx));"
+        "PRAGMA user_version = 1;"
+    )
+    conn.close()
+
+    db = MemoryDB(path)  # 打开时自动补上 speaker 列
+    turn = Turn(
+        id="t1",
+        space_id="s",
+        session_id="x",
+        idx=0,
+        role="user",
+        text="hi",
+        ts=datetime(2023, 1, 1),
+        speaker="Alice",
+    )
+    assert db.add_turns([turn]) == 1
+    assert db.get_turns("s")[0].speaker == "Alice"

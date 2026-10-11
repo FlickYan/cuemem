@@ -20,6 +20,7 @@ class TurnIn(BaseModel):
     role: Role
     text: str
     ts: datetime | None = None  # 缺省时使用会话开始时间
+    speaker: str | None = None  # 说话人名字；多人对话（如 LoCoMo）里用来区分是谁说的
 
 
 class SessionIn(BaseModel):
@@ -46,6 +47,7 @@ class Turn(BaseModel):
     text: str
     ts: datetime
     media_ids: list[str] = Field(default_factory=list)
+    speaker: str | None = None
 
 
 class MemoryUnit(BaseModel):

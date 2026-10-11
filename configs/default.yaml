@@ -9,6 +9,8 @@ paths:
   embed_cache: data/cache/embed.sqlite
   ledger: data/ledger.sqlite
   traces: runs/traces
+  datasets: data/datasets
+  eval_runs: runs/eval
 
 # 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
 llm_cache_mode: read_write

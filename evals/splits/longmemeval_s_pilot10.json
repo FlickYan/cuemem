@@ -1,0 +1,20 @@
+{
+  "dataset": "longmemeval_s",
+  "name": "pilot10",
+  "seed": 0,
+  "size": 10,
+  "created": "2026-10-12",
+  "note": "从 dev100 分层抽样",
+  "ids": [
+    "0a34ad58",
+    "184da446",
+    "1f2b8d4f",
+    "41275add",
+    "58ef2f1c",
+    "bc149d6b",
+    "c4ea545c",
+    "f0853d11",
+    "gpt4_2f56ae70",
+    "gpt4_b5700ca0"
+  ]
+}

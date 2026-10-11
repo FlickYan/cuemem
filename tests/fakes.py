@@ -58,6 +58,7 @@ class FakeAPI:
         self.chat_requests: list[dict[str, Any]] = []
         self.embed_requests: list[dict[str, Any]] = []
         self.embed_status: list[int] = []  # 预设的状态码序列，用于模拟限流和错误
+        self.embed_retry_after: str | None = None  # 出错响应附带的 Retry-After 头
         self.cached_tokens = 0
         self.embed_dim = 8
 
@@ -82,7 +83,12 @@ class FakeAPI:
             if self.embed_status:
                 status = self.embed_status.pop(0)
                 if status != 200:
-                    return httpx2.Response(status, json={"code": "Error", "message": "simulated"})
+                    headers = (
+                        {"Retry-After": self.embed_retry_after} if self.embed_retry_after else {}
+                    )
+                    return httpx2.Response(
+                        status, json={"code": "Error", "message": "simulated"}, headers=headers
+                    )
             texts = body["input"]["texts"]
             embeddings = [
                 {

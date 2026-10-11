@@ -36,13 +36,17 @@ def build_turns(space_id: str, session: SessionIn) -> list[Turn]:
             role=turn.role,
             text=turn.text,
             ts=turn.ts or session.started_at,
+            speaker=turn.speaker,
         )
         for idx, turn in enumerate(session.turns)
     ]
 
 
 def build_rounds(turns: Sequence[Turn]) -> list[MemoryUnit]:
-    """一问一答为一"轮"：每次用户发言开启新的一轮，其后的助手回复并入该轮。"""
+    """一问一答为一"轮"：每次用户发言开启新的一轮，其后的助手回复并入该轮。
+
+    多人对话里每个人都是 user 角色，因此每条发言各成一轮；文本前缀用说话人名字。
+    """
     groups: list[list[Turn]] = []
     for turn in turns:
         if turn.role == "user" or not groups:
@@ -52,7 +56,7 @@ def build_rounds(turns: Sequence[Turn]) -> list[MemoryUnit]:
     units = []
     for group in groups:
         first = group[0]
-        text = "\n".join(f"{'User' if t.role == 'user' else 'Assistant'}: {t.text}" for t in group)
+        text = "\n".join(f"{_label(t)}: {t.text}" for t in group)
         units.append(
             MemoryUnit(
                 id=stable_id(first.space_id, "round", first.session_id, first.idx),
@@ -62,9 +66,16 @@ def build_rounds(turns: Sequence[Turn]) -> list[MemoryUnit]:
                 text=text,
                 ts=first.ts,
                 source_turn_ids=[t.id for t in group],
+                meta={"turn_indices": [t.idx for t in group]},  # 评测时据此判断是否命中证据
             )
         )
     return units
+
+
+def _label(turn: Turn) -> str:
+    if turn.speaker:
+        return turn.speaker
+    return "User" if turn.role == "user" else "Assistant"
 
 
 class OnlineWriter:

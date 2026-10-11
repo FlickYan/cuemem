@@ -81,11 +81,17 @@ class CachedEmbedder:
     """包装任意 TextEmbedder：先查缓存，只把未命中的文本交给内部模型。"""
 
     def __init__(
-        self, inner: TextEmbedder, cache: EmbeddingCache, *, instruct: str | None = None
+        self,
+        inner: TextEmbedder,
+        cache: EmbeddingCache,
+        *,
+        instruct: str | None = None,
+        chunk_size: int = 50,
     ) -> None:
         self.inner = inner
         self.cache = cache
         self.instruct = instruct
+        self.chunk_size = chunk_size
 
     @property
     def name(self) -> str:
@@ -107,15 +113,18 @@ class CachedEmbedder:
             if key not in found:
                 missing.setdefault(key, text)
         tokens = 0
-        if missing:
-            batch = self.inner.embed(list(missing.values()), kind)
+        pending = list(missing.items())
+        # 分块向量化，每块完成就写入缓存：中途失败时，已经付费的结果不会丢
+        for start in range(0, len(pending), self.chunk_size):
+            chunk = pending[start : start + self.chunk_size]
+            batch = self.inner.embed([text for _, text in chunk], kind)
             new_items: list[tuple[str, FloatArray, SparseVector | None]] = []
-            for row, key in enumerate(missing):
+            for row, (key, _) in enumerate(chunk):
                 sparse = batch.sparse[row] if batch.sparse is not None else None
                 found[key] = (batch.dense[row], sparse)
                 new_items.append((key, batch.dense[row], sparse))
             self.cache.put_many(new_items)
-            tokens = batch.tokens
+            tokens += batch.tokens
         if not keys:
             return EmbeddingBatch(dense=np.zeros((0, self.dim), dtype=np.float32), tokens=0)
         dense = np.vstack([found[key][0] for key in keys]).astype(np.float32)

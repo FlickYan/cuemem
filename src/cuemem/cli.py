@@ -6,6 +6,9 @@ cuemem ingest FILE [--space S]        导入对话
 cuemem ask "问题" --space S [--at T]  检索记忆并回答
 cuemem spaces                         列出记忆空间
 cuemem usage [--today] [--run ID]     汇总调用量与成本
+cuemem data download [NAME...]       下载评测数据集
+cuemem eval split / run / report     评测：划分开发集、运行、生成报告
+cuemem eval audit RUN [--score]      判分抽检：导出待核对条目 / 统计一致率
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from cuemem.config import Settings, env_file_path, load_settings
@@ -27,6 +31,13 @@ from cuemem.core.models import Answer, Conversation
 from cuemem.embed import build_embedder
 from cuemem.envfile import mask, read_env, update_env
 from cuemem.errors import CueMemError
+from cuemem.evals.audit import export_audit, score_audit
+from cuemem.evals.datasets import DATASETS, EvalSet, dataset_path
+from cuemem.evals.datasets import download as download_dataset
+from cuemem.evals.datasets import load as load_dataset
+from cuemem.evals.report import build_report, load_rows, method_stats
+from cuemem.evals.runner import EvalRunner, RunConfig
+from cuemem.evals.splits import load_split, save_split, stratified_ids
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.memory import MemorySystem
@@ -195,6 +206,203 @@ def usage(
         console.print("没有调用记录。")
         return
     _print_usage_rows(rows, detailed=True)
+
+
+# ---------- 评测 ----------
+
+data_app = typer.Typer(help="评测数据集", no_args_is_help=True)
+eval_app = typer.Typer(help="评测：划分、运行、报告", no_args_is_help=True)
+app.add_typer(data_app, name="data")
+app.add_typer(eval_app, name="eval")
+
+
+@data_app.command("download")
+def data_download(
+    names: Annotated[list[str] | None, typer.Argument(help="数据集名，默认全部")] = None,
+) -> None:
+    """下载评测数据集到 data/datasets（已存在则跳过）。"""
+    settings = load_settings()
+    for name in names or list(DATASETS):
+        if name not in DATASETS:
+            console.print(f"[red]未知数据集 {name}[/red]，可选：{', '.join(DATASETS)}")
+            raise typer.Exit(1)
+        console.print(f"{name}：{DATASETS[name].description}")
+        path = download_dataset(name, settings.paths.datasets)
+        console.print(f"  → {path}（{path.stat().st_size / 1e6:.1f} MB）")
+
+
+@eval_app.command("split")
+def eval_split(
+    dataset: Annotated[str, typer.Option(help="数据集")] = "longmemeval_s",
+    name: Annotated[str, typer.Option(help="划分名")] = "dev100",
+    size: Annotated[int, typer.Option(help="抽取的题数")] = 100,
+    seed: Annotated[int, typer.Option(help="随机种子")] = 0,
+    parent: Annotated[
+        str | None, typer.Option(help="从已有划分中再抽（如从 dev100 抽 pilot10）")
+    ] = None,
+    rest: Annotated[
+        str | None, typer.Option(help="把剩余的题另存为这个划分名（如 test400）")
+    ] = None,
+) -> None:
+    """按（题型，是否拒答）分层抽样，生成划分文件（提交进仓库，保证可复现）。"""
+    settings = load_settings()
+    evalset = _load_evalset(settings, dataset, parent)
+    chosen = stratified_ids(evalset.samples, size, seed=seed)
+    note = f"从 {parent} 分层抽样" if parent else "按（题型，是否拒答）分层抽样"
+    path = save_split(dataset, name, chosen, seed=seed, note=note)
+    console.print(f"已保存 {path}（{len(chosen)} 题）")
+    if rest:
+        remaining = sorted({s.sample_id for s in evalset.samples} - set(chosen))
+        rest_path = save_split(dataset, rest, remaining, seed=seed, note=f"{name} 之外的其余题目")
+        console.print(f"已保存 {rest_path}（{len(remaining)} 题）")
+    picked = set(chosen)
+    counts: dict[str, list[int]] = {}
+    for s in evalset.samples:
+        total, selected = counts.setdefault(s.question_type, [0, 0])
+        counts[s.question_type] = [total + 1, selected + (s.sample_id in picked)]
+    table = Table(title="各题型题数（全部 / 抽中）")
+    for column in ("题型", "全部", "抽中"):
+        table.add_column(column)
+    for qtype, (total, selected) in sorted(counts.items()):
+        table.add_row(qtype, str(total), str(selected))
+    console.print(table)
+
+
+@eval_app.command("run")
+def eval_run(
+    dataset: Annotated[str, typer.Option(help="数据集")] = "longmemeval_s",
+    split: Annotated[str, typer.Option(help="划分名；all 表示全部题目")] = "dev100",
+    methods: Annotated[str, typer.Option(help="逗号分隔：B0,B1,B2,ORACLE")] = "B0,B1,B2,ORACLE",
+    k: Annotated[int, typer.Option(help="B2 的检索条数")] = 10,
+    workers: Annotated[int, typer.Option(help="并发线程数")] = 4,
+    max_cost: Annotated[
+        float, typer.Option(help="实际花费上限（美元），超过后不再开始新题")
+    ] = 10.0,
+    limit: Annotated[int | None, typer.Option(help="只跑前 N 题（调试用）")] = None,
+    types: Annotated[
+        str | None, typer.Option(help="只跑这些题型（逗号分隔）；LoCoMo 默认排除对抗题")
+    ] = None,
+    name: Annotated[str | None, typer.Option(help="运行名；同名运行会断点续跑")] = None,
+) -> None:
+    """运行评测：写入 → 回答 → 判分；结果写入 runs/eval/<运行名>/，最后生成报告。"""
+    settings = load_settings()
+    split_name = None if split == "all" else split
+    evalset = _load_evalset(settings, dataset, split_name)
+    if types:
+        wanted = {t.strip() for t in types.split(",")}
+        evalset.samples = [s for s in evalset.samples if s.question_type in wanted]
+    elif dataset == "locomo":  # 与文献一致：默认不评对抗题
+        evalset.samples = [s for s in evalset.samples if s.question_type != "adversarial"]
+    run_name = name or f"{dataset}-{split}-{datetime.now():%Y%m%d-%H%M}"
+    config = RunConfig(
+        name=run_name,
+        dataset=dataset,
+        split=split_name,
+        methods=[m.strip() for m in methods.split(",") if m.strip()],
+        k=k,
+        workers=workers,
+        max_cost=max_cost,
+        limit=limit,
+    )
+    count = min(limit, len(evalset.samples)) if limit else len(evalset.samples)
+    console.print(f"运行 [bold]{run_name}[/bold]：{count} 题 × {config.methods}")
+    with Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("评测", total=None)
+        runner = EvalRunner(
+            settings,
+            config,
+            on_start=lambda total: progress.update(task, total=total),
+            on_advance=lambda: progress.advance(task),
+        )
+        summary = runner.run(evalset)
+    report_path = build_report(summary.run_dir)
+    note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
+    console.print(
+        f"完成 {summary.completed} / {summary.planned} 个组合，出错 {summary.errors} 个{note}；"
+        f"耗时 {summary.elapsed_s:.0f} 秒；本次实际花费 ${summary.spent:.4f}"
+        f"（名义成本 ${summary.nominal_cost:.4f}）"
+    )
+    _print_method_stats(summary.run_dir)
+    console.print(f"报告：{report_path}")
+
+
+@eval_app.command("report")
+def eval_report(
+    run: Annotated[str, typer.Argument(help="运行名或运行目录")],
+) -> None:
+    """重新生成某次运行的报告。"""
+    settings = load_settings()
+    run_dir = Path(run) if Path(run).exists() else settings.paths.eval_runs / run
+    if not (run_dir / "run.json").exists():
+        console.print(f"[red]找不到运行目录 {run_dir}[/red]")
+        raise typer.Exit(1)
+    path = build_report(run_dir)
+    _print_method_stats(run_dir)
+    console.print(f"报告：{path}")
+
+
+@eval_app.command("audit")
+def eval_audit(
+    run: Annotated[str, typer.Argument(help="运行名或运行目录")],
+    n: Annotated[int, typer.Option(help="抽检条数（判对、判错各一半）")] = 50,
+    seed: Annotated[int, typer.Option(help="随机种子")] = 0,
+    score: Annotated[bool, typer.Option("--score", help="统计已勾选的抽检结果")] = False,
+) -> None:
+    """判分抽检：导出待核对的 Markdown，或统计人工核对后的一致率。"""
+    settings = load_settings()
+    run_dir = Path(run) if Path(run).exists() else settings.paths.eval_runs / run
+    path = run_dir / "judge-audit.md"
+    if score:
+        if not path.exists():
+            console.print(f"[red]找不到 {path}[/red]，请先不带 --score 运行一次导出")
+            raise typer.Exit(1)
+        agree, disagree, pending = score_audit(path)
+        checked = agree + disagree
+        rate = f"{agree / checked:.0%}" if checked else "—"
+        console.print(f"同意 {agree}，不同意 {disagree}，未勾选 {pending}；一致率 {rate}")
+        return
+    if path.exists():
+        console.print(f"[yellow]{path} 已存在[/yellow]，为避免覆盖你的勾选，请先改名或删除")
+        raise typer.Exit(1)
+    count = export_audit(load_rows(run_dir, "results.jsonl"), path, n=n, seed=seed)
+    console.print(f"已导出 {count} 条到 {path}")
+
+
+def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSet:
+    if dataset not in DATASETS:
+        console.print(f"[red]未知数据集 {dataset}[/red]，可选：{', '.join(DATASETS)}")
+        raise typer.Exit(1)
+    path = dataset_path(settings.paths.datasets, dataset)
+    if not path.exists():
+        console.print(
+            f"[red]缺少数据文件 {path}[/red]，请先运行：uv run cuemem data download {dataset}"
+        )
+        raise typer.Exit(1)
+    ids = load_split(dataset, split) if split else None
+    return load_dataset(dataset, path, ids=ids)
+
+
+def _print_method_stats(run_dir: Path) -> None:
+    stats = method_stats(load_rows(run_dir, "results.jsonl"))
+    table = Table(title="总体结果")
+    for column in ("方法", "题数", "准确率", "95% 置信区间", "平均输入 tokens", "名义成本 / 题"):
+        table.add_column(column)
+    for s in stats:
+        table.add_row(
+            s.method,
+            str(s.n),
+            f"{s.accuracy:.1%}",
+            f"{s.ci[0]:.1%} – {s.ci[1]:.1%}",
+            f"{s.input_tokens:,.0f}",
+            f"${s.cost:.5f}",
+        )
+    console.print(table)
 
 
 # ---------- 交互辅助 ----------

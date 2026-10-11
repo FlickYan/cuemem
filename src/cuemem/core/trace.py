@@ -89,6 +89,13 @@ _current: ContextVar[Trace | None] = ContextVar("cuemem_trace", default=None)
 
 @contextmanager
 def start_trace(name: str, sink: TraceSink | None = None, **attrs: Any) -> Iterator[Trace]:
+    """开始一个 trace；如果已经在某个 trace 里（例如评测 runner 调用 MemorySystem.ask），
+    就记为父 trace 的一个阶段，事件也都记到父 trace 上，便于外层统一统计用量。"""
+    parent = _current.get()
+    if parent is not None:
+        with parent.span(name, **attrs):
+            yield parent
+        return
     trace = Trace(name, **attrs)
     token = _current.set(trace)
     try:

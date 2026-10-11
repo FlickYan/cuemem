@@ -36,6 +36,7 @@ class MemorySystem:
         llm: LLMClient,
         ledger: Ledger,
         tracer: TraceSink | None = None,
+        owns_ledger: bool = True,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -44,6 +45,7 @@ class MemorySystem:
         self.llm = llm
         self.ledger = ledger
         self.tracer = tracer
+        self._owns_ledger = owns_ledger  # 评测时账本由多个线程共享，不能由单个系统关闭
         self.writer = OnlineWriter(db, vectors, embedder)
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.reader = Reader(llm)
@@ -75,6 +77,21 @@ class MemorySystem:
             tracer=TraceSink(paths.traces),
         )
 
+    @classmethod
+    def ephemeral(
+        cls, settings: Settings, *, embedder: TextEmbedder, llm: LLMClient, ledger: Ledger
+    ) -> MemorySystem:
+        """评测用：数据库与向量库都放在内存里，用完即弃；向量缓存与 LLM 缓存由传入的组件共享。"""
+        return cls(
+            settings,
+            db=MemoryDB(None),
+            vectors=VectorStore(None, dim=embedder.dim),
+            embedder=embedder,
+            llm=llm,
+            ledger=ledger,
+            owns_ledger=False,
+        )
+
     def ingest(self, conversation: Conversation) -> IngestReport:
         with start_trace("ingest", self.tracer, space=conversation.space_id) as trace:
             report = self.writer.ingest(conversation)
@@ -102,7 +119,8 @@ class MemorySystem:
     def close(self) -> None:
         self.vectors.close()
         self.db.close()
-        self.ledger.close()
+        if self._owns_ledger:
+            self.ledger.close()
 
     def __enter__(self) -> MemorySystem:
         return self

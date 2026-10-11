@@ -3,7 +3,7 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-> 进行中：N1 工程骨架已完成并通过联网验证，下一步是 N2 评测框架。进度见下方表格与 [路线图](docs/roadmap.md)。
+> 进行中：N2 评测框架与三条基线已完成，下一步是 N3 写入路径。进度见下方表格与 [路线图](docs/roadmap.md)。
 
 ## 它要解决什么
 
@@ -59,6 +59,8 @@ uv run cuemem doctor --live              # 检查配置与各模型的连通性
 uv run cuemem ingest examples/toy_conversation.json
 uv run cuemem ask "我现在在哪里工作？" --space demo --at 2025-10-10 --show-context
 uv run cuemem usage --today              # 调用量与成本（名义成本 / 估算花费）
+uv run cuemem data download              # 下载评测数据集（LongMemEval_S、LoCoMo）
+uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4）；dev100 为正式开发集
 ```
 
 没有 Key 时也可以离线体验写入与检索，向量改用哈希近似：在命令前加 `CUEMEM_EMBEDDING__BACKEND=hash`，回答仍然需要 LLM。
@@ -86,8 +88,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 |---|---|---|
 | N0 | 项目定位与总体设计 | 已完成 |
 | N1 | 工程骨架与基础设施 | 已完成 |
-| N2 | 评测框架与基线 | 下一步 |
-| N3 | 写入路径：结构化、带有效期的记忆 | 未开始 |
+| N2 | 评测框架与基线 | 已完成 |
+| N3 | 写入路径：结构化、带有效期的记忆 | 下一步 |
 | N4 | L1 快速召回 | 未开始 |
 | N5 | L2 深度检索 | 未开始 |
 | N6 | 多模态记忆 | 未开始 |
@@ -98,6 +100,28 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 
 ## 结果
 
-> N2 之后逐步填写。主线是统一评测框架下的**准确率–成本帕累托曲线**（LongMemEval、LoCoMo、MemLens）。
+主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
 
-N1 冒烟测试（示例对话、朴素 dense 检索即 B2 基线）：5 题答对 4 题，单次问答约 0.7–1.0 秒，名义成本约 $0.0002。失败的一题是"第一次提到旅行"：问题里的问法词稀释了关键词，相关记忆只排第 7。这正是查询规划（N5）、稀疏检索（N4）与检索控制器（N7）要解决的问题。
+### N2 基线：LongMemEval_S 开发集（100 题）
+
+| 方法 | 准确率（95% 置信区间） | 平均输入 tokens | 每题名义成本 |
+|---|---|---|---|
+| B0 无记忆 | 6%（2–11） | 458 | $0.0002 |
+| B1 全上下文 | 72%（63–80） | 105,262 | $0.0317 |
+| B2 朴素检索（dense top-10） | 65%（56–74） | 4,830 | $0.0016 |
+| ORACLE 只给证据会话（上限参照） | 83%（76–90） | 6,645 | $0.0021 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/n2-dev100-baselines/pareto-dark.png">
+  <img alt="各方法的准确率与每题名义成本（对数坐标）" src="docs/results/n2-dev100-baselines/pareto-light.png" width="720">
+</picture>
+
+三点观察：
+
+1. **长上下文不等于记忆**：B1 能看到全部信息，却比只看证据的 ORACLE 低 11 个百分点（置信区间部分重叠）：关键信息被淹没在约 10 万 tokens 里。
+2. **检索很划算，但还不够好**：朴素检索只用 B1 约 1/20 的成本，准确率 65% 对 72%（置信区间重叠）。
+3. **错误主要出在检索**：B2 答错的 35 道题里，12 道检索没命中证据，14 道命中了但证据不全或干扰多（ORACLE 能答对），只有 9 道是连 ORACLE 也答错的阅读推理问题。这正是 N3–N5 的改进空间。
+
+完整报告见 [docs/results/n2-dev100-baselines/report.md](docs/results/n2-dev100-baselines/report.md)。复现：`uv run cuemem eval run --split dev100 --name dev100-baselines`，约 15 分钟、约 $4（缓存命中后重跑几乎免费）。
+
+N1 冒烟测试的失败案例："第一次提到旅行"因问法词稀释关键词而检索失败。

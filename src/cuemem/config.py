@@ -84,6 +84,8 @@ class EmbeddingConfig(BaseModel):
     price_per_m: float = 0.07
     currency: Currency = "USD"
     timeout_s: float = 60.0
+    max_concurrency: int = 2  # 同时在途的向量请求数；QwenCloud 按分钟限额，并发过高会被 429 限流
+    max_attempts: int = 6  # 429 / 5xx / 网络错误的最大尝试次数（指数退避，单次最多等 30 秒）
 
 
 class PathsConfig(BaseModel):
@@ -93,6 +95,8 @@ class PathsConfig(BaseModel):
     embed_cache: Path = Path("data/cache/embed.sqlite")
     ledger: Path = Path("data/ledger.sqlite")
     traces: Path = Path("runs/traces")
+    datasets: Path = Path("data/datasets")  # 下载的评测数据集
+    eval_runs: Path = Path("runs/eval")  # 每次评测运行一个子目录
 
     def resolve_against(self, root: Path) -> PathsConfig:
         """把相对路径解析为以 root 为基准的绝对路径。"""

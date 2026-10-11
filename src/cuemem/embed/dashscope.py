@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import random
+import threading
 import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -31,7 +33,6 @@ class DashScopeTextEmbedder:
         *,
         http_client: httpx2.Client | None = None,
         ledger: Ledger | None = None,
-        max_attempts: int = 3,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.cfg = cfg
@@ -41,8 +42,10 @@ class DashScopeTextEmbedder:
         self._api_key = api_key
         self._http = http_client or httpx2.Client(timeout=cfg.timeout_s)
         self._ledger = ledger
-        self._max_attempts = max_attempts
+        self._max_attempts = max(1, cfg.max_attempts)
         self._sleep = sleep  # 测试时替换为空函数，避免真的等待
+        # 评测时多个线程共用同一个向量器：限制在途请求数，避免触发按分钟计的配额限流
+        self._slots = threading.BoundedSemaphore(max(1, cfg.max_concurrency))
 
     def embed(self, texts: Sequence[str], kind: EmbedKind) -> EmbeddingBatch:
         dense_parts: list[FloatArray] = []
@@ -83,22 +86,32 @@ class DashScopeTextEmbedder:
         for attempt in range(1, self._max_attempts + 1):
             started = time.perf_counter()
             try:
-                response = self._http.post(self.cfg.native_url, json=body, headers=headers)
+                with self._slots:
+                    response = self._http.post(self.cfg.native_url, json=body, headers=headers)
             except httpx2.TransportError as exc:
                 if attempt == self._max_attempts:
                     raise EmbeddingAPIError(f"向量接口网络错误：{exc}") from exc
-                self._sleep(_backoff(attempt))
+                self._wait(attempt, status=None, retry_after=None)
                 continue
             latency_ms = (time.perf_counter() - started) * 1000
             if response.status_code == 200:
                 return response.json(), latency_ms
             if response.status_code in _RETRYABLE_STATUS and attempt < self._max_attempts:
-                self._sleep(_backoff(attempt))
+                self._wait(attempt, response.status_code, response.headers.get("retry-after"))
                 continue
             raise EmbeddingAPIError(
                 f"向量接口返回 HTTP {response.status_code}：{response.text[:300]}"
             )
         raise EmbeddingAPIError("向量接口重试次数用尽")
+
+    def _wait(self, attempt: int, status: int | None, retry_after: str | None) -> None:
+        """退避等待：服务端给了 Retry-After 就照做，否则指数退避（1、2、4……秒，最多 30 秒）。"""
+        seconds = _backoff(attempt)
+        if retry_after is not None:
+            with contextlib.suppress(ValueError):
+                seconds = min(60.0, max(0.0, float(retry_after)))
+        record_event("embedding_retry", status=status, attempt=attempt, wait_s=round(seconds, 2))
+        self._sleep(seconds)
 
     def _account(self, tokens: int, latency_ms: float, n_texts: int) -> None:
         cost = tokens * self.cfg.price_per_m / 1e6
@@ -123,6 +136,7 @@ class DashScopeTextEmbedder:
             model=self.cfg.model,
             texts=n_texts,
             tokens=tokens,
+            cost=round(cost, 8),
             latency_ms=round(latency_ms, 1),
         )
 
@@ -147,4 +161,4 @@ def _parse(data: dict[str, Any], *, expected: int) -> tuple[FloatArray, list[Spa
 
 
 def _backoff(attempt: int) -> float:
-    return float(min(8, 2 ** (attempt - 1))) + random.uniform(0, 0.5)
+    return float(min(30, 2 ** (attempt - 1))) + random.uniform(0, 0.5)

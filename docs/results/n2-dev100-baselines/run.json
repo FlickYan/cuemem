@@ -1,0 +1,75 @@
+{
+  "config": {
+    "name": "dev100-baselines",
+    "dataset": "longmemeval_s",
+    "split": "dev100",
+    "methods": [
+      "B0",
+      "B1",
+      "B2",
+      "ORACLE"
+    ],
+    "k": 10,
+    "workers": 6,
+    "max_cost": 8.0,
+    "limit": null
+  },
+  "samples": 100,
+  "roles": {
+    "extractor": {
+      "model": "qwen3.8-flash",
+      "model_id": "qwen3.8-flash",
+      "price": {
+        "input": 0.15,
+        "output": 0.47,
+        "cached_input": 0.016
+      }
+    },
+    "planner": {
+      "model": "qwen3.8-flash",
+      "model_id": "qwen3.8-flash",
+      "price": {
+        "input": 0.15,
+        "output": 0.47,
+        "cached_input": 0.016
+      }
+    },
+    "reader": {
+      "model": "deepseek-flash",
+      "model_id": "deepseek-flash",
+      "price": {
+        "input": 0.3,
+        "output": 1.2,
+        "cached_input": 0.006
+      }
+    },
+    "vlm": {
+      "model": "deepseek-flash",
+      "model_id": "deepseek-flash",
+      "price": {
+        "input": 0.3,
+        "output": 1.2,
+        "cached_input": 0.006
+      }
+    },
+    "judge": {
+      "model": "qwen3.8-max",
+      "model_id": "qwen3.8-max",
+      "price": {
+        "input": 2.0,
+        "output": 6.0,
+        "cached_input": 0.25
+      }
+    }
+  },
+  "embedding": {
+    "model": "text-embedding-v4",
+    "dim": 1024,
+    "backend": "dashscope"
+  },
+  "git": "5dc775d-dirty",
+  "created": "2026-10-12T04:10:56",
+  "resumed": [
+    "2026-10-12T04:15:50"
+  ]
+}

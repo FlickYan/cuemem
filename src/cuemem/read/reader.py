@@ -7,20 +7,22 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from cuemem.core.models import Answer, Hit
+from cuemem.core.models import Answer, Hit, SessionIn
 from cuemem.core.trace import span
 from cuemem.llm.client import LLMClient
 
 # 评测基准以英文为主，提示词用英文；回答语言跟随问题
 READER_SYSTEM = """You are a personal assistant with long-term memory of past conversations with the user.
-You will receive memories retrieved from earlier conversations. Each memory has an id such as [m1] and the date it happened.
+You will receive either memories retrieved from earlier conversations (each with an id such as [m1] and the date it happened) or the full history of earlier conversations.
 
 Rules:
 1. Base your answer on the memories. If memories conflict, trust the most recent one unless the question asks about the past.
-2. Interpret relative time expressions ("last week", "上个月") relative to the current date given below.
-3. If the memories do not contain the answer, say that you don't know. Never invent details.
-4. Answer in the same language as the question, concisely.
-5. In "citations", list the ids of the memories you actually used."""  # noqa: E501
+2. Interpret relative time expressions (such as "last week" or "two months ago") relative to the current date given below.
+3. When the memories contain the answer, state it directly and concisely; do not hedge.
+4. If the question asks for a specific fact and the memories do not contain it, say that you don't know. Never invent details.
+5. If the question asks for advice or recommendations, give helpful, specific suggestions that make use of what the memories say about the user (their preferences, plans, and the things they own or use).
+6. Answer in the same language as the question.
+7. If the memories have ids, list in "citations" the ids of the memories you actually used."""  # noqa: E501
 
 
 class ReaderOutput(BaseModel):
@@ -53,17 +55,12 @@ class Reader:
 
     def answer(self, question: str, hits: Sequence[Hit], *, question_time: datetime) -> Answer:
         context, refs = format_memories(hits)
-        prompt = (
-            f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
-            f"Retrieved memories:\n{context or '(none)'}\n\n"
-            f"Question: {question}"
+        output = self._read(
+            question,
+            f"Retrieved memories:\n{context or '(none)'}",
+            question_time,
+            memories=len(hits),
         )
-        messages = [
-            {"role": "system", "content": READER_SYSTEM},
-            {"role": "user", "content": prompt},
-        ]
-        with span("read", memories=len(hits)):
-            output = self.llm.structured(self.role, messages, ReaderOutput).value
         # 只保留真实存在的引用编号，防止模型编造
         citations = [c.strip("[] ") for c in output.citations if c.strip("[] ") in refs]
         return Answer(
@@ -75,3 +72,47 @@ class Reader:
             hits=list(hits),
             question_time=question_time,
         )
+
+    def answer_from_history(
+        self, question: str, history: str, *, question_time: datetime
+    ) -> Answer:
+        """不检索，直接读给定的对话历史（全上下文基线与"只给证据会话"的上限参照用）。"""
+        output = self._read(
+            question, f"Conversation history:\n{history or '(none)'}", question_time, memories=0
+        )
+        return Answer(
+            question=question,
+            answer=output.answer,
+            evidence_sufficient=output.evidence_sufficient,
+            citations=[],
+            refs={},
+            hits=[],
+            question_time=question_time,
+        )
+
+    def _read(
+        self, question: str, context_block: str, question_time: datetime, **span_attrs: object
+    ) -> ReaderOutput:
+        prompt = (
+            f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
+            f"{context_block}\n\n"
+            f"Question: {question}"
+        )
+        messages = [
+            {"role": "system", "content": READER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+        with span("read", **span_attrs):
+            return self.llm.structured(self.role, messages, ReaderOutput).value
+
+
+def format_history(sessions: Sequence[SessionIn]) -> str:
+    """把若干会话按时间顺序拼成纯文本历史，每个会话标注日期。"""
+    blocks: list[str] = []
+    for i, session in enumerate(sorted(sessions, key=lambda s: s.started_at), start=1):
+        lines = [f"[Session {i} · {session.started_at:%Y-%m-%d (%a) %H:%M}]"]
+        for turn in session.turns:
+            label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
+            lines.append(f"{label}: {turn.text}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)

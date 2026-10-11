@@ -1,0 +1,81 @@
+[
+ {
+  "sample_id": "conv-test",
+  "conversation": {
+   "speaker_a": "Alice",
+   "speaker_b": "Bob",
+   "session_1_date_time": "1:56 pm on 8 May, 2023",
+   "session_1": [
+    {
+     "speaker": "Alice",
+     "dia_id": "D1:1",
+     "text": "I adopted a puppy named Max."
+    },
+    {
+     "speaker": "Bob",
+     "dia_id": "D1:2",
+     "text": "Cute! What breed?"
+    },
+    {
+     "speaker": "Alice",
+     "dia_id": "D1:3",
+     "text": "A golden retriever.",
+     "img_url": [
+      "http://example.com/max.jpg"
+     ],
+     "blip_caption": "a photo of a golden retriever puppy"
+    }
+   ],
+   "session_2_date_time": "10:00 am on 20 May, 2023",
+   "session_2": [
+    {
+     "speaker": "Bob",
+     "dia_id": "D2:1",
+     "text": "I ran a marathon yesterday."
+    },
+    {
+     "speaker": "Alice",
+     "dia_id": "D2:2",
+     "text": "Wow, congrats!"
+    }
+   ]
+  },
+  "qa": [
+   {
+    "question": "What breed is Alice's puppy?",
+    "answer": "golden retriever",
+    "evidence": [
+     "D1:3"
+    ],
+    "category": 4
+   },
+   {
+    "question": "When did Bob run a marathon?",
+    "answer": "19 May 2023",
+    "evidence": [
+     "D2:1"
+    ],
+    "category": 2
+   },
+   {
+    "question": "What did Alice say about her marathon?",
+    "adversarial_answer": "It was hard",
+    "evidence": [
+     "D2:1"
+    ],
+    "category": 5
+   },
+   {
+    "question": "Which year did Alice adopt Max and Bob run a marathon?",
+    "answer": 2023,
+    "evidence": [
+     "D1:1; D2:1"
+    ],
+    "category": 1
+   }
+  ],
+  "event_summary": {},
+  "observation": {},
+  "session_summary": {}
+ }
+]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -22,12 +22,16 @@ from cuemem.llm import Ledger
 
 
 def make_embedder(
-    settings: Settings, fake_api: FakeAPI, **overrides: object
+    settings: Settings,
+    fake_api: FakeAPI,
+    *,
+    sleep: Callable[[float], None] = lambda _: None,
+    **overrides: object,
 ) -> DashScopeTextEmbedder:
     fake_api.embed_dim = settings.embedding.dim
     cfg = settings.embedding.model_copy(update=overrides)
     return DashScopeTextEmbedder(
-        cfg, "sk-test", http_client=fake_api.client(), ledger=Ledger(None), sleep=lambda _: None
+        cfg, "sk-test", http_client=fake_api.client(), ledger=Ledger(None), sleep=sleep
     )
 
 
@@ -109,3 +113,49 @@ def test_hash_embedder_reflects_lexical_overlap() -> None:
     )
     similarity = batch.dense @ batch.dense.T
     assert similarity[0, 1] > similarity[0, 2]
+
+
+def test_retry_after_header_is_honored(settings: Settings, fake_api: FakeAPI) -> None:
+    waits: list[float] = []
+    fake_api.embed_status = [429, 200]
+    fake_api.embed_retry_after = "3"
+    make_embedder(settings, fake_api, sleep=waits.append).embed(["hello"], "document")
+    assert waits == [3.0]
+
+
+def test_gives_up_after_max_attempts(settings: Settings, fake_api: FakeAPI) -> None:
+    waits: list[float] = []
+    fake_api.embed_status = [503] * 10
+    embedder = make_embedder(settings, fake_api, sleep=waits.append, max_attempts=3)
+    with pytest.raises(EmbeddingAPIError, match="503"):
+        embedder.embed(["hello"], "document")
+    assert len(fake_api.embed_requests) == 3
+    assert len(waits) == 2
+    assert waits[0] < waits[1]  # 指数退避
+
+
+class FlakyEmbedder(HashEmbedder):
+    """第 fail_on 次调用时抛出限流错误，用来检验分块缓存。"""
+
+    def __init__(self, dim: int, fail_on: int) -> None:
+        super().__init__(dim)
+        self.calls = 0
+        self.fail_on = fail_on
+
+    def embed(self, texts: Sequence[str], kind: EmbedKind) -> EmbeddingBatch:
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise EmbeddingAPIError("HTTP 429")
+        return super().embed(texts, kind)
+
+
+def test_cached_embedder_keeps_partial_progress(tmp_path: Path) -> None:
+    cache = EmbeddingCache(tmp_path / "embed.sqlite")
+    flaky = CachedEmbedder(FlakyEmbedder(32, fail_on=2), cache, chunk_size=2)
+    texts = ["一", "二", "三", "四"]
+    with pytest.raises(EmbeddingAPIError):
+        flaky.embed(texts, "document")  # 第一块成功、第二块失败
+    retry_inner = CountingEmbedder(32)
+    batch = CachedEmbedder(retry_inner, cache, chunk_size=2).embed(texts, "document")
+    assert retry_inner.calls == [["三", "四"]]  # 只补算失败的那一块
+    assert batch.dense.shape == (4, 32)
