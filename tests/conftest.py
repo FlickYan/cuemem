@@ -37,7 +37,10 @@ def settings(clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope")
     loaded = load_settings()
-    return loaded.model_copy(update={"paths": PathsConfig().resolve_against(tmp_path)})
+    # 测试不能依赖真实时钟：分时价格的高峰时段里也不暂停（暂停逻辑在 test_peak.py 里用假时钟测）
+    return loaded.model_copy(
+        update={"paths": PathsConfig().resolve_against(tmp_path), "peak_policy": "allow"}
+    )
 
 
 @pytest.fixture

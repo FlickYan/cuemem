@@ -3,6 +3,7 @@
 职责：
 - 按角色选模型（roles → models），拼请求参数，处理供应商差异（例如关闭思考模式）；
 - 按供应商限制并发；
+- 分时价格：高峰时段需要真实调用时，按策略暂停到高峰结束（见 llm/peak.py）；
 - 本地响应缓存：相同请求只调用一次 API，既省钱也让实验可复现；
 - 用量记账与 trace 事件；
 - 结构化输出：JSON 模式 + Schema 提示 + pydantic 校验，不合格时把错误反馈给模型重试。
@@ -14,9 +15,10 @@ import json
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx2
 from openai import BadRequestError, OpenAI
@@ -33,9 +35,11 @@ from cuemem.errors import (
 )
 from cuemem.llm.cache import ResponseCache, request_key
 from cuemem.llm.ledger import Ledger, UsageRecord, chat_cost
+from cuemem.llm.peak import in_peak, peak_end
 from cuemem.llm.types import ChatResult, ToolCall, Usage
 
 Message = dict[str, Any]
+PeakPolicy = Literal["wait", "warn", "allow"]
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
@@ -57,10 +61,18 @@ class LLMClient:
         cache: ResponseCache | None = None,
         ledger: Ledger | None = None,
         http_client: httpx2.Client | None = None,
+        peak_policy: PeakPolicy | None = None,
+        on_peak_wait: Callable[[str, datetime], None] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.settings = settings
         self.cache = cache
         self.ledger = ledger
+        self.peak_policy: PeakPolicy = peak_policy or settings.peak_policy
+        self._on_peak_wait = on_peak_wait  # 开始等待时通知调用方（每段高峰每个供应商一次）
+        self._clock = clock  # 测试时注入假时钟；None 表示真实时间
+        self._sleep = sleep
         self._http_client = http_client  # 测试时注入模拟的传输层
         self._clients: dict[str, OpenAI] = {}
         self._semaphores = {
@@ -68,6 +80,7 @@ class LLMClient:
             for name, p in settings.providers.items()
         }
         self._lock = threading.Lock()
+        self._notified: set[tuple[str, datetime]] = set()
 
     def chat(
         self,
@@ -113,6 +126,7 @@ class LLMClient:
             if self.settings.llm_cache_mode == "read_only":
                 raise CacheMissError(f"read_only 模式下缓存未命中：role={role}, model={alias}")
 
+        self._peak_gate(spec.provider, role)
         create = cast(Any, self._client(spec.provider).chat.completions.create)
         started = time.perf_counter()
         with self._semaphores[spec.provider]:
@@ -284,8 +298,38 @@ class LLMClient:
                 )
             return self._clients[provider]
 
+    def _now(self) -> datetime:
+        return self._clock() if self._clock is not None else datetime.now().astimezone()
+
+    def _peak_gate(self, provider: str, role: str) -> None:
+        """高峰时段的真实调用：wait 策略下暂停到高峰结束；命中缓存的请求不会走到这里。"""
+        cfg = self.settings.providers[provider].peak_hours
+        if cfg is None or self.peak_policy == "allow":
+            return
+        end = peak_end(cfg, self._now())
+        if end is None:
+            return
+        if self.peak_policy == "warn":
+            record_event("peak_call", provider=provider, role=role)
+            return
+        with self._lock:
+            first = (provider, end) not in self._notified
+            self._notified.add((provider, end))
+        if first and self._on_peak_wait is not None:
+            self._on_peak_wait(provider, end)
+        record_event("peak_wait", provider=provider, role=role, until=end.isoformat())
+        while True:  # 分段睡眠：时钟被调整或高峰配置变化时也能正确醒来
+            now = self._now()
+            remaining = (end - now).total_seconds()
+            if remaining <= 0 or not in_peak(cfg, now):
+                return
+            self._sleep(min(remaining, 60.0))
+
     def _account(self, role: str, alias: str, spec: ModelSpec, result: ChatResult) -> None:
         nominal, discounted = chat_cost(spec.price, result.usage)
+        peak = self.settings.providers[spec.provider].peak_hours
+        if peak is not None and not result.from_cache and not in_peak(peak, self._now()):
+            discounted *= peak.off_peak_factor  # 非高峰时段的实际价格（标价按高峰计）
         usage = result.usage
         if self.ledger is not None:
             self.ledger.record(
@@ -315,6 +359,7 @@ class LLMClient:
             output_tokens=usage.output_tokens,
             cached_input_tokens=usage.cached_input_tokens,
             cost=round(nominal, 6),
+            spent=0.0 if result.from_cache else round(discounted, 6),
             latency_ms=round(result.latency_ms, 1),
         )
 

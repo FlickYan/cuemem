@@ -15,11 +15,20 @@ paths:
 # 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
 llm_cache_mode: read_write
 
+# 分时价格的高峰时段遇到需要真实调用的请求时怎么办：wait 暂停到高峰结束（评测等批量任务的默认）；
+# warn 照常调用但提醒；allow 照常调用。交互式提问（cuemem ask）总是 allow。
+peak_policy: wait
+
 providers:
   deepseek:
     base_url: https://api.deepseek.com
     api_key_env: DEEPSEEK_API_KEY
     max_concurrency: 8
+    peak_hours:                 # 工作日 9–12、14–18 点（北京时间）价格是其他时段的两倍
+      timezone: Asia/Shanghai
+      weekdays: [0, 1, 2, 3, 4]
+      windows: ["09:00-12:00", "14:00-18:00"]
+      off_peak_factor: 0.5      # 标价按高峰计；非高峰的实际价格 = 标价 × 0.5
   qwen:
     # QwenCloud：阿里把 DashScope / 百炼 / Model Studio 统一后的国际品牌（中国大陆为千问 AI 平台）
     base_url: https://maas.qwencloudapi.com/compatible-mode/v1

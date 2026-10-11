@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 from fakes import FakeAPI
 from pydantic import BaseModel
@@ -11,12 +14,17 @@ from cuemem.llm import Ledger, LLMClient, ResponseCache, Usage, chat_cost
 HELLO = [{"role": "user", "content": "hi"}]
 
 
+# 固定在 DeepSeek 的高峰时段（周一 10:00，北京时间）：花费按标价计，结果不依赖运行测试的时刻
+PEAK_TIME = datetime(2026, 10, 12, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
 def make_client(settings: Settings, fake_api: FakeAPI, ledger: Ledger | None = None) -> LLMClient:
     return LLMClient(
         settings,
         cache=ResponseCache(None),
         ledger=ledger or Ledger(None),
         http_client=fake_api.client(),
+        clock=lambda: PEAK_TIME,
     )
 
 

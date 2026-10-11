@@ -34,12 +34,25 @@ _config_path: ContextVar[Path] = ContextVar("cuemem_config_path", default=DEFAUL
 Currency = Literal["CNY", "USD"]
 
 
+class PeakHours(BaseModel):
+    """分时价格：这些时段是高峰，价格是其他时段的 1 / off_peak_factor 倍。
+
+    配置里的模型标价按高峰计（D-010）；非高峰时段的实际花费 = 标价 × off_peak_factor。
+    """
+
+    timezone: str = "Asia/Shanghai"
+    weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])  # 周一 = 0
+    windows: list[str] = Field(default_factory=lambda: ["09:00-12:00", "14:00-18:00"])
+    off_peak_factor: float = 0.5
+
+
 class ProviderConfig(BaseModel):
     base_url: str
     api_key_env: str
     max_concurrency: int = 8
     timeout_s: float = 120.0
     max_retries: int = 3
+    peak_hours: PeakHours | None = None  # 没有分时价格的供应商为空
 
     def api_key(self) -> str | None:
         return os.environ.get(self.api_key_env) or None
@@ -137,6 +150,9 @@ class Settings(BaseSettings):
 
     paths: PathsConfig = Field(default_factory=PathsConfig)
     llm_cache_mode: Literal["read_write", "read_only", "off"] = "read_write"
+    # 高峰时段遇到需要真实调用的请求：wait 暂停到高峰结束（批量任务默认）；
+    # warn 照常调用但记录提醒；allow 照常调用
+    peak_policy: Literal["wait", "warn", "allow"] = "wait"
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     models: dict[str, ModelSpec] = Field(default_factory=dict)
     roles: dict[str, RoleConfig] = Field(default_factory=dict)

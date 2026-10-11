@@ -88,7 +88,8 @@ def usage_from_trace(trace: Trace) -> dict[str, Any]:
         "cached_input_tokens": sum(e["cached_input_tokens"] for e in llm),
         "embedding_tokens": sum(e["tokens"] for e in emb),
         "cost": sum(e["cost"] for e in llm) + emb_cost,
-        "spent": sum(e["cost"] for e in llm if not e["from_cache"]) + emb_cost,
+        # 实际花费：扣除供应商缓存折扣与错峰折扣（旧版事件没有 spent 字段时按名义成本计）
+        "spent": sum(e.get("spent", e["cost"]) for e in llm if not e["from_cache"]) + emb_cost,
         "latency_ms": trace.total_ms,
         "spans": spans,
     }
@@ -103,17 +104,20 @@ class EvalRunner:
         http_client: httpx2.Client | None = None,
         on_start: Callable[[int], None] | None = None,
         on_advance: Callable[[], None] | None = None,
+        on_peak_wait: Callable[[str, datetime], None] | None = None,
     ) -> None:
         self.settings = settings
         self.config = config
         self.run_dir = settings.paths.eval_runs / config.name
         self.methods = build_methods(config.methods, k=config.k)
         self.ledger = Ledger(settings.paths.ledger, run_id=f"eval:{config.name}")
+        # 评测是批量任务：分时价格的高峰时段默认暂停（settings.peak_policy），等高峰结束再调用
         self.llm = LLMClient(
             settings,
             cache=ResponseCache(settings.paths.llm_cache),
             ledger=self.ledger,
             http_client=http_client,
+            on_peak_wait=on_peak_wait,
         )
         self.reader = Reader(self.llm)
         self.judge = Judge(self.llm)

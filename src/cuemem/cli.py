@@ -43,6 +43,7 @@ from cuemem.evals.runner import EvalRunner, RunConfig
 from cuemem.evals.splits import load_split, save_split, stratified_ids
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
+from cuemem.llm.peak import describe, next_peak_start, peak_end
 from cuemem.memory import MemorySystem
 from cuemem.store.sqlite import MemoryDB
 from cuemem.write.consolidate import ConsolidationReport
@@ -62,10 +63,15 @@ KEY_HINTS = {"qwen": "以 sk-ws- 开头"}  # 帮助区分同一平台上的其�
 
 @contextmanager
 def _open_system() -> Iterator[MemorySystem]:
-    """组装 MemorySystem；把 CueMem 的已知错误转成友好的提示。"""
+    """组装 MemorySystem；把 CueMem 的已知错误转成友好的提示。
+
+    交互式命令只发少量请求：分时价格的高峰时段照常调用（记录提醒），不像评测那样暂停。
+    """
     system: MemorySystem | None = None
     try:
-        system = MemorySystem.from_settings(load_settings())
+        settings = load_settings(peak_policy="warn")
+        _peak_note(settings)
+        system = MemorySystem.from_settings(settings)
         yield system
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{exc}")
@@ -454,9 +460,20 @@ def eval_run(
         str | None, typer.Option(help="只跑这些题型（逗号分隔）；LoCoMo 默认排除对抗题")
     ] = None,
     name: Annotated[str | None, typer.Option(help="运行名；同名运行会断点续跑")] = None,
+    peak: Annotated[
+        str | None,
+        typer.Option(help="高峰时段策略：wait 暂停到高峰结束（默认）/ warn / allow"),
+    ] = None,
 ) -> None:
     """运行评测：写入 → 回答 → 判分；结果写入 runs/eval/<运行名>/，最后生成报告。"""
+    if peak is not None and peak not in ("wait", "warn", "allow"):
+        console.print("[red]--peak 只能是 wait、warn 或 allow[/red]")
+        raise typer.Exit(1)
     settings = load_settings()
+    if peak is not None:
+        settings = settings.model_copy(update={"peak_policy": peak})
+    for line in _peak_status(settings):
+        console.print(line)
     split_name = None if split == "all" else split
     evalset = _load_evalset(settings, dataset, split_name)
     if types:
@@ -485,11 +502,20 @@ def eval_run(
         console=console,
     ) as progress:
         task = progress.add_task("评测", total=None)
+
+        def on_peak_wait(provider: str, until: datetime) -> None:
+            label = PROVIDER_LABELS.get(provider, provider)
+            progress.console.print(
+                f"[yellow]{label} 进入高峰时段：需要真实调用的请求暂停到 {until:%H:%M}，"
+                "命中缓存的继续执行（--peak allow 可关闭）[/yellow]"
+            )
+
         runner = EvalRunner(
             settings,
             config,
             on_start=lambda total: progress.update(task, total=total),
             on_advance=lambda: progress.advance(task),
+            on_peak_wait=on_peak_wait,
         )
         summary = runner.run(evalset)
     report_path = build_report(summary.run_dir)
@@ -588,6 +614,36 @@ def _prompt_secret(label: str, existing: str | None) -> str | None:
 # ---------- 输出辅助 ----------
 
 
+def _peak_note(settings: Settings) -> None:
+    """当前处于某个供应商的高峰时段时提醒一句（交互式命令照常调用）。"""
+    for name, provider in settings.providers.items():
+        cfg = provider.peak_hours
+        if cfg is not None and (end := peak_end(cfg)) is not None:
+            console.print(
+                f"[dim]提示：现在是 {PROVIDER_LABELS.get(name, name)} 的高峰时段"
+                f"（价格为平时的 {1 / cfg.off_peak_factor:g} 倍，到 {end:%H:%M} 结束）[/dim]"
+            )
+
+
+def _peak_status(settings: Settings) -> list[str]:
+    lines = []
+    for name, provider in settings.providers.items():
+        cfg = provider.peak_hours
+        if cfg is None:
+            continue
+        end = peak_end(cfg)
+        state = (
+            f"[yellow]高峰中，到 {end:%H:%M} 结束[/yellow]"
+            if end
+            else f"[green]非高峰[/green]，下一段高峰 {next_peak_start(cfg):%m-%d %H:%M}"
+        )
+        lines.append(
+            f"{PROVIDER_LABELS.get(name, name)} 高峰时段：{describe(cfg)}，"
+            f"价格为平时的 {1 / cfg.off_peak_factor:g} 倍；当前{state}"
+        )
+    return lines
+
+
 def _print_config(settings: Settings) -> None:
     providers = Table(title="供应商")
     for column in ("名称", "Base URL", "Key 环境变量", "状态"):
@@ -617,6 +673,9 @@ def _print_config(settings: Settings) -> None:
     vector_store = settings.vector_store.url or f"本地模式 {settings.paths.qdrant}"
     console.print(f"数据库：{settings.paths.db}")
     console.print(f"向量库：{vector_store}")
+    for line in _peak_status(settings):
+        console.print(line)
+    console.print(f"批量任务（评测）在高峰时段的策略：{settings.peak_policy}")
 
 
 def _live_check(settings: Settings) -> None:
