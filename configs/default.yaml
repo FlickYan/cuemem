@@ -1,0 +1,107 @@
+# CueMem 默认配置。
+# 任何字段都可以用环境变量覆盖：前缀 CUEMEM_，嵌套用 __，例如 CUEMEM_ROLES__READER__MODEL=qwen3.8-flash。
+# 相对路径以项目根目录为基准。API Key 用 `uv run cuemem configure` 交互式写入 .env，不进仓库。
+
+paths:
+  db: data/cuemem.sqlite
+  qdrant: data/qdrant
+  llm_cache: data/cache/llm.sqlite
+  embed_cache: data/cache/embed.sqlite
+  ledger: data/ledger.sqlite
+  traces: runs/traces
+
+# 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
+llm_cache_mode: read_write
+
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    max_concurrency: 8
+  qwen:
+    # QwenCloud：阿里把 DashScope / 百炼 / Model Studio 统一后的国际品牌（中国大陆为千问 AI 平台）
+    base_url: https://maas.qwencloudapi.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY   # QwenCloud 官方文档沿用的变量名；Key 以 sk-ws- 开头
+    max_concurrency: 8
+
+# 模型目录：别名 → 供应商、模型 ID、能力、名义标价。
+# 价格单位：美元 / 百万 tokens，取"高峰时段、未命中缓存"的标价，保证不同时间跑的实验成本可比（D-010）。
+# 核对日期 2026-10-12：DeepSeek 官网价格页（美元）；QwenCloud 各模型页（美元，取原价，不计限时折扣）。
+# 实际账单会因 DeepSeek 错峰半价、缓存命中、免费额度而更低。
+# 模型 ID 以 `cuemem doctor --live` 的实测结果为准。
+models:
+  deepseek-flash:
+    provider: deepseek
+    model_id: deepseek-flash
+    context_window: 1000000
+    vision: true
+    price: {input: 0.30, cached_input: 0.006, output: 1.20}
+    extra_body: {thinking: {type: disabled}}   # V4 系列默认开启思考模式，这里关闭
+  deepseek-flash-thinking:
+    provider: deepseek
+    model_id: deepseek-flash
+    context_window: 1000000
+    vision: true
+    price: {input: 0.30, cached_input: 0.006, output: 1.20}
+    extra_body: {thinking: {type: enabled}}
+  deepseek-v4-pro:
+    provider: deepseek
+    model_id: deepseek-v4-pro
+    context_window: 1000000
+    price: {input: 1.32, cached_input: 0.044, output: 3.96}
+    extra_body: {thinking: {type: disabled}}
+  qwen3.8-max:
+    provider: qwen
+    model_id: qwen3.8-max
+    context_window: 1000000
+    price: {input: 2.0, cached_input: 0.25, output: 6.0}
+    extra_body: {enable_thinking: false}
+  qwen3.7-plus:
+    provider: qwen
+    model_id: qwen3.7-plus
+    context_window: 1000000
+    vision: true
+    price: {input: 0.4, cached_input: 0.08, output: 1.6}     # 0–256K 输入档
+    extra_body: {enable_thinking: false}
+  qwen3.8-flash:
+    provider: qwen
+    model_id: qwen3.8-flash
+    context_window: 1000000
+    price: {input: 0.15, cached_input: 0.016, output: 0.47}
+    extra_body: {enable_thinking: false}
+  qwen3-vl-plus:
+    provider: qwen
+    model_id: qwen3-vl-plus
+    context_window: 262144
+    vision: true
+    price: {input: 0.2, cached_input: 0.04, output: 1.6}     # 0–32K 输入档
+
+# 角色 → 模型。主 reader 与 judge 来自不同家族，降低"给自己打高分"的偏差（D-008）。
+roles:
+  extractor: {model: qwen3.8-flash}    # 写入时的抽取：调用量大，选最便宜的
+  planner: {model: qwen3.8-flash}      # L2 的查询规划与充分性检查：要快
+  reader: {model: deepseek-flash}      # 主实验的回答模型
+  vlm: {model: deepseek-flash}         # 图片描述与再感知（N6 实测后再定）
+  judge: {model: qwen3.8-max}          # 评测判分
+
+embedding:
+  backend: dashscope                   # dashscope：通义向量 API；hash：离线哈希向量（仅测试与演示）
+  provider: qwen
+  # N1 实测（D-014）：v4 单条查询约 52 ms、10 条一批约 113 ms，稀疏向量是原文词项权重（约 20 项）；
+  # qwen3.7-text-embedding 分别约 164 ms、1481 ms，稀疏向量带语义扩展（约 500 项）。检索质量在 N4 对比。
+  model: text-embedding-v4
+  dim: 1024
+  sparse: true                         # 同时取稀疏向量，供 N4 的混合检索使用
+  batch_size: 10
+  max_chars: 6000
+  native_url: https://maas.qwencloudapi.com/api/v1/services/embeddings/text-embedding/text-embedding
+  price_per_m: 0.07
+  currency: USD
+
+vector_store:
+  # 为空时用 Qdrant 本地模式（数据在 paths.qdrant）。单个记忆空间超过约 2 万条时，
+  # 本地模式的稀疏检索会明显变慢（D-005），可用 Docker 启动服务端后填 http://localhost:6333
+  url: null
+
+retrieval:
+  naive_k: 8

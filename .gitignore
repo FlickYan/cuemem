@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 密钥：所有 .env 变体都忽略，只保留模板
+.env
+.env.*
+!.env.example
+
+# 运行时数据：数据库、向量库、缓存、账本、trace、评测结果
+data/
+runs/
+
+# 系统文件
+.DS_Store

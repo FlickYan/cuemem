@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import pytest
+from fakes import FakeAPI
+from pydantic import BaseModel
+
+from cuemem.config import Settings
+from cuemem.errors import CacheMissError, MissingAPIKeyError, StructuredOutputError
+from cuemem.llm import Ledger, LLMClient, ResponseCache, Usage, chat_cost
+
+HELLO = [{"role": "user", "content": "hi"}]
+
+
+def make_client(settings: Settings, fake_api: FakeAPI, ledger: Ledger | None = None) -> LLMClient:
+    return LLMClient(
+        settings,
+        cache=ResponseCache(None),
+        ledger=ledger or Ledger(None),
+        http_client=fake_api.client(),
+    )
+
+
+def test_deepseek_usage_and_cost(settings: Settings, fake_api: FakeAPI) -> None:
+    fake_api.cached_tokens = 40
+    ledger = Ledger(None)
+    result = make_client(settings, fake_api, ledger).chat("reader", HELLO)
+
+    assert result.content == "OK"
+    assert result.usage == Usage(input_tokens=120, output_tokens=30, cached_input_tokens=40)
+    nominal, discounted = chat_cost(settings.models["deepseek-flash"].price, result.usage)
+    assert nominal == pytest.approx((120 * 0.30 + 30 * 1.20) / 1e6)
+    assert discounted < nominal
+    [row] = ledger.summary()
+    assert (row["model"], row["role"], row["calls"]) == ("deepseek-flash", "reader", 1)
+    assert row["nominal_cost"] == pytest.approx(nominal)
+
+
+def test_provider_specific_request_fields(settings: Settings, fake_api: FakeAPI) -> None:
+    fake_api.cached_tokens = 10
+    client = make_client(settings, fake_api)
+
+    client.chat("reader", HELLO)
+    deepseek_body = fake_api.chat_requests[-1]
+    assert deepseek_body["model"] == "deepseek-flash"
+    assert deepseek_body["thinking"] == {"type": "disabled"}
+    assert deepseek_body["temperature"] == 0.0
+
+    result = client.chat("judge", HELLO)
+    qwen_body = fake_api.chat_requests[-1]
+    assert qwen_body["model"] == "qwen3.8-max"
+    assert qwen_body["enable_thinking"] is False
+    assert result.usage.cached_input_tokens == 10  # 通义的 prompt_tokens_details.cached_tokens
+
+
+def test_response_cache_avoids_repeat_calls(settings: Settings, fake_api: FakeAPI) -> None:
+    ledger = Ledger(None)
+    client = make_client(settings, fake_api, ledger)
+    first = client.chat("reader", HELLO)
+    second = client.chat("reader", HELLO)
+
+    assert len(fake_api.chat_requests) == 1
+    assert not first.from_cache
+    assert second.from_cache
+    assert second.content == first.content
+    [row] = ledger.summary()
+    assert (row["calls"], row["cache_hits"]) == (2, 1)
+    # 只有真实调用计入花费
+    assert row["spent"] == pytest.approx(
+        chat_cost(settings.models["deepseek-flash"].price, first.usage)[1]
+    )
+
+
+def test_read_only_cache_raises_on_miss(settings: Settings, fake_api: FakeAPI) -> None:
+    read_only = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    with pytest.raises(CacheMissError):
+        make_client(read_only, fake_api).chat("reader", HELLO)
+    assert fake_api.chat_requests == []
+
+
+def test_empty_reply_is_not_cached(settings: Settings, fake_api: FakeAPI) -> None:
+    fake_api.chat_replies = ["", "OK"]
+    client = make_client(settings, fake_api)
+    assert client.chat("reader", HELLO).content == ""
+    assert client.chat("reader", HELLO).content == "OK"
+    assert len(fake_api.chat_requests) == 2
+
+
+class Pet(BaseModel):
+    name: str
+    breed: str
+
+
+def test_structured_output_repairs_invalid_json(settings: Settings, fake_api: FakeAPI) -> None:
+    fake_api.chat_replies = [
+        '{"name": "Max"}',  # 缺少 breed 字段
+        '```json\n{"name": "Max", "breed": "golden retriever"}\n```',
+    ]
+    out = make_client(settings, fake_api).structured(
+        "extractor", [{"role": "user", "content": "Max 是金毛"}], Pet
+    )
+
+    assert out.value == Pet(name="Max", breed="golden retriever")
+    assert out.attempts == 2
+    first, second = fake_api.chat_requests
+    assert first["response_format"] == {"type": "json_object"}
+    assert "JSON Schema" in first["messages"][0]["content"]
+    assert "breed" in second["messages"][-1]["content"]  # 第二次请求带上了校验错误
+
+
+def test_structured_output_gives_up(settings: Settings, fake_api: FakeAPI) -> None:
+    fake_api.chat_replies = ["not json"]
+    with pytest.raises(StructuredOutputError):
+        make_client(settings, fake_api).structured("extractor", HELLO, Pet, max_attempts=2)
+    assert len(fake_api.chat_requests) == 2
+
+
+def test_missing_api_key(
+    settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY")
+    with pytest.raises(MissingAPIKeyError, match="DEEPSEEK_API_KEY"):
+        make_client(settings, fake_api).chat("reader", HELLO)
