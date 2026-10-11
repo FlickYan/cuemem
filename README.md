@@ -124,4 +124,4 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 
 完整报告见 [docs/results/n2-dev100-baselines/report.md](docs/results/n2-dev100-baselines/report.md)。复现：`uv run cuemem eval run --split dev100 --name dev100-baselines`，约 15 分钟、约 $4（缓存命中后重跑几乎免费）。
 
-N1 冒烟测试的失败案例："第一次提到旅行"因问法词稀释关键词而检索失败。
+N1 冒烟测试里还有一个典型失败：问"我第一次提到想去旅行是什么时候"，问题中的问法词稀释了关键词"旅行"，相关记忆只排第 7（共 9 条）；单独搜"旅行"时排第 1。查询改写（N5）、关键词检索（N4）与检索控制器（N7）都针对这类问题。
