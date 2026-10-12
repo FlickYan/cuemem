@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -160,6 +161,79 @@ def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedMo
     assert not service.system.db.get_turns("shop", session.session_id)
     assert not any("Ana" in f["statement"] for f in service.facts("shop"))
     assert live.window == []
+
+
+def _birthday_chat(service: ChatService, model: ScriptedModel, replies: list[str]) -> str:
+    """一段已巩固的会话：用户说了 Ana 的生日，助手后来没有引用、顺口转述了一次。
+
+    返回那条事实的 ID。
+    """
+    answers = iter(replies)
+    model.agent = lambda body: next(answers)
+
+    def extraction(prompt: str) -> dict[str, Any]:
+        out = echo_extraction(prompt)  # 用户的每句话记成一条事实
+        said = any("October 3" in f["statement"] for f in out["facts"])
+        for n, text in re.findall(r"\[t(\d+)\] Assistant: (.*)", prompt):
+            # 用户的原话还在时不重复记；原话删掉后，助手的转述成了唯一的出处
+            if "October 3" in text and not said:
+                out["facts"].append(
+                    {**out["facts"][0], "statement": text, "turns": [int(n)], "subject": "Ana",
+                     "predicate": "birthday", "object": "October 3"}
+                )  # fmt: skip
+        return out
+
+    model.extractions = extraction
+    session = service.start("shop", at=DAY)
+    for text in ("My sister Ana turns 30 on October 3.", "I'll get her the poles.", "Ana hikes."):
+        service.chat(session.session_id, text, mode="l0")
+    service.end(session.session_id, wait=True)
+    return next(f["id"] for f in service.facts("shop") if f["statement"].startswith("My sister"))
+
+
+def _flag(prompt: str, header: str) -> dict[str, Any]:
+    """假的复述检查：编号列表里提到 October 3 的都算复述（只回答给定的那一种检查）。"""
+    if header not in prompt:
+        return {"same": []}
+    listing = prompt.split(header)[1]
+    parts = re.split(r"^(?:\[(\d+)\]|(\d+)\.) ", listing, flags=re.M)[1:]
+    items = [
+        (int(a or b), text)
+        for a, b, text in zip(parts[::3], parts[1::3], parts[2::3], strict=False)
+    ]
+    return {"same": [n for n, text in items if "October 3" in text]}
+
+
+def test_forget_removes_uncited_restatements_in_the_log(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """没有引用、追不到的转述（D-051）：已巩固会话里助手顺口说的，进行中的会话里问候时提的，
+    都在原始日志里找出来一起删；只是提到同一个人的保留。"""
+    replies = ["Happy early birthday!", "Great pick. Ana turns 30 on October 3.", "Nice!",
+               "Welcome back! Ana's big day was October 3."]  # fmt: skip
+    fact_id = _birthday_chat(service, model, replies)
+    model.regrown = lambda prompt: _flag(prompt, "Conversation excerpts:")
+    live = service.start("shop", at=datetime(2026, 10, 10))
+    service.chat(live.session_id, "Hi again", mode="l0")  # 问候里提到了生日，没有引用
+    report = service.forget("shop", fact_ids=[fact_id])
+    statements = [f["statement"] for f in service.facts("shop")]
+    assert report.restated == 4 and report.regrown == 0  # 两轮：已巩固的转述与进行中的问候
+    assert report.turns_deleted == 6
+    assert not any("October 3" in s for s in statements)
+    assert "Ana hikes." in statements  # 只是提到同一个人，不算复述
+    assert not any("October 3" in str(m) for m in live.window)
+
+
+def test_forget_catches_facts_that_grow_back(service: ChatService, model: ScriptedModel) -> None:
+    """日志里没找出来的转述，重建之后会重新抽成事实：再删它的出处（兜底）。"""
+    fact_id = _birthday_chat(
+        service, model, ["Happy early birthday!", "Great pick. Ana turns 30 on October 3.", "Nice!"]
+    )
+    model.regrown = lambda prompt: _flag(prompt, "Remaining facts:")
+    report = service.forget("shop", fact_ids=[fact_id])
+    statements = [f["statement"] for f in service.facts("shop")]
+    assert report.restated == 0 and report.regrown == 1 and report.turns_deleted == 4
+    assert not any("October 3" in s for s in statements) and "Ana hikes." in statements
 
 
 # ---------- HTTP 接口 ----------

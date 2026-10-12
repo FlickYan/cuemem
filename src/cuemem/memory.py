@@ -15,6 +15,7 @@ from types import TracebackType
 from typing import Any, Literal
 
 import httpx2
+from pydantic import BaseModel, Field
 
 from cuemem.config import Settings
 from cuemem.core.models import (
@@ -95,6 +96,49 @@ class ForgetReport:
     images_deleted: int = 0  # 删除的原图文件数（同一张图被别的发言引用时保留）
     cascaded: int = 0  # 沿引用扩散多删的发言数（后来的回复引用过被删的记忆）
     traces_removed: int = 0  # 删除的 trace 条数（属性里有被删的原话）
+    restated: int = 0  # 原始日志里复述了被删信息（没有引用、追不到）而一起删的发言数（N10）
+    regrown: int = 0  # 重建后仍在复述被删信息、因而跟着删掉出处的事实数（N10）
+
+    def merged(self, later: ForgetReport) -> ForgetReport:
+        """同一次遗忘的后续几轮并进来：计数相加，删除前后的事实数取首尾。"""
+        return replace(
+            self,
+            turns_deleted=self.turns_deleted + later.turns_deleted,
+            sessions_affected=sorted({*self.sessions_affected, *later.sessions_affected}),
+            facts_after=later.facts_after,
+            embed_cache_purged=self.embed_cache_purged + later.embed_cache_purged,
+            llm_cache_purged=self.llm_cache_purged + later.llm_cache_purged,
+            elapsed_ms=self.elapsed_ms + later.elapsed_ms,
+            images_deleted=self.images_deleted + later.images_deleted,
+            cascaded=self.cascaded + later.cascaded,
+            traces_removed=self.traces_removed + later.traces_removed,
+            restated=self.restated + later.restated,
+            regrown=self.regrown + later.regrown,
+        )
+
+
+REGROWN_SYSTEM = (
+    "You check whether information the user asked to forget is still in their memory. "
+    "You get one deleted fact and a numbered list of facts that remain. List the remaining "
+    "facts that still reveal the deleted information, fully or in part: a restatement, the same "
+    "detail in other words, or a vaguer version that still gives it away. A fact that only "
+    "mentions the same person or topic, or says something different about it, does not count. "
+    'Reply with JSON only: {"same": [numbers]}'
+)
+
+
+RESTATED_SYSTEM = (
+    "You check whether information the user asked to forget is still in their conversation "
+    "history. You get one deleted fact and numbered excerpts of the remaining conversation. "
+    "List the excerpts that still reveal the deleted information, fully or in part: for example "
+    "the assistant restating it in passing, or the same detail in other words. An excerpt that "
+    "only mentions the same person or topic, or says something different about it, does not "
+    'count. Reply with JSON only: {"same": [numbers]}'
+)
+
+
+class RegrownOutput(BaseModel):
+    same: list[int] = Field(default_factory=list)
 
 
 def image_mode(cfg: L1Config) -> ImageMode:
@@ -474,6 +518,93 @@ class MemorySystem:
             frontier = fresh - doomed
             doomed |= frontier
         return doomed
+
+    def restating_turns(
+        self,
+        space_id: str,
+        statements: Sequence[str],
+        *,
+        exclude: Collection[str] = (),
+        limit: int = 8,
+        floor: float = 0.2,
+    ) -> list[str]:
+        """原始日志里还有哪些轮复述了被删的信息（N10，D-051），返回这些轮的发言 ID。
+
+        沿引用扩散只追得到引用过它的回复。助手在当时的对话里顺口转述的（"她 10 月 3 日生日，
+        早点下单"），或者进行中的会话里问候时提了一句的，都没有引用，删了出处照样留在日志里。
+        对每条要删的事实，按向量取最相近的几轮（包括进行中的会话），让便宜的模型确认哪些轮
+        仍在透露它；只是提到同一个人或话题的不算。
+        """
+        wanted = [s for s in dict.fromkeys(statements) if s.strip()]
+        if not wanted:
+            return []
+        skip = set(exclude)
+        found: list[str] = []
+        vectors = self.embedder.embed(wanted, "query").dense
+        for statement, vector in zip(wanted, vectors, strict=True):
+            hits = self.vectors.search_dense(space_id, vector, limit * 2, kinds=["round"])
+            ids = [h.unit_id for h in hits if h.score >= floor]
+            rounds = [
+                u for u in self.db.get_units(space_id, ids) if not skip & set(u.source_turn_ids)
+            ]
+            rounds = rounds[:limit]
+            if not rounds:
+                continue
+            listing = "\n\n".join(f"[{n}] {u.text[:1500]}" for n, u in enumerate(rounds, 1))
+            prompt = f'Deleted fact: "{statement}"\n\nConversation excerpts:\n{listing}'
+            verdict = self.llm.structured(
+                "extractor",
+                [
+                    {"role": "system", "content": RESTATED_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                RegrownOutput,
+                cache_scope=scope(space_id, "consolidate"),
+            ).value
+            for n in verdict.same:
+                if 1 <= n <= len(rounds):
+                    found.extend(rounds[n - 1].source_turn_ids)
+        return list(dict.fromkeys(found))
+
+    def regrown_facts(
+        self, space_id: str, statements: Sequence[str], *, threshold: float = 0.55, limit: int = 8
+    ) -> list[Fact]:
+        """遗忘之后重建出来的事实里，哪些还在说被删的信息（N10）。
+
+        沿引用扩散只追得到引用过它的回复；助手在当时的对话里顺口转述（"她 10 月 3 日生日，
+        早点下单"）而没有引用的，删掉出处、重建之后，同样的信息会从这一轮重新抽出来。
+        先按向量相似度挑候选（同一个人的其他信息也会进来，开发时实测 0.5–0.57，复述 0.6–0.9），
+        再让便宜的模型逐条确认：完整复述、换了说法、只透露一部分都算，只是提到同一个人或话题不算。
+        """
+        facts = self.db.get_facts(space_id)
+        wanted = [s for s in dict.fromkeys(statements) if s.strip()]
+        if not facts or not wanted:
+            return []
+        vectors = self.embedder.embed([*wanted, *(f.statement for f in facts)], "document").dense
+        similarity = vectors[: len(wanted)] @ vectors[len(wanted) :].T
+        found: dict[str, Fact] = {}
+        for row, statement in enumerate(wanted):
+            order = [int(i) for i in similarity[row].argsort()[::-1][:limit]]
+            candidates = [facts[i] for i in order if similarity[row, i] >= threshold]
+            if not candidates:
+                continue
+            listing = "\n".join(f"{n}. {f.statement}" for n, f in enumerate(candidates, 1))
+            verdict = self.llm.structured(
+                "extractor",
+                [
+                    {"role": "system", "content": REGROWN_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": f'Deleted fact: "{statement}"\n\nRemaining facts:\n{listing}',
+                    },
+                ],
+                RegrownOutput,
+                cache_scope=scope(space_id, "consolidate"),
+            ).value
+            for n in verdict.same:
+                if 1 <= n <= len(candidates):
+                    found.setdefault(candidates[n - 1].id, candidates[n - 1])
+        return list(found.values())
 
     def round_turns(self, space_id: str, turn_ids: Sequence[str]) -> list[str]:
         """把发言扩展成所在的整轮（用户的话 + 助手的回复）。遗忘一条事实或一张图时要删整轮：

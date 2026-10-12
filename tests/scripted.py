@@ -221,6 +221,7 @@ class ScriptedModel:
         captioner: Callable[[str], Reply] | None = None,
         router: Callable[[str], Reply] | None = None,
         agent: Callable[[dict[str, Any]], str | Reply] | None = None,
+        regrown: Callable[[str], Reply] | None = None,
     ) -> None:
         self.extractions = extractions if extractions is not None else {}
         # 对话 Agent（N8）：拿到整个请求体（消息与工具），返回文字回答或工具调用
@@ -235,6 +236,8 @@ class ScriptedModel:
             }
         )
         self.reconcile = reconcile or (lambda prompt: {"decisions": []})
+        # 遗忘后的复述检查（N10）：默认没有复述
+        self.regrown = regrown or (lambda prompt: {"same": []})
         self.entity = entity or (lambda prompt: {"matches": []})
         self.reader = reader or (
             lambda prompt: {"answer": "ok", "citations": [], "evidence_sufficient": True}
@@ -286,6 +289,8 @@ class ScriptedModel:
             kind, out = "caption", self.captioner(prompt)
         elif system.startswith("You decide how much memory retrieval"):
             kind, out = "route", self.router(prompt)
+        elif system.startswith("You check whether information the user asked to forget"):
+            kind, out = "regrown", self.regrown(prompt)
         else:
             self.calls["other"] += 1
             return "OK"

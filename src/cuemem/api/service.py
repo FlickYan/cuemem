@@ -10,7 +10,7 @@ import re
 import threading
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -27,6 +27,8 @@ from cuemem.read.controller import Router
 
 Scenario = Literal["shop", "plain"]
 # 控制器给的理由用中文标签（CLI 是中文的）；接口、界面与 MCP 给英文
+REGROW_ROUNDS = 3  # 遗忘后追查复述的轮数上限（每轮要重建一次派生记忆）
+
 REASON_EN = {
     "单点事实": "single fact",
     "多会话 / 多跳": "multi-session",
@@ -377,20 +379,40 @@ class ChatService:
     ) -> ForgetReport:
         """遗忘。原始日志是唯一的事实来源：删一条事实或一张图，删的是它出自的那一轮对话
         （用户的话与助手的回复），然后由剩下的日志重建所有派生记忆（D-021）。
-        进行中的会话同步去掉被删的内容。"""
+        删事实时还要追没有引用、追不到的转述（D-051）：先在原始日志里找复述了它的轮
+        （包括进行中的会话）一起删；重建之后如果同样的信息又从别处长了出来，再删它的出处，
+        最多再追 REGROW_ROUNDS 轮。进行中的会话同步去掉被删的内容。"""
         sources: list[str] = []
+        statements: list[str] = []
         if fact_ids:
             for fact in self.system.db.get_facts(space_id, ids=list(fact_ids)):
                 sources.extend(fact.source_turn_ids)
+                statements.append(fact.statement)
         if media_ids:
             sources.extend(
                 m.source_turn_id for m in self.system.db.get_media(space_id, ids=list(media_ids))
             )
         # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
         turns = [*turn_ids, *self.system.round_turns(space_id, sources)]
-        report = self.system.forget(
-            space_id, session_ids=list(session_ids), turn_ids=list(dict.fromkeys(turns))
+        restated = self.system.round_turns(
+            space_id, self.system.restating_turns(space_id, statements, exclude=turns)
         )
+        report = self.system.forget(
+            space_id,
+            session_ids=list(session_ids),
+            turn_ids=list(dict.fromkeys([*turns, *restated])),
+        )
+        report = replace(report, restated=len(restated))
+        for _ in range(REGROW_ROUNDS if statements else 0):
+            regrown = self.system.regrown_facts(space_id, statements)
+            if not regrown:
+                break
+            more = self.system.round_turns(
+                space_id, [t for f in regrown for t in f.source_turn_ids]
+            )
+            report = report.merged(
+                replace(self.system.forget(space_id, turn_ids=more), regrown=len(regrown))
+            )
         for session in self.open_sessions(space_id):
             self.agent.prune(session)
         return report

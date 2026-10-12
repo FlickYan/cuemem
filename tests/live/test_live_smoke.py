@@ -57,7 +57,9 @@ def test_embedding_dense_and_sparse(live_settings: Settings) -> None:
     )
     batch = embedder.embed(["我领养了一只金毛", "我的狗是金毛犬", "笔记本预算 6000 元"], "document")
     assert batch.dense.shape == (3, live_settings.embedding.dim)
-    assert batch.sparse is not None
-    assert all(len(s) > 0 for s in batch.sparse)
+    if live_settings.embedding.sparse:
+        assert batch.sparse is not None and all(len(s) > 0 for s in batch.sparse)
+    else:  # N4 起默认的向量模型只取 dense（D-014 修订）
+        assert batch.sparse is None
     similarity = batch.dense @ batch.dense.T
     assert similarity[0, 1] > similarity[0, 2]

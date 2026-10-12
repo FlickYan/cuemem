@@ -373,11 +373,13 @@ def build_ui(service: ChatService) -> gr.Blocks:
                 media_ids=[target] if kind == "image" else [],
                 session_ids=[target] if kind == "session" else [],
             )
-            cascade = (
-                f", including {report.cascaded} from later replies that repeated it"
-                if report.cascaded
-                else ""
-            )
+            extra = [
+                f"{report.cascaded} from later replies that cited it" if report.cascaded else "",
+                f"{report.restated} that restated it without citing" if report.restated else "",
+            ]
+            cascade = ", including " + " and ".join(e for e in extra if e) if any(extra) else ""
+            if report.regrown:
+                cascade += f"; {report.regrown} fact(s) grew back after the rebuild and went too"
             return (
                 f"Forgot {report.turns_deleted} conversation turn(s){cascade}; facts "
                 f"{report.facts_before} → {report.facts_after}, rebuilt from the remaining log "

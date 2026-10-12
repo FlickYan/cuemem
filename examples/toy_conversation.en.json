@@ -1,0 +1,53 @@
+{
+  "space_id": "demo-en",
+  "sessions": [
+    {
+      "session_id": "s1",
+      "started_at": "2025-03-01T10:00:00",
+      "turns": [
+        {"role": "user", "text": "Hi! I'm Alex Lin. I'm a product manager at an internet company in Beijing, and work has been pretty hectic lately."},
+        {"role": "assistant", "text": "Nice to meet you, Alex! Product work does move fast. What are you working on these days?"},
+        {"role": "user", "text": "Features for short-video recommendations. Oh, and I adopted a golden retriever last weekend. His name is Max."},
+        {"role": "assistant", "text": "Congratulations! Goldens are gentle dogs, and Max sounds adorable. Want a checklist for new dog owners?"}
+      ]
+    },
+    {
+      "session_id": "s2",
+      "started_at": "2025-04-12T20:30:00",
+      "turns": [
+        {"role": "user", "text": "I want to buy a new laptop, budget around 8,000 RMB. Mostly for writing docs, with some video editing now and then."},
+        {"role": "assistant", "text": "That budget gets you a good thin-and-light or an all-rounder. Do you care more about portability or performance?"},
+        {"role": "user", "text": "I don't like heavy machines. Ideally under 1.5 kg."},
+        {"role": "assistant", "text": "Got it: I'll focus on laptops under 1.5 kg with a strong integrated or entry-level discrete GPU."}
+      ]
+    },
+    {
+      "session_id": "s3",
+      "started_at": "2025-06-20T21:00:00",
+      "turns": [
+        {"role": "user", "text": "Max has become a picky eater. He only eats chicken-flavored dog food."},
+        {"role": "assistant", "text": "Try mixing a new flavor into the chicken food a little at a time, and keep an eye on his energy and weight."},
+        {"role": "user", "text": "Also, I'm thinking about a trip to Bali at the end of the year. I want to check the visa first."},
+        {"role": "assistant", "text": "Many passports can get a visa on arrival in Indonesia. Make sure your passport is valid for at least six more months."}
+      ]
+    },
+    {
+      "session_id": "s4",
+      "started_at": "2025-09-10T19:00:00",
+      "turns": [
+        {"role": "user", "text": "Some news: I changed jobs last month. I'm now an AI product manager at an e-commerce company in Singapore."},
+        {"role": "assistant", "text": "Congratulations! Going from recommendations to AI products is a great move. Settling in to Singapore?"},
+        {"role": "user", "text": "Still settling in. The move was expensive, so I want to lower my laptop budget to 6,000 RMB."},
+        {"role": "assistant", "text": "No problem. There are still plenty of laptops under 1.5 kg at 6,000 RMB."}
+      ]
+    },
+    {
+      "session_id": "s5",
+      "started_at": "2025-09-28T22:00:00",
+      "turns": [
+        {"role": "user", "text": "Max came to Singapore with me too. He loves walking in East Coast Park."},
+        {"role": "assistant", "text": "Wonderful! East Coast Park has a sea breeze and plenty of space for dogs. Just avoid the midday heat."}
+      ]
+    }
+  ]
+}
