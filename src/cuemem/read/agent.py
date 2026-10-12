@@ -26,9 +26,18 @@ from cuemem.core.trace import record_event, span
 from cuemem.llm.client import LLMClient, Message
 from cuemem.read.facts import MemoryView, format_facts
 from cuemem.read.l1 import L1Config, L1Result
-from cuemem.read.reader import READER_SYSTEM, Reader, ReaderOutput, relative_days
+from cuemem.read.reader import (
+    READER_SYSTEM,
+    Reader,
+    ReaderOutput,
+    attached_pictures,
+    memory_blocks,
+    relative_days,
+)
 
 AGENT_RULES = """You can search your memory of earlier conversations with the memory_search tool before answering. Search when the question may depend on what the user told you before; you may search several times with different queries (for example once per item or event the question involves), but one to three searches are usually enough. Use date_diff for date arithmetic. When you are ready, call the answer tool exactly once."""  # noqa: E501
+# 控制器先召回、模型兜底（N8 的 Agent 做法，评测方法 B6a，D-042）：召回的记忆随问题一起给出
+HATCH_RULES = """Memories recalled for this question are given with it. If they are enough, answer right away. If something is missing, search your memory of earlier conversations with the memory_search tool (you may search several times with different queries); new results continue the numbering. Use date_diff for date arithmetic. When you are ready, call the answer tool exactly once."""  # noqa: E501
 
 MEMORY_SEARCH_TOOL: dict[str, Any] = {
     "type": "function",
@@ -149,7 +158,10 @@ class ToolReader:
         core: CoreMemory | None,
         config: L1Config | None = None,
         cache_scope: str | None = None,
+        recalled: MemoryView | None = None,
     ) -> Answer:
+        """recalled：检索控制器已经召回的记忆（B6a）。给了就随问题一起放进去，编号接着往下排；
+        不给时（B3）请求与之前逐字相同。"""
         session = SearchSession(
             question_time=question_time,
             search=search,
@@ -158,9 +170,14 @@ class ToolReader:
         context = f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}"
         if core is not None and core.text:
             context += f"\n\nAbout the user (core memory, current facts):\n{core.text}"
+        rules = AGENT_RULES
+        content: str | list[dict[str, Any]] = f"{context}\n\nQuestion: {question}"
+        if recalled is not None:
+            rules = HATCH_RULES
+            content = _with_recalled(context, question, recalled, question_time, session)
         messages: list[Message] = [
-            {"role": "system", "content": f"{READER_SYSTEM}\n\n{AGENT_RULES}"},
-            {"role": "user", "content": f"{context}\n\nQuestion: {question}"},
+            {"role": "system", "content": f"{READER_SYSTEM}\n\n{rules}"},
+            {"role": "user", "content": content},
         ]
         output: ReaderOutput | None = None
         for step in range(1, self.max_steps + 1):
@@ -242,6 +259,41 @@ class ToolReader:
         if name == "date_diff":
             return date_diff(str(args.get("start", "")), str(args.get("end", "")))
         return f"Unknown tool or missing arguments: {name}"
+
+
+def _with_recalled(
+    context: str,
+    question: str,
+    view: MemoryView,
+    question_time: datetime,
+    session: SearchSession,
+) -> str | list[dict[str, Any]]:
+    """把控制器召回的记忆排进用户消息（与 L1 / L2 的 Reader 同一种排版），并登记到检索记录里，
+    之后 memory_search 的结果编号接着往下排、已经给过的不再重复给。"""
+    if not view.rounds and not view.facts:
+        text = f"{context}\n\nRecalled memories: none.\n\nQuestion: {question}"
+        return text
+    blocks, refs, facts = memory_blocks(view, question_time, profile=False, relative_time=True)
+    session.rounds.extend(view.rounds)
+    session.facts.extend(facts)
+    session.refs.update(refs)
+    recalled = "\n\n".join(blocks)
+    pictures = attached_pictures(view)
+    if not pictures:
+        return f"{context}\n\n{recalled}\n\nQuestion: {question}"
+    parts: list[dict[str, Any]] = [{"type": "text", "text": f"{context}\n\n{recalled}"}]
+    parts.append(
+        {
+            "type": "text",
+            "text": "\n\nAttached pictures: the original images of the memories marked "
+            '"see picture k" above.',
+        }
+    )
+    for label, url in pictures:
+        parts.append({"type": "text", "text": f"\n{label}:"})
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    parts.append({"type": "text", "text": f"\n\nQuestion: {question}"})
+    return parts
 
 
 def _parse_answer(arguments: str) -> ReaderOutput:

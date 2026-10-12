@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any, Literal, cast
 
 import httpx2
-from openai import BadRequestError, OpenAI
+from openai import APITimeoutError, BadRequestError, OpenAI
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ValidationError
 
@@ -222,19 +222,20 @@ class LLMClient:
     ) -> Structured[T]:
         """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。
 
-        fallback_model：内容审核拒绝时改用的模型（通常是另一家供应商的）。
+        fallback_model：内容审核拒绝或请求超时时改用的模型（通常是另一家供应商的）。
+        超时多半不是网络问题：模型在某条输入上生成失控、迟迟不结束，重发同样的请求还会超时。
         """
         try:
             return self._structured(
                 role, messages, schema, model, max_tokens, max_attempts, cache_scope
             )
-        except ContentFilteredError:
+        except (ContentFilteredError, APITimeoutError) as exc:
             primary = model or (
                 self.settings.roles[role].model if role in self.settings.roles else None
             )
             if fallback_model is None or fallback_model == primary:
                 raise
-            record_event("llm_fallback", role=role, model=fallback_model)
+            record_event("llm_fallback", role=role, model=fallback_model, reason=type(exc).__name__)
             return self._structured(
                 role, messages, schema, fallback_model, max_tokens, max_attempts, cache_scope
             )

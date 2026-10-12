@@ -52,7 +52,20 @@ ACTION_METHODS: dict[str, dict[str, str]] = {
 }
 ACTION_METHODS["memlens_128k"] = ACTION_METHODS["memlens_32k"]
 # 作为对照的方法（有就读进来）：模型自主检索、规则控制器、零样本 LLM 路由、学出来的控制器……
-REFERENCE_METHODS = ("B0", "B1", "B3", "B6r", "B6z", "B6", "B4-note", "ORACLE")
+REFERENCE_METHODS = (
+    "B0",
+    "B1",
+    "B2",
+    "B3",
+    "B6r",
+    "B6z",
+    "B6",
+    "B6h",
+    "B6a",
+    "B4-note",
+    "B5-ppr",
+    "ORACLE",
+)
 
 # 各数据集的题型 → 统一的推理类型（拒答题另算）。"none" 是混合流里与记忆无关的查询
 REASONING_TYPES = (

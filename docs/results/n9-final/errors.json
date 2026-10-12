@@ -1,0 +1,147 @@
+{
+ "test400-n9:B6": {
+  "wrong": 38,
+  "auto": {
+   "noisy_or_incomplete": 18,
+   "reading": 6,
+   "routed_l0": 6,
+   "false_refusal": 8
+  },
+  "reviewed": 38,
+  "manual": {
+   "outdated": 2,
+   "routing": 16,
+   "aggregation": 9,
+   "false_refusal": 2,
+   "dataset": 3,
+   "missing": 1,
+   "judge": 2,
+   "temporal": 3
+  },
+  "manual_by_type": {
+   "knowledge-update": {
+    "outdated": 2
+   },
+   "multi-session": {
+    "routing": 5,
+    "aggregation": 7,
+    "false_refusal": 2,
+    "dataset": 2
+   },
+   "single-session-preference": {
+    "missing": 1,
+    "routing": 3,
+    "judge": 1
+   },
+   "single-session-user": {
+    "judge": 1
+   },
+   "temporal-reasoning": {
+    "temporal": 3,
+    "dataset": 1,
+    "aggregation": 2,
+    "routing": 8
+   }
+  }
+ },
+ "locomo-test7-n9:B6": {
+  "wrong": 206,
+  "auto": {
+   "retrieval_miss": 19,
+   "noisy_or_incomplete": 55,
+   "reading": 85,
+   "false_refusal": 45,
+   "routed_l0": 1,
+   "no_retrieval": 1
+  },
+  "reviewed": 40,
+  "manual": {
+   "false_refusal": 2,
+   "aggregation": 10,
+   "dataset": 10,
+   "missing": 5,
+   "judge": 4,
+   "reasoning": 5,
+   "routing": 3,
+   "temporal": 1
+  },
+  "manual_by_type": {
+   "multi-hop": {
+    "false_refusal": 1,
+    "aggregation": 9,
+    "dataset": 2,
+    "missing": 1,
+    "judge": 1
+   },
+   "open-domain": {
+    "missing": 1,
+    "aggregation": 1,
+    "false_refusal": 1,
+    "reasoning": 3,
+    "dataset": 1
+   },
+   "single-hop": {
+    "judge": 3,
+    "missing": 3,
+    "dataset": 2,
+    "reasoning": 2,
+    "routing": 2
+   },
+   "temporal": {
+    "dataset": 5,
+    "routing": 1,
+    "temporal": 1
+   }
+  }
+ },
+ "memlens32-test-n9:B6": {
+  "wrong": 78,
+  "auto": {
+   "false_refusal": 18,
+   "reading": 41,
+   "routed_l0": 9,
+   "noisy_or_incomplete": 10
+  },
+  "photos": {
+   "needle": 64,
+   "none": 10,
+   "other": 4
+  },
+  "reviewed": 40,
+  "manual": {
+   "routing": 9,
+   "perception": 8,
+   "judge": 5,
+   "outdated": 1,
+   "reasoning": 2,
+   "dataset": 2,
+   "aggregation": 6,
+   "false_refusal": 5,
+   "temporal": 2
+  },
+  "manual_by_type": {
+   "information_extraction": {
+    "routing": 8,
+    "perception": 3,
+    "judge": 1
+   },
+   "knowledge_update": {
+    "judge": 4,
+    "outdated": 1,
+    "reasoning": 2,
+    "dataset": 2
+   },
+   "multi_session_reasoning": {
+    "aggregation": 6,
+    "perception": 2,
+    "false_refusal": 1
+   },
+   "temporal_reasoning": {
+    "false_refusal": 4,
+    "temporal": 2,
+    "perception": 3,
+    "routing": 1
+   }
+  }
+ }
+}

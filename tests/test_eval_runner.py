@@ -329,3 +329,24 @@ def test_probe_writes_controller_features(eval_settings: Settings, fake_api: Fak
     assert {r["sample_id"] for r in rows} == {s.sample_id for s in evalset.samples}
     assert all(r["features"]["m_rounds"] > 0 and "q_first_person" in r["features"] for r in rows)
     assert runner.probe(evalset) == (0, 0)  # 已经算过的跳过
+
+
+def test_reproduce_steps_use_known_methods() -> None:
+    """复现脚本里每次评测运行的方法名都能被评测框架识别（拼错要几个小时后才会暴露）。"""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    from cuemem.evals.methods import build_methods
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "reproduce.py"
+    spec = importlib.util.spec_from_file_location("reproduce", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["reproduce"] = module  # dataclass 需要在 sys.modules 里找到所在模块
+    spec.loader.exec_module(module)
+    runs = [s for s in module.STEPS if s.command[3:5] == ["eval", "run"]]
+    assert len(runs) >= 20
+    for step in runs:
+        methods = step.command[step.command.index("--methods") + 1].split(",")
+        assert [m.name for m in build_methods(methods)] == methods

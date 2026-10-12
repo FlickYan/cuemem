@@ -155,6 +155,30 @@ def test_content_filter_falls_back_to_other_provider(settings: Settings, fake_ap
     ]  # 被拒的请求不重试、不缓存
 
 
+def test_timeout_falls_back_to_other_provider(settings: Settings, fake_api: FakeAPI) -> None:
+    from fakes import TIMEOUT
+    from openai import APITimeoutError
+
+    class Out(BaseModel):
+        ok: bool
+
+    # 通义在这条输入上生成失控、一直超时，DeepSeek 正常回答（不让 SDK 再重试，测试才快）
+    providers = {
+        name: p.model_copy(update={"max_retries": 0}) for name, p in settings.providers.items()
+    }
+    fake_api.chat_replies = [
+        lambda body: TIMEOUT if body["model"] == "qwen3.8-flash" else '{"ok": true}'
+    ]
+    client = LLMClient(
+        settings.model_copy(update={"providers": providers}), http_client=fake_api.client()
+    )
+    messages = [{"role": "user", "content": "hello"}]
+    with pytest.raises(APITimeoutError):
+        client.structured("extractor", messages, Out)
+    result = client.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert result.value.ok and result.result.model_alias == "deepseek-flash"
+
+
 def test_identical_concurrent_requests_are_coalesced(settings: Settings, fake_api: FakeAPI) -> None:
     """两个线程同时发出同样的请求：只调用一次 API，另一个等结果（single-flight）。"""
     import threading

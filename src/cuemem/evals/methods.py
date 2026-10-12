@@ -1,6 +1,6 @@
 """评测方法：B0 无记忆、L0 只给核心记忆（N7）、B1 全上下文、B2 朴素检索、
 B2F 朴素检索 + 事实记忆（N3）、B4 L1 快速召回（N4）、B5 L2 深度检索与 B6r 规则版控制器（N5）、
-B3 模型自主检索（N5），以及"只给证据会话"的上限参照。
+B3 模型自主检索（N5）、B6a 控制器先选、模型兜底（N9），以及"只给证据会话"的上限参照。
 
 所有方法共用同一个回答模型和同一套系统提示，区别只在给它看什么、怎么检索。
 """
@@ -257,15 +257,26 @@ class RoutedRAG:
 
 class AgentRAG:
     """B3：模型自主检索（ReAct）——reader 带 memory_search 与 date_diff 工具，自己决定
-    要不要检索、检索什么、检索几次。"让 LLM 自己决定"的代表做法，N7 与控制器对比。"""
+    要不要检索、检索什么、检索几次。"让 LLM 自己决定"的代表做法，N7 与控制器对比。
 
-    name, label = "B3", "模型自主检索（ReAct）"
+    B6a（N9）：控制器先选档召回，召回的记忆随问题给出，模型缺什么再用 memory_search 补查——
+    N8 Agent 的做法（D-042）。"""
+
     needs_index, needs_consolidation = True, True
+
+    def __init__(self, name: str = "B3", *, hatch: bool = False) -> None:
+        self.name = name
+        self.hatch = hatch
+        self.label = "控制器先选、模型兜底" if hatch else "模型自主检索（ReAct）"
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
         assert ctx.system is not None
         a = ctx.system.ask(
-            ctx.space_id, ctx.sample.question, question_time=ctx.sample.question_time, mode="agent"
+            ctx.space_id,
+            ctx.sample.question,
+            question_time=ctx.sample.question_time,
+            mode="hatch" if self.hatch else "agent",
+            router="learned",
         )
         return MethodOutput(
             a.answer, a.evidence_sufficient, hits=a.hits, facts=a.facts, details=a.details
@@ -316,6 +327,7 @@ METHOD_NAMES = (
     "B6h",
     "B6z",
     "B3",
+    "B6a",
     "B4-text",
     "B4-cap",
     "B4-iso",
@@ -384,6 +396,8 @@ def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
         ),
         "B6z": lambda: RoutedRAG("B6z", "零样本 LLM 路由", L1Config(), L2Config(), router="llm"),
         "B3": AgentRAG,
+        # N9：控制器先选档召回、模型可用 memory_search 兜底（N8 的 Agent 做法）
+        "B6a": lambda: AgentRAG("B6a", hatch=True),
         # N6 多模态（MemLens）：从纯文本记忆逐级加上图片描述、事实、再感知
         "B4-text": lambda: L1RAG(
             "B4-text", "纯文本记忆（图片只留占位）", TEXT_ONLY, show_facts=False

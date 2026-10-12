@@ -318,6 +318,56 @@ def test_agent_searches_then_answers(
     assert "鸡肉" in tool_messages[0]["content"] and "112 days" in tool_messages[1]["content"]
 
 
+def test_hatch_gives_recalled_memories_then_lets_the_model_search(
+    toy: tuple[MemorySystem, ScriptedModel], fake_api: FakeAPI
+) -> None:
+    system, _ = toy
+    steps: list[dict[str, Any]] = []
+
+    def agent(body: dict[str, Any]) -> dict[str, Any]:
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": "Max 狗粮"}, ensure_ascii=False)
+            return {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": args}]}
+        answer = {"answer": "鸡肉味", "citations": ["m1", "f1"], "evidence_sufficient": True}
+        return {"tool_calls": [{"id": "c2", "name": "answer", "arguments": json.dumps(answer)}]}
+
+    fake_api.chat_replies = [agent]
+    result = system.ask(
+        "demo", "Max 爱吃什么口味的狗粮？", question_time=ASKED, mode="hatch", router="rule"
+    )
+    first = steps[0]["messages"]
+    assert "Memories recalled for this question are given with it" in first[0]["content"]
+    assert "Retrieved conversation excerpts:" in first[1]["content"]  # 控制器召回的记忆随问题给出
+    assert result.details["route"]["router"] == "rule"
+    assert result.details["searches"] == ["Max 狗粮"]
+    shown = first[1]["content"].count("\n[m")
+    tool = next(m for m in steps[1]["messages"] if m["role"] == "tool")
+    if "[m" in tool["content"]:  # 补查到的新片段编号接着往下排
+        assert f"[m{shown + 1}]" in tool["content"]
+    assert result.answer == "鸡肉味" and set(result.citations) <= {"m1", "f1"}
+
+
+def test_b3_request_is_unchanged_without_recall(
+    toy: tuple[MemorySystem, ScriptedModel], fake_api: FakeAPI
+) -> None:
+    system, _ = toy
+    bodies: list[dict[str, Any]] = []
+
+    def agent(body: dict[str, Any]) -> dict[str, Any]:
+        bodies.append(body)
+        answer = {"answer": "x", "citations": [], "evidence_sufficient": False}
+        return {"tool_calls": [{"id": "c1", "name": "answer", "arguments": json.dumps(answer)}]}
+
+    fake_api.chat_replies = [agent]
+    system.ask("demo", "Max 是什么品种？", question_time=ASKED, mode="agent")
+    messages = bodies[0]["messages"]
+    assert messages[0]["content"].endswith("call the answer tool exactly once.")
+    assert "You can search your memory" in messages[0]["content"]
+    assert messages[1]["content"].endswith("Question: Max 是什么品种？")
+    assert "Retrieved conversation excerpts" not in messages[1]["content"]
+
+
 def test_date_diff() -> None:
     assert date_diff("2023-05-01", "2023-05-30").startswith("29 days")
     assert date_diff("2023-05-30", "2023-05-01").startswith("-29 days")

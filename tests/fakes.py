@@ -17,6 +17,7 @@ TOY_CONVERSATION = PROJECT_ROOT / "examples" / "toy_conversation.json"
 ChatReply = str | Callable[[dict[str, Any]], str | dict[str, Any]]
 REJECT = "__REJECT__"  # 回复函数返回它时，模拟内容审核拒绝（HTTP 400）
 ABORT_JSON = "__ABORT_JSON__"  # 模拟 QwenCloud 在 JSON 模式下中止生成（HTTP 400）
+TIMEOUT = "__TIMEOUT__"  # 模拟请求超时（生成失控、迟迟不结束）
 
 
 def chat_completion_body(
@@ -87,6 +88,8 @@ class FakeAPI:
             self.chat_requests.append(body)
             reply = self.chat_replies.pop(0) if len(self.chat_replies) > 1 else self.chat_replies[0]
             content = reply(body) if callable(reply) else reply
+            if content == TIMEOUT:
+                raise httpx2.ReadTimeout("timed out", request=request)
             deepseek = "deepseek" in request.url.host
             if isinstance(content, dict):  # 工具调用
                 return httpx2.Response(

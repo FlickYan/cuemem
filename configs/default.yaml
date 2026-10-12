@@ -83,6 +83,14 @@ models:
     vision: true                       # 2026-10-12 实测能读图
     price: {input: 0.15, cached_input: 0.016, output: 0.47}
     extra_body: {enable_thinking: false}
+  qwen3.6-35b-a3b:                     # N9 的小模型档（MoE，每次激活约 3B 参数）
+    provider: qwen
+    model_id: qwen3.6-35b-a3b
+    context_window: 262144
+    vision: true
+    # QwenCloud 国际站的标价没有查到，暂按 OpenRouter 的价格记（2026-10 核对）
+    price: {input: 0.14, output: 1.00}
+    extra_body: {enable_thinking: false}
   qwen3-vl-plus:
     provider: qwen
     model_id: qwen3-vl-plus

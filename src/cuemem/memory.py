@@ -65,7 +65,7 @@ from cuemem.write.consolidate import (
 )
 from cuemem.write.online import IngestReport, OnlineWriter
 
-AskMode = Literal["l0", "l1", "l2", "auto", "agent", "facts", "naive"]
+AskMode = Literal["l0", "l1", "l2", "auto", "agent", "hatch", "facts", "naive"]
 RecallMode = Literal["l0", "l1", "l2", "auto"]
 Level = Literal["l0", "l1", "l2"]
 
@@ -542,6 +542,8 @@ class MemorySystem:
           在 L0 / L1 / L2 与"要不要再看原图"之间按 P̂(答对) − λ·成本选，lam 不填用模型里的默认值；
           "hybrid"：门控拿不准时再问 LLM；"llm"：零样本 LLM 路由；"rule"：规则版（B6r，N5）；
         - mode="agent"：模型自主检索（B3）——reader 带 memory_search 工具自己决定检索；
+        - mode="hatch"：控制器先选档召回，再交给带 memory_search 工具的 reader，缺什么自己补查
+          （N8 的 Agent 做法，B6a，D-042）；
         - mode="facts"：B2F，dense 检索 + 事实增强键 + 带有效期的事实 + 核心记忆（N3）；
         - mode="naive"：B2 基线，只在"轮"上做 dense 检索。
         notes：reader 先记笔记再回答（并按检索计划给阅读提示）；默认 L2 开、L1 关。
@@ -606,13 +608,27 @@ class MemorySystem:
                         cache_scope=cache_scope,
                     )
                 answer.details = dict(recall.details)
-            elif mode == "agent":
+            elif mode in ("agent", "hatch"):
+                if mode == "hatch":  # 控制器先选档召回，模型可以再用 memory_search 补查（B6a）
+                    recall = self.retrieve(
+                        space_id,
+                        question,
+                        question_time=when,
+                        mode="auto",
+                        router=router,
+                        lam=lam,
+                        k=k,
+                        l1=l1,
+                        l2=l2,
+                        cache_scope=cache_scope,
+                    )
                 answer = self.agent.answer(
                     question,
                     question_time=when,
                     search=lambda query, cfg: self.l1.search(space_id, query, when, cfg),
                     core=self.db.get_core_memory(space_id),
                     cache_scope=cache_scope,
+                    recalled=recall.view if recall is not None else None,
                 )
             elif mode == "naive":
                 hits = self.search(space_id, question, k)
