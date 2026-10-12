@@ -220,8 +220,13 @@ class ScriptedModel:
         checker: Callable[[str], Reply] | None = None,
         captioner: Callable[[str], Reply] | None = None,
         router: Callable[[str], Reply] | None = None,
+        agent: Callable[[dict[str, Any]], str | Reply] | None = None,
     ) -> None:
         self.extractions = extractions if extractions is not None else {}
+        # 对话 Agent（N8）：拿到整个请求体（消息与工具），返回文字回答或工具调用
+        # （{"tool_calls": [...]}）；默认回答 "OK"
+        self.agent = agent or (lambda body: "OK")
+        self.agent_requests: list[dict[str, Any]] = []
         # 零样本 LLM 路由（N7）：默认按问题里的线索粗分——"一共"走深度检索，问常识的不用记忆
         self.router = router or (
             lambda prompt: {
@@ -247,9 +252,13 @@ class ScriptedModel:
         self.calls: Counter[str] = Counter()
         self.prompts: dict[str, list[str]] = defaultdict(list)
 
-    def __call__(self, body: dict[str, Any]) -> str:
+    def __call__(self, body: dict[str, Any]) -> str | Reply:
         messages = body["messages"]
         system = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        if "How your memory works:" in system:
+            self.calls["agent"] += 1
+            self.agent_requests.append(body)
+            return self.agent(body)
         content = messages[-1]["content"]
         if isinstance(content, list):  # 带图的请求：文本块拼起来，记下图片张数
             prompt = "".join(b.get("text", "") for b in content if b.get("type") == "text")

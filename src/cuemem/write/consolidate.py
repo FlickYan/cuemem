@@ -23,7 +23,7 @@ import queue
 import threading
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -142,13 +142,23 @@ class Consolidator:
 
     # ---------- 任务 ----------
 
-    def enqueue(self, space_id: str, session_ids: Sequence[str] | None = None) -> int:
-        """为会话登记巩固任务（幂等），返回新登记的任务数。"""
+    def enqueue(
+        self,
+        space_id: str,
+        session_ids: Sequence[str] | None = None,
+        *,
+        skip: Collection[str] = (),
+    ) -> int:
+        """为会话登记巩固任务（幂等），返回新登记的任务数。
+
+        skip：暂不巩固的会话（Agent 正在进行的会话，结束后再登记）。同一会话的内容变了
+        （又追加了发言）时，新任务取代还没执行的旧任务（见 MemoryDB.enqueue_job）。
+        """
         sessions = self.db.get_sessions(space_id)
         added = 0
         for session_id in session_ids if session_ids is not None else sorted(sessions):
             turns = self.db.get_turns(space_id, session_id)
-            if not turns or session_id not in sessions:
+            if not turns or session_id not in sessions or session_id in skip:
                 continue
             digest = session_content_hash(turns, sessions[session_id])
             job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
@@ -170,11 +180,11 @@ class Consolidator:
         recorded = self.db.get_meta(f"consolidation:{space_id}")
         return bool(jobs) and recorded is not None and recorded != self.fingerprint()
 
-    def rebuild(self, space_id: str) -> None:
-        """清空派生记忆（数据库与向量），再为全部会话登记任务。"""
+    def rebuild(self, space_id: str, *, skip: Collection[str] = ()) -> None:
+        """清空派生记忆（数据库与向量），再为全部会话（skip 里的除外）登记任务。"""
         removed = self.db.clear_derived(space_id)
         self.vectors.delete(space_id, removed)
-        self.enqueue(space_id)
+        self.enqueue(space_id, skip=skip)
 
     # ---------- 执行 ----------
 

@@ -23,8 +23,9 @@ from typing import Any
 from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
 from cuemem.errors import ConfigMismatchError
 
-# v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；v4：media 增加孤立描述与尺寸
-SCHEMA_VERSION = 4
+# v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
+# v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -139,6 +140,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS provenance (
+    space_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    PRIMARY KEY (space_id, turn_id, target)
+);
+CREATE INDEX IF NOT EXISTS idx_provenance_target ON provenance (space_id, target);
 CREATE INDEX IF NOT EXISTS idx_turns_space ON turns (space_id, session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id);
 CREATE INDEX IF NOT EXISTS idx_facts_space ON facts (space_id, subject_id, predicate);
@@ -331,7 +339,46 @@ class MemoryDB:
                 " (SELECT id FROM turns WHERE space_id = ?)",
                 (space_id, space_id),
             )
+            conn.execute(
+                "DELETE FROM provenance WHERE space_id = ? AND turn_id NOT IN"
+                " (SELECT id FROM turns WHERE space_id = ?)",
+                (space_id, space_id),
+            )
         return deleted
+
+    # ---------- 溯源：助手的回复引用了哪些记忆（N8） ----------
+
+    def add_provenance(self, space_id: str, turn_id: str, targets: Sequence[str]) -> None:
+        """记下一次回复（助手的发言）引用的记忆：事实、轮或图片的 ID。属于原始层，
+        重建派生记忆时不清空；发言被删时一起删。"""
+        if not targets:
+            return
+        with self.transaction() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO provenance (space_id, turn_id, target) VALUES (?, ?, ?)",
+                [(space_id, turn_id, t) for t in dict.fromkeys(targets)],
+            )
+
+    def citing_turns(self, space_id: str, targets: Sequence[str]) -> list[str]:
+        """引用过这些记忆的发言。"""
+        if not targets:
+            return []
+        marks = ", ".join("?" * len(targets))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT turn_id FROM provenance"
+                f" WHERE space_id = ? AND target IN ({marks})",
+                [space_id, *targets],
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def provenance(self, space_id: str, turn_id: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT target FROM provenance WHERE space_id = ? AND turn_id = ?",
+                (space_id, turn_id),
+            ).fetchall()
+        return [r[0] for r in rows]
 
     # ---------- 检索层：记忆单元 ----------
 
@@ -684,7 +731,11 @@ class MemoryDB:
     def enqueue_job(
         self, job_id: str, space_id: str, session_id: str, version: str, content_hash: str
     ) -> bool:
-        """登记一个巩固任务；同一任务键已存在时什么也不做（幂等）。返回是否新登记。"""
+        """登记一个巩固任务；同一任务键已存在时什么也不做（幂等）。返回是否新登记。
+
+        新登记时，同一会话还没执行（或失败待重试）的旧任务标记为 superseded：会话又追加了
+        发言，旧任务对应的是过时的内容，执行它只会把同一个会话多抽取一遍。
+        """
         now = datetime.now().isoformat()
         with self.transaction() as conn:
             cursor = conn.execute(
@@ -693,7 +744,15 @@ class MemoryDB:
                 " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (job_id, space_id, session_id, version, content_hash, now, now),
             )
-            return cursor.rowcount > 0
+            added = cursor.rowcount > 0
+            if added:
+                conn.execute(
+                    "UPDATE jobs SET status = 'superseded', updated_at = ?"
+                    " WHERE space_id = ? AND session_id = ? AND id != ?"
+                    " AND status IN ('pending', 'failed')",
+                    (now, space_id, session_id, job_id),
+                )
+            return added
 
     def get_jobs(self, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
         sql = (
@@ -741,7 +800,7 @@ class MemoryDB:
 
     def delete_space(self, space_id: str) -> None:
         with self.transaction() as conn:
-            for table in ("units", "turns", "sessions", "media", *DERIVED_TABLES):
+            for table in ("units", "turns", "sessions", "media", "provenance", *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))
 

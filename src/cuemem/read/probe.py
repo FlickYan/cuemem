@@ -24,6 +24,7 @@ import math
 import re
 import time
 from collections import defaultdict
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -162,9 +163,14 @@ class Probe:
         question: str,
         question_time: datetime,
         cfg: L1Config | None = None,
+        *,
+        exclude: Collection[str] = (),
     ) -> ProbeResult:
+        """exclude：已经在上下文里的轮与图片（Agent 的工作记忆），不算作探针的命中。"""
         started = time.perf_counter()
-        cands = self.l1.candidates(space_id, question, question_time, cfg or L1Config())
+        cands = self.l1.candidates(
+            space_id, question, question_time, cfg or L1Config(), exclude=exclude
+        )
         features = {
             **query_features(question, cands.query),
             **self.feedback(space_id, question, question_time, cands),

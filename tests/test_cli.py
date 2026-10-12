@@ -157,3 +157,61 @@ def test_consolidate_inspect_and_forget(
     assert "已删除4条轮次" in _flat(result.output)
     result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--current"])
     assert "新加坡一家电商公司" not in _flat(result.output)
+
+
+def test_demo_and_chat_commands(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    from fakes import FakeAPI
+    from PIL import Image
+    from scripted import ScriptedModel, echo_extraction
+
+    from cuemem import cli
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("CUEMEM_PATHS__MEDIA", str(tmp_path / "media"))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake-qwen")
+    api = FakeAPI()
+    api.chat_replies = [ScriptedModel(echo_extraction, agent=lambda body: "Hi Maya, noted.")]
+    original = MemorySystem.from_settings
+    monkeypatch.setattr(
+        cli.MemorySystem,
+        "from_settings",
+        lambda settings, **kwargs: original(settings, http_client=api.client()),
+    )
+    monkeypatch.setattr(cli.console, "width", 300)
+    Image.new("RGB", (32, 32), "white").save(tmp_path / "shoes.jpg")
+    script = tmp_path / "script.json"
+    script.write_text(
+        json.dumps(
+            {
+                "space": "cli-demo",
+                "sessions": [
+                    {
+                        "at": "2026-08-28T19:30",
+                        "messages": [
+                            {"text": "Hi, I'm Maya.", "expect": [["Maya"]]},
+                            {"text": "Like these?", "images": ["shoes.jpg"], "expect_not": ["$"]},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = tmp_path / "report.json"
+    result = runner.invoke(app, ["demo", str(script), "--fresh", "--report", str(report)])
+    assert result.exit_code == 0, result.output
+    assert "通过2/2" in _flat(result.output)
+    turns = json.loads(report.read_text("utf-8"))["turns"]
+    assert [t["passed"] for t in turns] == [True, True]
+
+    result = runner.invoke(app, ["chat", "--space", "cli-chat"], input="hello\n/end\n/quit\n")
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "HiMaya,noted." in flat and "会话结束" in flat

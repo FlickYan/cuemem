@@ -195,7 +195,7 @@ def format_facts(
         if fact.valid_from and fact.valid_from != day(fact.recorded_at):
             notes.append(("happened " if fact.category == "event" else "since ") + fact.valid_from)
         if validity == "full":
-            notes.append(_status(fact, refs))
+            notes.append(fact_status(fact, refs))
         mark = " ★" if highlight is not None and highlight.contains(_moment(fact)) else ""
         lines.append(f"[{refs[fact.id]}] ({'; '.join(notes)}){mark} {fact.statement}")
     header = FACTS_HEADER if validity == "full" else FACTS_HEADER_PLAIN
@@ -213,7 +213,8 @@ def _moment(fact: Fact) -> datetime:
     return fact.recorded_at.replace(tzinfo=None)
 
 
-def _status(fact: Fact, refs: dict[str, str]) -> str:
+def fact_status(fact: Fact, refs: dict[str, str]) -> str:
+    """事实的有效状态：current，或何时起不再成立 / 何时被更正（refs 里有新版本时指向它）。"""
     if fact.is_current:
         return "current"
     successor = refs.get(fact.superseded_by or "")

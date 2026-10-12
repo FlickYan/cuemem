@@ -15,7 +15,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -74,6 +74,28 @@ class TraceSink:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
         self._lock = threading.Lock()
+
+    def remove(self, predicate: Callable[[dict[str, Any]], bool]) -> int:
+        """删除满足条件的 trace（遗忘时用：trace 的属性里有提问与回答的原文）。返回删除的条数。"""
+        removed = 0
+        with self._lock:
+            for path in sorted(self.directory.glob("*.jsonl")):
+                kept: list[str] = []
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        kept.append(line)
+                        continue
+                    if isinstance(record, dict) and predicate(record):
+                        removed += 1
+                    else:
+                        kept.append(line)
+                if removed:
+                    partial = path.with_suffix(".jsonl.part")
+                    partial.write_text("".join(f"{k}\n" for k in kept), encoding="utf-8")
+                    partial.replace(path)
+        return removed
 
     def write(self, trace: Trace) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)

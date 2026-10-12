@@ -1,0 +1,132 @@
+{
+  "title": "CueMart: a shopping assistant that remembers",
+  "space": "shop-demo",
+  "note": "Sessions 1 and 2 are replayed before the demo (cuemem demo demo/shop/script.json --until 2). Session 3 is played live in the UI; the replay can also run it end to end as a check. expect: each group must match (case-insensitive, any one item of the group); expect_not: none may appear; expect_level: what we hope the controller picks (reported, not enforced).",
+  "sessions": [
+    {
+      "title": "First visit: shoes for a first half marathon",
+      "at": "2026-08-28 19:30",
+      "messages": [
+        {
+          "text": "Hi! I'm Maya. I just signed up for my first half marathon in November, so I need proper running shoes. I wear EU 39 and I'd like to stay under $120.",
+          "expect": [
+            [
+              "$"
+            ]
+          ]
+        },
+        {
+          "text": "Oh, and I'm vegan, so no leather or suede please.",
+          "expect_not": [
+            "re:(^|\\n)\\s*(\\d+\\.|[-*•])\\s*\\**\\s*(Tempo Leather Trainer|Sprint Suede Racer)"
+          ],
+          "expect": [
+            [
+              "vegan"
+            ]
+          ]
+        },
+        {
+          "text": "My friend Lena wears these and I love the look. Do you have something similar?",
+          "images": [
+            "photos/lena-shoes.jpg"
+          ],
+          "expect": [
+            [
+              "Aero Knit"
+            ]
+          ]
+        },
+        {
+          "text": "Nice. I'll think about it, thanks!"
+        }
+      ]
+    },
+    {
+      "title": "Two weeks later: a promotion, a gift, a new size",
+      "at": "2026-09-12 11:00",
+      "messages": [
+        {
+          "text": "Good news: I got promoted, so my budget for running shoes can go up to $180 now."
+        },
+        {
+          "text": "Also, my sister Ana turns 30 on October 3rd. She loves hiking. Any gift ideas under $60?",
+          "expect": [
+            [
+              "Trekking Poles",
+              "Daypack",
+              "Bottle",
+              "Headlamp",
+              "Socks"
+            ]
+          ]
+        },
+        {
+          "text": "The trekking poles are perfect, I'll get those for her."
+        },
+        {
+          "text": "One more thing: I've switched to EU 40 for running shoes, my feet swell on long runs."
+        }
+      ]
+    },
+    {
+      "title": "Live: a month later",
+      "at": "2026-10-10 10:00",
+      "live": true,
+      "messages": [
+        {
+          "text": "Hi Cue, I'm back!",
+          "expect": [
+            [
+              "Maya"
+            ]
+          ],
+          "expect_level": "L0"
+        },
+        {
+          "text": "What size running shoes do I wear now?",
+          "expect": [
+            [
+              "40"
+            ]
+          ],
+          "expect_level": "L1"
+        },
+        {
+          "text": "Can you find shoes that look like the pair I showed you in August?",
+          "expect": [
+            [
+              "Aero Knit"
+            ]
+          ],
+          "expect_level": "L1+see"
+        },
+        {
+          "text": "How has my shoe budget changed since we first talked?",
+          "expect": [
+            [
+              "120"
+            ],
+            [
+              "180"
+            ]
+          ],
+          "expect_level": "L2"
+        },
+        {
+          "forget": "Ana",
+          "note": "In the UI: Memory tab → Forget a fact → the one about Ana's birthday. Forgetting removes the whole exchange it came from (what the user said and what the assistant replied), then rebuilds facts and profile."
+        },
+        {
+          "text": "When is my sister's birthday?",
+          "expect_not": [
+            "October 3",
+            "Oct 3",
+            "3 October",
+            "10-03"
+          ]
+        }
+      ]
+    }
+  ]
+}

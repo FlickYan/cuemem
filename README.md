@@ -3,7 +3,7 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-> 进行中：N7 检索控制器已完成（记忆探针 + 两段式控制器；20% 记忆题的混合流里比"总是检索"便宜 45%、准确率不降；在 L1 / L2 之间路由的空间比预想的小得多，换一个回答模型后模型自主检索反而最好，都如实记录），下一步是 N8 Agent Runtime 与 Demo。进度见下方表格与 [路线图](docs/roadmap.md)。
+> 进行中：N8 Agent Runtime 与 Demo 已完成（自研 agent loop：控制器先选档召回、模型可以自己补查；分区预算与稳定前缀；可解释的界面、HTTP 接口与 MCP Server；会记事的导购助手演示，剧本 14 项检查全过），下一步是 N9 完整评测与分析。进度见下方表格与 [路线图](docs/roadmap.md)。
 
 ## 它要解决什么
 
@@ -71,6 +71,18 @@ uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4�
 
 没有 Key 时也可以离线体验写入与检索，向量改用哈希近似：在命令前加 `CUEMEM_EMBEDDING__BACKEND=hash`，回答仍然需要 LLM。
 
+对话 Agent 与演示（N8，只用通义）：
+
+```bash
+uv run cuemem demo demo/shop/script.json --fresh --until 2   # 建好演示用的记忆：8 月、9 月两段导购对话
+uv run cuemem serve                      # 界面 http://127.0.0.1:7860/ ，接口文档 /docs
+uv run cuemem chat --space me            # 在终端里对话；/image 路径 文字 附图，/end 结束会话并巩固
+uv run cuemem demo demo/shop/script.json --fresh   # 整段剧本回放并核对（14 项检查）
+claude mcp add cuemem -- uv --directory "$PWD" run cuemem mcp --space me   # 把记忆作为 MCP 工具交给 Claude Code
+```
+
+演示步骤见 [demo/README.md](demo/README.md)。
+
 开发：
 
 ```bash
@@ -87,6 +99,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [路线图](docs/roadmap.md) | 实施节点、验收标准、进度 |
 | [相关工作](docs/related-work.md) | 与 MemGPT、Mem0、Zep、HippoRAG、Adaptive-RAG、MemLens 等的对比与定位 |
 | [设计决策记录](docs/decisions.md) | 每个重要取舍的背景、备选方案与理由 |
+| [演示指南](demo/README.md) | 3 分钟演示：准备、步骤、讲什么 |
 
 ## 进度
 
@@ -100,13 +113,35 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N5 | L2 深度检索 | 已完成 |
 | N6 | 多模态记忆 | 已完成 |
 | N7 | 检索控制器（核心） | 已完成 |
-| N8 | Agent Runtime 与 Demo | 下一步 |
-| N9 | 完整评测与分析 | 未开始 |
+| N8 | Agent Runtime 与 Demo | 已完成 |
+| N9 | 完整评测与分析 | 下一步 |
 | N10 | 包装 | 未开始 |
 
 ## 结果
 
 主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
+
+### N8 Agent Runtime 与 Demo：会记事的导购助手
+
+把记忆系统接进一个真正的多轮 Agent（自研 agent loop，没有用 agent 框架），做成可以演示的服务：
+
+- **每条消息**：检索控制器先决定想起多少，召回的记忆只放在最后一条消息里；模型可以调用 `memory_search` 自己补查，也可以调用领域工具（按文字找商品、按图找同款）；回答用 [p2] / [f2] / [m3] 引用记忆；这一轮在线写回，会话结束后在后台抽取事实、更新画像。
+- **上下文**：分区预算，系统提示、画像快照、本次对话的原话组成稳定前缀；本次对话里已有的内容不再检索。
+- **界面**：对话 + 记忆轨迹（控制器为什么这样选、上下文里放了什么、回答引用了哪些记忆、花了多少）+ 记忆浏览器（事实时间线、实体图、图库、遗忘）；另有 HTTP 接口与 MCP Server。
+
+![对话与记忆轨迹](docs/results/n8-agent/ui-chat.png)
+
+1. **演示剧本 14 项检查全部通过**（三段模拟日期的会话 + 一次遗忘）：
+   - 记得名字和更新后的尺码；
+   - 按八月分享的照片找到同款，原图从记忆里召回、再交给模型看；
+   - 说清预算的变化（$120 → $180）；
+   - 遗忘之后不再说出妹妹的生日。
+2. **控制器先选、模型兜底**：门控在导购对话里失准，把"预算怎么变的"判为与记忆无关；模型调用 `memory_search` 自己查到被取代的 $120 与现在的 $180，带引用答对。13 轮里 3 轮用了这个逃生通道。另一处偏差：有照片的空间里控制器几乎总是附原图（从 MemLens 学来的）。
+3. **稳定前缀在长对话里才显出价值**：16 轮的长会话里，输入有 70% 命中供应商的前缀缓存；把召回内容放进系统提示的对照布局只有 52%，每次调用要现算的输入多 41%。每轮召回很多、历史很短的对话里两者差不多。
+4. **遗忘要沿引用扩散**：第一次真实回放时，遗忘之后助手仍说出了生日——新会话的问候引用过它。现在删一条事实会删掉它出自的整轮对话，以及后来引用过它的回复，trace 里的原话也一并删除。
+5. **延迟与成本**：探针加检索约 170 ms，模型平均 5.6 秒（每轮 1.77 次调用），每轮约 $0.0006。N8 合计约 $0.95（其中生图 $0.75）。
+
+详见 [docs/results/n8-agent/README.md](docs/results/n8-agent/README.md)。
 
 ### N7 检索控制器：要不要想起、想多深（三个开发集 585 题 + 混合流 1,170 条无关查询）
 

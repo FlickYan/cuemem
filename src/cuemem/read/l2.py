@@ -16,7 +16,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -195,7 +195,9 @@ class L2Retriever:
         cfg: L2Config,
         *,
         cache_scope: str | None = None,
+        exclude: Collection[str] = (),
     ) -> L2Result:
+        """exclude：不参与检索的轮与图片（已经在 Agent 上下文里的工作记忆，见 read/l1.py）。"""
         timings: dict[str, float] = {}
         started = time.perf_counter()
         plan = (
@@ -207,7 +209,9 @@ class L2Retriever:
         debug: dict[str, Any] = {}
 
         with span("retrieve", route="l2", queries=len(plan.queries)) as record:
-            pool = self._recall(space_id, plan, plan.queries, question_time, cfg, debug)
+            pool = self._recall(
+                space_id, plan, plan.queries, question_time, cfg, debug, exclude=exclude
+            )
             timings["recall"] = _since(started) - timings["plan"]
             ranked = pool.ranked
             if cfg.rerank and self.reranker is not None:
@@ -240,7 +244,9 @@ class L2Retriever:
                     break
                 new_queries = new_queries[:MAX_FOLLOWUP_QUERIES]
                 tried.extend(new_queries)
-                extra = self._recall(space_id, plan, new_queries, question_time, cfg, None)
+                extra = self._recall(
+                    space_id, plan, new_queries, question_time, cfg, None, exclude=exclude
+                )
                 added_rounds = _add_rounds(rounds, extra, cfg)
                 added_facts = self._add_facts(space_id, facts, extra, cfg.followup_facts)
                 outcome.added_rounds, outcome.added_facts = len(added_rounds), len(added_facts)
@@ -273,6 +279,8 @@ class L2Retriever:
         question_time: datetime,
         cfg: L2Config,
         debug: dict[str, Any] | None,
+        *,
+        exclude: Collection[str] = (),
     ) -> L1Candidates:
         """对每个查询做一遍 L1 打分，按查询融合，再（第一轮时）加上图扩散这一路。"""
         vectors = self.embedder.embed(list(queries), "query").dense
@@ -284,6 +292,7 @@ class L2Retriever:
                 cfg.l1,
                 query=replace(plan.query, text=text),
                 dense_vec=vectors[i],
+                exclude=exclude,
             )
             for i, text in enumerate(queries)
         ]
@@ -291,6 +300,9 @@ class L2Retriever:
         fused = _fuse_queries(per_query, weights, cfg)
         if cfg.ppr and debug is not None:
             self._diffuse(space_id, plan, fused, cfg, debug)
+            if exclude:  # 图扩散可能把排除的轮带回来
+                skip = set(exclude)
+                fused.ranked = [(rid, score) for rid, score in fused.ranked if rid not in skip]
         return fused
 
     def _diffuse(

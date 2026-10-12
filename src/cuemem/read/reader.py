@@ -154,6 +154,55 @@ def relative_days(moment: datetime, question_time: datetime) -> str:
     return f"{days} days (about {round(days / 30.4)} months) before the question"
 
 
+def memory_blocks(
+    view: MemoryView,
+    question_time: datetime,
+    *,
+    validity: Validity = "full",
+    show_facts: bool = True,
+    profile: bool = True,
+    relative_time: bool = False,
+    highlight: TimeRange | None = None,
+) -> tuple[list[str], dict[str, str], list[FactHit]]:
+    """把一次检索的材料排成上下文：核心记忆、带有效期的事实、按时间排列的对话片段。
+
+    返回（各块文本，编号 → 记忆 ID，实际展示的事实）。Reader 与 Agent（N8）共用。
+    """
+    blocks: list[str] = []
+    if profile and view.core is not None and view.core.text:
+        # 多人对话（如 LoCoMo）的核心记忆按人分组，每组以"名字:"开头
+        who = "the user" if view.core.text.startswith("- ") else "the people in these chats"
+        blocks.append(f"About {who} (core memory, current facts):\n{view.core.text}")
+    facts = [fh for fh in view.facts if fh.fact.is_current or validity != "current"]
+    fact_refs: dict[str, str] = {}
+    when = question_time if relative_time else None
+    if show_facts and facts:
+        text, fact_refs = format_facts(
+            facts, validity=validity, question_time=when, highlight=highlight
+        )
+        blocks.append(text)
+    context, round_refs = format_memories(
+        view.rounds,
+        question_time=when,
+        highlight=highlight,
+        media=view.media,
+        image_mode=view.image_mode,
+        attach=view.attach,
+    )
+    blocks.append(f"Retrieved conversation excerpts:\n{context or '(none)'}")
+    return blocks, {**round_refs, **fact_refs}, facts if show_facts else []
+
+
+def attached_pictures(view: MemoryView) -> list[tuple[str, str]]:
+    """要附上的原图（再感知）：（说明，data URL）。"""
+    out = []
+    for k, media_id in enumerate(view.attach, start=1):
+        item = view.media.get(media_id)
+        if item is not None:
+            out.append((f"Picture {k} (shared on {item.ts:%Y-%m-%d})", image_data_url(item.path)))
+    return out
+
+
 class Reader:
     def __init__(self, llm: LLMClient, role: str = "reader") -> None:
         self.llm = llm
@@ -205,7 +254,7 @@ class Reader:
 
         系统提示与其他方法完全相同，事实的格式说明放在上下文里，保证方法之间只差"给它看什么"。
         """
-        blocks, refs, facts = self._memory_blocks(
+        blocks, refs, facts = memory_blocks(
             view,
             question_time,
             validity=validity,
@@ -218,7 +267,7 @@ class Reader:
             "\n\n".join(blocks),
             question_time,
             cache_scope=cache_scope,
-            pictures=self._pictures(view),
+            pictures=attached_pictures(view),
             memories=len(view.rounds),
             facts=len(facts),
         )
@@ -237,7 +286,7 @@ class Reader:
 
         系统提示仍与其他方法相同；阅读提示放在上下文末尾、问题之前。
         """
-        blocks, refs, facts = self._memory_blocks(
+        blocks, refs, facts = memory_blocks(
             view, question_time, relative_time=True, highlight=plan.time_range
         )
         guide = "\n".join(f"- {line}" for line in reading_guide(plan))
@@ -248,48 +297,13 @@ class Reader:
             question_time,
             cache_scope=cache_scope,
             schema=NotedReaderOutput,
-            pictures=self._pictures(view),
+            pictures=attached_pictures(view),
             memories=len(view.rounds),
             facts=len(facts),
         )
         answer = self._answer(question, output, refs, view, facts, question_time)
         answer.notes = list(output.notes) if isinstance(output, NotedReaderOutput) else []
         return answer
-
-    def _memory_blocks(
-        self,
-        view: MemoryView,
-        question_time: datetime,
-        *,
-        validity: Validity = "full",
-        show_facts: bool = True,
-        profile: bool = True,
-        relative_time: bool = False,
-        highlight: TimeRange | None = None,
-    ) -> tuple[list[str], dict[str, str], list[FactHit]]:
-        blocks: list[str] = []
-        if profile and view.core is not None and view.core.text:
-            # 多人对话（如 LoCoMo）的核心记忆按人分组，每组以"名字:"开头
-            who = "the user" if view.core.text.startswith("- ") else "the people in these chats"
-            blocks.append(f"About {who} (core memory, current facts):\n{view.core.text}")
-        facts = [fh for fh in view.facts if fh.fact.is_current or validity != "current"]
-        fact_refs: dict[str, str] = {}
-        when = question_time if relative_time else None
-        if show_facts and facts:
-            text, fact_refs = format_facts(
-                facts, validity=validity, question_time=when, highlight=highlight
-            )
-            blocks.append(text)
-        context, round_refs = format_memories(
-            view.rounds,
-            question_time=when,
-            highlight=highlight,
-            media=view.media,
-            image_mode=view.image_mode,
-            attach=view.attach,
-        )
-        blocks.append(f"Retrieved conversation excerpts:\n{context or '(none)'}")
-        return blocks, {**round_refs, **fact_refs}, facts if show_facts else []
 
     @staticmethod
     def _answer(
@@ -342,18 +356,6 @@ class Reader:
             hits=[],
             question_time=question_time,
         )
-
-    @staticmethod
-    def _pictures(view: MemoryView) -> list[tuple[str, str]]:
-        """要附上的原图：（说明，data URL）。"""
-        out = []
-        for k, media_id in enumerate(view.attach, start=1):
-            item = view.media.get(media_id)
-            if item is not None:
-                out.append(
-                    (f"Picture {k} (shared on {item.ts:%Y-%m-%d})", image_data_url(item.path))
-                )
-        return out
 
     def _read(
         self,

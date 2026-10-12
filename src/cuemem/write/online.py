@@ -34,7 +34,13 @@ class IngestReport:
     images_added: int = 0
 
 
-def build_turns(space_id: str, session: SessionIn) -> list[Turn]:
+def media_id(space_id: str, turn_id: str, index: int) -> str:
+    """一次发言里第 index 张图的记录 ID（Agent 据此在检索时排除工作记忆里的图片）。"""
+    return stable_id(space_id, "media", turn_id, index)
+
+
+def build_turns(space_id: str, session: SessionIn, first_idx: int = 0) -> list[Turn]:
+    """发言的序号从 first_idx 起（导入整段对话时从 0 起；Agent 追加新的一问一答时接着往下排）。"""
     return [
         Turn(
             id=stable_id(space_id, session.session_id, idx),
@@ -46,7 +52,7 @@ def build_turns(space_id: str, session: SessionIn) -> list[Turn]:
             ts=turn.ts or session.started_at,
             speaker=turn.speaker,
         )
-        for idx, turn in enumerate(session.turns)
+        for idx, turn in enumerate(session.turns, start=first_idx)
     ]
 
 
@@ -108,15 +114,24 @@ class OnlineWriter:
         self.image_embedder = image_embedder
 
     def ingest(self, conversation: Conversation) -> IngestReport:
+        return self._write(conversation.space_id, [(s, 0) for s in conversation.sessions])
+
+    def append(self, space_id: str, session: SessionIn, first_idx: int) -> IngestReport:
+        """往一个会话里追加发言（Agent 每轮写入新的一问一答），序号从 first_idx 起。
+
+        与重新导入整个会话不同，已有的发言不再处理；遗忘删掉的发言也不会被写回来。
+        """
+        return self._write(space_id, [(session, first_idx)])
+
+    def _write(self, space_id: str, sessions: Sequence[tuple[SessionIn, int]]) -> IngestReport:
         started = time.perf_counter()
-        space_id = conversation.space_id
         self.db.ensure_space(space_id)
         turns_added = 0
         units: list[MemoryUnit] = []
         media: list[MediaItem] = []
-        for session in conversation.sessions:
+        for session, first_idx in sessions:
             self.db.add_session(space_id, session.session_id, session.started_at)
-            turns = build_turns(space_id, session)
+            turns = build_turns(space_id, session, first_idx)
             if self.media is not None:
                 media.extend(self._attach_images(session, turns))
             turns_added += self.db.add_turns(turns)
@@ -126,7 +141,7 @@ class OnlineWriter:
         new_units, tokens = self._index(space_id, units)
         return IngestReport(
             space_id=space_id,
-            sessions=len(conversation.sessions),
+            sessions=len(sessions),
             turns_added=turns_added,
             units_added=len(new_units),
             embed_tokens=tokens,
@@ -143,7 +158,7 @@ class OnlineWriter:
                 stored = self.media.put(Path(path))
                 items.append(
                     MediaItem(
-                        id=stable_id(turn.space_id, "media", turn.id, i),
+                        id=media_id(turn.space_id, turn.id, i),
                         space_id=turn.space_id,
                         sha256=stored.sha256,
                         path=str(stored.path),

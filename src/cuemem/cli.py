@@ -12,6 +12,10 @@ cuemem usage [--today] [--run ID]     汇总调用量与成本
 cuemem data download [NAME...]       下载评测数据集
 cuemem eval split / run / report     评测：划分开发集、运行、生成报告
 cuemem eval audit RUN [--score]      判分抽检：导出待核对条目 / 统计一致率
+cuemem chat --space S [--at T]        在终端里与 Agent 对话（N8）
+cuemem serve [--port 7860]            启动 HTTP 接口与演示界面（FastAPI + Gradio）
+cuemem demo SCRIPT [--until N]        按演示剧本回放对话并核对回答
+cuemem mcp --space S                  以 MCP Server（stdio）提供 remember / recall / forget
 """
 
 from __future__ import annotations
@@ -25,10 +29,13 @@ from typing import Annotated, Any, cast, get_args
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from cuemem.agent import Reply
+from cuemem.api.service import ChatService, Scenario
 from cuemem.config import Settings, env_file_path, load_settings
 from cuemem.core.models import Answer, Conversation, Fact
 from cuemem.embed import build_embedder
@@ -319,6 +326,204 @@ def usage(
         console.print("没有调用记录。")
         return
     _print_usage_rows(rows, detailed=True)
+
+
+# ---------- Agent、服务与演示（N8） ----------
+
+SCENARIO_HELP = "shop：电商导购演示（商品目录与按图找同款）；plain：通用助手"
+
+
+def _service(
+    space: str, scenario: str, router: str, lam: float | None
+) -> tuple[Settings, ChatService]:
+    if scenario not in get_args(Scenario):
+        console.print(f"[red]--scenario 只能是 {'、'.join(get_args(Scenario))}[/red]")
+        raise typer.Exit(1)
+    if router not in get_args(Router):
+        console.print(f"[red]--router 只能是 {'、'.join(get_args(Router))}[/red]")
+        raise typer.Exit(1)
+    settings = load_settings(peak_policy="warn")
+    _peak_note(settings)
+    service = ChatService.create(
+        settings,
+        scenario=cast(Scenario, scenario),
+        default_space=space,
+        router=cast(Router, router),
+        lam=lam,
+    )
+    return settings, service
+
+
+@app.command()
+def serve(
+    host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="端口")] = 7860,
+    space: Annotated[str, typer.Option(help="界面默认的记忆空间")] = "shop-demo",
+    scenario: Annotated[str, typer.Option(help=SCENARIO_HELP)] = "shop",
+    router: Annotated[str, typer.Option(help="默认的检索控制器")] = "learned",
+    lam: Annotated[float | None, typer.Option(help="成本旋钮 λ；默认取控制器模型里的值")] = None,
+    no_ui: Annotated[bool, typer.Option("--no-ui", help="只启动 HTTP 接口")] = False,
+) -> None:
+    """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。"""
+    import uvicorn
+
+    from cuemem.api.app import create_app
+
+    settings, service = _service(space, scenario, router, lam)
+    try:
+        app_ = create_app(service, upload_dir=settings.paths.media.parent / "uploads", ui=not no_ui)
+        console.print(
+            f"界面：[bold]http://{host}:{port}/[/bold] · 接口文档：http://{host}:{port}/docs"
+        )
+        uvicorn.run(app_, host=host, port=port, log_level="warning")
+    finally:
+        service.close()
+
+
+@app.command()
+def chat(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    scenario: Annotated[str, typer.Option(help=SCENARIO_HELP)] = "plain",
+    at: Annotated[
+        datetime | None,
+        typer.Option(formats=DATETIME_FORMATS, help="模拟的会话开始时间；默认为现在"),
+    ] = None,
+    router: Annotated[str, typer.Option(help="检索控制器")] = "learned",
+    lam: Annotated[float | None, typer.Option(help="成本旋钮 λ")] = None,
+) -> None:
+    """在终端里与 Agent 对话。"/image 路径 文字" 附图；/end 结束会话并巩固；/quit 退出。"""
+    _, service = _service(space, scenario, router, lam)
+    session = service.start(space, at=at)
+    console.print(
+        f"会话 [bold]{session.session_id}[/bold]（{session.started_at:%Y-%m-%d %H:%M}）。"
+        "/image 路径 文字：附图；/end：结束并巩固；/quit：退出（会话交给后台巩固）。"
+    )
+    try:
+        while True:
+            try:
+                line = console.input("[bold green]你[/bold green] › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
+            if line == "/quit":
+                break
+            if line == "/end":
+                out = service.end(session.session_id, wait=True)
+                console.print(f"[dim]会话结束：{out.get('consolidation')}[/dim]")
+                session = service.start(space)
+                console.print(f"[dim]新会话 {session.session_id}[/dim]")
+                continue
+            images: list[str] = []
+            if line.startswith("/image "):
+                _, path, *rest = line.split(" ", 2)
+                images, line = [path], (rest[0] if rest else "")
+            reply = service.chat(session.session_id, line, images=images)
+            console.print(Panel(escape(reply.text), title="Cue", expand=False))
+            console.print(f"[dim]{_trace_line(reply)}[/dim]")
+    finally:
+        service.close()
+
+
+@app.command()
+def demo(
+    script: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="演示剧本 JSON")],
+    space: Annotated[str | None, typer.Option(help="记忆空间；默认取剧本里的")] = None,
+    until: Annotated[
+        int | None, typer.Option(help="只回放前 N 段会话（现场演示前建好记忆）")
+    ] = None,
+    fresh: Annotated[
+        bool, typer.Option("--fresh", help="先清空这个记忆空间（LLM 缓存保留，回放结果可复现）")
+    ] = False,
+    router: Annotated[str, typer.Option(help="检索控制器")] = "learned",
+    lam: Annotated[float | None, typer.Option(help="成本旋钮 λ")] = None,
+    report: Annotated[Path | None, typer.Option(help="回放报告（JSON）存放路径")] = None,
+) -> None:
+    """按演示剧本回放对话：每段会话结束后同步巩固；核对回答里该有、不该有的内容。"""
+    from cuemem.api.replay import DemoScript, TurnResult, replay, save_report
+
+    plan = DemoScript.load(script)
+    space_id = space or plan.space
+    settings, service = _service(space_id, "shop", router, lam)
+    try:
+        if fresh:
+            service.system.db.delete_space(space_id)
+            service.system.vectors.delete_space(space_id)
+            console.print(f"[dim]已清空记忆空间 {space_id}[/dim]")
+
+        def show(result: TurnResult) -> None:
+            mark = "[green]✓[/green]" if result.passed else "[red]✗[/red]"
+            head = f"S{result.session}·{result.index} {mark}"
+            if result.forgot is not None:
+                console.print(f"{head} 遗忘 {escape(str(result.forgot))}")
+                return
+            assert result.reply is not None
+            level = result.level + (
+                f"（期望 {result.expected_level}）"
+                if result.expected_level and result.expected_level != result.level
+                else ""
+            )
+            console.print(f"{head} [bold]{level}[/bold] {escape(result.text)}")
+            console.print(f"    [cyan]{escape(result.reply.text)}[/cyan]")
+            console.print(f"    [dim]{_trace_line(result.reply)}[/dim]")
+            for failure in result.failures:
+                console.print(f"    [red]{failure}[/red]")
+
+        results = replay(
+            service,
+            plan,
+            root=script.parent,
+            space=space_id,
+            until=until,
+            router=cast(Router, router),
+            lam=lam,
+            on_turn=show,
+        )
+        target = report or settings.paths.eval_runs.parent / "demo" / (
+            f"{space_id}-{datetime.now():%Y%m%d-%H%M%S}.json"
+        )
+        save_report(results, target, script=str(script), space=space_id, router=router)
+        passed = sum(r.passed for r in results)
+        console.print(f"通过 {passed} / {len(results)}；报告：{target}")
+        _print_usage_rows(service.system.ledger.summary(run_id=service.system.ledger.run_id))
+    finally:
+        service.close()
+
+
+@app.command("mcp")
+def mcp_cmd(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")] = "default",
+    router: Annotated[str, typer.Option(help="recall 用的检索控制器")] = "learned",
+) -> None:
+    """以 MCP Server（stdio）提供记忆工具，让其他 Agent（如 Claude Code）直接使用这套记忆。"""
+    from cuemem.api.mcp import build_server
+
+    settings = load_settings(peak_policy="warn")
+    service = ChatService.create(
+        settings, scenario="plain", default_space=space, router=cast(Router, router)
+    )
+    try:
+        build_server(service, space).run("stdio")
+    finally:
+        service.close()
+
+
+def _trace_line(reply: Reply) -> str:
+    """一轮对话的轨迹摘要：档位、召回与引用、工具、用量与耗时。"""
+    t = reply.trace
+    usage = t.usage
+    parts = [
+        f"{t.level}{'+see' if t.see else ''}（{t.router or '指定'}）",
+        f"召回 {len(t.recalled)} 条",
+        f"引用 {', '.join(reply.citations) or '无'}",
+        f"工具 {', '.join(r.name for r in t.tools) or '无'}",
+        f"输入 {int(usage.get('input_tokens', 0)):,}"
+        f"（前缀缓存 {int(usage.get('cached_input_tokens', 0)):,}）",
+        f"输出 {int(usage.get('output_tokens', 0)):,}",
+        f"${usage.get('spent', 0.0):.4f}",
+        f"{t.timings.get('total', 0) / 1000:.1f} s",
+    ]
+    return " · ".join(parts)
 
 
 # ---------- 记忆检查器 ----------

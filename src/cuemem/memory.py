@@ -5,18 +5,28 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Literal
+from typing import Any, Literal
 
 import httpx2
 
 from cuemem.config import Settings
-from cuemem.core.models import Answer, Conversation, CoreMemory, Entity, Fact, Hit, MediaItem
+from cuemem.core.models import (
+    Answer,
+    Conversation,
+    CoreMemory,
+    Entity,
+    Fact,
+    Hit,
+    MediaItem,
+    SessionIn,
+)
 from cuemem.core.trace import TraceSink, start_trace
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
@@ -40,7 +50,7 @@ from cuemem.read.facts import FactAugmentedRetriever, ImageMode, MemoryView, Val
 from cuemem.read.l1 import L1Candidates, L1Config, L1Retriever
 from cuemem.read.l2 import L2Config, L2Retriever
 from cuemem.read.naive import NaiveRetriever
-from cuemem.read.plan import rule_plan
+from cuemem.read.plan import QueryPlan, rule_plan
 from cuemem.read.probe import Probe
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
@@ -56,6 +66,20 @@ from cuemem.write.consolidate import (
 from cuemem.write.online import IngestReport, OnlineWriter
 
 AskMode = Literal["l0", "l1", "l2", "auto", "agent", "facts", "naive"]
+RecallMode = Literal["l0", "l1", "l2", "auto"]
+Level = Literal["l0", "l1", "l2"]
+
+
+@dataclass
+class Recall:
+    """一次检索（不回答）的结果：走了哪一档、交给回答模型的材料，以及过程记录。"""
+
+    level: Level
+    view: MemoryView
+    decision: RouteDecision | None = None  # mode="auto" 时检索控制器的决定
+    router: Router | None = None  # 实际用的控制器（没有模型文件时 learned 退回 rule）
+    plan: QueryPlan | None = None  # L2 的检索计划（阅读提示用）
+    details: dict[str, Any] = field(default_factory=dict)  # L2 的计划、充分性检查等
 
 
 @dataclass
@@ -69,6 +93,8 @@ class ForgetReport:
     llm_cache_purged: int
     elapsed_ms: float
     images_deleted: int = 0  # 删除的原图文件数（同一张图被别的发言引用时保留）
+    cascaded: int = 0  # 沿引用扩散多删的发言数（后来的回复引用过被删的记忆）
+    traces_removed: int = 0  # 删除的 trace 条数（属性里有被删的原话）
 
 
 def image_mode(cfg: L1Config) -> ImageMode:
@@ -78,6 +104,19 @@ def image_mode(cfg: L1Config) -> ImageMode:
     if cfg.image_kind == "image_iso":
         return "isolated"
     return "none"
+
+
+def route_details(recall: Recall) -> dict[str, Any]:
+    """控制器的决定，记在回答的 details["route"] 里（评测结果与 Agent 的轨迹面板都用）。"""
+    decision = recall.decision
+    assert decision is not None
+    return {
+        "router": recall.router,
+        "level": decision.level,
+        "see": decision.see,
+        "reasons": decision.reasons,
+        **({"scores": decision.scores} if decision.scores else {}),
+    }
 
 
 def build_reranker(
@@ -139,6 +178,9 @@ class MemorySystem:
         self.reader = Reader(llm)
         self.agent = ToolReader(llm)
         self.worker: ConsolidationWorker | None = None
+        # 进行中的会话（Agent 正在对话，N8）：暂不巩固，会话结束后再整体抽取一次
+        self._open: set[tuple[str, str]] = set()
+        self._open_lock = threading.Lock()
 
     @classmethod
     def from_settings(
@@ -233,21 +275,58 @@ class MemorySystem:
     # ---------- 写入 ----------
 
     def ingest(self, conversation: Conversation, *, consolidate: bool = False) -> IngestReport:
-        """在线写入（不调用 LLM），并为新会话登记巩固任务。
+        """在线写入（不调用 LLM），并为新会话登记巩固任务（进行中的会话除外）。
 
         consolidate=True 时立即同步巩固；否则如果后台线程已启动，就交给它异步完成。
         """
-        with start_trace("ingest", self.tracer, space=conversation.space_id) as trace:
+        space_id = conversation.space_id
+        with start_trace("ingest", self.tracer, space=space_id) as trace:
             report = self.writer.ingest(conversation)
-            queued = self.consolidator.enqueue(conversation.space_id)
+            queued = self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
             trace.attrs.update(
                 units_added=report.units_added, turns_added=report.turns_added, jobs=queued
             )
         if consolidate:
-            self.consolidate(conversation.space_id)
-        elif self.worker is not None:
-            self.worker.submit(conversation.space_id)
+            self.consolidate(space_id)
+        elif self.worker is not None and queued:
+            self.worker.submit(space_id)
         return report
+
+    def append(self, space_id: str, session: SessionIn, first_idx: int) -> IngestReport:
+        """往会话里追加发言（Agent 每轮写回新的一问一答，序号从 first_idx 起），在线写入、
+        不调用 LLM。会话进行中不登记巩固任务（见 open_session）。"""
+        with start_trace("append", self.tracer, space=space_id, session=session.session_id):
+            report = self.writer.append(space_id, session, first_idx)
+            queued = self.consolidator.enqueue(
+                space_id, [session.session_id], skip=self.open_sessions(space_id)
+            )
+        if queued and self.worker is not None:
+            self.worker.submit(space_id)
+        return report
+
+    # ---------- 进行中的会话（Agent，N8） ----------
+
+    def open_session(self, space_id: str, session_id: str) -> None:
+        """标记会话进行中：每轮照常在线写入（可检索），但不登记巩固任务——
+        否则半个会话会被抽取一遍，会话结束后整个会话又抽取一遍。"""
+        with self._open_lock:
+            self._open.add((space_id, session_id))
+
+    def close_session(
+        self, space_id: str, session_id: str, *, wait: bool = False
+    ) -> ConsolidationReport | None:
+        """会话结束：登记巩固任务；wait=True 时同步巩固并返回报告，否则交给后台线程。"""
+        with self._open_lock:
+            self._open.discard((space_id, session_id))
+        self.consolidator.enqueue(space_id, [session_id])
+        if wait:
+            return self.consolidate(space_id)
+        self.start_worker().submit(space_id)
+        return None
+
+    def open_sessions(self, space_id: str) -> set[str]:
+        with self._open_lock:
+            return {sid for space, sid in self._open if space == space_id}
 
     def consolidate(
         self, space_id: str, *, rebuild: bool = False, strict: bool = False
@@ -256,11 +335,12 @@ class MemorySystem:
 
         strict=True 时有会话抽取失败就抛出异常（评测用：宁可整题重试，也不要残缺的记忆）。
         """
+        skip = self.open_sessions(space_id)
         with start_trace("consolidate", self.tracer, space=space_id) as trace:
             if rebuild or self.consolidator.stale(space_id):
-                self.consolidator.rebuild(space_id)
+                self.consolidator.rebuild(space_id, skip=skip)
             self.db.retry_failed_jobs(space_id)
-            self.consolidator.enqueue(space_id)
+            self.consolidator.enqueue(space_id, skip=skip)
             report = self.consolidator.run(space_id)
             trace.attrs.update(report.as_dict())
         if strict and report.failed:
@@ -279,21 +359,28 @@ class MemorySystem:
         *,
         session_ids: Sequence[str] = (),
         turn_ids: Sequence[str] = (),
+        follow_citations: bool = True,
     ) -> ForgetReport:
         """遗忘（被遗忘权）：删除原始轮次，并清除由它们派生出的一切（D-021）。
 
         派生记忆是原始日志的函数，所以遗忘 = 从日志里删除 + 用剩下的日志重放派生记忆：
         事实、实体、摘要、核心记忆都重新生成；被删内容取代过的旧事实会自动恢复为当前有效。
         随后清理缓存：被删会话的抽取结果、该空间的对账与回答缓存、不再出现的文本的向量。
+
+        follow_citations（N8）：助手后来的回复如果引用过要删的记忆，它就复述了被删的信息，
+        那一轮也一起删，并继续往下追（溯源表记录了每次回复引用了什么）。
         """
         started = time.perf_counter()
         with start_trace("forget", self.tracer, space=space_id) as trace:
-            wanted_turns, wanted_sessions = set(turn_ids), set(session_ids)
-            targets = [
-                t
-                for t in self.db.get_turns(space_id)
-                if t.id in wanted_turns or t.session_id in wanted_sessions
-            ]
+            all_turns = self.db.get_turns(space_id)
+            asked, sessions = set(turn_ids), set(session_ids)
+            wanted_turns = {t.id for t in all_turns if t.id in asked or t.session_id in sessions}
+            cascaded = 0
+            if follow_citations and wanted_turns:
+                expanded = self._follow_citations(space_id, wanted_turns)
+                cascaded = len(expanded - wanted_turns)
+                wanted_turns = expanded
+            targets = [t for t in all_turns if t.id in wanted_turns]
             affected = sorted({t.session_id for t in targets})
             if not targets:
                 return ForgetReport(space_id, 0, [], 0, 0, 0, 0, 0.0)
@@ -323,10 +410,13 @@ class MemorySystem:
                 parts = [f"session:{sid}" for sid in affected] + ["consolidate", "ask"]
                 llm_purged = sum(self.llm.cache.delete_scope(scope(space_id, p)) for p in parts)
             if consolidated:
-                self.consolidator.enqueue(space_id)
+                self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
                 self.consolidator.run(space_id)
 
-            # 3. 向量缓存：删除已不在记忆里的文本（向量本身也可能泄露原文）
+            # 3. trace：属性里有被删原话的条目（提问、回答原文）一并删除
+            traces_removed = self._remove_traces(space_id, [t.text for t in targets])
+
+            # 4. 向量缓存：删除已不在记忆里的文本（向量本身也可能泄露原文）
             gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
             embed_purged = (
                 self.embedder.purge(gone) if isinstance(self.embedder, CachedEmbedder) else 0
@@ -342,9 +432,59 @@ class MemorySystem:
                 llm_cache_purged=llm_purged,
                 elapsed_ms=(time.perf_counter() - started) * 1000,
                 images_deleted=images_deleted,
+                cascaded=cascaded,
+                traces_removed=traces_removed,
             )
-            trace.attrs.update(turns_deleted=deleted, sessions=affected)
+            trace.attrs.update(turns_deleted=deleted, sessions=affected, cascaded=cascaded)
         return report
+
+    def _remove_traces(self, space_id: str, texts: Sequence[str]) -> int:
+        """删除这个空间里、属性中含有被删原话的 trace（太短的话不作依据，免得误删）。"""
+        wanted = [t for t in texts if len(t.strip()) >= 12]
+        if self.tracer is None or not wanted:
+            return 0
+
+        def doomed(record: dict[str, Any]) -> bool:
+            attrs = record.get("attrs") or {}
+            if attrs.get("space") != space_id:
+                return False
+            blob = " ".join(str(v) for v in attrs.values())
+            return any(text in blob for text in wanted)
+
+        return self.tracer.remove(doomed)
+
+    def _follow_citations(self, space_id: str, turns: set[str]) -> set[str]:
+        """沿引用扩散：要删的发言所在的轮、由它们抽取的事实、其中的图片，凡是被后来的回复
+        引用过，那一轮也要删；新删的轮又可能被更后来的回复引用，直到没有新的为止。"""
+        rounds = self.db.list_units(space_id, kinds=["round"])
+        round_of = {t: u for u in rounds for t in u.source_turn_ids}
+        facts = self.db.get_facts(space_id)
+        media = self.db.get_media(space_id)
+        doomed = set(turns)
+        frontier = set(turns)
+        while frontier:
+            items = {round_of[t].id for t in frontier if t in round_of}
+            items |= {f.id for f in facts if frontier & set(f.source_turn_ids)}
+            items |= {m.id for m in media if m.source_turn_id in frontier}
+            citing = set(self.db.citing_turns(space_id, sorted(items))) - doomed
+            fresh: set[str] = set()
+            for turn_id in citing:  # 整轮删除：用户的问话里也可能带着同样的信息
+                unit = round_of.get(turn_id)
+                fresh |= set(unit.source_turn_ids) if unit is not None else {turn_id}
+            frontier = fresh - doomed
+            doomed |= frontier
+        return doomed
+
+    def round_turns(self, space_id: str, turn_ids: Sequence[str]) -> list[str]:
+        """把发言扩展成所在的整轮（用户的话 + 助手的回复）。遗忘一条事实或一张图时要删整轮：
+        助手在同一轮的回复里往往复述了同样的信息（"Ana 十月三号生日快乐"），只删用户那句，
+        之后照样检索得到。"""
+        wanted = set(turn_ids)
+        out = list(dict.fromkeys(turn_ids))
+        for unit in self.db.list_units(space_id, kinds=["round"]):
+            if wanted & set(unit.source_turn_ids):
+                out.extend(t for t in unit.source_turn_ids if t not in out)
+        return out
 
     # ---------- 读取 ----------
 
@@ -410,41 +550,29 @@ class MemorySystem:
         when = question_time or datetime.now()
         cache_scope = scope(space_id, "ask")
         with start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace:
-            route: str = mode
-            decision: RouteDecision | None = None
-            candidates: L1Candidates | None = None
-            if mode == "auto":
-                decision, candidates, used = self._route(
-                    space_id, question, when, l1 or L1Config(), router, lam, cache_scope
+            recall: Recall | None = None
+            if mode in ("l0", "l1", "l2", "auto"):
+                recall = self.retrieve(
+                    space_id,
+                    question,
+                    question_time=when,
+                    mode=mode,
+                    router=router,
+                    lam=lam,
+                    k=k,
+                    l1=l1,
+                    l2=l2,
+                    cache_scope=cache_scope,
                 )
-                route = decision.level.lower()
-                if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
-                    l1 = replace(l1 or L1Config(), attach_images=3)
-                    base_l2 = l2 or L2Config()
-                    l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
-            if route == "l0":
-                view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
+            if recall is not None and recall.level == "l0":
                 answer = self.reader.answer_with_memory(
-                    question, view, question_time=when, cache_scope=cache_scope
+                    question, recall.view, question_time=when, cache_scope=cache_scope
                 )
-            elif route == "l1":
-                cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
-                if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
-                    result = self.l1.pack(space_id, candidates, cfg)
-                else:
-                    result = self.l1.search(space_id, question, when, cfg)
-                view = MemoryView(
-                    rounds=result.rounds,
-                    facts=result.facts,
-                    core=result.core,
-                    media=result.media,
-                    image_mode=image_mode(cfg),
-                    attach=result.attach,
-                )
+            elif recall is not None and recall.level == "l1":
                 if notes:  # 笔记式阅读用规则版计划给阅读提示（不调用规划模型）
                     answer = self.reader.answer_deep(
                         question,
-                        view,
+                        recall.view,
                         plan=rule_plan(question, when),
                         question_time=when,
                         cache_scope=cache_scope,
@@ -452,38 +580,33 @@ class MemorySystem:
                 else:
                     answer = self.reader.answer_with_memory(
                         question,
-                        view,
+                        recall.view,
                         question_time=when,
                         show_facts=show_facts,
                         profile=profile,
                         relative_time=relative_time,
                         cache_scope=cache_scope,
                     )
-            elif route == "l2":
-                l2_cfg = l2 or L2Config()
-                deep = self.l2.search(space_id, question, when, l2_cfg, cache_scope=cache_scope)
-                view = MemoryView(
-                    rounds=deep.rounds,
-                    facts=deep.facts,
-                    core=deep.core,
-                    media=deep.media,
-                    image_mode=image_mode(l2_cfg.l1),
-                    attach=deep.attach,
-                )
+            elif recall is not None:  # L2
+                assert recall.plan is not None
                 if notes is None or notes:
                     answer = self.reader.answer_deep(
-                        question, view, plan=deep.plan, question_time=when, cache_scope=cache_scope
+                        question,
+                        recall.view,
+                        plan=recall.plan,
+                        question_time=when,
+                        cache_scope=cache_scope,
                     )
                 else:
                     answer = self.reader.answer_with_memory(
                         question,
-                        view,
+                        recall.view,
                         question_time=when,
                         relative_time=True,
                         cache_scope=cache_scope,
                     )
-                answer.details = deep.details()
-            elif route == "agent":
+                answer.details = dict(recall.details)
+            elif mode == "agent":
                 answer = self.agent.answer(
                     question,
                     question_time=when,
@@ -491,7 +614,7 @@ class MemorySystem:
                     core=self.db.get_core_memory(space_id),
                     cache_scope=cache_scope,
                 )
-            elif route == "naive":
+            elif mode == "naive":
                 hits = self.search(space_id, question, k)
                 answer = self.reader.answer(
                     question, hits, question_time=when, cache_scope=cache_scope
@@ -514,18 +637,79 @@ class MemorySystem:
                     profile=profile,
                     cache_scope=cache_scope,
                 )
-            if decision is not None:
-                answer.details["route"] = {
-                    "router": used,
-                    "level": decision.level,
-                    "see": decision.see,
-                    "reasons": decision.reasons,
-                    **({"scores": decision.scores} if decision.scores else {}),
-                }
-            if route in ("l1", "l2") and view.attach:
-                answer.details["attached"] = list(view.attach)  # 附了原图的图片（再感知）
+            if recall is not None and recall.decision is not None:
+                answer.details["route"] = route_details(recall)
+            if recall is not None and recall.level != "l0" and recall.view.attach:
+                answer.details["attached"] = list(recall.view.attach)  # 附了原图的图片（再感知）
             trace.attrs.update(answer=answer.answer, citations=answer.citations)
         return answer
+
+    def retrieve(
+        self,
+        space_id: str,
+        question: str,
+        *,
+        question_time: datetime | None = None,
+        mode: RecallMode = "auto",
+        router: Router = "learned",
+        lam: float | None = None,
+        k: int | None = None,
+        l1: L1Config | None = None,
+        l2: L2Config | None = None,
+        exclude: Collection[str] = (),
+        cache_scope: str | None = None,
+    ) -> Recall:
+        """只检索、不回答：按 mode 取记忆（auto 由检索控制器选档），返回交给回答模型的材料。
+
+        ask() 与 Agent（N8）共用这一步。exclude 是已经在上下文里的轮与图片的 ID
+        （Agent 的工作记忆），不参与探针与检索。
+        """
+        when = question_time or datetime.now()
+        cache_scope = cache_scope or scope(space_id, "ask")
+        level: str = mode
+        decision: RouteDecision | None = None
+        used: Router | None = None
+        candidates: L1Candidates | None = None
+        if mode == "auto":
+            decision, candidates, used = self._route(
+                space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+            )
+            level = decision.level.lower()
+            if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
+                l1 = replace(l1 or L1Config(), attach_images=3)
+                base_l2 = l2 or L2Config()
+                l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
+        if level == "l0":
+            view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
+            return Recall("l0", view, decision, used)
+        if level == "l1":
+            cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
+            if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
+                result = self.l1.pack(space_id, candidates, cfg)
+            else:
+                result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
+            view = MemoryView(
+                rounds=result.rounds,
+                facts=result.facts,
+                core=result.core,
+                media=result.media,
+                image_mode=image_mode(cfg),
+                attach=result.attach,
+            )
+            return Recall("l1", view, decision, used)
+        l2_cfg = l2 or L2Config()
+        deep = self.l2.search(
+            space_id, question, when, l2_cfg, cache_scope=cache_scope, exclude=exclude
+        )
+        view = MemoryView(
+            rounds=deep.rounds,
+            facts=deep.facts,
+            core=deep.core,
+            media=deep.media,
+            image_mode=image_mode(l2_cfg.l1),
+            attach=deep.attach,
+        )
+        return Recall("l2", view, decision, used, plan=deep.plan, details=deep.details())
 
     def _route(
         self,
@@ -536,6 +720,7 @@ class MemorySystem:
         router: Router,
         lam: float | None,
         cache_scope: str,
+        exclude: Collection[str] = (),
     ) -> tuple[RouteDecision, L1Candidates | None, Router]:
         """检索控制器选档；学到的控制器先跑探针，选了 L1 时把探针的候选交回去直接打包。
 
@@ -545,7 +730,7 @@ class MemorySystem:
             return self.router.decide(question, cache_scope=cache_scope), None, "llm"
         if router == "rule" or self.learned is None:
             return self.controller.decide(question, when), None, "rule"
-        probe = self.probe.run(space_id, question, when, cfg)
+        probe = self.probe.run(space_id, question, when, cfg, exclude=exclude)
         has_images = probe.features.get("m_media", 0.0) > 0
         p_none: float | None = None
         asked = False

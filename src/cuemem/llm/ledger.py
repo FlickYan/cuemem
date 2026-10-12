@@ -24,7 +24,7 @@ from cuemem.llm.types import Usage
 class UsageRecord(BaseModel):
     ts: datetime
     run_id: str
-    kind: Literal["chat", "embedding", "rerank"]
+    kind: Literal["chat", "embedding", "rerank", "image"]  # image：生图（N8 演示素材）
     role: str | None
     provider: str
     model: str

@@ -1,0 +1,606 @@
+{
+ "summary": {
+  "checks": 14,
+  "passed": 14,
+  "chat_turns": 13,
+  "levels": {
+   "L0": 5,
+   "L1+see": 8
+  },
+  "memory_search_turns": 3,
+  "shop_tool_turns": 6,
+  "llm_calls_per_turn": 1.7692307692307692,
+  "input_tokens": 77555.0,
+  "cached_input_tokens": 41984.0,
+  "spent_per_turn": 0.000558923076923077,
+  "total_s_median": 4.7578000000000005,
+  "total_s_mean": 5.749384615384615,
+  "llm_s_mean": 5.639092307692308,
+  "write_ms_median": 104.8
+ },
+ "turns": [
+  {
+   "session": 1,
+   "index": 1,
+   "text": "Hi! I'm Maya. I just signed up for my first half marathon in November, so I need proper running shoes. I wear EU 39 and I'd like to stay under $120.",
+   "passed": true,
+   "failures": [],
+   "level": "L0",
+   "expected_level": null,
+   "p_none": 1.0,
+   "tools": [
+    {
+     "name": "search_products",
+     "arguments": {
+      "query": "running shoes",
+      "category": "running shoes",
+      "max_price": 120
+     }
+    }
+   ],
+   "citations": [],
+   "answer": "Great news, Maya — all of these come in EU 39 and fit your budget:\n\n1. **Aero Knit Runner** — $110: my top pick for half-marathon training. Lightweight enough for tempo days, cushioned enough for long runs, and a neutral fit for road running.\n2. **Cloudline Daily** — $89: a solid, budget-friendly daily trainer in recycled mesh if you want to save a little.\n3. **Breeze Knit Lite** — $75: very light, but better suited to short runs than marathon-distance training.\n\nI'd go with the Aero Knit Runner for race prep — the extra cushioning will matter on those 10K+ weekend runs. Want me to check anything else, like socks or a hydration belt?",
+   "recalled": 0,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 0,
+    "working": 0,
+    "recalled": 11,
+    "message": 38
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 2924.0,
+    "cached_input_tokens": 1024.0,
+    "output_tokens": 240.0,
+    "spent": 0.00043
+   },
+   "timings": {
+    "recall": 2.4,
+    "llm": 4359.0,
+    "write": 120.0,
+    "total": 4481.8
+   }
+  },
+  {
+   "session": 1,
+   "index": 2,
+   "text": "Oh, and I'm vegan, so no leather or suede please.",
+   "passed": true,
+   "failures": [],
+   "level": "L0",
+   "expected_level": null,
+   "p_none": 1.0,
+   "tools": [
+    {
+     "name": "search_products",
+     "arguments": {
+      "query": "vegan running shoes no leather synthetic mesh",
+      "category": "running shoes",
+      "max_price": 120
+     }
+    }
+   ],
+   "citations": [],
+   "answer": "Good thing I checked — here's how it looks with vegan-only shoes:\n\n1. **Aero Knit Runner** — $110: engineered knit upper, fully vegan. Still my top pick for your half-marathon training.\n2. **Cloudline Daily** — $89: recycled mesh upper (vegan), a great budget-friendly daily trainer.\n3. **Breeze Knit Lite** — $75: vegan knit, but best kept to short runs and walking.\n\nNote: the Tempo Leather Trainer ($95) and Sprint Suede Racer ($120) are in our catalog but use leather/suede, so I've ruled them out for you.\n\nAll three picks come in EU 39. Want me to look at any other gear — socks, shorts, or a hat — with vegan materials in mind?",
+   "recalled": 0,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 0,
+    "working": 199,
+    "recalled": 11,
+    "message": 13
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 3305.0,
+    "cached_input_tokens": 2048.0,
+    "output_tokens": 236.0,
+    "spent": 0.000349
+   },
+   "timings": {
+    "recall": 3.5,
+    "llm": 4664.8,
+    "write": 89.2,
+    "total": 4757.8
+   }
+  },
+  {
+   "session": 1,
+   "index": 3,
+   "text": "My friend Lena wears these and I love the look. Do you have something similar?",
+   "passed": true,
+   "failures": [],
+   "level": "L0",
+   "expected_level": null,
+   "p_none": 1.0,
+   "tools": [
+    {
+     "name": "find_similar_products",
+     "arguments": {
+      "image": "u1",
+      "category": "running shoes",
+      "max_price": 120
+     }
+    }
+   ],
+   "citations": [],
+   "answer": "Great news — the closest match is actually my top pick for you:\n\n1. **Aero Knit Runner** — $110 (white/mint green): almost the same look as Lena's shoes — white knit upper with a mint foam sole [match 0.67]. Vegan, in EU 39, and genuinely a proper half-marathon trainer, not just a fashion shoe.\n2. **Breeze Knit Lite** — $75 (white/lavender): similar silhouette but with a lavender sole instead of mint, and thinner cushioning — better for short runs and casual wear.\n\nThe other matches were leather or suede, so I've skipped them per your vegan requirement.\n\nI'd say get the Aero Knit Runner — you get Lena's look *and* a shoe that'll carry you through race training. Want me to check colors or anything else?",
+   "recalled": 0,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 0,
+    "working": 371,
+    "recalled": 11,
+    "message": 820
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 4896.0,
+    "cached_input_tokens": 2816.0,
+    "output_tokens": 257.0,
+    "spent": 0.000493
+   },
+   "timings": {
+    "recall": 3.0,
+    "llm": 7157.9,
+    "write": 116.4,
+    "total": 7285.2
+   }
+  },
+  {
+   "session": 1,
+   "index": 4,
+   "text": "Nice. I'll think about it, thanks!",
+   "passed": true,
+   "failures": [],
+   "level": "L0",
+   "expected_level": null,
+   "p_none": 1.0,
+   "tools": [],
+   "citations": [],
+   "answer": "Sounds good, Maya! Take your time — the **Aero Knit Runner** will be here when you're ready. If any questions come up while you're thinking (sizing, race-day gear, training tips), just ping me. Good luck with your November half marathon! 🏃‍♀️",
+   "recalled": 0,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 0,
+    "working": 1369,
+    "recalled": 11,
+    "message": 9
+   },
+   "usage": {
+    "llm_calls": 1.0,
+    "input_tokens": 2433.0,
+    "cached_input_tokens": 1536.0,
+    "output_tokens": 65.0,
+    "spent": 0.000197
+   },
+   "timings": {
+    "recall": 4.1,
+    "llm": 2566.7,
+    "write": 88.9,
+    "total": 2663.7
+   }
+  },
+  {
+   "session": 2,
+   "index": 1,
+   "text": "Good news: I got promoted, so my budget for running shoes can go up to $180 now.",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": null,
+   "p_none": 0.0015,
+   "tools": [
+    {
+     "name": "search_products",
+     "arguments": {
+      "query": "running shoes vegan knit upper cushioned road training",
+      "max_price": 180
+     }
+    }
+   ],
+   "citations": [
+    "f4",
+    "f5",
+    "f7"
+   ],
+   "answer": "Nice upgrade, Maya! With $180 to work with, here are the best vegan picks for your November half marathon:\n\n1. **Aero Knit Runner Pro** — $165 (white/mint green): the race-day version of the shoe you already liked — carbon plate and high-rebound foam that will genuinely help on race day, and it still matches Lena's look. EU 39 is in range.\n2. **Stratus Cushion 2** — $135 (grey/coral): a max-cushion trainer built specifically for long runs and half-marathon distance — great as a training shoe to save the Pro for race day.\n\nMy suggestion if you want one shoe only: the **Aero Knit Runner Pro**. If you'd rather split the budget, pair the Stratus for training with the original **Aero Knit Runner** ($110) — though that goes slightly over $180 combined.\n\nWant me to look at race-day socks or other gear to go with it?",
+   "recalled": 12,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 42,
+    "working": 0,
+    "recalled": 1988,
+    "message": 21
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 7061.0,
+    "cached_input_tokens": 4096.0,
+    "output_tokens": 303.0,
+    "spent": 0.000673
+   },
+   "timings": {
+    "recall": 5.4,
+    "llm": 10515.7,
+    "write": 111.0,
+    "total": 10636.2
+   }
+  },
+  {
+   "session": 2,
+   "index": 2,
+   "text": "Also, my sister Ana turns 30 on October 3rd. She loves hiking. Any gift ideas under $60?",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": null,
+   "p_none": 0.115,
+   "tools": [
+    {
+     "name": "search_products",
+     "arguments": {
+      "query": "hiking gift",
+      "category": "hiking",
+      "max_price": 60
+     }
+    }
+   ],
+   "citations": [
+    "f5"
+   ],
+   "answer": "Happy early birthday to Ana! Here are my top hiking gift picks under $60:\n\n1. **Summit Carbon Trekking Poles** — $59: foldable, ultralight carbon poles with cork grips — a genuinely useful \"level-up\" gift for a keen hiker turning 30.\n2. **Peak 20L Daypack** — $55: teal recycled-nylon pack with hydration sleeve and hip belt, great for day hikes (and vegan, like everything I pick for you ).\n3. **Canyon Insulated Bottle 1L** — $28: sage green, keeps drinks cold 24 hours — pairs nicely with the poles or pack if you want a small bundle (~$87 total, still reasonable).\n\nIf you know she already has poles, the daypack is the safest bet. Want me to check colors or anything else?",
+   "recalled": 12,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 42,
+    "working": 227,
+    "recalled": 1988,
+    "message": 23
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 7445.0,
+    "cached_input_tokens": 4352.0,
+    "output_tokens": 244.0,
+    "spent": 0.000665
+   },
+   "timings": {
+    "recall": 5.9,
+    "llm": 5594.7,
+    "write": 114.1,
+    "total": 5718.6
+   }
+  },
+  {
+   "session": 2,
+   "index": 3,
+   "text": "The trekking poles are perfect, I'll get those for her.",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": null,
+   "p_none": 0.1903,
+   "tools": [],
+   "citations": [
+    "f1",
+    "f5"
+   ],
+   "answer": "Great choice — the **Summit Carbon Trekking Poles** ($59) are a gift she'll actually use on every trail. \n\nOne quick note: I don't have order-placing ability in this demo, so you'd add them to your cart yourself on CueMart. If you'd like, I can suggest a small add-on to bundle — like the **Canyon Insulated Bottle 1L** ($28) in sage green — or check anything else before October 3rd. 🎁🥾",
+   "recalled": 12,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 42,
+    "working": 420,
+    "recalled": 1988,
+    "message": 14
+   },
+   "usage": {
+    "llm_calls": 1.0,
+    "input_tokens": 3755.0,
+    "cached_input_tokens": 1280.0,
+    "output_tokens": 117.0,
+    "spent": 0.000457
+   },
+   "timings": {
+    "recall": 5.5,
+    "llm": 3653.9,
+    "write": 87.6,
+    "total": 3750.9
+   }
+  },
+  {
+   "session": 2,
+   "index": 4,
+   "text": "One more thing: I've switched to EU 40 for running shoes, my feet swell on long runs.",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": null,
+   "p_none": 0.0077,
+   "tools": [
+    {
+     "name": "memory_search",
+     "arguments": {
+      "query": "Maya running shoes size EU 40 feet swell long runs"
+     }
+    }
+   ],
+   "citations": [
+    "f6"
+   ],
+   "answer": "Got it, Maya — noted! Going up a half size for long-run swelling is smart (and common). I'll use EU 40 for your running shoes from now on instead of EU 39.\n\nGood news: both the **Aero Knit Runner Pro** ($165) and **Stratus Cushion 2** ($135) come in EU 40, so our shoe plan stands. And Ana's **Summit Carbon Trekking Poles** aren't affected at all.\n\nAnything else before we wrap up — race-day socks or a hydration belt in mind?",
+   "recalled": 12,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 42,
+    "working": 531,
+    "recalled": 1988,
+    "message": 22
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 7872.0,
+    "cached_input_tokens": 5376.0,
+    "output_tokens": 167.0,
+    "spent": 0.000554
+   },
+   "timings": {
+    "recall": 5.2,
+    "llm": 6903.8,
+    "write": 104.8,
+    "total": 7017.7
+   }
+  },
+  {
+   "session": 3,
+   "index": 1,
+   "text": "Hi Cue, I'm back!",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": "L0",
+   "p_none": 0.8203,
+   "tools": [],
+   "citations": [
+    "f3",
+    "f11",
+    "f10",
+    "m5",
+    "f1",
+    "f8"
+   ],
+   "answer": "Welcome back, Maya! \n\nWhere would you like to pick up?\n\n- Your half-marathon shoes — budget now $180, size EU 40, with the **Aero Knit Runner Pro** ($165) as our last shortlist \n- Ana's birthday follow-up — her 30th was October 3rd; did the **Summit Carbon Trekking Poles** work out? \n- Something new entirely\n\nAlso: has anything changed since September — sizes, budget, or race plans?",
+   "recalled": 20,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 86,
+    "working": 0,
+    "recalled": 2873,
+    "message": 5
+   },
+   "usage": {
+    "llm_calls": 1.0,
+    "input_tokens": 4480.0,
+    "cached_input_tokens": 1024.0,
+    "output_tokens": 134.0,
+    "spent": 0.000608
+   },
+   "timings": {
+    "recall": 6.1,
+    "llm": 3145.5,
+    "write": 89.3,
+    "total": 3245.0
+   }
+  },
+  {
+   "session": 3,
+   "index": 2,
+   "text": "What size running shoes do I wear now?",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": "L1",
+   "p_none": 0.1859,
+   "tools": [],
+   "citations": [
+    "f9",
+    "f10",
+    "m5"
+   ],
+   "answer": "You wear EU 40 in running shoes now — you switched up from EU 39 because your feet swell on long runs. \n\nGood news: the **Aero Knit Runner Pro** ($165) comes in EU 40, so our half-marathon shoe plan still works.",
+   "recalled": 19,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 86,
+    "working": 102,
+    "recalled": 2869,
+    "message": 10
+   },
+   "usage": {
+    "llm_calls": 1.0,
+    "input_tokens": 4581.0,
+    "cached_input_tokens": 1024.0,
+    "output_tokens": 74.0,
+    "spent": 0.000591
+   },
+   "timings": {
+    "recall": 6.0,
+    "llm": 3228.6,
+    "write": 84.7,
+    "total": 3323.4
+   }
+  },
+  {
+   "session": 3,
+   "index": 3,
+   "text": "Can you find shoes that look like the pair I showed you in August?",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": "L1+see",
+   "p_none": 0.0016,
+   "tools": [
+    {
+     "name": "find_similar_products",
+     "arguments": {
+      "image": "i1",
+      "category": "running shoes",
+      "max_price": 180
+     }
+    }
+   ],
+   "citations": [
+    "i1",
+    "f10",
+    "f9",
+    "f4"
+   ],
+   "answer": "Found them — the look from Lena's shoes maps to two vegan options in white/mint:\n\n1. **Aero Knit Runner Pro** — $165 (white/mint green): closest to what you want for November — carbon plate, high-rebound foam, thicker mint rocker sole. Comes in EU 40 and fits your $180 budget.\n2. **Aero Knit Runner** — $110 (white/mint green): the original, nearly identical look, lighter cushioning, also EU 36–46.\n\nThe **Breeze Knit Lite** ($75) is similar in shape but lavender-soled and too thin for half-marathon distance. I skipped the Tempo Leather Trainer — it's leather, so not vegan.\n\nMy pick stays the Pro for race day. Want me to check anything else?",
+   "recalled": 19,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 86,
+    "working": 165,
+    "recalled": 2861,
+    "message": 17
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 9796.0,
+    "cached_input_tokens": 5888.0,
+    "output_tokens": 250.0,
+    "spent": 0.000813
+   },
+   "timings": {
+    "recall": 6.1,
+    "llm": 8246.5,
+    "write": 116.1,
+    "total": 8372.8
+   }
+  },
+  {
+   "session": 3,
+   "index": 4,
+   "text": "How has my shoe budget changed since we first talked?",
+   "passed": true,
+   "failures": [],
+   "level": "L0",
+   "expected_level": "L2",
+   "p_none": 0.9579,
+   "tools": [
+    {
+     "name": "memory_search",
+     "arguments": {
+      "query": "running shoe budget first mentioned"
+     }
+    }
+   ],
+   "citations": [
+    "f3",
+    "f10"
+   ],
+   "answer": "Your budget has gone up $60 since we started:\n\n- **Aug 28** — under $120 \n- **Sept 12** — raised to $180 after your promotion \n\nThat bump is what moved you from the **Aero Knit Runner** ($110) to the race-day **Aero Knit Runner Pro** ($165), which still fits comfortably.",
+   "recalled": 18,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 86,
+    "working": 344,
+    "recalled": 11,
+    "message": 14
+   },
+   "usage": {
+    "llm_calls": 2.0,
+    "input_tokens": 5801.0,
+    "cached_input_tokens": 2048.0,
+    "output_tokens": 135.0,
+    "spent": 0.000669
+   },
+   "timings": {
+    "recall": 5.8,
+    "llm": 3474.0,
+    "write": 116.7,
+    "total": 3596.7
+   }
+  },
+  {
+   "session": 3,
+   "index": 5,
+   "text": "[forget] Ana",
+   "passed": true,
+   "failures": [],
+   "forgot": {
+    "facts": [
+     "The user has a sister named Ana.",
+     "The user decided to buy Summit Carbon Trekking Poles as a birthday gift for Ana.",
+     "Ana turns 30 years old on October 3, 2026.",
+     "Ana loves hiking."
+    ],
+    "turns_deleted": 6,
+    "facts_before": 14,
+    "facts_after": 12
+   }
+  },
+  {
+   "session": 3,
+   "index": 6,
+   "text": "When is my sister's birthday?",
+   "passed": true,
+   "failures": [],
+   "level": "L1+see",
+   "expected_level": null,
+   "p_none": 0.2188,
+   "tools": [
+    {
+     "name": "memory_search",
+     "arguments": {
+      "query": "sister's birthday"
+     }
+    },
+    {
+     "name": "memory_search",
+     "arguments": {
+      "query": "family birthday sister Maya"
+     }
+    }
+   ],
+   "citations": [],
+   "answer": "I don't have that, Maya — nothing about your sister's birthday in what I know from our chats. If you tell me the date, I'll keep it in mind ( handy if you ever want gift ideas).",
+   "recalled": 17,
+   "partitions": {
+    "system": 512,
+    "tools": 442,
+    "core": 63,
+    "working": 324,
+    "recalled": 2487,
+    "message": 8
+   },
+   "usage": {
+    "llm_calls": 3.0,
+    "input_tokens": 13206.0,
+    "cached_input_tokens": 9472.0,
+    "output_tokens": 103.0,
+    "spent": 0.000767
+   },
+   "timings": {
+    "recall": 6.3,
+    "llm": 9797.1,
+    "write": 84.2,
+    "total": 9892.2
+   }
+  }
+ ]
+}

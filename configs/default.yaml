@@ -98,6 +98,9 @@ roles:
   vlm: {model: deepseek-flash}         # 回答时再感知原图：与主 reader 相同，方法之间只差"给不给原图"
   captioner: {model: qwen3.8-flash}    # 写入时的图片描述（N6）：调用量大、不在读路径上，选最便宜且能看图的
   judge: {model: qwen3.8-max}          # 评测判分
+  # 对话 Agent（N8）：要会用工具（换回答模型的实验里 qwen3.8-flash 自主检索最好，D-041），
+  # 也要便宜、能看图；通义没有分时价格，演示什么时候跑都一样
+  agent: {model: qwen3.8-flash, max_tokens: 1200}
 
 embedding:
   backend: dashscope                   # dashscope：通义向量 API；hash：离线哈希向量（仅测试与演示）

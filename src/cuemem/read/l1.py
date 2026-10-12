@@ -17,13 +17,16 @@
 可选一路"以文搜图"（问题与图片在同一个图文向量空间里比较）。图片按相关度排序，供回答时
 挑几张原图"再看一眼"。
 打分（candidates）与打包（pack_rounds）分开：L2 对多个子查询分别打分、融合后再打包（read/l2.py）。
+
+exclude（N8）：Agent 的工作记忆（当前会话最近几轮）已经原样放在上下文里，检索时排除这些轮与其中的
+图片，召回的名额留给上下文里没有的记忆。
 """
 
 from __future__ import annotations
 
 import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
@@ -123,9 +126,16 @@ class L1Retriever:
         self._bm25: dict[tuple[str, str], tuple[int, BM25, list[MemoryUnit]]] = {}
 
     def search(
-        self, space_id: str, question: str, question_time: datetime, cfg: L1Config
+        self,
+        space_id: str,
+        question: str,
+        question_time: datetime,
+        cfg: L1Config,
+        *,
+        exclude: Collection[str] = (),
     ) -> L1Result:
-        return self.pack(space_id, self.candidates(space_id, question, question_time, cfg), cfg)
+        cands = self.candidates(space_id, question, question_time, cfg, exclude=exclude)
+        return self.pack(space_id, cands, cfg)
 
     def pack(self, space_id: str, cands: L1Candidates, cfg: L1Config) -> L1Result:
         """把一次打分的候选按预算装入。控制器先用探针看过候选、决定走 L1 时，直接接着打包。"""
@@ -170,11 +180,13 @@ class L1Retriever:
         *,
         query: QueryInfo | None = None,
         dense_vec: FloatArray | None = None,
+        exclude: Collection[str] = (),
     ) -> L1Candidates:
         """一次查询的候选与分数（不打包）。
 
         query 可以传入改写过的问题分析（L2 用查询规划给出的时间区间替换规则解析的结果）；
-        dense_vec 是已经算好的查询向量（L2 把几个子查询一次向量化）。
+        dense_vec 是已经算好的查询向量（L2 把几个子查询一次向量化）；
+        exclude 是不参与检索的轮与图片的 ID（已经在上下文里的）。
         """
         timings: dict[str, float] = {}
         started = time.perf_counter()
@@ -205,9 +217,21 @@ class L1Retriever:
                 hits = self.vectors.search_images(space_id, vector, cfg.pool)
                 routes[("media", "visual")] = [(h.unit_id, h.score) for h in hits]
             timings["recall"] = (time.perf_counter() - started) * 1000 - timings["embed"]
+            skip = set(exclude)
+            if skip:  # 打分前从各路召回里去掉；事实、图片映射回来的分数在打分后再去一遍
+                routes = {
+                    key: [(uid, score) for uid, score in hits if uid not in skip]
+                    for key, hits in routes.items()
+                }
+                record["excluded"] = len(skip)
 
             cands = self._score(space_id, query, routes, cfg)
             cands.routes = routes
+            if skip:
+                cands.ranked = [(rid, score) for rid, score in cands.ranked if rid not in skip]
+                cands.media_score = {
+                    mid: score for mid, score in cands.media_score.items() if mid not in skip
+                }
             record["candidates"] = len(cands.ranked)
             record["time_range"] = query.time_range.expr if query.time_range else None
         timings["total"] = (time.perf_counter() - started) * 1000
