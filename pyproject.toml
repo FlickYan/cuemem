@@ -1,8 +1,10 @@
 [project]
 name = "cuemem"
 version = "0.1.0"
-description = "CueMem：线索驱动、可自我调控的多模态 Agent 长期记忆系统"
+description = "CueMem: cue-driven, self-regulating, multimodal long-term memory for LLM agents"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_prompts/LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.143",

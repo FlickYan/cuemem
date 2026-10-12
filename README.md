@@ -147,13 +147,15 @@ Development: `uv run pytest` (offline, no keys), `uv run pytest -m live` (needs 
 
 The project was built node by node, from N0 (design) to N10 (packaging). Every node's experiments, numbers and decisions are in the Chinese records above. The English documents cover the system and the final results.
 
-## Data and licences
+## Licence
 
-The datasets are downloaded by `cuemem data download` and are not redistributed:
+CueMem is released under the [MIT License](LICENSE).
+
+The LongMemEval and MemLens judge prompts included in the repository are also MIT-licensed; their notices are reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The evaluation datasets are downloaded by `cuemem data download`, are not redistributed, and keep their own licences:
 
 - LongMemEval_S (cleaned): MIT;
 - LoCoMo: CC BY-NC 4.0;
 - MemLens: CC BY 4.0, with images under their source sites' licences;
-- databricks-dolly-15k: CC BY-SA 3.0. The repository stores line numbers only.
+- databricks-dolly-15k: CC BY-SA 3.0.
 
-The demo store, its products and its photos are fictional; the images were generated with qwen-image-3.0.
+The repository stores only split IDs, Dolly line numbers and generated same-topic questions derived from the benchmarks; see the notices for how they are covered. The demo store, its products and its photos are fictional; the images were generated with qwen-image-3.0.

@@ -96,6 +96,14 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [设计决策记录](docs/decisions.md) | 每个重要取舍的背景、备选方案与理由 |
 | [演示指南](demo/README.md)（[English](demo/README.en.md)） | 3 分钟演示：准备、步骤、讲什么 |
 
+## 许可
+
+代码与文档以 [MIT 许可证](LICENSE) 发布。
+
+- 仓库里照搬的 LongMemEval 与 MemLens 判分提示词同样是 MIT 许可，原作者的声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 评测数据集由 `cuemem data download` 从发布方下载、不随仓库分发，各自的许可不变：LongMemEval_S（MIT）、LoCoMo（CC BY-NC 4.0）、MemLens（CC BY 4.0，图片沿用来源站点的许可）、databricks-dolly-15k（CC BY-SA 3.0）。
+- 仓库只存划分用的题号、Dolly 的行号，以及由基准题目生成的同话题问题。这些文件的归属在第三方声明里写明。
+
 ## 进度
 
 | 节点 | 内容 | 状态 |

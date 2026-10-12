@@ -1,6 +1,7 @@
 """判分。
 
-LongMemEval 的判分模板逐字照搬官方脚本 src/evaluation/evaluate_qa.py（get_anscheck_prompt），
+LongMemEval 的判分模板逐字照搬官方脚本 src/evaluation/evaluate_qa.py（get_anscheck_prompt；
+MIT License, Copyright (c) 2024 Di Wu，见仓库根目录的 THIRD_PARTY_NOTICES.md），
 调用方式也一致：只发一条 user 消息，temperature=0，max_tokens=10，回复中含 "yes" 即判为正确。
 LoCoMo 没有官方的 LLM 判分，沿用同一套模板（D-015），另外按原论文口径计算 token F1 作参考。
 MemLens 用官方 llm_judge.py 的提示词（按题型给评分标准与例子，逐字照搬，见 memlens_prompts/），
