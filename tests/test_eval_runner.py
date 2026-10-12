@@ -231,3 +231,51 @@ def test_consolidation_failure_only_affects_fact_methods(
     assert (summary.completed, summary.errors) == (3, 3)
     errors = load_rows(summary.run_dir, "errors.jsonl")
     assert {(e["method"], e["stage"]) for e in errors} == {("B2F", "consolidate")}
+
+
+def test_spaces_are_reused_across_runs(eval_settings: Settings, fake_api: FakeAPI) -> None:
+    """第二次运行（换个运行名）直接复用磁盘上的记忆空间：不再抽取，写入统计沿用首次构建的。"""
+    from scripted import ScriptedModel, echo_extraction
+
+    model = ScriptedModel(echo_extraction)
+    fake_api.chat_replies = [with_extraction(model)]
+    data = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    first = EvalRunner(
+        eval_settings,
+        RunConfig(name="first", dataset="longmemeval_s", split=None, methods=["B2F"], workers=1),
+        http_client=fake_api.client(),
+    ).run(data)
+    extractions = model.calls["extract"]
+    # 三份迷你历史的会话内容相同，相同的抽取请求命中响应缓存（单线程，结果确定）
+    assert extractions == 3
+    second = EvalRunner(
+        eval_settings,
+        RunConfig(name="second", dataset="longmemeval_s", split=None, methods=["B2F"], workers=1),
+        http_client=fake_api.client(),
+    ).run(data)
+    assert model.calls["extract"] == extractions  # 没有重新抽取
+    rows = load_rows(second.run_dir, "ingest.jsonl")
+    assert all(r.get("reused") for r in rows) and len(rows) == 6
+    built = {(r["space_key"], r["stage"]): r for r in load_rows(first.run_dir, "ingest.jsonl")}
+    for r in rows:
+        assert (
+            r["facts_extracted" if r["stage"] == "consolidate" else "units"]
+            == built[(r["space_key"], r["stage"])][
+                "facts_extracted" if r["stage"] == "consolidate" else "units"
+            ]
+        )
+    assert (second.completed, second.errors) == (3, 0)
+
+
+def test_resume_with_different_embedding_is_refused(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """同名运行换了向量模型：拒绝续跑，避免新旧结果混在一个目录里。"""
+    from cuemem.errors import ConfigMismatchError
+
+    run(eval_settings, fake_api, name="same", methods=["B0"])
+    other = eval_settings.model_copy(
+        update={"embedding": eval_settings.embedding.model_copy(update={"model": "other-model"})}
+    )
+    with pytest.raises(ConfigMismatchError, match="向量模型"):
+        run(other, fake_api, name="same", methods=["B0"])

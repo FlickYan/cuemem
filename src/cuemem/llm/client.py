@@ -81,6 +81,7 @@ class LLMClient:
         }
         self._lock = threading.Lock()
         self._notified: set[tuple[str, datetime]] = set()
+        self._inflight: dict[str, threading.Event] = {}  # 正在请求中的缓存键（相同请求合并）
 
     def chat(
         self,
@@ -116,16 +117,61 @@ class LLMClient:
                     "extra_body": spec.extra_body,
                 }
             )
-            cached = self.cache.get(key)
-            if cached is not None:
-                result = ChatResult.model_validate(
-                    {**cached, "role": role, "from_cache": True, "latency_ms": 0.0}
-                )
-                self._account(role, alias, spec, result)
-                return result
-            if self.settings.llm_cache_mode == "read_only":
-                raise CacheMissError(f"read_only 模式下缓存未命中：role={role}, model={alias}")
+            while True:
+                hit = self._from_cache(key, role, alias, spec)
+                if hit is not None:
+                    return hit
+                if self.settings.llm_cache_mode == "read_only":
+                    raise CacheMissError(f"read_only 模式下缓存未命中：role={role}, model={alias}")
+                # 相同请求合并（single-flight）：别的线程正在请求同样的内容时，等它的结果，
+                # 不重复花钱；它失败了（没写进缓存）就由本线程接着请求
+                waiting = self._claim(key)
+                if waiting is None:
+                    break
+                waiting.wait()
+        try:
+            return self._call_api(
+                role, alias, spec, messages, params, key if caching else "", cache_scope
+            )
+        finally:
+            if caching:
+                self._release(key)
 
+    def _from_cache(self, key: str, role: str, alias: str, spec: ModelSpec) -> ChatResult | None:
+        assert self.cache is not None
+        cached = self.cache.get(key)
+        if cached is None:
+            return None
+        result = ChatResult.model_validate(
+            {**cached, "role": role, "from_cache": True, "latency_ms": 0.0}
+        )
+        self._account(role, alias, spec, result)
+        return result
+
+    def _claim(self, key: str) -> threading.Event | None:
+        """登记"本线程正在请求 key"；已有别的线程在请求时，返回它完成时会触发的事件。"""
+        with self._lock:
+            event = self._inflight.get(key)
+            if event is None:
+                self._inflight[key] = threading.Event()
+            return event
+
+    def _release(self, key: str) -> None:
+        with self._lock:
+            event = self._inflight.pop(key, None)
+        if event is not None:
+            event.set()
+
+    def _call_api(
+        self,
+        role: str,
+        alias: str,
+        spec: ModelSpec,
+        messages: list[Message],
+        params: dict[str, Any],
+        key: str,
+        cache_scope: str | None,
+    ) -> ChatResult:
         self._peak_gate(spec.provider, role)
         create = cast(Any, self._client(spec.provider).chat.completions.create)
         started = time.perf_counter()
@@ -151,7 +197,7 @@ class LLMClient:
             latency_ms=latency_ms,
         )
         # 空回复不缓存：它往往是偶发问题，缓存后会被永久复现
-        if caching and (result.content or result.tool_calls):
+        if key and (result.content or result.tool_calls):
             assert self.cache is not None
             self.cache.put(
                 key,

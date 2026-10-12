@@ -55,7 +55,7 @@ class EntityMatches(BaseModel):
 
 
 def normalize_name(name: str) -> str:
-    return re.sub(r"[^0-9a-z一-鿿]+", " ", name.casefold()).strip()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", name.casefold()).strip()
 
 
 def is_generic(alias: str) -> bool:

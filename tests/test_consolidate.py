@@ -217,3 +217,26 @@ def test_content_filter_skips_session_or_falls_back_to_rules(
         assert jobs["s3"]["status"] == "done" and jobs["s3"]["stats"]["skipped"] == "content_filter"
         models = [r["model"] for r in fake_api.chat_requests]
         assert "deepseek-flash" in models  # 被拒后确实尝试了另一家
+
+
+def test_config_change_triggers_rebuild(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """影响巩固结果的配置（如阈值）变了：派生记忆自动重建；只改并发数不算。"""
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
+        memory.ingest(toy(), consolidate=True)
+        before = memory.consolidator.fingerprint()
+        assert not memory.consolidator.stale("demo")
+    faster = n3_settings.consolidation.model_copy(update={"workers": 7})
+    with MemorySystem.from_settings(
+        n3_settings.model_copy(update={"consolidation": faster}), http_client=fake_api.client()
+    ) as memory:
+        assert memory.consolidator.fingerprint() == before
+        assert not memory.consolidator.stale("demo")
+    changed = n3_settings.consolidation.model_copy(update={"profile_min_importance": 5})
+    with MemorySystem.from_settings(
+        n3_settings.model_copy(update={"consolidation": changed}), http_client=fake_api.client()
+    ) as memory:
+        assert memory.consolidator.stale("demo")
+        report = memory.consolidate("demo")  # 自动重建：5 个会话全部重放（命中缓存）
+        assert report.sessions == 5 and not memory.consolidator.stale("demo")

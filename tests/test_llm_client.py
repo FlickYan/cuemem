@@ -153,3 +153,31 @@ def test_content_filter_falls_back_to_other_provider(settings: Settings, fake_ap
         "qwen3.8-flash",
         "deepseek-flash",
     ]  # 被拒的请求不重试、不缓存
+
+
+def test_identical_concurrent_requests_are_coalesced(settings: Settings, fake_api: FakeAPI) -> None:
+    """两个线程同时发出同样的请求：只调用一次 API，另一个等结果（single-flight）。"""
+    import threading
+    import time
+
+    started, release = threading.Event(), threading.Event()
+
+    def slow(body: dict[str, object]) -> str:
+        started.set()
+        release.wait(5)
+        return "ok"
+
+    fake_api.chat_replies = [slow]
+    client = make_client(settings, fake_api)
+    results = []
+    first = threading.Thread(target=lambda: results.append(client.chat("reader", HELLO)))
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=lambda: results.append(client.chat("reader", HELLO)))
+    second.start()
+    time.sleep(0.1)  # 让第二个线程进入等待
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert len(fake_api.chat_requests) == 1
+    assert sorted(r.from_cache for r in results) == [False, True]

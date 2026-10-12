@@ -9,6 +9,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from types import TracebackType
 from typing import Literal
 
@@ -24,6 +25,7 @@ from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.read.facts import FactAugmentedRetriever, MemoryView, Validity
+from cuemem.read.l1 import L1Config, L1Retriever
 from cuemem.read.naive import NaiveRetriever
 from cuemem.read.reader import Reader
 from cuemem.store.sqlite import MemoryDB
@@ -36,7 +38,7 @@ from cuemem.write.consolidate import (
 )
 from cuemem.write.online import IngestReport, OnlineWriter
 
-AskMode = Literal["facts", "naive"]
+AskMode = Literal["l1", "facts", "naive"]
 
 
 @dataclass
@@ -76,6 +78,7 @@ class MemorySystem:
         self.consolidator = Consolidator(db, vectors, embedder, llm, settings.consolidation)
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
+        self.l1 = L1Retriever(db, vectors, embedder)
         self.reader = Reader(llm)
         self.worker: ConsolidationWorker | None = None
 
@@ -115,6 +118,36 @@ class MemorySystem:
             settings,
             db=MemoryDB(None),
             vectors=VectorStore(None, dim=embedder.dim),
+            embedder=embedder,
+            llm=llm,
+            ledger=ledger,
+            owns_ledger=False,
+        )
+
+    @classmethod
+    def on_disk(
+        cls,
+        settings: Settings,
+        directory: Path,
+        *,
+        embedder: TextEmbedder,
+        llm: LLMClient,
+        ledger: Ledger,
+    ) -> MemorySystem:
+        """评测用：每道题（每份对话历史）一个磁盘目录，写入与巩固的结果跨运行复用。
+
+        换了向量模型会在打开时报 ConfigMismatchError，调用方应删掉目录重建。
+        """
+        db = MemoryDB(directory / "memory.sqlite")
+        try:
+            db.check_or_set_meta("embedder", f"{embedder.name}:{embedder.dim}")
+        except Exception:
+            db.close()
+            raise
+        return cls(
+            settings,
+            db=db,
+            vectors=VectorStore(directory / "qdrant", dim=embedder.dim),
             embedder=embedder,
             llm=llm,
             ledger=ledger,
@@ -264,18 +297,37 @@ class MemorySystem:
         *,
         question_time: datetime | None = None,
         k: int | None = None,
-        mode: AskMode = "facts",
+        mode: AskMode = "l1",
         validity: Validity = "full",
         show_facts: bool = True,
         profile: bool = True,
         fact_keys: bool = True,
+        l1: L1Config | None = None,
+        relative_time: bool = True,
     ) -> Answer:
-        """检索并回答。mode="naive" 是 B2 基线（只检索"轮"）；mode="facts" 用上巩固出的事实、
-        有效期与核心记忆（B2F）。还没巩固过的空间，facts 模式退化为 naive 加空的事实区。"""
+        """检索并回答。
+
+        - mode="l1"（默认）：L1 快速召回——多粒度混合检索、时间感知、时间感知打包（N4）；
+        - mode="facts"：B2F，dense 检索 + 事实增强键 + 带有效期的事实 + 核心记忆（N3）；
+        - mode="naive"：B2 基线，只在"轮"上做 dense 检索。
+        还没巩固过的空间，l1 与 facts 模式也能用（只是没有事实可用）。
+        """
         when = question_time or datetime.now()
         cache_scope = scope(space_id, "ask")
         with start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace:
-            if mode == "naive":
+            if mode == "l1":
+                cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
+                result = self.l1.search(space_id, question, when, cfg)
+                answer = self.reader.answer_with_memory(
+                    question,
+                    MemoryView(rounds=result.rounds, facts=result.facts, core=result.core),
+                    question_time=when,
+                    show_facts=show_facts,
+                    profile=profile,
+                    relative_time=relative_time,
+                    cache_scope=cache_scope,
+                )
+            elif mode == "naive":
                 hits = self.search(space_id, question, k)
                 answer = self.reader.answer(
                     question, hits, question_time=when, cache_scope=cache_scope

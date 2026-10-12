@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 from cuemem.core.models import CoreMemory, Fact, FactHit, Hit
@@ -124,28 +125,49 @@ class FactAugmentedRetriever:
         current_only: bool,
         chain: bool,
     ) -> list[FactHit]:
-        ordered = sorted(scores, key=lambda fid: (-scores[fid], fid))
-        chosen = [
-            FactHit(fact=facts[fid], score=scores[fid])
-            for fid in ordered
-            if fid in facts and (facts[fid].is_current or not current_only)
-        ][:fact_k]
-        if not chain or current_only:
-            return chosen
-        # 沿版本链补齐：命中旧版本时带出取代它的新版本，命中新版本时带出它取代的旧版本
-        present = {fh.fact.id for fh in chosen}
-        successors = [fh.fact.superseded_by for fh in chosen if fh.fact.superseded_by]
-        linked = self.db.get_facts(space_id, ids=[i for i in successors if i not in present])
-        linked += self.db.get_facts(space_id, superseded_by=sorted(present))
-        for fact in linked:
-            if fact.id not in present:
-                present.add(fact.id)
-                chosen.append(FactHit(fact=fact, score=scores.get(fact.id, 0.0), via_chain=True))
+        return choose_facts(
+            self.db, space_id, facts, scores, fact_k, current_only=current_only, chain=chain
+        )
+
+
+def choose_facts(
+    db: MemoryDB,
+    space_id: str,
+    facts: dict[str, Fact],
+    scores: dict[str, float],
+    fact_k: int,
+    *,
+    current_only: bool,
+    chain: bool,
+) -> list[FactHit]:
+    """按分数取前 fact_k 条事实。
+
+    chain=True 时沿版本链补齐：命中旧版本带出取代它的新版本，命中新版本带出它取代的旧版本。
+    """
+    ordered = sorted(scores, key=lambda fid: (-scores[fid], fid))
+    chosen = [
+        FactHit(fact=facts[fid], score=scores[fid])
+        for fid in ordered
+        if fid in facts and (facts[fid].is_current or not current_only)
+    ][:fact_k]
+    if not chain or current_only:
         return chosen
+    present = {fh.fact.id for fh in chosen}
+    successors = [fh.fact.superseded_by for fh in chosen if fh.fact.superseded_by]
+    linked = db.get_facts(space_id, ids=[i for i in successors if i not in present])
+    linked += db.get_facts(space_id, superseded_by=sorted(present))
+    for fact in linked:
+        if fact.id not in present:
+            present.add(fact.id)
+            chosen.append(FactHit(fact=fact, score=scores.get(fact.id, 0.0), via_chain=True))
+    return chosen
 
 
 def format_facts(
-    facts: Sequence[FactHit], *, validity: Validity = "full"
+    facts: Sequence[FactHit],
+    *,
+    validity: Validity = "full",
+    question_time: datetime | None = None,
 ) -> tuple[str, dict[str, str]]:
     """按主语和时间排列事实并编号（f1、f2……），返回（上下文文本，编号 → 事实 ID）。
 
@@ -158,6 +180,9 @@ def format_facts(
     for fh in ordered:
         fact = fh.fact
         notes = [f"said on {day(fact.recorded_at)}"]
+        if question_time is not None:
+            days = (question_time.date() - fact.recorded_at.date()).days
+            notes[0] += f", {days} days before the question"
         if fact.valid_from and fact.valid_from != day(fact.recorded_at):
             notes.append(("happened " if fact.category == "event" else "since ") + fact.valid_from)
         if validity == "full":

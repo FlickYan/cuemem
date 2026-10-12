@@ -116,7 +116,7 @@ _CANONICAL = {alias: canon for canon, aliases in SYNONYMS.items() for alias in a
 
 def normalize_predicate(predicate: str) -> str:
     """转成 snake_case 并归并同义词：'Lives In' → 'lives_in'，'employer' → 'works_at'。"""
-    text = re.sub(r"[^0-9a-zA-Z一-鿿]+", "_", predicate.strip().lower()).strip("_")
+    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", predicate.strip().lower()).strip("_")
     text = text or "related_to"
     return _CANONICAL.get(text, text)
 
@@ -132,5 +132,5 @@ def registered_cardinality(predicate: str) -> Cardinality | None:
 
 def normalize_value(text: str) -> str:
     """比较宾语是否相同时用的规范形式：小写、去标点与多余空白、去掉常见冠词。"""
-    flat = re.sub(r"[^0-9a-z一-鿿]+", " ", text.lower()).strip()
+    flat = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", text.lower()).strip()
     return re.sub(r"^(the|a|an|my) ", "", flat)

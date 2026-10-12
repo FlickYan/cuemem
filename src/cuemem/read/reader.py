@@ -36,17 +36,40 @@ class ReaderOutput(BaseModel):
     )
 
 
-def format_memories(hits: Sequence[Hit]) -> tuple[str, dict[str, str]]:
-    """按时间顺序排列证据并编号，返回（上下文文本，编号 → 记忆单元 ID）。"""
+def format_memories(
+    hits: Sequence[Hit], *, question_time: datetime | None = None
+) -> tuple[str, dict[str, str]]:
+    """按时间顺序排列证据并编号，返回（上下文文本，编号 → 记忆单元 ID）。
+
+    给了 question_time 时，每条再标上"距提问几天"（时间感知打包，N4）：
+    让 reader 少做日期运算，"几天前""哪个先发生"这类问题直接有据可依。
+    """
     ordered = sorted(hits, key=lambda h: (h.unit.ts, h.unit.id))
     refs: dict[str, str] = {}
     blocks: list[str] = []
     for i, hit in enumerate(ordered, start=1):
         ref = f"m{i}"
         refs[ref] = hit.unit.id
-        header = f"[{ref}] {hit.unit.ts:%Y-%m-%d (%a) %H:%M} · session {hit.unit.session_id}"
+        header = f"[{ref}] {hit.unit.ts:%Y-%m-%d (%a) %H:%M}"
+        if question_time is not None:
+            header += f" · {relative_days(hit.unit.ts, question_time)}"
+        header += f" · session {hit.unit.session_id}"
         blocks.append(f"{header}\n{hit.unit.text}")
     return "\n\n".join(blocks), refs
+
+
+def relative_days(moment: datetime, question_time: datetime) -> str:
+    days = (question_time.date() - moment.date()).days
+    if days == 0:
+        return "the same day as the question"
+    if days < 0:
+        return f"{-days} days after the question"
+    unit = "day" if days == 1 else "days"
+    if days < 14:
+        return f"{days} {unit} before the question"
+    if days < 60:
+        return f"{days} days (about {round(days / 7)} weeks) before the question"
+    return f"{days} days (about {round(days / 30.4)} months) before the question"
 
 
 class Reader:
@@ -91,9 +114,12 @@ class Reader:
         validity: Validity = "full",
         show_facts: bool = True,
         profile: bool = True,
+        relative_time: bool = False,
         cache_scope: str | None = None,
     ) -> Answer:
-        """事实增强检索（B2F）的回答：核心记忆 + 带有效期的事实 + 原始对话片段。
+        """事实增强检索（B2F）与 L1 的回答：核心记忆 + 带有效期的事实 + 原始对话片段。
+
+        relative_time=True 时（L1 的时间感知打包），对话片段与事实都标上距提问几天。
 
         系统提示与其他方法完全相同，事实的格式说明放在上下文里，保证方法之间只差"给它看什么"。
         """
@@ -104,10 +130,11 @@ class Reader:
             blocks.append(f"About {who} (core memory, current facts):\n{view.core.text}")
         facts = [fh for fh in view.facts if fh.fact.is_current or validity != "current"]
         fact_refs: dict[str, str] = {}
+        when = question_time if relative_time else None
         if show_facts and facts:
-            text, fact_refs = format_facts(facts, validity=validity)
+            text, fact_refs = format_facts(facts, validity=validity, question_time=when)
             blocks.append(text)
-        context, round_refs = format_memories(view.rounds)
+        context, round_refs = format_memories(view.rounds, question_time=when)
         blocks.append(f"Retrieved conversation excerpts:\n{context or '(none)'}")
         output = self._read(
             question,

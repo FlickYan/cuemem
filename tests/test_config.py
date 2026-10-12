@@ -40,7 +40,7 @@ def test_env_overrides_are_deep_merged(clean_env: None, monkeypatch: pytest.Monk
     assert loaded.roles["reader"].temperature == 0.0  # 其余字段仍来自 YAML
     assert loaded.roles["judge"].model == "qwen3.8-max"  # 其他角色不受影响
     assert loaded.embedding.dim == 512
-    assert loaded.embedding.model == "text-embedding-v4"
+    assert loaded.embedding.model == "qwen3.7-text-embedding"
 
 
 def test_unknown_model_reference_is_rejected(

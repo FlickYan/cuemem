@@ -1,9 +1,11 @@
 """评测报告：把 results.jsonl 汇总成 Markdown 表格，并画"准确率–成本"散点图。
 
-图按可视化规范绘制：系列颜色按方法固定分配（不随排名变化），散点图最多 3 个系列色，
-分给三种可部署的方法（B1、B2、B2F）；B0（下限）与 ORACLE（上限）是参照点，用中性色空心
-标记，形状不同；消融变体只出现在表格里。浅色、深色各渲染一张，Markdown 里用 <picture>
-按读者的主题自动切换。图中文字用英文，避免 CI 环境缺少中文字体。
+图按可视化规范绘制：系列颜色按方法固定分配（不随排名变化），散点图最多 3 个系列色
+（蓝 / 青 / 黄，已用 validate_palette.js 在 --pairs all 下验证深浅两套），分给检索方法 B2、
+B2F、B4；B0（下限）、B1（全上下文）与 ORACLE（上限）是参照点，用中性色空心标记、形状区分；
+消融变体只出现在表格里。N4 之前 B1 用橙色，从 N4 起改为参照点，橙色不再分给别的方法。
+浅色、深色各渲染一张，Markdown 里用 <picture> 按读者的主题自动切换。图中文字用英文，
+避免 CI 环境缺少中文字体。
 """
 
 from __future__ import annotations
@@ -36,11 +38,18 @@ METHOD_LABELS = {
     "B2F-current": ("消融：只给当前事实（覆盖式更新）", "B2F current facts only"),
     "B2F-plain": ("消融：事实不标有效期", "B2F no validity labels"),
     "B2F-noprofile": ("消融：不给核心记忆", "B2F no core memory"),
+    "B4": ("L1 快速召回", "B4 L1 fast recall"),
+    "B4-k10": ("消融：固定取 10 轮", "B4 top-10 rounds"),
+    "B4-k5": ("消融：固定取 5 轮", "B4 top-5 rounds"),
+    "B4-b2k": ("消融：预算 2k tokens", "B4 2k-token budget"),
+    "B4-notime": ("消融：不做时间加分", "B4 no time boost"),
+    "B4-norel": ("消融：不标相对时间", "B4 no relative time"),
+    "B4-nobm25": ("消融：去掉 BM25", "B4 no BM25"),
     "ORACLE": ("只给证据会话（上限参照）", "Oracle: evidence only"),
 }
 METHOD_ORDER = list(METHOD_LABELS)
-PLOTTED = {"B0", "B1", "B2", "B2F", "ORACLE"}  # 消融变体只进表格，不进图
-REFERENCE_MARKERS = {"B0": "s", "ORACLE": "o"}  # 参照点：中性色空心，形状区分
+PLOTTED = {"B0", "B1", "B2", "B2F", "B4", "ORACLE"}  # 消融变体只进表格，不进图
+REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o"}  # 参照点：中性色空心，形状区分
 
 TYPE_LABELS = {
     "single-session-user": "单会话 · 用户说过",
@@ -57,9 +66,10 @@ TYPE_LABELS = {
 }
 
 RETRIEVAL_LABELS = {
-    "session_recall_any": ("会话召回（任一）", "前 k 条里至少命中一个证据会话的比例"),
-    "session_recall_all": ("会话召回（全部）", "证据会话被前 k 条覆盖的平均比例"),
-    "turn_recall_any": ("发言召回（任一）", "前 k 条里至少有一条包含证据发言的比例"),
+    "session_recall_any": ("会话召回（任一）", "检索结果里至少命中一个证据会话的比例"),
+    "session_recall_all": ("会话召回（全部）", "证据会话被检索结果覆盖的平均比例"),
+    "turn_recall_any": ("发言召回（任一）", "检索结果里至少有一条包含证据发言的比例"),
+    "turn_recall_all": ("发言召回（全部）", "包含证据发言的轮被检索结果覆盖的平均比例"),
     "turn_ndcg": ("发言 NDCG", "包含证据发言的轮排得越靠前越高"),
 }
 
@@ -84,7 +94,7 @@ THEMES = {
         muted="#898781",
         grid="#e1e0d9",
         axis="#c3c2b7",
-        series={"B2F": "#2a78d6", "B1": "#eb6834", "B2": "#1baf7a"},
+        series={"B2F": "#2a78d6", "B2": "#1baf7a", "B4": "#eda100"},
     ),
     "dark": Theme(
         surface="#1a1a19",
@@ -93,7 +103,7 @@ THEMES = {
         muted="#898781",
         grid="#2c2c2a",
         axis="#383835",
-        series={"B2F": "#3987e5", "B1": "#d95926", "B2": "#199e70"},
+        series={"B2F": "#3987e5", "B2": "#199e70", "B4": "#c98500"},
     ),
 }
 
@@ -114,6 +124,8 @@ class MethodStats:
     latency_p50: float
     latency_p95: float
     retrieval: dict[str, float]
+    rounds: float | None  # 平均交给回答模型的轮数（与检索指标同口径：不含拒答题）
+    uses_facts: bool
     judge_cost: float
     f1: float | None
 
@@ -146,9 +158,12 @@ def method_stats(rows: Sequence[dict[str, Any]]) -> list[MethodStats]:
                 types[r["question_type"]].append(c)
         abstained = [c for r, c in zip(items, correct, strict=True) if r["is_abstention"]]
         retrieval: dict[str, list[float]] = defaultdict(list)
+        rounds = []
         for r in items:
             for key, value in (r.get("retrieval") or {}).items():
                 retrieval[key].append(value)
+            if r.get("retrieval"):
+                rounds.append(len(r.get("retrieved") or []))
         # 延迟只统计真的调用了模型的题：命中本地缓存的回答没有意义上的延迟
         latencies = [
             r["usage"]["latency_ms"]
@@ -172,6 +187,8 @@ def method_stats(rows: Sequence[dict[str, Any]]) -> list[MethodStats]:
                 latency_p50=percentile(latencies, 50),
                 latency_p95=percentile(latencies, 95),
                 retrieval={k: mean(v) for k, v in retrieval.items()},
+                rounds=mean(rounds) if rounds else None,
+                uses_facts=any(r.get("retrieved_facts") for r in items),
                 judge_cost=sum(r["judge_usage"]["cost"] for r in items),
                 f1=mean(f1s) if f1s else None,
             )
@@ -205,7 +222,7 @@ def build_report(run_dir: Path) -> Path:
 
 def error_attribution(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, int]]:
     """把检索类方法答错的题分成三类（拒答题除外）：
-    - retrieval_miss：前 k 条里没有任何证据发言；
+    - retrieval_miss：交给回答模型的轮里没有任何证据发言；
     - noisy_or_incomplete：命中了证据但答错，而 ORACLE 答对——检索结果干扰多或证据不全；
     - reading：连 ORACLE 也答错——问题主要在阅读与推理。
     没有跑 ORACLE 时，后两类合并为 hit_but_wrong。
@@ -228,7 +245,7 @@ def error_attribution(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, int
 
 
 ATTRIBUTION_LABELS = {
-    "retrieval_miss": "检索未命中：前 k 条里没有任何证据发言",
+    "retrieval_miss": "检索未命中：交给回答模型的轮里没有任何证据发言",
     "noisy_or_incomplete": "命中证据但答错，ORACLE 答对：干扰多或证据不全",
     "reading": "ORACLE 也答错：阅读与推理问题",
     "hit_but_wrong": "命中证据但答错（未跑 ORACLE，无法细分）",
@@ -299,9 +316,19 @@ def render_markdown(
 
     with_retrieval = [s for s in stats if s.retrieval]
     if with_retrieval:
-        lines += ["", f"## 检索质量（前 k = {cfg['k']} 条，不含拒答题）", ""]
+        lines += [
+            "",
+            "## 检索质量（不含拒答题）",
+            "",
+            "检索结果指交给回答模型的全部轮：固定条数的方法取前 k 轮，按 token 预算装入的方法"
+            "（B4 系列）轮数随每轮的长短变化。轮数不同的方法，召回不能直接比较。",
+            "",
+        ]
         lines.append("| 指标 | " + " | ".join(s.method for s in with_retrieval) + " | 含义 |")
         lines.append("|---|" + "---|" * len(with_retrieval) + "---|")
+        if all(s.rounds is not None for s in with_retrieval):
+            cells = " | ".join(f"{s.rounds:.1f}" for s in with_retrieval)
+            lines.append(f"| 平均轮数 | {cells} | 每题交给回答模型的轮数 |")
         for key, (name, meaning) in RETRIEVAL_LABELS.items():
             if any(key in s.retrieval for s in with_retrieval):
                 cells = " | ".join(
@@ -309,7 +336,8 @@ def render_markdown(
                 )
                 lines.append(f"| {name} | {cells} | {meaning} |")
 
-    attribution = error_attribution(rows)
+    found = error_attribution(rows)
+    attribution = {s.method: found[s.method] for s in stats if s.method in found}  # 按方法顺序
     if attribution:
         lines += ["", "## 错误归因（检索类方法答错的题，不含拒答题）", ""]
         lines += ["| 原因 | " + " | ".join(attribution) + " |", "|---|" + "---|" * len(attribution)]
@@ -341,9 +369,11 @@ def render_markdown(
         f"{ingest_tokens:,} tokens；检索类方法需要，一次写入可服务多次提问 |"
     )
     if consolidated:
+        families = "、".join(dict.fromkeys(s.method.split("-")[0] for s in stats if s.uses_facts))
         lines.append(
             f"| 巩固（抽取、对账、摘要） | ${consolidate_cost:.4f} | "
-            f"{len(consolidated)} 份对话历史；只有 B2F 系列需要，同样是一次性成本 |"
+            f"{len(consolidated)} 份对话历史；只有 {families or '用到事实的方法'} 系列需要，"
+            "同样是一次性成本 |"
         )
     total = answer_cost + ingest_cost + consolidate_cost + judge_cost
     lines += [
@@ -497,56 +527,91 @@ def plot_pareto(
 def _place_labels(
     fig: Figure, ax: Axes, points: Sequence[MethodStats], legend: Legend, theme: Theme
 ) -> None:
-    """直接标签的防碰撞摆放：依次尝试右上、右下、左上、左下，避开点、区间竖线、图例与已放的标签。"""
+    """直接标签的防碰撞摆放：先试紧贴点的四个方位（右上、右下、左上、左下），都放不下时
+    逐步拉远并画一条细引线连回自己的点；避开点、区间竖线、图例与已放的标签。"""
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()  # type: ignore[attr-defined]
     to_px = ax.transData.transform
-    occupied: list[Bbox] = [legend.get_window_extent(renderer)]
+    # 每个障碍物记下属于哪个方法：摆某个点的标签时，它自己的点和区间竖线不算障碍
+    occupied: list[tuple[str, Bbox]] = [("", legend.get_window_extent(renderer))]
     for s in points:
         cx, cy = to_px((s.cost, s.accuracy * 100))
-        occupied.append(Bbox.from_extents(cx - 9, cy - 9, cx + 9, cy + 9))
+        occupied.append((s.method, Bbox.from_extents(cx - 9, cy - 9, cx + 9, cy + 9)))
         _, low = to_px((s.cost, s.ci[0] * 100))
         _, high = to_px((s.cost, s.ci[1] * 100))
-        occupied.append(Bbox.from_extents(cx - 6, low, cx + 6, high))  # 竖线两侧留出间距
+        occupied.append((s.method, Bbox.from_extents(cx - 6, low, cx + 6, high)))
     area = ax.get_window_extent(renderer)
-    candidates = [
-        (8, 5, "left", "bottom"),
-        (8, -5, "left", "top"),
-        (-8, 5, "right", "bottom"),
-        (-8, -5, "right", "top"),
+    candidates: list[tuple[float, float, str, str]] = []
+    offsets = [(8.0, 5.0), (8.0, -5.0), (-8.0, 5.0), (-8.0, -5.0)] + [
+        (sx * 14.0, sy * d) for d in (22.0, 36.0, 50.0) for sx in (1, -1) for sy in (1, -1)
     ]
+    for ox, oy in offsets:
+        candidates.append((ox, oy, "left" if ox > 0 else "right", "bottom" if oy > 0 else "top"))
     centers = {s.method: to_px((s.cost, s.accuracy * 100)) for s in points}
     for s in sorted(points, key=lambda p: p.cost):
         anchor = (s.cost, s.accuracy * 100)
-        own = Bbox.from_extents(*(to_px(anchor) - 9), *(to_px(anchor) + 9))
-        others = [box for box in occupied if not _same(box, own)]
+        others = [box for owner, box in occupied if owner != s.method]
         neighbours = [c for m, c in centers.items() if m != s.method]
-        text = None
-        for dx, dy, ha, va in candidates:
-            if text is not None:
-                text.remove()
-            text = ax.annotate(
-                f"{_label_en(s.method)}  {s.accuracy:.0%}",
-                anchor,
-                xytext=(dx, dy),
-                textcoords="offset points",
-                ha=ha,
-                va=va,
-                color=theme.ink2,
-                fontsize=8.5,
-                zorder=4,
-            )
+        best: tuple[float, tuple[float, float, str, str]] | None = None
+        chosen = None
+        for candidate in candidates:
+            text = _draw_label(ax, s, anchor, candidate, theme)
             box = text.get_window_extent(renderer).padded(3)
             inside = (
                 area.x0 <= box.x0 and box.x1 <= area.x1 and area.y0 <= box.y0 and box.y1 <= area.y1
             )
-            # 标签必须离自己的点最近：两个点挨得很近时，否则读者会把标签对到另一个点上
+            # 紧贴摆放时，标签必须离自己的点最近，否则读者会把标签对到另一个点上；有引线时不需要
             mine = _distance(box, centers[s.method])
-            ambiguous = any(_distance(box, c) < mine + 6 for c in neighbours)
-            if inside and not ambiguous and not any(box.overlaps(o) for o in others):
+            leader = abs(candidate[1]) > 5
+            ambiguous = not leader and any(_distance(box, c) < mine + 6 for c in neighbours)
+            # 代价：越界最重，其次是贴得离别的点更近（会对错号），再次是与其他元素的重叠面积
+            clashes = (
+                sum(_overlap(box, o) for o in others)
+                + (0 if inside else 1e6)
+                + (1e5 if ambiguous else 0)
+            )
+            text.remove()
+            if clashes == 0:
+                chosen = candidate
                 break
-        if text is not None:
-            occupied.append(text.get_window_extent(renderer))
+            if best is None or clashes < best[0]:
+                best = (clashes, candidate)
+        if chosen is None and best is not None:  # 都放不下：选重叠面积最小的位置
+            chosen = best[1]
+        if chosen is not None:
+            text = _draw_label(ax, s, anchor, chosen, theme)
+            occupied.append((s.method, text.get_window_extent(renderer)))
+
+
+def _draw_label(
+    ax: Axes,
+    s: MethodStats,
+    anchor: tuple[float, float],
+    candidate: tuple[float, float, str, str],
+    theme: Theme,
+) -> Any:
+    dx, dy, ha, va = candidate
+    leader = abs(dy) > 5  # 离点较远时画引线，读者能对上是哪个点
+    return ax.annotate(
+        f"{_label_en(s.method)}  {s.accuracy:.0%}",
+        anchor,
+        xytext=(dx, dy),
+        textcoords="offset points",
+        ha=ha,
+        va=va,
+        color=theme.ink2,
+        fontsize=8.5,
+        zorder=4,
+        arrowprops=(
+            {"arrowstyle": "-", "color": theme.muted, "lw": 0.6, "shrinkB": 5} if leader else None
+        ),
+    )
+
+
+def _overlap(a: Bbox, b: Bbox) -> float:
+    width = min(a.x1, b.x1) - max(a.x0, b.x0)
+    height = min(a.y1, b.y1) - max(a.y0, b.y0)
+    return max(0.0, width) * max(0.0, height)
 
 
 def _distance(box: Bbox, point: Any) -> float:
@@ -554,10 +619,6 @@ def _distance(box: Bbox, point: Any) -> float:
     dx = max(box.x0 - point[0], 0.0, point[0] - box.x1)
     dy = max(box.y0 - point[1], 0.0, point[1] - box.y1)
     return float((dx * dx + dy * dy) ** 0.5)
-
-
-def _same(a: Bbox, b: Bbox) -> bool:
-    return bool(abs(a.x0 - b.x0) < 0.5 and abs(a.y0 - b.y0) < 0.5)
 
 
 # ---------- 辅助 ----------

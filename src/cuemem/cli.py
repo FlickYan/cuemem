@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import typer
 from rich.console import Console
@@ -33,7 +33,7 @@ from cuemem.config import Settings, env_file_path, load_settings
 from cuemem.core.models import Answer, Conversation, Fact
 from cuemem.embed import build_embedder
 from cuemem.envfile import mask, read_env, update_env
-from cuemem.errors import CueMemError
+from cuemem.errors import ConfigMismatchError, CueMemError
 from cuemem.evals.audit import export_audit, score_audit
 from cuemem.evals.datasets import DATASETS, EvalSet, dataset_path
 from cuemem.evals.datasets import download as download_dataset
@@ -44,7 +44,7 @@ from cuemem.evals.splits import load_split, save_split, stratified_ids
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.llm.peak import describe, next_peak_start, peak_end
-from cuemem.memory import MemorySystem
+from cuemem.memory import AskMode, MemorySystem
 from cuemem.store.sqlite import MemoryDB
 from cuemem.write.consolidate import ConsolidationReport
 
@@ -210,18 +210,19 @@ def ask(
     ] = None,
     show_context: Annotated[bool, typer.Option("--show-context", help="显示检索到的记忆")] = False,
     mode: Annotated[
-        str, typer.Option(help="facts：事实增强检索（B2F，默认）；naive：朴素检索（B2）")
-    ] = "facts",
+        str,
+        typer.Option(
+            help="l1：L1 快速召回（默认）；facts：事实增强检索（B2F）；naive：朴素检索（B2）"
+        ),
+    ] = "l1",
 ) -> None:
     """检索记忆并回答问题。"""
-    if mode not in ("facts", "naive"):
-        console.print("[red]--mode 只能是 facts 或 naive[/red]")
+    if mode not in ("l1", "facts", "naive"):
+        console.print("[red]--mode 只能是 l1、facts 或 naive[/red]")
         raise typer.Exit(1)
     with _open_system() as system:
         started = time.perf_counter()
-        answer = system.ask(
-            space, question, question_time=at, k=k, mode="naive" if mode == "naive" else "facts"
-        )
+        answer = system.ask(space, question, question_time=at, k=k, mode=cast(AskMode, mode))
         elapsed = (time.perf_counter() - started) * 1000
         if show_context:
             _print_hits(answer)
@@ -517,7 +518,12 @@ def eval_run(
             on_advance=lambda: progress.advance(task),
             on_peak_wait=on_peak_wait,
         )
-        summary = runner.run(evalset)
+        try:
+            summary = runner.run(evalset)
+        except ConfigMismatchError as exc:
+            progress.stop()
+            console.print(f"[red]错误：[/red]{exc}")
+            raise typer.Exit(1) from exc
     report_path = build_report(summary.run_dir)
     note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
     console.print(

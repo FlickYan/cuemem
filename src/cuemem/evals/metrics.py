@@ -44,11 +44,12 @@ def retrieval_metrics(
     evidence_turns: Collection[tuple[str, int]],
     relevant_units: int,
 ) -> dict[str, float]:
-    """在给定命中列表上计算检索指标（命中列表本身就是前 k 条）。
+    """在给定命中列表上计算检索指标（命中列表就是交给回答模型的全部轮）。
 
     - session_recall_any：是否至少命中一个证据会话；
     - session_recall_all：证据会话被命中的比例；
     - turn_recall_any：是否至少有一条命中包含证据发言；
+    - turn_recall_all：包含证据发言的轮被命中的比例（多会话题需要全部证据，N4 起）；
     - turn_ndcg：以"包含证据发言的轮"为相关项的 NDCG，relevant_units 为理想情况下的相关轮数。
     """
     sessions = set(evidence_sessions)
@@ -65,5 +66,6 @@ def retrieval_metrics(
             1 / math.log2(rank + 1) for rank in range(1, min(relevant_units, len(hits)) + 1)
         )
         metrics["turn_recall_any"] = float(any(relevant))
+        metrics["turn_recall_all"] = min(1.0, sum(relevant) / relevant_units)
         metrics["turn_ndcg"] = dcg / ideal if ideal else 0.0
     return metrics

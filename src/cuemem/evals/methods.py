@@ -14,6 +14,7 @@ from cuemem.core.models import FactHit, Hit
 from cuemem.evals.datasets import EvalSession, Sample, to_session_ins
 from cuemem.memory import MemorySystem
 from cuemem.read.facts import Validity
+from cuemem.read.l1 import L1Config
 from cuemem.read.reader import Reader, format_history
 
 
@@ -128,6 +129,33 @@ class FactRAG:
         return MethodOutput(a.answer, a.evidence_sufficient, hits=a.hits, facts=a.facts)
 
 
+class L1RAG:
+    """B4：L1 快速召回（N4）——轮、事实、摘要的 dense + BM25 混合检索，模态内取最大后 RRF 融合，
+    时间感知加分与时间感知打包；外加 N3 的带有效期事实与核心记忆。不调用额外的 LLM。"""
+
+    needs_index, needs_consolidation = True, True
+
+    def __init__(
+        self, name: str, label: str, config: L1Config, *, relative_time: bool = True
+    ) -> None:
+        self.name = name
+        self.label = label
+        self.config = config
+        self.relative_time = relative_time
+
+    def answer(self, ctx: MethodContext) -> MethodOutput:
+        assert ctx.system is not None
+        a = ctx.system.ask(
+            ctx.space_id,
+            ctx.sample.question,
+            question_time=ctx.sample.question_time,
+            mode="l1",
+            l1=self.config,
+            relative_time=self.relative_time,
+        )
+        return MethodOutput(a.answer, a.evidence_sufficient, hits=a.hits, facts=a.facts)
+
+
 class OracleSessions:
     """上限参照：只给标注的证据会话。它衡量"检索完美时 reader 能答对多少"，不是可部署的方法。"""
 
@@ -153,6 +181,13 @@ METHOD_NAMES = (
     "B2F-current",
     "B2F-plain",
     "B2F-noprofile",
+    "B4",
+    "B4-k10",
+    "B4-k5",
+    "B4-b2k",
+    "B4-notime",
+    "B4-norel",
+    "B4-nobm25",
     "ORACLE",
 )
 
@@ -174,6 +209,14 @@ def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
         # 消融：事实照给，但不标注有效状态、不沿版本链补齐
         "B2F-plain": lambda: FactRAG("B2F-plain", "事实不标有效期", k=k, validity="none"),
         "B2F-noprofile": lambda: FactRAG("B2F-noprofile", "不给核心记忆", k=k, profile=False),
+        # B4：L1 的最终配置（按 4k token 预算打包，D-029）；其余是消融
+        "B4": lambda: L1RAG("B4", "L1 快速召回", L1Config()),
+        "B4-k10": lambda: L1RAG("B4-k10", "固定取 10 轮", L1Config(k=10, budget_tokens=None)),
+        "B4-k5": lambda: L1RAG("B4-k5", "固定取 5 轮", L1Config(k=5, budget_tokens=None)),
+        "B4-b2k": lambda: L1RAG("B4-b2k", "预算 2k tokens", L1Config(budget_tokens=2000)),
+        "B4-notime": lambda: L1RAG("B4-notime", "不做时间加分", L1Config(time_weight=0)),
+        "B4-norel": lambda: L1RAG("B4-norel", "不标相对时间", L1Config(), relative_time=False),
+        "B4-nobm25": lambda: L1RAG("B4-nobm25", "去掉 BM25", L1Config(sparse="none")),
         "ORACLE": OracleSessions,
     }
     unknown = [n for n in names if n not in factories]

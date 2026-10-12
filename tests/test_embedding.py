@@ -36,7 +36,9 @@ def make_embedder(
 
 
 def test_dashscope_batches_and_parses(settings: Settings, fake_api: FakeAPI) -> None:
-    batch = make_embedder(settings, fake_api).embed([f"text {i}" for i in range(23)], "document")
+    # 稀疏向量的解析仍要测：text-embedding-v4 + sparse 是可选配置
+    embedder = make_embedder(settings, fake_api, model="text-embedding-v4", sparse=True)
+    batch = embedder.embed([f"text {i}" for i in range(23)], "document")
 
     assert len(fake_api.embed_requests) == 3  # batch_size = 10
     first = fake_api.embed_requests[0]
@@ -159,3 +161,12 @@ def test_cached_embedder_keeps_partial_progress(tmp_path: Path) -> None:
     batch = CachedEmbedder(retry_inner, cache, chunk_size=2).embed(texts, "document")
     assert retry_inner.calls == [["三", "四"]]  # 只补算失败的那一块
     assert batch.dense.shape == (4, 32)
+
+
+def test_default_embedding_is_dense_only(settings: Settings, fake_api: FakeAPI) -> None:
+    """默认 qwen3.7-text-embedding 只取 dense：稀疏路由本地 BM25 承担（D-026）。"""
+    batch = make_embedder(settings, fake_api).embed(["hello"], "document")
+    request = fake_api.embed_requests[0]
+    assert request["model"] == "qwen3.7-text-embedding"
+    assert request["parameters"]["output_type"] == "dense"
+    assert batch.sparse is None

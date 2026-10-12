@@ -198,6 +198,15 @@ class MemoryDB:
                 "或通过 CUEMEM_PATHS__* 指定新的存储位置。"
             )
 
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
     # ---------- 原始层 ----------
 
     def ensure_space(self, space_id: str) -> None:

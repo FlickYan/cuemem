@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 import threading
 import time
@@ -28,6 +30,7 @@ from cuemem.core.models import Hit
 from cuemem.core.trace import Trace, start_trace
 from cuemem.embed import build_embedder
 from cuemem.embed.base import TextEmbedder
+from cuemem.errors import ConfigMismatchError
 from cuemem.evals.datasets import (
     EvalSession,
     EvalSet,
@@ -58,6 +61,7 @@ class RunConfig:
     workers: int = 4
     max_cost: float | None = None  # 美元，按实际花费计；None 表示不设上限
     limit: int | None = None  # 只跑前 N 道题（调试用）
+    reuse_spaces: bool = True  # 记忆空间存在磁盘上跨运行复用（paths.eval_spaces）
 
 
 @dataclass
@@ -188,25 +192,20 @@ class EvalRunner:
         space_id = f"{evalset.dataset}:{space_key}"
         system: MemorySystem | None = None
         turns = sum(len(s.turns) for s in sessions)
+        build: dict[str, Any] = {}
         try:
             if any(m.needs_index for _, methods in items for m in methods):
-                system = MemorySystem.ephemeral(
-                    self.settings, embedder=self.embedder, llm=self.llm, ledger=self.ledger
-                )
+                system, build = self._open_space(evalset.dataset, space_key)
                 with start_trace("ingest", space=space_id) as trace:
                     report = system.ingest(to_conversation(space_id, sessions))
-                usage = usage_from_trace(trace)
-                self._add_cost(usage)
-                self._append(
-                    "ingest.jsonl",
-                    {
-                        "space_key": space_key,
-                        "stage": "ingest",
-                        "units": report.units_added,
-                        "turns": turns,
-                        **usage,
-                    },
-                )
+                row = {
+                    "space_key": space_key,
+                    "stage": "ingest",
+                    "units": report.units_added,
+                    "turns": turns,
+                    **usage_from_trace(trace),
+                }
+                self._record_stage(row, build, did_work=report.units_added > 0)
         except Exception as exc:  # 写入失败只影响需要索引的方法，其余方法照常评测
             items = self._drop_failed(items, exc, "ingest", lambda m: m.needs_index)
             if system is not None:
@@ -218,25 +217,24 @@ class EvalRunner:
             try:
                 with start_trace("consolidate", space=space_id) as trace:
                     consolidation = system.consolidate(space_id, strict=True)
-                usage = usage_from_trace(trace)
-                self._add_cost(usage)
-                self._append(
-                    "ingest.jsonl",
-                    {
-                        "space_key": space_key,
-                        "stage": "consolidate",
-                        "turns": turns,
-                        **consolidation.as_dict(),
-                        "facts_total": len(system.db.get_facts(space_id)),
-                        "facts_current": len(system.db.get_facts(space_id, current_only=True)),
-                        "entities": len(system.db.get_entities(space_id)),
-                        **usage,
-                    },
-                )
+                row = {
+                    "space_key": space_key,
+                    "stage": "consolidate",
+                    "turns": turns,
+                    **consolidation.as_dict(),
+                    "facts_total": len(system.db.get_facts(space_id)),
+                    "facts_current": len(system.db.get_facts(space_id, current_only=True)),
+                    "entities": len(system.db.get_entities(space_id)),
+                    **usage_from_trace(trace),
+                }
+                self._record_stage(row, build, did_work=consolidation.sessions > 0)
             except Exception as exc:  # 巩固失败只影响需要事实记忆的方法
                 items = self._drop_failed(
                     items, exc, "consolidate", lambda m: m.needs_consolidation
                 )
+        if build.get("_path") and system is not None:
+            path = Path(build.pop("_path"))
+            path.write_text(json.dumps(build, ensure_ascii=False), encoding="utf-8")
         try:
             for sample, methods in items:
                 for method in methods:
@@ -327,6 +325,43 @@ class EvalRunner:
             evidence_turns=turns,
             relevant_units=relevant_units,
         )
+
+    def _open_space(self, dataset: str, space_key: str) -> tuple[MemorySystem, dict[str, Any]]:
+        """打开这份对话历史的记忆空间。复用时（reuse_spaces）存在磁盘上，下次运行直接用；
+        build.json 记下首次构建时的写入与巩固统计，复用时报告里的写入成本照样有数。"""
+        if not self.config.reuse_spaces:
+            system = MemorySystem.ephemeral(
+                self.settings, embedder=self.embedder, llm=self.llm, ledger=self.ledger
+            )
+            return system, {}
+        directory = space_dir(self.settings, dataset, self.embedder, space_key)
+        try:
+            system = MemorySystem.on_disk(
+                self.settings, directory, embedder=self.embedder, llm=self.llm, ledger=self.ledger
+            )
+        except ConfigMismatchError:  # 换了向量模型：旧空间作废，重建
+            shutil.rmtree(directory, ignore_errors=True)
+            system = MemorySystem.on_disk(
+                self.settings, directory, embedder=self.embedder, llm=self.llm, ledger=self.ledger
+            )
+        path = directory / "build.json"
+        build = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        build["_path"] = str(path)
+        return system, build
+
+    def _record_stage(self, row: dict[str, Any], build: dict[str, Any], *, did_work: bool) -> None:
+        """记录写入或巩固的统计：这次真的做了就记实测值；复用已有空间时记首次构建的统计。"""
+        stage = row["stage"]
+        self._add_cost(row)  # 花费只算这次真实发生的
+        if did_work or stage not in build:
+            if "_path" in build:
+                build[stage] = row
+            self._append("ingest.jsonl", row)
+            return
+        self._append("ingest.jsonl", {**build[stage], "reused": True})
+
+    def _check_resume(self, info: dict[str, Any]) -> None:
+        _check_resume_compatible(info, self.settings, self.config)
 
     def _drop_failed(
         self,
@@ -420,11 +455,42 @@ class EvalRunner:
                 "resumed": [],
             }
         else:
+            self._check_resume(info)
             info["resumed"].append(now)
             info["config"]["methods"] = sorted(
                 set(info["config"]["methods"]) | set(self.config.methods)
             )
         path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _check_resume_compatible(info: dict[str, Any], settings: Settings, config: RunConfig) -> None:
+    """续跑同名运行时，关键配置必须一致；否则新旧结果会混在一个目录里（N4 差点发生过）。"""
+    previous = info.get("config", {})
+    checks = {
+        "数据集": (previous.get("dataset"), config.dataset),
+        "划分": (previous.get("split"), config.split),
+        "向量模型": (info.get("embedding", {}).get("model"), settings.embedding.model),
+        "回答模型": (
+            info.get("roles", {}).get("reader", {}).get("model"),
+            settings.roles["reader"].model if "reader" in settings.roles else None,
+        ),
+    }
+    changed = [f"{name}：{old} → {new}" for name, (old, new) in checks.items() if old != new]
+    if changed:
+        raise ConfigMismatchError(
+            f"运行 {config.name} 已存在，但关键配置变了（{'；'.join(changed)}）。"
+            "续跑会把新旧结果混在一起：请换一个运行名（--name）。"
+        )
+
+
+def _safe_name(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+
+
+def space_dir(settings: Settings, dataset: str, embedder: TextEmbedder, space_key: str) -> Path:
+    """评测记忆空间的目录：按向量模型分开存，换模型对比时两套空间可以共存。"""
+    model = _safe_name(f"{embedder.name}-{embedder.dim}")
+    return settings.paths.eval_spaces / dataset / model / _safe_name(space_key)
 
 
 def _git_version() -> str:

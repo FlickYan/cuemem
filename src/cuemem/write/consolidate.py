@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import queue
 import threading
 import time
@@ -148,9 +149,20 @@ class Consolidator:
             added += self.db.enqueue_job(job_id, space_id, session_id, PIPELINE_VERSION, digest)
         return added
 
+    def fingerprint(self) -> str:
+        """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。"""
+        role = self.extractor.llm.settings.roles.get(self.extractor.role)
+        model = self.extractor.model or (role.model if role else "")
+        config = json.dumps(self.config.model_dump(exclude={"workers"}), sort_keys=True)
+        return stable_id(PIPELINE_VERSION, model, config)
+
     def stale(self, space_id: str) -> bool:
-        """是否有用旧版本流水线处理过的会话（需要重建派生记忆）。"""
-        return any(j["version"] != PIPELINE_VERSION for j in self.db.get_jobs(space_id))
+        """派生记忆是否过期：有用旧版本流水线处理过的会话，或巩固配置变了（需要重建）。"""
+        jobs = self.db.get_jobs(space_id)
+        if any(j["version"] != PIPELINE_VERSION for j in jobs):
+            return True
+        recorded = self.db.get_meta(f"consolidation:{space_id}")
+        return bool(jobs) and recorded is not None and recorded != self.fingerprint()
 
     def rebuild(self, space_id: str) -> None:
         """清空派生记忆（数据库与向量），再为全部会话登记任务。"""
@@ -258,6 +270,7 @@ class Consolidator:
             min_importance=self.config.profile_min_importance,
         )
         self.db.set_core_memory(core)
+        self.db.set_meta(f"consolidation:{space_id}", self.fingerprint())
         report.sessions = len(extractions)
         report.elapsed_ms = (time.perf_counter() - started) * 1000
         return report

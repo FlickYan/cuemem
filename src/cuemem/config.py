@@ -110,6 +110,7 @@ class PathsConfig(BaseModel):
     traces: Path = Path("runs/traces")
     datasets: Path = Path("data/datasets")  # 下载的评测数据集
     eval_runs: Path = Path("runs/eval")  # 每次评测运行一个子目录
+    eval_spaces: Path = Path("data/eval-spaces")  # 评测用的记忆空间（写入与巩固的结果），跨运行复用
 
     def resolve_against(self, root: Path) -> PathsConfig:
         """把相对路径解析为以 root 为基准的绝对路径。"""

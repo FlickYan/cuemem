@@ -11,6 +11,7 @@ paths:
   traces: runs/traces
   datasets: data/datasets
   eval_runs: runs/eval
+  eval_spaces: data/eval-spaces   # 评测题目的记忆空间存在磁盘上复用，第二次运行不用重新写入与巩固
 
 # 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
 llm_cache_mode: read_write
@@ -98,11 +99,12 @@ roles:
 embedding:
   backend: dashscope                   # dashscope：通义向量 API；hash：离线哈希向量（仅测试与演示）
   provider: qwen
-  # N1 实测（D-014）：v4 单条查询约 52 ms、10 条一批约 113 ms，稀疏向量是原文词项权重（约 20 项）；
-  # qwen3.7-text-embedding 分别约 164 ms、1481 ms，稀疏向量带语义扩展（约 500 项）。检索质量在 N4 对比。
-  model: text-embedding-v4
+  # N4 起默认 qwen3.7-text-embedding、只取 dense（D-014 修订）：dev100 抽 30 题，轮上的 dense 检索
+  # NDCG 54% → 73%（相对 text-embedding-v4）；稀疏路改由本地 BM25 承担（D-026）。
+  # 单价与 v4 相同（$0.07 / 百万 tokens），批量向量化慢约 6 倍，但写入是一次性的。
+  model: qwen3.7-text-embedding
   dim: 1024
-  sparse: true                         # 同时取稀疏向量，供 N4 的混合检索使用
+  sparse: false
   batch_size: 10
   max_chars: 6000
   native_url: https://maas.qwencloudapi.com/api/v1/services/embeddings/text-embedding/text-embedding
