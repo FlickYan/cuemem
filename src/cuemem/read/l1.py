@@ -12,6 +12,10 @@
    沿版本链补齐。
 
 各项权重在开发集上用纯检索指标（不调用 reader）调好，见 scripts/tune_l1.py。
+
+图片（N6）：图片描述也是一种"键"，命中时把分数交给图片所在的轮（与事实增强键相同）；
+可选一路"以文搜图"（问题与图片在同一个图文向量空间里比较）。图片按相关度排序，供回答时
+挑几张原图"再看一眼"。
 打分（candidates）与打包（pack_rounds）分开：L2 对多个子查询分别打分、融合后再打包（read/l2.py）。
 """
 
@@ -19,14 +23,16 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
-from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MemoryUnit
+from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MediaItem, MemoryUnit
 from cuemem.core.timeutil import partial_date_start
 from cuemem.core.trace import span
 from cuemem.embed.base import FloatArray, TextEmbedder
+from cuemem.embed.multimodal import ImageEmbedder
 from cuemem.read.bm25 import BM25
 from cuemem.read.facts import choose_facts
 from cuemem.read.query import QueryInfo, analyze
@@ -61,6 +67,14 @@ class L1Config:
     time_weight: float = 1.0  # 落在问题时间区间内的加分（以"某一路排第 1"的分数为单位）
     order_weight: float = 0.0  # 问"最近 / 最早"时按新旧加分（dev100 上有害，默认关闭）
     chain: bool = True  # 事实沿版本链补齐
+    # 图片（N6）：用哪一种描述作检索键与证据——上下文感知（image）、孤立（image_iso），
+    # 或不用描述（None：只把图片当作 "[image]" 占位，即纯文本记忆）
+    image_kind: Literal["image", "image_iso"] | None = "image"
+    image_weight: float = 1.0  # 图片描述键的权重
+    # 以文搜图这一路在模态间 RRF 里的权重（0 = 不用）。MemLens dev100 上让关键图片所在轮的召回
+    # 56% → 85%（D-036）；空间里没有图片时这一路自动跳过，不增加延迟与成本
+    visual_weight: float = 0.5
+    attach_images: int = 0  # 回答时附上几张原图（再感知）；0 = 只用描述
 
 
 @dataclass
@@ -71,6 +85,8 @@ class L1Result:
     core: CoreMemory | None
     timings_ms: dict[str, float] = field(default_factory=dict)
     debug: dict[str, object] = field(default_factory=dict)
+    media: dict[str, MediaItem] = field(default_factory=dict)  # 装入的轮里的图片
+    attach: list[str] = field(default_factory=list)  # 要附上原图的图片 ID（按相关度）
 
 
 @dataclass
@@ -85,13 +101,22 @@ class L1Candidates:
     fact_rounds: dict[str, list[str]]  # 事实 → 来源轮
     timings_ms: dict[str, float] = field(default_factory=dict)
     debug: dict[str, object] = field(default_factory=dict)
+    media_score: dict[str, float] = field(default_factory=dict)  # 图片 ID → 相关度（RRF 分）
 
 
 class L1Retriever:
-    def __init__(self, db: MemoryDB, vectors: VectorStore, embedder: TextEmbedder) -> None:
+    def __init__(
+        self,
+        db: MemoryDB,
+        vectors: VectorStore,
+        embedder: TextEmbedder,
+        *,
+        image_embedder: ImageEmbedder | None = None,
+    ) -> None:
         self.db = db
         self.vectors = vectors
         self.embedder = embedder
+        self.image_embedder = image_embedder  # 以文搜图用；为空时没有这一路
         # BM25 索引按空间缓存；单元数变化（写入了新内容）时重建
         self._bm25: dict[tuple[str, str], tuple[int, BM25, list[MemoryUnit]]] = {}
 
@@ -113,6 +138,11 @@ class L1Retriever:
             )
             record["hits"] = [[h.unit.id, round(h.score, 5)] for h in rounds]
             record["facts"] = [[fh.fact.id, round(fh.score, 5)] for fh in facts]
+            media, attach = collect_media(
+                self.db, space_id, rounds, cands.media_score, cfg.attach_images
+            )
+            if attach:
+                record["attach"] = attach
         timings = dict(cands.timings_ms)
         timings["total"] += (time.perf_counter() - started) * 1000
         return L1Result(
@@ -122,6 +152,8 @@ class L1Retriever:
             core=self.db.get_core_memory(space_id),
             timings_ms=timings,
             debug=cands.debug,
+            media=media,
+            attach=attach,
         )
 
     def candidates(
@@ -150,7 +182,8 @@ class L1Retriever:
                 sparse_vec = batch.sparse[0] if batch.sparse is not None else None
             timings["embed"] = (time.perf_counter() - started) * 1000
             routes: dict[tuple[str, str], list[tuple[str, float]]] = {}
-            for kind in KINDS:
+            kinds = [*KINDS, cfg.image_kind] if cfg.image_kind else list(KINDS)
+            for kind in kinds:
                 hits = self.vectors.search_dense(space_id, dense_vec, cfg.pool, kinds=[kind])
                 routes[(kind, "dense")] = [(h.unit_id, h.score) for h in hits]
                 if cfg.sparse == "v4" and sparse_vec is not None and len(sparse_vec) > 0:
@@ -158,6 +191,14 @@ class L1Retriever:
                     routes[(kind, "sparse")] = [(h.unit_id, h.score) for h in hits]
                 elif cfg.sparse == "bm25":
                     routes[(kind, "sparse")] = self._bm25_search(space_id, kind, question, cfg.pool)
+            if (
+                cfg.visual_weight > 0
+                and self.image_embedder is not None
+                and self._has_images(space_id)
+            ):
+                vector = self.image_embedder.embed_texts([question])[0]
+                hits = self.vectors.search_images(space_id, vector, cfg.pool)
+                routes[("media", "visual")] = [(h.unit_id, h.score) for h in hits]
             timings["recall"] = (time.perf_counter() - started) * 1000 - timings["embed"]
 
             cands = self._score(space_id, query, routes, cfg)
@@ -176,22 +217,44 @@ class L1Retriever:
         routes: dict[tuple[str, str], list[tuple[str, float]]],
         cfg: L1Config,
     ) -> L1Candidates:
-        unit_ids = list(dict.fromkeys(uid for hits in routes.values() for uid, _ in hits))
+        unit_ids = list(
+            dict.fromkeys(
+                uid for (kind, _), hits in routes.items() if kind != "media" for uid, _ in hits
+            )
+        )
         units = {u.id: u for u in self.db.get_units(space_id, unit_ids)}
         fact_ids = [uid for uid in unit_ids if units.get(uid) and units[uid].kind == "fact"]
         facts = {f.id: f for f in self.db.get_facts(space_id, ids=fact_ids)}
+        image_units = {uid: u for uid, u in units.items() if u.kind in ("image", "image_iso")}
+        visual = routes.get(("media", "visual"), [])
+        visual_media = {m.id: m for m in self.db.get_media(space_id, ids=[i for i, _ in visual])}
 
-        # 事实 → 来源轮：载入这些事实所在会话的全部轮
-        sessions = sorted({f.session_id for f in facts.values()})
+        # 事实、图片 → 来源轮：载入它们所在会话的全部轮
+        sessions = sorted(
+            {f.session_id for f in facts.values()} | {u.session_id for u in image_units.values()}
+        )
         round_units = {uid: u for uid, u in units.items() if u.kind == "round"}
         for unit in self.db.list_units(space_id, kinds=["round"], session_ids=sessions):
             round_units.setdefault(unit.id, unit)
+        if visual_media:  # 以文搜图命中的图片可能在任何会话里：按发言找到所在的轮
+            turn_sessions = {
+                t.id: t.session_id
+                for t in self.db.get_turns(space_id)
+                if t.id in {m.source_turn_id for m in visual_media.values()}
+            }
+            extra = sorted(set(turn_sessions.values()) - set(sessions))
+            for unit in self.db.list_units(space_id, kinds=["round"], session_ids=extra):
+                round_units.setdefault(unit.id, unit)
         turn_to_round = {t: u.id for u in round_units.values() for t in u.source_turn_ids}
         fact_rounds = {
             fid: list(
                 dict.fromkeys(turn_to_round[t] for t in f.source_turn_ids if t in turn_to_round)
             )
             for fid, f in facts.items()
+        }
+        image_rounds = {
+            uid: [turn_to_round[t] for t in u.source_turn_ids if t in turn_to_round]
+            for uid, u in image_units.items()
         }
 
         unit_rank = 1.0 / (cfg.rrf_k + 1)  # 某一路排第 1 的分数，作为各项加分的单位
@@ -201,30 +264,58 @@ class L1Retriever:
                 (u, x) for u, x in routes.get(("round", modality), []) if u in round_units
             ]
             fact_hits = routes.get(("fact", modality), [])
+            image_hits = routes.get((cfg.image_kind, modality), []) if cfg.image_kind else []
             if cfg.fusion == "kind":
                 # 对照方案：轮与事实键各自排名，全部做 RRF
                 for rank, (uid, _) in enumerate(round_hits, start=1):
                     round_score[uid] += cfg.round_weight / (cfg.rrf_k + rank)
-                mapped: list[str] = []
-                for fid, _ in fact_hits:
-                    for rid in fact_rounds.get(fid, []):
-                        if rid not in mapped:
-                            mapped.append(rid)
-                for rank, rid in enumerate(mapped, start=1):
-                    round_score[rid] += cfg.fact_weight / (cfg.rrf_k + rank)
+                for keys, key_rounds, weight in (
+                    (fact_hits, fact_rounds, cfg.fact_weight),
+                    (image_hits, image_rounds, cfg.image_weight),
+                ):
+                    mapped: list[str] = []
+                    for key, _ in keys:
+                        for rid in key_rounds.get(key, []):
+                            if rid not in mapped:
+                                mapped.append(rid)
+                    for rank, rid in enumerate(mapped, start=1):
+                        round_score[rid] += weight / (cfg.rrf_k + rank)
                 continue
-            # 默认方案：同一模态内按分数取最大值（轮自己的分数 vs 它来源事实的分数），
-            # 保留"一条很强的直接命中"；sparse 分数在轮与事实两个索引里尺度不同，先各自归一化
+            # 默认方案：同一模态内按分数取最大值（轮自己的分数 vs 它来源事实、图片描述的分数），
+            # 保留"一条很强的直接命中"；sparse 分数在各个索引里尺度不同，先各自归一化
             best: dict[str, float] = {}
             for uid, score in _normalized(round_hits, modality):
                 best[uid] = max(best.get(uid, float("-inf")), cfg.round_weight * score)
             for fid, score in _normalized(fact_hits, modality):
                 for rid in fact_rounds.get(fid, []):
                     best[rid] = max(best.get(rid, float("-inf")), cfg.fact_weight * score)
+            for iid, score in _normalized(image_hits, modality):
+                for rid in image_rounds.get(iid, []):
+                    best[rid] = max(best.get(rid, float("-inf")), cfg.image_weight * score)
             weight = 1.0 if modality == "dense" else cfg.sparse_weight
             ranked_ids = sorted(best, key=lambda rid: (-best[rid], rid))
             for rank, rid in enumerate(ranked_ids, start=1):
                 round_score[rid] += weight / (cfg.rrf_k + rank)
+
+        # 以文搜图：第三种模态，按图片所在轮的名次参与 RRF
+        media_score: dict[str, float] = defaultdict(float)
+        if visual:
+            visual_rounds: list[str] = []
+            for rank, (media_id, _) in enumerate(visual, start=1):
+                media_score[media_id] += 1.0 / (cfg.rrf_k + rank)
+                item = visual_media.get(media_id)
+                owner = turn_to_round.get(item.source_turn_id) if item else None
+                if owner is not None and owner not in visual_rounds:
+                    visual_rounds.append(owner)
+            for rank, owner in enumerate(visual_rounds, start=1):
+                round_score[owner] += cfg.visual_weight / (cfg.rrf_k + rank)
+        # 图片描述键的名次也算进图片的相关度（挑原图时用）
+        for modality in ("dense", "sparse"):
+            hits = routes.get((cfg.image_kind, modality), []) if cfg.image_kind else []
+            for rank, (iid, _) in enumerate(hits, start=1):
+                linked = image_units[iid].meta.get("media_id") if iid in image_units else None
+                if linked:
+                    media_score[str(linked)] += 1.0 / (cfg.rrf_k + rank)
 
         # 会话摘要：给所在会话的轮加会话先验（只给已经进入候选的轮）
         session_score: dict[str, float] = defaultdict(float)
@@ -286,7 +377,11 @@ class L1Retriever:
             fact_score=dict(fact_score),
             fact_rounds=fact_rounds,
             debug={"in_time_range": len(in_range), "candidates": len(round_score)},
+            media_score=dict(media_score),
         )
+
+    def _has_images(self, space_id: str) -> bool:
+        return self.db.has_media(space_id)
 
     def _bm25_search(self, space_id: str, kind: str, query: str, k: int) -> list[tuple[str, float]]:
         units = self.db.list_units(space_id, kinds=[kind])
@@ -296,6 +391,28 @@ class L1Retriever:
             self._bm25[(space_id, kind)] = cached
         _, index, indexed = cached
         return [(indexed[i].id, score) for i, score in index.search(query, k)]
+
+
+def collect_media(
+    db: MemoryDB,
+    space_id: str,
+    rounds: Sequence[Hit],
+    media_score: dict[str, float],
+    attach: int,
+) -> tuple[dict[str, MediaItem], list[str]]:
+    """装入的轮里的图片（回答时把描述填回原位），以及要附上原图的前 attach 张。
+
+    附图优先选相关度高的（描述键或以文搜图命中过的），不够时按轮的名次补。
+    """
+    ids = [m for h in rounds for m in h.unit.meta.get("media_ids", [])]
+    if not ids:
+        return {}, []
+    media = {m.id: m for m in db.get_media(space_id, ids=ids)}
+    if attach <= 0:
+        return media, []
+    order = {media_id: i for i, media_id in enumerate(ids)}
+    ranked = sorted(media, key=lambda m: (-media_score.get(m, 0.0), order[m]))
+    return media, ranked[:attach]
 
 
 def pack_rounds(

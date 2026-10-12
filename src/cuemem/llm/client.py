@@ -252,14 +252,27 @@ class LLMClient:
         msgs = _with_schema_instruction(messages, schema)
         last_error = ""
         for attempt in range(1, max_attempts + 1):
-            result = self.chat(
-                role,
-                msgs,
-                model=model,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-                cache_scope=cache_scope,
-            )
+            try:
+                result = self.chat(
+                    role,
+                    msgs,
+                    model=model,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    cache_scope=cache_scope,
+                )
+            except BadRequestError as exc:
+                # QwenCloud 在 JSON 模式下偶尔中止生成（"Model output became abnormal ..."），
+                # 同样的请求重发多半还会中止：补一句提示，换一个请求再试
+                if not _is_aborted_json(exc):
+                    raise
+                record_event("llm_json_aborted", role=role, attempt=attempt)
+                last_error = "供应商中止了 JSON 生成"
+                msgs = [
+                    *msgs,
+                    {"role": "user", "content": "Reply with one short, valid JSON object."},
+                ]
+                continue
             text = _strip_code_fence(result.content or "")
             if not text:
                 last_error = "模型返回了空内容"
@@ -408,6 +421,11 @@ class LLMClient:
             spent=0.0 if result.from_cache else round(discounted, 6),
             latency_ms=round(result.latency_ms, 1),
         )
+
+
+def _is_aborted_json(exc: BadRequestError) -> bool:
+    """QwenCloud 在 JSON 模式下中止生成时的报错（400 invalid_parameter_error）。"""
+    return "Model output became abnormal" in str(exc)
 
 
 def _is_content_filter(exc: BadRequestError) -> bool:

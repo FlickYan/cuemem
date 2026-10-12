@@ -15,7 +15,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 Role = Literal["user", "assistant"]
-UnitKind = Literal["round", "fact", "summary", "entity", "image"]
+# image：图片的上下文感知描述（N6）；image_iso：孤立描述（只看图、不看对话），只用于对比实验
+UnitKind = Literal["round", "fact", "summary", "entity", "image", "image_iso"]
 EntityType = Literal["person", "pet", "place", "organization", "product", "event", "other"]
 FactCategory = Literal[
     "attribute", "preference", "possession", "relationship", "event", "plan", "other"
@@ -32,6 +33,8 @@ class TurnIn(BaseModel):
     text: str
     ts: datetime | None = None  # 缺省时使用会话开始时间
     speaker: str | None = None  # 说话人名字；多人对话（如 LoCoMo）里用来区分是谁说的
+    # 这次发言附带的图片（本地文件路径）。文本里的 "<image>" 标记图片出现的位置（N6）
+    images: list[str] = Field(default_factory=list)
 
 
 class SessionIn(BaseModel):
@@ -152,18 +155,25 @@ class CoreMemory(BaseModel):
 
 
 class MediaItem(BaseModel):
-    """图片（视频 / 音频为扩展）。N3 只定义结构，N6 实现写入、描述与检索。"""
+    """图片（视频 / 音频为扩展）：一次发言里出现的一张图（N6）。
+
+    同一张图（同一个内容哈希）出现在不同的发言里时，各是一条记录：上下文不同，描述也不同。
+    原图按内容哈希存放在媒体库里（path），回答时可以取回原图"再看一眼"。
+    """
 
     id: str
     space_id: str
     sha256: str
     path: str
-    caption: str = ""
-    ocr_text: str = ""
+    caption: str = ""  # 上下文感知描述：模型同时看图和前后的对话
+    ocr_text: str = ""  # 图中的文字
     tags: list[str] = Field(default_factory=list)
     entity_ids: list[str] = Field(default_factory=list)
     source_turn_id: str
     ts: datetime
+    caption_iso: str = ""  # 孤立描述：只看图（对比实验用）
+    width: int = 0
+    height: int = 0
 
 
 class Hit(BaseModel):

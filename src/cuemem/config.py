@@ -31,6 +31,10 @@ QWENCLOUD_EMBEDDING_URL = (
 QWENCLOUD_RERANK_URL = (
     "https://maas.qwencloudapi.com/api/v1/services/rerank/text-rerank/text-rerank"
 )
+QWENCLOUD_MULTIMODAL_EMBEDDING_URL = (
+    "https://maas.qwencloudapi.com/api/v1/services/embeddings/multimodal-embedding/"
+    "multimodal-embedding"
+)
 
 # YAML 文件路径通过 ContextVar 传给配置源，避免修改全局环境变量
 _config_path: ContextVar[Path] = ContextVar("cuemem_config_path", default=DEFAULT_CONFIG)
@@ -105,6 +109,23 @@ class EmbeddingConfig(BaseModel):
     max_attempts: int = 6  # 429 / 5xx / 网络错误的最大尝试次数（指数退避，单次最多等 30 秒）
 
 
+class MultimodalEmbeddingConfig(BaseModel):
+    """图片向量（N6）：图片与文字映射到同一个向量空间，可以以文搜图、以图搜图。"""
+
+    backend: Literal["dashscope", "hash"] = "dashscope"
+    provider: str = "qwen"
+    model: str = "tongyi-embedding-vision-plus"
+    dim: int = 1152
+    url: str = QWENCLOUD_MULTIMODAL_EMBEDDING_URL
+    price_per_m: float = 0.108  # 美元 / 百万 tokens（国际站标价，图片与文字同价）
+    currency: Currency = "USD"
+    batch_size: int = 8
+    max_side: int = 768  # 送去向量化的图片最长边（像素）
+    timeout_s: float = 60.0
+    max_concurrency: int = 2
+    max_attempts: int = 6
+
+
 class RerankConfig(BaseModel):
     """重排模型（N5，L2 用）：QwenCloud 的 qwen3-rerank，原生接口。"""
 
@@ -129,6 +150,7 @@ class PathsConfig(BaseModel):
     datasets: Path = Path("data/datasets")  # 下载的评测数据集
     eval_runs: Path = Path("runs/eval")  # 每次评测运行一个子目录
     eval_spaces: Path = Path("data/eval-spaces")  # 评测用的记忆空间（写入与巩固的结果），跨运行复用
+    media: Path = Path("data/media")  # 原图，按内容哈希存放（N6）
 
     def resolve_against(self, root: Path) -> PathsConfig:
         """把相对路径解析为以 root 为基准的绝对路径。"""
@@ -160,6 +182,8 @@ class ConsolidationConfig(BaseModel):
     entity_gray_threshold: float = 0.75  # 介于两个阈值之间的实体交给 LLM 确认
     profile_max_chars: int = 1600  # 核心记忆的长度上限（约 400 tokens）
     profile_min_importance: int = 4  # 进入核心记忆的最低重要度（1–5）
+    caption_images: bool = True  # 巩固时为图片生成描述（上下文感知与孤立两种，N6）
+    caption_max_side: int = 768  # 送去描述的图片最长边（像素）
 
 
 class Settings(BaseSettings):
@@ -177,6 +201,9 @@ class Settings(BaseSettings):
     roles: dict[str, RoleConfig] = Field(default_factory=dict)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     rerank: RerankConfig = Field(default_factory=RerankConfig)
+    multimodal_embedding: MultimodalEmbeddingConfig = Field(
+        default_factory=MultimodalEmbeddingConfig
+    )
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     consolidation: ConsolidationConfig = Field(default_factory=ConsolidationConfig)

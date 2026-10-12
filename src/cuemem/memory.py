@@ -16,23 +16,25 @@ from typing import Literal
 import httpx2
 
 from cuemem.config import Settings
-from cuemem.core.models import Answer, Conversation, CoreMemory, Entity, Fact, Hit
+from cuemem.core.models import Answer, Conversation, CoreMemory, Entity, Fact, Hit, MediaItem
 from cuemem.core.trace import TraceSink, start_trace
-from cuemem.embed import CachedEmbedder, build_embedder
+from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
+from cuemem.embed.multimodal import ImageEmbedder
 from cuemem.errors import ConsolidationError
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.read.agent import ToolReader
 from cuemem.read.controller import RouteDecision, RuleController
-from cuemem.read.facts import FactAugmentedRetriever, MemoryView, Validity
+from cuemem.read.facts import FactAugmentedRetriever, ImageMode, MemoryView, Validity
 from cuemem.read.l1 import L1Config, L1Retriever
 from cuemem.read.l2 import L2Config, L2Retriever
 from cuemem.read.naive import NaiveRetriever
 from cuemem.read.plan import rule_plan
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
+from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 from cuemem.write.consolidate import (
@@ -56,6 +58,16 @@ class ForgetReport:
     embed_cache_purged: int
     llm_cache_purged: int
     elapsed_ms: float
+    images_deleted: int = 0  # 删除的原图文件数（同一张图被别的发言引用时保留）
+
+
+def image_mode(cfg: L1Config) -> ImageMode:
+    """检索用哪种图片描述，回答时就展示哪种（不用描述时只留 [Image] 占位）。"""
+    if cfg.image_kind == "image":
+        return "context"
+    if cfg.image_kind == "image_iso":
+        return "isolated"
+    return "none"
 
 
 def build_reranker(
@@ -88,6 +100,8 @@ class MemorySystem:
         tracer: TraceSink | None = None,
         owns_ledger: bool = True,
         reranker: Reranker | None = None,
+        media: MediaStore | None = None,
+        image_embedder: ImageEmbedder | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -97,11 +111,15 @@ class MemorySystem:
         self.ledger = ledger
         self.tracer = tracer
         self._owns_ledger = owns_ledger  # 评测时账本由多个线程共享，不能由单个系统关闭
-        self.writer = OnlineWriter(db, vectors, embedder)
+        self.media = media
+        self.image_embedder = image_embedder
+        self.writer = OnlineWriter(
+            db, vectors, embedder, media=media, image_embedder=image_embedder
+        )
         self.consolidator = Consolidator(db, vectors, embedder, llm, settings.consolidation)
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
-        self.l1 = L1Retriever(db, vectors, embedder)
+        self.l1 = L1Retriever(db, vectors, embedder, image_embedder=image_embedder)
         self.l2 = L2Retriever(db, vectors, embedder, llm, self.l1, reranker=reranker)
         self.controller = RuleController()
         self.reader = Reader(llm)
@@ -134,6 +152,8 @@ class MemorySystem:
             ledger=ledger,
             tracer=TraceSink(paths.traces),
             reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
+            media=MediaStore(paths.media),
+            image_embedder=build_image_embedder(settings, ledger=ledger, http_client=http_client),
         )
 
     @classmethod
@@ -145,6 +165,7 @@ class MemorySystem:
         llm: LLMClient,
         ledger: Ledger,
         reranker: Reranker | None = None,
+        image_embedder: ImageEmbedder | None = None,
     ) -> MemorySystem:
         """评测用：数据库与向量库都放在内存里，用完即弃；向量缓存与 LLM 缓存由传入的组件共享。"""
         return cls(
@@ -156,6 +177,8 @@ class MemorySystem:
             ledger=ledger,
             owns_ledger=False,
             reranker=reranker,
+            media=MediaStore(settings.paths.media),
+            image_embedder=image_embedder,
         )
 
     @classmethod
@@ -168,6 +191,7 @@ class MemorySystem:
         llm: LLMClient,
         ledger: Ledger,
         reranker: Reranker | None = None,
+        image_embedder: ImageEmbedder | None = None,
     ) -> MemorySystem:
         """评测用：每道题（每份对话历史）一个磁盘目录，写入与巩固的结果跨运行复用。
 
@@ -188,6 +212,8 @@ class MemorySystem:
             ledger=ledger,
             owns_ledger=False,
             reranker=reranker,
+            media=MediaStore(settings.paths.media),  # 原图在各空间之间共享（按内容哈希存放）
+            image_embedder=image_embedder,
         )
 
     # ---------- 写入 ----------
@@ -261,11 +287,18 @@ class MemorySystem:
             facts_before = len(self.db.get_facts(space_id))
             texts_before = {u.text for u in self.db.list_units(space_id)}
 
-            # 1. 原始层：删除轮次，按剩下的轮次重建受影响会话的"轮"
+            # 1. 原始层：删除轮次与其中的图片（记录、图片向量；没有别处引用的原图文件），
+            #    再按剩下的轮次重建受影响会话的"轮"
             old_rounds = self.db.list_units(space_id, kinds=["round"], session_ids=affected)
             self.vectors.delete(space_id, [u.id for u in old_rounds])
             self.db.delete_units(space_id, [u.id for u in old_rounds])
+            doomed_media = self.db.get_media(space_id, turn_ids=[t.id for t in targets])
             deleted = self.db.delete_turns(space_id, [t.id for t in targets])
+            self.vectors.delete_images(space_id, [m.id for m in doomed_media])
+            images_deleted = 0
+            for item in doomed_media:
+                if self.media is not None and not self.db.media_sha_in_use(item.sha256):
+                    images_deleted += int(self.media.delete(Path(item.path)))
             self.writer.reindex_sessions(space_id, affected)
 
             # 2. 派生层：清空并清理相关的 LLM 缓存，再从剩下的日志重放
@@ -294,6 +327,7 @@ class MemorySystem:
                 embed_cache_purged=embed_purged,
                 llm_cache_purged=llm_purged,
                 elapsed_ms=(time.perf_counter() - started) * 1000,
+                images_deleted=images_deleted,
             )
             trace.attrs.update(turns_deleted=deleted, sessions=affected)
         return report
@@ -365,7 +399,14 @@ class MemorySystem:
             if route == "l1":
                 cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
                 result = self.l1.search(space_id, question, when, cfg)
-                view = MemoryView(rounds=result.rounds, facts=result.facts, core=result.core)
+                view = MemoryView(
+                    rounds=result.rounds,
+                    facts=result.facts,
+                    core=result.core,
+                    media=result.media,
+                    image_mode=image_mode(cfg),
+                    attach=result.attach,
+                )
                 if notes:  # 笔记式阅读用规则版计划给阅读提示（不调用规划模型）
                     answer = self.reader.answer_deep(
                         question,
@@ -385,10 +426,16 @@ class MemorySystem:
                         cache_scope=cache_scope,
                     )
             elif route == "l2":
-                deep = self.l2.search(
-                    space_id, question, when, l2 or L2Config(), cache_scope=cache_scope
+                l2_cfg = l2 or L2Config()
+                deep = self.l2.search(space_id, question, when, l2_cfg, cache_scope=cache_scope)
+                view = MemoryView(
+                    rounds=deep.rounds,
+                    facts=deep.facts,
+                    core=deep.core,
+                    media=deep.media,
+                    image_mode=image_mode(l2_cfg.l1),
+                    attach=deep.attach,
                 )
-                view = MemoryView(rounds=deep.rounds, facts=deep.facts, core=deep.core)
                 if notes is None or notes:
                     answer = self.reader.answer_deep(
                         question, view, plan=deep.plan, question_time=when, cache_scope=cache_scope
@@ -435,8 +482,21 @@ class MemorySystem:
                 )
             if decision is not None:
                 answer.details["route"] = {"level": decision.level, "reasons": decision.reasons}
+            if route in ("l1", "l2") and view.attach:
+                answer.details["attached"] = list(view.attach)  # 附了原图的图片（再感知）
             trace.attrs.update(answer=answer.answer, citations=answer.citations)
         return answer
+
+    def search_by_image(
+        self, space_id: str, image: Path, k: int = 5
+    ) -> list[tuple[MediaItem, float]]:
+        """以图搜图（N6）："我之前给你看过这个吗？"——返回最相似的图片记录与余弦相似度。"""
+        if self.image_embedder is None:
+            return []
+        vector = self.image_embedder.embed_images([image])[0]
+        hits = self.vectors.search_images(space_id, vector, k)
+        items = {m.id: m for m in self.db.get_media(space_id, ids=[h.unit_id for h in hits])}
+        return [(items[h.unit_id], h.score) for h in hits if h.unit_id in items]
 
     # ---------- 检查（记忆检查器 CLI 与之后的界面用） ----------
 

@@ -3,6 +3,9 @@
 LongMemEval 的判分模板逐字照搬官方脚本 src/evaluation/evaluate_qa.py（get_anscheck_prompt），
 调用方式也一致：只发一条 user 消息，temperature=0，max_tokens=10，回复中含 "yes" 即判为正确。
 LoCoMo 没有官方的 LLM 判分，沿用同一套模板（D-015），另外按原论文口径计算 token F1 作参考。
+MemLens 用官方 llm_judge.py 的提示词（按题型给评分标准与例子，逐字照搬，见 memlens_prompts/），
+判分模型输出评分理由与 {"answer_score": 0/1}；超过 500 词的回答按官方做法直接判 0。
+官方判分模型是 Qwen3-VL-235B，QwenCloud 上没有，这里用与其他数据集相同的 qwen3.8-max。
 """
 
 from __future__ import annotations
@@ -13,7 +16,10 @@ from collections import Counter
 from dataclasses import dataclass
 
 from cuemem.evals.datasets import Sample
+from cuemem.evals.memlens_prompts import build_judge_prompt, get_task_key
 from cuemem.llm.client import LLMClient
+
+MEMLENS_MAX_WORDS = 500  # 官方 llm_judge.py：解析后的回答超过 500 词直接判 0
 
 # ---------- LongMemEval 官方模板（逐字照搬，包括个别句末多出的空格） ----------
 
@@ -94,6 +100,8 @@ class Judge:
         self.role = role
 
     def judge(self, sample: Sample, response: str) -> Verdict:
+        if sample.dataset.startswith("memlens"):
+            return self._judge_memlens(sample, response)
         result = self.llm.chat(
             self.role,
             [{"role": "user", "content": judge_prompt(sample, response)}],
@@ -102,6 +110,40 @@ class Judge:
         )
         raw = (result.content or "").strip()
         return Verdict(correct="yes" in raw.lower(), raw=raw)
+
+    def _judge_memlens(self, sample: Sample, response: str) -> Verdict:
+        if len(response.split()) > MEMLENS_MAX_WORDS:
+            return Verdict(correct=False, raw=f"auto_zero: more than {MEMLENS_MAX_WORDS} words")
+        result = self.llm.chat(
+            self.role,
+            [{"role": "user", "content": memlens_prompt(sample, response)}],
+            temperature=0.0,
+            max_tokens=512,
+        )
+        raw = (result.content or "").strip()
+        return Verdict(correct=parse_answer_score(raw) == 1, raw=raw[-400:])
+
+
+def memlens_prompt(sample: Sample, response: str) -> str:
+    task = get_task_key(
+        sample.question_type, str(sample.meta.get("question_subtype", "")), sample.answer
+    )
+    old_answer = str(sample.meta.get("old_answer") or "")  # 空串与 None 在官方代码里等价
+    return str(build_judge_prompt(task, sample.question, sample.answer, response, old_answer))
+
+
+def parse_answer_score(text: str) -> int:
+    """与官方 llm_judge.py 的解析顺序一致：JSON 里的 answer_score → "deserves x point" →
+    "[Score]: x"，都没有时判 0。"""
+    for pattern in (
+        r'"answer_score"\s*:\s*(\d+)',
+        r"deserves\s+(\d+)\s+point",
+        r"\[Score\]\s*:\s*(\d+)",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return min(int(match.group(1)), 1)
+    return 0
 
 
 # ---------- token F1（LoCoMo 原论文口径，SQuAD 风格的归一化） ----------

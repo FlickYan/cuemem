@@ -9,6 +9,11 @@ from cuemem.embed.base import EmbeddingBatch, EmbedKind, SparseVector, TextEmbed
 from cuemem.embed.cache import CachedEmbedder, EmbeddingCache
 from cuemem.embed.dashscope import DashScopeTextEmbedder
 from cuemem.embed.hashing import HashEmbedder
+from cuemem.embed.multimodal import (
+    DashScopeMultimodalEmbedder,
+    HashMultimodalEmbedder,
+    ImageEmbedder,
+)
 from cuemem.errors import MissingAPIKeyError
 from cuemem.llm.ledger import Ledger
 
@@ -19,9 +24,11 @@ __all__ = [
     "EmbeddingBatch",
     "EmbeddingCache",
     "HashEmbedder",
+    "ImageEmbedder",
     "SparseVector",
     "TextEmbedder",
     "build_embedder",
+    "build_image_embedder",
 ]
 
 
@@ -50,4 +57,27 @@ def build_embedder(
         return inner
     return CachedEmbedder(
         inner, EmbeddingCache(settings.paths.embed_cache), instruct=cfg.query_instruct
+    )
+
+
+def build_image_embedder(
+    settings: Settings,
+    *,
+    ledger: Ledger | None = None,
+    http_client: httpx2.Client | None = None,
+) -> ImageEmbedder | None:
+    """图片向量器（N6）。文本向量用离线哈希时也用哈希；没有 Key 时返回 None（不建图片向量）。"""
+    cfg = settings.multimodal_embedding
+    if cfg.backend == "hash" or settings.embedding.backend == "hash":
+        return HashMultimodalEmbedder()
+    provider = settings.providers.get(cfg.provider)
+    api_key = provider.api_key() if provider is not None else None
+    if api_key is None:
+        return None
+    return DashScopeMultimodalEmbedder(
+        cfg,
+        api_key,
+        http_client=http_client,
+        ledger=ledger,
+        cache=EmbeddingCache(settings.paths.embed_cache),
     )

@@ -1,7 +1,9 @@
 """评测数据集：下载、加载，并统一成 Sample 结构。
 
 - LongMemEval（ICLR 2025）：500 道题，每道题自带一份约 12 万 tokens 的对话历史；
-- LoCoMo（ACL 2024）：10 段两人长对话，每段对话对应约 200 道题。
+- LoCoMo（ACL 2024）：10 段两人长对话，每段对话对应约 200 道题；
+- MemLens（2026）：789 道图文多会话记忆题，同一批题按对话历史长度分 32K–256K 四档，
+  图片附在发言上（N6 接入 32K 与 128K 两档）。
 
 对话历史（haystack）单独存放、按 space_key 共享：LoCoMo 同一段对话的约 200 道题共用一份，
 避免每道题复制一遍造成内存浪费。
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import tarfile
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,6 +50,15 @@ class DatasetSpec:
     filename: str
     url: str
     description: str
+    # 一同下载的附加文件：（文件名，URL）；.tar.gz 下载后解压到同一目录
+    extras: tuple[tuple[str, str], ...] = ()
+
+
+_MEMLENS = "https://huggingface.co/datasets/xiyuRenBill/MEMLENS/resolve/main/"
+_MEMLENS_EXTRAS = (
+    ("memlens/agent_subset_195.json", _MEMLENS + "agent_subset_195.json"),
+    ("memlens/release_images.tar.gz", _MEMLENS + "release_images.tar.gz"),
+)
 
 
 DATASETS = {
@@ -63,7 +75,30 @@ DATASETS = {
         "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
         "LoCoMo：10 段对话、1986 题，约 3 MB",
     ),
+    "memlens_32k": DatasetSpec(
+        "memlens_32k",
+        "memlens/dataset_32k.json",
+        _MEMLENS + "dataset_32k.json",
+        "MemLens 32K 档：789 题，约 98 MB；图片 4,695 张约 225 MB（CC-BY-4.0）",
+        _MEMLENS_EXTRAS,
+    ),
+    "memlens_128k": DatasetSpec(
+        "memlens_128k",
+        "memlens/dataset_128k.json",
+        _MEMLENS + "dataset_128k.json",
+        "MemLens 128K 档：789 题，约 369 MB；图片与 32K 档共用",
+        _MEMLENS_EXTRAS,
+    ),
 }
+
+# MemLens 题型 → 名称（五种能力，与论文一致）；拒答题的标准答案是 "Insufficient information"
+MEMLENS_TYPES = (
+    "information_extraction",
+    "multi_session_reasoning",
+    "temporal_reasoning",
+    "knowledge_update",
+    "answer_refusal",
+)
 
 
 @dataclass(slots=True)
@@ -72,6 +107,7 @@ class EvalTurn:
     text: str
     speaker: str | None = None
     has_answer: bool = False  # 是否是答案证据所在的发言
+    images: list[str] = field(default_factory=list)  # 附带的图片（本地路径，MemLens）
 
 
 @dataclass(slots=True)
@@ -113,7 +149,10 @@ def to_session_ins(sessions: Iterable[EvalSession]) -> list[SessionIn]:
         SessionIn(
             session_id=s.session_id,
             started_at=s.started_at,
-            turns=[TurnIn(role=t.role, text=t.text, speaker=t.speaker) for t in s.turns],
+            turns=[
+                TurnIn(role=t.role, text=t.text, speaker=t.speaker, images=list(t.images))
+                for t in s.turns
+            ],
         )
         for s in sessions
     ]
@@ -138,20 +177,35 @@ def dataset_path(directory: Path, name: str) -> Path:
 def download(name: str, directory: Path, *, timeout_s: float = 600.0) -> Path:
     """下载数据集到 directory；已存在则跳过。先写临时文件，完成后再改名，避免留下半个文件。"""
     spec = DATASETS[name]
+    for filename, url in spec.extras:
+        extra = directory / filename
+        if filename.endswith(".tar.gz"):
+            unpacked = extra.parent / filename.split("/")[-1].removesuffix(".tar.gz")
+            if unpacked.exists():
+                continue
+            _fetch(url, extra, timeout_s)
+            with tarfile.open(extra) as archive:
+                archive.extractall(extra.parent, filter="data")
+            extra.unlink()
+        elif not extra.exists():
+            _fetch(url, extra, timeout_s)
     target = directory / spec.filename
-    if target.exists() and target.stat().st_size > 0:
-        return target
-    directory.mkdir(parents=True, exist_ok=True)
+    if not (target.exists() and target.stat().st_size > 0):
+        _fetch(spec.url, target, timeout_s)
+    return target
+
+
+def _fetch(url: str, target: Path, timeout_s: float) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".part")
     with (
-        httpx2.stream("GET", spec.url, follow_redirects=True, timeout=timeout_s) as response,
+        httpx2.stream("GET", url, follow_redirects=True, timeout=timeout_s) as response,
         partial.open("wb") as f,
     ):
         response.raise_for_status()
         for chunk in response.iter_bytes():
             f.write(chunk)
     partial.rename(target)
-    return target
 
 
 # ---------- 加载 ----------
@@ -162,6 +216,8 @@ def load(name: str, path: Path, *, ids: Collection[str] | None = None) -> EvalSe
         return load_longmemeval(path, ids=ids, dataset=name)
     if name == "locomo":
         return load_locomo(path, ids=ids)
+    if name.startswith("memlens_"):
+        return load_memlens(path, ids=ids, dataset=name)
     raise KeyError(f"未知数据集 {name}，可选：{sorted(DATASETS)}")
 
 
@@ -294,6 +350,69 @@ def load_locomo(path: Path, *, ids: Collection[str] | None = None) -> EvalSet:
         haystacks[conv_id] = sessions
         samples.extend(conv_samples)
     return EvalSet(dataset="locomo", samples=samples, haystacks=haystacks)
+
+
+def load_memlens(
+    path: Path, *, ids: Collection[str] | None = None, dataset: str = "memlens_32k"
+) -> EvalSet:
+    """加载 MemLens。格式与 LongMemEval 相同，发言上多了图片（release_images 下的相对路径）。
+
+    证据只标到会话（answer_session_ids）。每道题的关键图片放在 needle_images/ 下：把证据会话里
+    带关键图片的发言标为证据发言，检索指标里的"发言召回"就是"关键图片所在轮的召回"。
+    """
+    wanted = set(ids) if ids is not None else None
+    image_dir = path.parent / "release_images"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    samples: list[Sample] = []
+    haystacks: dict[str, list[EvalSession]] = {}
+    for item in raw:
+        qid = item["question_id"]
+        if wanted is not None and qid not in wanted:
+            continue
+        evidence = set(item.get("answer_session_ids") or [])
+        sessions = [
+            EvalSession(
+                session_id=sid,
+                started_at=_parse_longmemeval_date(date),
+                turns=[
+                    EvalTurn(
+                        role="assistant" if turn["role"] == "assistant" else "user",
+                        text=turn["content"],
+                        images=[str(image_dir / im["file"]) for im in turn.get("images") or []],
+                        has_answer=sid in evidence
+                        and any(
+                            str(im["file"]).startswith("needle_images/")
+                            for im in turn.get("images") or []
+                        ),
+                    )
+                    for turn in turns
+                ],
+            )
+            for sid, date, turns in zip(
+                item["haystack_session_ids"],
+                item["haystack_dates"],
+                item["haystack_sessions"],
+                strict=True,
+            )
+        ]
+        haystacks[qid] = sessions
+        qtype = item["question_type"]
+        samples.append(
+            Sample(
+                dataset=dataset,
+                sample_id=qid,
+                space_key=qid,
+                question=item["question"],
+                answer=str(item["answer"]),
+                question_type=qtype,
+                ability=qtype,
+                is_abstention=qtype == "answer_refusal",
+                question_time=_parse_longmemeval_date(item["question_date"]),
+                evidence_session_ids=list(item.get("answer_session_ids") or []),
+                meta={"question_subtype": item.get("question_subtype", "")},
+            )
+        )
+    return EvalSet(dataset=dataset, samples=samples, haystacks=haystacks)
 
 
 def _split_evidence(values: Iterable[str]) -> list[str]:

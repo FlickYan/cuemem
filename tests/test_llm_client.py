@@ -181,3 +181,19 @@ def test_identical_concurrent_requests_are_coalesced(settings: Settings, fake_ap
     second.join(5)
     assert len(fake_api.chat_requests) == 1
     assert sorted(r.from_cache for r in results) == [False, True]
+
+
+def test_structured_retries_when_provider_aborts_json(settings: Settings) -> None:
+    """QwenCloud 在 JSON 模式下中止生成（400）：补一句提示换个请求重试，而不是直接报错。"""
+    from fakes import ABORT_JSON
+
+    api = FakeAPI()
+    api.chat_replies = [ABORT_JSON, '{"answer": "ok"}']
+    client = LLMClient(settings, http_client=api.client())
+
+    class Out(BaseModel):
+        answer: str
+
+    result = client.structured("extractor", [{"role": "user", "content": "hi"}], Out)
+    assert result.value.answer == "ok" and result.attempts == 2
+    assert api.chat_requests[1]["messages"][-1]["content"].startswith("Reply with one short")

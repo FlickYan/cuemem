@@ -29,8 +29,9 @@ import httpx2
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.models import Hit
 from cuemem.core.trace import Trace, start_trace
-from cuemem.embed import build_embedder
+from cuemem.embed import build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
+from cuemem.embed.multimodal import ImageEmbedder
 from cuemem.errors import ConfigMismatchError
 from cuemem.evals.datasets import (
     EvalSession,
@@ -64,6 +65,7 @@ class RunConfig:
     max_cost: float | None = None  # 美元，按实际花费计；None 表示不设上限
     limit: int | None = None  # 只跑前 N 道题（调试用）
     reuse_spaces: bool = True  # 记忆空间存在磁盘上跨运行复用（paths.eval_spaces）
+    build_only: bool = False  # 只构建记忆空间（写入与巩固），不回答、不判分
 
 
 @dataclass
@@ -140,6 +142,8 @@ class EvalRunner:
         self._embedder: TextEmbedder | None = None
         self._reranker: Reranker | None = None
         self._reranker_checked = False
+        self._image_embedder: ImageEmbedder | None = None
+        self._image_embedder_checked = False
         self._on_start = on_start or (lambda total: None)
         self._on_advance = on_advance or (lambda: None)
         self._lock = threading.Lock()
@@ -162,9 +166,13 @@ class EvalRunner:
         planned = 0
         for sample in samples:
             pending = [m for m in self.methods if (sample.sample_id, m.name) not in done]
+            if self.config.build_only:  # 只构建：每份对话历史算一个任务
+                pending = list(self.methods)
             if pending:
                 groups.setdefault(sample.space_key, []).append((sample, pending))
                 planned += len(pending)
+        if self.config.build_only:
+            planned = len(groups)
         self._on_start(planned)
         # 对话历史比线程少时（LoCoMo 一共 3 段对话），同一段历史里的题也并行回答
         self._inner_workers = max(1, self.config.workers // max(1, len(groups)))
@@ -197,6 +205,17 @@ class EvalRunner:
                     self.settings, ledger=self.ledger, http_client=self._http_client
                 )
             return self._embedder
+
+    @property
+    def image_embedder(self) -> ImageEmbedder | None:
+        """图片向量器（N6），所有题共用一个；没有 Key 时为 None。"""
+        with self._lock:
+            if self._image_embedder is None and not self._image_embedder_checked:
+                self._image_embedder = build_image_embedder(
+                    self.settings, ledger=self.ledger, http_client=self._http_client
+                )
+                self._image_embedder_checked = True
+            return self._image_embedder
 
     @property
     def reranker(self) -> Reranker | None:
@@ -262,6 +281,13 @@ class EvalRunner:
         if build.get("_path") and system is not None:
             path = Path(build.pop("_path"))
             path.write_text(json.dumps(build, ensure_ascii=False), encoding="utf-8")
+        if self.config.build_only:
+            if system is not None:
+                system.close()
+            with self._lock:
+                self._completed += 1
+            self._on_advance()
+            return
         pairs = [(sample, method) for sample, methods in items for method in methods]
 
         def answer(pair: tuple[Sample, Method]) -> None:
@@ -373,6 +399,7 @@ class EvalRunner:
             "llm": self.llm,
             "ledger": self.ledger,
             "reranker": self.reranker,
+            "image_embedder": self.image_embedder,
         }
         if not self.config.reuse_spaces:
             return MemorySystem.ephemeral(self.settings, **parts), {}

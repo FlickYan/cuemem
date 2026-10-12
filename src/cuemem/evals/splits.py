@@ -37,15 +37,20 @@ def stratified_ids(samples: Sequence[Sample], size: int, *, seed: int = 0) -> li
     return sorted(chosen)
 
 
+def split_namespace(dataset: str) -> str:
+    """划分按题目定义：MemLens 各档长度是同一批题，共用一套划分文件。"""
+    return "memlens" if dataset.startswith("memlens") else dataset
+
+
 def split_path(dataset: str, name: str) -> Path:
-    return SPLITS_DIR / f"{dataset}_{name}.json"
+    return SPLITS_DIR / f"{split_namespace(dataset)}_{name}.json"
 
 
 def save_split(dataset: str, name: str, ids: Sequence[str], *, seed: int, note: str = "") -> Path:
     path = split_path(dataset, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "dataset": dataset,
+        "dataset": split_namespace(dataset),
         "name": name,
         "seed": seed,
         "size": len(ids),

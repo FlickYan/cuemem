@@ -12,6 +12,7 @@ paths:
   datasets: data/datasets
   eval_runs: runs/eval
   eval_spaces: data/eval-spaces   # 评测题目的记忆空间存在磁盘上复用，第二次运行不用重新写入与巩固
+  media: data/media               # 原图按内容哈希存放（N6）
 
 # 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
 llm_cache_mode: read_write
@@ -79,6 +80,7 @@ models:
     provider: qwen
     model_id: qwen3.8-flash
     context_window: 1000000
+    vision: true                       # 2026-10-12 实测能读图
     price: {input: 0.15, cached_input: 0.016, output: 0.47}
     extra_body: {enable_thinking: false}
   qwen3-vl-plus:
@@ -93,7 +95,8 @@ roles:
   extractor: {model: qwen3.8-flash}    # 写入时的抽取：调用量大，选最便宜的
   planner: {model: qwen3.8-flash}      # L2 的查询规划与充分性检查：要快
   reader: {model: deepseek-flash}      # 主实验的回答模型
-  vlm: {model: deepseek-flash}         # 图片描述与再感知（N6 实测后再定）
+  vlm: {model: deepseek-flash}         # 回答时再感知原图：与主 reader 相同，方法之间只差"给不给原图"
+  captioner: {model: qwen3.8-flash}    # 写入时的图片描述（N6）：调用量大、不在读路径上，选最便宜且能看图的
   judge: {model: qwen3.8-max}          # 评测判分
 
 embedding:
@@ -110,6 +113,14 @@ embedding:
   native_url: https://maas.qwencloudapi.com/api/v1/services/embeddings/text-embedding/text-embedding
   price_per_m: 0.07
   currency: USD
+
+# 图片向量（N6）：图片与文字在同一个向量空间（1152 维），用于以文搜图、以图搜图
+multimodal_embedding:
+  provider: qwen
+  model: tongyi-embedding-vision-plus
+  dim: 1152
+  price_per_m: 0.108                   # 美元 / 百万 tokens（国际站标价，2026-10-12 核对）
+  max_side: 768
 
 # 重排（N5，L2 用）：对候选轮做 cross-encoder 打分。QwenCloud 的 qwen3-rerank，原生接口
 rerank:

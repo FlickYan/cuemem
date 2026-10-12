@@ -16,6 +16,7 @@ TOY_CONVERSATION = PROJECT_ROOT / "examples" / "toy_conversation.json"
 # {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": "{...}"}]}
 ChatReply = str | Callable[[dict[str, Any]], str | dict[str, Any]]
 REJECT = "__REJECT__"  # 回复函数返回它时，模拟内容审核拒绝（HTTP 400）
+ABORT_JSON = "__ABORT_JSON__"  # 模拟 QwenCloud 在 JSON 模式下中止生成（HTTP 400）
 
 
 def chat_completion_body(
@@ -93,6 +94,18 @@ class FakeAPI:
                     json=chat_completion_body(
                         content.get("content"), deepseek=deepseek, tool_calls=content["tool_calls"]
                     ),
+                )
+            if content == ABORT_JSON:
+                return httpx2.Response(
+                    400,
+                    json={
+                        "error": {
+                            "code": "invalid_parameter_error",
+                            "message": "Model output became abnormal while generating a JSON "
+                            "response for response_format.",
+                            "type": "invalid_request_error",
+                        }
+                    },
                 )
             if content == REJECT:  # 模拟供应商的内容审核拒绝（QwenCloud 的报错格式）
                 return httpx2.Response(

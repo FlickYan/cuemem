@@ -20,10 +20,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MemoryUnit, Turn
+from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
 from cuemem.errors import ConfigMismatchError
 
-SCHEMA_VERSION = 3  # v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列
+# v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；v4：media 增加孤立描述与尺寸
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -120,7 +121,10 @@ CREATE TABLE IF NOT EXISTS media (
     tags TEXT NOT NULL DEFAULT '[]',
     entity_ids TEXT NOT NULL DEFAULT '[]',
     source_turn_id TEXT NOT NULL,
-    ts TEXT NOT NULL
+    ts TEXT NOT NULL,
+    caption_iso TEXT NOT NULL DEFAULT '',
+    width INTEGER NOT NULL DEFAULT 0,
+    height INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -140,6 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id)
 CREATE INDEX IF NOT EXISTS idx_facts_space ON facts (space_id, subject_id, predicate);
 CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
+CREATE INDEX IF NOT EXISTS idx_media_space ON media (space_id, source_turn_id);
 """
 
 # 派生数据所在的表：forget 与重建时整体清空，再从原始轮次重放
@@ -151,6 +156,10 @@ _FACT_COLUMNS = (
 )
 _UNIT_COLUMNS = "id, space_id, kind, session_id, text, ts, source_turn_ids, meta"
 _ENTITY_COLUMNS = "id, space_id, name, type, aliases, description, first_seen, last_seen, mentions"
+_MEDIA_COLUMNS = (
+    "id, space_id, sha256, path, caption, ocr_text, tags, entity_ids, source_turn_id, ts,"
+    " caption_iso, width, height"
+)
 
 
 class MemoryDB:
@@ -167,6 +176,14 @@ class MemoryDB:
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
             if "speaker" not in columns:  # 从 v1 升级
                 self._conn.execute("ALTER TABLE turns ADD COLUMN speaker TEXT")
+            media_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(media)")}
+            for column, ddl in (
+                ("caption_iso", "TEXT NOT NULL DEFAULT ''"),
+                ("width", "INTEGER NOT NULL DEFAULT 0"),
+                ("height", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in media_columns:  # 从 v3 升级
+                    self._conn.execute(f"ALTER TABLE media ADD COLUMN {column} {ddl}")
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
 
@@ -308,6 +325,12 @@ class MemoryDB:
                 " (SELECT DISTINCT session_id FROM turns WHERE space_id = ?)",
                 (space_id, space_id),
             )
+            # 被删发言里的图片记录一并删除（原图文件由调用方按引用情况清理）
+            conn.execute(
+                "DELETE FROM media WHERE space_id = ? AND source_turn_id NOT IN"
+                " (SELECT id FROM turns WHERE space_id = ?)",
+                (space_id, space_id),
+            )
         return deleted
 
     # ---------- 检索层：记忆单元 ----------
@@ -375,6 +398,88 @@ class MemoryDB:
                 )
                 deleted += max(cursor.rowcount, 0)
         return deleted
+
+    # ---------- 图片（N6） ----------
+
+    def add_media(self, items: Sequence[MediaItem]) -> int:
+        """登记图片（在线写入时，还没有描述）。重复登记同一条什么也不做。"""
+        rows = [
+            (
+                m.id,
+                m.space_id,
+                m.sha256,
+                m.path,
+                m.caption,
+                m.ocr_text,
+                json.dumps(m.tags, ensure_ascii=False),
+                json.dumps(m.entity_ids),
+                m.source_turn_id,
+                m.ts.isoformat(),
+                m.caption_iso,
+                m.width,
+                m.height,
+            )
+            for m in items
+        ]
+        with self.transaction() as conn:
+            cursor = conn.executemany(
+                f"INSERT OR IGNORE INTO media ({_MEDIA_COLUMNS}) VALUES ({', '.join('?' * 13)})",
+                rows,
+            )
+            return max(cursor.rowcount, 0)
+
+    def get_media(
+        self,
+        space_id: str,
+        *,
+        ids: Sequence[str] | None = None,
+        turn_ids: Sequence[str] | None = None,
+    ) -> list[MediaItem]:
+        sql = f"SELECT {_MEDIA_COLUMNS} FROM media WHERE space_id = ?"
+        args: list[Any] = [space_id]
+        for column, values in (("id", ids), ("source_turn_id", turn_ids)):
+            if values is not None:
+                if not values:
+                    return []
+                sql += f" AND {column} IN ({', '.join('?' for _ in values)})"
+                args.extend(values)
+        sql += " ORDER BY ts, id"
+        with self._lock:
+            fetched = self._conn.execute(sql, args).fetchall()
+        return [_row_to_media(r) for r in fetched]
+
+    def set_media_captions(self, items: Sequence[MediaItem]) -> None:
+        """写入巩固阶段生成的描述（上下文感知描述、孤立描述、图中文字、标签）。"""
+        with self.transaction() as conn:
+            conn.executemany(
+                "UPDATE media SET caption = ?, caption_iso = ?, ocr_text = ?, tags = ?"
+                " WHERE id = ? AND space_id = ?",
+                [
+                    (
+                        m.caption,
+                        m.caption_iso,
+                        m.ocr_text,
+                        json.dumps(m.tags, ensure_ascii=False),
+                        m.id,
+                        m.space_id,
+                    )
+                    for m in items
+                ],
+            )
+
+    def has_media(self, space_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM media WHERE space_id = ? LIMIT 1", (space_id,)
+            ).fetchone()
+        return row is not None
+
+    def media_sha_in_use(self, sha256: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM media WHERE sha256 = ? LIMIT 1", (sha256,)
+            ).fetchone()
+        return row is not None
 
     # ---------- 派生层：实体、事实、片段、核心记忆 ----------
 
@@ -554,6 +659,12 @@ class MemoryDB:
             conn.execute("DELETE FROM units WHERE space_id = ? AND kind != 'round'", (space_id,))
             for table in DERIVED_TABLES:
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
+            # 图片描述也是派生数据：清空后由巩固重新生成（命中缓存）；图片本身属于原始层
+            conn.execute(
+                "UPDATE media SET caption = '', caption_iso = '', ocr_text = '', tags = '[]'"
+                " WHERE space_id = ?",
+                (space_id,),
+            )
         return ids
 
     # ---------- 巩固任务队列 ----------
@@ -787,4 +898,22 @@ def _row_to_entity(r: Sequence[Any]) -> Entity:
         first_seen=datetime.fromisoformat(r[6]),
         last_seen=datetime.fromisoformat(r[7]),
         mentions=r[8],
+    )
+
+
+def _row_to_media(r: Sequence[Any]) -> MediaItem:
+    return MediaItem(
+        id=r[0],
+        space_id=r[1],
+        sha256=r[2],
+        path=r[3],
+        caption=r[4],
+        ocr_text=r[5],
+        tags=json.loads(r[6]),
+        entity_ids=json.loads(r[7]),
+        source_turn_id=r[8],
+        ts=datetime.fromisoformat(r[9]),
+        caption_iso=r[10],
+        width=r[11],
+        height=r[12],
     )

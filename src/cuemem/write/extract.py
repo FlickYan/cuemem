@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, get_args
@@ -20,6 +20,7 @@ from cuemem.core.models import Cardinality, EntityType, FactCategory, Turn
 from cuemem.core.timeutil import normalize_partial_date
 from cuemem.core.trace import span
 from cuemem.llm.client import LLMClient, Message
+from cuemem.write.caption import inline_images
 from cuemem.write.predicates import SUGGESTED
 
 # 抽取逻辑（提示词、输出结构、后处理）的版本。变化后，已巩固的空间需要重建派生记忆
@@ -173,13 +174,20 @@ def participants(turns: Sequence[Turn]) -> list[str]:
 
 
 def render_session(
-    turns: Sequence[Turn], started_at: datetime, *, assistant_chars: int | None
+    turns: Sequence[Turn],
+    started_at: datetime,
+    *,
+    assistant_chars: int | None,
+    image_notes: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     """把会话渲染成带轮次编号的文本。
 
     助手回复只保留开头 assistant_chars 个字符：记忆主要关于用户，LongMemEval 里助手回复
     占对话文本的 87%，截断后抽取的输入 token 少一大半；完整的助手回复仍保存在原始日志和"轮"
     索引里，"助手说过什么"这类问题照样能检索到。
+
+    image_notes（N6）：发言 ID → 这条发言里各张图的描述，填回 "<image>" 的位置。只有带图的
+    会话才多一行说明，不带图的会话渲染结果与之前完全相同（抽取缓存照常命中）。
     """
     names = participants(turns)
     who = ", ".join(names) if names != ["User", "Assistant"] else "User, Assistant (AI)"
@@ -187,13 +195,21 @@ def render_session(
         f"Conversation date: {started_at:%Y-%m-%d (%A)}",
         f"Participants: {who}",
         f"Language: {conversation_language(turns)}",
-        "",
     ]
+    notes = image_notes or {}
+    if any(notes.get(t.id) for t in turns):
+        lines.append(
+            "Images shared in the conversation are shown as [Image: description]; treat what "
+            "they show as information the speaker shared."
+        )
+    lines.append("")
     for turn in turns:
         label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
         text = turn.text.strip()
         if turn.role == "assistant" and assistant_chars is not None and len(text) > assistant_chars:
             text = text[:assistant_chars].rstrip() + " […]"
+        if notes.get(turn.id):
+            text = inline_images(text, notes[turn.id])
         lines.append(f"[t{turn.idx}] {label}: {text}")
     return "\n".join(lines)
 
@@ -231,6 +247,7 @@ class Extractor:
         started_at: datetime,
         *,
         cache_scope: str | None = None,
+        image_notes: Mapping[str, Sequence[str]] | None = None,
     ) -> SessionExtraction:
         """抽取一个会话。超长会话按轮次切成几个窗口分别抽取，再合并结果。"""
         by_idx = {t.idx: t.id for t in turns}
@@ -248,7 +265,7 @@ class Extractor:
             with span("extract", session=session_id, turns=len(window)):
                 structured = self.llm.structured(
                     self.role,
-                    self.messages(window, started_at),
+                    self.messages(window, started_at, image_notes=image_notes),
                     ExtractionOutput,
                     model=self.model,
                     cache_scope=cache_scope,
@@ -268,7 +285,13 @@ class Extractor:
         result.summary = " ".join(summaries)
         return result
 
-    def messages(self, turns: Sequence[Turn], started_at: datetime) -> list[Message]:
+    def messages(
+        self,
+        turns: Sequence[Turn],
+        started_at: datetime,
+        *,
+        image_notes: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[Message]:
         names = participants(turns)
         if names == ["User", "Assistant"]:
             focus, subject_hint = "the user", '"User" for the user'
@@ -276,7 +299,9 @@ class Extractor:
             focus = "the speakers (" + ", ".join(names) + ")"
             subject_hint = "the speaker's name (" + ", ".join(names) + ")"
         system = EXTRACTION_SYSTEM.format(focus=focus, subject_hint=subject_hint)
-        text = render_session(turns, started_at, assistant_chars=self.assistant_chars)
+        text = render_session(
+            turns, started_at, assistant_chars=self.assistant_chars, image_notes=image_notes
+        )
         return [{"role": "system", "content": system}, {"role": "user", "content": text}]
 
     def _windows(self, turns: Sequence[Turn]) -> list[list[Turn]]:
@@ -298,4 +323,6 @@ def session_content_hash(turns: Sequence[Turn], started_at: datetime) -> str:
     """会话内容指纹：任务键的一部分。会话追加了新轮次或轮次被删除时，指纹随之改变。"""
     parts = [started_at.isoformat()]
     parts += [f"{t.idx}\x1e{t.role}\x1e{t.speaker or ''}\x1e{t.text}" for t in turns]
+    # 带图的发言再加上图片 ID（不带图的会话指纹与之前相同，已有的任务键不变）
+    parts += [f"{t.idx}\x1e{','.join(t.media_ids)}" for t in turns if t.media_ids]
     return content_hash("\x1f".join(parts))

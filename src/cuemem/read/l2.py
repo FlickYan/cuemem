@@ -23,14 +23,21 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator
 
-from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MemoryUnit
+from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MediaItem, MemoryUnit
 from cuemem.core.trace import record_event, span
 from cuemem.embed.base import TextEmbedder
 from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient
 from cuemem.read.facts import choose_facts
 from cuemem.read.graph import GraphConfig, MemoryGraph
-from cuemem.read.l1 import L1Candidates, L1Config, L1Retriever, estimate_tokens, pack_rounds
+from cuemem.read.l1 import (
+    L1Candidates,
+    L1Config,
+    L1Retriever,
+    collect_media,
+    estimate_tokens,
+    pack_rounds,
+)
 from cuemem.read.plan import QueryPlan, QueryPlanner, rule_plan
 from cuemem.read.rerank import Reranker
 from cuemem.store.sqlite import MemoryDB
@@ -98,6 +105,8 @@ class L2Result:
     checks: list[CheckRecord] = field(default_factory=list)
     timings_ms: dict[str, float] = field(default_factory=dict)
     debug: dict[str, Any] = field(default_factory=dict)
+    media: dict[str, MediaItem] = field(default_factory=dict)  # 装入的轮里的图片（N6）
+    attach: list[str] = field(default_factory=list)  # 要附上原图的图片 ID
 
     def details(self) -> dict[str, Any]:
         """评测结果里记录的 L2 过程：计划、每次充分性检查、图扩散与重排的情况。"""
@@ -239,6 +248,9 @@ class L2Retriever:
                 facts.extend(added_facts)
         timings["total"] = _since(started)
         debug["evidence_tokens"] = sum(estimate_tokens(h.unit.text) for h in rounds)
+        media, attach = collect_media(
+            self.db, space_id, rounds, pool.media_score, cfg.l1.attach_images
+        )
         return L2Result(
             plan=plan,
             rounds=rounds,
@@ -247,6 +259,8 @@ class L2Retriever:
             checks=checks,
             timings_ms=timings,
             debug=debug,
+            media=media,
+            attach=attach,
         )
 
     # ---------- 多路召回与融合 ----------
@@ -410,6 +424,7 @@ def _fuse_queries(
     rrf_k = cfg.l1.rrf_k
     round_parts: dict[str, list[float]] = defaultdict(list)
     fact_parts: dict[str, list[float]] = defaultdict(list)
+    media_score: dict[str, float] = {}
     units: dict[str, MemoryUnit] = {}
     facts: dict[str, Fact] = {}
     fact_rounds: dict[str, list[str]] = {}
@@ -422,6 +437,8 @@ def _fuse_queries(
         units.update(cands.round_units)
         facts.update(cands.facts)
         fact_rounds.update(cands.fact_rounds)
+        for media_id, score in cands.media_score.items():
+            media_score[media_id] = max(media_score.get(media_id, 0.0), score)
 
     def combine(parts: list[float]) -> float:
         return max(parts) + 0.1 * sum(parts) if cfg.fusion == "max" else sum(parts)
@@ -436,6 +453,7 @@ def _fuse_queries(
         fact_score={fid: combine(parts) for fid, parts in fact_parts.items()},
         fact_rounds=fact_rounds,
         debug={"queries": len(per_query), "candidates": len(round_score)},
+        media_score=media_score,
     )
 
 

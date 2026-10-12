@@ -1,6 +1,7 @@
 """在线写入（同步、不调用 LLM）：追加原始轮次 → 切分为"轮" → 向量化 → 写入索引。
 
-巩固（抽取事实、实体、摘要）不在这里做，而是登记成任务，由 write/consolidate.py 异步完成。
+带图片的发言（N6）：原图按内容哈希存进媒体库，登记图片记录，并算出图片向量（以文搜图用）。
+巩固（抽取事实、实体、摘要、图片描述）不在这里做，而是登记成任务，由 write/consolidate.py 异步完成。
 """
 
 from __future__ import annotations
@@ -8,13 +9,16 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from cuemem.core.ids import stable_id
-from cuemem.core.models import Conversation, MemoryUnit, SessionIn, Turn
+from cuemem.core.models import Conversation, MediaItem, MemoryUnit, SessionIn, Turn
 from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import span
 from cuemem.embed.base import TextEmbedder
+from cuemem.embed.multimodal import ImageEmbedder
+from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 
@@ -27,6 +31,7 @@ class IngestReport:
     units_added: int
     embed_tokens: int
     elapsed_ms: float
+    images_added: int = 0
 
 
 def build_turns(space_id: str, session: SessionIn) -> list[Turn]:
@@ -60,6 +65,11 @@ def build_rounds(turns: Sequence[Turn]) -> list[MemoryUnit]:
     for group in groups:
         first = group[0]
         text = "\n".join(f"{_label(t)}: {t.text}" for t in group)
+        # turn_indices：评测时据此判断是否命中证据
+        meta: dict[str, Any] = {"turn_indices": [t.idx for t in group]}
+        media_ids = [m for t in group for m in t.media_ids]
+        if media_ids:
+            meta["media_ids"] = media_ids  # 这一轮里的图片，按出现顺序（回答时把描述填回原位）
         units.append(
             MemoryUnit(
                 id=stable_id(first.space_id, "round", first.session_id, first.idx),
@@ -69,7 +79,7 @@ def build_rounds(turns: Sequence[Turn]) -> list[MemoryUnit]:
                 text=text,
                 ts=first.ts,
                 source_turn_ids=[t.id for t in group],
-                meta={"turn_indices": [t.idx for t in group]},  # 评测时据此判断是否命中证据
+                meta=meta,
             )
         )
     return units
@@ -82,10 +92,20 @@ def _label(turn: Turn) -> str:
 
 
 class OnlineWriter:
-    def __init__(self, db: MemoryDB, vectors: VectorStore, embedder: TextEmbedder) -> None:
+    def __init__(
+        self,
+        db: MemoryDB,
+        vectors: VectorStore,
+        embedder: TextEmbedder,
+        *,
+        media: MediaStore | None = None,
+        image_embedder: ImageEmbedder | None = None,
+    ) -> None:
         self.db = db
         self.vectors = vectors
         self.embedder = embedder
+        self.media = media  # 为空时忽略图片（文本里的 "<image>" 标记照常保留）
+        self.image_embedder = image_embedder
 
     def ingest(self, conversation: Conversation) -> IngestReport:
         started = time.perf_counter()
@@ -93,12 +113,16 @@ class OnlineWriter:
         self.db.ensure_space(space_id)
         turns_added = 0
         units: list[MemoryUnit] = []
+        media: list[MediaItem] = []
         for session in conversation.sessions:
             self.db.add_session(space_id, session.session_id, session.started_at)
             turns = build_turns(space_id, session)
+            if self.media is not None:
+                media.extend(self._attach_images(session, turns))
             turns_added += self.db.add_turns(turns)
             units.extend(build_rounds(turns))
 
+        images_added = self._index_images(space_id, media)
         new_units, tokens = self._index(space_id, units)
         return IngestReport(
             space_id=space_id,
@@ -107,7 +131,49 @@ class OnlineWriter:
             units_added=len(new_units),
             embed_tokens=tokens,
             elapsed_ms=(time.perf_counter() - started) * 1000,
+            images_added=images_added,
         )
+
+    def _attach_images(self, session: SessionIn, turns: Sequence[Turn]) -> list[MediaItem]:
+        """把发言里的图片存进媒体库，生成图片记录，并把图片 ID 记在发言上。"""
+        assert self.media is not None
+        items: list[MediaItem] = []
+        for turn, turn_in in zip(turns, session.turns, strict=True):
+            for i, path in enumerate(turn_in.images):
+                stored = self.media.put(Path(path))
+                items.append(
+                    MediaItem(
+                        id=stable_id(turn.space_id, "media", turn.id, i),
+                        space_id=turn.space_id,
+                        sha256=stored.sha256,
+                        path=str(stored.path),
+                        source_turn_id=turn.id,
+                        ts=turn.ts,
+                        width=stored.width,
+                        height=stored.height,
+                    )
+                )
+            turn.media_ids = [m.id for m in items if m.source_turn_id == turn.id]
+        return items
+
+    def _index_images(self, space_id: str, items: Sequence[MediaItem]) -> int:
+        """新图片：先写图片向量，再登记图片记录（与文本单元一样，数据库里有就说明向量已写入）。"""
+        if not items:
+            return 0
+        existing = {m.id for m in self.db.get_media(space_id, ids=[m.id for m in items])}
+        new = [m for m in items if m.id not in existing]
+        if not new:
+            return 0
+        if self.image_embedder is not None:
+            with span("embed_images", images=len(new)):
+                vectors = self.image_embedder.embed_images([Path(m.path) for m in new])
+            self.vectors.upsert_images(
+                space_id,
+                [m.id for m in new],
+                vectors,
+                [{"turn_id": m.source_turn_id, "ts": to_epoch(m.ts)} for m in new],
+            )
+        return self.db.add_media(new)
 
     def reindex_sessions(self, space_id: str, session_ids: Sequence[str]) -> int:
         """按数据库里现存的轮次重建这些会话的"轮"（遗忘部分轮次之后使用）。

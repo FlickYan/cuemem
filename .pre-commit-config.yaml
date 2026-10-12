@@ -1,4 +1,6 @@
-# 使用项目自己锁定版本的 ruff，避免钩子与 CI 版本不一致
+# 使用项目自己锁定版本的 ruff，避免钩子与 CI 版本不一致。
+# MemLens 官方判分提示词逐字照搬，不能被自动修复或格式化改动
+exclude: ^src/cuemem/evals/memlens_prompts/
 repos:
   - repo: local
     hooks:

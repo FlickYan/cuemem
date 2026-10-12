@@ -235,6 +235,27 @@ def ask(
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
 
 
+@app.command("search-image")
+def search_image(
+    image: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="要查找的图片")],
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    k: Annotated[int, typer.Option(help="返回几张")] = 5,
+) -> None:
+    """以图搜图：在记忆里找出最相似的图片（"我之前给你看过这个吗？"）。"""
+    with _open_system() as system:
+        found = system.search_by_image(space, image, k)
+        if not found:
+            console.print("没有找到图片（这个空间里没有图片，或没有配置图片向量）。")
+            return
+        table = Table(title=f"最相似的 {len(found)} 张图片")
+        for column in ("相似度", "时间", "描述", "原图"):
+            table.add_column(column, overflow="fold")
+        for item, score in found:
+            caption = item.caption or "（还没有描述，运行 cuemem consolidate 生成）"
+            table.add_row(f"{score:.3f}", f"{item.ts:%Y-%m-%d}", caption[:120], item.path)
+        console.print(table)
+
+
 @app.command()
 def spaces() -> None:
     """列出所有记忆空间。"""
@@ -467,6 +488,14 @@ def eval_run(
         str | None,
         typer.Option(help="高峰时段策略：wait 暂停到高峰结束（默认）/ warn / allow"),
     ] = None,
+    build_only: Annotated[
+        bool,
+        typer.Option(
+            "--build-only",
+            help="只构建记忆空间（写入与巩固），不回答、不判分；"
+            "构建只用通义的模型，可以在 DeepSeek 高峰时段做",
+        ),
+    ] = False,
 ) -> None:
     """运行评测：写入 → 回答 → 判分；结果写入 runs/eval/<运行名>/，最后生成报告。"""
     if peak is not None and peak not in ("wait", "warn", "allow"):
@@ -494,6 +523,7 @@ def eval_run(
         workers=workers,
         max_cost=max_cost,
         limit=limit,
+        build_only=build_only,
     )
     count = min(limit, len(evalset.samples)) if limit else len(evalset.samples)
     console.print(f"运行 [bold]{run_name}[/bold]：{count} 题 × {config.methods}")
@@ -526,6 +556,13 @@ def eval_run(
             progress.stop()
             console.print(f"[red]错误：[/red]{exc}")
             raise typer.Exit(1) from exc
+    if build_only:
+        console.print(
+            f"构建完成：{summary.completed} / {summary.planned} 份对话历史，"
+            f"出错 {summary.errors} 份；耗时 {summary.elapsed_s:.0f} 秒；"
+            f"本次实际花费 ${summary.spent:.4f}"
+        )
+        return
     report_path = build_report(summary.run_dir)
     note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
     console.print(

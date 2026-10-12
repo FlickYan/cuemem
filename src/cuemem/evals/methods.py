@@ -17,7 +17,7 @@ from cuemem.memory import MemorySystem
 from cuemem.read.facts import Validity
 from cuemem.read.l1 import L1Config
 from cuemem.read.l2 import L2Config
-from cuemem.read.reader import Reader, format_history
+from cuemem.read.reader import Reader, format_history, history_blocks
 
 
 @dataclass
@@ -58,16 +58,23 @@ class NoMemory:
 
 
 class FullContext:
-    """B1：把整份对话历史塞进上下文（LongMemEval_S 每题约 12 万 tokens），最贵。"""
+    """B1：把整份对话历史塞进上下文（LongMemEval_S 每题约 12 万 tokens），最贵。
+    带图的对话（MemLens）把图片按原位插在对话里，即"长上下文模型直接看图"。"""
 
     name, label, needs_index, needs_consolidation = "B1", "全上下文", False, False
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
-        history = format_history(to_session_ins(ctx.sessions))
         a = ctx.reader.answer_from_history(
-            ctx.sample.question, history, question_time=ctx.sample.question_time
+            ctx.sample.question, _history(ctx.sessions), question_time=ctx.sample.question_time
         )
         return MethodOutput(a.answer, a.evidence_sufficient)
+
+
+def _history(sessions: Sequence[EvalSession]) -> str | list[dict[str, Any]]:
+    session_ins = to_session_ins(sessions)
+    if any(t.images for s in session_ins for t in s.turns):
+        return history_blocks(session_ins)
+    return format_history(session_ins)
 
 
 class NaiveRAG:
@@ -146,12 +153,14 @@ class L1RAG:
         *,
         relative_time: bool = True,
         notes: bool = False,
+        show_facts: bool = True,
     ) -> None:
         self.name = name
         self.label = label
         self.config = config
         self.relative_time = relative_time
         self.notes = notes
+        self.show_facts = show_facts  # False：不给事实与核心记忆（只看对话片段）
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
         assert ctx.system is not None
@@ -163,8 +172,12 @@ class L1RAG:
             l1=self.config,
             relative_time=self.relative_time,
             notes=self.notes,
+            show_facts=self.show_facts,
+            profile=self.show_facts,
         )
-        return MethodOutput(a.answer, a.evidence_sufficient, hits=a.hits, facts=a.facts)
+        return MethodOutput(
+            a.answer, a.evidence_sufficient, hits=a.hits, facts=a.facts, details=a.details
+        )
 
 
 class L2RAG:
@@ -247,9 +260,8 @@ class OracleSessions:
     def answer(self, ctx: MethodContext) -> MethodOutput:
         wanted = set(ctx.sample.evidence_session_ids)
         evidence = [s for s in ctx.sessions if s.session_id in wanted]
-        history = format_history(to_session_ins(evidence))
         a = ctx.reader.answer_from_history(
-            ctx.sample.question, history, question_time=ctx.sample.question_time
+            ctx.sample.question, _history(evidence), question_time=ctx.sample.question_time
         )
         return MethodOutput(a.answer, a.evidence_sufficient)
 
@@ -279,12 +291,24 @@ METHOD_NAMES = (
     "B5-nonote",
     "B6r",
     "B3",
+    "B4-text",
+    "B4-cap",
+    "B4-iso",
+    "B4-mm",
+    "B4-see",
+    "B4-novis",
+    "B4-see-novis",
+    "B5-see",
     "ORACLE",
 )
 
 
 # N4 定稿时的 L1 配置（带 BM25）：B4 及其消融固定用它，保证 N4 的结果可以复现
 N4_L1 = L1Config(sparse="bm25")
+# N6：只用对话与图片描述、不用事实的两个配置（事实是从带描述的会话里抽取的，会泄露图片内容）
+# 对比图片描述时不用以文搜图，只看描述本身的作用
+CAPTIONS = L1Config(fact_weight=0.0, visual_weight=0.0)
+TEXT_ONLY = replace(CAPTIONS, image_kind=None)
 
 
 def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
@@ -326,6 +350,38 @@ def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
         "B5-nonote": lambda: L2RAG("B5-nonote", "不记笔记", L2Config(), notes=False),
         "B6r": lambda: RoutedRAG("B6r", "规则版控制器（L1 / L2）", L1Config(), L2Config()),
         "B3": AgentRAG,
+        # N6 多模态（MemLens）：从纯文本记忆逐级加上图片描述、事实、再感知
+        "B4-text": lambda: L1RAG(
+            "B4-text", "纯文本记忆（图片只留占位）", TEXT_ONLY, show_facts=False
+        ),
+        "B4-cap": lambda: L1RAG(
+            "B4-cap", "对话 + 上下文感知的图片描述", CAPTIONS, show_facts=False
+        ),
+        "B4-iso": lambda: L1RAG(
+            "B4-iso",
+            "对话 + 孤立的图片描述",
+            replace(CAPTIONS, image_kind="image_iso"),
+            show_facts=False,
+        ),
+        "B4-mm": lambda: L1RAG(
+            "B4-mm", "L1：对话 + 图片描述 + 以文搜图 + 事实与核心记忆", L1Config()
+        ),
+        "B4-see": lambda: L1RAG(
+            "B4-see", "B4-mm + 再感知 3 张原图", replace(L1Config(), attach_images=3)
+        ),
+        "B4-novis": lambda: L1RAG(
+            "B4-novis", "B4-mm 去掉以文搜图", replace(L1Config(), visual_weight=0.0)
+        ),
+        "B4-see-novis": lambda: L1RAG(
+            "B4-see-novis",
+            "B4-see 去掉以文搜图",
+            replace(L1Config(), visual_weight=0.0, attach_images=3),
+        ),
+        "B5-see": lambda: L2RAG(
+            "B5-see",
+            "L2 + 再感知 3 张原图",
+            replace(L2Config(), l1=replace(L2Config().l1, attach_images=3)),
+        ),
         "ORACLE": OracleSessions,
     }
     unknown = [n for n in names if n not in factories]

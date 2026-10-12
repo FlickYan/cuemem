@@ -3,7 +3,7 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-> 进行中：N5 L2 深度检索已完成（查询规划、补检索、先记笔记再回答；规则版控制器与模型自主检索两条基线），下一步是 N6 多模态记忆。进度见下方表格与 [路线图](docs/roadmap.md)。
+> 进行中：N6 多模态记忆已完成（图片描述 + 图文向量 + 回答时再看原图；MemLens 上 L2 加再感知 65.6%，长上下文模型直接看图 52.3%），下一步是 N7 检索控制器。进度见下方表格与 [路线图](docs/roadmap.md)。
 
 ## 它要解决什么
 
@@ -60,9 +60,11 @@ uv run cuemem ingest examples/toy_conversation.json --consolidate   # 写入并�
 uv run cuemem inspect facts --space demo     # 事实时间线：哪些已被取代、何时、被谁取代
 uv run cuemem inspect facts --space demo --valid-at 2025-06   # 2025 年 6 月时现实中成立的事实
 uv run cuemem ask "我现在在哪里工作？" --space demo --at 2025-10-10 --show-context
+uv run cuemem ask "我一共换过几次工作？" --space demo --mode auto --show-context   # 规则版控制器选 L1 / L2
 uv run cuemem forget --space demo --session s4   # 遗忘一段会话：派生的事实、向量、缓存一并清除
 uv run cuemem usage --today              # 调用量与成本（名义成本 / 估算花费）
-uv run cuemem data download              # 下载评测数据集（LongMemEval_S、LoCoMo）
+uv run cuemem search-image photo.jpg --space demo   # 以图搜图："我之前给你看过这个吗？"
+uv run cuemem data download              # 下载评测数据集（LongMemEval_S、LoCoMo、MemLens 32K / 128K 与图片）
 uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4）；dev100 为正式开发集
 ```
 
@@ -95,8 +97,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N3 | 写入路径：结构化、带有效期的记忆 | 已完成 |
 | N4 | L1 快速召回 | 已完成 |
 | N5 | L2 深度检索 | 已完成 |
-| N6 | 多模态记忆 | 下一步 |
-| N7 | 检索控制器（核心） | 未开始 |
+| N6 | 多模态记忆 | 已完成 |
+| N7 | 检索控制器（核心） | 下一步 |
 | N8 | Agent Runtime 与 Demo | 未开始 |
 | N9 | 完整评测与分析 | 未开始 |
 | N10 | 包装 | 未开始 |
@@ -104,6 +106,46 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 ## 结果
 
 主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
+
+### N6 多模态记忆：MemLens 图文多会话记忆基准（官方 195 题子集，32K 与 128K）
+
+图片写入时有三种表示：
+- **原图**：按内容哈希存放，回答时可以取回来再看一眼。
+- **图文向量**：tongyi-embedding-vision-plus，可以以文搜图。
+- **描述**：qwen3.8-flash 生成，模型同时看图和前后的对话，并抄下图中的文字。
+
+描述会填回原话里图片的位置，参与事实抽取，图片里的信息因此也进入事实。检索时，描述像事实一样作为"键"指回原话所在的轮；回答时可以把最相关的 3 张原图附给回答模型（再感知）。
+
+| 方法 | 32K 准确率 | 128K 准确率 | 每题名义成本 32K / 128K |
+|---|---|---|---|
+| B1 全上下文（长上下文模型直接看图） | 52.3% | 46.2% | $0.0083 / $0.0406 |
+| B4-text 纯文本记忆（图片只留占位） | 36.9% | 34.9% | $0.0013 |
+| B4-mm L1：对话 + 图片描述 + 以文搜图 + 事实 | 50.8% | 48.7% | $0.0018 |
+| **B4-see** B4-mm + 再感知 3 张原图 | **63.1%** | 55.9% | $0.0020 |
+| **B5-see** L2 + 再感知 | **65.6%** | **64.6%** | $0.0044 |
+| ORACLE 只给证据会话（图片按原位，上限参照） | 55.9% | 57.9% | $0.0021 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/n6-memlens/agent195-128k/pareto-dark.png">
+  <img alt="N6：MemLens 128K 上各方法的准确率与每题名义成本（对数坐标）" src="docs/results/n6-memlens/agent195-128k/pareto-light.png" width="720">
+</picture>
+
+1. **回答时再看原图（H5）成立**：
+   - 附 3 张原图，对只用描述的 B4-mm，32K +26 / −2（p < 0.001），128K +19 / −5（p = 0.007）。
+   - 提升集中在信息抽取题（41% → 72%）：颜色、数量、图中文字这类细节，描述写不全。
+   - 代价是每题多约 670 个 token（每张图约 220），+$0.0002。
+2. **长上下文模型随长度退化，记忆系统靠 L2 保持稳定**：
+   - 同一批题从 32K 换到 128K，全上下文掉 6 个点（p = 0.012），成本涨 5 倍。
+   - L1 的 B4-see 也掉了 7 个点（p = 0.016）。
+   - 只有 L2 的 B5-see 不变（p = 0.86）。
+   - B5-see 比全上下文高 13–18 个点，成本只有它的 1/2–1/9。
+3. **"给对的东西"胜过"给全部相关的东西"**：B5-see 在 32K 上比只给证据会话的 ORACLE 还高 10 个点（p = 0.004）。
+4. **两个没有得到支持的直觉**：
+   - **上下文感知描述并不比孤立描述好（H6）**：开发集上孤立描述反而多对 3 题，n.s.；MemLens 多问画面细节。
+   - **以文搜图检索更准，答得并不更好**：它让关键图片所在轮的召回 +18 到 +29 个点，但端到端在开发集和两档测试集上都没有差异。
+5. **纯文本记忆的错多是"看不到"**：纯文本记忆有 88 次回答"不知道"（32K），加描述后 49 次，再感知后 20 次。
+
+开发集上的组件对比、配对检验、纯检索指标与成本拆分见 [docs/results/n6-memlens/README.md](docs/results/n6-memlens/README.md)。判分提示词逐字照搬官方，判分模型不同（QwenCloud 上没有 Qwen3-VL-235B），所以与论文数字只能作参考。N6 合计花费约 $23.7（构建 $11.7、回答 $7.0、判分 $4.5）：构建只用通义的模型，放在 DeepSeek 高峰时段跑；DeepSeek 调用全部在非高峰时段。
 
 ### N5 L2 深度检索与规则版控制器：LongMemEval_S 开发集（100 题）+ LoCoMo（385 题）
 

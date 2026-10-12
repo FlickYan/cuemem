@@ -1,0 +1,114 @@
+{
+  "config": {
+    "name": "memlens32-dev100-n6",
+    "dataset": "memlens_32k",
+    "split": "dev100",
+    "methods": [
+      "B0",
+      "B1",
+      "B4-cap",
+      "B4-iso",
+      "B4-mm",
+      "B4-novis",
+      "B4-see",
+      "B4-see-novis",
+      "B4-text",
+      "B5-see",
+      "ORACLE"
+    ],
+    "k": 10,
+    "workers": 8,
+    "max_cost": 8.0,
+    "limit": null,
+    "reuse_spaces": true,
+    "build_only": false
+  },
+  "samples": 100,
+  "roles": {
+    "extractor": {
+      "model": "qwen3.8-flash",
+      "model_id": "qwen3.8-flash",
+      "price": {
+        "input": 0.15,
+        "output": 0.47,
+        "cached_input": 0.016
+      }
+    },
+    "planner": {
+      "model": "qwen3.8-flash",
+      "model_id": "qwen3.8-flash",
+      "price": {
+        "input": 0.15,
+        "output": 0.47,
+        "cached_input": 0.016
+      }
+    },
+    "reader": {
+      "model": "deepseek-flash",
+      "model_id": "deepseek-flash",
+      "price": {
+        "input": 0.3,
+        "output": 1.2,
+        "cached_input": 0.006
+      }
+    },
+    "vlm": {
+      "model": "deepseek-flash",
+      "model_id": "deepseek-flash",
+      "price": {
+        "input": 0.3,
+        "output": 1.2,
+        "cached_input": 0.006
+      }
+    },
+    "captioner": {
+      "model": "qwen3.8-flash",
+      "model_id": "qwen3.8-flash",
+      "price": {
+        "input": 0.15,
+        "output": 0.47,
+        "cached_input": 0.016
+      }
+    },
+    "judge": {
+      "model": "qwen3.8-max",
+      "model_id": "qwen3.8-max",
+      "price": {
+        "input": 2.0,
+        "output": 6.0,
+        "cached_input": 0.25
+      }
+    }
+  },
+  "embedding": {
+    "model": "qwen3.7-text-embedding",
+    "dim": 1024,
+    "backend": "dashscope"
+  },
+  "retrieval": {
+    "naive_k": 8,
+    "fact_k": 10,
+    "fact_pool": 50
+  },
+  "consolidation": {
+    "pipeline_version": "n3-v1",
+    "assistant_chars": 600,
+    "max_session_chars": 24000,
+    "workers": 8,
+    "fallback_model": "deepseek-flash",
+    "duplicate_threshold": 0.93,
+    "conflict_threshold": 0.75,
+    "multi_conflict_threshold": 0.88,
+    "entity_merge_threshold": 0.9,
+    "entity_gray_threshold": 0.75,
+    "profile_max_chars": 1600,
+    "profile_min_importance": 4,
+    "caption_images": true,
+    "caption_max_side": 768
+  },
+  "git": "c9e3469-dirty",
+  "created": "2026-10-12T18:01:59",
+  "resumed": [
+    "2026-10-12T18:09:09"
+  ]
+}

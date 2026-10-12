@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-from cuemem.core.models import Answer, FactHit, Hit, SessionIn
+from cuemem.core.models import Answer, FactHit, Hit, MediaItem, SessionIn
 from cuemem.core.trace import span
-from cuemem.llm.client import LLMClient
-from cuemem.read.facts import MemoryView, Validity, format_facts
+from cuemem.llm.client import LLMClient, Message
+from cuemem.read.facts import ImageMode, MemoryView, Validity, format_facts
 from cuemem.read.plan import TEMPORAL_TYPES, QueryPlan, range_text
 from cuemem.read.query import TimeRange
+from cuemem.store.media import image_data_url
+from cuemem.write.caption import fill_images, image_note
 
 # 评测基准以英文为主，提示词用英文；回答语言跟随问题
 READER_SYSTEM = """You are a personal assistant with long-term memory of past conversations with the user.
@@ -90,16 +93,22 @@ def format_memories(
     *,
     question_time: datetime | None = None,
     highlight: TimeRange | None = None,
+    media: Mapping[str, MediaItem] | None = None,
+    image_mode: ImageMode = "context",
+    attach: Sequence[str] = (),
 ) -> tuple[str, dict[str, str]]:
     """按时间顺序排列证据并编号，返回（上下文文本，编号 → 记忆单元 ID）。
 
     给了 question_time 时，每条再标上"距提问几天"（时间感知打包，N4）：
     让 reader 少做日期运算，"几天前""哪个先发生"这类问题直接有据可依。
     给了 highlight（问题所指的时间区间，L2）时，区间内的证据标上 ★。
+    轮里的图片（N6）在原位写成 [Image i3: 描述]；附了原图的注明是第几张图。
     """
     ordered = sorted(hits, key=lambda h: (h.unit.ts, h.unit.id))
     refs: dict[str, str] = {}
     blocks: list[str] = []
+    images = media or {}
+    image_count = 0
     for i, hit in enumerate(ordered, start=1):
         ref = f"m{i}"
         refs[ref] = hit.unit.id
@@ -109,8 +118,26 @@ def format_memories(
         header += f" · session {hit.unit.session_id}"
         if highlight is not None and highlight.contains(hit.unit.ts):
             header += f" {IN_RANGE_MARK}"
-        blocks.append(f"{header}\n{hit.unit.text}")
+        text = hit.unit.text
+        rendered: list[str] = []
+        for media_id in hit.unit.meta.get("media_ids", []):
+            image_count += 1
+            label = f"i{image_count}"
+            refs[label] = media_id
+            rendered.append(_image_text(label, images.get(media_id), image_mode, attach))
+        if rendered or "<image>" in text:
+            text = fill_images(text, rendered)
+        blocks.append(f"{header}\n{text}")
     return "\n\n".join(blocks), refs
+
+
+def _image_text(label: str, item: MediaItem | None, mode: ImageMode, attach: Sequence[str]) -> str:
+    if item is None or mode == "none":
+        return "[Image]"
+    note = image_note(item, isolated=mode == "isolated")
+    if item.id in attach:
+        return f"[Image {label}, see picture {attach.index(item.id) + 1} below: {note}]"
+    return f"[Image {label}: {note}]"
 
 
 def relative_days(moment: datetime, question_time: datetime) -> str:
@@ -191,6 +218,7 @@ class Reader:
             "\n\n".join(blocks),
             question_time,
             cache_scope=cache_scope,
+            pictures=self._pictures(view),
             memories=len(view.rounds),
             facts=len(facts),
         )
@@ -220,6 +248,7 @@ class Reader:
             question_time,
             cache_scope=cache_scope,
             schema=NotedReaderOutput,
+            pictures=self._pictures(view),
             memories=len(view.rounds),
             facts=len(facts),
         )
@@ -251,7 +280,14 @@ class Reader:
                 facts, validity=validity, question_time=when, highlight=highlight
             )
             blocks.append(text)
-        context, round_refs = format_memories(view.rounds, question_time=when, highlight=highlight)
+        context, round_refs = format_memories(
+            view.rounds,
+            question_time=when,
+            highlight=highlight,
+            media=view.media,
+            image_mode=view.image_mode,
+            attach=view.attach,
+        )
         blocks.append(f"Retrieved conversation excerpts:\n{context or '(none)'}")
         return blocks, {**round_refs, **fact_refs}, facts if show_facts else []
 
@@ -277,12 +313,26 @@ class Reader:
         )
 
     def answer_from_history(
-        self, question: str, history: str, *, question_time: datetime
+        self, question: str, history: str | list[dict[str, Any]], *, question_time: datetime
     ) -> Answer:
-        """不检索，直接读给定的对话历史（全上下文基线与"只给证据会话"的上限参照用）。"""
-        output = self._read(
-            question, f"Conversation history:\n{history or '(none)'}", question_time, memories=0
-        )
+        """不检索，直接读给定的对话历史（全上下文基线与"只给证据会话"的上限参照用）。
+
+        history 是内容块列表时（带图的对话，见 history_blocks），图片按原位插在对话里。
+        """
+        if isinstance(history, list):
+            output = self._read(
+                question,
+                [{"type": "text", "text": "Conversation history:\n"}, *history],
+                question_time,
+                memories=0,
+            )
+        else:
+            output = self._read(
+                question,
+                f"Conversation history:\n{history or '(none)'}",
+                question_time,
+                memories=0,
+            )
         return Answer(
             question=question,
             answer=output.answer,
@@ -293,27 +343,95 @@ class Reader:
             question_time=question_time,
         )
 
+    @staticmethod
+    def _pictures(view: MemoryView) -> list[tuple[str, str]]:
+        """要附上的原图：（说明，data URL）。"""
+        out = []
+        for k, media_id in enumerate(view.attach, start=1):
+            item = view.media.get(media_id)
+            if item is not None:
+                out.append(
+                    (f"Picture {k} (shared on {item.ts:%Y-%m-%d})", image_data_url(item.path))
+                )
+        return out
+
     def _read(
         self,
         question: str,
-        context_block: str,
+        context_block: str | list[dict[str, Any]],
         question_time: datetime,
         *,
         cache_scope: str | None = None,
         schema: type[ReaderOutput] | type[NotedReaderOutput] = ReaderOutput,
+        pictures: Sequence[tuple[str, str]] = (),
         **span_attrs: object,
     ) -> ReaderOutput | NotedReaderOutput:
-        prompt = (
-            f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
-            f"{context_block}\n\n"
-            f"Question: {question}"
-        )
-        messages = [
+        """组装请求。纯文本时 user 消息是一个字符串（与 N4 之前的请求逐字相同，缓存照常命中）；
+        带图时改用内容块：对话里的图按原位插入，再感知的原图附在证据之后、问题之前。"""
+        head = f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
+        tail = f"Question: {question}"
+        content: str | list[dict[str, Any]]
+        if isinstance(context_block, str) and not pictures:
+            content = f"{head}{context_block}\n\n{tail}"
+        else:
+            blocks: list[dict[str, Any]] = [{"type": "text", "text": head}]
+            if isinstance(context_block, str):
+                blocks.append({"type": "text", "text": context_block})
+            else:
+                blocks.extend(context_block)
+            if pictures:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": "\n\nAttached pictures: the original images of the memories "
+                        'marked "see picture k" above. Look at them for visual details the '
+                        "descriptions may leave out.",
+                    }
+                )
+                for label, url in pictures:
+                    blocks.append({"type": "text", "text": f"\n{label}:"})
+                    blocks.append({"type": "image_url", "image_url": {"url": url}})
+            blocks.append({"type": "text", "text": f"\n\n{tail}"})
+            content = blocks
+            span_attrs = {**span_attrs, "pictures": len(pictures)}
+        messages: list[Message] = [
             {"role": "system", "content": READER_SYSTEM},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": content},
         ]
         with span("read", **span_attrs):
             return self.llm.structured(self.role, messages, schema, cache_scope=cache_scope).value
+
+
+def history_blocks(sessions: Sequence[SessionIn], *, max_side: int = 768) -> list[dict[str, Any]]:
+    """带图的对话历史：文本与图片按原位交替排成内容块（全上下文基线直接看图用）。"""
+    blocks: list[dict[str, Any]] = []
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if buffer:
+            blocks.append({"type": "text", "text": "".join(buffer)})
+            buffer.clear()
+
+    for i, session in enumerate(sorted(sessions, key=lambda s: s.started_at), start=1):
+        buffer.append(f"\n[Session {i} · {session.started_at:%Y-%m-%d (%a) %H:%M}]\n")
+        for turn in session.turns:
+            label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
+            parts = turn.text.split("<image>")
+            buffer.append(f"{label}: {parts[0]}")
+            images = list(turn.images)
+            for j, part in enumerate(parts[1:]):
+                if j < len(images):
+                    flush()
+                    url = image_data_url(images[j], max_side=max_side)
+                    blocks.append({"type": "image_url", "image_url": {"url": url}})
+                buffer.append(part)
+            for path in images[len(parts) - 1 :]:  # 没有占位标记的图片接在发言末尾
+                flush()
+                url = image_data_url(path, max_side=max_side)
+                blocks.append({"type": "image_url", "image_url": {"url": url}})
+            buffer.append("\n")
+    flush()
+    return blocks
 
 
 def format_history(sessions: Sequence[SessionIn]) -> str:

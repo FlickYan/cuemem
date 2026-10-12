@@ -279,3 +279,32 @@ def test_resume_with_different_embedding_is_refused(
     )
     with pytest.raises(ConfigMismatchError, match="向量模型"):
         run(other, fake_api, name="same", methods=["B0"])
+
+
+def test_build_only_builds_spaces_without_answering(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    from scripted import ScriptedModel, echo_extraction
+
+    fake_api.chat_replies = [with_extraction(ScriptedModel(echo_extraction))]
+    config = RunConfig(
+        name="build", dataset="longmemeval_s", split=None, methods=["B4"], build_only=True
+    )
+    runner = EvalRunner(eval_settings, config, http_client=fake_api.client())
+    summary = runner.run(load_longmemeval(FIXTURES / "longmemeval_mini.json"))
+    assert (summary.planned, summary.completed, summary.errors) == (3, 3, 0)
+    assert load_rows(summary.run_dir, "results.jsonl") == []  # 没有回答、没有判分
+    stages = {r["stage"] for r in load_rows(summary.run_dir, "ingest.jsonl")}
+    assert stages == {"ingest", "consolidate"}
+    # 之后正式运行时直接复用构建好的空间：不再抽取
+    calls = len(fake_api.chat_requests)
+    config = RunConfig(name="answer", dataset="longmemeval_s", split=None, methods=["B4"])
+    EvalRunner(eval_settings, config, http_client=fake_api.client()).run(
+        load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    )
+    extracts = [
+        r
+        for r in fake_api.chat_requests[calls:]
+        if r["messages"][0]["content"].startswith("You build the long-term")
+    ]
+    assert extracts == []

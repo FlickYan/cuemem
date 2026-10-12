@@ -32,14 +32,15 @@ import numpy as np
 
 from cuemem.config import ConsolidationConfig
 from cuemem.core.ids import stable_id
-from cuemem.core.models import Entity, Episode, Fact, MemoryUnit
+from cuemem.core.models import Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
 from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import record_event, span
 from cuemem.embed.base import FloatArray, SparseVector, TextEmbedder
-from cuemem.errors import ContentFilteredError
+from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
+from cuemem.write.caption import Captioner, CaptionMode, image_note, with_text
 from cuemem.write.entities import (
     EntityResolver,
     EntityState,
@@ -131,6 +132,11 @@ class Consolidator:
             multi_conflict_threshold=config.multi_conflict_threshold,
             fallback_model=config.fallback_model,
         )
+        self.captioner = (
+            Captioner(llm, max_side=config.caption_max_side, fallback_model=config.fallback_model)
+            if config.caption_images
+            else None
+        )
         self._space_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -191,6 +197,9 @@ class Consolidator:
         jobs.sort(key=lambda j: (sessions[j["session_id"]], j["session_id"]))
         turns_of = {j["session_id"]: self.db.get_turns(space_id, j["session_id"]) for j in jobs}
 
+        # A0. 图片描述（N6）：先描述这些会话里的图片，抽取事实时把描述填回原话里图片的位置
+        image_notes = self._caption_images(space_id, turns_of, report)
+
         # A. 并行抽取
         extractions: dict[str, SessionExtraction] = {}
         with (
@@ -206,6 +215,7 @@ class Consolidator:
                     turns_of[j["session_id"]],
                     sessions[j["session_id"]],
                     cache_scope=scope(space_id, f"session:{j['session_id']}"),
+                    image_notes=image_notes,
                 )
                 for j in jobs
             }
@@ -274,6 +284,126 @@ class Consolidator:
         report.sessions = len(extractions)
         report.elapsed_ms = (time.perf_counter() - started) * 1000
         return report
+
+    def _caption_images(
+        self,
+        space_id: str,
+        turns_of: dict[str, list[Turn]],
+        report: ConsolidationReport,
+    ) -> dict[str, list[str]]:
+        """为待处理会话里还没有描述的图片生成两种描述，写入图片记录与检索单元。
+
+        返回 发言 ID → 各张图的上下文感知描述（按出现顺序），供抽取时填回原话。
+        """
+        all_turns = {t.id: t for turns in turns_of.values() for t in turns}
+        media = self.db.get_media(space_id, turn_ids=list(all_turns)) if all_turns else []
+        if not media:
+            return {}
+        if self.captioner is not None:
+            todo = [m for m in media if not m.caption]
+            if todo:
+                self._run_captions(space_id, todo, turns_of, all_turns, report)
+        by_turn: dict[str, list[MediaItem]] = {}
+        for item in media:
+            by_turn.setdefault(item.source_turn_id, []).append(item)
+        notes: dict[str, list[str]] = {}
+        for turn_id, items in by_turn.items():
+            order = all_turns[turn_id].media_ids
+            items.sort(key=lambda m: order.index(m.id) if m.id in order else len(order))
+            notes[turn_id] = [image_note(m) for m in items if m.caption]
+        return {k: v for k, v in notes.items() if v}
+
+    def _run_captions(
+        self,
+        space_id: str,
+        todo: list[MediaItem],
+        turns_of: dict[str, list[Turn]],
+        all_turns: dict[str, Turn],
+        report: ConsolidationReport,
+    ) -> None:
+        assert self.captioner is not None
+        captioner = self.captioner
+        session_of = {t.id: t.session_id for t in all_turns.values()}
+        modes: tuple[CaptionMode, ...] = ("context", "isolated")
+        tasks = [(m, mode) for m in todo for mode in modes]
+
+        def run(item: MediaItem, mode: CaptionMode) -> tuple[str, CaptionMode, Any]:
+            session_id = session_of[item.source_turn_id]
+            try:
+                output = captioner.caption(
+                    item,
+                    turns_of[session_id],
+                    mode=mode,
+                    cache_scope=scope(space_id, f"session:{session_id}"),
+                )
+            except (ContentFilteredError, StructuredOutputError) as exc:
+                # 两家都拒绝，或多次重试仍得不到合格的描述：这张图没有描述（原图仍可再感知），
+                # 不让一张图拖垮整份历史的巩固
+                record_event("caption_failed", media=item.id, mode=mode, error=type(exc).__name__)
+                return item.id, mode, None
+            return item.id, mode, output
+
+        with (
+            span("consolidate_caption", images=len(todo)),
+            ThreadPoolExecutor(max_workers=max(1, self.config.workers)) as pool,
+        ):
+            futures = [
+                pool.submit(contextvars.copy_context().run, run, item, mode) for item, mode in tasks
+            ]
+            results = [f.result() for f in futures]
+        by_id = {m.id: m for m in todo}
+        for media_id, mode, output in results:
+            report.llm_calls += 1
+            if output is None:
+                continue
+            item = by_id[media_id]
+            if mode == "context":
+                item.caption = output.caption or "an image"
+                item.ocr_text = output.text_in_image
+                item.tags = output.tags
+            else:
+                item.caption_iso = with_text(output) or "an image"
+        captioned = [m for m in todo if m.caption or m.caption_iso]
+        self._index_images(space_id, captioned, all_turns)
+        self.db.set_media_captions(captioned)
+
+    def _index_images(
+        self, space_id: str, items: Sequence[MediaItem], all_turns: dict[str, Turn]
+    ) -> None:
+        """图片描述作为检索单元（像事实一样指回原话所在的轮）：上下文感知与孤立各一种。"""
+        units: list[MemoryUnit] = []
+        for item in items:
+            turn = all_turns[item.source_turn_id]
+            label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
+            for kind, note in (
+                ("image", image_note(item) if item.caption else ""),
+                ("image_iso", image_note(item, isolated=True) if item.caption_iso else ""),
+            ):
+                if not note:
+                    continue
+                units.append(
+                    MemoryUnit(
+                        id=stable_id(space_id, kind, item.id),
+                        space_id=space_id,
+                        kind=kind,
+                        session_id=turn.session_id,
+                        text=f"{label} shared an image: {note}",
+                        ts=item.ts,
+                        source_turn_ids=[turn.id],
+                        meta={"media_id": item.id},
+                    )
+                )
+        if not units:
+            return
+        vectors = self._embed([u.text for u in units])
+        dense = _stack([vectors[u.text][0] for u in units])
+        sparse_rows = [vectors[u.text][1] for u in units]
+        sparse = None if any(v is None for v in sparse_rows) else [v for v in sparse_rows if v]
+        payloads = [
+            {"kind": u.kind, "session_id": u.session_id, "ts": to_epoch(u.ts)} for u in units
+        ]
+        self.vectors.upsert(space_id, [u.id for u in units], dense, sparse, payloads)
+        self.db.add_units(units)
 
     def _apply(
         self,

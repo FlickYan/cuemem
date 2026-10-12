@@ -141,6 +141,68 @@ class VectorStore:
                 name, payload=payload, points=[point_uuid(u) for u in unit_ids]
             )
 
+    # ---------- 图片向量（N6）：每个空间另建一个集合，维度与文本向量不同 ----------
+
+    def upsert_images(
+        self,
+        space_id: str,
+        media_ids: Sequence[str],
+        vectors: FloatArray,
+        payloads: Sequence[dict[str, Any]],
+    ) -> None:
+        if not media_ids:
+            return
+        name = self._image_collection(space_id)
+        points = [
+            models.PointStruct(
+                id=point_uuid(media_id),
+                vector={DENSE: vectors[row].tolist()},
+                payload={"media_id": media_id, **payloads[row]},
+            )
+            for row, media_id in enumerate(media_ids)
+        ]
+        with self._lock:
+            if not self._client.collection_exists(name):
+                self._client.create_collection(
+                    name,
+                    vectors_config={
+                        DENSE: models.VectorParams(
+                            size=int(vectors.shape[1]), distance=models.Distance.COSINE
+                        )
+                    },
+                )
+            self._client.upsert(name, points=points)
+
+    def search_images(self, space_id: str, vector: FloatArray, k: int) -> list[VectorHit]:
+        """以文搜图 / 以图搜图：返回（图片 ID，余弦相似度）。"""
+        name = self._image_collection(space_id)
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return []
+            response = self._client.query_points(
+                name, query=vector.tolist(), using=DENSE, limit=k, with_payload=["media_id"]
+            )
+        return [
+            VectorHit(unit_id=str(point.payload["media_id"]), score=float(point.score))
+            for point in response.points
+            if point.payload
+        ]
+
+    def delete_images(self, space_id: str, media_ids: Sequence[str]) -> None:
+        name = self._image_collection(space_id)
+        if not media_ids:
+            return
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return
+            self._client.delete(
+                name,
+                points_selector=models.PointIdsList(points=[point_uuid(m) for m in media_ids]),
+            )
+
+    def _image_collection(self, space_id: str) -> str:
+        return f"{self.collection_name(space_id)}_img"
+
     def dense_vectors(self, space_id: str, unit_ids: Sequence[str]) -> dict[str, FloatArray]:
         """按记忆单元 ID 取回已存的 dense 向量（L2 的实体图用来给语义相近的事实连边）。"""
         name = self.collection_name(space_id)
@@ -184,10 +246,10 @@ class VectorStore:
                     return out
 
     def delete_space(self, space_id: str) -> None:
-        name = self.collection_name(space_id)
         with self._lock:
-            if self._client.collection_exists(name):
-                self._client.delete_collection(name)
+            for name in (self.collection_name(space_id), self._image_collection(space_id)):
+                if self._client.collection_exists(name):
+                    self._client.delete_collection(name)
 
     def close(self) -> None:
         with self._lock:

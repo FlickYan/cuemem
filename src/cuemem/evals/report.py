@@ -56,16 +56,26 @@ METHOD_LABELS = {
     "B5-ppr": ("变体：加图扩散（PPR）", "B5 + PPR"),
     "B6r": ("规则版控制器（L1 / L2）", "B6r rule router"),
     "B3": ("模型自主检索（ReAct）", "B3 model-driven search"),
+    "B4-text": ("纯文本记忆（图片只留占位）", "L1 text only"),
+    "B4-cap": ("对话 + 上下文感知的图片描述", "L1 + captions"),
+    "B4-iso": ("对话 + 孤立的图片描述", "L1 + isolated captions"),
+    "B4-mm": ("L1：对话 + 图片描述 + 以文搜图 + 事实", "B4-mm L1 multimodal"),
+    "B4-see": ("B4-mm + 再感知原图", "B4-see L1 + re-perception"),
+    "B4-novis": ("消融：B4-mm 去掉以文搜图", "B4-mm no visual search"),
+    "B4-see-novis": ("消融：B4-see 去掉以文搜图", "B4-see no visual search"),
+    "B5-see": ("L2 + 再感知原图", "B5-see L2 + re-perception"),
     "ORACLE": ("只给证据会话（上限参照）", "Oracle: evidence only"),
 }
 METHOD_ORDER = list(METHOD_LABELS)
-REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o", "B3": "^"}  # 参照点：中性色空心
+# 参照点：中性色空心，形状区分
+REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o", "B3": "^", "B4-text": "v"}
 
 # 每类运行画哪些方法、谁用哪个系列色（槽位：蓝、青、黄）；消融变体只进表格，不进图
 SERIES_SLOTS = ("blue", "aqua", "yellow")
 PROFILES = {
     "n4": {"B2F": "blue", "B2": "aqua", "B4": "yellow"},
     "n5": {"B5": "blue", "B6r": "aqua", "B4-nobm25": "yellow"},
+    "n6": {"B4-mm": "yellow", "B4-see": "blue", "B5-see": "aqua"},
 }
 
 TYPE_LABELS = {
@@ -80,6 +90,11 @@ TYPE_LABELS = {
     "open-domain": "开放域",
     "temporal": "时间",
     "adversarial": "对抗（应拒答）",
+    "information_extraction": "信息抽取",
+    "multi_session_reasoning": "多会话推理",
+    "temporal_reasoning": "时间推理",
+    "knowledge_update": "知识更新",
+    "answer_refusal": "拒答（应回答信息不足）",
 }
 
 RETRIEVAL_LABELS = {
@@ -387,6 +402,7 @@ def render_markdown(
         lines.append(f'| 其中回答"不知道"（误拒答，按措辞粗略识别） | {cells} |')
 
     lines += _l2_section(rows, stats)
+    lines += _image_section(rows, stats)
 
     online = _latest_per_space([r for r in ingests if r.get("stage", "ingest") == "ingest"])
     consolidated = _latest_per_space([r for r in ingests if r.get("stage") == "consolidate"])
@@ -471,6 +487,24 @@ def _l2_section(rows: Sequence[dict[str, Any]], stats: Sequence[MethodStats]) ->
             + (f"；触发的线索：{listed}" if listed else "")
             + "。",
         ]
+    return lines
+
+
+def _image_section(rows: Sequence[dict[str, Any]], stats: Sequence[MethodStats]) -> list[str]:
+    """再感知（N6）：每题附了几张原图。"""
+    attached: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        details = row.get("details") or {}
+        if "attached" in details or row["method"].endswith("-see"):
+            attached[row["method"]].append(len(details.get("attached", [])))
+    methods = [s.method for s in stats if s.method in attached]
+    if not methods:
+        return []
+    lines = ["", "## 再感知", "", "| 方法 | 平均附图张数 | 附了原图的题 |", "|---|---|---|"]
+    for m in methods:
+        counts = attached[m]
+        share = sum(1 for c in counts if c) / len(counts)
+        lines.append(f"| {m} | {mean(counts):.2f} | {share:.0%} |")
     return lines
 
 
@@ -621,10 +655,15 @@ def plot_pareto(
     subtitle += f" · {max(s.n for s in stats)} questions · bars: 95% CI"
     ax.set_title("Accuracy vs. cost per question", loc="left", color=theme.ink, fontsize=11, pad=20)
     ax.text(0, 1.03, subtitle, transform=ax.transAxes, color=theme.muted, fontsize=8.5)
-    legend = ax.legend(
-        loc="lower right", frameon=False, fontsize=8.5, labelcolor=theme.ink2, handletextpad=0.4
-    )
+    # 图例放在不压住点与置信区间竖线的位置（贵的全上下文点常落在右下角）。先让 matplotlib 选一次
+    # 位置，再把图例固定在那里：loc="best" 在保存时会重新选位置，那时直接标签已经画上了
+    style = {"frameon": False, "fontsize": 8.5, "labelcolor": theme.ink2, "handletextpad": 0.4}
+    legend = ax.legend(loc="best", **style)
     fig.tight_layout()
+    fig.canvas.draw()
+    box = legend.get_window_extent().transformed(ax.transAxes.inverted())
+    legend.remove()
+    legend = ax.legend(loc="lower left", bbox_to_anchor=(box.x0, box.y0), **style)
     _place_labels(fig, ax, points, legend, theme)
     fig.savefig(path, facecolor=theme.surface)
     plt.close(fig)
@@ -732,7 +771,10 @@ def _distance(box: Bbox, point: Any) -> float:
 
 def chart_profile(stats: Sequence[MethodStats]) -> dict[str, str]:
     """有 L2（B5）的运行画 N5 的三条主线，否则沿用 N4 的配色。"""
-    return PROFILES["n5" if any(s.method == "B5" for s in stats) else "n4"]
+    methods = {s.method for s in stats}
+    if "B4-see" in methods or "B4-mm" in methods:
+        return PROFILES["n6"]
+    return PROFILES["n5" if "B5" in methods else "n4"]
 
 
 def _method_rank(method: str) -> int:

@@ -218,6 +218,7 @@ class ScriptedModel:
         reader: Callable[[str], Reply] | None = None,
         planner: Callable[[str], Reply] | None = None,
         checker: Callable[[str], Reply] | None = None,
+        captioner: Callable[[str], Reply] | None = None,
     ) -> None:
         self.extractions = extractions if extractions is not None else {}
         self.reconcile = reconcile or (lambda prompt: {"decisions": []})
@@ -227,13 +228,26 @@ class ScriptedModel:
         )
         self.planner = planner or (lambda prompt: {"answer_type": "fact", "sub_queries": []})
         self.checker = checker or (lambda prompt: {"sufficient": True})
+        self.captioner = captioner or (
+            lambda prompt: {
+                "caption": "a red sign" if "marked >>>" in prompt else "an isolated red sign",
+                "text_in_image": "CUE 42",
+                "tags": ["sign"],
+            }
+        )
+        self.images: list[int] = []  # 每次调用附带的图片张数
         self.calls: Counter[str] = Counter()
         self.prompts: dict[str, list[str]] = defaultdict(list)
 
     def __call__(self, body: dict[str, Any]) -> str:
         messages = body["messages"]
         system = messages[0]["content"] if messages[0]["role"] == "system" else ""
-        prompt = messages[-1]["content"]
+        content = messages[-1]["content"]
+        if isinstance(content, list):  # 带图的请求：文本块拼起来，记下图片张数
+            prompt = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+            self.images.append(sum(1 for b in content if b.get("type") == "image_url"))
+        else:
+            prompt = content
         if system.startswith("You build the long-term memory"):
             kind = "extract"
             if callable(self.extractions):
@@ -251,6 +265,8 @@ class ScriptedModel:
             kind, out = "plan", self.planner(prompt)
         elif system.startswith("You check whether memories"):
             kind, out = "check", self.checker(prompt)
+        elif system.startswith("You describe an image"):
+            kind, out = "caption", self.captioner(prompt)
         else:
             self.calls["other"] += 1
             return "OK"

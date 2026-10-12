@@ -14,11 +14,11 @@ N4 会在此基础上加入稀疏检索、RRF 融合、时间感知与重排。
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
-from cuemem.core.models import CoreMemory, Fact, FactHit, Hit
+from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MediaItem
 from cuemem.core.timeutil import day, partial_date_start
 from cuemem.core.trace import span
 from cuemem.embed.base import TextEmbedder
@@ -27,6 +27,7 @@ from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 
 Validity = Literal["full", "current", "none"]
+ImageMode = Literal["context", "isolated", "none"]
 
 # 事实是压缩过的摘要：明确告诉 reader 细节以原话为准，避免它因为事实措辞与问题不完全一致而拒答
 FACTS_HEADER = (
@@ -49,6 +50,11 @@ class MemoryView:
     rounds: list[Hit]
     facts: list[FactHit]
     core: CoreMemory | None
+    # 图片（N6）：装入的轮里的图片；按哪种描述展示（上下文感知 / 孤立 / 不展示描述）；
+    # 要附上原图的图片 ID（再感知）
+    media: dict[str, MediaItem] = field(default_factory=dict)
+    image_mode: ImageMode = "context"
+    attach: list[str] = field(default_factory=list)
 
 
 class FactAugmentedRetriever:
