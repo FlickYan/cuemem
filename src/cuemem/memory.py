@@ -24,10 +24,15 @@ from cuemem.errors import ConsolidationError
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
+from cuemem.read.agent import ToolReader
+from cuemem.read.controller import RouteDecision, RuleController
 from cuemem.read.facts import FactAugmentedRetriever, MemoryView, Validity
 from cuemem.read.l1 import L1Config, L1Retriever
+from cuemem.read.l2 import L2Config, L2Retriever
 from cuemem.read.naive import NaiveRetriever
+from cuemem.read.plan import rule_plan
 from cuemem.read.reader import Reader
+from cuemem.read.rerank import Reranker
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 from cuemem.write.consolidate import (
@@ -38,7 +43,7 @@ from cuemem.write.consolidate import (
 )
 from cuemem.write.online import IngestReport, OnlineWriter
 
-AskMode = Literal["l1", "facts", "naive"]
+AskMode = Literal["l1", "l2", "auto", "agent", "facts", "naive"]
 
 
 @dataclass
@@ -53,6 +58,23 @@ class ForgetReport:
     elapsed_ms: float
 
 
+def build_reranker(
+    settings: Settings,
+    *,
+    llm: LLMClient,
+    ledger: Ledger | None,
+    http_client: httpx2.Client | None = None,
+) -> Reranker | None:
+    """重排模型（L2 用）。没有对应供应商的 Key 时返回 None，L2 不做重排。"""
+    provider = settings.providers.get(settings.rerank.provider)
+    api_key = provider.api_key() if provider is not None else None
+    if api_key is None:
+        return None
+    return Reranker(
+        settings.rerank, api_key, http_client=http_client, cache=llm.cache, ledger=ledger
+    )
+
+
 class MemorySystem:
     def __init__(
         self,
@@ -65,6 +87,7 @@ class MemorySystem:
         ledger: Ledger,
         tracer: TraceSink | None = None,
         owns_ledger: bool = True,
+        reranker: Reranker | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -79,7 +102,10 @@ class MemorySystem:
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
         self.l1 = L1Retriever(db, vectors, embedder)
+        self.l2 = L2Retriever(db, vectors, embedder, llm, self.l1, reranker=reranker)
+        self.controller = RuleController()
         self.reader = Reader(llm)
+        self.agent = ToolReader(llm)
         self.worker: ConsolidationWorker | None = None
 
     @classmethod
@@ -107,11 +133,18 @@ class MemorySystem:
             llm=llm,
             ledger=ledger,
             tracer=TraceSink(paths.traces),
+            reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
         )
 
     @classmethod
     def ephemeral(
-        cls, settings: Settings, *, embedder: TextEmbedder, llm: LLMClient, ledger: Ledger
+        cls,
+        settings: Settings,
+        *,
+        embedder: TextEmbedder,
+        llm: LLMClient,
+        ledger: Ledger,
+        reranker: Reranker | None = None,
     ) -> MemorySystem:
         """评测用：数据库与向量库都放在内存里，用完即弃；向量缓存与 LLM 缓存由传入的组件共享。"""
         return cls(
@@ -122,6 +155,7 @@ class MemorySystem:
             llm=llm,
             ledger=ledger,
             owns_ledger=False,
+            reranker=reranker,
         )
 
     @classmethod
@@ -133,6 +167,7 @@ class MemorySystem:
         embedder: TextEmbedder,
         llm: LLMClient,
         ledger: Ledger,
+        reranker: Reranker | None = None,
     ) -> MemorySystem:
         """评测用：每道题（每份对话历史）一个磁盘目录，写入与巩固的结果跨运行复用。
 
@@ -152,6 +187,7 @@ class MemorySystem:
             llm=llm,
             ledger=ledger,
             owns_ledger=False,
+            reranker=reranker,
         )
 
     # ---------- 写入 ----------
@@ -304,30 +340,77 @@ class MemorySystem:
         fact_keys: bool = True,
         l1: L1Config | None = None,
         relative_time: bool = True,
+        l2: L2Config | None = None,
+        notes: bool | None = None,
     ) -> Answer:
         """检索并回答。
 
         - mode="l1"（默认）：L1 快速召回——多粒度混合检索、时间感知、时间感知打包（N4）；
+        - mode="l2"：L2 深度检索——查询规划、多查询召回、图扩散、充分性检查与补检索（N5）；
+        - mode="auto"：规则版检索控制器按问题线索选 L1 或 L2（N5，N7 的基线）；
+        - mode="agent"：模型自主检索（B3）——reader 带 memory_search 工具自己决定检索；
         - mode="facts"：B2F，dense 检索 + 事实增强键 + 带有效期的事实 + 核心记忆（N3）；
         - mode="naive"：B2 基线，只在"轮"上做 dense 检索。
+        notes：reader 先记笔记再回答（并按检索计划给阅读提示）；默认 L2 开、L1 关。
         还没巩固过的空间，l1 与 facts 模式也能用（只是没有事实可用）。
         """
         when = question_time or datetime.now()
         cache_scope = scope(space_id, "ask")
         with start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace:
-            if mode == "l1":
+            route: str = mode
+            decision: RouteDecision | None = None
+            if mode == "auto":
+                decision = self.controller.decide(question, when)
+                route = "l2" if decision.level == "L2" else "l1"
+            if route == "l1":
                 cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
                 result = self.l1.search(space_id, question, when, cfg)
-                answer = self.reader.answer_with_memory(
+                view = MemoryView(rounds=result.rounds, facts=result.facts, core=result.core)
+                if notes:  # 笔记式阅读用规则版计划给阅读提示（不调用规划模型）
+                    answer = self.reader.answer_deep(
+                        question,
+                        view,
+                        plan=rule_plan(question, when),
+                        question_time=when,
+                        cache_scope=cache_scope,
+                    )
+                else:
+                    answer = self.reader.answer_with_memory(
+                        question,
+                        view,
+                        question_time=when,
+                        show_facts=show_facts,
+                        profile=profile,
+                        relative_time=relative_time,
+                        cache_scope=cache_scope,
+                    )
+            elif route == "l2":
+                deep = self.l2.search(
+                    space_id, question, when, l2 or L2Config(), cache_scope=cache_scope
+                )
+                view = MemoryView(rounds=deep.rounds, facts=deep.facts, core=deep.core)
+                if notes is None or notes:
+                    answer = self.reader.answer_deep(
+                        question, view, plan=deep.plan, question_time=when, cache_scope=cache_scope
+                    )
+                else:
+                    answer = self.reader.answer_with_memory(
+                        question,
+                        view,
+                        question_time=when,
+                        relative_time=True,
+                        cache_scope=cache_scope,
+                    )
+                answer.details = deep.details()
+            elif route == "agent":
+                answer = self.agent.answer(
                     question,
-                    MemoryView(rounds=result.rounds, facts=result.facts, core=result.core),
                     question_time=when,
-                    show_facts=show_facts,
-                    profile=profile,
-                    relative_time=relative_time,
+                    search=lambda query, cfg: self.l1.search(space_id, query, when, cfg),
+                    core=self.db.get_core_memory(space_id),
                     cache_scope=cache_scope,
                 )
-            elif mode == "naive":
+            elif route == "naive":
                 hits = self.search(space_id, question, k)
                 answer = self.reader.answer(
                     question, hits, question_time=when, cache_scope=cache_scope
@@ -350,6 +433,8 @@ class MemorySystem:
                     profile=profile,
                     cache_scope=cache_scope,
                 )
+            if decision is not None:
+                answer.details["route"] = {"level": decision.level, "reasons": decision.reasons}
             trace.attrs.update(answer=answer.answer, citations=answer.citations)
         return answer
 

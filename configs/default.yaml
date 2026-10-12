@@ -111,6 +111,14 @@ embedding:
   price_per_m: 0.07
   currency: USD
 
+# 重排（N5，L2 用）：对候选轮做 cross-encoder 打分。QwenCloud 的 qwen3-rerank，原生接口
+rerank:
+  provider: qwen
+  model: qwen3-rerank
+  url: https://maas.qwencloudapi.com/api/v1/services/rerank/text-rerank/text-rerank
+  price_per_m: 0.10                    # 美元 / 百万 tokens（国际站标价，2026-10-12 核对）
+  max_chars: 4000
+
 vector_store:
   # 为空时用 Qdrant 本地模式（数据在 paths.qdrant）。单个记忆空间超过约 2 万条时，
   # 本地模式的稀疏检索会明显变慢（D-005），可用 Docker 启动服务端后填 http://localhost:6333

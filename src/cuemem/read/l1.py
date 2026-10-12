@@ -12,6 +12,7 @@
    沿版本链补齐。
 
 各项权重在开发集上用纯检索指标（不调用 reader）调好，见 scripts/tune_l1.py。
+打分（candidates）与打包（pack_rounds）分开：L2 对多个子查询分别打分、融合后再打包（read/l2.py）。
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import Literal
 from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MemoryUnit
 from cuemem.core.timeutil import partial_date_start
 from cuemem.core.trace import span
-from cuemem.embed.base import TextEmbedder
+from cuemem.embed.base import FloatArray, TextEmbedder
 from cuemem.read.bm25 import BM25
 from cuemem.read.facts import choose_facts
 from cuemem.read.query import QueryInfo, analyze
@@ -46,7 +47,9 @@ class L1Config:
     max_rounds: int = 40
     fact_k: int = 10  # 放进上下文的事实条数（不含沿版本链补进来的）
     pool: int = 30  # 每一路召回的候选数
-    sparse: SparseRoute = "bm25"
+    # N5 复议后默认不用稀疏路（D-026 修订）：换用 qwen3.7 后 BM25 在 4k / 6k 预算下都降低召回，
+    # 重排也救不回来；N4 的 B4 仍用 BM25（评测方法里显式指定）
+    sparse: SparseRoute = "none"
     # modality：先在 dense、sparse 各自内部按分数把轮与事实键取最大值，再在两种模态之间做 RRF；
     # kind：轮、事实、摘要各自排名后全部做 RRF（对照用：丢掉分数大小，效果明显更差）
     fusion: Literal["modality", "kind"] = "modality"
@@ -70,6 +73,20 @@ class L1Result:
     debug: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class L1Candidates:
+    """一次查询的全部候选（打包之前）：按分数排好的轮，以及事实的分数。"""
+
+    query: QueryInfo
+    ranked: list[tuple[str, float]]  # 轮 ID 与分数，从高到低
+    round_units: dict[str, MemoryUnit]
+    facts: dict[str, Fact]
+    fact_score: dict[str, float]
+    fact_rounds: dict[str, list[str]]  # 事实 → 来源轮
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    debug: dict[str, object] = field(default_factory=dict)
+
+
 class L1Retriever:
     def __init__(self, db: MemoryDB, vectors: VectorStore, embedder: TextEmbedder) -> None:
         self.db = db
@@ -81,14 +98,57 @@ class L1Retriever:
     def search(
         self, space_id: str, question: str, question_time: datetime, cfg: L1Config
     ) -> L1Result:
+        cands = self.candidates(space_id, question, question_time, cfg)
+        started = time.perf_counter()
+        with span("pack", route="l1", budget=cfg.budget_tokens) as record:
+            rounds = pack_rounds(cands.ranked, cands.round_units, cfg)
+            facts = choose_facts(
+                self.db,
+                space_id,
+                cands.facts,
+                cands.fact_score,
+                cfg.fact_k,
+                current_only=False,
+                chain=cfg.chain,
+            )
+            record["hits"] = [[h.unit.id, round(h.score, 5)] for h in rounds]
+            record["facts"] = [[fh.fact.id, round(fh.score, 5)] for fh in facts]
+        timings = dict(cands.timings_ms)
+        timings["total"] += (time.perf_counter() - started) * 1000
+        return L1Result(
+            query=cands.query,
+            rounds=rounds,
+            facts=facts,
+            core=self.db.get_core_memory(space_id),
+            timings_ms=timings,
+            debug=cands.debug,
+        )
+
+    def candidates(
+        self,
+        space_id: str,
+        question: str,
+        question_time: datetime,
+        cfg: L1Config,
+        *,
+        query: QueryInfo | None = None,
+        dense_vec: FloatArray | None = None,
+    ) -> L1Candidates:
+        """一次查询的候选与分数（不打包）。
+
+        query 可以传入改写过的问题分析（L2 用查询规划给出的时间区间替换规则解析的结果）；
+        dense_vec 是已经算好的查询向量（L2 把几个子查询一次向量化）。
+        """
         timings: dict[str, float] = {}
         started = time.perf_counter()
-        query = analyze(question, question_time)
+        query = query or analyze(question, question_time)
         with span("retrieve", route="l1", k=cfg.k, sparse=cfg.sparse) as record:
-            batch = self.embedder.embed([question], "query")
+            sparse_vec = None
+            if dense_vec is None:
+                batch = self.embedder.embed([question], "query")
+                dense_vec = batch.dense[0]
+                sparse_vec = batch.sparse[0] if batch.sparse is not None else None
             timings["embed"] = (time.perf_counter() - started) * 1000
-            dense_vec = batch.dense[0]
-            sparse_vec = batch.sparse[0] if batch.sparse is not None else None
             routes: dict[tuple[str, str], list[tuple[str, float]]] = {}
             for kind in KINDS:
                 hits = self.vectors.search_dense(space_id, dense_vec, cfg.pool, kinds=[kind])
@@ -100,29 +160,22 @@ class L1Retriever:
                     routes[(kind, "sparse")] = self._bm25_search(space_id, kind, question, cfg.pool)
             timings["recall"] = (time.perf_counter() - started) * 1000 - timings["embed"]
 
-            rounds, facts, debug = self._fuse(space_id, query, routes, cfg)
-            record["hits"] = [[h.unit.id, round(h.score, 5)] for h in rounds]
-            record["facts"] = [[fh.fact.id, round(fh.score, 5)] for fh in facts]
+            cands = self._score(space_id, query, routes, cfg)
+            record["candidates"] = len(cands.ranked)
             record["time_range"] = query.time_range.expr if query.time_range else None
         timings["total"] = (time.perf_counter() - started) * 1000
-        return L1Result(
-            query=query,
-            rounds=rounds,
-            facts=facts,
-            core=self.db.get_core_memory(space_id),
-            timings_ms=timings,
-            debug=debug,
-        )
+        cands.timings_ms = timings
+        return cands
 
     # ---------- 融合与重排 ----------
 
-    def _fuse(
+    def _score(
         self,
         space_id: str,
         query: QueryInfo,
         routes: dict[tuple[str, str], list[tuple[str, float]]],
         cfg: L1Config,
-    ) -> tuple[list[Hit], list[FactHit], dict[str, object]]:
+    ) -> L1Candidates:
         unit_ids = list(dict.fromkeys(uid for hits in routes.values() for uid, _ in hits))
         units = {u.id: u for u in self.db.get_units(space_id, unit_ids)}
         fact_ids = [uid for uid in unit_ids if units.get(uid) and units[uid].kind == "fact"]
@@ -211,22 +264,6 @@ class L1Retriever:
                 bonus = position if query.wants_latest else 1.0 - position
                 round_score[rid] += cfg.order_weight * unit_rank * bonus
 
-        ranked_all = sorted(round_score.items(), key=lambda item: (-item[1], item[0]))
-        if cfg.budget_tokens is None:
-            ranked = ranked_all[: cfg.k]
-        else:
-            ranked, used = [], 0
-            for rid, score in ranked_all[: cfg.max_rounds]:
-                cost = estimate_tokens(round_units[rid].text)
-                if ranked and used + cost > cfg.budget_tokens:
-                    continue  # 放不下就跳过，后面更短的轮可能还放得下
-                ranked.append((rid, score))
-                used += cost
-        rounds = [
-            Hit(unit=round_units[rid], score=score, route="l1", rank=rank)
-            for rank, (rid, score) in enumerate(ranked, start=1)
-        ]
-
         # 事实：自己的两路 RRF，时间区间内的加分
         fact_score: dict[str, float] = defaultdict(float)
         for route in ("dense", "sparse"):
@@ -239,17 +276,17 @@ class L1Retriever:
                 moment = _fact_moment(fact)
                 if moment is not None and query.time_range.contains(moment):
                     fact_score[fid] += cfg.time_weight * specificity * unit_rank
-        chosen = choose_facts(
-            self.db,
-            space_id,
-            facts,
-            dict(fact_score),
-            cfg.fact_k,
-            current_only=False,
-            chain=cfg.chain,
+
+        ranked = sorted(round_score.items(), key=lambda item: (-item[1], item[0]))
+        return L1Candidates(
+            query=query,
+            ranked=ranked,
+            round_units=round_units,
+            facts=facts,
+            fact_score=dict(fact_score),
+            fact_rounds=fact_rounds,
+            debug={"in_time_range": len(in_range), "candidates": len(round_score)},
         )
-        debug: dict[str, object] = {"in_time_range": len(in_range), "candidates": len(round_score)}
-        return rounds, chosen, debug
 
     def _bm25_search(self, space_id: str, kind: str, query: str, k: int) -> list[tuple[str, float]]:
         units = self.db.list_units(space_id, kinds=[kind])
@@ -259,6 +296,31 @@ class L1Retriever:
             self._bm25[(space_id, kind)] = cached
         _, index, indexed = cached
         return [(indexed[i].id, score) for i, score in index.search(query, k)]
+
+
+def pack_rounds(
+    ranked: list[tuple[str, float]],
+    round_units: dict[str, MemoryUnit],
+    cfg: L1Config,
+    *,
+    route: str = "l1",
+) -> list[Hit]:
+    """按分数从高到低装入轮：设了 token 预算时装到预算用完（至少 1 轮，最多 max_rounds 轮），
+    否则取前 k 轮。放不下的轮跳过，后面更短的轮可能还放得下。"""
+    if cfg.budget_tokens is None:
+        chosen = ranked[: cfg.k]
+    else:
+        chosen, used = [], 0
+        for rid, score in ranked[: cfg.max_rounds]:
+            cost = estimate_tokens(round_units[rid].text)
+            if chosen and used + cost > cfg.budget_tokens:
+                continue
+            chosen.append((rid, score))
+            used += cost
+    return [
+        Hit(unit=round_units[rid], score=score, route=route, rank=rank)
+        for rank, (rid, score) in enumerate(chosen, start=1)
+    ]
 
 
 def _normalized(hits: list[tuple[str, float]], modality: str) -> list[tuple[str, float]]:

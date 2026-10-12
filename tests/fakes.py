@@ -12,7 +12,9 @@ import httpx2
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOY_CONVERSATION = PROJECT_ROOT / "examples" / "toy_conversation.json"
 
-ChatReply = str | Callable[[dict[str, Any]], str]
+# 回复可以是字符串，也可以是"由请求体生成回复"的函数；函数返回 dict 时表示工具调用：
+# {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": "{...}"}]}
+ChatReply = str | Callable[[dict[str, Any]], str | dict[str, Any]]
 REJECT = "__REJECT__"  # 回复函数返回它时，模拟内容审核拒绝（HTTP 400）
 
 
@@ -23,6 +25,7 @@ def chat_completion_body(
     prompt_tokens: int = 120,
     completion_tokens: int = 30,
     cached_tokens: int = 0,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """按两家供应商各自的 usage 字段格式构造聊天补全响应。"""
     usage: dict[str, Any] = {
@@ -35,6 +38,16 @@ def chat_completion_body(
         usage["prompt_cache_miss_tokens"] = prompt_tokens - cached_tokens
     else:
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {"name": call["name"], "arguments": call["arguments"]},
+            }
+            for call in tool_calls
+        ]
     return {
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -43,8 +56,8 @@ def chat_completion_body(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": usage,
@@ -58,6 +71,7 @@ class FakeAPI:
         self.chat_replies: list[ChatReply] = ["OK"]
         self.chat_requests: list[dict[str, Any]] = []
         self.embed_requests: list[dict[str, Any]] = []
+        self.rerank_requests: list[dict[str, Any]] = []
         self.embed_status: list[int] = []  # 预设的状态码序列，用于模拟限流和错误
         self.embed_retry_after: str | None = None  # 出错响应附带的 Retry-After 头
         self.cached_tokens = 0
@@ -72,6 +86,14 @@ class FakeAPI:
             self.chat_requests.append(body)
             reply = self.chat_replies.pop(0) if len(self.chat_replies) > 1 else self.chat_replies[0]
             content = reply(body) if callable(reply) else reply
+            deepseek = "deepseek" in request.url.host
+            if isinstance(content, dict):  # 工具调用
+                return httpx2.Response(
+                    200,
+                    json=chat_completion_body(
+                        content.get("content"), deepseek=deepseek, tool_calls=content["tool_calls"]
+                    ),
+                )
             if content == REJECT:  # 模拟供应商的内容审核拒绝（QwenCloud 的报错格式）
                 return httpx2.Response(
                     400,
@@ -83,12 +105,25 @@ class FakeAPI:
                         }
                     },
                 )
-            deepseek = "deepseek" in request.url.host
             return httpx2.Response(
                 200,
                 json=chat_completion_body(
                     content, deepseek=deepseek, cached_tokens=self.cached_tokens
                 ),
+            )
+        if "text-rerank" in request.url.path:
+            # 重排：按问题与文本共有的词数打分，结果确定、可预期
+            self.rerank_requests.append(body)
+            query = set(body["input"]["query"].lower().split())
+            docs = body["input"]["documents"]
+            results = [
+                {"index": i, "relevance_score": len(query & set(doc.lower().split())) / 10}
+                for i, doc in enumerate(docs)
+            ]
+            results.sort(key=lambda r: -r["relevance_score"])
+            tokens = sum(len(d.split()) for d in docs)
+            return httpx2.Response(
+                200, json={"output": {"results": results}, "usage": {"total_tokens": tokens}}
             )
         if "text-embedding" in request.url.path:
             self.embed_requests.append(body)

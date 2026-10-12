@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 import traceback
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -45,8 +46,9 @@ from cuemem.evals.metrics import retrieval_metrics
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
-from cuemem.memory import MemorySystem
+from cuemem.memory import MemorySystem, build_reranker
 from cuemem.read.reader import Reader
+from cuemem.read.rerank import Reranker
 from cuemem.write.extract import PIPELINE_VERSION
 from cuemem.write.online import build_rounds, build_turns
 
@@ -80,20 +82,29 @@ def usage_from_trace(trace: Trace) -> dict[str, Any]:
     """从 trace 事件汇总用量。cost 是名义成本；spent 只计真实发生的调用（本地缓存命中不花钱）。"""
     llm = [e for e in trace.events if e["kind"] == "llm"]
     emb = [e for e in trace.events if e["kind"] == "embedding"]
+    rerank = [e for e in trace.events if e["kind"] == "rerank"]
     spans: dict[str, float] = {}
     for record in trace.spans:
         spans[record["name"]] = round(spans.get(record["name"], 0.0) + record["ms"], 2)
     emb_cost = sum(e.get("cost", 0.0) for e in emb)
+    rerank_cost = sum(e["cost"] for e in rerank)
+    rerank_spent = sum(e["cost"] for e in rerank if not e.get("from_cache"))
     return {
         "llm_calls": len(llm),
         "llm_cache_hits": sum(1 for e in llm if e["from_cache"]),
+        # 按角色计调用次数：L2 的规划与充分性检查（planner）单独看得出来
+        "llm_calls_by_role": dict(Counter(str(e.get("role")) for e in llm)),
         "input_tokens": sum(e["input_tokens"] for e in llm),
         "output_tokens": sum(e["output_tokens"] for e in llm),
         "cached_input_tokens": sum(e["cached_input_tokens"] for e in llm),
         "embedding_tokens": sum(e["tokens"] for e in emb),
-        "cost": sum(e["cost"] for e in llm) + emb_cost,
+        "rerank_calls": len(rerank),
+        "rerank_tokens": sum(e["tokens"] for e in rerank),
+        "cost": sum(e["cost"] for e in llm) + emb_cost + rerank_cost,
         # 实际花费：扣除供应商缓存折扣与错峰折扣（旧版事件没有 spent 字段时按名义成本计）
-        "spent": sum(e.get("spent", e["cost"]) for e in llm if not e["from_cache"]) + emb_cost,
+        "spent": sum(e.get("spent", e["cost"]) for e in llm if not e["from_cache"])
+        + emb_cost
+        + rerank_spent,
         "latency_ms": trace.total_ms,
         "spans": spans,
     }
@@ -127,6 +138,8 @@ class EvalRunner:
         self.judge = Judge(self.llm)
         self._http_client = http_client
         self._embedder: TextEmbedder | None = None
+        self._reranker: Reranker | None = None
+        self._reranker_checked = False
         self._on_start = on_start or (lambda total: None)
         self._on_advance = on_advance or (lambda: None)
         self._lock = threading.Lock()
@@ -135,6 +148,7 @@ class EvalRunner:
         self._completed = 0
         self._errors = 0
         self._stop = threading.Event()
+        self._inner_workers = 1
 
     # ---------- 对外接口 ----------
 
@@ -152,6 +166,8 @@ class EvalRunner:
                 groups.setdefault(sample.space_key, []).append((sample, pending))
                 planned += len(pending)
         self._on_start(planned)
+        # 对话历史比线程少时（LoCoMo 一共 3 段对话），同一段历史里的题也并行回答
+        self._inner_workers = max(1, self.config.workers // max(1, len(groups)))
         with ThreadPoolExecutor(max_workers=max(1, self.config.workers)) as pool:
             futures = [
                 pool.submit(self._run_group, evalset, key, items) for key, items in groups.items()
@@ -181,6 +197,17 @@ class EvalRunner:
                     self.settings, ledger=self.ledger, http_client=self._http_client
                 )
             return self._embedder
+
+    @property
+    def reranker(self) -> Reranker | None:
+        """重排模型（L2 用），所有题共用一个（内部限制并发）。没有 Key 时为 None。"""
+        with self._lock:
+            if self._reranker is None and not self._reranker_checked:
+                self._reranker = build_reranker(
+                    self.settings, llm=self.llm, ledger=self.ledger, http_client=self._http_client
+                )
+                self._reranker_checked = True
+            return self._reranker
 
     def _run_group(
         self, evalset: EvalSet, space_key: str, items: list[tuple[Sample, list[Method]]]
@@ -235,21 +262,32 @@ class EvalRunner:
         if build.get("_path") and system is not None:
             path = Path(build.pop("_path"))
             path.write_text(json.dumps(build, ensure_ascii=False), encoding="utf-8")
+        pairs = [(sample, method) for sample, methods in items for method in methods]
+
+        def answer(pair: tuple[Sample, Method]) -> None:
+            sample, method = pair
+            if self._stop.is_set() or self._budget_exhausted():
+                self._stop.set()
+                return
+            try:
+                row = self._evaluate(sample, method, sessions, system, space_id)
+            except Exception as exc:
+                self._record_error(sample, method, exc, stage="answer")
+                return
+            self._append("results.jsonl", row)
+            with self._lock:
+                self._completed += 1
+            self._on_advance()
+
         try:
-            for sample, methods in items:
-                for method in methods:
-                    if self._budget_exhausted():
-                        self._stop.set()
-                        return
-                    try:
-                        row = self._evaluate(sample, method, sessions, system, space_id)
-                    except Exception as exc:
-                        self._record_error(sample, method, exc, stage="answer")
-                        continue
-                    self._append("results.jsonl", row)
-                    with self._lock:
-                        self._completed += 1
-                    self._on_advance()
+            if self._inner_workers > 1 and len(pairs) > 1:
+                with ThreadPoolExecutor(max_workers=self._inner_workers) as pool:
+                    list(pool.map(answer, pairs))
+            else:
+                for pair in pairs:
+                    if self._stop.is_set():
+                        break
+                    answer(pair)
         finally:
             if system is not None:
                 system.close()
@@ -300,6 +338,7 @@ class EvalRunner:
                 ]
                 for fh in output.facts
             ],
+            "details": output.details or None,
             "usage": usage,
             "judge_usage": judge_usage,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -329,21 +368,20 @@ class EvalRunner:
     def _open_space(self, dataset: str, space_key: str) -> tuple[MemorySystem, dict[str, Any]]:
         """打开这份对话历史的记忆空间。复用时（reuse_spaces）存在磁盘上，下次运行直接用；
         build.json 记下首次构建时的写入与巩固统计，复用时报告里的写入成本照样有数。"""
+        parts: dict[str, Any] = {
+            "embedder": self.embedder,
+            "llm": self.llm,
+            "ledger": self.ledger,
+            "reranker": self.reranker,
+        }
         if not self.config.reuse_spaces:
-            system = MemorySystem.ephemeral(
-                self.settings, embedder=self.embedder, llm=self.llm, ledger=self.ledger
-            )
-            return system, {}
+            return MemorySystem.ephemeral(self.settings, **parts), {}
         directory = space_dir(self.settings, dataset, self.embedder, space_key)
         try:
-            system = MemorySystem.on_disk(
-                self.settings, directory, embedder=self.embedder, llm=self.llm, ledger=self.ledger
-            )
+            system = MemorySystem.on_disk(self.settings, directory, **parts)
         except ConfigMismatchError:  # 换了向量模型：旧空间作废，重建
             shutil.rmtree(directory, ignore_errors=True)
-            system = MemorySystem.on_disk(
-                self.settings, directory, embedder=self.embedder, llm=self.llm, ledger=self.ledger
-            )
+            system = MemorySystem.on_disk(self.settings, directory, **parts)
         path = directory / "build.json"
         build = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         build["_path"] = str(path)

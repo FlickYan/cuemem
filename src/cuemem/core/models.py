@@ -192,3 +192,5 @@ class Answer(BaseModel):
     hits: list[Hit]
     question_time: datetime
     facts: list[FactHit] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)  # L2 的阅读笔记（先记笔记再回答）
+    details: dict[str, Any] = Field(default_factory=dict)  # 检索过程：L2 的计划、充分性检查等

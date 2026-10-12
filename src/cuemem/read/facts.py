@@ -19,9 +19,10 @@ from datetime import datetime
 from typing import Literal
 
 from cuemem.core.models import CoreMemory, Fact, FactHit, Hit
-from cuemem.core.timeutil import day
+from cuemem.core.timeutil import day, partial_date_start
 from cuemem.core.trace import span
 from cuemem.embed.base import TextEmbedder
+from cuemem.read.query import TimeRange
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 
@@ -168,11 +169,13 @@ def format_facts(
     *,
     validity: Validity = "full",
     question_time: datetime | None = None,
+    highlight: TimeRange | None = None,
 ) -> tuple[str, dict[str, str]]:
     """按主语和时间排列事实并编号（f1、f2……），返回（上下文文本，编号 → 事实 ID）。
 
     validity="full" 标注有效状态并指向取代它的事实；"current" 只给当前事实（调用方已过滤），
     与 "none" 一样只标日期——这两种用于消融"有效期"机制的作用。
+    highlight（L2）：事件时间（没有就用说出的时间）落在问题所指区间内的事实标上 ★。
     """
     ordered = sorted(facts, key=lambda fh: (fh.fact.subject, fh.fact.recorded_at, fh.fact.id))
     refs = {fh.fact.id: f"f{i}" for i, fh in enumerate(ordered, start=1)}
@@ -187,10 +190,21 @@ def format_facts(
             notes.append(("happened " if fact.category == "event" else "since ") + fact.valid_from)
         if validity == "full":
             notes.append(_status(fact, refs))
-        lines.append(f"[{refs[fact.id]}] ({'; '.join(notes)}) {fact.statement}")
+        mark = " ★" if highlight is not None and highlight.contains(_moment(fact)) else ""
+        lines.append(f"[{refs[fact.id]}] ({'; '.join(notes)}){mark} {fact.statement}")
     header = FACTS_HEADER if validity == "full" else FACTS_HEADER_PLAIN
     body = "\n".join(lines)
     return f"{header}\n{body}", {ref: fid for fid, ref in refs.items()}
+
+
+def _moment(fact: Fact) -> datetime:
+    """事实发生的时间：有事件时间用它的起点，否则用说出的时间。"""
+    if fact.valid_from:
+        try:
+            return partial_date_start(fact.valid_from)
+        except ValueError:
+            pass
+    return fact.recorded_at.replace(tzinfo=None)
 
 
 def _status(fact: Fact, refs: dict[str, str]) -> str:

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from qdrant_client import QdrantClient, models
 
 from cuemem.core.ids import point_uuid, stable_id
@@ -139,6 +140,27 @@ class VectorStore:
             self._client.set_payload(
                 name, payload=payload, points=[point_uuid(u) for u in unit_ids]
             )
+
+    def dense_vectors(self, space_id: str, unit_ids: Sequence[str]) -> dict[str, FloatArray]:
+        """按记忆单元 ID 取回已存的 dense 向量（L2 的实体图用来给语义相近的事实连边）。"""
+        name = self.collection_name(space_id)
+        if not unit_ids:
+            return {}
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return {}
+            points = self._client.retrieve(
+                name,
+                ids=[point_uuid(u) for u in unit_ids],
+                with_payload=["unit_id"],
+                with_vectors=[DENSE],
+            )
+        out: dict[str, FloatArray] = {}
+        for point in points:
+            vector = point.vector.get(DENSE) if isinstance(point.vector, dict) else None
+            if point.payload and vector is not None:
+                out[str(point.payload["unit_id"])] = np.asarray(vector, dtype=np.float32)
+        return out
 
     def unit_ids(self, space_id: str, *, kinds: Sequence[str] | None = None) -> list[str]:
         """列出空间里的全部记忆单元 ID（测试与一致性检查用）。"""

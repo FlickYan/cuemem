@@ -7,10 +7,12 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from cuemem.core.models import Answer, Hit, SessionIn
+from cuemem.core.models import Answer, FactHit, Hit, SessionIn
 from cuemem.core.trace import span
 from cuemem.llm.client import LLMClient
 from cuemem.read.facts import MemoryView, Validity, format_facts
+from cuemem.read.plan import TEMPORAL_TYPES, QueryPlan, range_text
+from cuemem.read.query import TimeRange
 
 # 评测基准以英文为主，提示词用英文；回答语言跟随问题
 READER_SYSTEM = """You are a personal assistant with long-term memory of past conversations with the user.
@@ -36,13 +38,64 @@ class ReaderOutput(BaseModel):
     )
 
 
+class NotedReaderOutput(BaseModel):
+    """L2 的回答格式：先记笔记（Chain-of-Note 式阅读），再回答。字段顺序就是生成顺序。"""
+
+    notes: list[str] = Field(
+        default_factory=list,
+        description="written before answering: one short note per relevant memory, "
+        "with its id, its date and the relevant detail",
+    )
+    answer: str = Field(description="final answer to the question")
+    citations: list[str] = Field(
+        default_factory=list, description="ids of the memories used, e.g. ['m1', 'f3']"
+    )
+    evidence_sufficient: bool = Field(
+        description="true if the retrieved memories were sufficient to answer"
+    )
+
+
+IN_RANGE_MARK = "★"
+
+
+def reading_guide(plan: QueryPlan) -> list[str]:
+    """按检索计划给 reader 的阅读提示：先记笔记；计数类逐项列出再数；时间类显式算日期差。"""
+    lines = [
+        "Before answering, write notes: for each memory relevant to the question, one short "
+        "note with its id, its date and the relevant detail. Skip unrelated memories."
+    ]
+    if plan.aggregate:
+        lines.append(
+            "This question needs every matching item. In the notes, list each distinct item "
+            "that matches, with its memory id. The same item is often mentioned in several "
+            "conversations: count it once. Items mentioned only in passing count too. Then "
+            "count or add up the items in your notes."
+        )
+    if plan.answer_type in TEMPORAL_TYPES:
+        lines.append(
+            'Work out dates from the memory headers. "N days before the question" gives each '
+            "memory's distance from the question date, so the time between two events is the "
+            "difference of these numbers. Write the calculation in your notes."
+        )
+    if plan.time_range is not None:
+        lines.append(
+            f"The question refers to {range_text(plan.time_range)}; memories from that period "
+            f"are marked with {IN_RANGE_MARK}."
+        )
+    return lines
+
+
 def format_memories(
-    hits: Sequence[Hit], *, question_time: datetime | None = None
+    hits: Sequence[Hit],
+    *,
+    question_time: datetime | None = None,
+    highlight: TimeRange | None = None,
 ) -> tuple[str, dict[str, str]]:
     """按时间顺序排列证据并编号，返回（上下文文本，编号 → 记忆单元 ID）。
 
     给了 question_time 时，每条再标上"距提问几天"（时间感知打包，N4）：
     让 reader 少做日期运算，"几天前""哪个先发生"这类问题直接有据可依。
+    给了 highlight（问题所指的时间区间，L2）时，区间内的证据标上 ★。
     """
     ordered = sorted(hits, key=lambda h: (h.unit.ts, h.unit.id))
     refs: dict[str, str] = {}
@@ -54,6 +107,8 @@ def format_memories(
         if question_time is not None:
             header += f" · {relative_days(hit.unit.ts, question_time)}"
         header += f" · session {hit.unit.session_id}"
+        if highlight is not None and highlight.contains(hit.unit.ts):
+            header += f" {IN_RANGE_MARK}"
         blocks.append(f"{header}\n{hit.unit.text}")
     return "\n\n".join(blocks), refs
 
@@ -123,6 +178,66 @@ class Reader:
 
         系统提示与其他方法完全相同，事实的格式说明放在上下文里，保证方法之间只差"给它看什么"。
         """
+        blocks, refs, facts = self._memory_blocks(
+            view,
+            question_time,
+            validity=validity,
+            show_facts=show_facts,
+            profile=profile,
+            relative_time=relative_time,
+        )
+        output = self._read(
+            question,
+            "\n\n".join(blocks),
+            question_time,
+            cache_scope=cache_scope,
+            memories=len(view.rounds),
+            facts=len(facts),
+        )
+        return self._answer(question, output, refs, view, facts, question_time)
+
+    def answer_deep(
+        self,
+        question: str,
+        view: MemoryView,
+        *,
+        plan: QueryPlan,
+        question_time: datetime,
+        cache_scope: str | None = None,
+    ) -> Answer:
+        """L2 的回答：证据与 L1 同样排版，另加按检索计划生成的阅读提示，并要求先记笔记再回答。
+
+        系统提示仍与其他方法相同；阅读提示放在上下文末尾、问题之前。
+        """
+        blocks, refs, facts = self._memory_blocks(
+            view, question_time, relative_time=True, highlight=plan.time_range
+        )
+        guide = "\n".join(f"- {line}" for line in reading_guide(plan))
+        blocks.append(f"Reading guide:\n{guide}")
+        output = self._read(
+            question,
+            "\n\n".join(blocks),
+            question_time,
+            cache_scope=cache_scope,
+            schema=NotedReaderOutput,
+            memories=len(view.rounds),
+            facts=len(facts),
+        )
+        answer = self._answer(question, output, refs, view, facts, question_time)
+        answer.notes = list(output.notes) if isinstance(output, NotedReaderOutput) else []
+        return answer
+
+    def _memory_blocks(
+        self,
+        view: MemoryView,
+        question_time: datetime,
+        *,
+        validity: Validity = "full",
+        show_facts: bool = True,
+        profile: bool = True,
+        relative_time: bool = False,
+        highlight: TimeRange | None = None,
+    ) -> tuple[list[str], dict[str, str], list[FactHit]]:
         blocks: list[str] = []
         if profile and view.core is not None and view.core.text:
             # 多人对话（如 LoCoMo）的核心记忆按人分组，每组以"名字:"开头
@@ -132,19 +247,23 @@ class Reader:
         fact_refs: dict[str, str] = {}
         when = question_time if relative_time else None
         if show_facts and facts:
-            text, fact_refs = format_facts(facts, validity=validity, question_time=when)
+            text, fact_refs = format_facts(
+                facts, validity=validity, question_time=when, highlight=highlight
+            )
             blocks.append(text)
-        context, round_refs = format_memories(view.rounds, question_time=when)
+        context, round_refs = format_memories(view.rounds, question_time=when, highlight=highlight)
         blocks.append(f"Retrieved conversation excerpts:\n{context or '(none)'}")
-        output = self._read(
-            question,
-            "\n\n".join(blocks),
-            question_time,
-            cache_scope=cache_scope,
-            memories=len(view.rounds),
-            facts=len(fact_refs),
-        )
-        refs = {**round_refs, **fact_refs}
+        return blocks, {**round_refs, **fact_refs}, facts if show_facts else []
+
+    @staticmethod
+    def _answer(
+        question: str,
+        output: ReaderOutput | NotedReaderOutput,
+        refs: dict[str, str],
+        view: MemoryView,
+        facts: list[FactHit],
+        question_time: datetime,
+    ) -> Answer:
         citations = [c.strip("[] ") for c in output.citations if c.strip("[] ") in refs]
         return Answer(
             question=question,
@@ -154,7 +273,7 @@ class Reader:
             refs=refs,
             hits=list(view.rounds),
             question_time=question_time,
-            facts=facts if show_facts else [],
+            facts=facts,
         )
 
     def answer_from_history(
@@ -181,8 +300,9 @@ class Reader:
         question_time: datetime,
         *,
         cache_scope: str | None = None,
+        schema: type[ReaderOutput] | type[NotedReaderOutput] = ReaderOutput,
         **span_attrs: object,
-    ) -> ReaderOutput:
+    ) -> ReaderOutput | NotedReaderOutput:
         prompt = (
             f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
             f"{context_block}\n\n"
@@ -193,9 +313,7 @@ class Reader:
             {"role": "user", "content": prompt},
         ]
         with span("read", **span_attrs):
-            return self.llm.structured(
-                self.role, messages, ReaderOutput, cache_scope=cache_scope
-            ).value
+            return self.llm.structured(self.role, messages, schema, cache_scope=cache_scope).value
 
 
 def format_history(sessions: Sequence[SessionIn]) -> str:

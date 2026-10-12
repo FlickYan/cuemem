@@ -69,7 +69,7 @@ def main() -> None:
             f"| {sign_test(won, lost):.3f} |"
         )
 
-    print("\n## 分题型的配对结果（赢 / 输）\n")
+    print("\n## 分题型的配对结果（它对、基准错 / 基准对、它错，符号检验 p）\n")
     types = sorted({r[args.base]["question_type"] for r in rows.values() if args.base in r})
     print("| 题型 | " + " | ".join(others) + " |")
     print("|---|" + "---|" * len(others))
@@ -83,7 +83,7 @@ def main() -> None:
             ]
             won = sum(1 for b, m in pairs if m["correct"] and not b["correct"])
             lost = sum(1 for b, m in pairs if b["correct"] and not m["correct"])
-            cells.append(f"+{won} / −{lost}")
+            cells.append(f"+{won} / −{lost}（p {sign_test(won, lost):.2f}）")
         print(f"| {qtype} | " + " | ".join(cells) + " |")
 
     print("\n## 知识更新题：问现在的值 vs 问以前的值\n")

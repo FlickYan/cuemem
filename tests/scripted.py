@@ -216,6 +216,8 @@ class ScriptedModel:
         reconcile: Callable[[str], Reply] | None = None,
         entity: Callable[[str], Reply] | None = None,
         reader: Callable[[str], Reply] | None = None,
+        planner: Callable[[str], Reply] | None = None,
+        checker: Callable[[str], Reply] | None = None,
     ) -> None:
         self.extractions = extractions if extractions is not None else {}
         self.reconcile = reconcile or (lambda prompt: {"decisions": []})
@@ -223,6 +225,8 @@ class ScriptedModel:
         self.reader = reader or (
             lambda prompt: {"answer": "ok", "citations": [], "evidence_sufficient": True}
         )
+        self.planner = planner or (lambda prompt: {"answer_type": "fact", "sub_queries": []})
+        self.checker = checker or (lambda prompt: {"sufficient": True})
         self.calls: Counter[str] = Counter()
         self.prompts: dict[str, list[str]] = defaultdict(list)
 
@@ -243,6 +247,10 @@ class ScriptedModel:
             kind, out = "entity", self.entity(prompt)
         elif system.startswith("You are a personal assistant"):
             kind, out = "read", self.reader(prompt)
+        elif system.startswith("You plan memory retrieval"):
+            kind, out = "plan", self.planner(prompt)
+        elif system.startswith("You check whether memories"):
+            kind, out = "check", self.checker(prompt)
         else:
             self.calls["other"] += 1
             return "OK"

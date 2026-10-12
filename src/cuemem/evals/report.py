@@ -1,9 +1,10 @@
 """评测报告：把 results.jsonl 汇总成 Markdown 表格，并画"准确率–成本"散点图。
 
 图按可视化规范绘制：系列颜色按方法固定分配（不随排名变化），散点图最多 3 个系列色
-（蓝 / 青 / 黄，已用 validate_palette.js 在 --pairs all 下验证深浅两套），分给检索方法 B2、
-B2F、B4；B0（下限）、B1（全上下文）与 ORACLE（上限）是参照点，用中性色空心标记、形状区分；
-消融变体只出现在表格里。N4 之前 B1 用橙色，从 N4 起改为参照点，橙色不再分给别的方法。
+（蓝 / 青 / 黄，已用 validate_palette.js 在 --pairs all 下验证深浅两套）。N4 及之前的运行
+分给 B2、B2F、B4；有 L2 的运行（N5 起）只画当前的三条主线：L1（黄，与 N4 的 B4 同色）、
+L2（蓝）、规则版控制器（青），B2、B2F 只进表格。B0（下限）、B1（全上下文）、ORACLE（上限）
+与 B3（模型自主检索）是参照点，用中性色空心标记、形状区分；消融变体只出现在表格里。
 浅色、深色各渲染一张，Markdown 里用 <picture> 按读者的主题自动切换。图中文字用英文，
 避免 CI 环境缺少中文字体。
 """
@@ -11,6 +12,7 @@ B2F、B4；B0（下限）、B1（全上下文）与 ORACLE（上限）是参照�
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -44,12 +46,27 @@ METHOD_LABELS = {
     "B4-b2k": ("消融：预算 2k tokens", "B4 2k-token budget"),
     "B4-notime": ("消融：不做时间加分", "B4 no time boost"),
     "B4-norel": ("消融：不标相对时间", "B4 no relative time"),
-    "B4-nobm25": ("消融：去掉 BM25", "B4 no BM25"),
+    "B4-nobm25": ("消融：去掉 BM25（N5 起的 L1 默认）", "L1 (no BM25)"),
+    "B4-b6k": ("对照：L1 预算 6k tokens（与 L2 相同）", "L1 6k budget"),
+    "B4-note": ("对照：L1 + 先记笔记再回答", "L1 + notes"),
+    "B5": ("L2 深度检索", "B5 L2 deep retrieval"),
+    "B5-noplan": ("消融：不做查询规划", "B5 no planning"),
+    "B5-noiter": ("消融：不做充分性检查与补检索", "B5 no follow-up"),
+    "B5-nonote": ("消融：不记笔记", "B5 no notes"),
+    "B5-ppr": ("变体：加图扩散（PPR）", "B5 + PPR"),
+    "B6r": ("规则版控制器（L1 / L2）", "B6r rule router"),
+    "B3": ("模型自主检索（ReAct）", "B3 model-driven search"),
     "ORACLE": ("只给证据会话（上限参照）", "Oracle: evidence only"),
 }
 METHOD_ORDER = list(METHOD_LABELS)
-PLOTTED = {"B0", "B1", "B2", "B2F", "B4", "ORACLE"}  # 消融变体只进表格，不进图
-REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o"}  # 参照点：中性色空心，形状区分
+REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o", "B3": "^"}  # 参照点：中性色空心
+
+# 每类运行画哪些方法、谁用哪个系列色（槽位：蓝、青、黄）；消融变体只进表格，不进图
+SERIES_SLOTS = ("blue", "aqua", "yellow")
+PROFILES = {
+    "n4": {"B2F": "blue", "B2": "aqua", "B4": "yellow"},
+    "n5": {"B5": "blue", "B6r": "aqua", "B4-nobm25": "yellow"},
+}
 
 TYPE_LABELS = {
     "single-session-user": "单会话 · 用户说过",
@@ -83,7 +100,7 @@ class Theme:
     muted: str  # 刻度与说明文字
     grid: str
     axis: str
-    series: dict[str, str]  # 方法 → 系列颜色（按方法固定，不随排名变化）
+    series: dict[str, str]  # 系列槽位 → 颜色
 
 
 THEMES = {
@@ -94,7 +111,7 @@ THEMES = {
         muted="#898781",
         grid="#e1e0d9",
         axis="#c3c2b7",
-        series={"B2F": "#2a78d6", "B2": "#1baf7a", "B4": "#eda100"},
+        series={"blue": "#2a78d6", "aqua": "#1baf7a", "yellow": "#eda100"},
     ),
     "dark": Theme(
         surface="#1a1a19",
@@ -103,7 +120,7 @@ THEMES = {
         muted="#898781",
         grid="#2c2c2a",
         axis="#383835",
-        series={"B2F": "#3987e5", "B2": "#199e70", "B4": "#c98500"},
+        series={"blue": "#3987e5", "aqua": "#199e70", "yellow": "#c98500"},
     ),
 }
 
@@ -244,6 +261,25 @@ def error_attribution(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, int
     return {method: dict(counts) for method, counts in out.items()}
 
 
+# 粗略识别"不知道"式回答：有答案的题答错时，区分"答成了别的"与"说不知道"（误拒答）
+DONT_KNOW = re.compile(
+    r"\b(i don't know|i do not know|i don't have (any )?(information|record|details)"
+    r"|i can't (tell|determine|give|say)|i cannot (tell|determine|give|say)"
+    r"|no (information|record|mention) (of|about)|(isn't|is not|aren't|are not) mentioned"
+    r"|not enough information)\b|不知道|没有(相关)?(的)?(信息|记录)",
+    re.IGNORECASE,
+)
+
+
+def false_abstentions(rows: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """每种方法在有答案的题上答错、且回答像"不知道"的题数（误拒答，按措辞粗略识别）。"""
+    out: dict[str, int] = defaultdict(int)
+    for r in rows:
+        if not r["correct"] and not r["is_abstention"] and DONT_KNOW.search(r["response"] or ""):
+            out[r["method"]] += 1
+    return dict(out)
+
+
 ATTRIBUTION_LABELS = {
     "retrieval_miss": "检索未命中：交给回答模型的轮里没有任何证据发言",
     "noisy_or_incomplete": "命中证据但答错，ORACLE 答对：干扰多或证据不全",
@@ -321,7 +357,8 @@ def render_markdown(
             "## 检索质量（不含拒答题）",
             "",
             "检索结果指交给回答模型的全部轮：固定条数的方法取前 k 轮，按 token 预算装入的方法"
-            "（B4 系列）轮数随每轮的长短变化。轮数不同的方法，召回不能直接比较。",
+            "（B4、B5 系列）轮数随每轮的长短变化，B5 的补检索还会再加几轮。"
+            "轮数不同的方法，召回不能直接比较。",
             "",
         ]
         lines.append("| 指标 | " + " | ".join(s.method for s in with_retrieval) + " | 含义 |")
@@ -345,6 +382,11 @@ def render_markdown(
             if any(key in counts for counts in attribution.values()):
                 cells = " | ".join(str(counts.get(key, 0)) for counts in attribution.values())
                 lines.append(f"| {label} | {cells} |")
+        refusals = false_abstentions(rows)
+        cells = " | ".join(str(refusals.get(method, 0)) for method in attribution)
+        lines.append(f'| 其中回答"不知道"（误拒答，按措辞粗略识别） | {cells} |')
+
+    lines += _l2_section(rows, stats)
 
     online = _latest_per_space([r for r in ingests if r.get("stage", "ingest") == "ingest"])
     consolidated = _latest_per_space([r for r in ingests if r.get("stage") == "consolidate"])
@@ -395,6 +437,67 @@ def render_markdown(
             f"- 有 {len(errors)} 个组合出错未计入结果，详见 `errors.jsonl`；重新运行会自动重试。"
         )
     return "\n".join(lines) + "\n"
+
+
+def _l2_section(rows: Sequence[dict[str, Any]], stats: Sequence[MethodStats]) -> list[str]:
+    """L2 的检索过程（N5）：查询规划、充分性检查与补检索；规则版控制器走 L2 的比例。"""
+    by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    routed: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        details = row.get("details") or {}
+        if details.get("plan"):
+            by_method[row["method"]].append(row)
+        if details.get("route"):
+            routed[row["method"]].append(row)
+    if not by_method and not routed:
+        return []
+    lines = ["", "## L2 检索过程", ""]
+    methods = [s.method for s in stats if s.method in by_method]
+    if methods:
+        lines += ["| 项目 | " + " | ".join(methods) + " |", "|---|" + "---|" * len(methods)]
+        for name, cells in _l2_rows([by_method[m] for m in methods]):
+            lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    for method in (s.method for s in stats if s.method in routed):
+        items = routed[method]
+        to_l2 = [r for r in items if r["details"]["route"]["level"] == "L2"]
+        reasons: dict[str, int] = defaultdict(int)
+        for r in to_l2:
+            for reason in r["details"]["route"]["reasons"]:
+                reasons[reason] += 1
+        listed = "、".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1]))
+        lines += [
+            "",
+            f"{method}：{len(to_l2)} / {len(items)} 题走 L2（{len(to_l2) / len(items):.0%}）"
+            + (f"；触发的线索：{listed}" if listed else "")
+            + "。",
+        ]
+    return lines
+
+
+def _l2_rows(groups: Sequence[list[dict[str, Any]]]) -> list[tuple[str, list[str]]]:
+    def share(test: Any) -> list[str]:
+        return [f"{sum(1 for r in g if test(r['details'])) / len(g):.0%}" for g in groups]
+
+    def average(value: Any, fmt: str = ".2f") -> list[str]:
+        return [format(mean([value(r) for r in g]), fmt) for g in groups]
+
+    return [
+        ("走 L2 的题数", [str(len(g)) for g in groups]),
+        ("查询规划由 LLM 完成", share(lambda d: d["plan"]["source"] == "llm")),
+        ("平均子查询数", average(lambda r: len(r["details"]["plan"]["sub_queries"]))),
+        ("判为需要穷尽（计数 / 求和 / 列举）", share(lambda d: d["plan"]["exhaustive"])),
+        ("带时间区间", share(lambda d: d["plan"]["time_range"])),
+        ("平均充分性检查次数", average(lambda r: len(r["details"]["checks"]))),
+        ("至少补检索一次", share(lambda d: any(c.get("added_rounds") for c in d["checks"]))),
+        (
+            "平均证据 tokens（轮）",
+            average(lambda r: r["details"].get("evidence_tokens", 0), ",.0f"),
+        ),
+        (
+            "每题规划与检查的调用次数",
+            average(lambda r: r["usage"].get("llm_calls_by_role", {}).get("planner", 0)),
+        ),
+    ]
 
 
 def _latest_per_space(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -461,10 +564,13 @@ def plot_pareto(
     fig.patch.set_facecolor(theme.surface)
     ax.set_facecolor(theme.surface)
 
-    points = [s for s in stats if s.cost > 0 and s.method in PLOTTED]
+    profile = chart_profile(stats)
+    plotted = set(profile) | set(REFERENCE_MARKERS)
+    points = [s for s in stats if s.cost > 0 and s.method in plotted]
     for s in points:
         x, y = s.cost, s.accuracy * 100
-        color = theme.series.get(s.method)
+        slot = profile.get(s.method)
+        color = theme.series[slot] if slot else None
         hollow = color is None  # B0、ORACLE 等参照点：中性色空心点
         line_color = theme.ink2 if color is None else color
         ax.vlines(
@@ -622,6 +728,11 @@ def _distance(box: Bbox, point: Any) -> float:
 
 
 # ---------- 辅助 ----------
+
+
+def chart_profile(stats: Sequence[MethodStats]) -> dict[str, str]:
+    """有 L2（B5）的运行画 N5 的三条主线，否则沿用 N4 的配色。"""
+    return PROFILES["n5" if any(s.method == "B5" for s in stats) else "n4"]
 
 
 def _method_rank(method: str) -> int:

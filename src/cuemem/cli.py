@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, cast, get_args
 
 import typer
 from rich.console import Console
@@ -212,13 +212,14 @@ def ask(
     mode: Annotated[
         str,
         typer.Option(
-            help="l1：L1 快速召回（默认）；facts：事实增强检索（B2F）；naive：朴素检索（B2）"
+            help="l1：L1 快速召回（默认）；l2：深度检索；auto：规则版控制器选 L1 / L2；"
+            "agent：模型自主检索；facts：事实增强检索（B2F）；naive：朴素检索（B2）"
         ),
     ] = "l1",
 ) -> None:
     """检索记忆并回答问题。"""
-    if mode not in ("l1", "facts", "naive"):
-        console.print("[red]--mode 只能是 l1、facts 或 naive[/red]")
+    if mode not in get_args(AskMode):
+        console.print(f"[red]--mode 只能是 {'、'.join(get_args(AskMode))}[/red]")
         raise typer.Exit(1)
     with _open_system() as system:
         started = time.perf_counter()
@@ -226,6 +227,7 @@ def ask(
         elapsed = (time.perf_counter() - started) * 1000
         if show_context:
             _print_hits(answer)
+            _print_process(answer)
         console.print(Panel(answer.answer, title="回答", expand=False))
         cited = ", ".join(answer.citations) or "无"
         sufficient = "是" if answer.evidence_sufficient else "否"
@@ -810,6 +812,34 @@ def _print_hits(answer: Answer) -> None:
                 fact.statement,
             )
         console.print(facts)
+
+
+def _print_process(answer: Answer) -> None:
+    """L2 的检索计划与充分性检查、控制器的选择、B3 的检索记录、阅读笔记。"""
+    details = answer.details
+    route = details.get("route")
+    if route:
+        reasons = "、".join(route["reasons"]) or "无"
+        console.print(f"[bold]控制器[/bold]：走 {route['level']}（触发的线索：{reasons}）")
+    plan = details.get("plan")
+    if plan:
+        console.print(
+            f"[bold]检索计划[/bold]（{'LLM' if plan['source'] == 'llm' else '规则'}）："
+            f"答案类型 {plan['answer_type']}，需要穷尽 {'是' if plan['exhaustive'] else '否'}，"
+            f"时间区间 {plan['time_range'] or '无'}"
+        )
+        for query in plan["sub_queries"]:
+            console.print(f"  · 子查询：{query}")
+    for check in details.get("checks", []):
+        verdict = "够了" if check["sufficient"] else f"不够（{check['missing']}）"
+        added = f"，补检索 {check['added_rounds']} 轮" if check.get("added_rounds") else ""
+        console.print(f"[bold]充分性检查 {check['iteration']}[/bold]：{verdict}{added}")
+        for query in check["queries"]:
+            console.print(f"  · 补充查询：{query}")
+    for query in details.get("searches", []):
+        console.print(f"[bold]模型检索[/bold]：{query}")
+    for note in answer.notes:
+        console.print(f"[dim]笔记：{note}[/dim]")
 
 
 def _print_usage_rows(rows: list[dict[str, Any]], *, detailed: bool = False) -> None:

@@ -28,6 +28,10 @@ QWENCLOUD_EMBEDDING_URL = (
     "https://maas.qwencloudapi.com/api/v1/services/embeddings/text-embedding/text-embedding"
 )
 
+QWENCLOUD_RERANK_URL = (
+    "https://maas.qwencloudapi.com/api/v1/services/rerank/text-rerank/text-rerank"
+)
+
 # YAML 文件路径通过 ContextVar 传给配置源，避免修改全局环境变量
 _config_path: ContextVar[Path] = ContextVar("cuemem_config_path", default=DEFAULT_CONFIG)
 
@@ -101,6 +105,20 @@ class EmbeddingConfig(BaseModel):
     max_attempts: int = 6  # 429 / 5xx / 网络错误的最大尝试次数（指数退避，单次最多等 30 秒）
 
 
+class RerankConfig(BaseModel):
+    """重排模型（N5，L2 用）：QwenCloud 的 qwen3-rerank，原生接口。"""
+
+    provider: str = "qwen"
+    model: str = "qwen3-rerank"
+    url: str = QWENCLOUD_RERANK_URL
+    price_per_m: float = 0.10  # 美元 / 百万 tokens（国际站标价）
+    currency: Currency = "USD"
+    max_chars: int = 4000  # 每段文本最多送多少字符
+    timeout_s: float = 60.0
+    max_concurrency: int = 4
+    max_attempts: int = 4
+
+
 class PathsConfig(BaseModel):
     db: Path = Path("data/cuemem.sqlite")
     qdrant: Path = Path("data/qdrant")
@@ -158,6 +176,7 @@ class Settings(BaseSettings):
     models: dict[str, ModelSpec] = Field(default_factory=dict)
     roles: dict[str, RoleConfig] = Field(default_factory=dict)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    rerank: RerankConfig = Field(default_factory=RerankConfig)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     consolidation: ConsolidationConfig = Field(default_factory=ConsolidationConfig)
@@ -184,6 +203,8 @@ class Settings(BaseSettings):
                 raise ValueError(f"角色 {role} 引用了未定义的模型 {rc.model}")
         if self.embedding.backend == "dashscope" and self.embedding.provider not in self.providers:
             raise ValueError(f"向量配置引用了未定义的供应商 {self.embedding.provider}")
+        if self.rerank.provider not in self.providers:
+            raise ValueError(f"重排配置引用了未定义的供应商 {self.rerank.provider}")
         return self
 
 
