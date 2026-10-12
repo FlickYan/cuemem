@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -26,12 +26,22 @@ from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.read.agent import ToolReader
-from cuemem.read.controller import RouteDecision, RuleController
+from cuemem.read.controller import (
+    DEFAULT_MODEL,
+    HYBRID_BAND,
+    HYBRID_CONFIDENCE,
+    LearnedController,
+    LLMRouter,
+    RouteDecision,
+    Router,
+    RuleController,
+)
 from cuemem.read.facts import FactAugmentedRetriever, ImageMode, MemoryView, Validity
-from cuemem.read.l1 import L1Config, L1Retriever
+from cuemem.read.l1 import L1Candidates, L1Config, L1Retriever
 from cuemem.read.l2 import L2Config, L2Retriever
 from cuemem.read.naive import NaiveRetriever
 from cuemem.read.plan import rule_plan
+from cuemem.read.probe import Probe
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
 from cuemem.store.media import MediaStore
@@ -45,7 +55,7 @@ from cuemem.write.consolidate import (
 )
 from cuemem.write.online import IngestReport, OnlineWriter
 
-AskMode = Literal["l1", "l2", "auto", "agent", "facts", "naive"]
+AskMode = Literal["l0", "l1", "l2", "auto", "agent", "facts", "naive"]
 
 
 @dataclass
@@ -121,7 +131,11 @@ class MemorySystem:
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
         self.l1 = L1Retriever(db, vectors, embedder, image_embedder=image_embedder)
         self.l2 = L2Retriever(db, vectors, embedder, llm, self.l1, reranker=reranker)
+        self.probe = Probe(db, self.l1)
         self.controller = RuleController()
+        # N7 的检索控制器：模型文件由 scripts/n7_controller.py 训练导出；没有时退回规则版
+        self.learned = LearnedController.load() if DEFAULT_MODEL.exists() else None
+        self.router = LLMRouter(llm)
         self.reader = Reader(llm)
         self.agent = ToolReader(llm)
         self.worker: ConsolidationWorker | None = None
@@ -376,12 +390,17 @@ class MemorySystem:
         relative_time: bool = True,
         l2: L2Config | None = None,
         notes: bool | None = None,
+        router: Router = "learned",
+        lam: float | None = None,
     ) -> Answer:
         """检索并回答。
 
+        - mode="l0"：只用常驻上下文（核心记忆，即用户画像），不检索（§6.1，N7 控制器的动作之一）；
         - mode="l1"（默认）：L1 快速召回——多粒度混合检索、时间感知、时间感知打包（N4）；
         - mode="l2"：L2 深度检索——查询规划、多查询召回、图扩散、充分性检查与补检索（N5）；
-        - mode="auto"：规则版检索控制器按问题线索选 L1 或 L2（N5，N7 的基线）；
+        - mode="auto"：检索控制器选档（N7）。router="learned"（默认）：探针特征 → 两段式控制器，
+          在 L0 / L1 / L2 与"要不要再看原图"之间按 P̂(答对) − λ·成本选，lam 不填用模型里的默认值；
+          "hybrid"：门控拿不准时再问 LLM；"llm"：零样本 LLM 路由；"rule"：规则版（B6r，N5）；
         - mode="agent"：模型自主检索（B3）——reader 带 memory_search 工具自己决定检索；
         - mode="facts"：B2F，dense 检索 + 事实增强键 + 带有效期的事实 + 核心记忆（N3）；
         - mode="naive"：B2 基线，只在"轮"上做 dense 检索。
@@ -393,12 +412,27 @@ class MemorySystem:
         with start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace:
             route: str = mode
             decision: RouteDecision | None = None
+            candidates: L1Candidates | None = None
             if mode == "auto":
-                decision = self.controller.decide(question, when)
-                route = "l2" if decision.level == "L2" else "l1"
-            if route == "l1":
+                decision, candidates, used = self._route(
+                    space_id, question, when, l1 or L1Config(), router, lam, cache_scope
+                )
+                route = decision.level.lower()
+                if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
+                    l1 = replace(l1 or L1Config(), attach_images=3)
+                    base_l2 = l2 or L2Config()
+                    l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
+            if route == "l0":
+                view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
+                answer = self.reader.answer_with_memory(
+                    question, view, question_time=when, cache_scope=cache_scope
+                )
+            elif route == "l1":
                 cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
-                result = self.l1.search(space_id, question, when, cfg)
+                if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
+                    result = self.l1.pack(space_id, candidates, cfg)
+                else:
+                    result = self.l1.search(space_id, question, when, cfg)
                 view = MemoryView(
                     rounds=result.rounds,
                     facts=result.facts,
@@ -481,11 +515,53 @@ class MemorySystem:
                     cache_scope=cache_scope,
                 )
             if decision is not None:
-                answer.details["route"] = {"level": decision.level, "reasons": decision.reasons}
+                answer.details["route"] = {
+                    "router": used,
+                    "level": decision.level,
+                    "see": decision.see,
+                    "reasons": decision.reasons,
+                    **({"scores": decision.scores} if decision.scores else {}),
+                }
             if route in ("l1", "l2") and view.attach:
                 answer.details["attached"] = list(view.attach)  # 附了原图的图片（再感知）
             trace.attrs.update(answer=answer.answer, citations=answer.citations)
         return answer
+
+    def _route(
+        self,
+        space_id: str,
+        question: str,
+        when: datetime,
+        cfg: L1Config,
+        router: Router,
+        lam: float | None,
+        cache_scope: str,
+    ) -> tuple[RouteDecision, L1Candidates | None, Router]:
+        """检索控制器选档；学到的控制器先跑探针，选了 L1 时把探针的候选交回去直接打包。
+
+        返回（决定，探针的候选，实际用的控制器）：没有模型文件时学到的控制器退回规则版。
+        """
+        if router == "llm":
+            return self.router.decide(question, cache_scope=cache_scope), None, "llm"
+        if router == "rule" or self.learned is None:
+            return self.controller.decide(question, when), None, "rule"
+        probe = self.probe.run(space_id, question, when, cfg)
+        has_images = probe.features.get("m_media", 0.0) > 0
+        p_none: float | None = None
+        asked = False
+        if router == "hybrid":
+            gate = self.learned.gate(probe.features)
+            if HYBRID_BAND[0] < gate < HYBRID_BAND[1]:  # 门控拿不准：问一次 LLM
+                asked = True
+                llm = self.router.decide(question, cache_scope=cache_scope)
+                p_none = HYBRID_CONFIDENCE if llm.level == "L0" else 1 - HYBRID_CONFIDENCE
+        decision = self.learned.decide(
+            probe.features, has_images=has_images, lam=lam, p_none=p_none
+        )
+        scores = {**decision.scores, "probe_ms": round(probe.ms, 1)}
+        if asked:
+            scores["asked_llm"] = 1.0
+        return replace(decision, scores=scores), probe.candidates, router
 
     def search_by_image(
         self, space_id: str, image: Path, k: int = 5

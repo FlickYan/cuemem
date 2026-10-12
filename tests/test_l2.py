@@ -279,10 +279,15 @@ def test_rule_controller_routes() -> None:
 
 def test_auto_mode_records_route(toy: tuple[MemorySystem, ScriptedModel]) -> None:
     system, model = toy
-    simple = system.ask("demo", "我在哪工作？", question_time=ASKED, mode="auto")
+    simple = system.ask("demo", "我在哪工作？", question_time=ASKED, mode="auto", router="rule")
     assert simple.details["route"]["level"] == "L1" and model.calls["plan"] == 0
-    deep = system.ask("demo", "我一共养了几只狗？", question_time=ASKED, mode="auto")
-    assert deep.details["route"] == {"level": "L2", "reasons": ["aggregation"]}
+    deep = system.ask("demo", "我一共养了几只狗？", question_time=ASKED, mode="auto", router="rule")
+    assert deep.details["route"] == {
+        "router": "rule",
+        "level": "L2",
+        "see": False,
+        "reasons": ["aggregation"],
+    }
     assert model.calls["plan"] == 1
 
 

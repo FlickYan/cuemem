@@ -3,7 +3,7 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-> 进行中：N6 多模态记忆已完成（图片描述 + 图文向量 + 回答时再看原图；MemLens 上 L2 加再感知 65.6%，长上下文模型直接看图 52.3%），下一步是 N7 检索控制器。进度见下方表格与 [路线图](docs/roadmap.md)。
+> 进行中：N7 检索控制器已完成（记忆探针 + 两段式控制器；20% 记忆题的混合流里比"总是检索"便宜 45%、准确率不降；在 L1 / L2 之间路由的空间比预想的小得多，换一个回答模型后模型自主检索反而最好，都如实记录），下一步是 N8 Agent Runtime 与 Demo。进度见下方表格与 [路线图](docs/roadmap.md)。
 
 ## 它要解决什么
 
@@ -60,7 +60,8 @@ uv run cuemem ingest examples/toy_conversation.json --consolidate   # 写入并�
 uv run cuemem inspect facts --space demo     # 事实时间线：哪些已被取代、何时、被谁取代
 uv run cuemem inspect facts --space demo --valid-at 2025-06   # 2025 年 6 月时现实中成立的事实
 uv run cuemem ask "我现在在哪里工作？" --space demo --at 2025-10-10 --show-context
-uv run cuemem ask "我一共换过几次工作？" --space demo --mode auto --show-context   # 规则版控制器选 L1 / L2
+uv run cuemem ask "我一共换过几次工作？" --space demo --mode auto --show-context   # 检索控制器选档（L0 / L1 / L2）
+uv run cuemem ask "我一共换过几次工作？" --space demo --mode auto --router hybrid --lam 10   # 拿不准时问 LLM；λ 越小越舍得花钱
 uv run cuemem forget --space demo --session s4   # 遗忘一段会话：派生的事实、向量、缓存一并清除
 uv run cuemem usage --today              # 调用量与成本（名义成本 / 估算花费）
 uv run cuemem search-image photo.jpg --space demo   # 以图搜图："我之前给你看过这个吗？"
@@ -98,14 +99,52 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N4 | L1 快速召回 | 已完成 |
 | N5 | L2 深度检索 | 已完成 |
 | N6 | 多模态记忆 | 已完成 |
-| N7 | 检索控制器（核心） | 下一步 |
-| N8 | Agent Runtime 与 Demo | 未开始 |
+| N7 | 检索控制器（核心） | 已完成 |
+| N8 | Agent Runtime 与 Demo | 下一步 |
 | N9 | 完整评测与分析 | 未开始 |
 | N10 | 包装 | 未开始 |
 
 ## 结果
 
 主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
+
+### N7 检索控制器：要不要想起、想多深（三个开发集 585 题 + 混合流 1,170 条无关查询）
+
+控制器在 L0（只用核心记忆）、L1 快速召回、L2 深度检索之间选，有图时再决定要不要回看原图。
+
+- **记忆探针**：每一问先做一次不调用 LLM 的检索（L1 的打分，选了 L1 时候选直接复用），得到 54 个特征——问题线索、检索分数分布、命中的分散程度、实体与图片命中、记忆规模。
+- **两段式控制器**：先判"要不要记忆"与推理类型，再查各档在这类题上的准确率，按 P̂(答对) − λ · 成本选动作。λ 是运行时旋钮。
+- **训练数据**：离线时每道题的每个动作都跑过、判过分。结果按对话历史交叉拟合，测试集没有动。
+
+| 策略 | 记忆题准确率 | 每千题成本：纯记忆题 | 每千题成本：混合流（20% 记忆题） |
+|---|---|---|---|
+| always-L1（总是检索） | 80.5% | $1.57 | $1.57 |
+| always-L2 | 85.3% | $3.46 | $3.46 |
+| B6r 规则版（N5） | 82.6% | $2.01 | $1.92 |
+| 按模型不确定度逐级升级（L0 → L1 → L2） | 77.6% | $2.10 | $0.66 |
+| B6z 零样本 LLM 路由（每问多一次调用） | 80.7% | $2.15 | $0.72 |
+| **B6 学到的控制器（λ = 30，不调用 LLM）** | **81.2%** | $2.14 | **$0.87** |
+| 已知真实题型的路由（参照） | 84.4% | $2.44 | — |
+| 事后理想路由（参照） | 88.5% | $1.41 | $0.52 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/n7-controller/mixed-dark.png">
+  <img alt="N7：混合流上各控制器的记忆题准确率与平均成本" src="docs/results/n7-controller/mixed-light.png" width="640">
+</picture>
+
+1. **控制器的价值在"要不要想起"**：混合流里 B6 比总是检索便宜 45%，记忆题准确率不降。
+   - 区分记忆题与无关查询的 AUC：只看问题线索 0.79，加上检索反馈 0.98。
+   - 按模型不确定度升级最差：回答模型在 L0 上自信地答了 13% 的记忆题。
+2. **"想多深"能挣的很少**：事后理想路由大多是在吃回答的随机翻转。
+   - 同一道题 L1、L2 的证据只差一点，回答就会翻转：L2 救回 45 题，又弄错 17 题。
+   - 已知真实题型的路由也只比 always-L2 省 29%。
+   - 学到的深度决策没有赢过规则版；"L1 + 先记笔记再回答"比所有路由都划算。
+3. **零样本 LLM 路由判得更准，代价是每问多一次调用（p50 0.58 秒）**。它看不到记忆，会把偏好类问题、指代已分享图片的问题判成"不需要记忆"。混合方案 B6h 只在门控拿不准时问它（19% 的查询）。
+4. **不能零样本跨对话风格迁移，但几十条目标数据就够**：没见过 LoCoMo 时，门控把它的第三人称问题当成无关查询，86.5% → 43.9%。加上 LoCoMo 里随机 20 条带标注的样本，回到 85.7%。
+
+5. **H3 不成立：换一个回答模型，模型自主检索反而最好**。回答模型换成 qwen3.8-flash 后，固定档位与控制器掉 2–7 个点，B3 在 LongMemEval 上 91%、LoCoMo 上 90.1%，比 always-L2 更准也更便宜。"自己决定检索"好不好取决于模型会不会用工具，N9 把它作为控制器的一档。
+
+H1 部分成立，H2 在纯记忆题上不成立。完整的表格、特征消融、跨数据集与混合流的构建方法见 [docs/results/n7-controller/README.md](docs/results/n7-controller/README.md)。真实运行与离线重放逐题一致；N7 合计花费约 $3.59，DeepSeek 调用全部在非高峰时段。
 
 ### N6 多模态记忆：MemLens 图文多会话记忆基准（官方 195 题子集，32K 与 128K）
 

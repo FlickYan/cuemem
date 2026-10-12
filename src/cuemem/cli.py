@@ -45,6 +45,7 @@ from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.llm.peak import describe, next_peak_start, peak_end
 from cuemem.memory import AskMode, MemorySystem
+from cuemem.read.controller import Router
 from cuemem.store.sqlite import MemoryDB
 from cuemem.write.consolidate import ConsolidationReport
 
@@ -212,18 +213,39 @@ def ask(
     mode: Annotated[
         str,
         typer.Option(
-            help="l1：L1 快速召回（默认）；l2：深度检索；auto：规则版控制器选 L1 / L2；"
-            "agent：模型自主检索；facts：事实增强检索（B2F）；naive：朴素检索（B2）"
+            help="l1：L1 快速召回（默认）；l2：深度检索；auto：检索控制器选档（L0 / L1 / L2）；"
+            "l0：只用核心记忆；agent：模型自主检索；facts：事实增强检索（B2F）；naive：朴素检索（B2）"
         ),
     ] = "l1",
+    router: Annotated[
+        str,
+        typer.Option(
+            help="mode=auto 时用哪种控制器：learned（默认，探针 + 两段式）、"
+            "hybrid（拿不准时问 LLM）、rule（规则版 B6r）、llm（零样本 LLM 路由）"
+        ),
+    ] = "learned",
+    lam: Annotated[
+        float | None, typer.Option(help="成本旋钮 λ：越大越省钱；默认取控制器模型里的值")
+    ] = None,
 ) -> None:
     """检索记忆并回答问题。"""
     if mode not in get_args(AskMode):
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(AskMode))}[/red]")
         raise typer.Exit(1)
+    if router not in get_args(Router):
+        console.print(f"[red]--router 只能是 {'、'.join(get_args(Router))}[/red]")
+        raise typer.Exit(1)
     with _open_system() as system:
         started = time.perf_counter()
-        answer = system.ask(space, question, question_time=at, k=k, mode=cast(AskMode, mode))
+        answer = system.ask(
+            space,
+            question,
+            question_time=at,
+            k=k,
+            mode=cast(AskMode, mode),
+            router=cast(Router, router),
+            lam=lam,
+        )
         elapsed = (time.perf_counter() - started) * 1000
         if show_context:
             _print_hits(answer)
@@ -574,6 +596,44 @@ def eval_run(
     console.print(f"报告：{report_path}")
 
 
+@eval_app.command("probe")
+def eval_probe(
+    dataset: Annotated[str, typer.Option(help="数据集")] = "longmemeval_s",
+    split: Annotated[str, typer.Option(help="划分名；all 表示全部题目")] = "dev100",
+    name: Annotated[str, typer.Option(help="运行名：特征写入 runs/eval/<运行名>/probe.jsonl")] = "",
+    limit: Annotated[int | None, typer.Option(help="只跑前 N 题")] = None,
+    workers: Annotated[int, typer.Option(help="并发线程数")] = 8,
+) -> None:
+    """跑记忆探针（一次检索，不调用 LLM）：每道题的检索控制器特征（N7）。空间要先构建好。"""
+    if not name:
+        console.print("[red]请用 --name 指定运行名（与评测运行同名，特征与结果放在一起）[/red]")
+        raise typer.Exit(1)
+    settings = load_settings()
+    split_name = None if split == "all" else split
+    evalset = _load_evalset(settings, dataset, split_name)
+    if dataset == "locomo":  # 与评测一致：不含对抗题
+        evalset.samples = [s for s in evalset.samples if s.question_type != "adversarial"]
+    config = RunConfig(
+        name=name, dataset=dataset, split=split_name, methods=[], workers=workers, limit=limit
+    )
+    with Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("探针", total=None)
+        runner = EvalRunner(
+            settings,
+            config,
+            on_start=lambda total: progress.update(task, total=total),
+            on_advance=lambda: progress.advance(task),
+        )
+        done, errors = runner.probe(evalset)
+    console.print(f"完成 {done} 题，出错 {errors} 题：{runner.run_dir / 'probe.jsonl'}")
+
+
 @eval_app.command("report")
 def eval_report(
     run: Annotated[str, typer.Argument(help="运行名或运行目录")],
@@ -857,7 +917,18 @@ def _print_process(answer: Answer) -> None:
     route = details.get("route")
     if route:
         reasons = "、".join(route["reasons"]) or "无"
-        console.print(f"[bold]控制器[/bold]：走 {route['level']}（触发的线索：{reasons}）")
+        see = "，附原图再看" if route.get("see") else ""
+        if route.get("router") == "rule":
+            console.print(f"[bold]控制器[/bold]：走 {route['level']}（触发的线索：{reasons}）")
+        elif route.get("router") == "llm":
+            console.print(f"[bold]控制器[/bold]（llm）：走 {route['level']}{see}（{reasons}）")
+        else:
+            scores = route.get("scores", {})
+            extra = "，问了 LLM" if scores.get("asked_llm") else ""
+            console.print(
+                f"[bold]控制器[/bold]（{route.get('router')}）：走 {route['level']}{see}"
+                f"（推理类型：{reasons}；与记忆无关的概率 {scores.get('p_none', 0):.0%}{extra}）"
+            )
     plan = details.get("plan")
     if plan:
         console.print(

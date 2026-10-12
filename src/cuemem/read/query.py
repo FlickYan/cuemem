@@ -108,6 +108,25 @@ TEMPORAL_WORDS = re.compile(
 )
 
 
+# 规则版控制器（B6r，N5）的三条线索：先后、时长、比较；N7 起也是探针的查询线索特征
+_NOT_ORDER = r"(?!\s+(?:week|month|year|weekend|night|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)"  # noqa: E501
+ORDER_WORDS = re.compile(
+    rf"\b(first|earliest|last{_NOT_ORDER}|latest|most recent(?:ly)?|before|after|order"
+    r"|sequence)\b|第一次|最早|最后一次|最近一次|先后|之前|之后",
+    re.I,
+)
+DURATION_WORDS = re.compile(
+    r"\bhow (?:long|many (?:days|weeks|months|years|hours|minutes))\b"
+    r"|多久|多长时间|几天|几周|几个月|几年",
+    re.I,
+)
+COMPARE_WORDS = re.compile(
+    r"\b(more|most|less|least|fewer|larger|largest|bigger|biggest|compared?|difference)\b"
+    r"|更多|最多|最少|比较",
+    re.I,
+)
+
+
 @dataclass(frozen=True)
 class TimeRange:
     start: datetime

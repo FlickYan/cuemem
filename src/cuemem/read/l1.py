@@ -102,6 +102,8 @@ class L1Candidates:
     timings_ms: dict[str, float] = field(default_factory=dict)
     debug: dict[str, object] = field(default_factory=dict)
     media_score: dict[str, float] = field(default_factory=dict)  # 图片 ID → 相关度（RRF 分）
+    # 各路召回的原始结果（单元 ID 与分数，从高到低），键是（单元类型，模态）；探针从这里取分数分布
+    routes: dict[tuple[str, str], list[tuple[str, float]]] = field(default_factory=dict)
 
 
 class L1Retriever:
@@ -123,7 +125,10 @@ class L1Retriever:
     def search(
         self, space_id: str, question: str, question_time: datetime, cfg: L1Config
     ) -> L1Result:
-        cands = self.candidates(space_id, question, question_time, cfg)
+        return self.pack(space_id, self.candidates(space_id, question, question_time, cfg), cfg)
+
+    def pack(self, space_id: str, cands: L1Candidates, cfg: L1Config) -> L1Result:
+        """把一次打分的候选按预算装入。控制器先用探针看过候选、决定走 L1 时，直接接着打包。"""
         started = time.perf_counter()
         with span("pack", route="l1", budget=cfg.budget_tokens) as record:
             rounds = pack_rounds(cands.ranked, cands.round_units, cfg)
@@ -202,6 +207,7 @@ class L1Retriever:
             timings["recall"] = (time.perf_counter() - started) * 1000 - timings["embed"]
 
             cands = self._score(space_id, query, routes, cfg)
+            cands.routes = routes
             record["candidates"] = len(cands.ranked)
             record["time_range"] = query.time_range.expr if query.time_range else None
         timings["total"] = (time.perf_counter() - started) * 1000

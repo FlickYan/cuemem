@@ -1,50 +1,53 @@
-"""规则版检索控制器：N7 可学习控制器的基线（设计文档 §6.3）。
+"""检索控制器（设计文档 §6.3）：决定这一问用哪一档检索——L0 只用常驻上下文、L1 快速召回、
+L2 深度检索——以及要不要再看原图（再感知）。
 
-只看问题里的线索，不调用 LLM，也不看检索结果，决定走 L1 还是 L2：
+三种实现，同一个接口（RouteDecision）：
 
-- 聚合：问"多少、几次、一共、哪些、列出……"——证据散落在多个会话，需要多查询召回、多给事实、
-  补检索；
-- 时间推算与先后：问"多久、几天、哪个先、第一次、最近一次、之前、之后……"——要比较多条证据的日期；
-- 比较：问"更多、最多、比……"——要把几个候选都找全再比较；
-其余（问一个具体事实、要建议）走 L1。
-
-规则在看到 L2 的逐题结果之前写定，避免照着结果调规则；N7 用探针特征与离线标签训练的控制器
-和它比较。
+- **RuleController**（B6r，N5 的基线）：只看问题里的线索，不调用 LLM、不看检索结果。聚合
+  （"多少、几次、一共、哪些"）、时间推算与先后（"多久、哪个先、第一次、之前"）、比较（"更多、
+  最多"）走 L2，其余走 L1。规则在看到 L2 的逐题结果之前写定，避免照着结果调规则；
+- **LLMRouter**（B6z，N7 的对照）：零样本让便宜的模型（qwen3.8-flash）只看问题文本选一档；
+- **LearnedController**（B6，N7）：两段式。先用探针特征（read/probe.py）预测这道题属于哪类推理
+  （多分类逻辑回归），再从离线全信息标注的表里查各档在这类题上的准确率，按
+  P̂(答对 | x, a) − λ · ĉ(a) 选动作。λ 是运行时旋钮：调大更省钱，调小更准；不用重新训练。
+  模型参数是一个 JSON 文件（evals/routing.py 训练并导出），运行时只用 numpy。
 """
 
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
-from cuemem.read.query import analyze
+import numpy as np
+from pydantic import BaseModel
 
-Level = Literal["L1", "L2"]
+from cuemem.core.trace import record_event
+from cuemem.errors import ContentFilteredError, StructuredOutputError
+from cuemem.llm.client import LLMClient, Message
+from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyze
 
-_NOT_ORDER = r"(?!\s+(?:week|month|year|weekend|night|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)"  # noqa: E501
-_ORDER = re.compile(
-    rf"\b(first|earliest|last{_NOT_ORDER}|latest|most recent(?:ly)?|before|after|order"
-    r"|sequence)\b|第一次|最早|最后一次|最近一次|先后|之前|之后",
-    re.I,
-)
-_DURATION = re.compile(
-    r"\bhow (?:long|many (?:days|weeks|months|years|hours|minutes))\b"
-    r"|多久|多长时间|几天|几周|几个月|几年",
-    re.I,
-)
-_COMPARE = re.compile(
-    r"\b(more|most|less|least|fewer|larger|largest|bigger|biggest|compared?|difference)\b"
-    r"|更多|最多|最少|比较",
-    re.I,
-)
+Level = Literal["L0", "L1", "L2"]
+Router = Literal["learned", "hybrid", "rule", "llm"]
+DEFAULT_MODEL = Path(__file__).with_name("controller_model.json")
+# 混合方案（B6h）：门控估计的 P(none) 落在这个区间里才问 LLM；LLM 判"无关"时 P(none) 取
+# HYBRID_CONFIDENCE，判"需要记忆"时取 1 − HYBRID_CONFIDENCE。两个数都是事先定的，没有在评测数据上调
+HYBRID_BAND = (0.1, 0.9)
+HYBRID_CONFIDENCE = 0.95
 
 
 @dataclass(frozen=True)
 class RouteDecision:
     level: Level
     reasons: list[str] = field(default_factory=list)
+    see: bool = False  # 回答时附上原图（再感知）
+    scores: dict[str, float] = field(default_factory=dict)  # 各动作的答对概率与效用（可解释）
+
+    @property
+    def action(self) -> str:
+        return self.level + ("+see" if self.see else "")
 
 
 class RuleController:
@@ -53,10 +56,203 @@ class RuleController:
         reasons: list[str] = []
         if query.aggregation:
             reasons.append("aggregation")
-        if _DURATION.search(question):
+        if DURATION_WORDS.search(question):
             reasons.append("duration")
-        if _ORDER.search(question):
+        if ORDER_WORDS.search(question):
             reasons.append("order")
-        if _COMPARE.search(question):
+        if COMPARE_WORDS.search(question):
             reasons.append("compare")
         return RouteDecision("L2" if reasons else "L1", reasons)
+
+
+ROUTER_SYSTEM = """You decide how much memory retrieval a personal assistant needs before it answers a user's message. The assistant keeps a long-term memory of its past conversations with this user, including photos the user shared.
+
+Levels:
+- NONE: the message does not depend on the user's past conversations (general knowledge, how-to, creative or brainstorming requests, chit-chat). The assistant answers from its own knowledge.
+- FAST: one quick search of past conversations is enough: the answer is a single fact or detail mentioned before.
+- DEEP: a thorough multi-step search: combine details from several past conversations, count or list things, compare, order events in time, or work out dates and durations.
+
+Also say whether answering needs a fresh look at photos the user shared (visual details such as colors, objects, or text in an image)."""  # noqa: E501
+
+_ROUTER_LEVELS: dict[str, Level] = {"NONE": "L0", "FAST": "L1", "DEEP": "L2"}
+
+
+class RouterOutput(BaseModel):
+    level: Literal["NONE", "FAST", "DEEP"]
+    look_at_images: bool = False
+
+
+class LLMRouter:
+    """零样本 LLM 路由（N7 的对照）：只看问题文本，不看记忆；失败时退回 L1。"""
+
+    def __init__(self, llm: LLMClient, role: str = "planner") -> None:
+        self.llm = llm
+        self.role = role
+
+    def decide(self, question: str, *, cache_scope: str | None = None) -> RouteDecision:
+        messages: list[Message] = [
+            {"role": "system", "content": ROUTER_SYSTEM},
+            {"role": "user", "content": f"User message:\n{question}"},
+        ]
+        try:
+            out = self.llm.structured(
+                self.role, messages, RouterOutput, max_tokens=60, cache_scope=cache_scope
+            ).value
+        except (StructuredOutputError, ContentFilteredError) as exc:
+            record_event("router_fallback", error=type(exc).__name__)
+            return RouteDecision("L1", [f"路由失败（{type(exc).__name__}），默认 L1"])
+        return RouteDecision(
+            _ROUTER_LEVELS[out.level], [f"llm:{out.level}"], see=out.look_at_images
+        )
+
+
+@dataclass
+class ControllerModel:
+    """两段式控制器的参数（evals/routing.py 的 TwoStageModel.to_json 导出）。
+
+    有门控时分两层：门控（二分类）估计"这一问与记忆无关"的概率 P(none | x)，推理类型的多分类
+    只管记忆题；P(t | x) = (1 − P(none | x)) · P(t | x, 记忆题)。
+    """
+
+    features: list[str]
+    mean: np.ndarray
+    scale: np.ndarray
+    types: list[str]  # 有门控时最后一个是 "none"
+    coef: np.ndarray  # (记忆题类型数, 特征数)
+    intercept: np.ndarray
+    accuracy: dict[str, dict[str, float]]  # 推理类型 → 档 → 准确率
+    see_gain: dict[str, dict[str, float]]  # 推理类型 → 档 → 再感知的增益
+    cost: dict[str, float]  # 档 → 平均名义成本（美元）；"see" 是再感知多出来的成本
+    lam: float  # 默认的 λ
+    gate_coef: np.ndarray | None = None
+    gate_intercept: float = 0.0
+    clip: float = 5.0  # 标准化后的特征截断在 ±clip 以内（与训练时一致）
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def load(cls, path: Path) -> ControllerModel:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        known = {
+            "features",
+            "mean",
+            "scale",
+            "types",
+            "coef",
+            "intercept",
+            "gate",
+            "accuracy",
+            "see_gain",
+            "cost",
+            "lambda",
+            "clip",
+        }
+        gate = raw.get("gate")
+        return cls(
+            features=list(raw["features"]),
+            mean=np.asarray(raw["mean"], dtype=float),
+            scale=np.asarray(raw["scale"], dtype=float),
+            types=list(raw["types"]),
+            coef=np.asarray(raw["coef"], dtype=float),
+            intercept=np.asarray(raw["intercept"], dtype=float),
+            accuracy=raw["accuracy"],
+            see_gain=raw["see_gain"],
+            cost=raw["cost"],
+            lam=float(raw["lambda"]),
+            gate_coef=np.asarray(gate["coef"], dtype=float) if gate else None,
+            gate_intercept=float(gate["intercept"]) if gate else 0.0,
+            clip=float(raw.get("clip", 5.0)),
+            meta={k: v for k, v in raw.items() if k not in known},
+        )
+
+    @property
+    def memory_types(self) -> list[str]:
+        return self.types[:-1] if self.gate_coef is not None else self.types
+
+    def parts(self, features: dict[str, float]) -> tuple[dict[str, float], float]:
+        """（记忆题条件下各推理类型的概率，与记忆无关的概率）。没有门控时后者为 0。"""
+        x = np.array([features.get(n, 0.0) for n in self.features])
+        z = np.clip((x - self.mean) / self.scale, -self.clip, self.clip)  # 分布外的输入不外推
+        logits = z @ self.coef.T + self.intercept
+        logits -= logits.max()
+        p = np.exp(logits)
+        p /= p.sum()
+        types = {t: float(v) for t, v in zip(self.memory_types, p, strict=True)}
+        if self.gate_coef is None:
+            return types, 0.0
+        return types, float(1.0 / (1.0 + np.exp(-(z @ self.gate_coef + self.gate_intercept))))
+
+    def type_proba(
+        self, features: dict[str, float], *, p_none: float | None = None
+    ) -> dict[str, float]:
+        """各推理类型的概率；p_none 可以换掉门控的估计（混合方案用 LLM 的判断）。"""
+        types, gate = self.parts(features)
+        none = gate if p_none is None else p_none
+        if self.gate_coef is None:
+            return types
+        return {**{t: (1 - none) * v for t, v in types.items()}, "none": none}
+
+    def action_proba(self, types: dict[str, float], *, has_images: bool) -> dict[str, float]:
+        out = {
+            lv: sum(p * self.accuracy[t][lv] for t, p in types.items()) for lv in ("L0", "L1", "L2")
+        }
+        if has_images:
+            for lv in ("L1", "L2"):
+                gain = sum(p * self.see_gain[t][lv] for t, p in types.items())
+                out[f"{lv}+see"] = min(1.0, max(0.0, out[lv] + gain))
+        return out
+
+    def action_cost(self, action: str) -> float:
+        level = action.removesuffix("+see")
+        return self.cost[level] + (self.cost.get("see", 0.0) if action.endswith("+see") else 0.0)
+
+
+TYPE_LABELS = {
+    "single": "单点事实",
+    "multi": "多会话 / 多跳",
+    "temporal": "时间推理",
+    "update": "知识更新",
+    "preference": "偏好与建议",
+    "open": "开放推断",
+    "abstention": "拒答",
+    "none": "与记忆无关",
+}
+
+
+class LearnedController:
+    """B6：两段式检索控制器（N7）。features 来自记忆探针；lam 越大越省钱。"""
+
+    def __init__(self, model: ControllerModel, lam: float | None = None) -> None:
+        self.model = model
+        self.lam = model.lam if lam is None else lam
+
+    @classmethod
+    def load(cls, path: Path | None = None, lam: float | None = None) -> LearnedController:
+        return cls(ControllerModel.load(path or DEFAULT_MODEL), lam)
+
+    def gate(self, features: dict[str, float]) -> float:
+        """门控估计的"与记忆无关"的概率（混合方案据此决定要不要问 LLM）。"""
+        return self.model.parts(features)[1]
+
+    def decide(
+        self,
+        features: dict[str, float],
+        *,
+        has_images: bool,
+        lam: float | None = None,
+        p_none: float | None = None,
+    ) -> RouteDecision:
+        lam = self.lam if lam is None else lam
+        types = self.model.type_proba(features, p_none=p_none)
+        proba = self.model.action_proba(types, has_images=has_images)
+        # 舍到 9 位小数再比较：与离线训练（evals/routing.py 的 decide）的平局规则逐位一致
+        utility = {a: round(p - lam * self.model.action_cost(a), 9) for a, p in proba.items()}
+        action = max(utility, key=lambda a: (utility[a], -self.model.action_cost(a)))
+        top = sorted(types.items(), key=lambda kv: -kv[1])[:2]
+        reasons = [f"{TYPE_LABELS.get(t, t)} {p:.0%}" for t, p in top if p >= 0.1]
+        scores = {f"p:{a}": round(p, 4) for a, p in proba.items()}
+        scores.update({f"u:{a}": round(u, 4) for a, u in utility.items()})
+        scores["p_none"] = round(types.get("none", 0.0), 4)
+        level: Level = (
+            "L0" if action.startswith("L0") else "L1" if action.startswith("L1") else "L2"
+        )
+        return RouteDecision(level, reasons, see=action.endswith("+see"), scores=scores)

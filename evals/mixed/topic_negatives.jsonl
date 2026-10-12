@@ -1,0 +1,585 @@
+{"sample_id": "118b2229", "dataset": "longmemeval_s", "negative": "What is the average length of a daily commute in major metropolitan areas?"}
+{"sample_id": "58bf7951", "dataset": "longmemeval_s", "negative": "What are some popular plays frequently performed by community theaters?"}
+{"sample_id": "58ef2f1c", "dataset": "longmemeval_s", "negative": "What are common activities at animal shelter fundraising dinners?"}
+{"sample_id": "5d3d2817", "dataset": "longmemeval_s", "negative": "What are common career paths for someone with a background in marketing?"}
+{"sample_id": "75499fd8", "dataset": "longmemeval_s", "negative": "What are the most popular dog breeds in the United States?"}
+{"sample_id": "a06e4cfe", "dataset": "longmemeval_s", "negative": "What is the standard gin-to-vermouth ratio for a classic dry martini?"}
+{"sample_id": "e01b8e2f", "dataset": "longmemeval_s", "negative": "What are some popular destinations for a week-long family vacation?"}
+{"sample_id": "ccb36322", "dataset": "longmemeval_s", "negative": "What are the most popular music streaming services currently available?"}
+{"sample_id": "311778f1", "dataset": "longmemeval_s", "negative": "What are some highly-rated documentary series available on Netflix?"}
+{"sample_id": "c19f7a0b", "dataset": "longmemeval_s", "negative": "What are typical commute times for office workers in major metropolitan areas?"}
+{"sample_id": "29f2956b", "dataset": "longmemeval_s", "negative": "How much time should a beginner dedicate to practicing guitar every day?"}
+{"sample_id": "c14c00dd", "dataset": "longmemeval_s", "negative": "What are the most popular shampoo brands in the United States?"}
+{"sample_id": "3d86fd0a", "dataset": "longmemeval_s", "negative": "What are some common places where people meet new friends?"}
+{"sample_id": "15745da0_abs", "dataset": "longmemeval_s", "negative": "What are the best practices for storing and preserving vintage film reels?"}
+{"sample_id": "6d550036", "dataset": "longmemeval_s", "negative": "What are the key metrics used to evaluate project leadership effectiveness?"}
+{"sample_id": "gpt4_59c863d7", "dataset": "longmemeval_s", "negative": "What are some popular model kit brands and types for beginners?"}
+{"sample_id": "gpt4_f2262a51", "dataset": "longmemeval_s", "negative": "What is the average number of doctor visits per year for adults in the United States?"}
+{"sample_id": "dd2973ad", "dataset": "longmemeval_s", "negative": "What is the recommended amount of sleep to get before a doctor's appointment?"}
+{"sample_id": "46a3abf7", "dataset": "longmemeval_s", "negative": "What are the essential components needed to set up a freshwater aquarium for beginners?"}
+{"sample_id": "gpt4_7fce9456", "dataset": "longmemeval_s", "negative": "What is the typical number of properties a buyer views before making an offer on a townhouse?"}
+{"sample_id": "d682f1a2", "dataset": "longmemeval_s", "negative": "What are the most popular food delivery services available in major cities?"}
+{"sample_id": "7024f17c", "dataset": "longmemeval_s", "negative": "What are the typical calorie burn rates for jogging versus yoga?"}
+{"sample_id": "gpt4_2ba83207", "dataset": "longmemeval_s", "negative": "What are the most effective strategies for reducing grocery bills?"}
+{"sample_id": "2788b940", "dataset": "longmemeval_s", "negative": "How many fitness classes are recommended to attend in a typical week for general health?"}
+{"sample_id": "9d25d4e0", "dataset": "longmemeval_s", "negative": "What are the best ways to track and organize a personal jewelry collection?"}
+{"sample_id": "gpt4_ab202e7f", "dataset": "longmemeval_s", "negative": "What are common signs that indicate a kitchen appliance needs to be replaced rather than repaired?"}
+{"sample_id": "e3038f8c", "dataset": "longmemeval_s", "negative": "What are some common examples of rare items found in video games?"}
+{"sample_id": "2b8f3739", "dataset": "longmemeval_s", "negative": "What are the typical profit margins for handmade goods sold at local craft markets?"}
+{"sample_id": "bf659f65", "dataset": "longmemeval_s", "negative": "What are the most common formats for purchasing and downloading music albums or EPs?"}
+{"sample_id": "81507db6", "dataset": "longmemeval_s", "negative": "What is the typical duration of a university graduation ceremony?"}
+{"sample_id": "eeda8a6d_abs", "dataset": "longmemeval_s", "negative": "What is the recommended number of fish for a 30-gallon aquarium?"}
+{"sample_id": "gpt4_372c3eed_abs", "dataset": "longmemeval_s", "negative": "What is the typical duration of formal education from high school through a Master's degree?"}
+{"sample_id": "32260d93", "dataset": "longmemeval_s", "negative": "What are some highly-rated movies or TV shows suitable for a casual evening watch?"}
+{"sample_id": "195a1a1b", "dataset": "longmemeval_s", "negative": "What are some good activities to do in the evening?"}
+{"sample_id": "afdc33df", "dataset": "longmemeval_s", "negative": "What are some effective strategies for maintaining a clean and organized kitchen?"}
+{"sample_id": "09d032c9", "dataset": "longmemeval_s", "negative": "What are some effective tips for improving smartphone battery life?"}
+{"sample_id": "d6233ab6", "dataset": "longmemeval_s", "negative": "What are the common benefits and drawbacks of attending a high school reunion?"}
+{"sample_id": "0a34ad58", "dataset": "longmemeval_s", "negative": "What are some helpful tips for navigating public transportation in Tokyo?"}
+{"sample_id": "4f54b7c9", "dataset": "longmemeval_s", "negative": "What are common ways people acquire antique items?"}
+{"sample_id": "85fa3a3f", "dataset": "longmemeval_s", "negative": "What are the typical price ranges for a new pet food bowl, measuring cup, dental chews, and flea and tick collar?"}
+{"sample_id": "1f2b8d4f", "dataset": "longmemeval_s", "negative": "What are the typical price differences between luxury leather boots and budget-friendly alternatives?"}
+{"sample_id": "9ee3ecd6", "dataset": "longmemeval_s", "negative": "How many points do you need to earn to redeem a free skincare product at Sephora?"}
+{"sample_id": "91b15a6e", "dataset": "longmemeval_s", "negative": "What factors determine the resale value of vintage diamond necklaces and antique vanities?"}
+{"sample_id": "3fe836c9", "dataset": "longmemeval_s", "negative": "What factors typically cause a difference between a mortgage pre-approval amount and the final sale price of a house?"}
+{"sample_id": "bc149d6b", "dataset": "longmemeval_s", "negative": "What is the typical weight range for a standard bag of commercial livestock feed?"}
+{"sample_id": "e56a43b9", "dataset": "longmemeval_s", "negative": "What are the typical discount structures offered by grocery loyalty programs?"}
+{"sample_id": "e5ba910e_abs", "dataset": "longmemeval_s", "negative": "What are the typical price ranges for high-end wireless headphones and a standard iPad model?"}
+{"sample_id": "0bc8ad92", "dataset": "longmemeval_s", "negative": "What are some popular museums in major cities that offer guided tours?"}
+{"sample_id": "af082822", "dataset": "longmemeval_s", "negative": "How long does a Nordstrom Friends and Family sale typically last?"}
+{"sample_id": "gpt4_18c2b244", "dataset": "longmemeval_s", "negative": "What is the typical order of operations for redeeming cashback rewards from apps like Ibotta compared to using manufacturer coupons at retail stores?"}
+{"sample_id": "gpt4_7a0daae1", "dataset": "longmemeval_s", "negative": "What is the typical shipping time for online orders of sports equipment?"}
+{"sample_id": "gpt4_4ef30696", "dataset": "longmemeval_s", "negative": "What is the typical reading time for 'The Nightingale' by Kristin Hannah?"}
+{"sample_id": "gpt4_74aed68e", "dataset": "longmemeval_s", "negative": "What is the typical recommended interval for replacing spark plugs in a modern gasoline engine?"}
+{"sample_id": "gpt4_21adecb5", "dataset": "longmemeval_s", "negative": "What is the typical time duration between completing an undergraduate degree and submitting a master's thesis?"}
+{"sample_id": "gpt4_e414231e", "dataset": "longmemeval_s", "negative": "What are the typical maintenance intervals for mountain bikes compared to road bike pedal upgrades?"}
+{"sample_id": "gpt4_7bc6cf22", "dataset": "longmemeval_s", "negative": "What is the typical publication schedule for The New Yorker magazine?"}
+{"sample_id": "71017277", "dataset": "longmemeval_s", "negative": "What are some common types of jewelry given as gifts?"}
+{"sample_id": "b46e15ee", "dataset": "longmemeval_s", "negative": "What are some common types of charity events people participate in?"}
+{"sample_id": "gpt4_f420262d", "dataset": "longmemeval_s", "negative": "What are the major airlines operating domestic flights in the United States?"}
+{"sample_id": "gpt4_59149c78", "dataset": "longmemeval_s", "negative": "What are some common venues used for hosting local art exhibitions and community art events?"}
+{"sample_id": "0bc8ad93", "dataset": "longmemeval_s", "negative": "What are the typical opening hours for major museums in London?"}
+{"sample_id": "gpt4_b5700ca0", "dataset": "longmemeval_s", "negative": "What are some common religious activities held on weekends?"}
+{"sample_id": "08f4fc43", "dataset": "longmemeval_s", "negative": "How many days are there between the last Sunday of Lent and Ash Wednesday?"}
+{"sample_id": "f0853d11", "dataset": "longmemeval_s", "negative": "What is the typical duration of a coastal cleanup event?"}
+{"sample_id": "gpt4_483dd43c", "dataset": "longmemeval_s", "negative": "Which show premiered first, 'The Crown' or 'Game of Thrones'?"}
+{"sample_id": "gpt4_8c8961ae", "dataset": "longmemeval_s", "negative": "What are the typical visa requirements for traveling to Europe versus Thailand?"}
+{"sample_id": "gpt4_d9af6064", "dataset": "longmemeval_s", "negative": "What is the recommended order for setting up a smart thermostat and a new router?"}
+{"sample_id": "gpt4_7de946e7", "dataset": "longmemeval_s", "negative": "What are the common causes of a persistent cough versus a skin tag?"}
+{"sample_id": "d01c6aa8", "dataset": "longmemeval_s", "negative": "What are the common age ranges for people moving to the United States?"}
+{"sample_id": "a3045048", "dataset": "longmemeval_s", "negative": "How many days in advance should I order a gift for a friend's birthday party to ensure it arrives on time?"}
+{"sample_id": "gpt4_88806d6e", "dataset": "longmemeval_s", "negative": "What are the typical steps for introducing two new acquaintances to each other?"}
+{"sample_id": "gpt4_2f56ae70", "dataset": "longmemeval_s", "negative": "What are the most popular streaming services currently available?"}
+{"sample_id": "gpt4_70e84552_abs", "dataset": "longmemeval_s", "negative": "What are the typical steps involved in setting up a small livestock farm, such as installing fencing and purchasing animals?"}
+{"sample_id": "945e3d21", "dataset": "longmemeval_s", "negative": "How often should one attend yoga classes to effectively help with anxiety?"}
+{"sample_id": "89941a93", "dataset": "longmemeval_s", "negative": "What are the most common types of bicycles used for commuting?"}
+{"sample_id": "184da446", "dataset": "longmemeval_s", "negative": "How many pages does the book 'A Short History of Nearly Everything' have?"}
+{"sample_id": "031748ae", "dataset": "longmemeval_s", "negative": "What is the typical number of engineers a Senior Software Engineer leads in a standard tech company?"}
+{"sample_id": "f9e8c073", "dataset": "longmemeval_s", "negative": "What is the typical duration and structure of a bereavement support group program?"}
+{"sample_id": "618f13b2", "dataset": "longmemeval_s", "negative": "What are the key features of Converse Chuck Taylor All Star sneakers?"}
+{"sample_id": "c4ea545c", "dataset": "longmemeval_s", "negative": "What are the recommended guidelines for gym frequency for general health and fitness?"}
+{"sample_id": "2133c1b5", "dataset": "longmemeval_s", "negative": "What is the average lease duration for apartments in Harajuku, Tokyo?"}
+{"sample_id": "ed4ddc30", "dataset": "longmemeval_s", "negative": "What is the recommended storage method for keeping eggs fresh in a refrigerator?"}
+{"sample_id": "7e974930", "dataset": "longmemeval_s", "negative": "What are typical daily earnings for vendors at a downtown farmers market?"}
+{"sample_id": "59524333", "dataset": "longmemeval_s", "negative": "What are the best times of day to go to the gym for optimal results?"}
+{"sample_id": "50635ada", "dataset": "longmemeval_s", "negative": "What are the requirements to achieve Premier Gold status on United Airlines?"}
+{"sample_id": "e66b632c", "dataset": "longmemeval_s", "negative": "What are the average finishing times for a 5K run among recreational runners?"}
+{"sample_id": "cf22b7bf", "dataset": "longmemeval_s", "negative": "What are effective strategies for tracking weight loss progress when starting a consistent gym routine?"}
+{"sample_id": "ba61f0b9", "dataset": "longmemeval_s", "negative": "What are the typical gender diversity metrics for teams led by senior managers in the tech industry?"}
+{"sample_id": "f685340e_abs", "dataset": "longmemeval_s", "negative": "What are the typical rules and scoring systems used in recreational table tennis matches?"}
+{"sample_id": "c4f10528", "dataset": "longmemeval_s", "negative": "What are some popular restaurants in Cihampelas Walk, Bandung, that are known for serving Nasi Goreng?"}
+{"sample_id": "ceb54acb", "dataset": "longmemeval_s", "negative": "What are some alternative clinical or descriptive terms for sexual compulsions?"}
+{"sample_id": "18dcd5a5", "dataset": "longmemeval_s", "negative": "How many mummies are typically encountered in the Lost Temple of the Djinn one-shot adventure?"}
+{"sample_id": "8aef76bc", "dataset": "longmemeval_s", "negative": "What sealant is recommended for protecting newspaper flower vases in DIY home decor projects?"}
+{"sample_id": "71a3fd6b", "dataset": "longmemeval_s", "negative": "What is the phone number of the Speyer tourism board?"}
+{"sample_id": "70b3e69b", "dataset": "longmemeval_s", "negative": "Who are some prominent Spanish-Catalan singer-songwriters known for advocating unity between Catalonia and Spain?"}
+{"sample_id": "41275add", "dataset": "longmemeval_s", "negative": "What are some recommended YouTube videos from the Mayo Clinic regarding workplace posture?"}
+{"sample_id": "4388e9dd", "dataset": "longmemeval_s", "negative": "What are some common costume choices for comedic characters in movie scripts?"}
+{"sample_id": "16c90bf4", "dataset": "longmemeval_s", "negative": "What type of beer is traditionally recommended for making Seco de Cordero, a Peruvian lamb stew from the Ancash region?"}
+{"sample_id": "c7cf7dfd", "dataset": "longmemeval_s", "negative": "What are some reputable online stores based in India that sell traditional fabrics, threads, and embellishments for embroidery?"}
+{"sample_id": "e48988bc", "dataset": "longmemeval_s", "negative": "Which companies are widely recognized for their leadership in environmentally responsible supply chain practices?"}
+{"sample_id": "conv-26-q0", "dataset": "locomo", "negative": "What are the typical meeting schedules for LGBTQ support groups?"}
+{"sample_id": "conv-26-q1", "dataset": "locomo", "negative": "What are the best times of day to paint a sunrise?"}
+{"sample_id": "conv-26-q2", "dataset": "locomo", "negative": "What are some popular fields of study for students interested in a career in healthcare?"}
+{"sample_id": "conv-26-q3", "dataset": "locomo", "negative": "What are the key steps involved in conducting academic research?"}
+{"sample_id": "conv-26-q4", "dataset": "locomo", "negative": "What are the key components of personal identity in psychology?"}
+{"sample_id": "conv-26-q5", "dataset": "locomo", "negative": "What are some popular charity races held annually?"}
+{"sample_id": "conv-26-q6", "dataset": "locomo", "negative": "What are the best months for camping in temperate climates?"}
+{"sample_id": "conv-26-q7", "dataset": "locomo", "negative": "What are the common relationship statuses people might have?"}
+{"sample_id": "conv-26-q8", "dataset": "locomo", "negative": "What are the key elements of a successful speech given at a school?"}
+{"sample_id": "conv-26-q9", "dataset": "locomo", "negative": "What are some common ways people organize gatherings with friends, family, and mentors?"}
+{"sample_id": "conv-26-q10", "dataset": "locomo", "negative": "What are some common signs that a group of friends has been together for a long time?"}
+{"sample_id": "conv-26-q11", "dataset": "locomo", "negative": "What are some common reasons people choose to relocate to a new city?"}
+{"sample_id": "conv-26-q12", "dataset": "locomo", "negative": "What is the legal age of majority in most countries?"}
+{"sample_id": "conv-26-q13", "dataset": "locomo", "negative": "What are the key steps involved in choosing a career path?"}
+{"sample_id": "conv-26-q14", "dataset": "locomo", "negative": "What are the common motivations for people to pursue a career in counseling?"}
+{"sample_id": "conv-26-q15", "dataset": "locomo", "negative": "What are some common leisure activities people enjoy?"}
+{"sample_id": "conv-26-q16", "dataset": "locomo", "negative": "What are the typical steps involved in signing up for a beginner pottery class?"}
+{"sample_id": "conv-26-q17", "dataset": "locomo", "negative": "What are the typical dates and locations for major transgender conferences held annually?"}
+{"sample_id": "conv-26-q18", "dataset": "locomo", "negative": "What are some popular camping destinations in the United States?"}
+{"sample_id": "conv-26-q19", "dataset": "locomo", "negative": "What are some popular activities for children aged 6 to 10?"}
+{"sample_id": "conv-26-q20", "dataset": "locomo", "negative": "What are the typical opening hours for major art museums?"}
+{"sample_id": "conv-26-q21", "dataset": "locomo", "negative": "What are some popular picnic spots in major cities?"}
+{"sample_id": "conv-26-q22", "dataset": "locomo", "negative": "What are some of the most popular children's books written by Dr. Seuss?"}
+{"sample_id": "conv-26-q23", "dataset": "locomo", "negative": "What are some popular books recommended for beginners interested in reading?"}
+{"sample_id": "conv-26-q24", "dataset": "locomo", "negative": "What are some effective techniques for reducing stress?"}
+{"sample_id": "conv-26-q25", "dataset": "locomo", "negative": "What are some major annual LGBTQ conferences held in the United States?"}
+{"sample_id": "conv-26-q26", "dataset": "locomo", "negative": "What is the publication date of the book 'Nothing Is Impossible'?"}
+{"sample_id": "conv-26-q27", "dataset": "locomo", "negative": "What are the typical career paths for someone with a degree in creative writing?"}
+{"sample_id": "conv-26-q28", "dataset": "locomo", "negative": "What are the typical steps involved in attending an adoption meeting?"}
+{"sample_id": "conv-26-q29", "dataset": "locomo", "negative": "What are the typical steps involved in a beginner's pottery workshop?"}
+{"sample_id": "conv-26-q30", "dataset": "locomo", "negative": "What criteria are generally used to determine if someone is considered a member of the LGBTQ community?"}
+{"sample_id": "conv-26-q31", "dataset": "locomo", "negative": "What are some popular camping destinations in the United States for June?"}
+{"sample_id": "conv-26-q32", "dataset": "locomo", "negative": "What are some common types of LGBTQ+ community events held in major cities?"}
+{"sample_id": "conv-26-q33", "dataset": "locomo", "negative": "What are some common activities and traditions associated with Pride parades during the summer?"}
+{"sample_id": "conv-26-q34", "dataset": "locomo", "negative": "What are some common ways individuals can volunteer to help children in their community?"}
+{"sample_id": "conv-26-q35", "dataset": "locomo", "negative": "What are the best months for camping in July?"}
+{"sample_id": "conv-26-q36", "dataset": "locomo", "negative": "What are the typical steps to join a professional mentorship program?"}
+{"sample_id": "conv-26-q37", "dataset": "locomo", "negative": "What are some common subjects that contemporary painters often choose to depict?"}
+{"sample_id": "conv-26-q38", "dataset": "locomo", "negative": "What are some common activities families do together?"}
+{"sample_id": "conv-26-q39", "dataset": "locomo", "negative": "What are some common ways individuals participate in the LGBTQ community?"}
+{"sample_id": "conv-26-q40", "dataset": "locomo", "negative": "What are the most popular beaches in California for families?"}
+{"sample_id": "conv-26-q41", "dataset": "locomo", "negative": "What are the typical steps for joining a new activist group?"}
+{"sample_id": "conv-26-q42", "dataset": "locomo", "negative": "What are the main differences between visiting a national park and a theme park?"}
+{"sample_id": "conv-26-q43", "dataset": "locomo", "negative": "What are the main characteristics of contemporary art?"}
+{"sample_id": "conv-26-q44", "dataset": "locomo", "negative": "What are some popular gift ideas for a young child's birthday?"}
+{"sample_id": "conv-26-q45", "dataset": "locomo", "negative": "When is Pride Month typically celebrated in the United States?"}
+{"sample_id": "conv-26-q46", "dataset": "locomo", "negative": "What are the common criteria used to determine if a public figure is considered an ally to the transgender community?"}
+{"sample_id": "conv-26-q47", "dataset": "locomo", "negative": "What are effective strategies for supporting someone who has had a negative experience?"}
+{"sample_id": "conv-26-q48", "dataset": "locomo", "negative": "What are the main types of pottery techniques used in ceramics?"}
+{"sample_id": "conv-26-q49", "dataset": "locomo", "negative": "What are some common activities and traditions associated with Pride festivals?"}
+{"sample_id": "conv-26-q50", "dataset": "locomo", "negative": "What are the common indicators used to determine a person's political leaning?"}
+{"sample_id": "conv-26-q51", "dataset": "locomo", "negative": "What are some common subjects that beginner painters often choose to paint?"}
+{"sample_id": "conv-26-q52", "dataset": "locomo", "negative": "What are some common names people give to pets?"}
+{"sample_id": "conv-26-q53", "dataset": "locomo", "negative": "What are the typical steps and timeline for applying to adoption agencies?"}
+{"sample_id": "conv-26-q54", "dataset": "locomo", "negative": "What are some common techniques used by artists when drawing self-portraits?"}
+{"sample_id": "conv-26-q55", "dataset": "locomo", "negative": "What are some common subjects in contemporary landscape painting?"}
+{"sample_id": "conv-26-q56", "dataset": "locomo", "negative": "What are some common symbols used in branding and what do they typically represent?"}
+{"sample_id": "conv-26-q57", "dataset": "locomo", "negative": "What are common safety tips for hiking alone?"}
+{"sample_id": "conv-26-q58", "dataset": "locomo", "negative": "What are the typical steps involved in making a plate on a pottery wheel?"}
+{"sample_id": "conv-26-q59", "dataset": "locomo", "negative": "What are the common criteria used to determine if a person is considered religious?"}
+{"sample_id": "conv-26-q60", "dataset": "locomo", "negative": "What are the most common instruments played in a standard rock band?"}
+{"sample_id": "conv-26-q61", "dataset": "locomo", "negative": "What are some popular musical artists and bands across different genres?"}
+{"sample_id": "conv-26-q62", "dataset": "locomo", "negative": "What are the typical opening hours for public parks in major US cities?"}
+{"sample_id": "conv-26-q63", "dataset": "locomo", "negative": "What are some common activities organized by youth centers?"}
+{"sample_id": "conv-26-q64", "dataset": "locomo", "negative": "What are the key characteristics of Vivaldi's 'The Four Seasons'?"}
+{"sample_id": "conv-26-q65", "dataset": "locomo", "negative": "What are some common changes people experience during a gender transition journey?"}
+{"sample_id": "conv-26-q66", "dataset": "locomo", "negative": "What are some common activities families do together while hiking?"}
+{"sample_id": "conv-26-q67", "dataset": "locomo", "negative": "What are some popular biking trails in the United States?"}
+{"sample_id": "conv-26-q68", "dataset": "locomo", "negative": "How long does it typically take to become proficient in art?"}
+{"sample_id": "conv-26-q69", "dataset": "locomo", "negative": "What are common personality traits associated with the name Caroline?"}
+{"sample_id": "conv-26-q70", "dataset": "locomo", "negative": "What are some common types of events organized for the transgender community?"}
+{"sample_id": "conv-26-q71", "dataset": "locomo", "negative": "What are some popular book recommendations for readers who enjoy contemporary fiction?"}
+{"sample_id": "conv-26-q72", "dataset": "locomo", "negative": "What are the typical steps involved in the domestic adoption process?"}
+{"sample_id": "conv-26-q73", "dataset": "locomo", "negative": "What are the most common causes of sports injuries?"}
+{"sample_id": "conv-26-q74", "dataset": "locomo", "negative": "What are some popular road trip destinations in the United States?"}
+{"sample_id": "conv-26-q75", "dataset": "locomo", "negative": "What is the average number of children per family in the United States?"}
+{"sample_id": "conv-26-q76", "dataset": "locomo", "negative": "What are some popular hiking trails near major road trip destinations in the United States?"}
+{"sample_id": "conv-26-q77", "dataset": "locomo", "negative": "What are some popular road trip destinations in the United States?"}
+{"sample_id": "conv-26-q78", "dataset": "locomo", "negative": "What are some popular items to buy for a housewarming gift?"}
+{"sample_id": "conv-26-q79", "dataset": "locomo", "negative": "What are the typical steps and timeline for completing an adoption home study interview?"}
+{"sample_id": "conv-26-q80", "dataset": "locomo", "negative": "What are some popular types of collectible figurines available for purchase?"}
+{"sample_id": "conv-26-q81", "dataset": "locomo", "negative": "What are common reasons people choose to move back to their home country?"}
+{"sample_id": "conv-26-q82", "dataset": "locomo", "negative": "What are common causes that charity races typically raise awareness for?"}
+{"sample_id": "conv-26-q83", "dataset": "locomo", "negative": "What are common realizations or takeaways people often have after participating in a charity race?"}
+{"sample_id": "conv-26-q84", "dataset": "locomo", "negative": "What are some effective strategies for prioritizing self-care?"}
+{"sample_id": "conv-26-q85", "dataset": "locomo", "negative": "What are some popular summer travel destinations in Europe?"}
+{"sample_id": "conv-26-q86", "dataset": "locomo", "negative": "What types of individuals do adoption agencies typically support?"}
+{"sample_id": "conv-26-q87", "dataset": "locomo", "negative": "What factors should prospective parents consider when choosing an adoption agency?"}
+{"sample_id": "conv-26-q88", "dataset": "locomo", "negative": "What are common milestones in the pet adoption process that owners often look forward to?"}
+{"sample_id": "conv-26-q89", "dataset": "locomo", "negative": "What are common perspectives on the decision to adopt a child?"}
+{"sample_id": "conv-26-q90", "dataset": "locomo", "negative": "What are the average ages at first marriage for men and women in the United States?"}
+{"sample_id": "conv-26-q91", "dataset": "locomo", "negative": "What are common symbolic meanings associated with necklaces in jewelry design?"}
+{"sample_id": "conv-26-q92", "dataset": "locomo", "negative": "What are some common factors that determine a person's nationality?"}
+{"sample_id": "conv-26-q93", "dataset": "locomo", "negative": "What are some thoughtful gift ideas for a grandmother to give her granddaughter?"}
+{"sample_id": "conv-26-q94", "dataset": "locomo", "negative": "What are common symbolic meanings associated with hand-painted ceramic bowls?"}
+{"sample_id": "conv-26-q95", "dataset": "locomo", "negative": "What are some common activities families do while camping?"}
+{"sample_id": "conv-26-q96", "dataset": "locomo", "negative": "What are the different types of counseling and mental health services available for individuals seeking professional support?"}
+{"sample_id": "conv-26-q97", "dataset": "locomo", "negative": "What are some popular types of professional development workshops available for employees?"}
+{"sample_id": "conv-26-q98", "dataset": "locomo", "negative": "What are common topics covered in LGBTQ+ counseling workshops?"}
+{"sample_id": "conv-26-q99", "dataset": "locomo", "negative": "What are common motivations for people to pursue a career in counseling?"}
+{"sample_id": "conv-26-q100", "dataset": "locomo", "negative": "What are some key elements to consider when designing a community space for people?"}
+{"sample_id": "conv-26-q101", "dataset": "locomo", "negative": "What are common techniques used to create black and white ceramic bowls?"}
+{"sample_id": "conv-26-q102", "dataset": "locomo", "negative": "What are some popular genres of books typically found in a home library?"}
+{"sample_id": "conv-26-q103", "dataset": "locomo", "negative": "What are some of the most popular children's books published in the 1990s?"}
+{"sample_id": "conv-26-q104", "dataset": "locomo", "negative": "What are some highly recommended books for beginners interested in learning about psychology?"}
+{"sample_id": "conv-26-q105", "dataset": "locomo", "negative": "What are the main themes and lessons from the book 'Becoming Nicole'?"}
+{"sample_id": "conv-26-q106", "dataset": "locomo", "negative": "What are the most common uses for new athletic shoes?"}
+{"sample_id": "conv-26-q107", "dataset": "locomo", "negative": "What are common reasons people start running?"}
+{"sample_id": "conv-26-q108", "dataset": "locomo", "negative": "What are the general health benefits of running?"}
+{"sample_id": "conv-26-q109", "dataset": "locomo", "negative": "What are some common items people make during a beginner pottery workshop?"}
+{"sample_id": "conv-26-q110", "dataset": "locomo", "negative": "What are common types of pots made from clay?"}
+{"sample_id": "conv-26-q111", "dataset": "locomo", "negative": "What are some creative projects parents can do with their children besides pottery?"}
+{"sample_id": "conv-26-q112", "dataset": "locomo", "negative": "What are some popular painting projects for families with children?"}
+{"sample_id": "conv-26-q113", "dataset": "locomo", "negative": "What typically happens during a council meeting regarding adoption cases?"}
+{"sample_id": "conv-26-q114", "dataset": "locomo", "negative": "What do sunflowers typically symbolize in the language of flowers?"}
+{"sample_id": "conv-26-q115", "dataset": "locomo", "negative": "Why are flowers important in human culture and history?"}
+{"sample_id": "conv-26-q116", "dataset": "locomo", "negative": "What are common sources of inspiration for artists preparing work for a gallery exhibition?"}
+{"sample_id": "conv-26-q117", "dataset": "locomo", "negative": "What are some common activities families do at the beach?"}
+{"sample_id": "conv-26-q118", "dataset": "locomo", "negative": "What are some common wildlife species people might see while camping in North American forests?"}
+{"sample_id": "conv-26-q119", "dataset": "locomo", "negative": "What are some common emotional reactions people report experiencing while watching a meteor shower?"}
+{"sample_id": "conv-26-q120", "dataset": "locomo", "negative": "What are some popular ways to celebrate a birthday?"}
+{"sample_id": "conv-26-q121", "dataset": "locomo", "negative": "What are some popular children's party entertainers or performers available for hire?"}
+{"sample_id": "conv-26-q122", "dataset": "locomo", "negative": "What are common reasons artists choose to use colors and patterns in pottery projects?"}
+{"sample_id": "conv-26-q123", "dataset": "locomo", "negative": "What are some common pets kept by people in urban apartments?"}
+{"sample_id": "conv-26-q124", "dataset": "locomo", "negative": "What are the most common types of pets kept in households?"}
+{"sample_id": "conv-26-q125", "dataset": "locomo", "negative": "Where do dogs typically hide their bones?"}
+{"sample_id": "conv-26-q126", "dataset": "locomo", "negative": "What are some common outdoor activities that fathers and daughters often enjoy doing together?"}
+{"sample_id": "conv-26-q127", "dataset": "locomo", "negative": "What are some common types of food or crafts people make for local church events?"}
+{"sample_id": "conv-26-q128", "dataset": "locomo", "negative": "What are some common items people might find while walking through a residential neighborhood?"}
+{"sample_id": "conv-26-q129", "dataset": "locomo", "negative": "What are some popular songs known for inspiring courage and motivation?"}
+{"sample_id": "conv-26-q130", "dataset": "locomo", "negative": "What are some popular classical musicians and composers?"}
+{"sample_id": "conv-26-q131", "dataset": "locomo", "negative": "Who are some popular modern music artists?"}
+{"sample_id": "conv-26-q132", "dataset": "locomo", "negative": "How long does it typically take to become proficient in a new art medium?"}
+{"sample_id": "conv-26-q133", "dataset": "locomo", "negative": "What are common precautionary signs found in cafés?"}
+{"sample_id": "conv-26-q134", "dataset": "locomo", "negative": "What are the general steps and requirements for starting the adoption process?"}
+{"sample_id": "conv-26-q135", "dataset": "locomo", "negative": "What are common setbacks faced by small businesses in October?"}
+{"sample_id": "conv-26-q136", "dataset": "locomo", "negative": "What are some common hobbies people take up during a break from pottery?"}
+{"sample_id": "conv-26-q137", "dataset": "locomo", "negative": "What are the key characteristics of Impressionist paintings?"}
+{"sample_id": "conv-26-q138", "dataset": "locomo", "negative": "What are the main characteristics of Impressionist painting?"}
+{"sample_id": "conv-26-q139", "dataset": "locomo", "negative": "What are common themes explored in contemporary poetry readings?"}
+{"sample_id": "conv-26-q140", "dataset": "locomo", "negative": "What are common elements found on posters for poetry readings?"}
+{"sample_id": "conv-26-q141", "dataset": "locomo", "negative": "What are common symbolic meanings associated with drawings in art therapy?"}
+{"sample_id": "conv-26-q142", "dataset": "locomo", "negative": "How do long-term partners typically describe their journey through life together?"}
+{"sample_id": "conv-26-q143", "dataset": "locomo", "negative": "What are some common safety tips for families traveling on road trips?"}
+{"sample_id": "conv-26-q144", "dataset": "locomo", "negative": "What are common ways children cope with the aftermath of a car accident?"}
+{"sample_id": "conv-26-q145", "dataset": "locomo", "negative": "What are common psychological reactions to family trauma following a serious accident?"}
+{"sample_id": "conv-26-q146", "dataset": "locomo", "negative": "How do children typically react to car accidents?"}
+{"sample_id": "conv-26-q147", "dataset": "locomo", "negative": "What are common emotional responses people experience after a car accident?"}
+{"sample_id": "conv-26-q148", "dataset": "locomo", "negative": "What are some common reactions parents have when their children visit the Grand Canyon?"}
+{"sample_id": "conv-26-q149", "dataset": "locomo", "negative": "What are some common gifts families give to their members during holidays?"}
+{"sample_id": "conv-26-q150", "dataset": "locomo", "negative": "How does family support typically affect an individual's emotional well-being?"}
+{"sample_id": "conv-26-q151", "dataset": "locomo", "negative": "What are some common ways people relax after a long road trip?"}
+{"sample_id": "conv-30-q0", "dataset": "locomo", "negative": "What are the typical steps involved in a career transition from banking to another industry?"}
+{"sample_id": "conv-30-q1", "dataset": "locomo", "negative": "What are the common reasons for account deactivation on food delivery platforms like DoorDash?"}
+{"sample_id": "conv-30-q2", "dataset": "locomo", "negative": "What are some common ways people destress?"}
+{"sample_id": "conv-30-q3", "dataset": "locomo", "negative": "What are some common traits that successful business partners often share?"}
+{"sample_id": "conv-30-q4", "dataset": "locomo", "negative": "What are common reasons entrepreneurs decide to start a dance studio?"}
+{"sample_id": "conv-30-q5", "dataset": "locomo", "negative": "What are the key design elements of an ideal dance studio?"}
+{"sample_id": "conv-30-q6", "dataset": "locomo", "negative": "What are some tips for finding out when a specific band is scheduled to perform at a music festival?"}
+{"sample_id": "conv-30-q7", "dataset": "locomo", "negative": "What are the typical steps involved in launching a digital ad campaign for a retail store?"}
+{"sample_id": "conv-30-q8", "dataset": "locomo", "negative": "What are the best months to visit Paris for mild weather?"}
+{"sample_id": "conv-30-q9", "dataset": "locomo", "negative": "Which cities are commonly visited by tourists in France?"}
+{"sample_id": "conv-30-q10", "dataset": "locomo", "negative": "How do brands typically collaborate with local artists for product designs?"}
+{"sample_id": "conv-30-q11", "dataset": "locomo", "negative": "What are the typical healing stages and timeline for a new tattoo?"}
+{"sample_id": "conv-30-q12", "dataset": "locomo", "negative": "What are the recommended frequency and duration for gym sessions for a beginner?"}
+{"sample_id": "conv-30-q13", "dataset": "locomo", "negative": "What are the typical steps involved in launching an online clothing store?"}
+{"sample_id": "conv-30-q14", "dataset": "locomo", "negative": "What are the best strategies for a creative studio to expand its social media presence?"}
+{"sample_id": "conv-30-q15", "dataset": "locomo", "negative": "What are the typical rules and judging criteria for a dance competition?"}
+{"sample_id": "conv-30-q16", "dataset": "locomo", "negative": "What are effective strategies for dance studios to gain community exposure through local events?"}
+{"sample_id": "conv-30-q17", "dataset": "locomo", "negative": "What are the common motivations for entrepreneurs to start their own clothing stores?"}
+{"sample_id": "conv-30-q18", "dataset": "locomo", "negative": "What are the key factors to consider when starting a business based on personal passion?"}
+{"sample_id": "conv-30-q19", "dataset": "locomo", "negative": "What are the typical steps in a design internship interview process?"}
+{"sample_id": "conv-30-q20", "dataset": "locomo", "negative": "What is the typical timeline for receiving acceptance notifications for design internships?"}
+{"sample_id": "conv-30-q21", "dataset": "locomo", "negative": "What are the key principles of 'The Lean Startup' methodology?"}
+{"sample_id": "conv-30-q22", "dataset": "locomo", "negative": "What are the key steps for creating an effective video presentation to teach fashion styling techniques?"}
+{"sample_id": "conv-30-q23", "dataset": "locomo", "negative": "What are effective marketing strategies for promoting a new clothing store?"}
+{"sample_id": "conv-30-q24", "dataset": "locomo", "negative": "What are some effective strategies for entrepreneurs to promote a new business venture through public events?"}
+{"sample_id": "conv-30-q25", "dataset": "locomo", "negative": "What services and classes are typically offered by a dance studio?"}
+{"sample_id": "conv-30-q26", "dataset": "locomo", "negative": "What are the typical stages of mentorship for a startup founder?"}
+{"sample_id": "conv-30-q27", "dataset": "locomo", "negative": "What are the typical requirements for participating in professional dance competitions?"}
+{"sample_id": "conv-30-q28", "dataset": "locomo", "negative": "What are the best historical sites to visit in Rome?"}
+{"sample_id": "conv-30-q29", "dataset": "locomo", "negative": "What are the most visited cities in Europe?"}
+{"sample_id": "conv-30-q30", "dataset": "locomo", "negative": "What are the typical steps involved in opening a dance studio?"}
+{"sample_id": "conv-30-q31", "dataset": "locomo", "negative": "What are the typical steps and timeline for opening a new art studio?"}
+{"sample_id": "conv-30-q32", "dataset": "locomo", "negative": "What are the key steps involved in designing a limited edition clothing collection?"}
+{"sample_id": "conv-30-q33", "dataset": "locomo", "negative": "What are the best strategies for finding local networking events suitable for small business owners?"}
+{"sample_id": "conv-30-q34", "dataset": "locomo", "negative": "What factors typically lead to a fashion designer being recognized by industry editors?"}
+{"sample_id": "conv-30-q35", "dataset": "locomo", "negative": "What are the best resources for beginners to learn marketing and analytics tools?"}
+{"sample_id": "conv-30-q36", "dataset": "locomo", "negative": "What are the key steps involved in planning a collaborative dance content creation project?"}
+{"sample_id": "conv-30-q37", "dataset": "locomo", "negative": "When did Shia LaBeouf first gain widespread recognition for his acting career?"}
+{"sample_id": "conv-30-q38", "dataset": "locomo", "negative": "What are the typical benefits of attending a group dance class?"}
+{"sample_id": "conv-30-q39", "dataset": "locomo", "negative": "What are the most popular styles of dance globally?"}
+{"sample_id": "conv-30-q40", "dataset": "locomo", "negative": "What are the most popular styles of social dance?"}
+{"sample_id": "conv-30-q41", "dataset": "locomo", "negative": "What are some common ways people describe their favorite dancing memories?"}
+{"sample_id": "conv-30-q42", "dataset": "locomo", "negative": "What are the common criteria judges use to score competitive dance performances?"}
+{"sample_id": "conv-30-q43", "dataset": "locomo", "negative": "What do the dancers in a traditional ballet performance typically represent?"}
+{"sample_id": "conv-30-q44", "dataset": "locomo", "negative": "What are common characteristics of professional dancers?"}
+{"sample_id": "conv-30-q45", "dataset": "locomo", "negative": "What are common attitudes people have towards participating in dance festivals?"}
+{"sample_id": "conv-30-q46", "dataset": "locomo", "negative": "What are the best flooring options for a dance studio?"}
+{"sample_id": "conv-30-q47", "dataset": "locomo", "negative": "What are some effective strategies for sourcing unique inventory for a clothing store?"}
+{"sample_id": "conv-30-q48", "dataset": "locomo", "negative": "What are common design elements used in retail store layouts to improve customer experience?"}
+{"sample_id": "conv-30-q49", "dataset": "locomo", "negative": "What are common strategies retail stores use to influence customer emotions and enhance the shopping experience?"}
+{"sample_id": "conv-30-q50", "dataset": "locomo", "negative": "What are common metrics used to evaluate the progress of a small retail store?"}
+{"sample_id": "conv-30-q51", "dataset": "locomo", "negative": "What factors typically influence the choice of furniture and decor for a retail store?"}
+{"sample_id": "conv-30-q52", "dataset": "locomo", "negative": "What are some effective strategies for creating a special experience for customers?"}
+{"sample_id": "conv-30-q53", "dataset": "locomo", "negative": "What are some effective strategies for creating a memorable customer experience?"}
+{"sample_id": "conv-30-q54", "dataset": "locomo", "negative": "What are common metrics used to evaluate the performance of a small retail store?"}
+{"sample_id": "conv-30-q55", "dataset": "locomo", "negative": "What are common symbolic meanings associated with tattoos?"}
+{"sample_id": "conv-30-q56", "dataset": "locomo", "negative": "What are some common metaphors used to describe the entrepreneurial journey?"}
+{"sample_id": "conv-30-q57", "dataset": "locomo", "negative": "What are some key pieces of advice for running a successful business?"}
+{"sample_id": "conv-30-q58", "dataset": "locomo", "negative": "What are common reasons for shutting down a bank account?"}
+{"sample_id": "conv-30-q59", "dataset": "locomo", "negative": "What are the benefits of combining a clothing business with dance?"}
+{"sample_id": "conv-30-q60", "dataset": "locomo", "negative": "What are the common physical and mental benefits of dancing?"}
+{"sample_id": "conv-30-q61", "dataset": "locomo", "negative": "What are common prizes awarded in dance competitions?"}
+{"sample_id": "conv-30-q62", "dataset": "locomo", "negative": "What are some effective strategies for entrepreneurs to maintain confidence in their business?"}
+{"sample_id": "conv-30-q63", "dataset": "locomo", "negative": "What are the typical requirements for a professional internship acceptance letter?"}
+{"sample_id": "conv-30-q64", "dataset": "locomo", "negative": "What are some common locations for fashion internships?"}
+{"sample_id": "conv-30-q65", "dataset": "locomo", "negative": "What are some popular books currently trending on bestseller lists?"}
+{"sample_id": "conv-30-q66", "dataset": "locomo", "negative": "What are common incentives or perks that dance studio owners offer to attract and retain dancers?"}
+{"sample_id": "conv-30-q67", "dataset": "locomo", "negative": "What are the common features and uses of a clipboard with an attached notepad?"}
+{"sample_id": "conv-30-q68", "dataset": "locomo", "negative": "What are common reasons people refuse to take on new responsibilities?"}
+{"sample_id": "conv-30-q69", "dataset": "locomo", "negative": "What are the main historical and cultural attractions to visit in Rome?"}
+{"sample_id": "conv-30-q70", "dataset": "locomo", "negative": "What are the key steps involved in opening a new small business?"}
+{"sample_id": "conv-30-q71", "dataset": "locomo", "negative": "What are common ways people describe the atmosphere of a newly opened art studio?"}
+{"sample_id": "conv-30-q72", "dataset": "locomo", "negative": "What are common challenges faced by new dance studio owners during their opening night?"}
+{"sample_id": "conv-30-q73", "dataset": "locomo", "negative": "What are the common emotional and psychological benefits associated with dancing?"}
+{"sample_id": "conv-30-q74", "dataset": "locomo", "negative": "What are common activities included in the grand opening of a dance studio?"}
+{"sample_id": "conv-30-q75", "dataset": "locomo", "negative": "What are common things people say to each other about a grand opening?"}
+{"sample_id": "conv-30-q76", "dataset": "locomo", "negative": "What are common strategies for generating positive sentiment around a grand opening event?"}
+{"sample_id": "conv-30-q77", "dataset": "locomo", "negative": "What are some examples of limited edition product lines released by major fashion brands?"}
+{"sample_id": "conv-30-q78", "dataset": "locomo", "negative": "What qualities are generally considered essential for an effective mentor and guide?"}
+{"sample_id": "conv-30-q80", "dataset": "locomo", "negative": "What are common strategies for following up after a networking event?"}
+{"sample_id": "conv-30-q81", "dataset": "locomo", "negative": "What are common types of social media offers or collaborations that influencers make to brands?"}
+{"sample_id": "conv-41-q0", "dataset": "locomo", "negative": "What are some popular restaurants in Paris for a romantic dinner?"}
+{"sample_id": "conv-41-q1", "dataset": "locomo", "negative": "What are the typical steps involved in donating a car to a charity?"}
+{"sample_id": "conv-41-q2", "dataset": "locomo", "negative": "What are the most common martial arts practiced in Japan?"}
+{"sample_id": "conv-41-q3", "dataset": "locomo", "negative": "What are some common types of volunteer work people do?"}
+{"sample_id": "conv-41-q4", "dataset": "locomo", "negative": "What are the typical steps to join an online support group?"}
+{"sample_id": "conv-41-q5", "dataset": "locomo", "negative": "What are the best beaches to visit in California?"}
+{"sample_id": "conv-41-q6", "dataset": "locomo", "negative": "What are some effective strategies for making friends in a new city?"}
+{"sample_id": "conv-41-q7", "dataset": "locomo", "negative": "What are some common items people mention having as a child?"}
+{"sample_id": "conv-41-q8", "dataset": "locomo", "negative": "What are common indicators of a person's financial status?"}
+{"sample_id": "conv-41-q9", "dataset": "locomo", "negative": "What are common sources of financial assistance for families facing economic hardship?"}
+{"sample_id": "conv-41-q10", "dataset": "locomo", "negative": "What are some common ways people meet in professional settings?"}
+{"sample_id": "conv-41-q11", "dataset": "locomo", "negative": "What are some common ways volunteers can make a positive impact on their communities?"}
+{"sample_id": "conv-41-q12", "dataset": "locomo", "negative": "What are the most common standardized tests that students take multiple times?"}
+{"sample_id": "conv-41-q13", "dataset": "locomo", "negative": "What are the typical legal steps required to settle an estate after a grandmother passes away?"}
+{"sample_id": "conv-41-q14", "dataset": "locomo", "negative": "What are common indicators that someone is considered patriotic?"}
+{"sample_id": "conv-41-q15", "dataset": "locomo", "negative": "What are the most common types of creative writing classes offered at community colleges?"}
+{"sample_id": "conv-41-q16", "dataset": "locomo", "negative": "What is the typical duration for completing a bachelor's degree?"}
+{"sample_id": "conv-41-q17", "dataset": "locomo", "negative": "What are common degree fields for a career in software engineering?"}
+{"sample_id": "conv-41-q18", "dataset": "locomo", "negative": "What are the benefits of practicing yoga with a partner?"}
+{"sample_id": "conv-41-q19", "dataset": "locomo", "negative": "What are common types of damage that can occur to a car?"}
+{"sample_id": "conv-41-q20", "dataset": "locomo", "negative": "What are some popular scenic routes for a road trip to the Pacific Northwest?"}
+{"sample_id": "conv-41-q21", "dataset": "locomo", "negative": "What are some popular travel destinations in the United States?"}
+{"sample_id": "conv-41-q22", "dataset": "locomo", "negative": "What are the typical dates for major industry conventions?"}
+{"sample_id": "conv-41-q23", "dataset": "locomo", "negative": "What are some popular homemade desserts?"}
+{"sample_id": "conv-41-q24", "dataset": "locomo", "negative": "What are the typical duration and structure of a family boot camp program?"}
+{"sample_id": "conv-41-q25", "dataset": "locomo", "negative": "What are the most popular European countries for first-time travelers?"}
+{"sample_id": "conv-41-q26", "dataset": "locomo", "negative": "What are some common practices people use to feel closer to their faith?"}
+{"sample_id": "conv-41-q27", "dataset": "locomo", "negative": "What are common traditions for hosting parties to honor military veterans?"}
+{"sample_id": "conv-41-q28", "dataset": "locomo", "negative": "What are some common causes that people feel passionate about supporting?"}
+{"sample_id": "conv-41-q29", "dataset": "locomo", "negative": "What are some effective event ideas for a homeless shelter fundraiser?"}
+{"sample_id": "conv-41-q30", "dataset": "locomo", "negative": "What are some common types of animal shelters where volunteers typically work?"}
+{"sample_id": "conv-41-q31", "dataset": "locomo", "negative": "What is the typical age range for adopting a dog from a shelter?"}
+{"sample_id": "conv-41-q32", "dataset": "locomo", "negative": "What are some common outdoor team-building activities for corporate groups?"}
+{"sample_id": "conv-41-q33", "dataset": "locomo", "negative": "What are the main types of yoga practiced globally?"}
+{"sample_id": "conv-41-q34", "dataset": "locomo", "negative": "What are the typical benefits of joining a gym for physical fitness?"}
+{"sample_id": "conv-41-q35", "dataset": "locomo", "negative": "What are the most popular states for family vacations in the United States?"}
+{"sample_id": "conv-41-q36", "dataset": "locomo", "negative": "What are some popular music festivals held annually in the United States?"}
+{"sample_id": "conv-41-q37", "dataset": "locomo", "negative": "What are some common events and activities organized for veterans?"}
+{"sample_id": "conv-41-q38", "dataset": "locomo", "negative": "What are the common causes of car accidents?"}
+{"sample_id": "conv-41-q39", "dataset": "locomo", "negative": "What are the most common causes of car accidents in the United States?"}
+{"sample_id": "conv-41-q40", "dataset": "locomo", "negative": "What are common names for children in English-speaking countries?"}
+{"sample_id": "conv-41-q41", "dataset": "locomo", "negative": "What are the typical geographic features found near coastal areas versus mountainous regions?"}
+{"sample_id": "conv-41-q42", "dataset": "locomo", "negative": "What are the most common causes of urban flooding?"}
+{"sample_id": "conv-41-q43", "dataset": "locomo", "negative": "What are the most common causes of urban flooding?"}
+{"sample_id": "conv-41-q44", "dataset": "locomo", "negative": "What are some common social activities that church groups typically organize for their members?"}
+{"sample_id": "conv-41-q45", "dataset": "locomo", "negative": "What are the key factors to consider when deciding whether to move to another country?"}
+{"sample_id": "conv-41-q46", "dataset": "locomo", "negative": "What are some popular hiking trails near major cities in the United States?"}
+{"sample_id": "conv-41-q47", "dataset": "locomo", "negative": "What are some common exercises for improving cardiovascular health?"}
+{"sample_id": "conv-41-q48", "dataset": "locomo", "negative": "What is the typical timeline for a new firefighter to receive their first emergency call-out after completing training?"}
+{"sample_id": "conv-41-q49", "dataset": "locomo", "negative": "What are some common food items donated to homeless shelters?"}
+{"sample_id": "conv-41-q50", "dataset": "locomo", "negative": "What are common attributes used to describe a person's personality?"}
+{"sample_id": "conv-41-q51", "dataset": "locomo", "negative": "What are the typical steps to start volunteering at a homeless shelter?"}
+{"sample_id": "conv-41-q52", "dataset": "locomo", "negative": "What are some common ways to express gratitude in written notes?"}
+{"sample_id": "conv-41-q53", "dataset": "locomo", "negative": "What are the typical steps involved in renovating a community center?"}
+{"sample_id": "conv-41-q54", "dataset": "locomo", "negative": "What are some common ways people get involved in community service through religious organizations?"}
+{"sample_id": "conv-41-q55", "dataset": "locomo", "negative": "What are the common criteria for receiving a medal from a homeless shelter?"}
+{"sample_id": "conv-41-q56", "dataset": "locomo", "negative": "What are the typical distances for charity running events?"}
+{"sample_id": "conv-41-q57", "dataset": "locomo", "negative": "What are some common causes that celebrity event organizers typically support?"}
+{"sample_id": "conv-41-q58", "dataset": "locomo", "negative": "What is the typical age range for adopting a pet from a shelter?"}
+{"sample_id": "conv-41-q59", "dataset": "locomo", "negative": "What are the best months for camping in the Pacific Northwest?"}
+{"sample_id": "conv-41-q60", "dataset": "locomo", "negative": "What are some common names for dogs?"}
+{"sample_id": "conv-41-q61", "dataset": "locomo", "negative": "What are the typical steps involved in adopting a pet from an animal shelter?"}
+{"sample_id": "conv-41-q62", "dataset": "locomo", "negative": "What are the typical steps involved in adopting a dog from an animal shelter?"}
+{"sample_id": "conv-41-q63", "dataset": "locomo", "negative": "What is the recommended waiting period between adopting two cats to ensure a smooth introduction?"}
+{"sample_id": "conv-41-q64", "dataset": "locomo", "negative": "What are some promising career paths for someone interested in healthcare?"}
+{"sample_id": "conv-41-q65", "dataset": "locomo", "negative": "What are the common areas of focus for local politicians?"}
+{"sample_id": "conv-41-q66", "dataset": "locomo", "negative": "What are common factors that spark interest in improving education and infrastructure within a community?"}
+{"sample_id": "conv-41-q67", "dataset": "locomo", "negative": "How does extra funding typically help schools improve their educational outcomes?"}
+{"sample_id": "conv-41-q68", "dataset": "locomo", "negative": "What are the main types of group fitness classes available at a typical gym?"}
+{"sample_id": "conv-41-q69", "dataset": "locomo", "negative": "What are common items people donate to homeless shelters during the winter months?"}
+{"sample_id": "conv-41-q70", "dataset": "locomo", "negative": "What are some common meals that families typically prepare together?"}
+{"sample_id": "conv-41-q71", "dataset": "locomo", "negative": "What are the benefits of joining an online community group?"}
+{"sample_id": "conv-41-q72", "dataset": "locomo", "negative": "What are some common community service activities that volunteer groups typically organize?"}
+{"sample_id": "conv-41-q73", "dataset": "locomo", "negative": "What are common motivations that inspire people to start volunteering?"}
+{"sample_id": "conv-41-q74", "dataset": "locomo", "negative": "What are common reasons volunteers sit with children at shelter events?"}
+{"sample_id": "conv-41-q75", "dataset": "locomo", "negative": "What are common life experiences people go through before meeting a significant other?"}
+{"sample_id": "conv-41-q76", "dataset": "locomo", "negative": "What are common reasons why politicians decide to run for office again?"}
+{"sample_id": "conv-41-q77", "dataset": "locomo", "negative": "What are some common team-building activities for office colleagues?"}
+{"sample_id": "conv-41-q78", "dataset": "locomo", "negative": "What are common milestones for a one-year-old child?"}
+{"sample_id": "conv-41-q79", "dataset": "locomo", "negative": "What are the benefits of taking children to a park regularly?"}
+{"sample_id": "conv-41-q80", "dataset": "locomo", "negative": "What are some common home decor items people buy to remind them of a trip to England?"}
+{"sample_id": "conv-41-q81", "dataset": "locomo", "negative": "What are some common sources of inspiration for creating a castle shadow box?"}
+{"sample_id": "conv-41-q82", "dataset": "locomo", "negative": "What are the common types of certificates awarded for professional achievements?"}
+{"sample_id": "conv-41-q83", "dataset": "locomo", "negative": "What are the most common policy areas that legislators typically specialize in?"}
+{"sample_id": "conv-41-q84", "dataset": "locomo", "negative": "What are some common community events or activities people typically participate in during the first weekend of April?"}
+{"sample_id": "conv-41-q85", "dataset": "locomo", "negative": "What are some common types of events where volunteers are typically needed?"}
+{"sample_id": "conv-41-q86", "dataset": "locomo", "negative": "What are some common financial mistakes that can put a strain on one's wallet?"}
+{"sample_id": "conv-41-q87", "dataset": "locomo", "negative": "What are some popular road trip destinations in the United States?"}
+{"sample_id": "conv-41-q88", "dataset": "locomo", "negative": "What are some popular topics for personal blogs in 2024?"}
+{"sample_id": "conv-41-q89", "dataset": "locomo", "negative": "What are common reasons people start blogging about politics and policies?"}
+{"sample_id": "conv-41-q90", "dataset": "locomo", "negative": "What are common topics covered in academic blogs by researchers?"}
+{"sample_id": "conv-41-q91", "dataset": "locomo", "negative": "What are some common types of professional conferences held in March?"}
+{"sample_id": "conv-41-q92", "dataset": "locomo", "negative": "What are some effective ways to incorporate family members into a regular workout routine?"}
+{"sample_id": "conv-41-q93", "dataset": "locomo", "negative": "What are the typical fitness benefits of participating in family boot camps?"}
+{"sample_id": "conv-41-q94", "dataset": "locomo", "negative": "What are some common dishes served at a traditional family dinner?"}
+{"sample_id": "conv-41-q95", "dataset": "locomo", "negative": "What are some popular outdoor activities for mothers and daughters to do together in May?"}
+{"sample_id": "conv-41-q96", "dataset": "locomo", "negative": "What are some common ways people strengthen their connection to a religious community?"}
+{"sample_id": "conv-41-q97", "dataset": "locomo", "negative": "What are common reasons people choose to join a local church?"}
+{"sample_id": "conv-41-q98", "dataset": "locomo", "negative": "What are some common types of events or activities organized for veterans?"}
+{"sample_id": "conv-41-q99", "dataset": "locomo", "negative": "What are some common activities people do at small social gatherings?"}
+{"sample_id": "conv-41-q100", "dataset": "locomo", "negative": "What are common emotional responses veterans experience when attending small gatherings with other veterans?"}
+{"sample_id": "conv-41-q101", "dataset": "locomo", "negative": "What are common types of events organized by animal shelters to raise funds and awareness?"}
+{"sample_id": "conv-41-q102", "dataset": "locomo", "negative": "What are effective strategies for spreading the word about a fundraiser for a volunteer shelter?"}
+{"sample_id": "conv-41-q103", "dataset": "locomo", "negative": "What are common ways to cope with the loss of a pet?"}
+{"sample_id": "conv-41-q104", "dataset": "locomo", "negative": "What is the average lifespan of a domestic cat?"}
+{"sample_id": "conv-41-q105", "dataset": "locomo", "negative": "What are some common ways people honor the memories of their beloved pets?"}
+{"sample_id": "conv-41-q106", "dataset": "locomo", "negative": "What are the common values parents aim to teach children through pet ownership?"}
+{"sample_id": "conv-41-q107", "dataset": "locomo", "negative": "What are some popular new hobbies people often start in early June?"}
+{"sample_id": "conv-41-q108", "dataset": "locomo", "negative": "What are the typical sensory experiences and environmental characteristics of visiting a large waterfall in Oregon?"}
+{"sample_id": "conv-41-q109", "dataset": "locomo", "negative": "What are the common physical sensations people report when performing upside-down yoga poses?"}
+{"sample_id": "conv-41-q110", "dataset": "locomo", "negative": "What are some common types of exciting news people share with friends?"}
+{"sample_id": "conv-41-q111", "dataset": "locomo", "negative": "What are some effective yoga poses for improving strength and endurance?"}
+{"sample_id": "conv-41-q112", "dataset": "locomo", "negative": "What are the typical responsibilities of a senior manager role?"}
+{"sample_id": "conv-41-q113", "dataset": "locomo", "negative": "What are some common challenges faced by individuals transitioning into an assistant manager role?"}
+{"sample_id": "conv-41-q114", "dataset": "locomo", "negative": "What are common ways employees describe the support they receive during a promotion to assistant manager?"}
+{"sample_id": "conv-41-q115", "dataset": "locomo", "negative": "What are some common types of family events held in June?"}
+{"sample_id": "conv-41-q116", "dataset": "locomo", "negative": "What are common reasons why someone might need assistance finding a new place to live?"}
+{"sample_id": "conv-41-q117", "dataset": "locomo", "negative": "What are some common ways individuals can show support for veterans' rights?"}
+{"sample_id": "conv-41-q118", "dataset": "locomo", "negative": "What are common reasons people join marches for veterans' rights?"}
+{"sample_id": "conv-41-q119", "dataset": "locomo", "negative": "What factors determine how often a specific location experiences vivid sunsets?"}
+{"sample_id": "conv-41-q120", "dataset": "locomo", "negative": "What natural disaster affected the Kipahulu area of Maui on 7 July, 2023?"}
+{"sample_id": "conv-41-q121", "dataset": "locomo", "negative": "What are the typical impacts of flooding on residential homes?"}
+{"sample_id": "conv-41-q122", "dataset": "locomo", "negative": "What are common motivations for community members to discuss potential solutions for local issues?"}
+{"sample_id": "conv-41-q123", "dataset": "locomo", "negative": "What are some popular evening activities for tourists visiting Lisbon in July?"}
+{"sample_id": "conv-41-q124", "dataset": "locomo", "negative": "What are some common activities people do at church group picnics?"}
+{"sample_id": "conv-41-q125", "dataset": "locomo", "negative": "What are common reasons veterans appreciate hospital visits?"}
+{"sample_id": "conv-41-q126", "dataset": "locomo", "negative": "What are the common psychological and social benefits of visiting veterans in hospitals?"}
+{"sample_id": "conv-41-q127", "dataset": "locomo", "negative": "What are common reasons people feel inspired to join the military?"}
+{"sample_id": "conv-41-q128", "dataset": "locomo", "negative": "What are some common community service activities that church groups typically participate in during the summer?"}
+{"sample_id": "conv-41-q129", "dataset": "locomo", "negative": "What are the benefits of trying new classes at a yoga studio?"}
+{"sample_id": "conv-41-q130", "dataset": "locomo", "negative": "What are some common fitness activities offered at yoga studios besides yoga classes?"}
+{"sample_id": "conv-41-q131", "dataset": "locomo", "negative": "What are some common types of community service activities that individuals can participate in?"}
+{"sample_id": "conv-41-q132", "dataset": "locomo", "negative": "What are the typical steps to start volunteering at a homeless shelter?"}
+{"sample_id": "conv-41-q133", "dataset": "locomo", "negative": "What are some common activities parents do with their children during the summer?"}
+{"sample_id": "conv-41-q134", "dataset": "locomo", "negative": "What are common ways people describe children's reactions to military memorials?"}
+{"sample_id": "conv-41-q135", "dataset": "locomo", "negative": "Why is it considered important for younger generations to visit military memorials?"}
+{"sample_id": "conv-41-q136", "dataset": "locomo", "negative": "What are common perspectives on teaching children about the importance of veterans?"}
+{"sample_id": "conv-41-q137", "dataset": "locomo", "negative": "What are common reasons for job loss in the tech industry?"}
+{"sample_id": "conv-41-q138", "dataset": "locomo", "negative": "What are some popular group activities for friends to do together in August?"}
+{"sample_id": "conv-41-q139", "dataset": "locomo", "negative": "What are some common ways individuals can contribute to their local community?"}
+{"sample_id": "conv-41-q140", "dataset": "locomo", "negative": "What are some common causes supported by local 5K charity runs?"}
+{"sample_id": "conv-41-q141", "dataset": "locomo", "negative": "What are some effective strategies for raising awareness and funds for victims of domestic abuse?"}
+{"sample_id": "conv-41-q142", "dataset": "locomo", "negative": "What are common types of recognition or awards given to volunteers at homeless shelters?"}
+{"sample_id": "conv-41-q143", "dataset": "locomo", "negative": "What are some common names for puppies?"}
+{"sample_id": "conv-41-q144", "dataset": "locomo", "negative": "What are some popular outdoor activities for friends to enjoy together during the summer?"}
+{"sample_id": "conv-41-q145", "dataset": "locomo", "negative": "What are common ways people describe their experiences on camping trips?"}
+{"sample_id": "conv-41-q146", "dataset": "locomo", "negative": "What are common psychological reasons why people feel stuck and question their decisions and goals?"}
+{"sample_id": "conv-41-q147", "dataset": "locomo", "negative": "What are common names for a second puppy in a household?"}
+{"sample_id": "conv-41-q148", "dataset": "locomo", "negative": "What are some common tips for helping a new puppy adjust to its home?"}
+{"sample_id": "conv-41-q149", "dataset": "locomo", "negative": "What are some common volunteer opportunities available in August?"}
+{"sample_id": "conv-41-q150", "dataset": "locomo", "negative": "What are some popular family-friendly activities for groups to enjoy together?"}
+{"sample_id": "conv-41-q151", "dataset": "locomo", "negative": "What are some common items that community donations help local neighborhoods acquire?"}
+{"sample_id": "q_32db3de4", "dataset": "memlens_32k", "negative": "What is the typical price range for a standard drip coffee maker?"}
+{"sample_id": "q_f993a7fa", "dataset": "memlens_32k", "negative": "What is the average cost of a drink at a bar in Tokyo in yen?"}
+{"sample_id": "q_19011868", "dataset": "memlens_32k", "negative": "Below are 8 facts about the history of Mumbai's monsoon culture. You need to sort these facts in chronological order. Requirements: Your output format must be numbers enclosed in parentheses without any other symbols or whitespace. For example: (1)(5)(2)(7)(3)(8)(6)(4)\n\n(1) In the early 20th century, Marine Drive was constructed as a promenade along the Arabian Sea.\n(2) During the British Raj, Leopold Cafe became a popular gathering spot for intellectuals and artists.\n(3) The tradition of drinking chai with pakoras during the rains is often cited as a staple of Mumbai street food culture.\n(4) Crawford Market was established in 1869 as one of the oldest wholesale markets in Mumbai.\n(5) The Bombay Canteen opened its doors in the late 2010s, focusing on regional Indian cuisine.\n(6) Monsoon festivals like Teej have been celebrated in Maharashtra for centuries.\n(7) The first recorded instance of heavy monsoon flooding in Mumbai dates back to the mid-19th century.\n(8) Modern urban planning initiatives in the 2020s aim to improve drainage systems to handle monsoon rains.\nAnswer in the exact format like (1)(2)(3)(4)(5)(6)(7)(8), listing all items in order."}
+{"sample_id": "q_349043cd", "dataset": "memlens_32k", "negative": "Below are 8 facts about a fictional researcher's career. You need to sort these facts in chronological order. Requirements: Your output format must be numbers enclosed in parentheses without any other symbols or whitespace. For example: (1)(5)(2)(7)(3)(8)(6)(4)\n\n(1) Then, on the third of February in 2020, I began my PhD at the institution shown in <image>.\n(2) I continued working in that research position until New Year's Eve , 2019.\n(3)  On the first of June in 2022, I started a new chapter as a Visiting Scholar at State Library Victoria.\n(4) I found myself at Readings Carlton buying a notebook, on March 15th, 2018.\n(5) My academic journey kicked off on New Year's Day, 2018, when I started my role as a Research Assistant.\n(6) Finally, on December 15th, 2023 of the following year, I submitted my thesis at the Baillieu Library.\n(7) About six weeks into that fellowship, on July 15th, 2022, I discovered a crucial source in the La Trobe Reading Room.\n(8) Later that same year of 2020, specifically on November 12th, I took a break to visit The Ian Potter Museum of Art.\nAnswer in the exact format like (1)(2)(3)(4)(5)(6)(7)(8), listing all items in order."}
+{"sample_id": "q_5cb00245", "dataset": "memlens_32k", "negative": "Below are 8 facts about the history of photography. You need to sort these facts in chronological order. Requirements: Your output format must be numbers enclosed in parentheses without any other symbols or whitespace. For example: (1)(5)(2)(7)(3)(8)(6)(4)\n\n(1) The first permanent photograph was created by Joseph Nicéphore Niépce in 1826.\n(2) Louis Daguerre announced the daguerreotype process in 1839.\n(3) George Eastman introduced the Kodak roll film camera in 1888.\n(4) The first color photograph was taken by James Clerk Maxwell in 1861.\n(5) The Leica I, the first commercially available 35mm camera, was released in 1925.\n(6) Polaroid introduced the SX-70 instant camera in 1972.\n(7) The first digital camera prototype was built by Steven Sasson at Kodak in 1975.\n(8) The iPhone, which revolutionized mobile photography, was launched in 2007.\nAnswer in the exact format like (1)(2)(3)(4)(5)(6)(7)(8), listing all items in order."}
+{"sample_id": "q_f7d3cda2", "dataset": "memlens_32k", "negative": "Are Scottish Fold cats commonly found in pet shops in Tokyo?"}
+{"sample_id": "q_de5d2784", "dataset": "memlens_32k", "negative": "How can you identify a reserved seat on a train?"}
+{"sample_id": "q_346bac50", "dataset": "memlens_32k", "negative": "What is the general procedure for phytosanitary inspection of plants at Haneda Airport?"}
+{"sample_id": "q_c5d8f832", "dataset": "memlens_32k", "negative": "What is the average number of mystery novels published per year in the United States?"}
+{"sample_id": "q_f3d9a5fb", "dataset": "memlens_32k", "negative": "Below are 8 facts about the history of Indian cuisine. You need to sort these facts in chronological order. Requirements: Your output format must be numbers enclosed in parentheses without any other symbols or whitespace. For example: (1)(5)(2)(7)(3)(8)(6)(4)\n\n(1) The Mughal Empire introduced rich, creamy curries and biryanis to the Indian subcontinent starting in the early 16th century.\n(2) The Portuguese arrived in India in 1498, eventually introducing chili peppers which transformed local cooking.\n(3) The British Raj period saw the codification of many regional recipes into cookbooks for colonial households.\n(4) Ancient Ayurvedic texts from around 1000 BCE describe basic spice combinations and cooking methods.\n(5) In the 20th century, Indian restaurants began gaining significant popularity in Western countries like the UK.\n(6) The Indus Valley Civilization provides some of the earliest archaeological evidence of grain-based diets.\n(7) Post-independence, there was a renewed interest in preserving and documenting diverse regional culinary traditions.\n(8) Medieval temple kitchens developed sophisticated vegetarian cuisines using local ingredients.\nAnswer in the exact format like (1)(2)(3)(4)(5)(6)(7)(8), listing all items in order."}
+{"sample_id": "q_cd6b90fc", "dataset": "memlens_32k", "negative": "What is the average number of taxis a person typically sees or uses in a single day in a major city?"}
+{"sample_id": "q_d09cb59e", "dataset": "memlens_32k", "negative": "Below are 8 facts about a typical road trip itinerary. You need to sort these facts in chronological order. Requirements: Your output format must be numbers enclosed in parentheses without any other symbols or whitespace. For example: (1)(5)(2)(7)(3)(8)(6)(4)\n\n(1) I bought a reliable vehicle to prepare for my travels across the country.\n(2) I picked up the vehicle from the rental lot near the airport to begin my adventure.\n(3) That spring, I spent weeks exploring the southern regions and camping at serene locations.\n(4) On one of my stops, I camped by a famous lake, enjoying its calm beauty.\n(5) While at a coastal park, I met a couple who shared coffee brewing tips.\n(6) A few months later, I reluctantly sold the vehicle and ended my journey.\n(7) During that summer, I discovered an appreciation for mornings immersed in nature.\n(8) The vehicle and I completed our adventure through the region that summer.\nAnswer in the exact format like (1)(2)(3)(4)(5)(6)(7)(8), listing all items in order."}
+{"sample_id": "q_c95c36ed", "dataset": "memlens_32k", "negative": "Are delivery vehicles generally allowed to park directly at the front entrance lobby of a commercial building?"}
+{"sample_id": "q_02a2a7ab", "dataset": "memlens_32k", "negative": "What are some common must-have ingredients for meal planning?"}
+{"sample_id": "q_9b791210", "dataset": "memlens_32k", "negative": "How many distinct car models are currently in production by Toyota?"}
+{"sample_id": "q_e3a3eefc", "dataset": "memlens_32k", "negative": "What are some popular educational board games for children?"}
+{"sample_id": "q_b584fee8", "dataset": "memlens_32k", "negative": "What is the average cost of cultural programs for tourists in Vienna?"}
+{"sample_id": "q_7fa0aa5f", "dataset": "memlens_32k", "negative": "What is the typical range of cover charges for salsa nights at popular dance clubs in major US cities?"}
+{"sample_id": "q_73f71c82", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The typical time spent on a standard university lecture.\n*Duration 2:* The typical time spent on a single song performance at a music festival.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_086a00c4", "dataset": "memlens_32k", "negative": "What are the most common types of vintage bicycles found in collections?"}
+{"sample_id": "q_f63c70ba", "dataset": "memlens_32k", "negative": "How many FIFA games have been released in total?"}
+{"sample_id": "q_8dd95465", "dataset": "memlens_32k", "negative": "What are the most popular fruits in the United States?"}
+{"sample_id": "q_b7fbe254", "dataset": "memlens_32k", "negative": "What are the most popular types of music genres today?"}
+{"sample_id": "q_2ad250bc", "dataset": "memlens_32k", "negative": "What are some popular cultured dairy treats that can serve as a dessert alternative?"}
+{"sample_id": "q_458193cc", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The typical time required to learn basic C++ syntax.\n*Duration 2:* The average lifespan of a high-end electric mountain bike battery under normal use.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_a9688310", "dataset": "memlens_32k", "negative": "What are the most popular vegetables in the United States?"}
+{"sample_id": "q_6f869a92", "dataset": "memlens_32k", "negative": "What are some common food items people order frequently for convenience and satisfaction?"}
+{"sample_id": "q_61f5727c", "dataset": "memlens_32k", "negative": "What are the most effective cardio machines for home gyms?"}
+{"sample_id": "q_b70b4496", "dataset": "memlens_32k", "negative": "What are some popular low-maintenance houseplants for indoor environments?"}
+{"sample_id": "q_9da60113", "dataset": "memlens_32k", "negative": "What are the most popular video games right now?"}
+{"sample_id": "q_059a4b99", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The average time it takes to eat a large burrito.\n*Duration 2:* The average time it takes to prepare ingredients for a complex meal.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_d038ec8f", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The typical time required to complete a master's thesis in urban planning.\n*Duration 2:* The typical time required to deliver a standard freelance web design project.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_c328f36f", "dataset": "memlens_32k", "negative": "What are some popular hobbies that can be resumed easily over multiple sessions?"}
+{"sample_id": "q_c73d9ce2", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The time spent volunteering at a local community center.\n*Duration 2:* The time spent on a typical annual fan club membership subscription period.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_4ca18e9a", "dataset": "memlens_32k", "negative": "How many rated M for Mature Xbox Series X games are available on the Microsoft Store?"}
+{"sample_id": "q_5ab7d684", "dataset": "memlens_32k", "negative": "What are the most common subjects for beginner painters to start with?"}
+{"sample_id": "q_2f7f062c", "dataset": "memlens_32k", "negative": "What are some popular hobbies for adults?"}
+{"sample_id": "q_38646f81", "dataset": "memlens_32k", "negative": "Which of the following two durations is typically longer?\n*Duration 1:* The standard length of a freelance bartending contract.\n*Duration 2:* The typical duration of a semester abroad program.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_07acb304", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The typical duration of a Bachelor's degree in Law at a Brazilian university.\n*Duration 2:* The typical duration of a Master's degree in Business Administration at a Brazilian university.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_4a87e5e0", "dataset": "memlens_32k", "negative": "What are some popular food items that people often choose based on their mood?"}
+{"sample_id": "q_84b47a8d", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer? *Duration 1:* The typical tenure for a Menu Consultant at a mid-sized restaurant. *Duration 2:* The typical time spent working as a Commis Chef at a luxury hotel."}
+{"sample_id": "q_4d18b7df", "dataset": "memlens_32k", "negative": "What is the average cost of a box of hot chocolate mix in the United States?"}
+{"sample_id": "q_fbed2a84", "dataset": "memlens_32k", "negative": "What are some popular home organization products that help maintain a tidy space and fit into a daily routine?"}
+{"sample_id": "q_c172b5a3", "dataset": "memlens_32k", "negative": "What materials balance warmth and breathability for year-round comfort?"}
+{"sample_id": "q_6a524a9a", "dataset": "memlens_32k", "negative": "What are the most common types of acoustic guitar body shapes?"}
+{"sample_id": "q_31b86538", "dataset": "memlens_32k", "negative": "Which of the following two durations is longer?\n*Duration 1:* The average lifespan of a Lenovo ThinkPad X1 Carbon.\n*Duration 2:* The typical duration of a guided tour at Tiergarten Park in Berlin.\nA. Duration 1 is longer.\nB. Duration 2 is longer.\nAnswer with \"A\" or \"B\" only."}
+{"sample_id": "q_d5a04746", "dataset": "memlens_32k", "negative": "What are the main differences between a Volkswagen Golf and a Toyota Corolla?"}
+{"sample_id": "q_5539ff37", "dataset": "memlens_32k", "negative": "What are common safety features found on modern wheelchairs?"}
+{"sample_id": "q_c8f2601a", "dataset": "memlens_32k", "negative": "What color are the centers of typical bicycle wheels?"}
+{"sample_id": "q_5ee9a3e0", "dataset": "memlens_32k", "negative": "What are common shirt colors for men wearing glasses?"}
+{"sample_id": "q_5eab16d1", "dataset": "memlens_32k", "negative": "What is the average rent for a shared flat near Shinjuku Station in Tokyo?"}
+{"sample_id": "q_9397308f", "dataset": "memlens_32k", "negative": "In a typical fetal position, which side does the baby's arm usually extend from?"}
+{"sample_id": "q_149997f5", "dataset": "memlens_32k", "negative": "What pattern is featured on the onion dome of St. Basil's Cathedral?"}
+{"sample_id": "q_f7b60d76", "dataset": "memlens_32k", "negative": "What is the typical hue of a textured concrete surface?"}
+{"sample_id": "q_bc8b88e0", "dataset": "memlens_32k", "negative": "What shape does Mount Fuji take in Hokusai's woodblock print?"}
+{"sample_id": "q_0d921dca", "dataset": "memlens_32k", "negative": "What is the historical significance of Caffè Sant'Eustachio in Rome?"}
+{"sample_id": "q_3e5d1689", "dataset": "memlens_32k", "negative": "What is the typical width of a winding dirt path?"}
+{"sample_id": "q_3b3db5ae", "dataset": "memlens_32k", "negative": "What are the common tonal characteristics of square-shaped frames in portrait photography?"}
+{"sample_id": "q_ee01d324", "dataset": "memlens_32k", "negative": "Which type of camera is typically mounted on drones for obstacle sensing capabilities?"}
+{"sample_id": "q_f05b80f3", "dataset": "memlens_32k", "negative": "What shape is the Mount Fuji detail in Katsushika Hokusai's 'The Great Wave off Kanagawa'?"}
+{"sample_id": "q_6f8e2d87", "dataset": "memlens_32k", "negative": "What is the typical color of a flame from a standard butane torch?"}
+{"sample_id": "q_926aed1d", "dataset": "memlens_32k", "negative": "How many statues of Christ the Redeemer exist in the world?"}
+{"sample_id": "q_3c08ec6b", "dataset": "memlens_32k", "negative": "What phrase does the acronym NASA spell out?"}
+{"sample_id": "q_3b539b69", "dataset": "memlens_32k", "negative": "What are common colors used in lattice designs on decorative objects?"}
+{"sample_id": "q_414ff04a", "dataset": "memlens_32k", "negative": "What are the typical savings for a member compared to a non-member on guided tea tours in China?"}
+{"sample_id": "q_0837a87d", "dataset": "memlens_32k", "negative": "What are the standard steps to recover a deleted Git repository from GitHub?"}
+{"sample_id": "q_db6bffd9", "dataset": "memlens_32k", "negative": "When did the restaurant The Purple Pig open in Chicago?"}
+{"sample_id": "q_716cbf96", "dataset": "memlens_32k", "negative": "When was the city of Zurich founded?"}
+{"sample_id": "q_b11710e6", "dataset": "memlens_32k", "negative": "What is the typical duration of a promotional period for retail sales?"}
+{"sample_id": "q_93977f68", "dataset": "memlens_32k", "negative": "What type of building is directly to the right of the Flatiron Building's narrowest edge?"}
+{"sample_id": "q_fabf670d", "dataset": "memlens_32k", "negative": "When was the University of Auckland founded?"}
+{"sample_id": "q_b8d05864", "dataset": "memlens_32k", "negative": "What hue is the moon typically described as?"}
+{"sample_id": "q_22b32f9f", "dataset": "memlens_32k", "negative": "What is the typical duration of the monsoon season in Mumbai?"}
+{"sample_id": "q_f28acaef", "dataset": "memlens_32k", "negative": "In standard file management interfaces, is a status tag typically positioned to the left or right of the document icon?"}
+{"sample_id": "q_0ccda6c1", "dataset": "memlens_32k", "negative": "What is the typical harvest window for fresh basil in Italy?"}
+{"sample_id": "q_6852626c", "dataset": "memlens_32k", "negative": "What is the recommended storage orientation for most blood pressure medication bottles?"}
+{"sample_id": "q_09391fc4", "dataset": "memlens_32k", "negative": "What shape is the top of a typical Inca ashlar stone block?"}
+{"sample_id": "q_7cecaeaf", "dataset": "memlens_32k", "negative": "What is the dominant color in the sky of Edvard Munch's painting The Scream?"}
+{"sample_id": "q_d69d2929", "dataset": "memlens_32k", "negative": "What is the color of the fur on the animal held by the figure in Leonardo da Vinci's 'Lady with an Ermine'?"}
+{"sample_id": "q_c677bfc0", "dataset": "memlens_32k", "negative": "What is the average lease duration for townhouses in Johannesburg?"}
+{"sample_id": "q_b58c0284", "dataset": "memlens_32k", "negative": "What is the best time of year to take a tram ride in Prague to see the castle?"}
+{"sample_id": "q_3e6e3255", "dataset": "memlens_32k", "negative": "How many levels of seating does the El Djem Amphitheatre in Tunisia have?"}
+{"sample_id": "q_312c84c6", "dataset": "memlens_32k", "negative": "What is the typical duration of a major food critic's visit to a high-end restaurant?"}
+{"sample_id": "q_c3dff3b6", "dataset": "memlens_32k", "negative": "What are common shirt colors worn by professional photographers?"}
+{"sample_id": "q_450cac0b", "dataset": "memlens_32k", "negative": "What type of flowers are commonly depicted in traditional Chinese paintings of celestial maidens?"}
+{"sample_id": "q_9d96e18f", "dataset": "memlens_32k", "negative": "What are common colors of soil found in different regions?"}
+{"sample_id": "q_bb0cc22f", "dataset": "memlens_32k", "negative": "Where is the tall instruction banner situated in relation to the dispensing machine?"}
+{"sample_id": "q_3f4c54b1", "dataset": "memlens_32k", "negative": "What is the typical height of a lifeguard tower?"}
+{"sample_id": "q_d3a9460d", "dataset": "memlens_32k", "negative": "What are common visual indicators used to identify a bag with a pink label in retail settings?"}
+{"sample_id": "q_843dba3e", "dataset": "memlens_32k", "negative": "What are the typical wattage and voltage requirements for string lights used on food trucks?"}
+{"sample_id": "q_a475c0d4", "dataset": "memlens_32k", "negative": "What are some common phrases used in rice culture?"}
+{"sample_id": "q_b0a1e48f", "dataset": "memlens_32k", "negative": "If a clock is set back by 15 minutes, how do you calculate the new displayed time?"}
+{"sample_id": "q_f4ed47fa", "dataset": "memlens_32k", "negative": "What are the defining architectural features of Gothic pointed arches?"}
+{"sample_id": "q_c1fc71ae", "dataset": "memlens_32k", "negative": "What is the standard position of a zipper pull relative to the fabric tape when fully closed?"}
+{"sample_id": "q_8e3456e8", "dataset": "memlens_32k", "negative": "What is the port located next to the touch sensor panel on the right earcup of the Sony WH-1000XM5?"}
+{"sample_id": "q_9dc49a2b", "dataset": "memlens_32k", "negative": "What are some popular snack options for people who enjoy sweet and salty combinations?"}
+{"sample_id": "q_59b382c8", "dataset": "memlens_32k", "negative": "What is the best time of year to visit Nairobi National Park?"}
+{"sample_id": "q_9cb01cb1", "dataset": "memlens_32k", "negative": "Which of the following two durations is typically longer? *Duration 1:* The time from purchasing ingredients at a market to finalizing a recipe. *Duration 2:* A standard one-year employment contract."}
+{"sample_id": "q_5bc90bb6", "dataset": "memlens_32k", "negative": "What is the average price of a mocha at major coffee chains?"}
+{"sample_id": "q_5e3423af", "dataset": "memlens_32k", "negative": "What is the typical price range for a high-performance countertop blender?"}

@@ -308,3 +308,24 @@ def test_build_only_builds_spaces_without_answering(
         if r["messages"][0]["content"].startswith("You build the long-term")
     ]
     assert extracts == []
+
+
+def test_probe_writes_controller_features(eval_settings: Settings, fake_api: FakeAPI) -> None:
+    """eval probe：在构建好的空间上为每道题跑一次探针（不调用 LLM），特征写入 probe.jsonl。"""
+    from scripted import ScriptedModel, echo_extraction
+
+    fake_api.chat_replies = [with_extraction(ScriptedModel(echo_extraction))]
+    evalset = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    config = RunConfig(
+        name="probe", dataset="longmemeval_s", split=None, methods=["B4"], build_only=True
+    )
+    EvalRunner(eval_settings, config, http_client=fake_api.client()).run(evalset)
+    calls = len(fake_api.chat_requests)
+    runner = EvalRunner(eval_settings, config, http_client=fake_api.client())
+    done, errors = runner.probe(evalset)
+    assert (done, errors) == (len(evalset.samples), 0)
+    assert len(fake_api.chat_requests) == calls  # 探针不调用 LLM
+    rows = load_rows(runner.run_dir, "probe.jsonl")
+    assert {r["sample_id"] for r in rows} == {s.sample_id for s in evalset.samples}
+    assert all(r["features"]["m_rounds"] > 0 and "q_first_person" in r["features"] for r in rows)
+    assert runner.probe(evalset) == (0, 0)  # 已经算过的跳过

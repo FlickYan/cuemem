@@ -75,6 +75,14 @@ DATASETS = {
         "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
         "LoCoMo：10 段对话、1986 题，约 3 MB",
     ),
+    # 混合流（N7）里"不需要记忆"的通用请求，只用不带参考材料的四类（mixed.py）
+    "dolly": DatasetSpec(
+        "dolly",
+        "databricks-dolly-15k.jsonl",
+        "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/"
+        "databricks-dolly-15k.jsonl",
+        "databricks-dolly-15k：15,011 条人工撰写的指令，约 13 MB，CC BY-SA 3.0",
+    ),
     "memlens_32k": DatasetSpec(
         "memlens_32k",
         "memlens/dataset_32k.json",

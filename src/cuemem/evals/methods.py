@@ -1,6 +1,6 @@
-"""评测方法：B0 无记忆、B1 全上下文、B2 朴素检索、B2F 朴素检索 + 事实记忆（N3）、
-B4 L1 快速召回（N4）、B5 L2 深度检索与 B6r 规则版控制器（N5）、B3 模型自主检索（N5），
-以及"只给证据会话"的上限参照。
+"""评测方法：B0 无记忆、L0 只给核心记忆（N7）、B1 全上下文、B2 朴素检索、
+B2F 朴素检索 + 事实记忆（N3）、B4 L1 快速召回（N4）、B5 L2 深度检索与 B6r 规则版控制器（N5）、
+B3 模型自主检索（N5），以及"只给证据会话"的上限参照。
 
 所有方法共用同一个回答模型和同一套系统提示，区别只在给它看什么、怎么检索。
 """
@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from cuemem.core.models import FactHit, Hit
 from cuemem.evals.datasets import EvalSession, Sample, to_session_ins
 from cuemem.memory import MemorySystem
+from cuemem.read.controller import Router
 from cuemem.read.facts import Validity
 from cuemem.read.l1 import L1Config
 from cuemem.read.l2 import L2Config
@@ -55,6 +56,21 @@ class NoMemory:
     def answer(self, ctx: MethodContext) -> MethodOutput:
         a = ctx.reader.answer(ctx.sample.question, [], question_time=ctx.sample.question_time)
         return MethodOutput(a.answer, a.evidence_sufficient)
+
+
+class ResidentContext:
+    """L0：只给常驻上下文（核心记忆，即用户画像），不检索——N7 控制器最便宜的一档。
+    与 B0 的区别：B0 什么都不给；L0 给每轮都在上下文里的那部分（稳定前缀，可命中 prompt cache）。"""
+
+    name, label = "L0", "L0 常驻上下文（只给核心记忆）"
+    needs_index, needs_consolidation = True, True
+
+    def answer(self, ctx: MethodContext) -> MethodOutput:
+        assert ctx.system is not None
+        a = ctx.system.ask(
+            ctx.space_id, ctx.sample.question, question_time=ctx.sample.question_time, mode="l0"
+        )
+        return MethodOutput(a.answer, a.evidence_sufficient, details=a.details)
 
 
 class FullContext:
@@ -208,16 +224,20 @@ class L2RAG:
 
 
 class RoutedRAG:
-    """B6r：规则版检索控制器（N7 的基线）——按问题线索（聚合、时间推算、先后、比较）选 L2，
-    其余走 L1。两条路径与 B4、B5 完全相同，所以回答直接命中它们的缓存。"""
+    """检索控制器选档后回答：B6r 规则版（N5，只在 L1 / L2 之间选）；N7 的 B6 学到的控制器
+    （探针 + 两段式，L0 / L1 / L2 与是否再感知）、B6h 混合方案（门控拿不准时问 LLM）、
+    B6z 零样本 LLM 路由。各条路径与 L0、B4、B5（及 -see）完全相同，回答直接命中它们的缓存。"""
 
     needs_index, needs_consolidation = True, True
 
-    def __init__(self, name: str, label: str, l1: L1Config, l2: L2Config) -> None:
+    def __init__(
+        self, name: str, label: str, l1: L1Config, l2: L2Config, *, router: Router = "rule"
+    ) -> None:
         self.name = name
         self.label = label
         self.l1 = l1
         self.l2 = l2
+        self.router: Router = router
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
         assert ctx.system is not None
@@ -228,6 +248,7 @@ class RoutedRAG:
             mode="auto",
             l1=self.l1,
             l2=self.l2,
+            router=self.router,
         )
         return MethodOutput(
             a.answer, a.evidence_sufficient, hits=a.hits, facts=a.facts, details=a.details
@@ -268,6 +289,7 @@ class OracleSessions:
 
 METHOD_NAMES = (
     "B0",
+    "L0",
     "B1",
     "B2",
     "B2F",
@@ -290,6 +312,9 @@ METHOD_NAMES = (
     "B5-noiter",
     "B5-nonote",
     "B6r",
+    "B6",
+    "B6h",
+    "B6z",
     "B3",
     "B4-text",
     "B4-cap",
@@ -314,6 +339,7 @@ TEXT_ONLY = replace(CAPTIONS, image_kind=None)
 def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
     factories: dict[str, Callable[[], Method]] = {
         "B0": NoMemory,
+        "L0": ResidentContext,
         "B1": FullContext,
         "B2": lambda: NaiveRAG(k),
         "B2F": lambda: FactRAG("B2F", "朴素检索 + 事实记忆", k=k),
@@ -349,6 +375,14 @@ def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
         ),
         "B5-nonote": lambda: L2RAG("B5-nonote", "不记笔记", L2Config(), notes=False),
         "B6r": lambda: RoutedRAG("B6r", "规则版控制器（L1 / L2）", L1Config(), L2Config()),
+        # N7：学到的控制器（默认 λ 取模型文件里的值）、混合方案、零样本 LLM 路由
+        "B6": lambda: RoutedRAG(
+            "B6", "学到的控制器（探针 + 两段式）", L1Config(), L2Config(), router="learned"
+        ),
+        "B6h": lambda: RoutedRAG(
+            "B6h", "混合控制器（拿不准时问 LLM）", L1Config(), L2Config(), router="hybrid"
+        ),
+        "B6z": lambda: RoutedRAG("B6z", "零样本 LLM 路由", L1Config(), L2Config(), router="llm"),
         "B3": AgentRAG,
         # N6 多模态（MemLens）：从纯文本记忆逐级加上图片描述、事实、再感知
         "B4-text": lambda: L1RAG(

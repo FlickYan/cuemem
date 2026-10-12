@@ -219,8 +219,16 @@ class ScriptedModel:
         planner: Callable[[str], Reply] | None = None,
         checker: Callable[[str], Reply] | None = None,
         captioner: Callable[[str], Reply] | None = None,
+        router: Callable[[str], Reply] | None = None,
     ) -> None:
         self.extractions = extractions if extractions is not None else {}
+        # 零样本 LLM 路由（N7）：默认按问题里的线索粗分——"一共"走深度检索，问常识的不用记忆
+        self.router = router or (
+            lambda prompt: {
+                "level": "DEEP" if "一共" in prompt else "NONE" if "首都" in prompt else "FAST",
+                "look_at_images": False,
+            }
+        )
         self.reconcile = reconcile or (lambda prompt: {"decisions": []})
         self.entity = entity or (lambda prompt: {"matches": []})
         self.reader = reader or (
@@ -267,6 +275,8 @@ class ScriptedModel:
             kind, out = "check", self.checker(prompt)
         elif system.startswith("You describe an image"):
             kind, out = "caption", self.captioner(prompt)
+        elif system.startswith("You decide how much memory retrieval"):
+            kind, out = "route", self.router(prompt)
         else:
             self.calls["other"] += 1
             return "OK"

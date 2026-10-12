@@ -144,7 +144,7 @@ def test_consolidate_inspect_and_forget(
     # 规则版控制器把聚合题送到 L2：显示控制器的选择、检索计划与充分性检查
     question = "我一共养了几只狗？"
     args = ["ask", question, "--space", "demo", "--at", "2025-10-10", "--show-context"]
-    result = runner.invoke(app, [*args, "--mode", "auto"])
+    result = runner.invoke(app, [*args, "--mode", "auto", "--router", "rule"])
     assert result.exit_code == 0, result.output
     flat = _flat(result.output)
     assert "走L2" in flat and "检索计划（LLM）" in flat and "充分性检查1：够了" in flat

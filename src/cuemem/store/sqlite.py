@@ -467,6 +467,18 @@ class MemoryDB:
                 ],
             )
 
+    def space_stats(self, space_id: str) -> dict[str, int]:
+        """一个空间的规模：会话数、轮数、当前有效的事实数、图片数（检索控制器的特征，N7）。"""
+        sql = (
+            "SELECT (SELECT COUNT(*) FROM sessions WHERE space_id = ?),"
+            " (SELECT COUNT(*) FROM units WHERE space_id = ? AND kind = 'round'),"
+            " (SELECT COUNT(*) FROM facts WHERE space_id = ? AND invalidated_at IS NULL),"
+            " (SELECT COUNT(*) FROM media WHERE space_id = ?)"
+        )
+        with self._lock:
+            row = self._conn.execute(sql, (space_id,) * 4).fetchone()
+        return dict(zip(("sessions", "rounds", "facts", "media"), row, strict=True))
+
     def has_media(self, space_id: str) -> bool:
         with self._lock:
             row = self._conn.execute(

@@ -17,9 +17,9 @@ import threading
 import time
 import traceback
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -66,6 +66,18 @@ class RunConfig:
     limit: int | None = None  # 只跑前 N 道题（调试用）
     reuse_spaces: bool = True  # 记忆空间存在磁盘上跨运行复用（paths.eval_spaces）
     build_only: bool = False  # 只构建记忆空间（写入与巩固），不回答、不判分
+
+
+@dataclass(frozen=True)
+class ProbeQuery:
+    """一次探针：在哪个空间、问什么、什么时候问；meta 原样写进 probe.jsonl。"""
+
+    query_id: str
+    dataset: str  # 记忆空间所在的数据集
+    space_key: str
+    question: str
+    question_time: datetime
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -193,6 +205,94 @@ class EvalRunner:
             elapsed_s=time.perf_counter() - started,
             stopped_by_budget=self._stop.is_set(),
         )
+
+    def probe(self, evalset: EvalSet) -> tuple[int, int]:
+        """为每道题跑一次记忆探针（不调用 LLM），特征写入 probe.jsonl：N7 检索控制器的训练数据。"""
+        samples = evalset.samples[: self.config.limit] if self.config.limit else evalset.samples
+        queries = [
+            ProbeQuery(
+                s.sample_id,
+                evalset.dataset,
+                s.space_key,
+                s.question,
+                s.question_time,
+                {
+                    "dataset": s.dataset,
+                    "space_key": s.space_key,
+                    "question_type": s.question_type,
+                    "is_abstention": s.is_abstention,
+                },
+            )
+            for s in samples
+        ]
+        return self.probe_queries(queries)
+
+    def probe_queries(self, queries: Sequence[ProbeQuery]) -> tuple[int, int]:
+        """在指定的记忆空间上跑探针（混合流的无关查询也走这里）。
+
+        空间必须已经构建好（之前跑过需要索引的方法，或 --build-only）；探针只读不写。
+        已经算过的查询跳过。返回（新算的条数，出错的条数）。
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        path = self.run_dir / "probe.jsonl"
+        done: set[str] = set()
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    done.add(json.loads(line)["sample_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        groups: dict[tuple[str, str], list[ProbeQuery]] = {}
+        for query in queries:
+            if query.query_id not in done:
+                groups.setdefault((query.dataset, query.space_key), []).append(query)
+        self._on_start(sum(len(items) for items in groups.values()))
+        counts = Counter[str]()
+
+        def run_group(dataset: str, space_key: str, items: list[ProbeQuery]) -> None:
+            space_id = f"{dataset}:{space_key}"
+            system, _ = self._open_space(dataset, space_key)
+            try:
+                if system.db.space_stats(space_id)["rounds"] == 0:
+                    raise RuntimeError(f"空间 {space_id} 还没有构建，先跑一次评测或 --build-only")
+                for query in items:
+                    result = system.probe.run(space_id, query.question, query.question_time)
+                    self._append(
+                        "probe.jsonl",
+                        {
+                            "sample_id": query.query_id,
+                            **query.meta,
+                            "features": {k: round(v, 5) for k, v in result.features.items()},
+                            "probe_ms": round(result.ms, 1),
+                        },
+                    )
+                    with self._lock:
+                        counts["done"] += 1
+                    self._on_advance()
+            except Exception as exc:
+                with self._lock:
+                    counts["errors"] += len(items)
+                self._append(
+                    "errors.jsonl",
+                    {
+                        "space_key": space_key,
+                        "stage": "probe",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+            finally:
+                system.close()
+
+        with ThreadPoolExecutor(max_workers=max(1, self.config.workers)) as pool:
+            futures = [
+                pool.submit(run_group, dataset, key, items)
+                for (dataset, key), items in groups.items()
+            ]
+            for future in as_completed(futures):
+                future.result()
+        self.ledger.close()
+        return counts["done"], counts["errors"]
 
     # ---------- 内部实现 ----------
 

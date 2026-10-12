@@ -12,7 +12,6 @@ L2（蓝）、规则版控制器（青），B2、B2F 只进表格。B0（下限�
 from __future__ import annotations
 
 import json
-import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -30,6 +29,7 @@ from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 from matplotlib.transforms import Bbox
 
 from cuemem.evals.metrics import bootstrap_ci, mean, percentile
+from cuemem.read.probe import DONT_KNOW
 
 METHOD_LABELS = {
     "B0": ("无记忆", "B0 No memory"),
@@ -276,14 +276,8 @@ def error_attribution(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, int
     return {method: dict(counts) for method, counts in out.items()}
 
 
-# 粗略识别"不知道"式回答：有答案的题答错时，区分"答成了别的"与"说不知道"（误拒答）
-DONT_KNOW = re.compile(
-    r"\b(i don't know|i do not know|i don't have (any )?(information|record|details)"
-    r"|i can't (tell|determine|give|say)|i cannot (tell|determine|give|say)"
-    r"|no (information|record|mention) (of|about)|(isn't|is not|aren't|are not) mentioned"
-    r"|not enough information)\b|不知道|没有(相关)?(的)?(信息|记录)",
-    re.IGNORECASE,
-)
+# 粗略识别"不知道"式回答（DONT_KNOW，与控制器的反应式升级共用）：有答案的题答错时，
+# 区分"答成了别的"与"说不知道"（误拒答）
 
 
 def false_abstentions(rows: Sequence[dict[str, Any]]) -> dict[str, int]:
