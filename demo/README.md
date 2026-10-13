@@ -4,7 +4,7 @@
 
 演示的是 N8 的电商导购助手 Cue：一家虚构的运动用品店 CueMart（24 件商品，图片由 qwen-image-3.0 生成）。用户 Maya 在 8 月和 9 月各聊过一次；演示时是 10 月 10 日的第三次对话，现场展示：
 
-- 跨会话回忆，以及知识更新（尺码 39 → 40、预算 $120 → $180）；
+- 跨会话回忆，以及知识更新（跑鞋改穿 40、平时仍是 39；预算 $120 → $180）；
 - 晒图找同款：八月分享的照片从记忆里召回，原图再交给模型看；
 - 每一轮的记忆轨迹：控制器为什么这样选、上下文里放了什么、回答引用了哪些记忆；
 - 遗忘：删掉一条事实，连同复述过它的回复一起删（引用过它的，以及没有引用、只是顺口转述的）。
@@ -33,10 +33,10 @@ uv run cuemem serve              # 打开 http://127.0.0.1:7860/
 |---|---|---|
 | 0:00 | 打开界面；"Session date" 填 `2026-10-10 10:00`，点 New session | 记忆空间里已经有 8 月、9 月两次对话；时间是模拟的 |
 | 0:15 | 发 `Hi Cue, I'm back!` | 叫得出名字，记得马拉松计划和看中的鞋；右边的轨迹：控制器的选择、画像里被引用的条目 |
-| 0:40 | 发 `What size running shoes do I wear now?` | 答 EU 40，并说明九月从 39 换成 40——旧事实没有删，标成"已被取代"，回答用的是新的 |
+| 0:40 | 发 `What size running shoes do I wear now?` | 答 EU 40，并说明九月起跑鞋换成了 40。记忆里两条事实都是"当前"：N11 起，对账把"跑鞋穿 40"看作比"穿 39 码"更窄的范围，作为新增，而不是取代平时的尺码（D-053）。"被取代"的例子见 1:40 那一步的预算 |
 | 1:05 | 发 `Can you find shoes that look like the pair I showed you in August?` | 轨迹里有八月那张照片：从记忆里召回、原图交给模型（"original photo shown to the model"），再按图在商品目录里找同款；回答下方是商品图 |
 | 1:40 | 发 `How has my shoe budget changed since we first talked?` | $120 → $180。如果控制器选了 L0，轨迹里会看到模型自己调用了 memory_search 补查——"控制器先选、模型兜底"；也可以在 Memory controller settings 里把 Recall 切到 l2，看深度检索的规划与补检索 |
-| 2:10 | 切到 Memory 页 | 画像；事实时间线里被取代的预算与尺码，以及取代它们的新事实；实体图；图库 |
+| 2:10 | 切到 Memory 页 | 画像；事实时间线里被取代的预算，以及取代它的新事实；实体图；图库 |
 | 2:30 | Forget a → fact → 选 "Ana turns 30 on October 3…" → Forget | 删的是这条事实出自的那一轮对话、后来引用过它的回复，以及没有引用、只是顺口转述它的轮（九月那次回复里的"她 10 月 3 日生日，早点下单"，或今天问候时提到的生日，D-051），提示里会写 "including N that restated it without citing"；事实与画像按剩下的日志重建 |
 | 2:50 | 回到 Chat，发 `When is my sister's birthday?` | 答"不知道"。屏幕上的聊天记录还在，但 Cue 的上下文和记忆里已经没有了 |
 
@@ -66,3 +66,4 @@ uv run cuemem demo demo/shop/script.json --fresh   # 三段会话加遗忘，14 
 | `shop/images/` | 商品图（`scripts/n8_assets.py` 生成，最长边 768 像素） |
 | `shop/photos/lena-shoes.jpg` | "朋友的鞋"那张照片（同样是生成的） |
 | `shop/script.json` | 剧本：三段会话、每条消息的检查 |
+| `video/cuemem-60s.html` | 60 秒的无声介绍动画（GSAP、SVG、Canvas、CSS），字幕直接在画面里。用浏览器打开即可播放；`uv run --with playwright --with imageio-ffmpeg python scripts/render_video.py` 渲染成 1080p MP4，输出到 `runs/video/` |

@@ -1,0 +1,908 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CueMem in 60 seconds</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=block">
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
+<!--
+  CueMem 60 秒介绍动画：无声，字幕与注释直接画在画面里。
+
+  预览：直接用浏览器打开本文件（空格暂停 / 继续，← → 前后跳 2 秒，R 从头播放）。
+  渲染：uv run --with playwright --with imageio-ffmpeg python scripts/render_video.py
+
+  所有动画挂在一条暂停的 GSAP 时间线上，渲染时逐帧 seek，输出与机器快慢无关。
+  演示里的问答、轨迹与遗忘结果是 CueMem 演示的真实输出（N10 录制，回答模型 qwen3.8-flash），
+  界面为视频重新绘制，回答有删节；结果数字来自 README 与 docs/results/。
+-->
+<style>
+:root {
+  --bg: #F4F7FA; --ink: #0F172A; --ink2: #334155; --muted: #64748B; --faint: #94A3B8;
+  --line: #E2E8F0; --soft: #F8FAFC;
+  --teal: #14B8A6; --teal-d: #0F766E; --teal-50: #F0FDFA; --teal-100: #CCFBF1; --teal-200: #99F6E4;
+  --amber: #F59E0B; --amber-d: #B45309; --amber-50: #FFFBEB; --amber-100: #FEF3C7;
+  --red: #EF4444; --red-d: #B91C1C; --red-50: #FEF2F2;
+  --shadow: 0 24px 60px rgba(15, 23, 42, .08);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; background: #0B1220; }
+body { font-family: Inter, system-ui, sans-serif; color: var(--ink); -webkit-font-smoothing: antialiased; }
+#viewport { position: fixed; inset: 0; overflow: hidden; }
+#stage { position: absolute; left: 50%; top: 50%; width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); transform-origin: 0 0; transform: translate(-50%, -50%); }
+body.render #stage { left: 0; top: 0; transform: none; }
+#bar { position: fixed; left: 0; bottom: 0; height: 4px; width: 0; background: var(--teal); }
+body.render #bar { display: none; }
+#bg {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(900px 620px at 88% 6%, rgba(20, 184, 166, .11), transparent 62%),
+    radial-gradient(760px 520px at 4% 98%, rgba(245, 158, 11, .08), transparent 60%),
+    radial-gradient(circle, rgba(15, 23, 42, .07) 1.2px, transparent 1.4px) 0 0 / 28px 28px;
+}
+.scene { position: absolute; inset: 0; visibility: hidden; }
+.hidden { position: absolute; visibility: hidden; }
+.center-col { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.sec { font-family: 'JetBrains Mono', monospace; font-size: 15px; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); margin-bottom: 10px; }
+
+/* ---------- 常驻：品牌、章节、字幕 ---------- */
+#brand { left: 64px; top: 38px; font-size: 30px; font-weight: 800; letter-spacing: -.02em; }
+#brand b, .wordmark .m { color: var(--teal); }
+#chapters { right: 64px; top: 34px; display: flex; gap: 8px; list-style: none; }
+#chapters li {
+  display: flex; gap: 8px; align-items: center; font-size: 19px; font-weight: 600; color: #94A3B8;
+  padding: 8px 16px; border-radius: 999px; border: 1.5px solid rgba(204, 251, 241, 0); background: rgba(240, 253, 250, 0);
+}
+#chapters li i { font-style: normal; font-family: 'JetBrains Mono', monospace; font-size: 15px; opacity: .75; }
+.cap {
+  position: absolute; left: 0; right: 0; bottom: 36px; margin: 0 auto; width: fit-content; max-width: 1480px;
+  visibility: hidden; background: rgba(15, 23, 42, .92); color: #fff; font-size: 34px; line-height: 1.3; font-weight: 500;
+  padding: 15px 32px; border-radius: 16px; text-align: center; box-shadow: 0 12px 30px rgba(15, 23, 42, .2);
+}
+.cap q { quotes: "“" "”"; color: var(--teal-200); }
+
+/* ---------- 0 片名 ---------- */
+.wordmark { font-size: 188px; font-weight: 800; letter-spacing: -.045em; line-height: 1; display: flex; perspective: 800px; }
+.wordmark span { display: inline-block; }
+.tagline { font-size: 44px; color: var(--ink2); font-weight: 500; margin-top: 30px; letter-spacing: -.012em; }
+.pills { display: flex; gap: 14px; list-style: none; margin-top: 46px; }
+.pills li { font-size: 24px; font-weight: 600; color: var(--teal-d); background: #fff; border: 1.5px solid var(--teal-100); padding: 10px 22px; border-radius: 999px; box-shadow: 0 6px 16px rgba(15, 23, 42, .05); }
+.mini-tl { margin-bottom: 34px; overflow: visible; }
+.mini-tl text { font: 600 19px Inter, sans-serif; fill: var(--muted); text-anchor: middle; }
+
+/* ---------- 1 问题 ---------- */
+.ctx { position: absolute; left: 150px; top: 170px; width: 640px; height: 740px; background: #fff; border: 1.5px solid var(--line); border-radius: 26px; box-shadow: var(--shadow); overflow: hidden; }
+.ctx-head { display: flex; justify-content: space-between; align-items: center; height: 76px; padding: 0 28px; border-bottom: 1.5px solid var(--line); font-size: 23px; font-weight: 700; color: var(--ink2); }
+.ctx-count { font-family: 'JetBrains Mono', monospace; font-size: 21px; color: var(--muted); font-weight: 500; }
+.ctx-count b { color: var(--red-d); font-weight: 600; }
+#flood { display: block; width: 640px; height: 600px; }
+.ctx-note { position: absolute; left: 0; right: 0; bottom: 0; padding: 30px 28px 22px; font-size: 21px; color: var(--muted); background: linear-gradient(rgba(255, 255, 255, 0), #fff 45%); }
+.problems { position: absolute; left: 880px; top: 214px; width: 890px; display: flex; flex-direction: column; gap: 30px; }
+.prob { display: flex; gap: 28px; align-items: center; background: #fff; border: 1.5px solid var(--line); border-radius: 24px; padding: 32px 36px; box-shadow: 0 14px 36px rgba(15, 23, 42, .06); visibility: hidden; }
+.prob svg { flex: none; width: 72px; height: 72px; }
+.prob h3 { font-size: 40px; font-weight: 800; letter-spacing: -.025em; }
+.prob p { font-size: 26px; color: var(--muted); margin-top: 6px; }
+.question h2 { font-size: 78px; font-weight: 800; letter-spacing: -.035em; line-height: 1.1; text-align: center; visibility: hidden; }
+.opts { display: flex; gap: 40px; margin-top: 70px; }
+.opt { position: relative; width: 660px; display: flex; gap: 24px; align-items: flex-start; padding: 32px 36px; border-radius: 26px; background: #fff; border: 2px solid #E2E8F0; box-shadow: 0 14px 36px rgba(15, 23, 42, .05); visibility: hidden; }
+.opt-k { flex: none; width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center; font-weight: 800; font-size: 28px; background: #F1F5F9; color: #64748B; }
+.opt h4 { font-size: 34px; font-weight: 700; letter-spacing: -.02em; }
+.opt p { font-size: 24px; color: var(--muted); margin-top: 8px; line-height: 1.35; }
+.opt-tag { position: absolute; top: -20px; right: 28px; font-size: 20px; font-weight: 800; color: #fff; background: var(--teal); padding: 7px 16px; border-radius: 999px; visibility: hidden; }
+
+/* ---------- 2–4 演示：聊天与记忆面板 ---------- */
+.card { position: absolute; background: #fff; border: 1.5px solid var(--line); border-radius: 26px; box-shadow: var(--shadow); overflow: hidden; visibility: hidden; }
+.chat { left: 110px; top: 130px; width: 1030px; height: 780px; }
+.mem { left: 1170px; top: 130px; width: 640px; height: 780px; }
+.card > header { display: flex; align-items: center; gap: 16px; height: 94px; padding: 0 30px; border-bottom: 1.5px solid var(--line); }
+.avatar { width: 50px; height: 50px; border-radius: 50%; background: var(--teal); color: #fff; display: grid; place-items: center; font-weight: 800; font-size: 25px; }
+.card header b { font-size: 26px; font-weight: 700; }
+.card header small { display: block; font-size: 19px; color: var(--muted); margin-top: 2px; }
+.pill { margin-left: auto; font-size: 18px; font-weight: 600; color: var(--teal-d); background: var(--teal-50); border: 1.5px solid var(--teal-100); padding: 7px 14px; border-radius: 999px; white-space: nowrap; }
+.group { position: absolute; left: 36px; right: 36px; top: 124px; display: flex; flex-direction: column; gap: 18px; visibility: hidden; }
+.msg { font-size: 27px; line-height: 1.45; border-radius: 20px; padding: 15px 24px; max-width: 900px; visibility: hidden; }
+.msg.user { align-self: flex-end; background: var(--teal-50); border: 1.5px solid var(--teal-200); max-width: 740px; }
+.reply { position: relative; display: flex; flex-direction: column; align-items: flex-start; }
+.nowrap { white-space: nowrap; }
+.msg.bot { max-width: 100%; background: var(--soft); border: 1.5px solid var(--line); color: var(--ink2); }
+.msg.bot b { color: var(--ink); }
+.msg ul { list-style: none; margin: 8px 0 0 4px; }
+.msg li { margin-top: 4px; padding-left: 26px; text-indent: -26px; }  /* 圆点写在文字里，跟着逐词出现 */
+sup.cite { font-size: 16px; font-weight: 700; color: var(--teal-d); margin-left: 3px; display: inline-block; vertical-align: super; line-height: 1; }
+.caret { display: inline-block; width: 3px; height: 1.05em; background: var(--teal); vertical-align: -.16em; margin-left: 2px; }
+.dots { position: absolute; left: 0; top: 0; display: flex; gap: 9px; padding: 21px 24px; border-radius: 20px; background: var(--soft); border: 1.5px solid var(--line); visibility: hidden; }
+.dots i { width: 11px; height: 11px; border-radius: 50%; background: var(--faint); }
+.trace { display: flex; align-items: center; gap: 10px; font-size: 19px; color: var(--muted); visibility: hidden; }
+.trace-k { font-family: 'JetBrains Mono', monospace; font-size: 15px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin-right: 4px; }
+.chip { font-size: 19px; font-weight: 700; padding: 6px 14px; border-radius: 999px; display: inline-block; }
+.chip.teal { background: var(--teal-100); color: var(--teal-d); }
+.chip.amber { background: var(--amber-100); color: var(--amber-d); }
+.to-model { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 18px; color: var(--muted); }
+.slot { width: 66px; height: 50px; border-radius: 9px; background: var(--amber-50); outline: 2px dashed #FCD34D; overflow: hidden; }
+.slot img { width: 100%; height: 100%; object-fit: cover; display: block; visibility: hidden; }
+.tool { font-family: 'JetBrains Mono', monospace; font-size: 19px; color: var(--ink2); background: #F1F5F9; border-radius: 12px; padding: 12px 16px; visibility: hidden; }
+.tool .ret { color: var(--teal-d); visibility: hidden; }
+.products { display: flex; gap: 14px; margin: 12px 0 10px; }
+.products figure { width: 262px; border: 1.5px solid var(--line); border-radius: 14px; overflow: hidden; background: #fff; visibility: hidden; }
+.products img { width: 100%; height: 118px; object-fit: cover; display: block; }
+.products figcaption { font-size: 17px; font-weight: 600; padding: 7px 12px; color: var(--ink); white-space: nowrap; }
+#leather { border-radius: 6px; background: rgba(254, 243, 199, 0); }
+.badge-ok { align-self: flex-start; font-size: 23px; font-weight: 700; color: var(--teal-d); background: var(--teal-50); border: 1.5px solid var(--teal-200); padding: 10px 20px; border-radius: 999px; visibility: hidden; }
+
+.panel { position: absolute; left: 0; right: 0; top: 94px; bottom: 0; padding: 22px 28px; visibility: hidden; }
+.panel > * { visibility: hidden; }
+.sessions { display: flex; gap: 10px; margin-bottom: 20px; }
+.sess { font-size: 18px; font-weight: 600; color: var(--ink2); background: var(--soft); border: 1.5px solid var(--line); padding: 7px 13px; border-radius: 12px; }
+.fact { display: grid; grid-template-columns: 78px 1fr; column-gap: 12px; row-gap: 4px; padding: 9px 12px; border-radius: 14px; border: 1.5px solid rgba(226, 232, 240, 0); background: rgba(248, 250, 252, 0); margin-bottom: 4px; }
+.fact .d { font-family: 'JetBrains Mono', monospace; font-size: 15px; color: var(--faint); padding-top: 3px; }
+.fact .t { font-size: 19px; line-height: 1.32; color: var(--ink2); }
+.fact .t .id { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 600; color: var(--teal-d); margin-right: 6px; }
+.fact .s { grid-column: 2; justify-self: start; font-size: 15px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+.s.cur { background: var(--teal-50); color: var(--teal-d); }
+.s.old { background: var(--amber-100); color: var(--amber-d); }
+.validity { margin-top: 12px; padding: 12px 14px 4px; border-radius: 16px; border: 1.5px solid var(--line); background: var(--soft); }
+.validity svg { display: block; overflow: visible; }
+.validity text { font: 600 15px Inter, sans-serif; fill: var(--muted); }
+.validity text.lab { font: 700 17px Inter, sans-serif; }
+.polaroid { width: 420px; margin: 6px auto 0; background: #fff; border: 1.5px solid var(--line); border-radius: 16px; padding: 14px; box-shadow: 0 16px 40px rgba(15, 23, 42, .1); transform: rotate(-2deg); }
+.polaroid img { width: 100%; height: 292px; object-fit: cover; border-radius: 10px; display: block; }
+.polaroid p { font-size: 18px; color: var(--ink2); margin-top: 10px; font-weight: 600; }
+.capbox { margin-top: 26px; font-size: 19px; line-height: 1.45; color: var(--muted); border: 1.5px dashed #CBD5E1; border-radius: 14px; padding: 14px 16px; }
+.capbox .sec { margin-bottom: 6px; }
+.seg { display: flex; gap: 8px; margin-bottom: 12px; }
+.seg span { font-size: 17px; font-weight: 600; padding: 6px 14px; border-radius: 999px; border: 1.5px solid var(--line); color: var(--muted); }
+.seg span.on { background: var(--teal); border-color: var(--teal); color: #fff; }
+.forget-row { display: flex; gap: 12px; align-items: stretch; }
+.select { flex: 1; font-size: 19px; line-height: 1.4; color: var(--ink); border: 1.5px solid var(--line); border-radius: 14px; padding: 12px 14px; background: #fff; }
+.btn-forget { flex: none; display: grid; place-items: center; font-size: 22px; font-weight: 700; color: var(--red-d); background: var(--red-50); border: 1.5px solid #FECACA; border-radius: 14px; padding: 0 24px; }
+.log { margin-top: 26px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.tchip { height: 30px; border-radius: 8px; background: #E2E8F0; }
+.tchip.u { background: var(--teal-100); }
+.legend { display: flex; gap: 18px; margin-top: 12px; font-size: 16px; color: var(--muted); visibility: hidden; }
+.legend span::before { content: ""; display: inline-block; width: 14px; height: 14px; border-radius: 4px; margin-right: 7px; vertical-align: -2px; background: var(--red); }
+.legend span.re::before { background: repeating-linear-gradient(135deg, var(--red) 0 3px, #FCA5A5 3px 6px); }
+.result { font-family: 'JetBrains Mono', monospace; font-size: 16.5px; line-height: 1.55; color: var(--ink2); background: var(--soft); border: 1.5px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-top: 18px; }
+.result b { color: var(--teal-d); font-weight: 600; }
+.foot { left: 112px; top: 922px; font-size: 17px; color: var(--faint); }
+
+.overlay { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; pointer-events: none; overflow: visible; }
+#flyer { position: absolute; left: 0; top: 0; object-fit: cover; border-radius: 12px; visibility: hidden; box-shadow: 0 0 0 5px var(--amber), 0 30px 70px rgba(15, 23, 42, .28); }
+.callout { position: absolute; left: 0; top: 0; visibility: hidden; background: var(--ink); color: #fff; border-radius: 16px; padding: 14px 20px; font-size: 23px; font-weight: 600; line-height: 1.3; box-shadow: 0 16px 40px rgba(15, 23, 42, .25); white-space: nowrap; }
+.callout small { display: block; color: #CBD5E1; font-size: 18px; font-weight: 500; margin-top: 4px; }
+.callout.amber { background: var(--amber-d); }
+.callout.amber small { color: #FDE68A; }
+.callout.to-right::after, .callout.to-left::after { content: ""; position: absolute; top: 50%; margin-top: -11px; border: 11px solid transparent; }
+.callout.to-right::after { right: -20px; border-left-color: var(--ink); }
+.callout.to-left::after { left: -20px; border-right-color: var(--ink); }
+#cursor { position: absolute; left: 0; top: 0; width: 38px; height: 38px; visibility: hidden; z-index: 20; filter: drop-shadow(0 4px 6px rgba(15, 23, 42, .3)); }
+#ripple { position: absolute; left: -35px; top: -35px; width: 70px; height: 70px; border-radius: 50%; border: 4px solid var(--red); visibility: hidden; }
+
+/* ---------- 5 控制器 ---------- */
+.sc-title { position: absolute; left: 110px; top: 128px; font-size: 52px; font-weight: 800; letter-spacing: -.03em; visibility: hidden; }
+.sc-title small { display: block; font-size: 24px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-top: 8px; }
+.pipe { position: absolute; left: 110px; right: 110px; top: 262px; display: flex; align-items: stretch; }
+.node { flex: 1; background: #fff; border: 2px solid var(--line); border-radius: 22px; padding: 20px 24px; box-shadow: 0 14px 34px rgba(15, 23, 42, .06); visibility: hidden; }
+.node small, .stat-card small { font-family: 'JetBrains Mono', monospace; font-size: 15px; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); }
+.node p { font-size: 23px; line-height: 1.35; color: var(--ink2); margin-top: 8px; }
+.node.ctrl { border-color: var(--teal); background: var(--teal-50); }
+.node.ctrl small { color: var(--teal-d); }
+.arrow { flex: none; width: 64px; align-self: center; overflow: visible; }
+.arrow path { fill: none; stroke: #94A3B8; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; visibility: hidden; }
+#pulse { position: absolute; left: -10px; top: -10px; width: 20px; height: 20px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 8px rgba(20, 184, 166, .22); visibility: hidden; }
+#ctrl-path { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; visibility: hidden; }
+.decide { position: absolute; left: 760px; top: 482px; width: 1050px; background: #fff; border: 1.5px solid var(--line); border-radius: 22px; padding: 18px 26px 16px; box-shadow: var(--shadow); visibility: hidden; }
+.d-head { display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 15px; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; padding: 0 12px; }
+.d-row { display: grid; grid-template-columns: 220px 1fr 64px 96px; align-items: center; gap: 16px; padding: 8px 12px; border-radius: 12px; font-size: 23px; color: var(--ink2); border: 1.5px solid rgba(20, 184, 166, 0); background: rgba(240, 253, 250, 0); }
+.d-row .track { height: 18px; border-radius: 9px; background: #F1F5F9; overflow: hidden; }
+.d-row .track i { display: block; height: 100%; border-radius: 9px; background: var(--teal-200); width: calc(var(--v) * 100%); transform-origin: left center; }
+.d-row b { font-family: 'JetBrains Mono', monospace; font-size: 21px; font-weight: 600; text-align: right; color: var(--ink); }
+.d-row em { font-style: normal; font-size: 17px; font-weight: 800; color: #fff; background: var(--teal); border-radius: 999px; padding: 4px 12px; visibility: hidden; justify-self: start; }
+.side { position: absolute; left: 110px; top: 482px; width: 610px; display: flex; flex-direction: column; gap: 18px; }
+.stat-card { background: #fff; border: 1.5px solid var(--line); border-radius: 20px; padding: 16px 24px; box-shadow: 0 12px 30px rgba(15, 23, 42, .05); visibility: hidden; }
+.stat-card .big { display: block; font-size: 44px; font-weight: 800; letter-spacing: -.03em; color: var(--teal-d); line-height: 1.12; margin-top: 2px; }
+.stat-card p { font-size: 21px; color: var(--ink2); line-height: 1.35; margin-top: 2px; }
+.stat-card.lam .big { font-family: 'JetBrains Mono', monospace; font-size: 34px; color: var(--ink); }
+.stat-card.dim .big { color: var(--amber-d); font-size: 38px; }
+
+/* ---------- 6 结果 ---------- */
+.res-card { position: absolute; top: 262px; width: 820px; height: 590px; background: #fff; border: 1.5px solid var(--line); border-radius: 26px; padding: 30px 36px; box-shadow: var(--shadow); visibility: hidden; }
+.res-card h3 { font-size: 30px; font-weight: 800; letter-spacing: -.02em; }
+.res-card h3 small { display: block; font-size: 20px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-top: 6px; }
+#r1 { left: 110px; } #r2 { left: 990px; }
+.hrow { margin-top: 40px; }
+.hrow .lab { display: flex; justify-content: space-between; align-items: baseline; font-size: 24px; font-weight: 600; color: var(--ink2); }
+.hrow .lab b { font-size: 40px; font-weight: 800; letter-spacing: -.02em; color: var(--ink); }
+.hrow .htrack { height: 34px; border-radius: 10px; background: #F1F5F9; margin-top: 10px; overflow: hidden; }
+.hrow .htrack i { display: block; height: 100%; border-radius: 10px; background: #CBD5E1; width: calc(var(--v) * 1%); transform-origin: left center; }
+.hrow.teal .htrack i { background: var(--teal); }
+.hrow.teal .lab b { color: var(--teal-d); }
+.hrow .cost { font-family: 'JetBrains Mono', monospace; font-size: 19px; color: var(--muted); margin-top: 8px; }
+.deltas { display: flex; gap: 12px; margin-top: 30px; align-items: center; flex-wrap: wrap; }
+.dl { font-size: 24px; font-weight: 800; padding: 8px 18px; border-radius: 999px; visibility: hidden; }
+.dl.teal { color: #fff; background: var(--teal); }
+.dl.grey { color: var(--ink2); background: #E2E8F0; }
+.dl-note { font-size: 20px; color: var(--muted); visibility: hidden; }
+.r-note { font-size: 19px; line-height: 1.4; color: var(--muted); margin-top: 26px; visibility: hidden; }
+.vchart { display: flex; gap: 70px; justify-content: center; margin-top: 22px; }
+.vgroup { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.vbars { display: flex; gap: 14px; align-items: flex-end; height: 262px; }
+.vbar { width: 104px; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; height: 100%; }
+.vbar b { font-family: 'JetBrains Mono', monospace; font-size: 21px; font-weight: 600; color: var(--ink2); margin-bottom: 6px; }
+.vbar i { display: block; width: 100%; height: calc(var(--v) * 2.3px); border-radius: 10px 10px 4px 4px; background: #CBD5E1; transform-origin: bottom center; }
+.vbar.teal i { background: var(--teal); }
+.vbar.teal b { color: var(--teal-d); }
+.vgroup .gl { font-size: 21px; font-weight: 700; color: var(--ink2); text-align: center; }
+.vgroup .gl small { display: block; font-size: 17px; font-weight: 500; color: var(--muted); }
+.vlegend { display: flex; gap: 22px; justify-content: center; margin-top: 16px; font-size: 18px; color: var(--muted); }
+.vlegend span::before { content: ""; display: inline-block; width: 14px; height: 14px; border-radius: 4px; margin-right: 8px; vertical-align: -1px; background: #CBD5E1; }
+.vlegend span.t::before { background: var(--teal); }
+.trust { position: absolute; left: 110px; right: 110px; top: 880px; display: flex; gap: 16px; justify-content: center; }
+.trust span { font-size: 21px; font-weight: 600; color: var(--ink2); background: #fff; border: 1.5px solid var(--line); border-radius: 999px; padding: 10px 20px; visibility: hidden; }
+.trust span b { color: var(--teal-d); }
+
+/* ---------- 7 收尾 ---------- */
+.end-url { font-family: 'JetBrains Mono', monospace; font-size: 44px; font-weight: 600; color: var(--teal-d); margin-top: 40px; visibility: hidden; }
+.end-sub { font-size: 30px; color: var(--muted); margin-top: 18px; font-weight: 500; visibility: hidden; }
+</style>
+</head>
+<body>
+<div id="viewport"><div id="stage">
+  <div id="bg"></div>
+
+  <!-- 0 片名 -->
+  <section class="scene" id="s0"><div class="center-col">
+    <svg class="mini-tl" width="560" height="70" viewBox="0 0 560 70">
+      <line id="mtl-line" x1="40" y1="20" x2="520" y2="20" stroke="#99F6E4" stroke-width="4" stroke-linecap="round"/>
+      <g class="mtl-dot"><circle cx="80" cy="20" r="10" fill="#14B8A6"/><text x="80" y="60">Aug 28</text></g>
+      <g class="mtl-dot"><circle cx="280" cy="20" r="10" fill="#14B8A6"/><text x="280" y="60">Sep 12</text></g>
+      <g class="mtl-dot"><circle cx="480" cy="20" r="10" fill="#F59E0B"/><text x="480" y="60">Oct 10</text></g>
+    </svg>
+    <h1 class="wordmark" id="title"><span>C</span><span>u</span><span>e</span><span class="m">M</span><span class="m">e</span><span class="m">m</span></h1>
+    <p class="tagline" id="tagline">Long-term multimodal memory for LLM agents</p>
+    <ul class="pills" id="pills"><li>Writes facts</li><li>Recalls at the right depth</li><li>Re-looks at photos</li><li>Forgets on request</li></ul>
+  </div></section>
+
+  <!-- 1 问题 -->
+  <section class="scene" id="s1">
+    <div class="ctx" id="ctx">
+      <div class="ctx-head"><span>Full context: re-read everything</span><span class="ctx-count"><b id="tok">0</b> tokens</span></div>
+      <canvas id="flood" width="640" height="600"></canvas>
+      <div class="ctx-note">every past chat, for every new message</div>
+    </div>
+    <div class="problems" id="problems">
+      <div class="prob">
+        <svg viewBox="0 0 72 72" fill="none" stroke="#B91C1C" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><circle cx="36" cy="38" r="24"/><path d="M36 26v12l8 6M30 8h12"/></svg>
+        <div><h3>Slow &amp; costly</h3><p>105,943 input tokens per question (LongMemEval)</p></div>
+      </div>
+      <div class="prob">
+        <svg viewBox="0 0 72 72" fill="none" stroke="#B45309" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><rect x="10" y="14" width="52" height="48" rx="8"/><path d="M10 28h52M24 8v12M48 8v12M28 46l-6-6 6-6M22 40h24"/></svg>
+        <div><h3>Goes stale</h3><p>Budget: under $120 in August, $180 by September</p></div>
+      </div>
+      <div class="prob">
+        <svg viewBox="0 0 72 72" fill="none" stroke="#334155" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 20h44M28 20v-6h16v6M20 20l3 40h26l3-40M31 30v20M41 30v20"/></svg>
+        <div><h3>Hard to forget</h3><p>Deleting one fact means finding every copy of it</p></div>
+      </div>
+    </div>
+    <div class="center-col question">
+      <h2 id="qtext">Who decides when an agent recalls,<br>and how deeply?</h2>
+      <div class="opts">
+        <div class="opt" id="optA"><span class="opt-k">A</span><div><h4>The LLM itself</h4><p>calls a search tool when it thinks it needs one</p></div></div>
+        <div class="opt" id="optB"><span class="opt-k">B</span><div><h4>A small trained controller</h4><p>decides before the LLM is called, and never calls one itself</p></div><span class="opt-tag" id="optTag">CueMem</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2–4 演示 -->
+  <section class="scene" id="app">
+    <div class="card chat" id="chat">
+      <header>
+        <div class="avatar">C</div>
+        <div><b>Cue</b><small>shopping assistant at CueMart</small></div>
+        <span class="pill">Oct 10 · Maya's third chat</span>
+      </header>
+
+      <div class="group" id="g2">
+        <div class="msg user"><span class="typed" data-text="How has my shoe budget changed since we first talked?"></span></div>
+        <div class="reply">
+          <div class="dots"><i></i><i></i><i></i></div>
+          <div class="msg bot" data-stream>
+            <p>Your budget has gone up <b>$60</b>, from under $120 to a max of <span class="nowrap" id="c-group"><b>$180</b><sup class="cite" id="c-f2">f2</sup><sup class="cite" id="c-f8">f8</sup>.</span></p>
+            <ul>
+              <li>• <b>August 28:</b> you told me “stay under $120,” so I shortlisted the Aero Knit Runner ($110)…</li>
+              <li>• <b>September 12:</b> after your promotion, you raised it to $180.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="group" id="g3">
+        <div class="msg user"><span class="typed" data-text="Can you find shoes that look like the pair I showed you in August?"></span></div>
+        <div class="trace" id="trace3">
+          <span class="trace-k">controller</span><span class="chip teal">L1 fast recall</span><span class="chip amber">+ re-look at photos</span>
+          <span class="to-model">to the model:<span class="slot" id="slot"><img src="../shop/photos/lena-shoes.jpg" alt=""></span></span>
+        </div>
+        <div class="tool" id="tool3"><span class="typed" data-text="find_similar_products(image='i1', max_price=180)"></span><span class="ret" id="ret3"> → 5 products · 14 ms</span></div>
+        <div class="reply">
+          <div class="msg bot" id="a3">
+            <p data-stream>Found them: that's Lena's white knit / mint-sole look<sup class="cite">f3</sup>. Two matches keep it almost exactly:</p>
+            <div class="products">
+              <figure><img src="../shop/images/P02.jpg" alt=""><figcaption>Aero Knit Runner Pro · $165</figcaption></figure>
+              <figure><img src="../shop/images/P01.jpg" alt=""><figcaption>Aero Knit Runner · $110</figcaption></figure>
+            </div>
+            <p data-stream><span id="leather">I'd skip the Tempo Leather Trainer ($95): it's full-grain leather.</span></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="group" id="g4">
+        <div class="msg user"><span class="typed" data-text="When is my sister's birthday?"></span></div>
+        <div class="reply">
+          <div class="dots"><i></i><i></i><i></i></div>
+          <div class="msg bot" data-stream><p>I don't have that: your sister's birthday has never come up in our chats, so I can't tell you the date.</p></div>
+        </div>
+        <div class="badge-ok" id="ok4">✓ Forgotten: gone from Cue's context and memory</div>
+      </div>
+    </div>
+
+    <div class="card mem" id="mem">
+      <header><b>Memory</b><span class="pill">Maya</span></header>
+
+      <div class="panel" id="mp-facts">
+        <div class="sec">Chats in memory</div>
+        <div class="sessions"><span class="sess">Aug 28 · 8 turns · 1 photo</span><span class="sess">Sep 12 · 4 turns</span></div>
+        <div class="sec">Fact timeline</div>
+        <div class="fact"><span class="d">Aug 28</span><span class="t">Maya is vegan and avoids leather or suede materials.</span><span class="s cur">current</span></div>
+        <div class="fact" id="f2"><span class="d">Aug 28</span><span class="t"><span class="id">f2</span>Maya has a budget of under $120 for running shoes.</span><span class="s old" id="f2s">no longer true from Sep 12</span></div>
+        <div class="fact" id="f8"><span class="d">Sep 12</span><span class="t"><span class="id">f8</span>Maya's budget for running shoes is now up to $180.</span><span class="s cur">current</span></div>
+        <div class="fact"><span class="d">Sep 12</span><span class="t">Maya has a sister named Ana who turns 30 on October 3rd.</span><span class="s cur">current</span></div>
+        <div class="validity" id="validity">
+          <svg width="548" height="80" viewBox="0 0 548 80">
+            <line x1="14" y1="40" x2="534" y2="40" stroke="#CBD5E1" stroke-width="2"/>
+            <rect class="v1" x="24" y="30" width="170" height="20" rx="6" fill="#FCD34D"/>
+            <rect class="v2" x="198" y="30" width="300" height="20" rx="6" fill="#14B8A6"/>
+            <path class="v2" d="M498 26 L518 40 L498 54 Z" fill="#14B8A6"/>
+            <text class="lab v1" x="109" y="20" text-anchor="middle" style="fill:#B45309">under $120</text>
+            <text class="lab v2" x="348" y="20" text-anchor="middle" style="fill:#0F766E">up to $180</text>
+            <text x="24" y="74">Aug 28</text><text x="198" y="74">Sep 12</text><text x="468" y="74">Oct 10</text>
+          </svg>
+        </div>
+      </div>
+
+      <div class="panel" id="mp-photo">
+        <div class="sec">Images in memory</div>
+        <div class="polaroid"><img id="polimg" src="../shop/photos/lena-shoes.jpg" alt=""><p>Aug 28 · the pair Lena wears</p></div>
+        <div class="capbox"><div class="sec">stored caption, used to find it</div>“A first-person POV shot of a person's feet wearing white knit running shoes with thick mint-green foam soles, resting on weathered wooden planks.”</div>
+      </div>
+
+      <div class="panel" id="mp-forget">
+        <div class="sec">Forget a</div>
+        <div class="seg"><span class="on">fact</span><span>image</span><span>session</span></div>
+        <div class="forget-row">
+          <div class="select">Maya has a sister named Ana who turns 30 on October 3rd.</div>
+          <div class="btn-forget" id="btnForget">Forget</div>
+        </div>
+        <div class="log">
+          <div class="sec">Conversation log, the source of truth</div>
+          <div class="chips" id="chips"></div>
+          <div class="legend" id="legend"><span>its source, and replies that cited it</span><span class="re">restated it without citing</span></div>
+        </div>
+        <div class="result" id="result">Forgot <b>6 turns</b> · <b>4</b> restated it without citing<br>Facts <b id="factsN">15</b> · rebuilt from the log in 15.5 s</div>
+      </div>
+    </div>
+
+    <p class="hidden foot" id="foot">Replies are real outputs of the CueMem demo (qwen3.8-flash), shortened; the interface is redrawn for video.</p>
+  </section>
+
+  <!-- 5 控制器 -->
+  <section class="scene" id="s5">
+    <h2 class="sc-title">How Cue decides what to recall<small>the read path, for every message</small></h2>
+    <div class="pipe">
+      <div class="node" id="n-msg"><small>message</small><p>“…shoes that look like the pair I showed you in August?”</p></div>
+      <svg class="arrow" viewBox="0 0 64 24" height="24"><path d="M6 12h48M44 4l10 8-10 8"/></svg>
+      <div class="node" id="n-probe"><small>memory probe</small><p>one cheap retrieval pass,<br>54 features, no LLM</p></div>
+      <svg class="arrow" viewBox="0 0 64 24" height="24"><path d="M6 12h48M44 4l10 8-10 8"/></svg>
+      <div class="node ctrl" id="n-ctrl"><small>controller</small><p>gate + question-type model,<br>trained on dev sets</p></div>
+      <svg class="arrow" viewBox="0 0 64 24" height="24"><path d="M6 12h48M44 4l10 8-10 8"/></svg>
+      <div class="node" id="n-llm"><small>reader LLM</small><p>answers with what<br>was recalled</p></div>
+    </div>
+    <svg class="overlay"><path id="ctrl-path" d=""/></svg>
+    <div class="decide" id="decide">
+      <div class="d-head"><span>action</span><span>expected accuracy − λ × cost</span></div>
+      <div class="d-row"><span>L0 · profile only</span><span class="track"><i style="--v:.05"></i></span><b>0.05</b><em></em></div>
+      <div class="d-row"><span>L1 · fast recall</span><span class="track"><i style="--v:.81"></i></span><b>0.81</b><em></em></div>
+      <div class="d-row"><span>L2 · deep recall</span><span class="track"><i style="--v:.76"></i></span><b>0.76</b><em></em></div>
+      <div class="d-row" id="win"><span>L1 + photos</span><span class="track"><i style="--v:.95"></i></span><b>0.95</b><em id="chosen">chosen</em></div>
+      <div class="d-row"><span>L2 + photos</span><span class="track"><i style="--v:.89"></i></span><b>0.89</b><em></em></div>
+    </div>
+    <div class="side">
+      <div class="stat-card lam" id="sc0"><small>the cost knob</small><span class="big">λ</span><p>how much one extra correct answer is worth; a larger λ saves more</p></div>
+      <div class="stat-card" id="sc1"><small>mixed traffic, 80% need no memory</small><span class="big">−41% cost</span><p>vs always retrieving, with no loss in accuracy</p></div>
+      <div class="stat-card dim" id="sc2"><small>memory questions only</small><span class="big">−2.8 points</span><p>vs always deep recall: a limit, reported as one</p></div>
+    </div>
+    <div id="pulse"></div>
+  </section>
+
+  <!-- 6 结果 -->
+  <section class="scene" id="s6">
+    <h2 class="sc-title">Results<small>test sets used once · every method frozen beforehand · nominal cost per 1,000 questions</small></h2>
+    <div class="res-card" id="r1">
+      <h3>Memory vs a long context window<small>LongMemEval · 400 questions</small></h3>
+      <div class="hrow"><div class="lab"><span>Full context</span><b data-n="73.0">0%</b></div><div class="htrack"><i style="--v:73.0"></i></div><div class="cost">$31.88 per 1k questions</div></div>
+      <div class="hrow teal"><div class="lab"><span>CueMem · L1 fast recall</span><b data-n="90.5">0%</b></div><div class="htrack"><i style="--v:90.5"></i></div><div class="cost">$1.60 per 1k questions</div></div>
+      <div class="deltas"><span class="dl teal">+17.5 points</span><span class="dl teal">1/20 of the cost</span></div>
+      <p class="r-note">Full context sends the whole chat history, about 106K tokens per question, to the model.</p>
+    </div>
+    <div class="res-card" id="r2">
+      <h3>CueMem vs Mem0<small>same extraction model, embeddings, reader and judge</small></h3>
+      <div class="vchart">
+        <div class="vgroup"><div class="vbars"><div class="vbar"><b data-n="80.5">0%</b><i style="--v:80.5"></i></div><div class="vbar teal"><b data-n="81.0">0%</b><i style="--v:81.0"></i></div></div><div class="gl">LoCoMo<small>200 questions</small></div></div>
+        <div class="vgroup"><div class="vbars"><div class="vbar"><b data-n="83.0">0%</b><i style="--v:83.0"></i></div><div class="vbar teal"><b data-n="92.0">0%</b><i style="--v:92.0"></i></div></div><div class="gl">LongMemEval<small>100 questions</small></div></div>
+      </div>
+      <div class="vlegend"><span>Mem0 (open source 2.2)</span><span class="t">CueMem · L1 fast recall</span></div>
+      <div class="deltas" style="justify-content:center;margin-top:18px"><span class="dl grey">LoCoMo: tie</span><span class="dl teal">LongMemEval: +9 points</span><span class="dl-note">Mem0's writes cost 2.3–2.9×</span></div>
+    </div>
+    <div class="trust"><span>A second judge agrees on <b>94.7–97.9%</b> of verdicts</span><span>Rerun with the cache off: <b>≤ 0.9 points</b></span></div>
+  </section>
+
+  <!-- 7 收尾 -->
+  <section class="scene" id="s7"><div class="center-col">
+    <h1 class="wordmark" id="title2"><span>C</span><span>u</span><span>e</span><span class="m">M</span><span class="m">e</span><span class="m">m</span></h1>
+    <p class="end-url">github.com/FlickYan/cuemem</p>
+    <p class="end-sub">Code · technical report · every number</p>
+  </div></section>
+
+  <!-- 常驻元素与覆盖层 -->
+  <div class="hidden" id="brand">Cue<b>Mem</b></div>
+  <ol class="hidden" id="chapters"><li><i>01</i>Recall</li><li><i>02</i>Photos</li><li><i>03</i>Forget</li><li><i>04</i>Controller</li><li><i>05</i>Results</li></ol>
+  <svg class="overlay" id="links"></svg>
+  <img id="flyer" src="../shop/photos/lena-shoes.jpg" alt="">
+  <div class="callout to-right" id="co-super">Superseded, not deleted<small>every fact keeps its validity period</small></div>
+  <div class="callout amber" id="co-orig">The original photo goes back to the model<small>re-perception: up to +12.3 points on MemLens</small></div>
+  <div class="callout to-left" id="co-vegan">Still remembers: vegan, no leather<small>from the August chat</small></div>
+  <svg id="cursor" viewBox="0 0 38 38"><path d="M6 3 L6 31 L13 24 L18 35 L23 33 L18 22 L28 22 Z" fill="#0F172A" stroke="#fff" stroke-width="2.4" stroke-linejoin="round"/></svg>
+  <div id="ripple"></div>
+  <div id="caps"></div>
+</div></div>
+<div id="bar"></div>
+
+<script>
+const RENDER = new URLSearchParams(location.search).has('render');
+if (RENDER) document.body.classList.add('render');
+const $ = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+const stage = $('#stage');
+let SCALE = 1;
+
+// 字幕：[开始, 结束, 文本]
+const CAPTIONS = [
+  [4.5, 7.4, "A longer context window isn't memory."],
+  [8.4, 10.9, "CueMem's answer: a small controller decides, before the LLM is called."],
+  [11.5, 14.6, "Maya's third chat with Cue. Her August and September chats are in memory."],
+  [14.8, 18.2, 'Cue answers from memory and cites the facts it used.'],
+  [18.4, 21.9, "The old budget isn't deleted. It's marked no longer true from Sep 12."],
+  [22.3, 25.4, '<q>The pair I showed you in August</q>: the photo comes back from memory.'],
+  [25.6, 31.6, 'Re-perception: the model sees the original photo again, not just a caption.'],
+  [31.9, 35.2, "Forgetting removes the fact's source and every reply that repeated it."],
+  [35.4, 39.3, "Memory is rebuilt from what's left. Ask again, and Cue doesn't know."],
+  [39.8, 44.2, 'A small trained controller picks the recall depth before the LLM runs.'],
+  [44.4, 48.3, 'It weighs expected accuracy against cost, and never calls an LLM itself.'],
+  [48.8, 52.9, 'Memory beats a long context: +17.5 points at 1/20 of the cost.'],
+  [53.1, 57.2, 'Against Mem0 with the same models: a tie on LoCoMo, +9 points on LongMemEval.'],
+];
+
+function box(el) {  // 舞台坐标
+  const s = stage.getBoundingClientRect(), r = el.getBoundingClientRect();
+  return { x: (r.left - s.left) / SCALE, y: (r.top - s.top) / SCALE, w: r.width / SCALE, h: r.height / SCALE };
+}
+
+const WORDS = new Map();
+function splitWords(el) {  // 拆成逐词出现的 span，保留加粗、角标等结构
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  const words = [];
+  for (const node of nodes) {
+    if (!node.textContent.trim()) continue;
+    const frag = document.createDocumentFragment();
+    for (const part of node.textContent.split(/(\s+)/)) {
+      if (!part) continue;
+      if (/^\s+$/.test(part)) { frag.append(part); continue; }
+      const w = document.createElement('span');
+      w.textContent = part;
+      frag.append(w);
+      words.push(w);
+    }
+    node.replaceWith(frag);
+  }
+  return words;
+}
+
+// ---------- 第 1 段的画布：越堆越多的对话 ----------
+const flood = $('#flood');
+const fctx = flood.getContext('2d');
+const FLOOD_T0 = 4.5, FLOOD_DT = 0.015, FLOOD_N = 168;
+const FLOOD = (() => {
+  let seed = 11;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const dates = { 0: 'Aug 28', 58: 'Sep 12', 112: 'Oct 10' };
+  const items = [];
+  let y = 20;
+  for (let i = 0; i < FLOOD_N; i++) {
+    if (dates[i]) { items.push({ date: dates[i], at: i, y, h: 28 }); y += 44; }
+    const user = i % 2 === 0;
+    const h = user ? 22 : 22 + 14 * Math.floor(rnd() * 3);
+    items.push({ user, at: i, w: user ? 140 + rnd() * 180 : 230 + rnd() * 250, h, y });
+    y += h + 10;
+  }
+  return items;
+})();
+
+function drawFlood(t) {
+  const W = flood.width, H = flood.height;
+  fctx.clearRect(0, 0, W, H);
+  const k = (t - FLOOD_T0) / FLOOD_DT;  // 已经出现的条数（带小数）
+  const shown = FLOOD.filter(it => it.at < k);
+  $('#tok').textContent = Math.round(105943 * Math.min(1, Math.max(0, k) / FLOOD_N) ** 2).toLocaleString('en-US');
+  if (!shown.length) return;
+  const last = shown[shown.length - 1];
+  const scroll = Math.max(0, last.y + last.h - (H - 70));
+  fctx.textAlign = 'center';
+  fctx.textBaseline = 'middle';
+  for (const it of shown) {
+    const y = it.y - scroll;
+    if (y < -60 || y > H) continue;
+    const fresh = Math.min(1, (k - it.at) / 4);
+    fctx.globalAlpha = fresh;
+    if (it.date) {
+      fctx.font = '600 16px Inter';
+      const tw = fctx.measureText(it.date).width + 28;
+      fctx.fillStyle = '#F1F5F9';
+      fctx.beginPath(); fctx.roundRect((W - tw) / 2, y, tw, 28, 14); fctx.fill();
+      fctx.fillStyle = '#64748B';
+      fctx.fillText(it.date, W / 2, y + 15);
+    } else {
+      fctx.fillStyle = it.user ? '#CCFBF1' : '#E2E8F0';
+      fctx.beginPath(); fctx.roundRect(it.user ? W - 28 - it.w : 28, y + (1 - fresh) * 12, it.w, it.h, 10); fctx.fill();
+    }
+  }
+  fctx.globalAlpha = 1;
+}
+
+// ---------- 时间线 ----------
+const T = gsap.timeline({ paused: true });
+const inn = (el, t, o = {}) => T.fromTo(el, { autoAlpha: 0, x: o.x || 0, y: o.y ?? 24, scale: o.s || 1 },
+  { autoAlpha: 1, x: 0, y: 0, scale: 1, duration: o.d || 0.6, ease: o.ease || 'power3.out', stagger: o.stagger || 0 }, t);
+const out = (el, t, o = {}) => T.to(el, { autoAlpha: 0, x: o.x || 0, y: o.y ?? -18, duration: o.d || 0.45, ease: 'power2.in' }, t);
+const pop = (el, t, o = {}) => inn(el, t, { y: 0, s: 0.85, d: 0.45, ease: 'back.out(2)', ...o });
+
+function typeIn(el, t, cps) {  // 逐字打出
+  const text = el.dataset.text, o = { n: 0 }, d = text.length / cps;
+  const span = document.createElement('span'), caret = document.createElement('i');
+  caret.className = 'caret';
+  el.textContent = '';
+  el.append(span, caret);
+  T.to(o, { n: text.length, duration: d, ease: 'none', onUpdate: () => { span.textContent = text.slice(0, Math.round(o.n)); } }, t);
+  T.to(caret, { autoAlpha: 0, duration: 0.01 }, t + d + 0.3);
+  return t + d;
+}
+function stream(el, t, per = 0.03) {  // 回答逐词出现
+  const words = WORDS.get(el);
+  T.fromTo(words, { opacity: 0 }, { opacity: 1, duration: 0.2, stagger: per, ease: 'none' }, t);
+  return t + words.length * per + 0.2;
+}
+function thinking(dots, t0, t1) {
+  inn(dots, t0, { y: 8, d: 0.25 });
+  const n = Math.max(1, Math.round((t1 - t0) / 0.44));
+  T.fromTo($$('i', dots), { y: 0 }, { y: -9, duration: 0.22, ease: 'sine.inOut', yoyo: true, repeat: n * 2 - 1, stagger: 0.12 }, t0);
+  T.to(dots, { autoAlpha: 0, duration: 0.12 }, t1);
+}
+function counter(el, t, d, to, fmt) {
+  const o = { v: 0 };
+  T.to(o, { v: to, duration: d, ease: 'power3.out', onUpdate: () => { el.textContent = fmt(o.v); } }, t);
+}
+function draw(path, t, d = 0.8) {  // 到了时刻才出现：圆头线帽在长度为 0 时也会画出一个点
+  const len = path.getTotalLength();
+  gsap.set(path, { strokeDasharray: len, strokeDashoffset: len });
+  T.set(path, { autoAlpha: 1 }, t);
+  T.to(path, { strokeDashoffset: 0, duration: d, ease: 'power2.inOut' }, t);
+}
+function chapter(i, t0, t1) {
+  const li = $$('#chapters li')[i];
+  T.to(li, { color: '#0F766E', backgroundColor: 'rgba(240,253,250,1)', borderColor: 'rgba(204,251,241,1)', duration: 0.3 }, t0);
+  T.to(li, { color: '#94A3B8', backgroundColor: 'rgba(240,253,250,0)', borderColor: 'rgba(204,251,241,0)', duration: 0.3 }, t1);
+}
+function svg(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  el.style.visibility = 'hidden';
+  $('#links').append(el);
+  return el;
+}
+
+function prep() {
+  // 用户的话先填上全文、回答先拆好词，量位置时的版面就和最终一致
+  for (const el of $$('.typed')) el.textContent = el.dataset.text;
+  for (const el of $$('[data-stream]')) WORDS.set(el, splitWords(el));
+  const widths = [58, 92, 46, 120, 64, 84, 52, 110, 70, 96, 48, 88, 62, 104, 56, 90, 66, 78, 50, 98];
+  const del = { 9: 'x', 10: 'x', 12: 're', 14: 're', 15: 're', 17: 're' };
+  widths.forEach((w, i) => {
+    const c = document.createElement('i');
+    c.className = 'tchip' + (i % 2 === 0 ? ' u' : '');
+    c.style.width = w + 'px';
+    if (del[i]) c.dataset.del = del[i];
+    $('#chips').append(c);
+  });
+}
+
+function measure() {
+  const at = {};
+  for (const id of ['chat', 'c-group', 'c-f2', 'c-f8', 'f2', 'f8', 'validity', 'slot', 'polimg', 'btnForget', 'leather',
+    'n-msg', 'n-probe', 'n-ctrl', 'decide', 'co-super', 'co-orig', 'co-vegan'])
+    at[id] = box($('#' + id));
+  return at;
+}
+
+function build(at) {
+  // ---------- 字幕 ----------
+  for (const [t0, t1, html] of CAPTIONS) {
+    const p = document.createElement('p');
+    p.className = 'cap';
+    p.innerHTML = html;
+    $('#caps').append(p);
+    T.fromTo(p, { autoAlpha: 0, y: 12 }, { autoAlpha: 1, y: 0, duration: 0.3, ease: 'power2.out' }, t0);
+    T.to(p, { autoAlpha: 0, y: -6, duration: 0.25, ease: 'power2.in' }, t1 - 0.25);
+  }
+
+  // ---------- 0 片名（0–4 s）----------
+  T.set('#s0', { autoAlpha: 1 }, 0);
+  T.fromTo('#mtl-line', { attr: { x2: 40 } }, { attr: { x2: 520 }, duration: 1.0, ease: 'power2.inOut' }, 0.15);
+  T.fromTo('.mtl-dot', { autoAlpha: 0, y: 10 }, { autoAlpha: 1, y: 0, duration: 0.4, stagger: 0.25, ease: 'back.out(2)' }, 0.3);
+  T.fromTo('#title span', { autoAlpha: 0, y: 70, rotateX: -70 }, { autoAlpha: 1, y: 0, rotateX: 0, duration: 0.7, stagger: 0.06, ease: 'back.out(1.6)' }, 0.45);
+  inn('#tagline', 1.2, { y: 20 });
+  inn('#pills li', 1.7, { y: 16, d: 0.45, stagger: 0.12 });
+  out('#s0', 3.55, { y: -40, d: 0.5 });
+
+  // ---------- 1 问题（4–11 s）----------
+  T.set('#s1', { autoAlpha: 1 }, 4.0);
+  inn('#ctx', 4.05, { x: -40, y: 0, d: 0.7 });
+  inn('.prob', 4.9, { x: 40, y: 0, d: 0.6, stagger: 0.55 });
+  T.to(['#ctx', '#problems'], { autoAlpha: 0, scale: 0.94, duration: 0.5, ease: 'power2.in' }, 7.4);
+  inn('#qtext', 7.85, { y: 30, d: 0.7 });
+  inn('.opt', 8.35, { y: 30, d: 0.6, stagger: 0.18 });
+  T.to('#optA', { opacity: 0.45, duration: 0.4 }, 9.3);
+  T.to('#optB', { borderColor: '#14B8A6', backgroundColor: '#F0FDFA', scale: 1.04, duration: 0.45, ease: 'back.out(2)' }, 9.3);
+  T.to('#optB .opt-k', { backgroundColor: '#14B8A6', color: '#FFFFFF', duration: 0.4 }, 9.3);
+  pop('#optTag', 9.45);
+  out('#s1', 10.6, { y: -30, d: 0.4 });
+
+  // ---------- 常驻：品牌与章节（11–57 s）----------
+  inn(['#brand', '#chapters'], 11.0, { y: -10, d: 0.5 });
+  chapter(0, 11.0, 22.0); chapter(1, 22.0, 31.8); chapter(2, 31.8, 39.5); chapter(3, 39.5, 48.5); chapter(4, 48.5, 57.1);
+  out(['#brand', '#chapters'], 57.1, { y: -10, d: 0.4 });
+
+  // ---------- 2 跨会话与知识更新（11–22 s）----------
+  T.set('#app', { autoAlpha: 1 }, 11.0);
+  inn('#chat', 11.0, { x: -50, y: 0, d: 0.7 });
+  inn('#mem', 11.15, { x: 50, y: 0, d: 0.7 });
+  inn('#foot', 11.6, { y: 0, d: 0.5 });
+  T.set('#mp-facts', { autoAlpha: 1 }, 11.3);
+  inn('#mp-facts > *', 11.5, { y: 14, d: 0.45, stagger: 0.07 });
+  T.to('.sess', { borderColor: '#5EEAD4', backgroundColor: '#F0FDFA', duration: 0.3, stagger: 0.15 }, 12.6);
+  T.to('.sess', { borderColor: '#E2E8F0', backgroundColor: '#F8FAFC', duration: 0.4 }, 14.6);
+  const g2 = $('#g2');
+  T.set(g2, { autoAlpha: 1 }, 12.2);
+  inn($('.msg.user', g2), 12.2, { y: 14, d: 0.35 });
+  const typed2 = typeIn($('.typed', g2), 12.4, 38);
+  thinking($('.dots', g2), typed2 + 0.3, typed2 + 1.0);
+  const a2 = $('.msg.bot', g2);
+  inn(a2, typed2 + 1.0, { y: 10, d: 0.3 });
+  const a2done = stream(a2, typed2 + 1.05);
+  T.fromTo(['#c-f2', '#c-f8'], { scale: 1 }, { scale: 1.6, duration: 0.22, yoyo: true, repeat: 1, ease: 'power2.out' }, a2done + 0.05);
+  // 引用角标连到右侧的两条事实：线从这一句的句末出发，不压住角标
+  T.to('#c-f2', { color: '#B45309', duration: 0.2 }, a2done + 0.05);
+  const G = at['c-group'];
+  [[at['f2'], '#F59E0B', -4], [at['f8'], '#14B8A6', 4]].forEach(([f, color, dy], i) => {
+    const a = { x: G.x + G.w + 10, y: G.y + G.h / 2 + dy }, b = { x: f.x - 6, y: f.y + f.h / 2 };
+    const mx = (a.x + b.x) / 2;
+    const p = svg('path', { d: `M${a.x},${a.y} C${mx},${a.y} ${mx},${b.y} ${b.x},${b.y}`, fill: 'none', stroke: color, 'stroke-width': 3, 'stroke-linecap': 'round' });
+    const end = svg('circle', { cx: b.x, cy: b.y, r: 6, fill: color });
+    const t = a2done + 0.35 + i * 0.15;
+    draw(p, t, 0.7);
+    T.set(end, { autoAlpha: 1 }, t + 0.7);
+    T.to([p, end], { autoAlpha: 0, duration: 0.3 }, 21.5);
+  });
+  T.to('#c-f2', { color: '#0F766E', duration: 0.3 }, 21.5);
+  T.to('#f2', { backgroundColor: 'rgba(255,251,235,1)', borderColor: 'rgba(252,211,77,1)', duration: 0.35 }, a2done + 1.0);
+  T.to('#f8', { backgroundColor: 'rgba(240,253,250,1)', borderColor: 'rgba(153,246,228,1)', duration: 0.35 }, a2done + 1.15);
+  T.fromTo('#f2s', { scale: 1 }, { scale: 1.12, duration: 0.25, yoyo: true, repeat: 1 }, 18.5);
+  T.fromTo('#validity .v1', { autoAlpha: 0, scaleX: 0, transformOrigin: 'left center' }, { autoAlpha: 1, scaleX: 1, duration: 0.6, ease: 'power2.out' }, 18.6);
+  T.fromTo('#validity .v2', { autoAlpha: 0, scaleX: 0, transformOrigin: 'left center' }, { autoAlpha: 1, scaleX: 1, duration: 0.7, ease: 'power2.out' }, 19.1);
+  const V = at['validity'], CS = at['co-super'];
+  T.set('#co-super', { left: V.x - CS.w - 26, top: V.y + V.h / 2 - CS.h / 2 }, 0);
+  pop('#co-super', 19.6, { x: -20 });
+  out('#co-super', 21.5, { d: 0.3, y: 0 });
+  T.to(['#f2', '#f8'], { backgroundColor: 'rgba(248,250,252,0)', borderColor: 'rgba(226,232,240,0)', duration: 0.3 }, 21.6);
+  out(g2, 21.8, { y: -30, d: 0.4 });
+  out('#mp-facts', 21.9, { y: 0, d: 0.35 });
+
+  // ---------- 3 照片：按八月那张图找同款（22–31.8 s）----------
+  const g3 = $('#g3');
+  T.set(g3, { autoAlpha: 1 }, 22.3);
+  inn($('.msg.user', g3), 22.3, { y: 14, d: 0.35 });
+  const typed3 = typeIn($('.typed', g3), 22.45, 46);
+  T.set('#mp-photo', { autoAlpha: 1 }, 22.4);
+  inn('#mp-photo > *', 22.5, { y: 16, d: 0.5, stagger: 0.12 });
+  inn('#trace3', typed3 + 0.2, { y: 8, d: 0.35 });
+  T.fromTo('#trace3 .chip', { scale: 0.6 }, { scale: 1, duration: 0.4, stagger: 0.15, ease: 'back.out(2.4)' }, typed3 + 0.25);
+  // 照片从记忆里飞出、放大，再落进"交给模型"的位置
+  const P = at['polimg'], S = at['slot'], C = at['chat'], CO = at['co-orig'];
+  const big = { w: 540, h: 400 };
+  const bigAt = { x: C.x + (C.w - big.w) / 2, y: C.y + 230 };
+  T.set('#flyer', { x: P.x, y: P.y, width: P.w, height: P.h, rotate: -2, autoAlpha: 0 }, 0);
+  T.set('#flyer', { autoAlpha: 1 }, 24.5);
+  T.to('#flyer', { x: bigAt.x, y: bigAt.y, width: big.w, height: big.h, rotate: 0, duration: 0.85, ease: 'power3.inOut' }, 24.55);
+  T.set('#co-orig', { left: bigAt.x + (big.w - CO.w) / 2, top: bigAt.y + big.h + 22 }, 0);
+  pop('#co-orig', 25.3);
+  out('#co-orig', 26.75, { d: 0.25, y: 0 });
+  T.to('#flyer', { x: S.x, y: S.y, width: S.w, height: S.h, duration: 0.6, ease: 'power3.inOut' }, 26.95);
+  T.set('#flyer', { autoAlpha: 0 }, 27.55);
+  T.set('#slot img', { autoAlpha: 1 }, 27.55);
+  T.to('#slot', { outlineColor: '#F59E0B', outlineStyle: 'solid', duration: 0.01 }, 27.55);
+  const tool = $('#tool3');
+  inn(tool, 27.6, { y: 8, d: 0.3 });
+  const typedTool = typeIn($('.typed', tool), 27.7, 70);
+  inn('#ret3', typedTool + 0.1, { y: 0, x: -8, d: 0.3 });
+  const a3 = $('#a3');
+  inn(a3, typedTool + 0.35, { y: 10, d: 0.3 });
+  const [p1, p2] = $$('[data-stream]', a3);
+  const p1done = stream(p1, typedTool + 0.45, 0.028);
+  inn('#a3 figure', p1done - 0.1, { y: 18, s: 0.95, d: 0.45, stagger: 0.15 });
+  const p2done = stream(p2, p1done + 0.4, 0.028);
+  T.to('#leather', { backgroundColor: 'rgba(254,243,199,1)', duration: 0.3 }, p2done + 0.05);
+  const LE = at['leather'], CV = at['co-vegan'];
+  T.set('#co-vegan', { left: C.x + C.w + 30, top: LE.y + LE.h / 2 - CV.h / 2 }, 0);
+  pop('#co-vegan', p2done + 0.15, { x: 20 });
+  out('#co-vegan', 31.5, { d: 0.3, y: 0 });
+
+  // ---------- 4 遗忘（31.8–39.5 s）----------
+  T.to(g3, { opacity: 0.25, duration: 0.4 }, 31.8);
+  out('#mp-photo', 31.8, { y: 0, d: 0.3 });
+  T.set('#mp-forget', { autoAlpha: 1 }, 32.0);
+  inn('#mp-forget > :not(.result)', 32.0, { y: 14, d: 0.4, stagger: 0.1 });
+  inn('#chips i', 32.3, { y: 0, s: 0.5, d: 0.3, stagger: 0.025 });
+  const BF = at['btnForget'];
+  const click = { x: BF.x + BF.w / 2, y: BF.y + BF.h / 2 };
+  T.set('#cursor', { left: click.x + 240, top: click.y + 320, autoAlpha: 0 }, 0);
+  T.set('#cursor', { autoAlpha: 1 }, 32.4);
+  T.to('#cursor', { left: click.x - 6, top: click.y - 3, duration: 0.7, ease: 'power3.inOut' }, 32.4);
+  T.to('#cursor', { scale: 0.82, duration: 0.09, yoyo: true, repeat: 1 }, 33.15);
+  T.to('#btnForget', { scale: 0.94, backgroundColor: '#FEE2E2', duration: 0.09, yoyo: true, repeat: 1 }, 33.15);
+  T.set('#ripple', { x: click.x, y: click.y, scale: 0.3, autoAlpha: 1 }, 33.2);
+  T.to('#ripple', { scale: 2.2, autoAlpha: 0, duration: 0.6, ease: 'power2.out' }, 33.2);
+  out('#cursor', 33.8, { y: 20, d: 0.3 });
+  const hit = $$('#chips i[data-del="x"]'), restated = $$('#chips i[data-del="re"]');
+  T.to(hit, { backgroundColor: '#EF4444', duration: 0.25, stagger: 0.12 }, 33.4);
+  restated.forEach((c, i) => {
+    T.set(c, { background: 'repeating-linear-gradient(135deg, #EF4444 0 3px, #FCA5A5 3px 6px)' }, 33.65 + i * 0.12);
+    T.fromTo(c, { scale: 1 }, { scale: 1.15, duration: 0.12, yoyo: true, repeat: 1 }, 33.65 + i * 0.12);
+  });
+  inn('#legend', 33.8, { y: 6, d: 0.3 });
+  T.to([...hit, ...restated], { width: 0, marginRight: -8, autoAlpha: 0, duration: 0.45, ease: 'power2.inOut', stagger: 0.05 }, 34.6);
+  inn('#result', 34.75, { y: 10, d: 0.35 });
+  const fo = { v: 15 };
+  T.to(fo, { v: 12, duration: 0.8, ease: 'none', onUpdate: () => { $('#factsN').textContent = `15 → ${Math.round(fo.v)}`; } }, 34.9);
+  T.to(g3, { autoAlpha: 0, duration: 0.3 }, 35.2);
+  const g4 = $('#g4');
+  T.set(g4, { autoAlpha: 1 }, 35.4);
+  inn($('.msg.user', g4), 35.4, { y: 14, d: 0.35 });
+  const typed4 = typeIn($('.typed', g4), 35.55, 34);
+  thinking($('.dots', g4), typed4 + 0.25, typed4 + 0.85);
+  const a4 = $('.msg.bot', g4);
+  inn(a4, typed4 + 0.85, { y: 10, d: 0.3 });
+  const a4done = stream(a4, typed4 + 0.9);
+  pop('#ok4', a4done + 0.2);
+  out('#app', 39.15, { y: -20, d: 0.4 });
+
+  // ---------- 5 控制器（39.5–48.5 s）----------
+  T.set('#s5', { autoAlpha: 1 }, 39.5);
+  inn('#s5 .sc-title', 39.55, { y: 20, d: 0.5 });
+  inn('#s5 .node', 39.75, { y: 24, d: 0.5, stagger: 0.18 });
+  $$('#s5 .arrow path').forEach((p, i) => draw(p, 40.0 + i * 0.18, 0.4));
+  const M = at['n-msg'], R = at['n-probe'], K = at['n-ctrl'], D = at['decide'];
+  const cy = M.y + M.h / 2;
+  T.set('#pulse', { x: M.x + M.w + 4, y: cy, autoAlpha: 0 }, 0);
+  T.set('#pulse', { autoAlpha: 1 }, 40.9);
+  T.to('#pulse', { x: R.x - 4, duration: 0.3, ease: 'power1.inOut' }, 40.9);
+  T.set('#pulse', { autoAlpha: 0 }, 41.2);
+  T.to('#n-probe', { borderColor: '#14B8A6', duration: 0.18, yoyo: true, repeat: 1 }, 41.2);
+  T.set('#pulse', { x: R.x + R.w + 4, autoAlpha: 1 }, 41.6);
+  T.to('#pulse', { x: K.x - 4, duration: 0.3, ease: 'power1.inOut' }, 41.6);
+  T.set('#pulse', { autoAlpha: 0 }, 41.9);
+  T.fromTo('#n-ctrl', { scale: 1 }, { scale: 1.04, duration: 0.15, yoyo: true, repeat: 1 }, 41.9);
+  $('#ctrl-path').setAttribute('d', `M${K.x + K.w / 2},${K.y + K.h + 4} L${K.x + K.w / 2},${D.y - 4}`);
+  draw($('#ctrl-path'), 42.1, 0.35);
+  inn('#decide', 42.4, { y: 16, d: 0.45 });
+  T.fromTo('#decide .track i', { scaleX: 0 }, { scaleX: 1, duration: 0.7, stagger: 0.12, ease: 'power3.out' }, 42.7);
+  T.to('#win', { backgroundColor: 'rgba(240,253,250,1)', borderColor: 'rgba(20,184,166,1)', duration: 0.35 }, 43.9);
+  T.to('#win .track i', { backgroundColor: '#14B8A6', duration: 0.35 }, 43.9);
+  pop('#chosen', 44.0);
+  inn('#sc0', 44.6, { x: -30, y: 0, d: 0.5 });
+  inn('#sc1', 45.6, { x: -30, y: 0, d: 0.5 });
+  inn('#sc2', 46.5, { x: -30, y: 0, d: 0.5 });
+  out('#s5', 48.15, { y: -24, d: 0.4 });
+
+  // ---------- 6 结果（48.5–57.4 s）----------
+  T.set('#s6', { autoAlpha: 1 }, 48.5);
+  inn('#s6 .sc-title', 48.55, { y: 20, d: 0.5 });
+  inn('#r1', 48.8, { y: 30, d: 0.55 });
+  $$('#r1 .hrow').forEach((row, i) => {
+    const t = 49.2 + i * 0.45, b = $('b', row);
+    T.fromTo($('.htrack i', row), { scaleX: 0 }, { scaleX: 1, duration: 0.9, ease: 'power3.out' }, t);
+    counter(b, t, 0.9, parseFloat(b.dataset.n), v => v.toFixed(1) + '%');
+  });
+  pop('#r1 .dl', 50.7, { stagger: 0.18 });
+  inn('#r1 .r-note', 51.1, { y: 8, d: 0.4 });
+  inn('#r2', 51.4, { y: 30, d: 0.55 });
+  $$('#r2 .vbar').forEach((bar, i) => {
+    const t = 51.8 + i * 0.16, b = $('b', bar);
+    const h = parseFloat(getComputedStyle($('i', bar)).height);  // 长高度而不是缩放，数值标签跟着柱顶走
+    T.fromTo($('i', bar), { height: 0 }, { height: h, duration: 0.8, ease: 'power3.out' }, t);
+    counter(b, t, 0.8, parseFloat(b.dataset.n), v => v.toFixed(1) + '%');
+  });
+  pop('#r2 .dl', 53.0, { stagger: 0.2 });
+  inn('#r2 .dl-note', 53.5, { y: 6, d: 0.4 });
+  inn('.trust span', 54.3, { y: 14, d: 0.45, stagger: 0.25 });
+  out('#s6', 57.0, { y: -24, d: 0.4 });
+
+  // ---------- 7 收尾（57.4–60 s）----------
+  T.set('#s7', { autoAlpha: 1 }, 57.4);
+  T.fromTo('#title2 span', { autoAlpha: 0, y: 50 }, { autoAlpha: 1, y: 0, duration: 0.55, stagger: 0.05, ease: 'back.out(1.6)' }, 57.45);
+  inn('#s7 .end-url', 57.9, { y: 16, d: 0.45 });
+  inn('#s7 .end-sub', 58.15, { y: 12, d: 0.45 });
+  T.set({}, {}, 60.0);  // 片尾停到 60 秒
+}
+
+function fit() {
+  if (RENDER) return;
+  SCALE = Math.min(innerWidth / 1920, innerHeight / 1080);
+  stage.style.transform = `scale(${SCALE}) translate(-50%, -50%)`;
+}
+
+async function init() {
+  const fonts = ['400 20px Inter', '500 20px Inter', '600 20px Inter', '700 20px Inter', '800 20px Inter',
+    '500 20px "JetBrains Mono"', '600 20px "JetBrains Mono"'];
+  await Promise.all(fonts.map(f => document.fonts.load(f)));
+  await document.fonts.ready;
+  await Promise.all([...document.images].map(img => img.decode().catch(() => {})));
+  prep();
+  const at = measure();  // 舞台此时未缩放
+  build(at);
+  T.seek(0);
+  drawFlood(0);
+  window.cuemem = { duration: T.duration(), seek(t) { T.seek(t, false); drawFlood(t); }, ready: true };
+  if (!RENDER) preview();
+}
+
+function preview() {
+  fit();
+  addEventListener('resize', fit);
+  T.play(0);
+  gsap.ticker.add(() => {
+    drawFlood(T.time());
+    $('#bar').style.width = (T.time() / T.duration() * 100) + '%';
+  });
+  addEventListener('keydown', e => {
+    if (e.code === 'Space') T.paused(!T.paused());
+    if (e.code === 'ArrowRight') T.seek(Math.min(T.duration(), T.time() + 2));
+    if (e.code === 'ArrowLeft') T.seek(Math.max(0, T.time() - 2));
+    if (e.key === 'r' || e.key === 'R') T.play(0);
+  });
+}
+
+init();
+</script>
+</body>
+</html>
