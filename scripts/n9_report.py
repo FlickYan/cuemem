@@ -46,7 +46,7 @@ from cuemem.evals.report import (
     method_stats,
 )
 from cuemem.evals.splits import load_split
-from cuemem.read.controller import HYBRID_BAND, HYBRID_CONFIDENCE, LearnedController
+from cuemem.read.controller import HYBRID_BAND, HYBRID_CONFIDENCE, V1_MODEL, LearnedController
 
 sys.path.insert(0, str(Path(__file__).parent))
 import n7_controller as N7
@@ -622,7 +622,7 @@ def plot_readers(section: dict[str, Any], path_for: Callable[[str], Path]) -> No
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(parents=True, exist_ok=True)
-    ctrl = LearnedController.load()
+    ctrl = LearnedController.load(V1_MODEL)  # N9 冻结评测的是 v1
     results: dict[str, Any] = {
         "created": datetime.now().isoformat(timespec="seconds"),
         "lambda": ctrl.lam,

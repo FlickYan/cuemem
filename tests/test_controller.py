@@ -14,6 +14,7 @@ import pytest
 from fakes import TOY_CONVERSATION, FakeAPI
 from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
 
+from cuemem.api.service import english_reason
 from cuemem.config import Settings
 from cuemem.core.models import Conversation
 from cuemem.evals import routing as R
@@ -178,6 +179,74 @@ def test_training_and_runtime_controllers_agree(tmp_path: Path) -> None:
             want = R.decide(proba, costs, lam, list(proba))
             got = runtime.decide(it.features, has_images=it.has_images, lam=lam)
             assert got.action == want
+
+
+def test_v2_training_and_runtime_agree_with_the_image_table(tmp_path: Path) -> None:
+    """v2（有图的空间查有图的准确率表）：离线导出的 JSON 与运行时的选择同样逐题一致。"""
+    items = synthetic_items()
+    model = R.fit_two_stage(items, ["q_aggregation", "p_round_top1", "m_media"], by_images=True)
+    assert model.accuracy.image is not None
+    exported = model.to_json(lam=20.0, meta={})
+    assert exported["version"] == "n11-two-stage-v2" and "accuracy_images" in exported
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(exported), encoding="utf-8")
+    runtime = LearnedController.load(path)
+    offline = model.predict(items)
+    for lam in (0.0, 20.0, 300.0):
+        for it, proba in zip(items, offline, strict=True):
+            costs = {a: model.costs.of(a) for a in proba}
+            want = R.decide(proba, costs, lam, list(proba))
+            got = runtime.decide(it.features, has_images=it.has_images, lam=lam)
+            assert got.action == want
+
+
+def test_v2_image_table_does_not_saturate(tmp_path: Path) -> None:
+    """v1 把看图增益加到合并的准确率上再截断：L1、L2 都到 1.0、打平，总选便宜的 L1。
+    v2 直接查有图的表，L2 + 看图确实更准时（且值这个价）就选它。"""
+    single = {"single": 1.0}
+    v1 = toy_controller(
+        tmp_path,
+        see_gain={**TOY_MODEL["see_gain"], "single": {"L1": 0.3, "L2": 0.3}},
+    )
+    p1 = v1.model.action_proba(single, has_images=True)
+    assert p1["L1+see"] == p1["L2+see"] == 1.0
+    images = {
+        t: {"L0": 0.0, "L1": 0.4, "L2": 0.45, "L1+see": 0.65, "L2+see": 0.8}
+        for t in ("multi", "single")
+    }
+    images["none"] = dict.fromkeys(("L0", "L1", "L2", "L1+see", "L2+see"), 1.0)
+    v2 = toy_controller(tmp_path, accuracy_images=images)
+    p2 = v2.model.action_proba(single, has_images=True)
+    assert p2["L1+see"] == 0.65 and p2["L2+see"] == 0.8
+    # 没有图的空间不受影响
+    assert v2.model.action_proba(single, has_images=False) == v1.model.action_proba(
+        single, has_images=False
+    )
+
+
+def test_image_floor_lifts_visual_questions_out_of_l0(tmp_path: Path) -> None:
+    """保底（D-052）：有图的空间里问画面细节，门控再确信"与记忆无关"也至少 L1 + 看图。"""
+    images = {
+        t: {"L0": 0.0, "L1": 0.4, "L2": 0.45, "L1+see": 0.65, "L2+see": 0.8}
+        for t in ("multi", "single")
+    }
+    images["none"] = dict.fromkeys(("L0", "L1", "L2", "L1+see", "L2+see"), 1.0)
+    ctrl = toy_controller(tmp_path, accuracy_images=images, image_floor=["q_visual", "q_scene"])
+    unrelated = {"q_aggregation": 0.0, "p_round_top1": 0.0}  # 门控：几乎肯定与记忆无关
+    assert ctrl.decide(unrelated, has_images=True).level == "L0"
+    visual = {**unrelated, "q_scene": 1.0}
+    decision = ctrl.decide(visual, has_images=True)
+    assert decision.action == "L1+see" and "画面细节" in decision.reasons[-1]
+    assert english_reason(decision.reasons[-1]).startswith("asks about details in a photo")
+    assert ctrl.decide(visual, has_images=False).level == "L0"  # 没有图的空间不保底
+    # v1 的模型文件没有 image_floor：行为不变
+    assert toy_controller(tmp_path).decide(visual, has_images=True).level == "L0"
+
+
+def test_scene_reference_cue() -> None:
+    assert query_features("What color is the metal structure on the far left?")["q_scene"] == 1
+    assert query_features("Examine the readout shown in the photo.")["q_scene"] == 1
+    assert query_features("How do I make sourdough bread?")["q_scene"] == 0
 
 
 def test_two_stage_learns_the_types() -> None:

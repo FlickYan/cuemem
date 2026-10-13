@@ -166,6 +166,9 @@ class RetrievalConfig(BaseModel):
     naive_k: int = 8
     fact_k: int = 10  # 事实增强检索：放进上下文的事实条数（不含沿版本链补进来的）
     fact_pool: int = 50  # 事实增强检索：一次向量检索取回的候选数（轮与事实合计）
+    # 检索控制器的模型文件：相对路径相对 src/cuemem/read/。默认是 v2（N11）；
+    # 复现 N7 / N9 的数字时用 controller_model_v1.json
+    controller: str = "controller_model.json"
 
 
 class ConsolidationConfig(BaseModel):

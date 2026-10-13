@@ -16,10 +16,12 @@ cuemem chat --space S [--at T]        在终端里与 Agent 对话（N8）
 cuemem serve [--port 7860]            启动 HTTP 接口与演示界面（FastAPI + Gradio）
 cuemem demo SCRIPT [--until N]        按演示剧本回放对话并核对回答
 cuemem mcp --space S                  以 MCP Server（stdio）提供 remember / recall / forget
+cuemem migrate-vectors --to URL       把本地向量库复制到 Qdrant 服务端（N11）
 """
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -367,14 +369,27 @@ def serve(
     """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。"""
     import uvicorn
 
-    from cuemem.api.app import create_app
+    from cuemem.api.app import TOKEN_ENV, create_app
 
     settings, service = _service(space, scenario, router, lam)
+    token = os.environ.get(TOKEN_ENV) or None  # _service 加载配置时已读入 .env
     try:
-        app_ = create_app(service, upload_dir=settings.paths.media.parent / "uploads", ui=not no_ui)
+        app_ = create_app(
+            service,
+            upload_dir=settings.paths.media.parent / "uploads",
+            ui=not no_ui,
+            token=token,
+        )
         console.print(
             f"界面：[bold]http://{host}:{port}/[/bold] · 接口文档：http://{host}:{port}/docs"
         )
+        if token:
+            console.print(f"已启用访问令牌（{TOKEN_ENV}）：接口要带 Bearer 令牌，界面要先登录")
+        elif host not in ("127.0.0.1", "localhost", "::1"):
+            console.print(
+                f"[yellow]注意：[/yellow]监听 {host} 但没有设置 {TOKEN_ENV}，"
+                "能连到这台机器的人都能读写、删除记忆"
+            )
         uvicorn.run(app_, host=host, port=port, log_level="warning")
     finally:
         service.close()
@@ -488,6 +503,48 @@ def demo(
         _print_usage_rows(service.system.ledger.summary(run_id=service.system.ledger.run_id))
     finally:
         service.close()
+
+
+@app.command("migrate-vectors")
+def migrate_vectors(
+    to: Annotated[str, typer.Option("--to", help="Qdrant 服务端地址，如 http://localhost:6333")],
+) -> None:
+    """把本地模式的向量库原样复制到 Qdrant 服务端（改用服务端之前运行一次）。
+
+    数据库里已有的记忆不会被重新写入向量库，所以直接切换会得到一个空的向量库。
+    """
+    from cuemem.store.vector import VectorStore
+
+    settings = load_settings()
+    if settings.vector_store.url:
+        console.print(
+            "[red]当前已经在用服务端[/red]（CUEMEM_VECTOR_STORE__URL）：这个命令只从本地模式迁出"
+        )
+        raise typer.Exit(1)
+    try:
+        source = VectorStore(settings.paths.qdrant, dim=settings.embedding.dim)
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{exc}")
+        raise typer.Exit(1) from exc
+    target = VectorStore(None, dim=settings.embedding.dim, url=to)
+    try:
+        counts = source.copy_into(target)
+    except Exception as exc:  # 命令行的边界：连不上服务端、版本不兼容……都给一句能看懂的话
+        console.print(f"[red]复制失败[/red]（{to}）：{exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        source.close()
+        target.close()
+    if not counts:
+        console.print("本地向量库里没有集合，不需要迁移")
+        return
+    table = Table(title=f"已复制到 {to}")
+    table.add_column("集合")
+    table.add_column("点数", justify="right")
+    for name, count in counts.items():
+        table.add_row(name, str(count))
+    console.print(table)
+    console.print(f"下一步：在 .env 里加上 [bold]CUEMEM_VECTOR_STORE__URL={to}[/bold]")
 
 
 @app.command("mcp")
@@ -646,11 +703,13 @@ app.add_typer(eval_app, name="eval")
 
 @data_app.command("download")
 def data_download(
-    names: Annotated[list[str] | None, typer.Argument(help="数据集名，默认全部")] = None,
+    names: Annotated[
+        list[str] | None, typer.Argument(help="数据集名，默认全部（可选的只在点名时下载）")
+    ] = None,
 ) -> None:
     """下载评测数据集到 data/datasets（已存在则跳过）。"""
     settings = load_settings()
-    for name in names or list(DATASETS):
+    for name in names or [n for n, spec in DATASETS.items() if not spec.optional]:
         if name not in DATASETS:
             console.print(f"[red]未知数据集 {name}[/red]，可选：{', '.join(DATASETS)}")
             raise typer.Exit(1)

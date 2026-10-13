@@ -1,6 +1,6 @@
 # CueMem design
 
-> v1.0 · 2026-10-13 · English edition of [docs/design.md](../design.md). This document explains what the system does and why. The test-set results are in the [technical report](report.md). Design decisions are recorded in Chinese in [decisions.md](../decisions.md), cited here as D-xxx. The design was drafted in N0, and each section was filled in with the implementation as its node was completed.
+> v1.1 · 2026-10-13 · English edition of [docs/design.md](../design.md). This document explains what the system does and why. The test-set results are in the [technical report](report.md). Design decisions are recorded in [decisions.md](decisions.md) ([中文](../decisions.md)), cited here as D-xxx. The design was drafted in N0, and each section was filled in with the implementation as its node was completed.
 
 ## 0. Summary
 
@@ -11,7 +11,7 @@
   3. **Multimodal memory cannot store text descriptions only.** Compressing for the index is fine, but answering must be able to look at the original again.
 - **Approach.** Three pillars, with evaluation first:
   - **Write.** An immutable log, consolidated asynchronously into facts with bi-temporal validity, an entity graph, multi-granularity indexes and a user profile.
-  - **Read.** A memory probe that calls no LLM (tens of milliseconds) feeds a **retrieval controller**. The controller makes a cost-aware choice between L0 (no retrieval), L1 (fast recall) and L2 (deep recall).
+  - **Read.** A memory probe that calls no LLM (one retrieval scoring pass; measured p50 0.2–0.5 s, mostly the query embedding) feeds a **retrieval controller**. The controller makes a cost-aware choice between L0 (no retrieval), L1 (fast recall) and L2 (deep recall).
   - **Multimodal.** Context-aware captions and visual embeddings serve as the index, and the original photos are **re-perceived** at answer time when needed.
 - **Deliverables.**
   - Accuracy–cost Pareto curves, ablations and error analysis on LongMemEval and LoCoMo (text) and MemLens (images and text), all under one evaluation framework.
@@ -47,7 +47,7 @@
 - For **private memory**, the model's parameters never contained the user's information. Asked "what is my dog's name?", a model may confidently invent a name or simply refuse, so its uncertainty is not a reliable signal.
 - What matters is **whether this turn depends on the user's past**, and two kinds of cheap signals can tell:
   - **Cues in the query:** first person and possessives ("my"), references ("that one", "last time"), temporal expressions ("last week", "in March"), aggregation and order words ("how many times", "the first"), visual-detail words ("in the photo", "what color").
-  - **Feedback from a memory probe:** one hybrid retrieval of a few tens of milliseconds with the current query. Is there a strong hit? Are hits concentrated in one session or spread over many? Are entities hit? Are superseded facts among them?
+  - **Feedback from a memory probe:** one hybrid retrieval with the current query, with no LLM call. Is there a strong hit? Are hits concentrated in one session or spread over many? Are entities hit? Are superseded facts among them?
 
 This matches where leading systems went in 2026. Agent Zero Memory explicitly aims for *memory-driven rather than model-driven* quality, with an intent gate on its read path, and its accuracy varies by only 3.4 points across 8 LLM backbones. This project differs in treating the controller as a **first-class, separately evaluated, learnable component**, with:
 
@@ -236,7 +236,7 @@ pending jobs ──parallel──▶ A extract: one LLM call per session → fac
 |---|---|---|
 | Extraction | One structured LLM call. Facts: subject–predicate–object, a self-contained statement, category, cardinality, event date, importance, source turns. Also entities and a session summary | qwen3.8-flash (D-018); only the first 600 characters of each assistant reply; response cache, so a shared session is extracted once |
 | Entity linking | Merge new entities into existing ones ("Max", "Maxie"); "the user's name is Lin Xiao" makes "Lin Xiao" point to the user | Exact name or alias match → description embedding similarity → an LLM only in the grey zone |
-| Fact reconciliation | Compare with existing facts: ADD / SUPERSEDE / MERGE / NOOP (§5.3) | Merge, negation and multi-value accumulation by rule; supersession confirmed by an LLM, with a session's grey-zone facts batched into one call |
+| Fact reconciliation | Compare with existing facts: ADD / SUPERSEDE / MERGE / NOOP (§5.3) | Merge, negation and multi-value accumulation by rule; supersession confirmed by an LLM, with a session's grey-zone facts batched into one call, each with the message it came from (to tell a correction from a change, N11) |
 | Multi-granularity index | Facts, summaries and entities go into the vector index; facts serve as "augmented keys" pointing back to raw turns | Batched embedding plus a content-hash cache |
 | Profile update | Pick important, currently valid facts and generate a length-capped core memory | Rules, no LLM (D-022) |
 | Image captions | A VLM writes a caption, OCR text, tags and entity binding, seeing the image together with the turns around it (§7) | Each image processed once |
@@ -316,7 +316,7 @@ Every turn includes the system instructions, the core memory (user profile) and 
 
 ### 6.2 The memory probe
 
-The probe runs every turn and **calls no LLM**; the target is tens of milliseconds. It does one query embedding (needed anyway), one hybrid retrieval (top-K), and rule-based cue extraction, and outputs the controller's features.
+The probe runs every turn and **calls no LLM**. It does one query embedding (needed anyway), one hybrid retrieval (top-K), and rule-based cue extraction, and outputs the controller's features. The design target was tens of milliseconds; the measured times below are dominated by the embedding API (about 110 ms per query) and local Qdrant search in large spaces.
 
 **Implementation** (`read/probe.py`): the probe is one L1 scoring pass, and every route's raw scores travel with the candidates. When the controller picks L1, those candidates are packed directly, with no second retrieval. There are 54 features:
 
@@ -328,7 +328,7 @@ The probe runs every turn and **calls no LLM**; the target is tens of millisecon
   - top-1 for photo captions and for text-to-image search.
 - **4 memory-size features**: sessions, turns, current facts, images.
 
-Two post-answer features (claims insufficient evidence, sounds like "I don't know") are used only for reactive escalation.
+Two post-answer features (claims insufficient evidence, sounds like "I don't know") are used only for reactive escalation. Since N11 there is also a position cue, `q_scene`, used only by controller v2's floor rule and not by the classifiers.
 
 Probe time at p50 is 56 ms on LoCoMo, 169 ms on MemLens and 271 ms on LongMemEval: larger spaces are slower with local Qdrant. The planned "conversation state" features were not implemented, because all three benchmarks ask single questions and have no conversation state to evaluate.
 
@@ -366,9 +366,16 @@ $$
   - **The gate does not transfer zero-shot to a new conversation style** (LoCoMo across datasets: 86.5% → 43.9%). Twenty labelled target examples bring it back to 85.7%.
   - **Reactive escalation on top of prediction** adds 0.5 points for +10% cost and is off by default.
   - **With a different reader (qwen3.8-flash), agentic retrieval (B3) became the best method**, so H3 failed. The agent therefore keeps it as an escape hatch (D-041, D-042).
-  - **Known issues found on the test sets (N9), recorded and not fixed** (D-048):
+  - **Known issues found on the test sets (N9), recorded and not fixed at the time** (D-048):
     - the photo gain is added and clipped at 1.0, so L1 + photos ties with L2 + photos and the cheaper one always wins;
     - the per-level accuracy is calibrated on the main reader.
+
+**N11 revision: controller v2** (D-052; the N9 issues fixed on the development set, with the test sets only replayed post hoc):
+
+- In a space with photos, the controller no longer adds a photo gain to the no-photo success rate and clips at 1.0 (which clipped both levels to 1.0 and lost their order). It looks up an image-space accuracy table instead: reasoning type × {L0, L1, L2, L1 + photos, L2 + photos}, estimated only from training questions with photos and shrunk towards the overall mean in the same way.
+- In a space with photos, a question with a visual cue or a position cue (a new feature, `q_scene`, used only by this rule and not by the classifiers) is lifted from L0 to L1 + photos.
+- The gate, the reasoning-type model and λ are unchanged. The frozen v1 is kept as `controller_model_v1.json` for reproducing N7 and N9; the `retrieval.controller` setting chooses the model file.
+- Development set 81.2% → 81.7%; post-hoc test replay 81.6% → 81.9%, all of it on MemLens. For a new reader, recalibrating the accuracy table does not help, while setting λ per reader does (λ = 15 recovers most of the gap to always-L2 at 16–24% lower cost).
 
 **Online learning (extension).** In production only the chosen action's outcome is observed (partial feedback), so the problem becomes a contextual bandit (LinUCB / Thompson sampling):
 
@@ -642,6 +649,7 @@ All methods use **the same reader and the same judge**:
 | B6 | This system + learned controller (N7) | Probe + two-stage controller choosing among L0 / L1 / L2 and whether to re-perceive, by λ; sweeping λ draws the curve; default λ = 30 |
 | B6h / B6z | Hybrid / zero-shot LLM router (N7) | B6h asks an LLM once when the gate is unsure; B6z lets qwen3.8-flash pick a level from the question text alone |
 | B6a | Controller first, LLM may search more (N9) | B6 recalls, the recalled memories come with the question, and the reader may call `memory_search` for anything missing: the N8 agent's approach (D-042) |
+| M0 | External baseline: Mem0 (N11) | Open-source mem0ai 2.2.1 writing with its own pipeline (one `add` per session; on LoCoMo one user_id per speaker, as in the Mem0 paper) and reading with its own `search` (top-30, full hybrid search); its LLM and embeddings replaced by the models of this system's write path; same reader and judge (D-055) |
 
 ### 8.4 Ablations
 
@@ -660,7 +668,9 @@ All methods use **the same reader and the same judge**:
 
 - Temperature 0 and a response cache make results reproducible.
 - Judge templates are copied verbatim, with regression tests against the official code.
-- 50 judgements were audited by hand, half right and half wrong (`cuemem eval audit` exports them and computes agreement).
+- A hand audit of 50 judgements, half right and half wrong (`cuemem eval audit` exports them and computes agreement). N11 samples them from the N9 test-set judgements, stratified by dataset (`scripts/n11_audit.py`); the labelling is still to be done.
+- A second judge (N11): a model from another family (deepseek-flash) re-judges every answer of the main methods on the test sets, to check agreement and whether the ranking of methods changes.
+- Repeated runs (N11): the main methods are rerun with the cache off, to measure how much the same configuration varies between two runs, as a yardstick for differences between methods.
 - `pilot10` dry runs come first: read the errors one by one and check whether a problem lies in the method, the reader or the judge before running at full size.
 - 95% bootstrap confidence intervals.
 - Separate development and test sets.
@@ -801,7 +811,13 @@ The project runs on a laptop, but the architecture was designed with millions of
   - λ is configured per scenario: customer service wants low latency, a deep personal assistant can spend more.
   - The stable-prefix layout keeps provider prefix caching effective.
 - **Compliance and privacy.** Follow Singapore's PDPA and the EU's GDPR; cascade deletion along provenance (the right to be forgotten), including uncited restatements; audit logs.
-- **Continual learning.** Implicit feedback in production (e.g. the user correcting "you got that wrong") becomes a reward signal for a contextual bandit that updates the controller online, starting with per-reader recalibration of the accuracy table.
+- **Continual learning.** Implicit feedback in production (e.g. the user correcting "you got that wrong") becomes a reward signal for a contextual bandit that updates the controller online. The first step is setting λ per reader model; N11 found that recalibrating the accuracy table per reader did not help.
+
+**Already done (N11, D-056):**
+
+- **Server mode.** Setting `CUEMEM_VECTOR_STORE__URL` (e.g. `http://localhost:6333`, with `docker run -p 6333:6333 qdrant/qdrant:v1.19.1`) switches to a Qdrant server; new collections get payload indexes on `kind` and `ts`. Local mode allows one process per data directory, and a second one now gets a `StorageLockedError` that says so. Copy existing local data first with `cuemem migrate-vectors --to URL`: memories already in the database are not written to the vector store again, so switching without migrating gives an empty vector store.
+- **Scale** (`scripts/n11_latency.py`, excluding the ~110 ms query embedding call in production): the local work on the read path grows linearly in local mode, about 1.08 s at 46k retrieval units, against 91 ms with the server. Concurrency in one process: local mode saturates at about 9 reads per second; the server reaches 55 per second with 16 threads.
+- **Access token.** With `CUEMEM_API_TOKEN` set, the HTTP API requires a Bearer token and the UI asks to sign in. There is one shared token and no per-user isolation of memory spaces; running several instances would also need a server database instead of embedded SQLite.
 
 ## Appendix: glossary
 

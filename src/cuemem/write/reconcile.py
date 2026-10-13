@@ -17,13 +17,16 @@
 - **认知变了**（correct，用户更正或补充细节）：旧事实只设 invalidated_at，valid_to 保持为空——
   它在现实中并没有"结束"，只是系统不再采信这个版本。
 
+灰区里的每条新事实附上它出自的那句话（N11）：抽取出的事实只剩"Mia 31 岁"，看不出用户是在
+更正（"之前说错了"）还是现实变了（过了生日），这要看原话。
+
 时间规则：迟到的旧消息不会覆盖新状态。如果新事实的事件时间早于当前事实（例如后导入了一段
 更早的对话），新事实直接作为历史版本写入，当前事实保持不变。
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -41,11 +44,13 @@ from cuemem.write.predicates import normalize_value, registered_cardinality
 Action = Literal["add", "supersede", "merge", "noop"]
 
 RECONCILE_SYSTEM = """You maintain a long-term memory of facts about people. New facts were just learned from a conversation. For each new fact, compare it with the existing facts listed under it and choose one action:
-- "update": the new fact gives a new value for the same attribute of the same person or thing, and the two cannot both be true now (a different home city, a new job, a new count or total, a new personal best, a changed schedule). Give the replaced fact's id as "target".
-- "correct": the existing fact was wrong, or the new fact restates the same information more precisely. Give its id as "target".
+- "update": the new fact gives a new value for the same attribute of the same person or thing, and the two cannot both be true now (a different home city, a new job, a new count or total, a new personal best, a schedule changed for the same days). Give the replaced fact's id as "target".
+- "correct": the user says the existing fact was a mistake ("sorry, I meant...", "actually it was..."), or the new fact restates the same information more precisely. A situation that changed (moving, a new job) is an "update", not a correction. Give its id as "target".
 - "duplicate": the new fact says the same thing as an existing fact. Give its id as "target".
-- "add": anything else, including facts on the same topic that can both be true (another project, another purchase, another event, more details about something).
+- "add": anything else, including facts on the same topic that can both be true (another project, another purchase, another event, more details about something) and facts with a different or narrower scope (weekdays vs. Fridays, at work vs. at home, one trip vs. another), even when the new fact is a recent change: "I work from home on Mondays now" does not replace "I work at the office", because the general fact still holds on the other days.
+A new fact may come with the message it was taken from: use it to tell a correction of an earlier statement from a change in the world.
 When unsure, choose "add". Return one decision for every new fact."""  # noqa: E501
+SOURCE_CHARS = 400  # 灰区里新事实附上的原话最多这么多字符
 
 
 class LLMDecision(BaseModel):
@@ -128,8 +133,12 @@ class Reconciler:
         new_facts: Sequence[tuple[Fact, FloatArray]],
         *,
         cache_scope: str | None = None,
+        sources: Mapping[str, str] | None = None,
     ) -> ReconcileResult:
-        """按顺序处理一个会话的新事实，原地更新 state，返回操作列表与改动过的事实。"""
+        """按顺序处理一个会话的新事实，原地更新 state，返回操作列表与改动过的事实。
+
+        sources：轮 ID → 这一轮的原话；灰区交给 LLM 时，每条新事实附上它出自的那句话。
+        """
         result = ReconcileResult()
         gray: list[tuple[Fact, FloatArray, list[Fact]]] = []
         for fact, vector in new_facts:
@@ -198,7 +207,7 @@ class Reconciler:
                 continue
             self._add(state, result, fact, vector, rule="default")
         if gray:
-            self._resolve_gray(state, result, gray, cache_scope)
+            self._resolve_gray(state, result, gray, cache_scope, sources or {})
         return result
 
     # ---------- 动作 ----------
@@ -283,11 +292,17 @@ class Reconciler:
         result: ReconcileResult,
         gray: list[tuple[Fact, FloatArray, list[Fact]]],
         cache_scope: str | None,
+        sources: Mapping[str, str],
     ) -> None:
         labels: dict[str, str] = {}
         blocks: list[str] = []
         for i, (fact, _, related) in enumerate(gray, start=1):
             lines = [f"New fact {i}: {fact.statement} (said on {day(fact.recorded_at)})"]
+            said = " / ".join(sources[t] for t in fact.source_turn_ids if t in sources)
+            said = " ".join(said.split())  # 压掉换行：提示按空行分块
+            if said:
+                cut = said[:SOURCE_CHARS] + ("…" if len(said) > SOURCE_CHARS else "")
+                lines.append(f'From the message: "{cut}"')
             lines.append("Existing facts:")
             for existing in related:
                 label = f"e{len(labels) + 1}"

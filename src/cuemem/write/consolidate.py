@@ -467,7 +467,14 @@ class Consolidator:
             )
             new_facts.append((fact, embedded[raw.statement][0]))
         report.facts_extracted += len(new_facts)
-        rec = self.reconciler.reconcile(fact_state, new_facts, cache_scope=cache_scope)
+        said = {  # 用户说的原话：对账靠它分清"说错了"与"现实变了"
+            t.id: f"{t.speaker}: {t.text}" if t.speaker else t.text
+            for t in turns
+            if t.role == "user"
+        }
+        rec = self.reconciler.reconcile(
+            fact_state, new_facts, cache_scope=cache_scope, sources=said
+        )
 
         # 先写向量（新事实、摘要、新实体；被取代的事实更新 payload），再在一个事务里写数据库
         units: list[MemoryUnit] = []

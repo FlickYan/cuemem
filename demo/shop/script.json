@@ -22,7 +22,9 @@
           ],
           "expect": [
             [
-              "vegan"
+              "vegan",
+              "no leather",
+              "leather-free"
             ]
           ]
         },

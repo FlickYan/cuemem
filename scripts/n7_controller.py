@@ -11,7 +11,9 @@
    逐级升级、理想路由比较；默认 λ 按事先定好的规则选；
 5. 跨数据集：在两个数据集上训练、第三个上测试；
 6. 混合流：记忆题与无关查询按 1:1 与 1:4 混合；
-7. 用全部开发数据训练最终的控制器，导出 src/cuemem/read/controller_model.json。
+7. 用全部开发数据训练最终的控制器，导出 src/cuemem/read/controller_model_v1.json
+   （N9 冻结评测的那一版；N11 的 v2 由 scripts/n11_controller_v2.py 导出为默认的
+   controller_model.json）。
 
 用法：
     uv run python scripts/n7_controller.py
@@ -44,7 +46,7 @@ from cuemem.evals.runner import usage_from_trace
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
-from cuemem.read.controller import DEFAULT_MODEL, HYBRID_BAND, HYBRID_CONFIDENCE, LLMRouter
+from cuemem.read.controller import HYBRID_BAND, HYBRID_CONFIDENCE, V1_MODEL, LLMRouter
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -506,7 +508,7 @@ def main() -> None:
         "hybrid_band": list(BAND),
         "created": datetime.now().strftime("%Y-%m-%d"),
     }
-    DEFAULT_MODEL.write_text(
+    V1_MODEL.write_text(
         json.dumps(final.to_json(lam=lam, meta=meta), ensure_ascii=False, indent=1) + "\n",
         encoding="utf-8",
     )
@@ -514,7 +516,7 @@ def main() -> None:
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )
     draw(items, datasets, fixed, curves)
-    print(f"结果：{OUT}；控制器：{DEFAULT_MODEL}")
+    print(f"结果：{OUT}；控制器：{V1_MODEL}")
 
 
 ADAPT_SIZES = (0, 10, 20, 50, 100)

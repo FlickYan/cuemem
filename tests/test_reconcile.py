@@ -145,6 +145,20 @@ def test_gray_zone_goes_to_llm_in_one_call(settings: Settings, fake_api: FakeAPI
     assert state.facts["c"].valid_to is None and state.facts["c"].invalidated_at is not None
 
 
+def test_gray_zone_prompt_quotes_the_source_message(settings: Settings, fake_api: FakeAPI) -> None:
+    """抽取出的"Mia 31 岁"看不出是更正还是过了生日：灰区的提示附上它出自的那句话。"""
+    state = FactState()
+    rec = reconciler(settings, fake_api, [{"new": 1, "action": "correct", "target": "e1"}])
+    rec.reconcile(state, [(fact("a", "Mia is 30.", "age", "30", "2025-03-03"), vec(1, 0))])
+    new = fact("b", "Mia is 31.", "age", "31", "2025-06-20")
+    said = {"t-b": "Oops, I got that wrong before:\n\nMia is 31, not 30.", "t-x": "unrelated"}
+    rec.reconcile(state, [(new, vec(0.8, 0.6))], sources=said)
+    prompt = fake_api.chat_requests[0]["messages"][-1]["content"]
+    assert 'From the message: "Oops, I got that wrong before: Mia is 31, not 30."' in prompt
+    assert "unrelated" not in prompt
+    assert state.facts["a"].supersede_reason == "corrected"
+
+
 def test_invalid_llm_target_falls_back_to_add(settings: Settings, fake_api: FakeAPI) -> None:
     state = FactState()
     rec = reconciler(settings, fake_api, [{"new": 1, "action": "update", "target": "e9"}])

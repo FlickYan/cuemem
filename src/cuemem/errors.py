@@ -31,3 +31,7 @@ class ConsolidationError(CueMemError):
 
 class ContentFilteredError(CueMemError):
     """供应商的内容审核拒绝了这次请求（常见误伤：普通的生活对话也可能被判为不当内容）。"""
+
+
+class StorageLockedError(CueMemError):
+    """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""

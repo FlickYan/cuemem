@@ -1,0 +1,2084 @@
+{
+ "created": "2026-10-13T07:45:09",
+ "dev": {
+  "lambda": {
+   "v1": 30.0,
+   "v2 table only": 30.0,
+   "v2": 30.0
+  },
+  "combined": {
+   "always-L1": {
+    "accuracy": 80.5,
+    "cost_per_1k": 1.566,
+    "l0": 0.0,
+    "l2": 0.0,
+    "see": 17.1,
+    "n": 585
+   },
+   "always-L2": {
+    "accuracy": 85.3,
+    "cost_per_1k": 3.455,
+    "l0": 0.0,
+    "l2": 100.0,
+    "see": 17.1,
+    "n": 585
+   },
+   "B6r": {
+    "accuracy": 82.6,
+    "cost_per_1k": 2.005,
+    "l0": 0.0,
+    "l2": 21.2,
+    "see": 17.1,
+    "n": 585
+   },
+   "B6 v1": {
+    "accuracy": 81.2,
+    "cost_per_1k": 2.143,
+    "l0": 2.4,
+    "l2": 31.3,
+    "see": 15.9,
+    "n": 585
+   },
+   "B6 v2 table only": {
+    "accuracy": 81.4,
+    "cost_per_1k": 2.148,
+    "l0": 2.6,
+    "l2": 31.5,
+    "see": 15.7,
+    "n": 585
+   },
+   "B6 v2": {
+    "accuracy": 81.7,
+    "cost_per_1k": 2.164,
+    "l0": 1.7,
+    "l2": 31.5,
+    "see": 16.6,
+    "n": 585
+   }
+  },
+  "by_dataset": {
+   "longmemeval_s": {
+    "always-L1": {
+     "accuracy": 81.0,
+     "cost_per_1k": 1.592,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "always-L2": {
+     "accuracy": 89.0,
+     "cost_per_1k": 3.393,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6r": {
+     "accuracy": 88.0,
+     "cost_per_1k": 2.793,
+     "l0": 0.0,
+     "l2": 62.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v1": {
+     "accuracy": 84.0,
+     "cost_per_1k": 2.293,
+     "l0": 3.0,
+     "l2": 37.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v2 table only": {
+     "accuracy": 84.0,
+     "cost_per_1k": 2.293,
+     "l0": 3.0,
+     "l2": 37.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v2": {
+     "accuracy": 84.0,
+     "cost_per_1k": 2.293,
+     "l0": 3.0,
+     "l2": 37.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "tests": {
+     "v2 vs v1": {
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0
+     },
+     "v2 vs always-L2": {
+      "wins": 1,
+      "losses": 6,
+      "p": 0.125
+     }
+    }
+   },
+   "locomo": {
+    "always-L1": {
+     "accuracy": 86.2,
+     "cost_per_1k": 1.458,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 385
+    },
+    "always-L2": {
+     "accuracy": 89.1,
+     "cost_per_1k": 3.233,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 385
+    },
+    "B6r": {
+     "accuracy": 86.0,
+     "cost_per_1k": 1.593,
+     "l0": 0.0,
+     "l2": 7.8,
+     "see": 0.0,
+     "n": 385
+    },
+    "B6 v1": {
+     "accuracy": 86.5,
+     "cost_per_1k": 1.828,
+     "l0": 1.3,
+     "l2": 22.6,
+     "see": 0.0,
+     "n": 385
+    },
+    "B6 v2 table only": {
+     "accuracy": 86.5,
+     "cost_per_1k": 1.828,
+     "l0": 1.3,
+     "l2": 22.6,
+     "see": 0.0,
+     "n": 385
+    },
+    "B6 v2": {
+     "accuracy": 86.5,
+     "cost_per_1k": 1.828,
+     "l0": 1.3,
+     "l2": 22.6,
+     "see": 0.0,
+     "n": 385
+    },
+    "tests": {
+     "v2 vs v1": {
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0
+     },
+     "v2 vs always-L2": {
+      "wins": 7,
+      "losses": 17,
+      "p": 0.0639
+     }
+    }
+   },
+   "memlens_32k": {
+    "always-L1": {
+     "accuracy": 58.0,
+     "cost_per_1k": 1.956,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 100.0,
+     "n": 100
+    },
+    "always-L2": {
+     "accuracy": 67.0,
+     "cost_per_1k": 4.371,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 100.0,
+     "n": 100
+    },
+    "B6r": {
+     "accuracy": 64.0,
+     "cost_per_1k": 2.805,
+     "l0": 0.0,
+     "l2": 32.0,
+     "see": 100.0,
+     "n": 100
+    },
+    "B6 v1": {
+     "accuracy": 58.0,
+     "cost_per_1k": 3.206,
+     "l0": 6.0,
+     "l2": 59.0,
+     "see": 93.0,
+     "n": 100
+    },
+    "B6 v2 table only": {
+     "accuracy": 59.0,
+     "cost_per_1k": 3.237,
+     "l0": 7.0,
+     "l2": 60.0,
+     "see": 92.0,
+     "n": 100
+    },
+    "B6 v2": {
+     "accuracy": 61.0,
+     "cost_per_1k": 3.327,
+     "l0": 2.0,
+     "l2": 60.0,
+     "see": 97.0,
+     "n": 100
+    },
+    "tests": {
+     "v2 vs v1": {
+      "wins": 5,
+      "losses": 2,
+      "p": 0.4531
+     },
+     "v2 vs always-L2": {
+      "wins": 0,
+      "losses": 6,
+      "p": 0.0312
+     }
+    }
+   }
+  },
+  "mixed": {
+   "always-L1": {
+    "memory_accuracy": 80.5,
+    "cost_per_1k": 1.566,
+    "false_recall": 100.0,
+    "memory_l0": 0.0
+   },
+   "always-L2": {
+    "memory_accuracy": 85.3,
+    "cost_per_1k": 3.455,
+    "false_recall": 100.0,
+    "memory_l0": 0.0
+   },
+   "B6r": {
+    "memory_accuracy": 82.6,
+    "cost_per_1k": 1.916,
+    "false_recall": 100.0,
+    "memory_l0": 0.0
+   },
+   "B6 v1": {
+    "memory_accuracy": 81.2,
+    "cost_per_1k": 0.875,
+    "false_recall": 19.2,
+    "memory_l0": 2.4
+   },
+   "B6 v2 table only": {
+    "memory_accuracy": 81.4,
+    "cost_per_1k": 0.876,
+    "false_recall": 18.4,
+    "memory_l0": 2.6
+   },
+   "B6 v2": {
+    "memory_accuracy": 81.7,
+    "cost_per_1k": 0.887,
+    "false_recall": 19.0,
+    "memory_l0": 1.7
+   }
+  },
+  "tests": {
+   "v2 vs v1": {
+    "wins": 5,
+    "losses": 2,
+    "p": 0.4531
+   },
+   "v2 vs always-L2": {
+    "wins": 8,
+    "losses": 29,
+    "p": 0.0008
+   }
+  },
+  "curves": {
+   "v1": [
+    {
+     "lam": 0.0,
+     "accuracy": 84.6,
+     "cost_per_1k": 3.355,
+     "l0": 0.0,
+     "l2": 95.9,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 2,
+     "accuracy": 84.3,
+     "cost_per_1k": 3.256,
+     "l0": 0.0,
+     "l2": 91.5,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 5,
+     "accuracy": 84.1,
+     "cost_per_1k": 3.191,
+     "l0": 0.2,
+     "l2": 87.9,
+     "see": 16.6,
+     "n": 585
+    },
+    {
+     "lam": 10,
+     "accuracy": 83.8,
+     "cost_per_1k": 2.97,
+     "l0": 0.9,
+     "l2": 75.2,
+     "see": 16.2,
+     "n": 585
+    },
+    {
+     "lam": 15,
+     "accuracy": 83.4,
+     "cost_per_1k": 2.713,
+     "l0": 1.0,
+     "l2": 60.7,
+     "see": 16.2,
+     "n": 585
+    },
+    {
+     "lam": 20,
+     "accuracy": 82.9,
+     "cost_per_1k": 2.509,
+     "l0": 1.4,
+     "l2": 50.1,
+     "see": 16.2,
+     "n": 585
+    },
+    {
+     "lam": 25,
+     "accuracy": 81.9,
+     "cost_per_1k": 2.324,
+     "l0": 1.9,
+     "l2": 40.9,
+     "see": 15.9,
+     "n": 585
+    },
+    {
+     "lam": 30,
+     "accuracy": 81.2,
+     "cost_per_1k": 2.143,
+     "l0": 2.4,
+     "l2": 31.3,
+     "see": 15.9,
+     "n": 585
+    },
+    {
+     "lam": 40,
+     "accuracy": 79.8,
+     "cost_per_1k": 1.804,
+     "l0": 2.4,
+     "l2": 12.3,
+     "see": 15.9,
+     "n": 585
+    },
+    {
+     "lam": 50,
+     "accuracy": 79.1,
+     "cost_per_1k": 1.662,
+     "l0": 2.9,
+     "l2": 6.0,
+     "see": 15.4,
+     "n": 585
+    },
+    {
+     "lam": 75,
+     "accuracy": 78.5,
+     "cost_per_1k": 1.516,
+     "l0": 3.9,
+     "l2": 0.5,
+     "see": 11.8,
+     "n": 585
+    },
+    {
+     "lam": 100,
+     "accuracy": 78.3,
+     "cost_per_1k": 1.49,
+     "l0": 4.3,
+     "l2": 0.0,
+     "see": 8.5,
+     "n": 585
+    },
+    {
+     "lam": 150,
+     "accuracy": 77.3,
+     "cost_per_1k": 1.464,
+     "l0": 5.6,
+     "l2": 0.0,
+     "see": 5.1,
+     "n": 585
+    },
+    {
+     "lam": 200,
+     "accuracy": 76.2,
+     "cost_per_1k": 1.438,
+     "l0": 7.5,
+     "l2": 0.0,
+     "see": 4.6,
+     "n": 585
+    },
+    {
+     "lam": 300,
+     "accuracy": 74.0,
+     "cost_per_1k": 1.386,
+     "l0": 11.3,
+     "l2": 0.0,
+     "see": 2.9,
+     "n": 585
+    },
+    {
+     "lam": 500,
+     "accuracy": 45.8,
+     "cost_per_1k": 0.897,
+     "l0": 50.6,
+     "l2": 0.0,
+     "see": 1.7,
+     "n": 585
+    },
+    {
+     "lam": 1000,
+     "accuracy": 11.3,
+     "cost_per_1k": 0.295,
+     "l0": 100.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 585
+    },
+    {
+     "lam": 3000,
+     "accuracy": 11.3,
+     "cost_per_1k": 0.295,
+     "l0": 100.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 585
+    }
+   ],
+   "v2 table only": [
+    {
+     "lam": 0.0,
+     "accuracy": 85.0,
+     "cost_per_1k": 3.434,
+     "l0": 0.0,
+     "l2": 99.1,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 2,
+     "accuracy": 84.6,
+     "cost_per_1k": 3.34,
+     "l0": 0.2,
+     "l2": 95.0,
+     "see": 16.6,
+     "n": 585
+    },
+    {
+     "lam": 5,
+     "accuracy": 84.3,
+     "cost_per_1k": 3.268,
+     "l0": 0.3,
+     "l2": 91.1,
+     "see": 16.4,
+     "n": 585
+    },
+    {
+     "lam": 10,
+     "accuracy": 84.1,
+     "cost_per_1k": 3.034,
+     "l0": 0.9,
+     "l2": 77.8,
+     "see": 16.2,
+     "n": 585
+    },
+    {
+     "lam": 15,
+     "accuracy": 83.8,
+     "cost_per_1k": 2.763,
+     "l0": 1.0,
+     "l2": 62.6,
+     "see": 16.2,
+     "n": 585
+    },
+    {
+     "lam": 20,
+     "accuracy": 82.9,
+     "cost_per_1k": 2.545,
+     "l0": 1.9,
+     "l2": 51.8,
+     "see": 15.9,
+     "n": 585
+    },
+    {
+     "lam": 25,
+     "accuracy": 81.9,
+     "cost_per_1k": 2.333,
+     "l0": 2.2,
+     "l2": 41.2,
+     "see": 15.9,
+     "n": 585
+    },
+    {
+     "lam": 30,
+     "accuracy": 81.4,
+     "cost_per_1k": 2.148,
+     "l0": 2.6,
+     "l2": 31.5,
+     "see": 15.7,
+     "n": 585
+    },
+    {
+     "lam": 40,
+     "accuracy": 79.7,
+     "cost_per_1k": 1.825,
+     "l0": 2.7,
+     "l2": 13.5,
+     "see": 15.4,
+     "n": 585
+    },
+    {
+     "lam": 50,
+     "accuracy": 78.1,
+     "cost_per_1k": 1.671,
+     "l0": 3.8,
+     "l2": 7.5,
+     "see": 14.0,
+     "n": 585
+    },
+    {
+     "lam": 75,
+     "accuracy": 77.8,
+     "cost_per_1k": 1.498,
+     "l0": 4.8,
+     "l2": 0.5,
+     "see": 11.1,
+     "n": 585
+    },
+    {
+     "lam": 100,
+     "accuracy": 77.9,
+     "cost_per_1k": 1.473,
+     "l0": 5.3,
+     "l2": 0.0,
+     "see": 8.0,
+     "n": 585
+    },
+    {
+     "lam": 150,
+     "accuracy": 76.4,
+     "cost_per_1k": 1.417,
+     "l0": 8.7,
+     "l2": 0.0,
+     "see": 4.6,
+     "n": 585
+    },
+    {
+     "lam": 200,
+     "accuracy": 74.4,
+     "cost_per_1k": 1.337,
+     "l0": 14.2,
+     "l2": 0.0,
+     "see": 3.6,
+     "n": 585
+    },
+    {
+     "lam": 300,
+     "accuracy": 71.1,
+     "cost_per_1k": 1.219,
+     "l0": 22.4,
+     "l2": 0.0,
+     "see": 1.5,
+     "n": 585
+    },
+    {
+     "lam": 500,
+     "accuracy": 44.3,
+     "cost_per_1k": 0.794,
+     "l0": 57.4,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 585
+    },
+    {
+     "lam": 1000,
+     "accuracy": 11.3,
+     "cost_per_1k": 0.295,
+     "l0": 100.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 585
+    },
+    {
+     "lam": 3000,
+     "accuracy": 11.3,
+     "cost_per_1k": 0.295,
+     "l0": 100.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 585
+    }
+   ],
+   "v2": [
+    {
+     "lam": 0.0,
+     "accuracy": 85.0,
+     "cost_per_1k": 3.434,
+     "l0": 0.0,
+     "l2": 99.1,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 2,
+     "accuracy": 84.6,
+     "cost_per_1k": 3.343,
+     "l0": 0.0,
+     "l2": 95.0,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 5,
+     "accuracy": 84.4,
+     "cost_per_1k": 3.274,
+     "l0": 0.0,
+     "l2": 91.1,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 10,
+     "accuracy": 84.3,
+     "cost_per_1k": 3.044,
+     "l0": 0.3,
+     "l2": 77.8,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 15,
+     "accuracy": 83.9,
+     "cost_per_1k": 2.772,
+     "l0": 0.5,
+     "l2": 62.6,
+     "see": 16.8,
+     "n": 585
+    },
+    {
+     "lam": 20,
+     "accuracy": 83.1,
+     "cost_per_1k": 2.558,
+     "l0": 1.2,
+     "l2": 51.8,
+     "see": 16.6,
+     "n": 585
+    },
+    {
+     "lam": 25,
+     "accuracy": 82.1,
+     "cost_per_1k": 2.345,
+     "l0": 1.5,
+     "l2": 41.2,
+     "see": 16.6,
+     "n": 585
+    },
+    {
+     "lam": 30,
+     "accuracy": 81.7,
+     "cost_per_1k": 2.164,
+     "l0": 1.7,
+     "l2": 31.5,
+     "see": 16.6,
+     "n": 585
+    },
+    {
+     "lam": 40,
+     "accuracy": 80.2,
+     "cost_per_1k": 1.843,
+     "l0": 1.7,
+     "l2": 13.5,
+     "see": 16.4,
+     "n": 585
+    },
+    {
+     "lam": 50,
+     "accuracy": 78.6,
+     "cost_per_1k": 1.695,
+     "l0": 2.4,
+     "l2": 7.5,
+     "see": 15.4,
+     "n": 585
+    },
+    {
+     "lam": 75,
+     "accuracy": 78.6,
+     "cost_per_1k": 1.528,
+     "l0": 3.1,
+     "l2": 0.5,
+     "see": 12.8,
+     "n": 585
+    },
+    {
+     "lam": 100,
+     "accuracy": 78.8,
+     "cost_per_1k": 1.506,
+     "l0": 3.4,
+     "l2": 0.0,
+     "see": 9.9,
+     "n": 585
+    },
+    {
+     "lam": 150,
+     "accuracy": 77.6,
+     "cost_per_1k": 1.464,
+     "l0": 6.0,
+     "l2": 0.0,
+     "see": 7.4,
+     "n": 585
+    },
+    {
+     "lam": 200,
+     "accuracy": 75.6,
+     "cost_per_1k": 1.386,
+     "l0": 11.3,
+     "l2": 0.0,
+     "see": 6.5,
+     "n": 585
+    },
+    {
+     "lam": 300,
+     "accuracy": 72.5,
+     "cost_per_1k": 1.277,
+     "l0": 19.0,
+     "l2": 0.0,
+     "see": 5.0,
+     "n": 585
+    },
+    {
+     "lam": 500,
+     "accuracy": 46.3,
+     "cost_per_1k": 0.872,
+     "l0": 52.8,
+     "l2": 0.0,
+     "see": 4.6,
+     "n": 585
+    },
+    {
+     "lam": 1000,
+     "accuracy": 13.3,
+     "cost_per_1k": 0.373,
+     "l0": 95.4,
+     "l2": 0.0,
+     "see": 4.6,
+     "n": 585
+    },
+    {
+     "lam": 3000,
+     "accuracy": 13.3,
+     "cost_per_1k": 0.373,
+     "l0": 95.4,
+     "l2": 0.0,
+     "see": 4.6,
+     "n": 585
+    }
+   ]
+  },
+  "auc": {
+   "v1": 63.04,
+   "v2 table only": 65.43,
+   "v2": 64.88
+  },
+  "auc_range_per_1k": [
+   0.373,
+   3.355
+  ]
+ },
+ "test_posthoc": {
+  "by_dataset": {
+   "longmemeval_s": {
+    "always-L1": {
+     "accuracy": 90.5,
+     "cost_per_1k": 1.604,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 400
+    },
+    "always-L2": {
+     "accuracy": 93.2,
+     "cost_per_1k": 3.412,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 400
+    },
+    "B6r": {
+     "accuracy": 92.5,
+     "cost_per_1k": 2.832,
+     "l0": 0.0,
+     "l2": 65.8,
+     "see": 0.0,
+     "n": 400
+    },
+    "B6 v1": {
+     "accuracy": 90.5,
+     "cost_per_1k": 2.419,
+     "l0": 1.8,
+     "l2": 42.8,
+     "see": 0.0,
+     "n": 400
+    },
+    "B6 v2 table only": {
+     "accuracy": 90.5,
+     "cost_per_1k": 2.419,
+     "l0": 1.8,
+     "l2": 42.8,
+     "see": 0.0,
+     "n": 400
+    },
+    "B6 v2": {
+     "accuracy": 90.5,
+     "cost_per_1k": 2.419,
+     "l0": 1.8,
+     "l2": 42.8,
+     "see": 0.0,
+     "n": 400
+    },
+    "tests": {
+     "table only vs v1": {
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0
+     },
+     "v2 vs v1": {
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0
+     },
+     "v2 vs always-L2": {
+      "wins": 6,
+      "losses": 17,
+      "p": 0.0347
+     },
+     "v2 vs always-L1": {
+      "wins": 10,
+      "losses": 10,
+      "p": 1.0
+     }
+    },
+    "v2_vs_l2": {
+     "lost_at_L0": 6,
+     "lost_at_L1": 11,
+     "won_at_L1": 6
+    },
+    "v1_losses_to_l2": {
+     "lost_at_L0": 6,
+     "lost_at_L0_fixed_by_table": 0,
+     "lost_at_L0_fixed_by_v2": 0,
+     "lost_at_L1": 11,
+     "lost_at_L1_fixed_by_table": 0,
+     "lost_at_L1_fixed_by_v2": 0
+    }
+   },
+   "locomo": {
+    "always-L1": {
+     "accuracy": 79.7,
+     "cost_per_1k": 1.438,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 1155
+    },
+    "always-L2": {
+     "accuracy": 84.5,
+     "cost_per_1k": 3.252,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 1155
+    },
+    "B6r": {
+     "accuracy": 80.6,
+     "cost_per_1k": 1.691,
+     "l0": 0.0,
+     "l2": 12.2,
+     "see": 0.0,
+     "n": 1155
+    },
+    "B6 v1": {
+     "accuracy": 82.2,
+     "cost_per_1k": 2.207,
+     "l0": 0.1,
+     "l2": 39.9,
+     "see": 0.0,
+     "n": 1155
+    },
+    "B6 v2 table only": {
+     "accuracy": 82.2,
+     "cost_per_1k": 2.207,
+     "l0": 0.1,
+     "l2": 39.9,
+     "see": 0.0,
+     "n": 1155
+    },
+    "B6 v2": {
+     "accuracy": 82.2,
+     "cost_per_1k": 2.207,
+     "l0": 0.1,
+     "l2": 39.9,
+     "see": 0.0,
+     "n": 1155
+    },
+    "tests": {
+     "table only vs v1": {
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0
+     },
+     "v2 vs v1": {
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0
+     },
+     "v2 vs always-L2": {
+      "wins": 7,
+      "losses": 34,
+      "p": 0.0
+     },
+     "v2 vs always-L1": {
+      "wins": 42,
+      "losses": 13,
+      "p": 0.0001
+     }
+    },
+    "v2_vs_l2": {
+     "lost_at_L0": 1,
+     "lost_at_L1": 33,
+     "won_at_L1": 7
+    },
+    "v1_losses_to_l2": {
+     "lost_at_L0": 1,
+     "lost_at_L0_fixed_by_table": 0,
+     "lost_at_L0_fixed_by_v2": 0,
+     "lost_at_L1": 33,
+     "lost_at_L1_fixed_by_table": 0,
+     "lost_at_L1_fixed_by_v2": 0
+    }
+   },
+   "memlens_32k": {
+    "always-L1": {
+     "accuracy": 63.1,
+     "cost_per_1k": 1.965,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 100.0,
+     "n": 195
+    },
+    "always-L2": {
+     "accuracy": 65.6,
+     "cost_per_1k": 4.41,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 100.0,
+     "n": 195
+    },
+    "B6r": {
+     "accuracy": 63.6,
+     "cost_per_1k": 2.726,
+     "l0": 0.0,
+     "l2": 27.7,
+     "see": 100.0,
+     "n": 195
+    },
+    "B6 v1": {
+     "accuracy": 60.0,
+     "cost_per_1k": 3.142,
+     "l0": 5.6,
+     "l2": 55.9,
+     "see": 92.3,
+     "n": 195
+    },
+    "B6 v2 table only": {
+     "accuracy": 60.0,
+     "cost_per_1k": 3.128,
+     "l0": 7.2,
+     "l2": 53.8,
+     "see": 91.3,
+     "n": 195
+    },
+    "B6 v2": {
+     "accuracy": 62.6,
+     "cost_per_1k": 3.204,
+     "l0": 2.6,
+     "l2": 53.8,
+     "see": 95.9,
+     "n": 195
+    },
+    "tests": {
+     "table only vs v1": {
+      "wins": 7,
+      "losses": 7,
+      "p": 1.0
+     },
+     "v2 vs v1": {
+      "wins": 10,
+      "losses": 5,
+      "p": 0.3018
+     },
+     "v2 vs always-L2": {
+      "wins": 2,
+      "losses": 8,
+      "p": 0.1094
+     },
+     "v2 vs always-L1": {
+      "wins": 11,
+      "losses": 12,
+      "p": 1.0
+     }
+    },
+    "v2_vs_l2": {
+     "lost_at_L0": 3,
+     "lost_at_L1": 5,
+     "won_at_L1": 2
+    },
+    "v1_losses_to_l2": {
+     "lost_at_L0": 5,
+     "lost_at_L0_fixed_by_table": 0,
+     "lost_at_L0_fixed_by_v2": 3,
+     "lost_at_L1": 8,
+     "lost_at_L1_fixed_by_table": 6,
+     "lost_at_L1_fixed_by_v2": 6
+    }
+   },
+   "memlens_128k": {
+    "always-L1": {
+     "accuracy": 55.4,
+     "cost_per_1k": 1.937,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 100.0,
+     "n": 195
+    },
+    "always-L2": {
+     "accuracy": 65.1,
+     "cost_per_1k": 4.434,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 100.0,
+     "n": 195
+    },
+    "B6r": {
+     "accuracy": 57.9,
+     "cost_per_1k": 2.698,
+     "l0": 0.0,
+     "l2": 27.7,
+     "see": 100.0,
+     "n": 195
+    },
+    "B6 v1": {
+     "accuracy": 60.5,
+     "cost_per_1k": 3.614,
+     "l0": 2.6,
+     "l2": 70.8,
+     "see": 95.9,
+     "n": 195
+    },
+    "B6 v2 table only": {
+     "accuracy": 59.5,
+     "cost_per_1k": 3.649,
+     "l0": 5.1,
+     "l2": 73.3,
+     "see": 94.4,
+     "n": 195
+    },
+    "B6 v2": {
+     "accuracy": 61.0,
+     "cost_per_1k": 3.692,
+     "l0": 2.6,
+     "l2": 73.3,
+     "see": 96.9,
+     "n": 195
+    },
+    "tests": {
+     "table only vs v1": {
+      "wins": 3,
+      "losses": 5,
+      "p": 0.7266
+     },
+     "v2 vs v1": {
+      "wins": 5,
+      "losses": 4,
+      "p": 1.0
+     },
+     "v2 vs always-L2": {
+      "wins": 1,
+      "losses": 9,
+      "p": 0.0215
+     },
+     "v2 vs always-L1": {
+      "wins": 19,
+      "losses": 8,
+      "p": 0.0522
+     }
+    },
+    "v2_vs_l2": {
+     "lost_at_L0": 3,
+     "lost_at_L1": 6,
+     "won_at_L1": 1
+    },
+    "v1_losses_to_l2": {
+     "lost_at_L0": 4,
+     "lost_at_L0_fixed_by_table": 0,
+     "lost_at_L0_fixed_by_v2": 1,
+     "lost_at_L1": 7,
+     "lost_at_L1_fixed_by_table": 3,
+     "lost_at_L1_fixed_by_v2": 3
+    }
+   }
+  },
+  "combined": {
+   "always-L1": {
+    "accuracy": 80.3,
+    "cost_per_1k": 1.534,
+    "l0": 0.0,
+    "l2": 0.0,
+    "see": 11.1,
+    "n": 1750
+   },
+   "always-L2": {
+    "accuracy": 84.4,
+    "cost_per_1k": 3.417,
+    "l0": 0.0,
+    "l2": 100.0,
+    "see": 11.1,
+    "n": 1750
+   },
+   "B6 v1": {
+    "accuracy": 81.6,
+    "cost_per_1k": 2.36,
+    "l0": 1.1,
+    "l2": 42.3,
+    "see": 10.3,
+    "n": 1750
+   },
+   "B6 v2": {
+    "accuracy": 81.9,
+    "cost_per_1k": 2.367,
+    "l0": 0.7,
+    "l2": 42.1,
+    "see": 10.7,
+    "n": 1750
+   }
+  },
+  "tests": {
+   "v2 vs v1": {
+    "wins": 10,
+    "losses": 5,
+    "p": 0.3018
+   },
+   "v2 vs always-L2": {
+    "wins": 15,
+    "losses": 59,
+    "p": 0.0
+   }
+  },
+  "mixed": {
+   "always-L1": {
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 1.534,
+    "false_recall": 100.0,
+    "memory_l0": 0.0
+   },
+   "always-L2": {
+    "memory_accuracy": 84.4,
+    "cost_per_1k": 3.417,
+    "false_recall": 100.0,
+    "memory_l0": 0.0
+   },
+   "B6 v1": {
+    "memory_accuracy": 81.6,
+    "cost_per_1k": 0.897,
+    "false_recall": 17.3,
+    "memory_l0": 1.1
+   },
+   "B6 v2": {
+    "memory_accuracy": 81.9,
+    "cost_per_1k": 0.901,
+    "false_recall": 16.7,
+    "memory_l0": 0.7
+   }
+  }
+ },
+ "readers": {
+  "qflash_table": {
+   "abstention": {
+    "L0": 0.587,
+    "L1": 0.824,
+    "L2": 0.661
+   },
+   "multi": {
+    "L0": 0.082,
+    "L1": 0.729,
+    "L2": 0.779
+   },
+   "open": {
+    "L0": 0.171,
+    "L1": 0.579,
+    "L2": 0.703
+   },
+   "preference": {
+    "L0": 0.132,
+    "L1": 0.733,
+    "L2": 0.843
+   },
+   "single": {
+    "L0": 0.054,
+    "L1": 0.856,
+    "L2": 0.888
+   },
+   "temporal": {
+    "L0": 0.095,
+    "L1": 0.834,
+    "L2": 0.886
+   },
+   "update": {
+    "L0": 0.123,
+    "L1": 0.953,
+    "L2": 0.963
+   }
+  },
+  "qwen3.8-flash": {
+   "longmemeval_s": {
+    "L1": {
+     "accuracy": 93.0,
+     "cost_per_1k": 0.828,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "L2": {
+     "accuracy": 93.0,
+     "cost_per_1k": 2.267,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v2": {
+     "accuracy": 93.0,
+     "cost_per_1k": 1.43,
+     "l0": 5.0,
+     "l2": 40.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v2 + dev calibration": {
+     "accuracy": 89.0,
+     "cost_per_1k": 0.851,
+     "l0": 5.0,
+     "l2": 4.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B3": {
+     "accuracy": 95.0,
+     "cost_per_1k": 1.532,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "tests": {
+     "B6 v2 + dev calibration vs B6 v2": {
+      "wins": 0,
+      "losses": 4,
+      "p": 0.125
+     },
+     "B6 v2 + dev calibration vs L2": {
+      "wins": 4,
+      "losses": 8,
+      "p": 0.3877
+     },
+     "B6 v2 vs L2": {
+      "wins": 4,
+      "losses": 4,
+      "p": 1.0
+     },
+     "B6 v2 + 2-fold calibration vs B6 v2": {
+      "wins": 1,
+      "losses": 2,
+      "p": 1.0
+     },
+     "B6 v2 + 2-fold calibration vs L2": {
+      "wins": 3,
+      "losses": 4,
+      "p": 1.0
+     }
+    },
+    "lambda_sweep": [
+     {
+      "lam": 30.0,
+      "accuracy": 93.0,
+      "cost_per_1k": 1.43,
+      "l0": 5.0,
+      "l2": 40.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 4,
+       "losses": 4,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 15.0,
+      "accuracy": 93.0,
+      "cost_per_1k": 1.839,
+      "l0": 2.0,
+      "l2": 66.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 1,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 10.0,
+      "accuracy": 94.0,
+      "cost_per_1k": 1.915,
+      "l0": 1.0,
+      "l2": 73.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 5.0,
+      "accuracy": 94.0,
+      "cost_per_1k": 2.117,
+      "l0": 1.0,
+      "l2": 88.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 0.0,
+      "accuracy": 93.0,
+      "cost_per_1k": 2.267,
+      "l0": 0.0,
+      "l2": 100.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     }
+    ],
+    "B6 v2 + 2-fold calibration": {
+     "accuracy": 92.0,
+     "cost_per_1k": 1.43,
+     "l0": 4.0,
+     "l2": 38.0,
+     "see": 0.0,
+     "n": 100
+    }
+   },
+   "locomo": {
+    "L1": {
+     "accuracy": 74.0,
+     "cost_per_1k": 0.794,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "L2": {
+     "accuracy": 80.5,
+     "cost_per_1k": 2.311,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "B6 v2": {
+     "accuracy": 76.5,
+     "cost_per_1k": 1.416,
+     "l0": 0.0,
+     "l2": 39.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "B6 v2 + dev calibration": {
+     "accuracy": 74.0,
+     "cost_per_1k": 0.877,
+     "l0": 0.0,
+     "l2": 5.5,
+     "see": 0.0,
+     "n": 200
+    },
+    "B3": {
+     "accuracy": 85.5,
+     "cost_per_1k": 1.524,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "tests": {
+     "B6 v2 + dev calibration vs B6 v2": {
+      "wins": 2,
+      "losses": 7,
+      "p": 0.1797
+     },
+     "B6 v2 + dev calibration vs L2": {
+      "wins": 4,
+      "losses": 17,
+      "p": 0.0072
+     },
+     "B6 v2 vs L2": {
+      "wins": 2,
+      "losses": 10,
+      "p": 0.0386
+     },
+     "B6 v2 + 2-fold calibration vs B6 v2": {
+      "wins": 4,
+      "losses": 4,
+      "p": 1.0
+     },
+     "B6 v2 + 2-fold calibration vs L2": {
+      "wins": 2,
+      "losses": 10,
+      "p": 0.0386
+     }
+    },
+    "lambda_sweep": [
+     {
+      "lam": 30.0,
+      "accuracy": 76.5,
+      "cost_per_1k": 1.416,
+      "l0": 0.0,
+      "l2": 39.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 2,
+       "losses": 10,
+       "p": 0.0386
+      }
+     },
+     {
+      "lam": 15.0,
+      "accuracy": 79.0,
+      "cost_per_1k": 1.85,
+      "l0": 0.0,
+      "l2": 67.5,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 4,
+       "p": 0.375
+      }
+     },
+     {
+      "lam": 10.0,
+      "accuracy": 80.0,
+      "cost_per_1k": 2.008,
+      "l0": 0.0,
+      "l2": 78.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 2,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 5.0,
+      "accuracy": 80.5,
+      "cost_per_1k": 2.243,
+      "l0": 0.0,
+      "l2": 96.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 0.0,
+      "accuracy": 80.5,
+      "cost_per_1k": 2.299,
+      "l0": 0.0,
+      "l2": 99.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     }
+    ],
+    "B6 v2 + 2-fold calibration": {
+     "accuracy": 76.5,
+     "cost_per_1k": 1.476,
+     "l0": 0.0,
+     "l2": 46.0,
+     "see": 0.0,
+     "n": 200
+    }
+   }
+  },
+  "qwen3.6-35b-a3b": {
+   "longmemeval_s": {
+    "L1": {
+     "accuracy": 81.0,
+     "cost_per_1k": 0.841,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "L2": {
+     "accuracy": 90.0,
+     "cost_per_1k": 2.89,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v2": {
+     "accuracy": 83.0,
+     "cost_per_1k": 1.674,
+     "l0": 5.0,
+     "l2": 40.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B3": {
+     "accuracy": 90.0,
+     "cost_per_1k": 1.614,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "tests": {
+     "B6 v2 vs L2": {
+      "wins": 0,
+      "losses": 7,
+      "p": 0.0156
+     },
+     "B6 v2 + 2-fold calibration vs B6 v2": {
+      "wins": 1,
+      "losses": 2,
+      "p": 1.0
+     },
+     "B6 v2 + 2-fold calibration vs L2": {
+      "wins": 0,
+      "losses": 8,
+      "p": 0.0078
+     }
+    },
+    "lambda_sweep": [
+     {
+      "lam": 30.0,
+      "accuracy": 83.0,
+      "cost_per_1k": 1.674,
+      "l0": 5.0,
+      "l2": 40.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 7,
+       "p": 0.0156
+      }
+     },
+     {
+      "lam": 15.0,
+      "accuracy": 87.0,
+      "cost_per_1k": 2.206,
+      "l0": 2.0,
+      "l2": 66.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 3,
+       "p": 0.25
+      }
+     },
+     {
+      "lam": 10.0,
+      "accuracy": 88.0,
+      "cost_per_1k": 2.335,
+      "l0": 1.0,
+      "l2": 73.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 2,
+       "p": 0.5
+      }
+     },
+     {
+      "lam": 5.0,
+      "accuracy": 89.0,
+      "cost_per_1k": 2.648,
+      "l0": 1.0,
+      "l2": 88.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 1,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 0.0,
+      "accuracy": 90.0,
+      "cost_per_1k": 2.89,
+      "l0": 0.0,
+      "l2": 100.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     }
+    ],
+    "B6 v2 + 2-fold calibration": {
+     "accuracy": 82.0,
+     "cost_per_1k": 1.649,
+     "l0": 5.0,
+     "l2": 36.0,
+     "see": 0.0,
+     "n": 100
+    }
+   },
+   "locomo": {
+    "L1": {
+     "accuracy": 77.5,
+     "cost_per_1k": 0.793,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "L2": {
+     "accuracy": 82.5,
+     "cost_per_1k": 2.765,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "B6 v2": {
+     "accuracy": 80.0,
+     "cost_per_1k": 1.526,
+     "l0": 0.0,
+     "l2": 39.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "B3": {
+     "accuracy": 77.0,
+     "cost_per_1k": 1.915,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "tests": {
+     "B6 v2 vs L2": {
+      "wins": 2,
+      "losses": 7,
+      "p": 0.1797
+     },
+     "B6 v2 + 2-fold calibration vs B6 v2": {
+      "wins": 6,
+      "losses": 4,
+      "p": 0.7539
+     },
+     "B6 v2 + 2-fold calibration vs L2": {
+      "wins": 2,
+      "losses": 5,
+      "p": 0.4531
+     }
+    },
+    "lambda_sweep": [
+     {
+      "lam": 30.0,
+      "accuracy": 80.0,
+      "cost_per_1k": 1.526,
+      "l0": 0.0,
+      "l2": 39.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 2,
+       "losses": 7,
+       "p": 0.1797
+      }
+     },
+     {
+      "lam": 15.0,
+      "accuracy": 82.0,
+      "cost_per_1k": 2.125,
+      "l0": 0.0,
+      "l2": 67.5,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 1,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 10.0,
+      "accuracy": 82.5,
+      "cost_per_1k": 2.36,
+      "l0": 0.0,
+      "l2": 78.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 5.0,
+      "accuracy": 82.5,
+      "cost_per_1k": 2.704,
+      "l0": 0.0,
+      "l2": 96.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 0.0,
+      "accuracy": 82.5,
+      "cost_per_1k": 2.752,
+      "l0": 0.0,
+      "l2": 99.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     }
+    ],
+    "B6 v2 + 2-fold calibration": {
+     "accuracy": 81.0,
+     "cost_per_1k": 1.649,
+     "l0": 0.0,
+     "l2": 40.0,
+     "see": 0.0,
+     "n": 200
+    }
+   }
+  },
+  "deepseek-flash": {
+   "longmemeval_s": {
+    "L1": {
+     "accuracy": 92.0,
+     "cost_per_1k": 1.585,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "L2": {
+     "accuracy": 96.0,
+     "cost_per_1k": 3.343,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B6 v2": {
+     "accuracy": 92.0,
+     "cost_per_1k": 2.26,
+     "l0": 5.0,
+     "l2": 40.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "B3": {
+     "accuracy": 94.0,
+     "cost_per_1k": 2.896,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 100
+    },
+    "tests": {
+     "B6 v2 vs L2": {
+      "wins": 2,
+      "losses": 6,
+      "p": 0.2891
+     },
+     "B6 v2 + 2-fold calibration vs B6 v2": {
+      "wins": 1,
+      "losses": 0,
+      "p": 1.0
+     },
+     "B6 v2 + 2-fold calibration vs L2": {
+      "wins": 2,
+      "losses": 5,
+      "p": 0.4531
+     }
+    },
+    "lambda_sweep": [
+     {
+      "lam": 30.0,
+      "accuracy": 92.0,
+      "cost_per_1k": 2.26,
+      "l0": 5.0,
+      "l2": 40.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 2,
+       "losses": 6,
+       "p": 0.2891
+      }
+     },
+     {
+      "lam": 15.0,
+      "accuracy": 95.0,
+      "cost_per_1k": 2.752,
+      "l0": 2.0,
+      "l2": 66.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 2,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 10.0,
+      "accuracy": 96.0,
+      "cost_per_1k": 2.861,
+      "l0": 1.0,
+      "l2": 73.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 1,
+       "losses": 1,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 5.0,
+      "accuracy": 95.0,
+      "cost_per_1k": 3.126,
+      "l0": 1.0,
+      "l2": 88.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 1,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 0.0,
+      "accuracy": 96.0,
+      "cost_per_1k": 3.343,
+      "l0": 0.0,
+      "l2": 100.0,
+      "see": 0.0,
+      "n": 100,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     }
+    ],
+    "B6 v2 + 2-fold calibration": {
+     "accuracy": 93.0,
+     "cost_per_1k": 2.133,
+     "l0": 4.0,
+     "l2": 30.0,
+     "see": 0.0,
+     "n": 100
+    }
+   },
+   "locomo": {
+    "L1": {
+     "accuracy": 81.0,
+     "cost_per_1k": 1.443,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "L2": {
+     "accuracy": 87.5,
+     "cost_per_1k": 3.246,
+     "l0": 0.0,
+     "l2": 100.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "B6 v2": {
+     "accuracy": 85.5,
+     "cost_per_1k": 2.194,
+     "l0": 0.0,
+     "l2": 39.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "B3": {
+     "accuracy": 87.5,
+     "cost_per_1k": 3.134,
+     "l0": 0.0,
+     "l2": 0.0,
+     "see": 0.0,
+     "n": 200
+    },
+    "tests": {
+     "B6 v2 vs L2": {
+      "wins": 0,
+      "losses": 4,
+      "p": 0.125
+     },
+     "B6 v2 + 2-fold calibration vs B6 v2": {
+      "wins": 5,
+      "losses": 5,
+      "p": 1.0
+     },
+     "B6 v2 + 2-fold calibration vs L2": {
+      "wins": 1,
+      "losses": 5,
+      "p": 0.2188
+     }
+    },
+    "lambda_sweep": [
+     {
+      "lam": 30.0,
+      "accuracy": 85.5,
+      "cost_per_1k": 2.194,
+      "l0": 0.0,
+      "l2": 39.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 4,
+       "p": 0.125
+      }
+     },
+     {
+      "lam": 15.0,
+      "accuracy": 87.5,
+      "cost_per_1k": 2.716,
+      "l0": 0.0,
+      "l2": 67.5,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 10.0,
+      "accuracy": 87.5,
+      "cost_per_1k": 2.903,
+      "l0": 0.0,
+      "l2": 78.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 5.0,
+      "accuracy": 87.5,
+      "cost_per_1k": 3.176,
+      "l0": 0.0,
+      "l2": 96.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     },
+     {
+      "lam": 0.0,
+      "accuracy": 87.5,
+      "cost_per_1k": 3.23,
+      "l0": 0.0,
+      "l2": 99.0,
+      "see": 0.0,
+      "n": 200,
+      "vs_L2": {
+       "wins": 0,
+       "losses": 0,
+       "p": 1.0
+      }
+     }
+    ],
+    "B6 v2 + 2-fold calibration": {
+     "accuracy": 85.5,
+     "cost_per_1k": 2.439,
+     "l0": 0.0,
+     "l2": 50.5,
+     "see": 0.0,
+     "n": 200
+    }
+   }
+  }
+ }
+}

@@ -5,7 +5,7 @@
 
 [English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [演示指南](demo/README.md)
 
-> 十个节点全部完成（N0–N10）：测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N11 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署）。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 ![演示：跨会话回忆、尺码的更新、按八月的照片找同款、预算的变化与遗忘](docs/assets/demo.gif)
 
@@ -41,6 +41,7 @@
 - **读**：记忆探针（一次 L1 打分，不调用 LLM，54 个特征）→ 两段式控制器按"预计答对概率 − λ × 成本"在 L0（只给画像）、L1（快速召回，不调用 LLM）、L2（规划、补检索、先记笔记再回答）之间选，有图时再决定要不要附原图。
 - **Agent**：控制器先选档召回，模型可以用 `memory_search` 自己补查；上下文按分区预算组装、前缀稳定；另有 HTTP 接口、可解释的界面与 MCP Server。
 - N0 规划里的 L1 重排、L2 图扩散、证据不足时自动升级都实现了，但实测没有收益或收益不抵成本，默认关闭。
+- **部署**：默认用嵌入式的 SQLite 与 Qdrant 本地模式，单进程；可以切到 Qdrant 服务端（见下），HTTP 接口可选访问令牌。
 
 ## 快速开始
 
@@ -77,6 +78,16 @@ claude mcp add cuemem -- uv --directory "$PWD" run cuemem mcp --space me   # 把
 
 演示步骤见 [demo/README.md](demo/README.md)。
 
+部署相关（N11）：
+
+```bash
+docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1        # Qdrant 服务端（本地模式同一时间只允许一个进程打开数据目录）
+uv run cuemem migrate-vectors --to http://localhost:6333  # 已有的本地向量原样复制过去
+export CUEMEM_VECTOR_STORE__URL=http://localhost:6333    # 之后都用服务端（也可以写进 .env）
+CUEMEM_API_TOKEN=换成你的令牌 uv run cuemem serve --host 0.0.0.0   # 接口要带 Bearer 令牌，界面先登录
+uv run python scripts/n11_latency.py                      # 离线延迟基准（不调用 API）
+```
+
 开发：
 
 ```bash
@@ -93,7 +104,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [设计文档](docs/design.md)（[English](docs/en/design.md)） | 动机、架构、检索控制器、多模态、评测方案、技术选型 |
 | [路线图](docs/roadmap.md) | 实施节点、验收标准、进度 |
 | [相关工作](docs/related-work.md) | 与 MemGPT、Mem0、Zep、HippoRAG、Adaptive-RAG、MemLens 等的对比与定位 |
-| [设计决策记录](docs/decisions.md) | 每个重要取舍的背景、备选方案与理由 |
+| [设计决策记录](docs/decisions.md)（[English](docs/en/decisions.md)） | 每个重要取舍的背景、备选方案与理由 |
 | [演示指南](demo/README.md)（[English](demo/README.en.md)） | 3 分钟演示：准备、步骤、讲什么 |
 
 ## 许可
@@ -101,8 +112,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 代码与文档以 [MIT 许可证](LICENSE) 发布。
 
 - 仓库里照搬的 LongMemEval 与 MemLens 判分提示词同样是 MIT 许可，原作者的声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-- 评测数据集由 `cuemem data download` 从发布方下载、不随仓库分发，各自的许可不变：LongMemEval_S（MIT）、LoCoMo（CC BY-NC 4.0）、MemLens（CC BY 4.0，图片沿用来源站点的许可）、databricks-dolly-15k（CC BY-SA 3.0）。
-- 仓库只存划分用的题号、Dolly 的行号，以及由基准题目生成的同话题问题。这些文件的归属在第三方声明里写明。
+- 评测数据集由 `cuemem data download` 从发布方下载、不随仓库分发，各自的许可不变：LongMemEval_S（MIT）、LoCoMo（CC BY-NC 4.0）、MemLens（CC BY 4.0，图片沿用来源站点的许可）、databricks-dolly-15k（CC BY-SA 3.0）；WildChat-1M（只取一个分片、点名才下载，ODC-BY，N11）。
+- 仓库只存划分用的题号、Dolly 的行号、WildChat 的会话哈希，以及由基准题目生成的同话题问题。这些文件的归属在第三方声明里写明。
 
 ## 进度
 
@@ -119,10 +130,25 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N8 | Agent Runtime 与 Demo | 已完成 |
 | N9 | 完整评测与分析 | 已完成 |
 | N10 | 包装 | 已完成 |
+| N11 | 测试集之后的补做 | 已完成 |
 
 ## 结果
 
 主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
+
+### N11 测试集之后的补做（事后，不再用测试集做选择）
+
+N10 之后自查出 11 处不足，逐项处理。控制器的改动在开发集上定，测试集只把冻结的模型重放一遍；冻结的 v1 另存，N9 的数字不动。
+
+1. **控制器 v2**：有图的空间直接查图片空间的准确率表（看图增益不再相加截断），问画面细节时不放到 L0。开发集 81.2% → 81.7%，测试集事后重放 81.6% → 81.9%（+10 / −5，收益全在 MemLens）。N9 归因于饱和的 6 道题确实救回来了，但新表在别处也改了选择，净值为零；净收益来自保底规则。
+2. **换回答模型**：重新标定准确率表反而更差；按回答模型调 λ 有效（λ = 15 补回与总是 L2 的大部分差距，成本仍低 16–24%）。
+   **门控在真实流量上**：无关查询换成 WildChat 里真实用户消息的第一句，门控误送去检索 10.5%（构造的混合流 17.3%），比总是检索省 46%（原来 41%）。
+3. **外部基线 Mem0**：开源版 2.2，用同样的抽取模型、向量、回答模型与判分，LoCoMo 200 题 80.5%、LongMemEval 100 题 83.0%。CueMem 的 L1 在 LoCoMo 上与它打平（81.0%），在 LongMemEval 上高 9 个点（92.0%，p = 0.049）；Mem0 的写入成本是 2.3–2.9 倍。它找得到证据会话，丢分在时间推理、知识更新与助手说过的细节：只增不改的抽取留不住这些。
+4. **判分与随机性**：换一家的判分模型重判 12,835 条回答，一致率 94.7–97.9%（κ 0.82–0.93），方法排序基本不变；关掉缓存重跑，准确率变化不超过 0.9 个点，3–4% 的题翻转。N9 的结论里只有一条不稳：LoCoMo 上 L1 比全上下文低 2.3 个点（换判分后不显著，重跑后 1.5 个点）。人工抽检 50 条已备好，等人工勾选。
+5. **写入与遗忘**：对账提示分清"范围不同""现实变了""说错了"，并附上新事实出自的原话（只看"Mia 31 岁"分不清是更正还是过了生日）；新编的小对话重复 5 次，三类都对（N9 的提示：3 / 5、5 / 5、0 / 5）。Agent 的回答缓存按会话归属，遗忘不再清掉别的会话的缓存。
+6. **规模与部署**：读路径的本机部分在本地模式下随规模线性增长（4.6 万个检索单元约 1.08 s），换 Qdrant 服务端后 91 ms；单进程并发 8.7 → 55 次 / 秒。本地库被占用时明确报错，`cuemem migrate-vectors` 迁到服务端，可选访问令牌。
+
+详见 [N11 结果](docs/results/n11-improvements/README.md) 与[技术报告 §12](docs/report.md#12-n11测试集之后的补做)。
 
 ### N9 最终评测：三个测试集，方法事先冻结，测试集只用一次
 
@@ -147,7 +173,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 1. **记忆系统比全上下文又准又便宜**：LongMemEval 上 L1 高 17.5 个点、成本约 1/20；MemLens 上全上下文从 32K 到 128K 掉 5.6 个点，L2 + 再感知几乎不变。
 2. **写入路径是最大的单项收益**：同样的朴素检索加上写入路径的产出，LongMemEval 82.0% → 91.0%（+53 / −17）。L2 对 L1 在 LoCoMo 上 +4.8 个点，四类题各自显著。
 3. **冻结的控制器复现了开发集的估计**（记忆题 81.2% → 81.6%）：混合流里比总是检索便宜 41%、准确率不降；纯记忆题上比总是 L2 低 2.8 个点。价值在"要不要想起"，不在"想多深"。
-4. **测试集上发现了控制器的两个问题，只记录、不回头改**：
+4. **测试集上发现了控制器的两个问题，当时只记录、不回头改**（N11 在开发集上做了 v2，见上）：
    - 看图增益相加后截断到 1.0，L1 + 看图与 L2 + 看图打平，代价项总选 L1（MemLens 上 B6 低于总是 L2 的主要原因）；
    - "各档准确率"按主回答模型标定，换成小模型后照样大量选 L1。
 5. **模型自主检索读文字最强、看图失灵**：它的检索工具只返回文字。"控制器先选、模型兜底"三个数据集都稳，但最贵。换三个回答模型后，它也不比控制器更不稳（H3 不成立）；大模型一档因余额未跑。

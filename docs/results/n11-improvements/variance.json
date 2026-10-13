@@ -1,0 +1,48 @@
+{
+  "test400-n11-rerun": {
+    "original": "test400-n9",
+    "methods": {
+      "B4-nobm25": {
+        "n": 400,
+        "n9": 0.905,
+        "rerun": 0.9,
+        "delta_pts": -0.5,
+        "gained": 5,
+        "lost": 7,
+        "flip_rate": 0.03,
+        "p": 0.7744,
+        "same_response": 178,
+        "judge_only_flips": 0
+      },
+      "B6": {
+        "n": 400,
+        "n9": 0.905,
+        "rerun": 0.9025,
+        "delta_pts": -0.2,
+        "gained": 7,
+        "lost": 8,
+        "flip_rate": 0.0375,
+        "p": 1.0,
+        "same_response": 124,
+        "judge_only_flips": 0
+      }
+    }
+  },
+  "locomo-test7-n11-rerun": {
+    "original": "locomo-test7-n9",
+    "methods": {
+      "B4-nobm25": {
+        "n": 1155,
+        "n9": 0.7965,
+        "rerun": 0.8052,
+        "delta_pts": 0.9,
+        "gained": 26,
+        "lost": 16,
+        "flip_rate": 0.0364,
+        "p": 0.1641,
+        "same_response": 538,
+        "judge_only_flips": 2
+      }
+    }
+  }
+}

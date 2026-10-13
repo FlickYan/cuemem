@@ -337,6 +337,7 @@ METHOD_NAMES = (
     "B4-see-novis",
     "B5-see",
     "ORACLE",
+    "M0",
 )
 
 
@@ -346,6 +347,12 @@ N4_L1 = L1Config(sparse="bm25")
 # 对比图片描述时不用以文搜图，只看描述本身的作用
 CAPTIONS = L1Config(fact_weight=0.0, visual_weight=0.0)
 TEXT_ONLY = replace(CAPTIONS, image_kind=None)
+
+
+def _mem0() -> Method:
+    from cuemem.evals.mem0_baseline import Mem0Baseline
+
+    return Mem0Baseline()
 
 
 def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
@@ -431,6 +438,8 @@ def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
             replace(L2Config(), l1=replace(L2Config().l1, attach_images=3)),
         ),
         "ORACLE": OracleSessions,
+        # N11：外部基线 Mem0（需要临时装上 mem0ai，见 evals/mem0_baseline.py）
+        "M0": _mem0,
     }
     unknown = [n for n in names if n not in factories]
     if unknown:

@@ -141,6 +141,14 @@ class RegrownOutput(BaseModel):
     same: list[int] = Field(default_factory=list)
 
 
+def load_controller(settings: Settings) -> LearnedController | None:
+    """按配置（retrieval.controller）加载检索控制器的模型文件；没有时返回 None（退回规则版）。"""
+    path = Path(settings.retrieval.controller)
+    if not path.is_absolute():
+        path = DEFAULT_MODEL.parent / path
+    return LearnedController.load(path) if path.exists() else None
+
+
 def image_mode(cfg: L1Config) -> ImageMode:
     """检索用哪种图片描述，回答时就展示哪种（不用描述时只留 [Image] 占位）。"""
     if cfg.image_kind == "image":
@@ -216,8 +224,9 @@ class MemorySystem:
         self.l2 = L2Retriever(db, vectors, embedder, llm, self.l1, reranker=reranker)
         self.probe = Probe(db, self.l1)
         self.controller = RuleController()
-        # N7 的检索控制器：模型文件由 scripts/n7_controller.py 训练导出；没有时退回规则版
-        self.learned = LearnedController.load() if DEFAULT_MODEL.exists() else None
+        # 检索控制器（N7 / N11）：模型文件由 scripts/n7_controller.py（v1）、
+        # scripts/n11_controller_v2.py（v2，默认）训练导出；没有时退回规则版
+        self.learned = load_controller(settings)
         self.router = LLMRouter(llm)
         self.reader = Reader(llm)
         self.agent = ToolReader(llm)

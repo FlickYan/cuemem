@@ -1,0 +1,232 @@
+{
+  "labels": {
+    "M0": "Mem0 (OSS 2.2, hybrid search, top-30 per user)",
+    "B1": "Full context",
+    "B2": "Naive RAG",
+    "B4-nobm25": "CueMem L1",
+    "B5": "CueMem L2",
+    "B6": "CueMem controller"
+  },
+  "locomo-test200r-mem0": {
+    "dataset": "locomo",
+    "questions": 200,
+    "errors": 0,
+    "methods": {
+      "M0": {
+        "n": 200,
+        "accuracy": 0.805,
+        "cost_per_1k": 1.36,
+        "by_type": {
+          "multi-hop": 0.611,
+          "open-domain": 0.462,
+          "single-hop": 0.892,
+          "temporal": 0.85
+        }
+      },
+      "B1": {
+        "n": 200,
+        "accuracy": 0.845,
+        "cost_per_1k": 6.89,
+        "by_type": {
+          "multi-hop": 0.556,
+          "open-domain": 0.692,
+          "single-hop": 0.973,
+          "temporal": 0.8
+        }
+      },
+      "B2": {
+        "n": 200,
+        "accuracy": 0.675,
+        "cost_per_1k": 0.42,
+        "by_type": {
+          "multi-hop": 0.333,
+          "open-domain": 0.308,
+          "single-hop": 0.793,
+          "temporal": 0.775
+        }
+      },
+      "B4-nobm25": {
+        "n": 200,
+        "accuracy": 0.81,
+        "cost_per_1k": 1.44,
+        "by_type": {
+          "multi-hop": 0.556,
+          "open-domain": 0.462,
+          "single-hop": 0.928,
+          "temporal": 0.825
+        }
+      },
+      "B5": {
+        "n": 200,
+        "accuracy": 0.875,
+        "cost_per_1k": 3.25,
+        "by_type": {
+          "multi-hop": 0.722,
+          "open-domain": 0.462,
+          "single-hop": 0.973,
+          "temporal": 0.875
+        }
+      },
+      "B6": {
+        "n": 200,
+        "accuracy": 0.855,
+        "cost_per_1k": 2.19,
+        "by_type": {
+          "multi-hop": 0.667,
+          "open-domain": 0.462,
+          "single-hop": 0.955,
+          "temporal": 0.875
+        }
+      }
+    },
+    "paired": {
+      "B4-nobm25_vs_M0": {
+        "wins": 15,
+        "losses": 14,
+        "p": 1.0
+      },
+      "B2_vs_M0": {
+        "wins": 12,
+        "losses": 38,
+        "p": 0.00030586400160359517
+      },
+      "B6_vs_M0": {
+        "wins": 18,
+        "losses": 8,
+        "p": 0.07551869750022888
+      }
+    },
+    "write": {
+      "mem0": {
+        "cost": 0.7009194599999999,
+        "spent": 0.23120545999999997,
+        "memories": 2833,
+        "llm_calls": 404,
+        "spaces": 7
+      },
+      "cuemem": {
+        "cost": 0.24178338,
+        "llm_calls": 396,
+        "spaces": 7
+      }
+    },
+    "mem0_session_recall": 0.992
+  },
+  "test100r-mem0": {
+    "dataset": "longmemeval_s",
+    "questions": 100,
+    "errors": 0,
+    "methods": {
+      "M0": {
+        "n": 100,
+        "accuracy": 0.83,
+        "cost_per_1k": 0.83,
+        "by_type": {
+          "knowledge-update": 0.812,
+          "multi-session": 0.769,
+          "single-session-assistant": 0.818,
+          "single-session-preference": 1.0,
+          "single-session-user": 1.0,
+          "temporal-reasoning": 0.778
+        }
+      },
+      "B1": {
+        "n": 100,
+        "accuracy": 0.8,
+        "cost_per_1k": 32.0,
+        "by_type": {
+          "knowledge-update": 0.875,
+          "multi-session": 0.731,
+          "single-session-assistant": 1.0,
+          "single-session-preference": 0.667,
+          "single-session-user": 1.0,
+          "temporal-reasoning": 0.667
+        }
+      },
+      "B2": {
+        "n": 100,
+        "accuracy": 0.86,
+        "cost_per_1k": 1.71,
+        "by_type": {
+          "knowledge-update": 0.75,
+          "multi-session": 0.769,
+          "single-session-assistant": 1.0,
+          "single-session-preference": 1.0,
+          "single-session-user": 1.0,
+          "temporal-reasoning": 0.852
+        }
+      },
+      "B4-nobm25": {
+        "n": 100,
+        "accuracy": 0.92,
+        "cost_per_1k": 1.58,
+        "by_type": {
+          "knowledge-update": 1.0,
+          "multi-session": 0.808,
+          "single-session-assistant": 1.0,
+          "single-session-preference": 0.667,
+          "single-session-user": 1.0,
+          "temporal-reasoning": 0.963
+        }
+      },
+      "B5": {
+        "n": 100,
+        "accuracy": 0.96,
+        "cost_per_1k": 3.34,
+        "by_type": {
+          "knowledge-update": 0.938,
+          "multi-session": 1.0,
+          "single-session-assistant": 1.0,
+          "single-session-preference": 0.667,
+          "single-session-user": 1.0,
+          "temporal-reasoning": 0.963
+        }
+      },
+      "B6": {
+        "n": 100,
+        "accuracy": 0.92,
+        "cost_per_1k": 2.26,
+        "by_type": {
+          "knowledge-update": 1.0,
+          "multi-session": 0.923,
+          "single-session-assistant": 1.0,
+          "single-session-preference": 0.667,
+          "single-session-user": 1.0,
+          "temporal-reasoning": 0.852
+        }
+      }
+    },
+    "paired": {
+      "B4-nobm25_vs_M0": {
+        "wins": 13,
+        "losses": 4,
+        "p": 0.049041748046875
+      },
+      "B2_vs_M0": {
+        "wins": 8,
+        "losses": 5,
+        "p": 0.5810546875
+      },
+      "B6_vs_M0": {
+        "wins": 15,
+        "losses": 6,
+        "p": 0.0783538818359375
+      }
+    },
+    "write": {
+      "mem0": {
+        "cost": 9.755869189999999,
+        "spent": 4.849083190000001,
+        "memories": 29140,
+        "llm_calls": 4769,
+        "spaces": 100
+      },
+      "cuemem": {
+        "cost": 4.321678759999998,
+        "llm_calls": 7830,
+        "spaces": 100
+      }
+    },
+    "mem0_session_recall": 1.0
+  }
+}

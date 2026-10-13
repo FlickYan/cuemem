@@ -22,7 +22,7 @@ from typing import Any
 
 from cuemem.config import PROJECT_ROOT
 from cuemem.evals import routing as R
-from cuemem.read.controller import LearnedController
+from cuemem.read.controller import V1_MODEL, LearnedController
 
 RUNS = PROJECT_ROOT / "runs" / "eval"
 OUT = PROJECT_ROOT / "docs" / "results" / "n7-controller"
@@ -43,7 +43,7 @@ def row(policy: R.PolicyResult) -> dict[str, float]:
 
 
 def main() -> None:
-    lam = LearnedController.load().lam
+    lam = LearnedController.load(V1_MODEL).lam
     actions = json.loads((RUNS / "n7-controller" / "b6_crossfit.json").read_text("utf-8"))
     results: dict[str, Any] = {"lambda": lam, "readers": {}}
     per_reader: dict[str, dict[str, dict[str, R.PolicyResult]]] = {}

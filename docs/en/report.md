@@ -1,6 +1,6 @@
 # CueMem technical report
 
-> v1.0 · 2026-10-13 · English edition of [docs/report.md](../report.md). This report covers the system and the final evaluation. The node-by-node experiments, the development-set results and the design decisions are recorded in Chinese, in [docs/results/](../results/) and [decisions.md](../decisions.md) (cited below as D-xxx).
+> v1.1 · 2026-10-13 · English edition of [docs/report.md](../report.md). This report covers the system, the final evaluation (N9), and the follow-up work done after the test sets were used (N11, §12). The node-by-node experiments and development-set results are recorded in Chinese in [docs/results/](../results/); the design decisions are in [decisions.md](decisions.md) (cited below as D-xxx).
 
 ## Abstract
 
@@ -38,7 +38,7 @@ This project treats memory as an information-management problem. It asks one con
 ## 2. System
 
 ```text
-user message ──► memory probe (no LLM, tens of ms) ──► controller ──► L0 profile only
+user message ──► memory probe (no LLM, p50 0.2–0.5 s) ──► controller ──► L0 profile only
                                                          ├──► L1 fast recall (no LLM)
                                                          └──► L2 deep recall (plan, re-check, notes)
                                                                (with photos: attach the originals or not)
@@ -191,7 +191,7 @@ Accuracy / nominal cost per 1,000 questions. On MemLens, L1 and L2 attach the or
 
 - **Memory versus full context.**
   - LongMemEval: L1 is 17.5 points above full context (+84 / −14 questions) at about 1/20 of the cost. Full context is worst on multi-session questions (62.9%) and temporal questions (52.0%).
-  - LoCoMo: a conversation is only about 20k tokens, so full context is not long here. L1 is 2.3 points lower (p = 0.038) and L2 2.5 points higher (p = 0.021), at less than half the cost.
+  - LoCoMo: a conversation is only about 20k tokens, so full context is not long here. L1 is 2.3 points lower (p = 0.038) and L2 2.5 points higher (p = 0.021), at less than half the cost. (N11: L1 being lower is not significant under a second judge and shrinks to 1.5 points in a rerun, so the two should be read as close; see §12.3.)
   - MemLens: full context drops 5.6 points from 32K to 128K, while L2 with photos barely moves (65.6% → 65.1%). L2 with photos beats full context +33 / −6 (32K) and +47 / −10 (128K).
 - **The write path.**
   - The same naive retrieval, given the write path's output, goes from 82.0% to 91.0% on LongMemEval (+53 / −17, p < 0.001). The output is facts with validity, fact-augmented index keys and a profile.
@@ -260,6 +260,8 @@ With photos in the memory, the controller estimates the success of "L1 + photos"
 | L2 + photos | 109 | 56 | 56 | 56 |
 
 B6 loses 13 questions to "always L2 + photos". Six of them are in the clipped group. Five are memory questions the gate sent to L0, mostly questions that refer to a shared photo without any first-person cue; N7's zero-shot router misses these too. The fix is simple: add the gain in log-odds, or compare before clipping. Problems found on the test sets are recorded here and not fixed (D-048).
+
+> **N11 note.** A post-hoc replay shows that "the fix is simple" was too optimistic. With an image-space accuracy table, those 6 questions are indeed recovered, but the choices on some 70 other questions change too, and the net effect at 32K is zero. The net gain comes from a different rule: in a space with photos, a question about visual detail never goes to L0 (§12.1).
 
 ## 6. Swapping the reader model
 
@@ -416,6 +418,8 @@ B6 made 78 errors; 40 were read:
 - **Both of the controller's MemLens problems show up in the errors.**
   - The gate misses questions that refer to a shared photo. On the test mixed stream, the gate's AUC in MemLens spaces is 0.93, against 0.98 or more elsewhere. N7's zero-shot LLM router misses these too (D-039).
   - The saturated photo gain makes L1 + photos tie with L2 + photos (§5.3).
+
+  N11's controller v2 changes both; the post-hoc replay is in §12.1.
 - **7 of the 40 are judging or dataset problems.**
   - 4 knowledge-update questions name the same thing differently.
   - 2 gold answers contradict the session dates. MemLens tells preference changes through narrative ("At first…", "Lately…"), but the session dates do not follow the narrative order. For example, the 05-19 session says "lately I lean towards the Oculus Quest", the 05-26 session says "in the end I prefer the Switch", and the gold answer is Oculus Quest. Taking the latest statement by date (the system's design, D-002) is marked wrong.
@@ -427,9 +431,9 @@ B6 made 78 errors; 40 were read:
 |---|---|---|
 | H1 | For deciding how deeply to retrieve, probe feedback + query-cue features beat query text alone, and beat triggering on model uncertainty | **Half supported.** True for "recall or not": on the development set, question cues alone give AUC 0.79, probe feedback alone 0.96, both 0.98; the frozen gate scores 0.990 on the test stream. Escalating on model uncertainty was worst (N7). Not true for "L1 or L2": the reasoning type depends mostly on how the question is phrased. On the test sets, B6's depth decisions beat always-L1 (+60 / −37) but stay 2.8 points below always-L2 |
 | H2 | The controller reaches close to always-L2 accuracy at much lower average cost | **False on memory questions alone, true in the mixed stream.** On the test sets, B6 is 2.8 points below always-L2 (+15 / −64) at 31% lower cost. In a stream with 20% memory questions, it is 41% cheaper than always retrieving with no loss of memory accuracy (+1.3 points). Matches the development estimate |
-| H3 | Compared with agentic retrieval, the controller is more stable across reader models, and its advantage is larger on small models | **Refuted** (three readers; the large tier not run for lack of balance). B3 fluctuates no more than B6 across readers; on the smallest model, B3 loses a little only on LoCoMo (+9 / −20 against L2, p = 0.061). The controller's own problem: its per-level accuracy is calibrated on the main reader, so with a small reader it keeps choosing L1. "Controller first, LLM may search more" is never the worst under any reader |
+| H3 | Compared with agentic retrieval, the controller is more stable across reader models, and its advantage is larger on small models | **Refuted** (three readers; the large tier not run for lack of balance). B3 fluctuates no more than B6 across readers; on the smallest model, B3 loses a little only on LoCoMo (+9 / −20 against L2, p = 0.061). The controller's own problem: its per-level accuracy is calibrated on the main reader, so with a small reader it keeps choosing L1 (N11: recalibrating does not help, setting λ per reader does; §12.1). "Controller first, LLM may search more" is never the worst under any reader |
 | H4 | Validity periods ("invalidate, don't delete") help knowledge-update questions without hurting questions about past states | **Not supported.** On the test knowledge-update questions, the full version, "current facts only" and "no validity labels" all score 96.5%: the raw conversation is still in context and the model tells old from new by itself. The full version's edge over the ablations (+15 / −6, +13 / −7) comes from multi-session questions and is not significant. The write path as a whole gains 9 points, but not from validity labels |
-| H5 | Re-perceiving original photos at answer time significantly helps questions that need visual detail, and the controller can control the image token cost | **Supported** (N6; N9 uses the same test set). L1 with 3 original photos: +12.3 points at 32K (+26 / −2), +6.7 at 128K (+18 / −5), concentrated in information extraction. The controller does control whether to attach photos, but the clipped photo gain makes it choose wrongly between L1 + photos and L2 + photos (§5.3) |
+| H5 | Re-perceiving original photos at answer time significantly helps questions that need visual detail, and the controller can control the image token cost | **Supported** (N6; N9 uses the same test set). L1 with 3 original photos: +12.3 points at 32K (+26 / −2), +6.7 at 128K (+18 / −5), concentrated in information extraction. The controller does control whether to attach photos, but the clipped photo gain makes it choose wrongly between L1 + photos and L2 + photos (§5.3; N11's fix in §12.1) |
 | H6 | Context-aware image captions beat isolated captions, especially for entity-binding questions | **Not supported** (N6; not re-tested in N9). Slightly better for retrieval, but end to end the isolated captions got 3 more questions right (n.s.); MemLens mostly asks about visual detail (D-035) |
 
 Of the six hypotheses, only H5 holds fully; H1 and H2 hold in half. The refuted ones are informative too:
@@ -448,10 +452,13 @@ Of the six hypotheses, only H5 holds fully; H1 and H2 hold in half. The refuted 
   - N9's MemLens numbers differ from N6's by ±1–3 questions.
   - N6 ran its 32K and 128K evaluations concurrently. When identical requests run at the same time, which one is written to the cache first is not determined; we found 1 judgement and 3 L2 query plans that differ.
   - "Reproducible" means replaying from the cache gives byte-identical results; rerunning from scratch varies by this much.
-- **The controller was trained on only 585 development questions** and does not transfer zero-shot across datasets (N7). Three problems found on the test sets are recorded, not fixed (D-048):
+- **The controller was trained on only 585 development questions** and does not transfer zero-shot across datasets (N7). Three problems found on the test sets were recorded and, at the time, not fixed (D-048):
   - the gate misses questions that refer to a shared photo on MemLens (§8.3);
   - the photo gain is added and clipped, so L1 + photos ties with L2 + photos (§5.3);
   - the per-level accuracy is calibrated on the main reader and goes wrong with a new reader (§6).
+
+  N11 built a controller v2 on the development set and only replayed it on the test sets (§12.1). The first two problems improve a little (MemLens 32K 60.0% → 62.6%). Recalibrating the table for a new reader does not help; setting λ per reader does.
+- **The mixed stream is synthetic.** The queries that need no memory are Dolly requests and generated same-topic questions, and "20% of queries need memory" is an assumption. N11 checked the gate's false recall on the first messages of real chatbot conversations from WildChat (§12.1), but how many real messages need memory, and what they look like, is still unknown.
 - **The gold labels are noisy.** Among errors read by hand, 10 / 40 on LoCoMo had wrong or underivable gold answers (5 of the 7 temporal errors), and 2 / 40 on MemLens contradicted the session dates. They were not removed.
 - **The large reader tier was not run.** deepseek-v4-pro was skipped for lack of DeepSeek balance, so H3 covers only the small and medium tiers.
 - **All datasets are English.** Chinese conversations were not evaluated. The small model's price (qwen3.6-35b-a3b) is taken from OpenRouter's listing (D-049).
@@ -490,3 +497,101 @@ There are three exceptions:
 - The N2 and N3 numbers used the older embedding model text-embedding-v4; the script switches automatically.
 - The N8 context-layout experiment ran with the local cache off and real calls every time, so it is not in the script.
 - The N9 large reader tier has never been run and is an optional step (`--with-optional`).
+
+## 12. N11: follow-up work after the test sets
+
+After N10 we went back over the weaknesses we could find. Two rules held throughout:
+
+- **No more decisions on the test sets.** Every controller change was settled on the development set. The frozen model was only replayed on the test results, and the differences are reported.
+- **The N9 numbers stay as they are.** The frozen v1 controller is kept as a separate file, and reproducing N7 and N9 always uses it (D-052).
+
+Details and raw numbers are in the [N11 results record](../results/n11-improvements/README.md) (Chinese).
+
+### 12.1 Controller v2
+
+Two changes; the gate, the reasoning-type model and λ (still 30) are unchanged (D-052):
+
+1. In a space with photos, the controller no longer adds a photo gain to the no-photo success rate and clips at 1.0. It looks up an image-space accuracy table instead: reasoning type × five actions, estimated only from training questions with photos.
+2. In a space with photos, a question with a visual cue or a position cue ("on the left", "in the background", "in the photo") never goes to L0; it gets at least L1 + photos.
+
+| Test sets (post-hoc replay) | v1 (N9) | v2, table only | **v2** | Always L2 |
+|---|---|---|---|---|
+| LongMemEval | 90.5% | 90.5% | 90.5% | 93.2% |
+| LoCoMo | 82.2% | 82.2% | 82.2% | 84.5% |
+| MemLens 32K | 60.0% | 60.0% | **62.6%** | 65.6% |
+| MemLens 128K | 60.5% | 59.5% | **61.0%** | 65.1% |
+| Memory questions combined | 81.6% / $2.36 | — | 81.9% / $2.37 | 84.4% / $3.42 |
+
+- Development set (cross-fitted): 81.2% → 81.7%. Test sets: +10 / −5 (not significant), all on MemLens; the text datasets are unchanged question by question.
+- **A correction to §5.3.** The table alone does recover the 6 questions attributed to saturation, but it also changes the choice on some 70 other questions, for a net +7 / −7 at 32K. The image-space accuracies can only be estimated from the 100 MemLens development questions, so every cell is sparse. The net gain comes from the floor rule, which recovers 3 of the 5 memory questions v1 sent to L0.
+- **For a new reader, recalibration does not help; λ does.** Recalibrating the accuracy table on qwen3.8-flash's development results makes things worse (LongMemEval 93% → 89%). With the same model, lowering λ from 30 to 15 recovers most of the gap to always-L2 for all three readers while staying 16–24% cheaper. For example, the small qwen3.6-35b-a3b goes from 83% to 87% on LongMemEval (always-L2: 90%). This is a post-hoc curve on the test subsets and the default λ is unchanged; it says that "how much an extra correct answer is worth" should be set per reader.
+- v2 does not decide "L1 or L2" any better (still 2.5 points below always-L2), so the N9 conclusion stands.
+- **The gate on real traffic** (D-057): the synthetic queries that need no memory were replaced by the first messages of real chatbot conversations from WildChat (1,750, 23% of them in the first person); the memory questions and the controller are unchanged.
+
+| Queries that need no memory | Gate false recall v1 / v2 | Mixed-stream cost per 1k (v1) | Saving vs always-L1 | Zero-shot LLM router: false recall / memory questions sent to L0 |
+|---|---|---|---|---|
+| **WildChat first messages** | **10.5% / 9.9%** | $0.83 | **46%** | 0.7% / 3.0% |
+| N9's mixed stream (half Dolly, half generated same-topic questions) | 17.3% / 16.7% | $0.90 | 41% | 0.8% / 3.0% |
+
+  False recall on real first messages lies between Dolly (6.6%) and the generated questions (27.9%), so the synthetic stream was the harder one, and the "whether to recall" half of the conclusion holds on real messages. What the gate wrongly sends to retrieval is mostly first-person messages about the user's own experiences. Limitation: later messages in a conversation are the ones likely to need memory, and those are not labelled; "20% of queries need memory" is still an assumption.
+
+### 12.2 External baseline: Mem0
+
+| Dataset (questions) | Mem0 | Naive RAG | CueMem L1 | CueMem controller | CueMem L2 | Full context |
+|---|---|---|---|---|---|---|
+| LoCoMo (200) | 80.5% / $1.36 | 67.5% / $0.42 | 81.0% / $1.44 | 85.5% / $2.19 | 87.5% / $3.25 | 84.5% / $6.89 |
+| LongMemEval (100) | 83.0% / $0.83 | 86.0% / $1.71 | 92.0% / $1.58 | 92.0% / $2.26 | 96.0% / $3.34 | 80.0% / $32.00 |
+
+Accuracy / answer cost per 1,000 questions (writing excluded); CueMem's numbers are N9's results on the same questions.
+
+- On LoCoMo, L1 ties with Mem0 (+15 / −14); on LongMemEval it is 9 points higher (+13 / −4, p = 0.049). The controller is higher on both, just short of significance (p = 0.076 and 0.078). Mem0's nominal write cost is 2.3–2.9 times CueMem's.
+- Mem0's retrieved memories almost always come from the evidence sessions (session recall 99–100%); it loses points on what the memories contain: temporal reasoning (78% against L1's 96%), knowledge updates (81% against 100%) and details the assistant gave (82% against 100%). Mem0 2.x only adds, keeps no validity periods, and extracts mostly the user's facts; that is what CueMem's write path (facts on two timelines, plus the raw turns) covers. Mem0 is better on preference questions.
+- Qwen's JSON mode sometimes returns a bare list of memories, and Mem0 then drops the whole session (8 of about 5,400 extractions). The adapter adds the missing wrapper, and the 7 affected spaces were rebuilt.
+- Limitations: one run per dataset; Mem0 runs on CueMem's models rather than its default OpenAI models; the Mem0 paper's numbers (different reader and judge) are not comparable.
+
+Protocol (D-055): open-source mem0ai 2.2.1, writing with its own pipeline (one `add` per session) and reading with its own `search` (top-30, with spaCy and fastembed installed so its hybrid search is complete). LoCoMo is a conversation between two people, so, as in the Mem0 paper's evaluation code, each speaker gets a user_id, and retrieval takes 30 memories from each side, labelled with whose they are. Mem0's internal LLM and embeddings are replaced by the same models CueMem's write path uses; the reader, the reader prompt and the judge are the same as for every other method. The open-source version does not support `timestamp`, so the "observation date" in its extraction prompt is set to the session date.
+
+### 12.3 Judging and run-to-run variation
+
+**A second judge.** deepseek-flash (another provider's model, same prompts and parsing) re-judged the 12,835 answers of N9's main methods:
+
+| Dataset | Agreement | κ | Judged correct: primary / second | Method ranking, Kendall τ |
+|---|---|---|---|---|
+| LongMemEval | 97.9% | 0.91 | 87.3% / 87.9% | 0.90 |
+| LoCoMo | 94.7% | 0.82 | 80.9% / 84.4% | 0.90 |
+| MemLens 32K | 96.8% | 0.93 | 58.1% / 61.4% | 0.87 |
+| MemLens 128K | 96.7% | 0.93 | 56.8% / 59.6% | 1.00 |
+
+Of the 17 key comparisons, one changes significance: L1 below full context on LoCoMo, +65 / −92 (p = 0.038) → +64 / −77 (p = 0.31). Ranking changes are only between adjacent methods less than 2 points apart. The second judge is more lenient everywhere; it is also the main reader and may favour its own answers, so it is used to test the conclusions, not to replace the primary judge.
+
+**The same configuration, run again.** With the LLM cache off, on the same memory spaces:
+
+| Dataset | Method | N9 | Rerun | Flips: right→wrong / wrong→right |
+|---|---|---|---|---|
+| LongMemEval | L1 | 90.5% | 90.0% | 7 / 5 (3.0%) |
+| | Controller | 90.5% | 90.2% | 8 / 7 (3.8%) |
+| LoCoMo | L1 | 79.7% | 80.5% | 16 / 26 (3.6%) |
+
+At temperature 0, more than half of the answers are still worded differently; accuracy moves within ±1 point and 3–4% of questions flip. **Comparisons about 1 point apart are not stable conclusions**: "L1 is 2.3 points below full context on LoCoMo" shrinks to 1.5 points in the rerun and is not significant under the second judge, so the two are close; the controller's 10 / 10 against L1 on LongMemEval is the same. The large conclusions (L1 against full context on LongMemEval, +84 / −14; the controller against L2) are far outside this noise.
+
+Human audit: 50 judgements were sampled from N9, stratified by dataset and half judged correct, half wrong (`scripts/n11_audit.py`). They await hand-checking.
+
+### 12.4 Write path and forgetting
+
+- **Reconciliation now separates "different scope", "the world changed" and "it was a mistake"** (D-053). This fixes the two errors in N9's error analysis: "up at 6:00 on Fridays" replaced "up at 6:30 on weekdays", and "moved to Singapore" was labelled a correction. The live test showed that the prompt alone was not enough: the reconciler only saw the extracted "Mia is 31", which cannot tell a correction from a birthday, so each new fact in the gray zone now comes with the message it was taken from. On a new four-session conversation run 5 times, different scope / the world changed / it was a mistake were right 5 / 5 each (N9's prompt: 3 / 5, 5 / 5, 0 / 5). It is one conversation and the prompt was revised against it, so this is not an overall accuracy for reconciliation. Prompt text is not part of the consolidation fingerprint, so the existing evaluation spaces are not rebuilt.
+- **The agent's reply cache is scoped to the session** (D-054). Forgetting clears only the sessions it affects, so demo replays no longer fail now and then because another session's cache was cleared. Two full replays each passed 13 of 14 checks, including the checks after forgetting. The two misses: a keyword check that was too literal (the reply kept the vegan constraint without the word "vegan"; relaxed), and the agent answering the previous question again (the facts were reconciled correctly, and the same turn had passed the three replays before).
+
+### 12.5 Scale and deployment
+
+Offline latency benchmark (`scripts/n11_latency.py`, hash embeddings, excluding the ~110 ms query embedding call in production; Apple M2, median of 3 runs per size):
+
+| Rounds (retrieval units) | Read path p50: local mode | Read path p50: Qdrant server |
+|---|---|---|
+| 500 (1.3k) | 32 ms | 14 ms |
+| 2,000 (4.7k) | 111 ms | 20 ms |
+| 8,000 (19k) | 445 ms | 33 ms |
+| 20,000 (46k) | 1,076 ms | 91 ms |
+
+- Local mode is exact search in Python and grows linearly. A year of daily chats is about 3,600 rounds, or about 0.2 s of local work; beyond that, switch to the server (which now gets payload indexes).
+- Concurrency in one process (2,000 rounds, a simulated 110 ms embedding call): local mode saturates at about 9 reads per second; the server reaches 55 per second with 16 threads.
+- When another process holds the local vector store, CueMem now says so and explains how to switch to a server. The HTTP API and the UI take an optional access token (`CUEMEM_API_TOKEN`, D-056).

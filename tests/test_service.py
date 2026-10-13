@@ -163,6 +163,28 @@ def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedMo
     assert live.window == []
 
 
+def test_forget_keeps_other_sessions_reply_cache(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """回答缓存按会话归属（N11）：遗忘一条事实只清受影响会话的缓存，别的会话回放时仍然命中。"""
+    from cuemem.write.consolidate import scope
+
+    model.agent = lambda body: "Noted!"
+    first = service.start("shop", at=DAY)
+    service.chat(first.session_id, "I'm vegan, so no leather please.", mode="l0")
+    service.end(first.session_id, wait=True)
+    second = service.start("shop", at=datetime(2026, 9, 12))
+    service.chat(second.session_id, "My sister Ana turns 30 on October 3.", mode="l0")
+    service.end(second.session_id, wait=True)
+    cache = service.system.llm.cache
+    assert cache is not None
+    before = len(cache.responses(scope("shop", f"session:{first.session_id}")))
+    fact = next(f for f in service.facts("shop") if "Ana" in f["statement"])
+    service.forget("shop", fact_ids=[fact["id"]])
+    assert len(cache.responses(scope("shop", f"session:{first.session_id}"))) == before > 0
+    assert not cache.responses(scope("shop", f"session:{second.session_id}"))
+
+
 def _birthday_chat(service: ChatService, model: ScriptedModel, replies: list[str]) -> str:
     """一段已巩固的会话：用户说了 Ana 的生日，助手后来没有引用、顺口转述了一次。
 
@@ -272,6 +294,21 @@ def test_http_api(service: ChatService, tmp_path: Path, catalog_root: Path) -> N
         files=[("images", ("x.txt", b"not an image", "text/plain"))],
     )
     assert rejected.status_code == 415
+
+
+def test_http_api_token(service: ChatService, tmp_path: Path) -> None:
+    """设置访问令牌后：健康检查不鉴权，其余接口要带正确的 Bearer 令牌。"""
+    client = TestClient(
+        create_app(service, upload_dir=tmp_path / "uploads", ui=False, token="fake-token")
+    )
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/spaces").status_code == 401
+    wrong = client.get("/api/spaces", headers={"Authorization": "Bearer fake-wrong"})
+    assert wrong.status_code == 401 and wrong.headers["www-authenticate"] == "Bearer"
+    ok = client.get("/api/spaces", headers={"Authorization": "Bearer fake-token"})
+    assert ok.status_code == 200
+    forget = client.post("/api/spaces/shop/forget", json={"session_ids": ["s1"]})
+    assert forget.status_code == 401  # 删除记忆同样要令牌
 
 
 # ---------- MCP ----------

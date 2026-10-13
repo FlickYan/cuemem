@@ -315,9 +315,15 @@ class AccuracyTable:
 
     level: dict[str, dict[str, float]]  # 推理类型 → 档 → 准确率
     see_gain: dict[str, dict[str, float]]  # 推理类型 → 档 → 再感知的增益
+    # v2（N11）：有图的空间里各动作（含再感知）的准确率，直接从有图的数据估计。
+    # v1 把再感知的增益加到"所有数据合并"的准确率上再截断到 1：合并的准确率主要来自文字数据集，
+    # 单点事实题 L1 / L2 都在 0.86 左右，加上 MemLens 的看图增益就双双溢出成 1.0，两档打平
+    image: dict[str, dict[str, float]] | None = None
 
 
-def accuracy_table(items: Sequence[Item], types: Sequence[str] = REASONING_TYPES) -> AccuracyTable:
+def accuracy_table(
+    items: Sequence[Item], types: Sequence[str] = REASONING_TYPES, *, by_images: bool = False
+) -> AccuracyTable:
     level: dict[str, dict[str, float]] = {}
     see_gain: dict[str, dict[str, float]] = {}
     # 收缩的目标是记忆题的总体均值：无关查询各档都算"答对"，混进来会把小类的 L0 准确率拉高
@@ -352,7 +358,31 @@ def accuracy_table(items: Sequence[Item], types: Sequence[str] = REASONING_TYPES
                 see_gain[t][lv] = 0.0
                 continue
             see_gain[t][lv] = (sum(gains) + SHRINK * see_overall[lv]) / (len(gains) + SHRINK)
-    return AccuracyTable(level, see_gain)
+    return AccuracyTable(level, see_gain, image_table(items, types) if by_images else None)
+
+
+def image_table(items: Sequence[Item], types: Sequence[str]) -> dict[str, dict[str, float]] | None:
+    """有图的空间里，各推理类型上各动作（L0 / L1 / L2 / L1+see / L2+see）的准确率。
+
+    只用有图的题估计，向有图记忆题的总体均值收缩；有图数据里没有的类型（偏好、开放推断）
+    就取总体均值。与记忆无关的查询按假设各动作都答对。
+    """
+    image_items = [it for it in items if it.has_images]
+    base = [it for it in image_items if it.is_memory]
+    if not base:
+        return None
+    actions = sorted(set.intersection(*(set(it.actions) for it in base)))
+    overall = {a: float(np.mean([it.actions[a].correct for it in base])) for a in actions}
+    table: dict[str, dict[str, float]] = {}
+    for t in types:
+        members = [it for it in image_items if it.rtype == t]
+        shrink = 0.0 if t == "none" and members else SHRINK
+        table[t] = {
+            a: (sum(it.actions[a].correct for it in members) + shrink * overall[a])
+            / (len(members) + shrink)
+            for a in actions
+        }
+    return table
 
 
 def combine(
@@ -361,6 +391,15 @@ def combine(
     """第二段：P̂(a | x) = Σ_t P(t | x) · acc(a | t)；有图的空间另算再感知的两个动作。"""
     out = []
     for row, images in zip(type_rows, has_images, strict=True):
+        if images and table.image is not None:  # v2：有图的空间直接查有图的表，不再"加增益再截断"
+            actions = next(iter(table.image.values()))
+            out.append(
+                {
+                    a: float(sum(row[i] * table.image[t][a] for i, t in enumerate(types)))
+                    for a in actions
+                }
+            )
+            continue
         p = {
             lv: float(sum(row[i] * table.level[t][lv] for i, t in enumerate(types)))
             for lv in LEVELS
@@ -430,8 +469,8 @@ class TwoStageModel:
                 "coef": [round(float(v), 6) for v in self.gate_coef],
                 "intercept": round(self.gate_intercept, 6),
             }
-        return {
-            "version": "n7-two-stage-v1",
+        out = {
+            "version": "n11-two-stage-v2" if self.accuracy.image else "n7-two-stage-v1",
             "clip": CLIP,
             "features": self.features,
             "mean": [round(float(v), 6) for v in self.mean],
@@ -449,6 +488,9 @@ class TwoStageModel:
             "lambda": lam,
             **meta,
         }
+        if self.accuracy.image is not None:
+            out["accuracy_images"] = rounded(self.accuracy.image)
+        return out
 
 
 def _standardize(x: FloatArray) -> tuple[FloatArray, FloatArray]:
@@ -476,6 +518,7 @@ def fit_two_stage(
     c_gate: float = 1.0,
     label: Callable[[Item], str] | None = None,
     weights: Sequence[float] | None = None,
+    by_images: bool = False,
 ) -> TwoStageModel:
     """label 可以换掉推理类型（消融：只分"深 / 浅"两类）。
 
@@ -511,7 +554,7 @@ def fit_two_stage(
         types=types,
         coef=coef,
         intercept=intercept,
-        accuracy=accuracy_table(relabeled, types),
+        accuracy=accuracy_table(relabeled, types, by_images=by_images),
         costs=cost_table(items),
         gate_coef=gate_coef,
         gate_intercept=gate_intercept,

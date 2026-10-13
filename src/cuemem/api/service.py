@@ -23,7 +23,7 @@ from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import stable_id
 from cuemem.core.models import Fact, SessionIn, TurnIn
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
-from cuemem.read.controller import Router
+from cuemem.read.controller import IMAGE_FLOOR_REASON, Router
 
 Scenario = Literal["shop", "plain"]
 # 控制器给的理由用中文标签（CLI 是中文的）；接口、界面与 MCP 给英文
@@ -42,6 +42,8 @@ REASON_EN = {
 
 
 def english_reason(text: str) -> str:
+    if text == IMAGE_FLOOR_REASON:
+        return "asks about details in a photo: recall and look at it"
     for zh, en in REASON_EN.items():
         if text.startswith(zh):
             return en + text[len(zh) :]

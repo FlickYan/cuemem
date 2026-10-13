@@ -52,6 +52,7 @@ class DatasetSpec:
     description: str
     # 一同下载的附加文件：（文件名，URL）；.tar.gz 下载后解压到同一目录
     extras: tuple[tuple[str, str], ...] = ()
+    optional: bool = False  # 不随"全部下载"一起下，点名才下载
 
 
 _MEMLENS = "https://huggingface.co/datasets/xiyuRenBill/MEMLENS/resolve/main/"
@@ -82,6 +83,16 @@ DATASETS = {
         "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/"
         "databricks-dolly-15k.jsonl",
         "databricks-dolly-15k：15,011 条人工撰写的指令，约 13 MB，CC BY-SA 3.0",
+    ),
+    # N11：真实的聊天机器人用户消息（会话的第一句），检验门控在真实流量上的误召回；
+    # 只取 WildChat-1M 的一个分片，固定到发布时的提交
+    "wildchat": DatasetSpec(
+        "wildchat",
+        "wildchat/train-00000-of-00014.parquet",
+        "https://huggingface.co/datasets/allenai/WildChat-1M/resolve/"
+        "7d6490e462285cf85d91eabea0f9a954fbddcd1f/data/train-00000-of-00014.parquet",
+        "WildChat-1M 的第 1 个分片：约 7 万段真实的聊天机器人对话，约 231 MB，ODC-BY",
+        optional=True,
     ),
     "memlens_32k": DatasetSpec(
         "memlens_32k",

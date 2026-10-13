@@ -1,0 +1,275 @@
+{
+ "n_memory": 1750,
+ "v1": {
+  "wildchat": {
+   "n": 1750,
+   "false_recall": 10.5,
+   "routed": {
+    "L0": 1566,
+    "L1": 183,
+    "L2": 1
+   },
+   "gate_auc": 0.9943,
+   "memory_accuracy": 81.6,
+   "cost_per_1k": 0.833,
+   "always_l1_cost_per_1k": 1.534,
+   "saving_vs_always_l1": 45.7,
+   "B6z": {
+    "false_recall": 0.7,
+    "memory_l0": 3.0,
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 0.742
+   },
+   "B6h": {
+    "false_recall": 2.3,
+    "memory_l0": 1.8,
+    "memory_accuracy": 81.3,
+    "cost_per_1k": 0.753,
+    "asked_llm": 11.4
+   }
+  },
+  "dolly": {
+   "n": 1750,
+   "false_recall": 6.6,
+   "routed": {
+    "L0": 1634,
+    "L1": 114,
+    "L2": 2
+   },
+   "gate_auc": 0.9962,
+   "memory_accuracy": 81.6,
+   "cost_per_1k": 0.786,
+   "always_l1_cost_per_1k": 1.534,
+   "saving_vs_always_l1": 48.8,
+   "B6z": {
+    "false_recall": 0.4,
+    "memory_l0": 3.0,
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 0.737
+   },
+   "B6h": {
+    "false_recall": 1.3,
+    "memory_l0": 1.8,
+    "memory_accuracy": 81.3,
+    "cost_per_1k": 0.739,
+    "asked_llm": 9.6
+   }
+  },
+  "topic": {
+   "n": 1750,
+   "false_recall": 27.9,
+   "routed": {
+    "L0": 1261,
+    "L1": 480,
+    "L2": 9
+   },
+   "gate_auc": 0.9837,
+   "memory_accuracy": 81.6,
+   "cost_per_1k": 1.008,
+   "always_l1_cost_per_1k": 1.534,
+   "saving_vs_always_l1": 34.3,
+   "B6z": {
+    "false_recall": 1.3,
+    "memory_l0": 3.0,
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 0.753
+   },
+   "B6h": {
+    "false_recall": 20.8,
+    "memory_l0": 1.8,
+    "memory_accuracy": 81.3,
+    "cost_per_1k": 0.952,
+    "asked_llm": 15.5
+   }
+  }
+ },
+ "v2": {
+  "wildchat": {
+   "n": 1750,
+   "false_recall": 9.9,
+   "routed": {
+    "L0": 1576,
+    "L1": 166,
+    "L2": 8
+   },
+   "gate_auc": 0.9943,
+   "memory_accuracy": 81.7,
+   "cost_per_1k": 0.834,
+   "always_l1_cost_per_1k": 1.534,
+   "saving_vs_always_l1": 45.6,
+   "B6z": {
+    "false_recall": 0.7,
+    "memory_l0": 3.0,
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 0.742
+   },
+   "B6h": {
+    "false_recall": 2.3,
+    "memory_l0": 1.7,
+    "memory_accuracy": 81.5,
+    "cost_per_1k": 0.759,
+    "asked_llm": 11.4
+   }
+  },
+  "dolly": {
+   "n": 1750,
+   "false_recall": 6.1,
+   "routed": {
+    "L0": 1644,
+    "L1": 104,
+    "L2": 2
+   },
+   "gate_auc": 0.9962,
+   "memory_accuracy": 81.7,
+   "cost_per_1k": 0.779,
+   "always_l1_cost_per_1k": 1.534,
+   "saving_vs_always_l1": 49.2,
+   "B6z": {
+    "false_recall": 0.4,
+    "memory_l0": 3.0,
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 0.737
+   },
+   "B6h": {
+    "false_recall": 1.4,
+    "memory_l0": 1.7,
+    "memory_accuracy": 81.5,
+    "cost_per_1k": 0.743,
+    "asked_llm": 9.6
+   }
+  },
+  "topic": {
+   "n": 1750,
+   "false_recall": 27.2,
+   "routed": {
+    "L0": 1274,
+    "L1": 450,
+    "L2": 26
+   },
+   "gate_auc": 0.9837,
+   "memory_accuracy": 81.7,
+   "cost_per_1k": 1.018,
+   "always_l1_cost_per_1k": 1.534,
+   "saving_vs_always_l1": 33.6,
+   "B6z": {
+    "false_recall": 1.3,
+    "memory_l0": 3.0,
+    "memory_accuracy": 80.3,
+    "cost_per_1k": 0.753
+   },
+   "B6h": {
+    "false_recall": 19.1,
+    "memory_l0": 1.7,
+    "memory_accuracy": 81.5,
+    "cost_per_1k": 0.943,
+    "asked_llm": 15.5
+   }
+  }
+ },
+ "examples": {
+  "least_none": [
+   [
+    0.026,
+    "wildchat:20086e1914b9e4dd346e6a5348cdc2f3"
+   ],
+   [
+    0.031,
+    "wildchat:ae3aa52368a1398ae82406e8a45a1e76"
+   ],
+   [
+    0.038,
+    "wildchat:ffba2d2e4290f4b31a90032a613625f3"
+   ],
+   [
+    0.042,
+    "wildchat:6584b0862df5cec69b276c79b59fd54b"
+   ],
+   [
+    0.108,
+    "wildchat:d1263a953d499ad2ed22b10001756b75"
+   ],
+   [
+    0.145,
+    "wildchat:403ddeea1b42c4fa3e3a88abc7ee851b"
+   ],
+   [
+    0.154,
+    "wildchat:afc2111c3f4d88df34f3bfde31b47129"
+   ],
+   [
+    0.16,
+    "wildchat:0300b6cd912b3afb740bd2e7cfd86051"
+   ],
+   [
+    0.186,
+    "wildchat:224085286794d53f27d8a71306c1d28a"
+   ],
+   [
+    0.189,
+    "wildchat:9720b3a764982dbe1adfc8a546bb1e80"
+   ],
+   [
+    0.196,
+    "wildchat:f3857a8bca86900e169bd3aa4874a399"
+   ],
+   [
+    0.206,
+    "wildchat:41cc781a4a70c8c2605d43c88c485fa9"
+   ],
+   [
+    0.224,
+    "wildchat:65fc0b648cee9c41d2d0d7f024cbec0f"
+   ],
+   [
+    0.229,
+    "wildchat:ee090a48368ddc0bc1d915e9e2fcbe62"
+   ],
+   [
+    0.235,
+    "wildchat:359da4655ba4cfb39d688a315c7db46c"
+   ]
+  ],
+  "random": [
+   [
+    0.6,
+    "wildchat:d231eed865abc33d9ca6f6abec13379c"
+   ],
+   [
+    0.949,
+    "wildchat:283483f05dcf094dc21d9cf4b018877f"
+   ],
+   [
+    0.954,
+    "wildchat:3247d7cb61b3f49774c681ab4f98bd26"
+   ],
+   [
+    0.961,
+    "wildchat:6070e6d39b34c0ef03e05b035f8cc4f0"
+   ],
+   [
+    0.999,
+    "wildchat:3bdf17dfe26fd923a70384debb6ae925"
+   ],
+   [
+    0.999,
+    "wildchat:4da84d67939704effc8f5c4b102b494f"
+   ],
+   [
+    1.0,
+    "wildchat:01a2ef9573dbb667140fa7b90c36bd64"
+   ],
+   [
+    1.0,
+    "wildchat:07c8070c99d3b7abc7896ad84c963604"
+   ],
+   [
+    1.0,
+    "wildchat:49395153d2149bc5fdfaec283bb9f916"
+   ],
+   [
+    1.0,
+    "wildchat:7d6c8660dcbd971edaf9c0b2e834cc64"
+   ]
+  ]
+ }
+}

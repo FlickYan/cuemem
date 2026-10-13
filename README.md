@@ -42,6 +42,17 @@ On MemLens, L1 and L2 attach the top-3 original photos at answer time ("re-perce
 4. **Letting the LLM search for itself is strong on text and weak on images.** ReAct is the best method on LoCoMo but scores 46.7% on MemLens, because its search tool returns only text. "Controller first, LLM may search more" holds up on all three datasets, at the highest cost.
 5. **Most errors are not retrieval misses.** Of the errors read by hand, only 1 / 38 on LongMemEval and 5 / 40 on LoCoMo were evidence that never reached the context. The common causes were picking the wrong level, miscounting, and, on LoCoMo, a wrong gold answer (10 of 40 sampled errors).
 
+**After the final evaluation (N11).** The test sets were used once; the follow-up work changes nothing in the table above. Controller changes were made on the development set and only replayed on the test results:
+
+- **Controller v2.** In spaces with photos it looks up an image-space accuracy table instead of adding and clipping a photo gain, and questions about visual detail no longer go to L0. Post-hoc replay: 81.6% → 81.9% on memory questions (+10 / −5), all of it on MemLens. For a new reader model, recalibrating the accuracy table made things worse; lowering λ from 30 to 15 recovered most of the gap to always-L2 at 16–24% lower cost.
+- **The gate on real traffic.** With the first messages of real WildChat conversations as the queries that need no memory, the gate sends 10.5% of them to retrieval (17.3% on the synthetic stream) and the stream costs 46% less than always retrieving (41% before).
+- **External baseline: Mem0.** Open-source Mem0 2.2 with the same extraction model, embeddings, reader and judge: 80.5% on 200 LoCoMo questions and 83.0% on 100 LongMemEval questions. CueMem's L1 ties on LoCoMo (81.0%) and is 9 points higher on LongMemEval (92.0%, p = 0.049), and Mem0's writes cost 2.3–2.9 times as much. Mem0 finds the right sessions; it loses on temporal reasoning, knowledge updates and details the assistant gave, which its add-only extraction does not keep.
+- **Judging and variance.** A second judge from another provider agrees on 94.7–97.9% of 12,835 judgements (κ 0.82–0.93) and keeps the method ranking (Kendall τ 0.87–1.0). A rerun with the cache off moves accuracy by at most 0.9 points, with 3–4% of questions flipping. One N9 comparison does not survive: L1 being 2.3 points below full context on LoCoMo (not significant under the second judge, 1.5 points in the rerun). A hand audit of 50 judgements is prepared and awaits labelling.
+- **Write path.** Reconciliation now tells "a different scope", "the world changed" and "it was a mistake" apart, and sees the message each new fact came from: "Mia is 31" alone cannot tell a correction from a birthday. On a small invented conversation run 5 times, all three cases are right every time (N9's prompt: 3 / 5, 5 / 5, 0 / 5).
+- **Scale.** The local work on the read path grows linearly with local Qdrant (about 1.08 s at 46k retrieval units) and is 91 ms with a Qdrant server; one process serves 55 reads per second with the server (8.7 in local mode).
+
+Details in the [technical report, §12](docs/en/report.md#12-n11-follow-up-work-after-the-test-sets).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/n9-final/pareto-dark.png">
   <img alt="Accuracy against nominal cost per 1,000 questions on the four test sets; the curve is the learned controller at different settings of its cost knob" src="docs/results/n9-final/pareto-light.png" width="900">
@@ -53,7 +64,7 @@ Hypotheses, stated before the experiments and resolved on the test sets:
 |---|---|---|
 | H1 | Probe feedback + query cues beat query text alone, and beat uncertainty-triggered escalation | **Half supported.** True for "recall or not" (gate AUC 0.990 on the test stream); "L1 or L2" is decided by how the question is phrased |
 | H2 | The controller matches always-deep-recall accuracy at much lower cost | **Half supported.** Holds in a mixed stream (−41% cost); not on memory questions alone (−2.8 points) |
-| H3 | A controller is more robust than agentic retrieval across reader models | **Refuted** with three readers. ReAct is not less stable; the controller's accuracy table must be recalibrated per reader |
+| H3 | A controller is more robust than agentic retrieval across reader models | **Refuted** with three readers. ReAct is not less stable. The controller has to be tuned per reader: recalibrating its accuracy table did not help, setting its cost knob λ per reader did (N11) |
 | H4 | Validity periods ("invalidate, don't delete") help knowledge-update questions | **Not supported.** All variants score 96.5% on those questions |
 | H5 | Re-perceiving original photos helps visual-detail questions | **Supported.** +12.3 points (32K) and +6.7 points (128K), concentrated in information extraction |
 | H6 | Context-aware image captions beat isolated captions | **Not supported** |
@@ -123,6 +134,16 @@ uv run python scripts/reproduce.py --only N9      # the final evaluation (near-f
 
 Development: `uv run pytest` (offline, no keys), `uv run pytest -m live` (needs keys), `uv run ruff check . && uv run mypy`.
 
+Deployment (N11). By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory. For more, run a Qdrant server and protect the API with a token:
+
+```bash
+docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1
+uv run cuemem migrate-vectors --to http://localhost:6333   # copy existing local vectors first
+export CUEMEM_VECTOR_STORE__URL=http://localhost:6333     # or put it in .env
+CUEMEM_API_TOKEN=your-token uv run cuemem serve --host 0.0.0.0   # Bearer token for /api, sign-in for the UI
+uv run python scripts/n11_latency.py                       # offline latency benchmark, no API calls
+```
+
 ## Repository layout
 
 | Path | What is there |
@@ -143,9 +164,10 @@ Development: `uv run pytest` (offline, no keys), `uv run pytest -m live` (needs 
 | Technical report: system, final results, controller, readers, ablations, errors, lessons | [English](docs/en/report.md) · [中文](docs/report.md) |
 | Design: motivation, architecture, controller, multimodal memory, evaluation plan | [English](docs/en/design.md) · [中文](docs/design.md) |
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
-| Decision records (51 ADRs), roadmap and progress log, related work, per-node results | 中文: [decisions](docs/decisions.md), [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
+| Decision records (57 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 
-The project was built node by node, from N0 (design) to N10 (packaging). Every node's experiments, numbers and decisions are in the Chinese records above. The English documents cover the system and the final results.
+The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
 
 ## Licence
 
@@ -156,6 +178,7 @@ The LongMemEval and MemLens judge prompts included in the repository are also MI
 - LongMemEval_S (cleaned): MIT;
 - LoCoMo: CC BY-NC 4.0;
 - MemLens: CC BY 4.0, with images under their source sites' licences;
-- databricks-dolly-15k: CC BY-SA 3.0.
+- databricks-dolly-15k: CC BY-SA 3.0;
+- WildChat-1M (one shard, downloaded only on request, N11): ODC-BY.
 
-The repository stores only split IDs, Dolly line numbers and generated same-topic questions derived from the benchmarks; see the notices for how they are covered. The demo store, its products and its photos are fictional; the images were generated with qwen-image-3.0.
+The repository stores only split IDs, Dolly line numbers, WildChat conversation hashes and generated same-topic questions derived from the benchmarks; see the notices for how they are covered. The demo store, its products and its photos are fictional; the images were generated with qwen-image-3.0.

@@ -38,6 +38,18 @@ V4 = {"CUEMEM_EMBEDDING__MODEL": "text-embedding-v4"}
 QFLASH = {"CUEMEM_ROLES__READER__MODEL": "qwen3.8-flash"}
 QSMALL = {"CUEMEM_ROLES__READER__MODEL": "qwen3.6-35b-a3b"}
 DSPRO = {"CUEMEM_ROLES__READER__MODEL": "deepseek-v4-pro"}
+# N7 训练、N8 演示与 N9 冻结评测用的都是 v1 控制器；N11 起默认是 v2
+# （src/cuemem/read/controller_model.json）
+V1 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v1.json"}
+NODE_ENV = {"N7": V1, "N8": V1, "N9": V1}
+NO_CACHE = {"CUEMEM_LLM_CACHE_MODE": "off"}
+# 外部基线 Mem0（N11）：mem0ai 不是依赖，临时装上；spaCy 与 fastembed 让它的混合检索完整生效
+SPACY_SM = (
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/"
+    "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+)
+MEM0 = ["uv", "run", "--with", "mem0ai", "--with", "spacy", "--with", "fastembed",
+        "--with", SPACY_SM]  # fmt: skip
 
 
 @dataclass
@@ -49,7 +61,7 @@ class Step:
     optional: bool = False  # 没有缓存、要真花钱的步骤：默认跳过
 
     def describe(self) -> str:
-        env = " ".join(f"{k}={v}" for k, v in self.env.items())
+        env = " ".join(f"{k}={v}" for k, v in {**NODE_ENV.get(self.node, {}), **self.env}.items())
         return f"[{self.node}] {env + ' ' if env else ''}{' '.join(self.command)}"
 
 
@@ -174,6 +186,28 @@ STEPS: list[Step] = [
     script("N9", "scripts/n9_mixed.py"),
     script("N9", "scripts/n9_errors.py", "summarize"),  # 人工错误标注（已提交）的汇总
     script("N9", "scripts/n9_report.py"),  # results.json、图与 tables.md
+    # N11：测试集之后的补做（控制器 v2 只在开发集上选，测试集只作事后重放）
+    script("N11", "scripts/n11_controller_v2.py"),  # 导出 v2 并写 controller_v2.json
+    script("N11", "scripts/n11_latency.py"),  # 离线；服务端那一组要先起 Qdrant（见脚本说明）
+    Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "locomo", "--split", "test200r",
+                 "--methods", "M0", "--name", "locomo-test200r-mem0", "--workers", "12",
+                 "--max-cost", "5"]),
+    Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "longmemeval_s", "--split",
+                 "test100r", "--methods", "M0", "--name", "test100r-mem0", "--workers", "16",
+                 "--max-cost", "5"]),
+    script("N11", "scripts/n11_mem0.py"),
+    script("N11", "scripts/n11_second_judge.py", "run"),
+    Step("N11", ["uv", "run", "cuemem", "data", "download", "wildchat"]),
+    Step("N11", ["uv", "run", "--with", "pyarrow", "python", "scripts/n11_wildchat.py", "prepare"]),
+    script("N11", "scripts/n11_wildchat.py", "probe"),
+    script("N11", "scripts/n11_wildchat.py", "report"),
+    # 重复运行：关掉缓存、真实调用，按定义不能从缓存复现
+    run("N11", "test400-n11-rerun", "longmemeval_s", "test400", "B4-nobm25,B6",
+        env={**NO_CACHE, **V1}, optional=True),
+    run("N11", "locomo-test7-n11-rerun", "locomo", "test7", "B4-nobm25", env=NO_CACHE,
+        optional=True),
+    script("N11", "scripts/n11_variance.py"),
+    script("N11", "scripts/n11_audit.py"),  # 导出人工抽检的样本（已存在时不覆盖）
 ]  # fmt: skip
 
 
@@ -200,7 +234,7 @@ def main() -> None:
         print(step.describe(), flush=True)
         if args.dry_run:
             continue
-        env = {**os.environ, **step.env}
+        env = {**os.environ, **NODE_ENV.get(step.node, {}), **step.env}
         done = subprocess.run(step.command, cwd=ROOT, env=env, check=False)
         if done.returncode != 0:
             sys.exit(f"失败：{step.describe()}")

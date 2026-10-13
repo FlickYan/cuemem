@@ -9,7 +9,7 @@ from fakes import TOY_CONVERSATION
 from cuemem.core.models import Conversation
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
-from cuemem.errors import ConfigMismatchError
+from cuemem.errors import ConfigMismatchError, StorageLockedError
 from cuemem.store import MemoryDB, VectorStore
 from cuemem.write import build_rounds, build_turns
 
@@ -72,6 +72,35 @@ def test_vector_store_search_and_filters(tmp_path: Path) -> None:
     reopened.delete_space("s")
     assert reopened.count("s") == 0
     reopened.close()
+
+
+def test_locked_local_store_explains_itself(tmp_path: Path) -> None:
+    """Qdrant 本地模式一次只允许一个进程打开：第二个打开者得到能看懂的报错，而不是库内部的异常。"""
+    first = VectorStore(tmp_path / "qdrant", dim=4)
+    with pytest.raises(StorageLockedError, match="CUEMEM_VECTOR_STORE__URL"):
+        VectorStore(tmp_path / "qdrant", dim=4)
+    first.close()
+    VectorStore(tmp_path / "qdrant", dim=4).close()  # 锁随关闭释放
+
+
+def test_copy_into_moves_every_collection(tmp_path: Path) -> None:
+    """迁到服务端：文字与图片集合连同向量、payload 原样复制，检索结果不变。"""
+    source = VectorStore(tmp_path / "local", dim=4)
+    dense = l2_normalize(np.eye(4, dtype=np.float32)[:3] + 0.1)
+    sparse = [SparseVector(indices=[i], values=[1.0]) for i in range(3)]
+    payloads = [{"kind": "round", "ts": float(i)} for i in range(3)]
+    source.upsert("s", ["a", "b", "c"], dense, sparse, payloads)
+    source.upsert_images("s", ["m1"], l2_normalize(np.ones((1, 2), dtype=np.float32)), [{}])
+    target = VectorStore(tmp_path / "server", dim=4)
+    counts = source.copy_into(target)
+    assert sorted(counts.values()) == [1, 3]
+    assert target.count("s") == 3
+    before = [h.unit_id for h in source.search_dense("s", dense[1], 3)]
+    assert [h.unit_id for h in target.search_dense("s", dense[1], 3)] == before
+    assert [h.unit_id for h in target.search_sparse("s", sparse[2], 1)] == ["c"]
+    assert [h.unit_id for h in target.search_images("s", np.ones(2) / np.sqrt(2), 1)] == ["m1"]
+    source.close()
+    target.close()
 
 
 def test_v1_database_is_migrated(tmp_path: Path) -> None:

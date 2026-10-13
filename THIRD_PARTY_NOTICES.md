@@ -51,11 +51,13 @@ SOFTWARE.
 | LoCoMo | CC BY-NC 4.0 |
 | MemLens | CC BY 4.0; images remain under their source sites' licences |
 | databricks-dolly-15k | CC BY-SA 3.0 |
+| WildChat-1M (one shard, optional, N11) | ODC-BY |
 
 The repository does contain some files derived from these datasets.
 
 - **`evals/splits/`**: question and conversation IDs that define the development and test splits.
 - **`evals/mixed/dolly_lines*.json`**: line numbers into databricks-dolly-15k.
+- **`evals/mixed/wildchat_test.json`**: conversation hashes of WildChat-1M (allenai/WildChat-1M, ODC-BY). The messages themselves are not stored; `cuemem data download wildchat` fetches the shard, and `scripts/n11_wildchat.py` reads the first user turns from it.
 - **`evals/mixed/topic_negatives*.jsonl`**:
   - one general-knowledge question per benchmark question, written by qwen3.8-flash from that question's topic;
   - they do not reproduce benchmark text, but they are derived from the benchmarks' questions;

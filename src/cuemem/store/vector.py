@@ -17,9 +17,13 @@ from qdrant_client import QdrantClient, models
 
 from cuemem.core.ids import point_uuid, stable_id
 from cuemem.embed.base import FloatArray, SparseVector
+from cuemem.errors import StorageLockedError
 
 DENSE = "dense"
 SPARSE = "sparse"
+IMAGE_SUFFIX = "_img"  # 每个空间的图片向量放在单独的集合里（维度不同）
+# 检索时用来过滤的 payload 字段（_build_filter）
+PAYLOAD_INDEXES = {"kind": models.PayloadSchemaType.KEYWORD, "ts": models.PayloadSchemaType.FLOAT}
 
 
 @dataclass(frozen=True)
@@ -32,14 +36,27 @@ class VectorStore:
     def __init__(self, path: Path | None, dim: int, *, url: str | None = None) -> None:
         """url 非空时连接 Qdrant 服务端；否则用本地模式（path 为空则只放在内存里）。"""
         self.dim = dim
+        self.remote = url is not None
         if url is not None:
             self._client = QdrantClient(url=url)
         elif path is None:
             self._client = QdrantClient(location=":memory:")
         else:
             path.mkdir(parents=True, exist_ok=True)
-            self._client = QdrantClient(path=str(path))
-        self._lock = threading.RLock()  # 本地模式不是线程安全的，统一加锁
+            try:
+                self._client = QdrantClient(path=str(path))
+            except RuntimeError as exc:
+                if "already accessed" not in str(exc):
+                    raise
+                raise StorageLockedError(
+                    f"向量库 {path} 正被另一个进程使用"
+                    "（Qdrant 本地模式同一时间只允许一个进程打开）。"
+                    "先停掉那个进程（比如正在运行的 cuemem serve），或者改用 Qdrant 服务端："
+                    "设置 CUEMEM_VECTOR_STORE__URL，见 docs/design.md 的部署一节"
+                ) from exc
+        # 统一加锁：本地模式不是线程安全的；服务端模式下同步客户端被多个线程同时使用也会出错
+        # （N11 压测里出现 "Bad file descriptor"）
+        self._lock = threading.RLock()
 
     @staticmethod
     def collection_name(space_id: str) -> str:
@@ -57,6 +74,9 @@ class VectorStore:
                     },
                     sparse_vectors_config={SPARSE: models.SparseVectorParams()},
                 )
+                if self.remote:  # 服务端按 payload 建索引，过滤检索不必扫全集合（本地模式不支持）
+                    for field, schema in PAYLOAD_INDEXES.items():
+                        self._client.create_payload_index(name, field, field_schema=schema)
 
     def upsert(
         self,
@@ -108,6 +128,15 @@ class VectorStore:
             return []
         query = models.SparseVector(indices=vector.indices, values=vector.values)
         return self._query(space_id, query, SPARSE, k, _build_filter(kinds, ts_range))
+
+    def indexed(self, space_id: str) -> bool:
+        """服务端是否已建完索引（大批写入后后台建 HNSW，期间检索变慢）；本地模式总是 True。"""
+        name = self.collection_name(space_id)
+        with self._lock:
+            if not self.remote or not self._client.collection_exists(name):
+                return True
+            info = self._client.get_collection(name)
+        return info.status == models.CollectionStatus.GREEN
 
     def count(self, space_id: str, *, kinds: Sequence[str] | None = None) -> int:
         name = self.collection_name(space_id)
@@ -201,7 +230,7 @@ class VectorStore:
             )
 
     def _image_collection(self, space_id: str) -> str:
-        return f"{self.collection_name(space_id)}_img"
+        return f"{self.collection_name(space_id)}{IMAGE_SUFFIX}"
 
     def dense_vectors(self, space_id: str, unit_ids: Sequence[str]) -> dict[str, FloatArray]:
         """按记忆单元 ID 取回已存的 dense 向量（L2 的实体图用来给语义相近的事实连边）。"""
@@ -244,6 +273,49 @@ class VectorStore:
                 out.extend(str(p.payload["unit_id"]) for p in points if p.payload)
                 if offset is None:
                     return out
+
+    def copy_into(self, target: VectorStore, *, batch: int = 256) -> dict[str, int]:
+        """把所有集合（文字与图片，向量与 payload 原样）复制到 target，返回各集合的点数。
+
+        用于从本地模式迁到服务端：数据库里已有的记忆单元不会被重新写入向量库（写入是幂等的），
+        所以切换前要先把向量搬过去。target 里已有的同名点会被覆盖。
+        """
+        counts: dict[str, int] = {}
+        with target._lock:
+            target._client.get_collections()  # 先确认连得上目标，免得复制到一半才失败
+        with self._lock:
+            names = [c.name for c in self._client.get_collections().collections]
+        for name in names:
+            with self._lock:
+                params = self._client.get_collection(name).config.params
+            with target._lock:
+                if not target._client.collection_exists(name):
+                    target._client.create_collection(
+                        name,
+                        vectors_config=params.vectors,
+                        sparse_vectors_config=params.sparse_vectors,
+                    )
+                    if target.remote and not name.endswith(IMAGE_SUFFIX):
+                        for field, schema in PAYLOAD_INDEXES.items():
+                            target._client.create_payload_index(name, field, field_schema=schema)
+            offset = None
+            counts[name] = 0
+            while True:
+                with self._lock:
+                    records, offset = self._client.scroll(
+                        name, limit=batch, offset=offset, with_payload=True, with_vectors=True
+                    )
+                points = [
+                    models.PointStruct(id=r.id, vector=r.vector or {}, payload=r.payload)
+                    for r in records
+                ]
+                if points:
+                    with target._lock:
+                        target._client.upsert(name, points=points)
+                counts[name] += len(points)
+                if offset is None:
+                    break
+        return counts
 
     def delete_space(self, space_id: str) -> None:
         with self._lock:

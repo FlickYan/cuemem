@@ -57,7 +57,7 @@ The model's answers differ slightly from run to run, and the controller's choice
 uv run cuemem demo demo/shop/script.json --fresh   # three chats plus forgetting, 14 checks
 ```
 
-A full replay ends with forgetting, which (by design) also clears the space's answer cache. Afterwards, run `--until 2` again to restore the pre-demo state.
+A full replay ends with forgetting, which also clears the answer cache of the sessions it touches (since N11 the cache is scoped per session, so other sessions keep theirs; D-054). Afterwards, run `--until 2` again to restore the pre-demo state.
 
 To re-record the GIF above, keep `cuemem serve` running on a freshly built demo memory, then run `uv run --with playwright python scripts/record_demo.py`. It uses your local Google Chrome.
 

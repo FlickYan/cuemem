@@ -2,20 +2,26 @@
 
 界面（Gradio）挂在同一个应用的根路径上，与接口共用一个服务对象（api/ui.py）。
 接口文档：启动后打开 /docs。
+
+访问令牌（可选，N11）：设置环境变量 CUEMEM_API_TOKEN 后，/api 下除健康检查外的接口都要带
+Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密码填令牌）。不设置时不鉴权，
+只适合在本机演示（cuemem serve 默认只监听 127.0.0.1）。
 """
 
 from __future__ import annotations
 
+import secrets
 import shutil
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, get_args
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from cuemem import __version__
@@ -26,6 +32,9 @@ from cuemem.memory import RecallMode
 from cuemem.read.controller import Router
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+TOKEN_ENV = "CUEMEM_API_TOKEN"
+# 放在模块级：注解是字符串（from __future__ import annotations），FastAPI 解析不到函数里的局部变量
+_BEARER = HTTPBearer(auto_error=False)
 
 
 class StartRequest(BaseModel):
@@ -79,29 +88,54 @@ def _router(value: str | None) -> Router | None:
     return value  # type: ignore[return-value]
 
 
-def create_app(service: ChatService, *, upload_dir: Path, ui: bool = True) -> FastAPI:
+def _same(given: str, token: str) -> bool:
+    return secrets.compare_digest(given.encode(), token.encode())
+
+
+def _token_check(token: str) -> Callable[..., None]:
+    def check(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],
+    ) -> None:
+        if credentials is None or not _same(credentials.credentials, token):
+            raise HTTPException(401, "缺少或错误的访问令牌", headers={"WWW-Authenticate": "Bearer"})
+
+    return check
+
+
+def _ui_login(token: str | None) -> Callable[[str, str], bool] | None:
+    """界面的登录检查：用户名任意，密码是访问令牌。"""
+    if not token:
+        return None
+    return lambda _user, password: _same(password, token)
+
+
+def create_app(
+    service: ChatService, *, upload_dir: Path, ui: bool = True, token: str | None = None
+) -> FastAPI:
+    """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。"""
     app = FastAPI(
         title="CueMem",
         version=__version__,
         description="Long-term multimodal memory for LLM agents: chat, browse, forget, recall.",
     )
+    api = APIRouter(dependencies=[Depends(_token_check(token))] if token else [])
 
-    @app.get("/api/health")
+    @app.get("/api/health")  # 不鉴权：给负载均衡与监控探活用
     def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__, "open_sessions": len(service.sessions)}
 
-    @app.get("/api/spaces")
+    @api.get("/api/spaces")
     def spaces() -> list[dict[str, Any]]:
         return service.spaces()
 
-    @app.post("/api/sessions")
+    @api.post("/api/sessions")
     def start(request: StartRequest) -> SessionOut:
         session = service.start(request.space, at=request.at)
         return SessionOut(
             session_id=session.session_id, space=session.space_id, started_at=session.started_at
         )
 
-    @app.post("/api/sessions/{session_id}/messages")
+    @api.post("/api/sessions/{session_id}/messages")
     def message(
         session_id: str,
         text: Annotated[str, Form()],
@@ -116,12 +150,12 @@ def create_app(service: ChatService, *, upload_dir: Path, ui: bool = True) -> Fa
                 session_id, text, images=paths, mode=_mode(mode), router=_router(router), lam=lam
             )
 
-    @app.post("/api/sessions/{session_id}/end")
+    @api.post("/api/sessions/{session_id}/end")
     def end(session_id: str, wait: bool = False) -> dict[str, Any]:
         with _errors():
             return service.end(session_id, wait=wait)
 
-    @app.post("/api/spaces/{space}/recall")
+    @api.post("/api/spaces/{space}/recall")
     def recall(space: str, request: RecallRequest) -> dict[str, Any]:
         with _errors():
             return service.recall(
@@ -133,34 +167,34 @@ def create_app(service: ChatService, *, upload_dir: Path, ui: bool = True) -> Fa
                 at=request.at,
             )
 
-    @app.get("/api/spaces/{space}/profile")
+    @api.get("/api/spaces/{space}/profile")
     def profile(space: str) -> dict[str, str]:
         return {"text": service.profile(space)}
 
-    @app.get("/api/spaces/{space}/facts")
+    @api.get("/api/spaces/{space}/facts")
     def facts(space: str, current_only: bool = False) -> list[dict[str, Any]]:
         return service.facts(space, current_only=current_only)
 
-    @app.get("/api/spaces/{space}/entities")
+    @api.get("/api/spaces/{space}/entities")
     def entities(space: str) -> list[dict[str, Any]]:
         return service.entities(space)
 
-    @app.get("/api/spaces/{space}/graph")
+    @api.get("/api/spaces/{space}/graph")
     def graph(space: str) -> dict[str, Any]:
         return service.graph(space)
 
-    @app.get("/api/spaces/{space}/media")
+    @api.get("/api/spaces/{space}/media")
     def media(space: str) -> list[dict[str, Any]]:
         return service.media(space)
 
-    @app.get("/api/spaces/{space}/media/{media_id}")
+    @api.get("/api/spaces/{space}/media/{media_id}")
     def media_file(space: str, media_id: str) -> FileResponse:
         items = service.system.db.get_media(space, ids=[media_id])
         if not items or not Path(items[0].path).exists():
             raise HTTPException(404, "没有这张图片")
         return FileResponse(items[0].path)
 
-    @app.get("/api/spaces/{space}/sessions")
+    @api.get("/api/spaces/{space}/sessions")
     def sessions(space: str) -> list[dict[str, Any]]:
         return [
             {
@@ -172,11 +206,11 @@ def create_app(service: ChatService, *, upload_dir: Path, ui: bool = True) -> Fa
             for s in service.session_list(space)
         ]
 
-    @app.get("/api/spaces/{space}/status")
+    @api.get("/api/spaces/{space}/status")
     def status(space: str) -> dict[str, Any]:
         return service.status(space)
 
-    @app.post("/api/spaces/{space}/forget")
+    @api.post("/api/spaces/{space}/forget")
     def forget(space: str, request: ForgetRequest) -> dict[str, Any]:
         with _errors():
             report = service.forget(
@@ -194,11 +228,12 @@ def create_app(service: ChatService, *, upload_dir: Path, ui: bool = True) -> Fa
             "images_deleted": report.images_deleted,
         }
 
-    @app.post("/api/spaces/{space}/consolidate")
+    @api.post("/api/spaces/{space}/consolidate")
     def consolidate(space: str) -> dict[str, Any]:
         with _errors():
             return service.consolidate(space)
 
+    app.include_router(api)
     if ui:
         import gradio as gr
 
@@ -212,6 +247,8 @@ def create_app(service: ChatService, *, upload_dir: Path, ui: bool = True) -> Fa
             css=CSS,
             allowed_paths=[str(upload_dir), str(service.system.settings.paths.media)],
             footer_links=[],  # 接口文档在 /docs
+            auth=_ui_login(token),
+            auth_message="Sign in with any username and the access token as the password.",
         )
     return app
 

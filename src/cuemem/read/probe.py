@@ -3,7 +3,8 @@
 探针就是 L1 的打分（read/l1.py 的 candidates）：一次查询向量化，轮、事实、摘要、图片描述各走
 dense 召回，再加一路以文搜图。控制器选了 L1 时直接拿这份候选打包，不重复检索；选 L2 时，L2 对
 原问题的打分命中向量缓存。所以走 L1、L2 时探针几乎没有额外成本；最后选了 L0 时，多花的是一次
-查询向量化（几十个 tokens）和几十毫秒。
+查询向量化（几十个 tokens，约 110 ms 的网络往返）和本机的检索与特征计算（本地模式下随空间变大
+而变慢，2,000 轮约 0.1 秒；实测见 N11 的延迟基准）。
 
 特征分四组，名字带前缀：
 
@@ -57,6 +58,18 @@ _VISUAL = re.compile(
     r"|照片|图片|图里|图中|颜色|长什么样|画面|上面写",
     re.I,
 )
+# 指向一个具体画面里的东西（位置、读数、表格里的某一栏……）：在有图的空间里，这样问而这条消息
+# 又没有附图，问的多半是之前分享过的照片（N11，D-052：有图空间的 L0 保底规则用它）
+_SCENE = re.compile(
+    r"\b(on|at|in|to) the (far |upper |lower |top |bottom )?(left|right|top|bottom|center|centre"
+    r"|middle|background|foreground|corner|edge)\b"
+    r"|\b(top|bottom|upper|lower)[- ](left|right)\b|\b(left|right)[- ]hand side\b"
+    r"|\b(in|on|from) (the|this|that) (image|photo|picture|photograph|screenshot|scene|shot|frame"
+    r"|poster|sign|label|screen|display|readout|form|table|page|menu|receipt|document|chart)\b"
+    r"|\b(visible|depicted|pictured|shown|displayed|appears?|inscribed|printed|written)\b"
+    r"|左边|右边|左上|右上|左下|右下|角落|背景里|画面里",
+    re.I,
+)
 _RECOMMEND = re.compile(
     r"\b(recommend\w*|suggest\w*|advice|tips|ideas?|should i|any good|what would you)\b"
     r"|推荐|建议|有什么好",
@@ -96,6 +109,11 @@ NEAR_FACT = 0.05  # 与 top-1 事实的相似度差在这个范围内算"接近"
 SCORE_KINDS = ("round", "fact", "summary")
 
 
+def scene_reference(question: str) -> bool:
+    """问题是否指向一个具体画面里的东西（q_scene）。"""
+    return bool(_SCENE.search(question))
+
+
 def query_features(question: str, query: QueryInfo | None = None) -> dict[str, float]:
     """只看问题文本的线索（q_ 组），不检索。"""
     query = query or analyze(question, datetime.now())
@@ -116,6 +134,7 @@ def query_features(question: str, query: QueryInfo | None = None) -> dict[str, f
         "q_first": float(query.wants_first),
         "q_history": float(query.wants_history),
         "q_visual": float(bool(_VISUAL.search(question))),
+        "q_scene": float(bool(_SCENE.search(question))),
         "q_recommend": float(bool(_RECOMMEND.search(question))),
         "q_recall": float(bool(_RECALL.search(question))),
         "q_past_self": float(bool(_PAST_SELF.search(question))),

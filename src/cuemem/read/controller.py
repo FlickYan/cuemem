@@ -16,7 +16,7 @@ L2 深度检索——以及要不要再看原图（再感知）。
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -31,7 +31,10 @@ from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyz
 
 Level = Literal["L0", "L1", "L2"]
 Router = Literal["learned", "hybrid", "rule", "llm"]
+# 默认是 v2（N11，有图的空间直接查有图的准确率表）；v1 是 N7 导出、N9 测试集上冻结评测的那一版，
+# 复现 N7 / N9 的数字时用它（配置 retrieval.controller，scripts/reproduce.py 会自动指定）
 DEFAULT_MODEL = Path(__file__).with_name("controller_model.json")
+V1_MODEL = Path(__file__).with_name("controller_model_v1.json")
 # 混合方案（B6h）：门控估计的 P(none) 落在这个区间里才问 LLM；LLM 判"无关"时 P(none) 取
 # HYBRID_CONFIDENCE，判"需要记忆"时取 1 − HYBRID_CONFIDENCE。两个数都是事先定的，没有在评测数据上调
 HYBRID_BAND = (0.1, 0.9)
@@ -125,6 +128,10 @@ class ControllerModel:
     cost: dict[str, float]  # 档 → 平均名义成本（美元）；"see" 是再感知多出来的成本
     lam: float  # 默认的 λ
     gate_coef: np.ndarray | None = None
+    # v2：有图的空间里各动作（含再感知）的准确率；为空时退回 v1 的"加增益再截断"
+    accuracy_images: dict[str, dict[str, float]] | None = None
+    # v2：有图的空间里，这些问题线索之一成立时不选 L0，至少快速召回并看图（D-052）
+    image_floor: list[str] | None = None
     gate_intercept: float = 0.0
     clip: float = 5.0  # 标准化后的特征截断在 ±clip 以内（与训练时一致）
     meta: dict[str, Any] = field(default_factory=dict)
@@ -145,6 +152,8 @@ class ControllerModel:
             "cost",
             "lambda",
             "clip",
+            "accuracy_images",
+            "image_floor",
         }
         gate = raw.get("gate")
         return cls(
@@ -161,8 +170,25 @@ class ControllerModel:
             gate_coef=np.asarray(gate["coef"], dtype=float) if gate else None,
             gate_intercept=float(gate["intercept"]) if gate else 0.0,
             clip=float(raw.get("clip", 5.0)),
+            accuracy_images=raw.get("accuracy_images"),
+            image_floor=raw.get("image_floor"),
             meta={k: v for k, v in raw.items() if k not in known},
         )
+
+    def with_tables(
+        self,
+        accuracy: dict[str, dict[str, float]],
+        accuracy_images: dict[str, dict[str, float]] | None = None,
+    ) -> ControllerModel:
+        """换一个回答模型时重新标定（N11）：选档用的特征与回答模型无关，"这一档能答对多少"有关。
+        门控与类型模型不变，只换准确率表；表里缺的类型沿用原表。"""
+        merged = {t: {**row, **accuracy.get(t, {})} for t, row in self.accuracy.items()}
+        images = self.accuracy_images
+        if accuracy_images is not None and images is not None:
+            images = {t: {**row, **accuracy_images.get(t, {})} for t, row in images.items()}
+        elif accuracy_images is not None:
+            images = accuracy_images
+        return replace(self, accuracy=merged, accuracy_images=images)
 
     @property
     def memory_types(self) -> list[str]:
@@ -192,6 +218,11 @@ class ControllerModel:
         return {**{t: (1 - none) * v for t, v in types.items()}, "none": none}
 
     def action_proba(self, types: dict[str, float], *, has_images: bool) -> dict[str, float]:
+        if has_images and self.accuracy_images is not None:
+            actions = next(iter(self.accuracy_images.values()))
+            return {
+                a: sum(p * self.accuracy_images[t][a] for t, p in types.items()) for a in actions
+            }
         out = {
             lv: sum(p * self.accuracy[t][lv] for t, p in types.items()) for lv in ("L0", "L1", "L2")
         }
@@ -206,6 +237,7 @@ class ControllerModel:
         return self.cost[level] + (self.cost.get("see", 0.0) if action.endswith("+see") else 0.0)
 
 
+IMAGE_FLOOR_REASON = "有图的空间里问画面细节：至少快速召回并看图"
 TYPE_LABELS = {
     "single": "单点事实",
     "multi": "多会话 / 多跳",
@@ -249,6 +281,18 @@ class LearnedController:
         action = max(utility, key=lambda a: (utility[a], -self.model.action_cost(a)))
         top = sorted(types.items(), key=lambda kv: -kv[1])[:2]
         reasons = [f"{TYPE_LABELS.get(t, t)} {p:.0%}" for t, p in top if p >= 0.1]
+        floor = self.model.image_floor
+        if (
+            has_images
+            and floor
+            and action.startswith("L0")
+            and "L1+see" in proba
+            and any(features.get(name, 0.0) > 0 for name in floor)
+        ):
+            # 保底（D-052）：门控对"问已分享照片里的细节"的问题常判成无关；在有图的空间里，
+            # 问画面细节而这条消息没有附图，问的多半是之前的照片
+            action = "L1+see"
+            reasons.append(IMAGE_FLOOR_REASON)
         scores = {f"p:{a}": round(p, 4) for a, p in proba.items()}
         scores.update({f"u:{a}": round(u, 4) for a, u in utility.items()})
         scores["p_none"] = round(types.get("none", 0.0), 4)

@@ -1,0 +1,320 @@
+{
+  "local": {
+    "machine": "macOS-26.2-arm64-arm-64bit, 8 CPUs",
+    "embedder": "hash-1024 (no API call; production adds ~110 ms per query)",
+    "repeats": 40,
+    "trials": 3,
+    "rows": [
+      {
+        "rounds": 500,
+        "units": 1279,
+        "append_ms": {
+          "p50": 1.4,
+          "p95": 1.5
+        },
+        "recall_ms": {
+          "p50": 29.1,
+          "p95": 31.2
+        },
+        "probe_ms": {
+          "p50": 31.8,
+          "p95": 35.6
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 0.3,
+          "p95": 0.4
+        },
+        "read_ms": {
+          "p50": 32.2,
+          "p95": 36.0
+        },
+        "build_s": 1.0,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 2000,
+        "units": 4729,
+        "append_ms": {
+          "p50": 1.4,
+          "p95": 1.8
+        },
+        "recall_ms": {
+          "p50": 105.4,
+          "p95": 106.6
+        },
+        "probe_ms": {
+          "p50": 110.1,
+          "p95": 111.6
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 0.7,
+          "p95": 0.7
+        },
+        "read_ms": {
+          "p50": 110.9,
+          "p95": 112.4
+        },
+        "build_s": 3.8,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 8000,
+        "units": 18529,
+        "append_ms": {
+          "p50": 2.8,
+          "p95": 4.8
+        },
+        "recall_ms": {
+          "p50": 424.1,
+          "p95": 444.5
+        },
+        "probe_ms": {
+          "p50": 440.9,
+          "p95": 461.3
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 3.5,
+          "p95": 3.9
+        },
+        "read_ms": {
+          "p50": 444.6,
+          "p95": 465.2
+        },
+        "build_s": 16.5,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 20000,
+        "units": 46129,
+        "append_ms": {
+          "p50": 2.5,
+          "p95": 2.9
+        },
+        "recall_ms": {
+          "p50": 1010.7,
+          "p95": 1059.1
+        },
+        "probe_ms": {
+          "p50": 1060.0,
+          "p95": 1115.2
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 15.7,
+          "p95": 17.8
+        },
+        "read_ms": {
+          "p50": 1076.2,
+          "p95": 1138.9
+        },
+        "build_s": 43.7,
+        "index_s": 0.0
+      }
+    ],
+    "concurrency": {
+      "rounds": 2000,
+      "reads": 64,
+      "embed_delay_ms": 110.0,
+      "rows": [
+        {
+          "threads": 1,
+          "qps": 4.3,
+          "latency_ms": {
+            "p50": 231.9,
+            "p95": 236.6
+          }
+        },
+        {
+          "threads": 4,
+          "qps": 8.7,
+          "latency_ms": {
+            "p50": 452.0,
+            "p95": 548.9
+          }
+        },
+        {
+          "threads": 16,
+          "qps": 8.7,
+          "latency_ms": {
+            "p50": 1777.5,
+            "p95": 2018.2
+          }
+        }
+      ]
+    }
+  },
+  "server": {
+    "machine": "macOS-26.2-arm64-arm-64bit, 8 CPUs",
+    "embedder": "hash-1024 (no API call; production adds ~110 ms per query)",
+    "repeats": 40,
+    "trials": 3,
+    "rows": [
+      {
+        "rounds": 500,
+        "units": 1279,
+        "append_ms": {
+          "p50": 5.9,
+          "p95": 17.1
+        },
+        "recall_ms": {
+          "p50": 10.7,
+          "p95": 36.7
+        },
+        "probe_ms": {
+          "p50": 13.7,
+          "p95": 43.6
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 0.3,
+          "p95": 0.5
+        },
+        "read_ms": {
+          "p50": 14.3,
+          "p95": 44.2
+        },
+        "build_s": 1.8,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 2000,
+        "units": 4729,
+        "append_ms": {
+          "p50": 5.7,
+          "p95": 14.7
+        },
+        "recall_ms": {
+          "p50": 13.4,
+          "p95": 32.2
+        },
+        "probe_ms": {
+          "p50": 19.1,
+          "p95": 39.0
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 0.7,
+          "p95": 1.0
+        },
+        "read_ms": {
+          "p50": 19.9,
+          "p95": 40.0
+        },
+        "build_s": 4.6,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 8000,
+        "units": 18529,
+        "append_ms": {
+          "p50": 5.2,
+          "p95": 6.4
+        },
+        "recall_ms": {
+          "p50": 13.9,
+          "p95": 17.1
+        },
+        "probe_ms": {
+          "p50": 29.4,
+          "p95": 35.0
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 3.5,
+          "p95": 4.0
+        },
+        "read_ms": {
+          "p50": 33.2,
+          "p95": 39.1
+        },
+        "build_s": 12.6,
+        "index_s": 1.0
+      },
+      {
+        "rounds": 20000,
+        "units": 46129,
+        "append_ms": {
+          "p50": 6.6,
+          "p95": 10.1
+        },
+        "recall_ms": {
+          "p50": 27.3,
+          "p95": 31.0
+        },
+        "probe_ms": {
+          "p50": 75.1,
+          "p95": 81.8
+        },
+        "decide_ms": {
+          "p50": 0.1,
+          "p95": 0.1
+        },
+        "pack_ms": {
+          "p50": 15.6,
+          "p95": 16.7
+        },
+        "read_ms": {
+          "p50": 90.9,
+          "p95": 98.2
+        },
+        "build_s": 38.2,
+        "index_s": 4.2
+      }
+    ],
+    "concurrency": {
+      "rounds": 2000,
+      "reads": 64,
+      "embed_delay_ms": 110.0,
+      "rows": [
+        {
+          "threads": 1,
+          "qps": 6.8,
+          "latency_ms": {
+            "p50": 146.4,
+            "p95": 160.5
+          }
+        },
+        {
+          "threads": 4,
+          "qps": 23.0,
+          "latency_ms": {
+            "p50": 170.3,
+            "p95": 199.1
+          }
+        },
+        {
+          "threads": 16,
+          "qps": 54.7,
+          "latency_ms": {
+            "p50": 289.3,
+            "p95": 382.9
+          }
+        }
+      ]
+    }
+  }
+}

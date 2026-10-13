@@ -215,3 +215,22 @@ def test_demo_and_chat_commands(
     assert result.exit_code == 0, result.output
     flat = _flat(result.output)
     assert "HiMaya,noted." in flat and "会话结束" in flat
+
+
+def test_data_download_skips_optional_datasets(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """不点名时只下载评测必需的数据集；WildChat（231 MB，N11）要点名才下载。"""
+    fetched: list[str] = []
+
+    def fake_download(name: str, directory: Path) -> Path:
+        fetched.append(name)
+        path = tmp_path / f"{name}.bin"
+        path.write_bytes(b"x")
+        return path
+
+    monkeypatch.setattr("cuemem.cli.download_dataset", fake_download)
+    assert runner.invoke(app, ["data", "download"]).exit_code == 0
+    assert "wildchat" not in fetched and "longmemeval_s" in fetched
+    assert runner.invoke(app, ["data", "download", "wildchat"]).exit_code == 0
+    assert fetched[-1] == "wildchat"

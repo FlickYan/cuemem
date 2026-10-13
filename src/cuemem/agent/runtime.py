@@ -267,7 +267,10 @@ class Agent:
         when = at or session.now()
         if session.last_at is not None and when < session.last_at:
             when = session.last_at  # 时间不倒流
-        cache_scope = scope(space, "ask")  # 遗忘时与回答缓存一起清理
+        # 回答缓存按会话归属（N11）：遗忘只清受影响会话的缓存。整个空间共用一个归属时，删一条事实
+        # 就会清掉所有会话的回答缓存，剧本回放的其他会话也得重新调用模型，检查时好时坏。
+        # 缓存只存请求的哈希与回答；复述了被删信息的回答会被遗忘找出来（D-051），所在会话随之清理
+        cache_scope = scope(space, f"session:{session.session_id}")
         started = time.perf_counter()
         first = len(session.uploads) + 1
         labels = [f"u{first + i}" for i in range(len(images))]

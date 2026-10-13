@@ -54,7 +54,7 @@ uv run cuemem serve              # 打开 http://127.0.0.1:7860/
 uv run cuemem demo demo/shop/script.json --fresh   # 三段会话加遗忘，14 项检查
 ```
 
-整段回放以遗忘结束（遗忘会按设计清空这个空间的回答缓存），跑完记得再执行一次 `--until 2` 恢复演示前的状态。
+整段回放以遗忘结束（遗忘会清掉受影响会话的回答缓存；N11 起回答缓存按会话归属，别的会话不受影响，D-054），跑完记得再执行一次 `--until 2` 恢复演示前的状态。
 
 重录上面的动图：在刚建好的演示记忆上开着 `cuemem serve`，运行 `uv run --with playwright python scripts/record_demo.py`（用本机的 Google Chrome）。
 
