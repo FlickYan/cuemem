@@ -668,7 +668,7 @@ All methods use **the same reader and the same judge**:
 
 - Temperature 0 and a response cache make results reproducible.
 - Judge templates are copied verbatim, with regression tests against the official code.
-- A hand audit of 50 judgements, half right and half wrong (`cuemem eval audit` exports them and computes agreement). N11 samples them from the N9 test-set judgements, stratified by dataset (`scripts/n11_audit.py`); the labelling is still to be done.
+- A hand audit of 50 judgements, half right and half wrong (`cuemem eval audit` exports them and computes agreement). N11 samples them from the N9 test-set judgements, stratified by dataset (`scripts/n11_audit.py`); all 48 labelled items agree with the judge, and 2 were left unlabelled.
 - A second judge (N11): a model from another family (deepseek-flash) re-judges every answer of the main methods on the test sets, to check agreement and whether the ranking of methods changes.
 - Repeated runs (N11): the main methods are rerun with the cache off, to measure how much the same configuration varies between two runs, as a yardstick for differences between methods.
 - `pilot10` dry runs come first: read the errors one by one and check whether a problem lies in the method, the reader or the judge before running at full size.

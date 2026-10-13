@@ -2,7 +2,7 @@
 
 **Cue-driven, self-regulating, multimodal long-term memory for LLM agents**
 
-English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [Demo guide](demo/README.en.md)
+English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/XbGL0nc12-I)
 
 CueMem gives an LLM agent a memory that lasts across months of conversations:
 
@@ -12,6 +12,8 @@ CueMem gives an LLM agent a memory that lasts across months of conversations:
 - it **forgets on request**, including replies that only restated the forgotten information.
 
 The question the project studies is **who should decide whether to recall, and how deeply**. One option is the LLM itself, calling a search tool. The other is a cheap, trainable controller that runs before the LLM is called and never calls an LLM itself. CueMem builds the controller, evaluates both approaches on three public benchmarks under a frozen protocol, and reports where each one wins.
+
+<a href="https://youtu.be/XbGL0nc12-I"><img alt="CueMem in 60 seconds: watch the intro on YouTube" src="docs/assets/video-thumbnail.png" width="720"></a>
 
 ![A shopping assistant that remembers: cross-session recall, a changed shoe size, finding the pair from a photo shared in August, a budget that changed, and forgetting a fact](docs/assets/demo.gif)
 
@@ -47,7 +49,7 @@ On MemLens, L1 and L2 attach the top-3 original photos at answer time ("re-perce
 - **Controller v2.** In spaces with photos it looks up an image-space accuracy table instead of adding and clipping a photo gain, and questions about visual detail no longer go to L0. Post-hoc replay: 81.6% → 81.9% on memory questions (+10 / −5), all of it on MemLens. For a new reader model, recalibrating the accuracy table made things worse; lowering λ from 30 to 15 recovered most of the gap to always-L2 at 16–24% lower cost.
 - **The gate on real traffic.** With the first messages of real WildChat conversations as the queries that need no memory, the gate sends 10.5% of them to retrieval (17.3% on the synthetic stream) and the stream costs 46% less than always retrieving (41% before).
 - **External baseline: Mem0.** Open-source Mem0 2.2 with the same extraction model, embeddings, reader and judge: 80.5% on 200 LoCoMo questions and 83.0% on 100 LongMemEval questions. CueMem's L1 ties on LoCoMo (81.0%) and is 9 points higher on LongMemEval (92.0%, p = 0.049), and Mem0's writes cost 2.3–2.9 times as much. Mem0 finds the right sessions; it loses on temporal reasoning, knowledge updates and details the assistant gave, which its add-only extraction does not keep.
-- **Judging and variance.** A second judge from another provider agrees on 94.7–97.9% of 12,835 judgements (κ 0.82–0.93) and keeps the method ranking (Kendall τ 0.87–1.0). A rerun with the cache off moves accuracy by at most 0.9 points, with 3–4% of questions flipping. One N9 comparison does not survive: L1 being 2.3 points below full context on LoCoMo (not significant under the second judge, 1.5 points in the rerun). A hand audit of 50 judgements is prepared and awaits labelling.
+- **Judging and variance.** A second judge from another provider agrees on 94.7–97.9% of 12,835 judgements (κ 0.82–0.93) and keeps the method ranking (Kendall τ 0.87–1.0). A rerun with the cache off moves accuracy by at most 0.9 points, with 3–4% of questions flipping. One N9 comparison does not survive: L1 being 2.3 points below full context on LoCoMo (not significant under the second judge, 1.5 points in the rerun). A hand audit of 50 judgements, stratified by dataset, agrees with the judge on all 48 that were labelled; 2 LoCoMo items were left unlabelled, and both judges marked them wrong.
 - **Write path.** Reconciliation now tells "a different scope", "the world changed" and "it was a mistake" apart, and sees the message each new fact came from: "Mia is 31" alone cannot tell a correction from a birthday. On a small invented conversation run 5 times, all three cases are right every time (N9's prompt: 3 / 5, 5 / 5, 0 / 5).
 - **Scale.** The local work on the read path grows linearly with local Qdrant (about 1.08 s at 46k retrieval units) and is 91 ms with a Qdrant server; one process serves 55 reads per second with the server (8.7 in local mode).
 

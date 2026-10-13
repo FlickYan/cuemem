@@ -574,7 +574,7 @@ Of the 17 key comparisons, one changes significance: L1 below full context on Lo
 
 At temperature 0, more than half of the answers are still worded differently; accuracy moves within ±1 point and 3–4% of questions flip. **Comparisons about 1 point apart are not stable conclusions**: "L1 is 2.3 points below full context on LoCoMo" shrinks to 1.5 points in the rerun and is not significant under the second judge, so the two are close; the controller's 10 / 10 against L1 on LongMemEval is the same. The large conclusions (L1 against full context on LongMemEval, +84 / −14; the controller against L2) are far outside this noise.
 
-Human audit: 50 judgements were sampled from N9, stratified by dataset and half judged correct, half wrong (`scripts/n11_audit.py`). They await hand-checking.
+Human audit: 50 judgements were sampled from N9, stratified by dataset (LongMemEval 15, LoCoMo 15, MemLens 20) and half judged correct, half wrong (`scripts/n11_audit.py`), then checked by hand. The hand labels agree with the judge on all 48 that were labelled (48 / 48; the 95% confidence interval goes down to about 93%). The other 2 are LoCoMo items that were left unlabelled; both judges marked them wrong. The second judge also scored 44 of the 50 and agreed with the primary judge on 42. The 2 disagreements are LoCoMo list questions whose answers leave out one item of the gold list: the primary judge marked them wrong, as the official rule requires for a partial answer, the second judge marked them right, and the hand labels side with the primary judge. The sample is small: it finds no clear judging errors, which is consistent with the 94.7–97.9% agreement between the two judges.
 
 ### 12.4 Write path and forgetting
 

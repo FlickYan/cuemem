@@ -3,6 +3,7 @@
     uv run --with playwright --with imageio-ffmpeg python scripts/render_video.py
     uv run --with playwright python scripts/render_video.py --still 12.5 --still 27   # 只截静帧检查
     （渲染命令加上 --start 22 --end 32，只渲染一段）
+    uv run --with playwright python scripts/render_video.py --thumbnail   # README 里的视频封面
 
 页面里所有动画挂在一条暂停的 GSAP 时间线上：逐帧 seek 到 t = i / fps 再截图，输出与机器快慢无关。
 用本机 Chrome（channel="chrome"）；字体与 GSAP 从 CDN 加载，需要联网。ffmpeg 用 imageio-ffmpeg
@@ -26,6 +27,19 @@ OUT = ROOT / "runs" / "video"
 SIZE = {"width": 1920, "height": 1080}
 POSTER_AT = 2.6  # 片名完整出现的时刻
 ENCODE = ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
+THUMBNAIL = ROOT / "docs" / "assets" / "video-thumbnail.png"
+# 封面：片名帧下方加一个播放按钮，提示这是视频
+PLAY_BUTTON = """() => {
+  const b = document.createElement('div');
+  b.style.cssText = 'position:absolute;left:0;right:0;bottom:118px;margin:0 auto;width:fit-content;'
+    + 'display:flex;align-items:center;gap:18px;padding:16px 36px 16px 20px;border-radius:999px;'
+    + 'background:#0F172A;color:#fff;font:600 34px Inter,sans-serif;'
+    + 'box-shadow:0 16px 40px rgba(15,23,42,.25)';
+  b.innerHTML = '<svg width="52" height="52" viewBox="0 0 52 52"><circle cx="26" cy="26" r="26"'
+    + ' fill="#14B8A6"/><path d="M21 15 L37 26 L21 37 Z" fill="#fff"/></svg>'
+    + 'Watch the 60-second intro';
+  document.querySelector('#stage').append(b);
+}"""
 
 
 class _Quiet(http.server.SimpleHTTPRequestHandler):
@@ -74,6 +88,7 @@ def main() -> None:
     parser.add_argument("--end", type=float, help="渲染到第几秒（默认到结尾）")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--out", type=Path, default=OUT / "cuemem-60s.mp4")
+    parser.add_argument("--thumbnail", action="store_true", help="只生成 README 里的视频封面")
     args = parser.parse_args()
 
     from playwright.sync_api import sync_playwright
@@ -84,7 +99,9 @@ def main() -> None:
         with sync_playwright() as p:
             browser, page, problems = open_page(p, port)
             duration = float(page.evaluate("window.cuemem.duration"))
-            if args.still:
+            if args.thumbnail:
+                thumbnail(page)
+            elif args.still:
                 stills = OUT / "stills"
                 stills.mkdir(exist_ok=True)
                 for t in args.still:
@@ -98,6 +115,18 @@ def main() -> None:
                 raise RuntimeError("\n".join(problems))
     finally:
         server.shutdown()
+
+
+def thumbnail(page: Any) -> None:
+    import io
+
+    from PIL import Image
+
+    page.evaluate("t => window.cuemem.seek(t)", POSTER_AT)
+    page.evaluate(PLAY_BUTTON)
+    image = Image.open(io.BytesIO(page.screenshot(type="png"))).convert("RGB")
+    image.resize((1280, 720), Image.Resampling.LANCZOS).save(THUMBNAIL, optimize=True)
+    print(f"{THUMBNAIL.relative_to(ROOT)}  {THUMBNAIL.stat().st_size / 1e3:.0f} KB")
 
 
 def render(page: Any, args: argparse.Namespace, duration: float) -> None:
