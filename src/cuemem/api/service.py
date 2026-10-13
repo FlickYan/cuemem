@@ -381,9 +381,10 @@ class ChatService:
     ) -> ForgetReport:
         """遗忘。原始日志是唯一的事实来源：删一条事实或一张图，删的是它出自的那一轮对话
         （用户的话与助手的回复），然后由剩下的日志重建所有派生记忆（D-021）。
-        删事实时还要追没有引用、追不到的转述（D-051）：先在原始日志里找复述了它的轮
+        删事实时还要追没有引用、追不到的转述（D-051）：先在原始日志里找复述了它的发言
         （包括进行中的会话）一起删；重建之后如果同样的信息又从别处长了出来，再删它的出处，
-        最多再追 REGROW_ROUNDS 轮。进行中的会话同步去掉被删的内容。"""
+        最多再追 REGROW_ROUNDS 轮。按内容找到的转述只删那条发言、不沿引用扩散：同一轮里
+        用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。进行中的会话同步去掉被删的内容。"""
         sources: list[str] = []
         statements: list[str] = []
         if fact_ids:
@@ -396,24 +397,21 @@ class ChatService:
             )
         # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
         turns = [*turn_ids, *self.system.round_turns(space_id, sources)]
-        restated = self.system.round_turns(
-            space_id, self.system.restating_turns(space_id, statements, exclude=turns)
-        )
+        restated = self.system.restating_turns(space_id, statements, exclude=turns)
         report = self.system.forget(
             space_id,
             session_ids=list(session_ids),
-            turn_ids=list(dict.fromkeys([*turns, *restated])),
+            turn_ids=list(dict.fromkeys(turns)),
+            restated_turn_ids=restated,
         )
         report = replace(report, restated=len(restated))
         for _ in range(REGROW_ROUNDS if statements else 0):
             regrown = self.system.regrown_facts(space_id, statements)
             if not regrown:
                 break
-            more = self.system.round_turns(
-                space_id, [t for f in regrown for t in f.source_turn_ids]
-            )
+            more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
             report = report.merged(
-                replace(self.system.forget(space_id, turn_ids=more), regrown=len(regrown))
+                replace(self.system.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
             )
         for session in self.open_sessions(space_id):
             self.agent.prune(session)

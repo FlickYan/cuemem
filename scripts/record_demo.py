@@ -34,13 +34,23 @@ WIDTH = 1000
 CAPTIONS = [
     ("start", "Third chat with Maya on Oct 10 · her August and September chats are in memory"),
     ("m1", "1  Remembers her across sessions · the trace shows what the controller chose and why"),
-    ("m2", "2  Knows what changed · EU 39 → 40, the old fact is kept and marked superseded"),
+    ("m2", "2  Knows what changed · EU 40 for running shoes since September; her usual size is 39"),
     ("m3", '3  "The pair I showed you in August" · recalls the photo, re-looks at the original'),
-    ("m4", "4  Explains how her budget changed · $120 → $180, every claim cites a memory"),
+    ("m4", "4  How her budget changed · $120 → $180; the old fact is kept, marked no longer true"),
     ("memory", "5  Memory browser · profile, fact timeline with validity, photos, sessions"),
-    ("forget", "6  Forget a fact · its source turns go, and so do uncited restatements"),
+    ("forget", "6  Forget a fact · its exchange and the replies that restated it go, nothing else"),
     ("m5", "7  Gone from context and memory · Cue no longer knows the birthday"),
 ]
+# 界面的对话区不一定自动滚到底（长回答之后会停在中间），截图前自己滚
+LATEST_JS = """() => {
+  const box = document.querySelector('[aria-label="chatbot conversation"]');
+  if (!box) return;
+  box.scrollTop = box.scrollHeight;
+  const asked = box.querySelectorAll('.user-row');
+  const last = asked[asked.length - 1];
+  const gap = last ? last.getBoundingClientRect().top - box.getBoundingClientRect().top : 0;
+  if (gap < 0) box.scrollTop += gap - 12;
+}"""
 MESSAGES = [
     "Hi Cue, I'm back!",
     "What size running shoes do I wear now?",
@@ -79,6 +89,11 @@ def record() -> list[dict[str, Any]]:
             page.wait_for_timeout(500)
         raise TimeoutError("the answer did not finish")
 
+    def to_latest(page: Page) -> None:
+        """滚到对话底部；回答太长、顶出了这一问时，把这一问滚回顶上（问与答的开头都在画面里）。"""
+        page.evaluate(LATEST_JS)
+        page.wait_for_timeout(400)
+
     def send(page: Page, text: str, tag: str) -> None:
         box = chat_box(page)
         box.click()
@@ -90,6 +105,7 @@ def record() -> list[dict[str, Any]]:
         page.wait_for_timeout(700)
         shot(page, f"{tag}-thinking", 1.0)
         wait_answer(page)
+        to_latest(page)
         shot(page, f"{tag}-answer", 5.0)
 
     with sync_playwright() as p:
@@ -118,10 +134,10 @@ def record() -> list[dict[str, Any]]:
         page.wait_for_timeout(1000)
         dropdown = page.get_by_label("Which one")
         dropdown.click()
-        dropdown.type("Ana turns", delay=40)
+        dropdown.type("turns 30", delay=40)  # "…Ana who turns 30 on October 3rd."
         page.wait_for_timeout(1200)
         shot(page, "forget-pick", 2.5)
-        page.locator("li", has_text="Ana turns 30").first.click()
+        page.locator("li", has_text="turns 30").first.click()
         page.wait_for_timeout(800)
         page.get_by_role("button", name="Forget", exact=True).click()
         for _ in range(180):

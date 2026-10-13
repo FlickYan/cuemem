@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -185,7 +185,15 @@ def test_forget_keeps_other_sessions_reply_cache(
     assert not cache.responses(scope("shop", f"session:{second.session_id}"))
 
 
-def _birthday_chat(service: ChatService, model: ScriptedModel, replies: list[str]) -> str:
+BIRTHDAY_CHAT = ("My sister Ana turns 30 on October 3.", "I'll get her the poles.", "Ana hikes.")
+
+
+def _birthday_chat(
+    service: ChatService,
+    model: ScriptedModel,
+    replies: list[str],
+    said: Sequence[str] = BIRTHDAY_CHAT,
+) -> str:
     """一段已巩固的会话：用户说了 Ana 的生日，助手后来没有引用、顺口转述了一次。
 
     返回那条事实的 ID。
@@ -207,7 +215,7 @@ def _birthday_chat(service: ChatService, model: ScriptedModel, replies: list[str
 
     model.extractions = extraction
     session = service.start("shop", at=DAY)
-    for text in ("My sister Ana turns 30 on October 3.", "I'll get her the poles.", "Ana hikes."):
+    for text in said:
         service.chat(session.session_id, text, mode="l0")
     service.end(session.session_id, wait=True)
     return next(f["id"] for f in service.facts("shop") if f["statement"].startswith("My sister"))
@@ -230,7 +238,7 @@ def test_forget_removes_uncited_restatements_in_the_log(
     service: ChatService, model: ScriptedModel
 ) -> None:
     """没有引用、追不到的转述（D-051）：已巩固会话里助手顺口说的，进行中的会话里问候时提的，
-    都在原始日志里找出来一起删；只是提到同一个人的保留。"""
+    都在原始日志里找出来一起删；只删那条回复，同一轮里用户的话、只是提到同一个人的都保留。"""
     replies = ["Happy early birthday!", "Great pick. Ana turns 30 on October 3.", "Nice!",
                "Welcome back! Ana's big day was October 3."]  # fmt: skip
     fact_id = _birthday_chat(service, model, replies)
@@ -239,11 +247,13 @@ def test_forget_removes_uncited_restatements_in_the_log(
     service.chat(live.session_id, "Hi again", mode="l0")  # 问候里提到了生日，没有引用
     report = service.forget("shop", fact_ids=[fact_id])
     statements = [f["statement"] for f in service.facts("shop")]
-    assert report.restated == 4 and report.regrown == 0  # 两轮：已巩固的转述与进行中的问候
-    assert report.turns_deleted == 6
+    assert report.restated == 2 and report.regrown == 0  # 两条回复：已巩固的转述与进行中的问候
+    assert report.turns_deleted == 4
     assert not any("October 3" in s for s in statements)
     assert "Ana hikes." in statements  # 只是提到同一个人，不算复述
-    assert not any("October 3" in str(m) for m in live.window)
+    assert "I'll get her the poles." in statements  # 转述那一轮里用户的话保留
+    assert live.window == []  # 问候的回复删了，这一轮从工作记忆里整轮去掉
+    assert [t.text for t in service.system.db.get_turns("shop", live.session_id)] == ["Hi again"]
 
 
 def test_forget_catches_facts_that_grow_back(service: ChatService, model: ScriptedModel) -> None:
@@ -254,8 +264,36 @@ def test_forget_catches_facts_that_grow_back(service: ChatService, model: Script
     model.regrown = lambda prompt: _flag(prompt, "Remaining facts:")
     report = service.forget("shop", fact_ids=[fact_id])
     statements = [f["statement"] for f in service.facts("shop")]
-    assert report.restated == 0 and report.regrown == 1 and report.turns_deleted == 4
+    assert report.restated == 0 and report.regrown == 1 and report.turns_deleted == 3
     assert not any("October 3" in s for s in statements) and "Ana hikes." in statements
+    assert "I'll get her the poles." in statements  # 只删长出它的那条回复
+
+
+def test_forget_restatement_does_not_take_its_round_along(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """转述只删那条回复，也不从它出发沿引用扩散（重录演示时发现）：助手在"换成 40 码"那一轮
+    顺口提了生日；整轮删掉会连带删掉用户的 40 码，再沿引用删掉后来所有引用 40 码的回答。"""
+    replies = ["Happy early birthday!", "Noted, EU 40. And Ana turns 30 on October 3.", "Nice!"]
+    said = (
+        "My sister Ana turns 30 on October 3.",
+        "I switched to EU 40 for running.",
+        "Ana hikes.",
+    )
+    fact_id = _birthday_chat(service, model, replies, said)
+    size = next(f["id"] for f in service.facts("shop") if "EU 40" in f["statement"])
+    model.agent = lambda body: "You wear EU 40 now."
+    live = service.start("shop", at=datetime(2026, 10, 10))
+    service.chat(live.session_id, "What size do I wear now?", mode="l0")
+    answer = service.system.db.get_turns("shop", live.session_id)[-1]
+    service.system.db.add_provenance("shop", answer.id, [size])  # 这条回答引用了 40 码
+    model.regrown = lambda prompt: _flag(prompt, "Conversation excerpts:")
+    report = service.forget("shop", fact_ids=[fact_id])
+    statements = [f["statement"] for f in service.facts("shop")]
+    assert report.restated == 1 and report.cascaded == 0 and report.turns_deleted == 3
+    assert "I switched to EU 40 for running." in statements
+    assert len(service.system.db.get_turns("shop", live.session_id)) == 2
+    assert not any("October 3" in s for s in statements)
 
 
 # ---------- HTTP 接口 ----------

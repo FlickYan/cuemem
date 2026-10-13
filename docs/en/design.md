@@ -298,8 +298,8 @@ A predicate's **cardinality** decides the conflict rules:
   - Open sessions drop the deleted content, and trace entries containing the deleted text are removed.
 - **Uncited restatements** (N10, D-051). A reply that restated the information without citing it cannot be reached through citations: for example, an assistant saying in passing "her birthday is October 3, order soon", or a greeting in an open session. Such replies are now found in the raw log:
   - for each deleted fact, the nearest rounds are retrieved, including open sessions;
-  - a cheap model confirms which ones still reveal the information. Mentioning the same person or topic does not count.
-  - Those rounds are deleted too. After the rebuild, any fact that grows back from elsewhere has its source deleted as well, for up to 3 rounds.
+  - a cheap model goes through their messages one by one and confirms which still reveal the information. Mentioning the same person or topic does not count.
+  - Only those messages are deleted, and no citation cascade starts from them (revised after N11): what else the user said in the same round stays. After the rebuild, any fact that grows back from elsewhere has its source deleted as well, for up to 3 rounds.
 - **Isolation.** Memory spaces share nothing.
 
 ## 6. Read path

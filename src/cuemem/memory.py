@@ -129,9 +129,9 @@ REGROWN_SYSTEM = (
 
 RESTATED_SYSTEM = (
     "You check whether information the user asked to forget is still in their conversation "
-    "history. You get one deleted fact and numbered excerpts of the remaining conversation. "
-    "List the excerpts that still reveal the deleted information, fully or in part: for example "
-    "the assistant restating it in passing, or the same detail in other words. An excerpt that "
+    "history. You get one deleted fact and numbered messages from the remaining conversation. "
+    "List the messages that still reveal the deleted information, fully or in part: for example "
+    "the assistant restating it in passing, or the same detail in other words. A message that "
     "only mentions the same person or topic, or says something different about it, does not "
     'count. Reply with JSON only: {"same": [numbers]}'
 )
@@ -413,6 +413,7 @@ class MemorySystem:
         session_ids: Sequence[str] = (),
         turn_ids: Sequence[str] = (),
         follow_citations: bool = True,
+        restated_turn_ids: Sequence[str] = (),
     ) -> ForgetReport:
         """遗忘（被遗忘权）：删除原始轮次，并清除由它们派生出的一切（D-021）。
 
@@ -422,6 +423,10 @@ class MemorySystem:
 
         follow_citations（N8）：助手后来的回复如果引用过要删的记忆，它就复述了被删的信息，
         那一轮也一起删，并继续往下追（溯源表记录了每次回复引用了什么）。
+
+        restated_turn_ids（D-051）：按内容找到的转述，一起删，但不从它们出发沿引用扩散。
+        它们只是顺带透露了被删的信息，所在那一轮里别的内容（用户在同一轮说的另一件事、
+        由此抽出的事实、后来引用这些事实的回复）不是要删的。
         """
         started = time.perf_counter()
         with start_trace("forget", self.tracer, space=space_id) as trace:
@@ -433,6 +438,8 @@ class MemorySystem:
                 expanded = self._follow_citations(space_id, wanted_turns)
                 cascaded = len(expanded - wanted_turns)
                 wanted_turns = expanded
+            restated = set(restated_turn_ids)
+            wanted_turns |= {t.id for t in all_turns if t.id in restated}
             targets = [t for t in all_turns if t.id in wanted_turns]
             affected = sorted({t.session_id for t in targets})
             if not targets:
@@ -537,12 +544,15 @@ class MemorySystem:
         limit: int = 8,
         floor: float = 0.2,
     ) -> list[str]:
-        """原始日志里还有哪些轮复述了被删的信息（N10，D-051），返回这些轮的发言 ID。
+        """原始日志里还有哪些发言复述了被删的信息（N10，D-051），返回这些发言的 ID。
 
         沿引用扩散只追得到引用过它的回复。助手在当时的对话里顺口转述的（"她 10 月 3 日生日，
         早点下单"），或者进行中的会话里问候时提了一句的，都没有引用，删了出处照样留在日志里。
-        对每条要删的事实，按向量取最相近的几轮（包括进行中的会话），让便宜的模型确认哪些轮
-        仍在透露它；只是提到同一个人或话题的不算。
+        对每条要删的事实，按向量取最相近的几轮（包括进行中的会话），把其中的发言逐条交给
+        便宜的模型，确认哪几条仍在透露它；只是提到同一个人或话题的不算。
+
+        逐条而不是整轮判断：助手顺口转述时，同一轮里用户说的常常是别的事（"我跑鞋换成
+        40 码了"），整轮删掉会连带删掉无关的记忆。
         """
         wanted = [s for s in dict.fromkeys(statements) if s.strip()]
         if not wanted:
@@ -559,7 +569,12 @@ class MemorySystem:
             rounds = rounds[:limit]
             if not rounds:
                 continue
-            listing = "\n\n".join(f"[{n}] {u.text[:1500]}" for n, u in enumerate(rounds, 1))
+            order = [t for u in rounds for t in u.source_turn_ids]
+            by_id = {t.id: t for t in self.db.get_turns(space_id, ids=order)}
+            turns = [by_id[t] for t in order if t in by_id]
+            listing = "\n\n".join(
+                f"[{n}] {t.role.capitalize()}: {t.text[:1500]}" for n, t in enumerate(turns, 1)
+            )
             prompt = f'Deleted fact: "{statement}"\n\nConversation excerpts:\n{listing}'
             verdict = self.llm.structured(
                 "extractor",
@@ -571,8 +586,8 @@ class MemorySystem:
                 cache_scope=scope(space_id, "consolidate"),
             ).value
             for n in verdict.same:
-                if 1 <= n <= len(rounds):
-                    found.extend(rounds[n - 1].source_turn_ids)
+                if 1 <= n <= len(turns):
+                    found.append(turns[n - 1].id)
         return list(dict.fromkeys(found))
 
     def regrown_facts(

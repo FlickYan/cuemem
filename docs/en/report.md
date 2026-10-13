@@ -63,7 +63,7 @@ user message ──► memory probe (no LLM, p50 0.2–0.5 s) ──► controll
 - **Reconciliation.** Rules only merge, negate and accumulate multi-valued facts; every "supersedes" is confirmed by an LLM. With rules alone, supersession precision in the first round was about 10%, and a wrong "invalidated" label is worse than none (D-019).
 - **Forgetting.** Delete from the log, replay the derived memory from what remains, and purge caches by ownership (D-021).
   - From N8, whole rounds are deleted and the deletion follows citations into later replies (D-046).
-  - From N10, it also finds uncited restatements in the log (D-051).
+  - From N10, it also finds uncited restatements in the log (D-051); after N11 it deletes only the restating message and starts no citation cascade from it.
 
 ### 2.2 Retrieval: three levels (N4, N5, N7)
 

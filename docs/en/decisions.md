@@ -54,7 +54,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 | D-048 | Final evaluation: each test set used once, methods and configuration frozen in advance; LoCoMo's last 7 conversations as the test set | Adopted (N9) |
 | D-049 | Reader models: small, medium and large, on stratified subsets | Adopted (N9) |
 | D-050 | Structured output also falls back to another model on request timeouts | Adopted (N9) |
-| D-051 | Forgetting a fact also deletes rounds that restated it without citing it | Adopted (N10) |
+| D-051 | Forgetting a fact also deletes messages that restated it without citing it | Adopted (N10; revised after N11) |
 | D-052 | Controller v2: image-space accuracy table in spaces with photos; visual-detail questions never go to L0; test sets only replayed post hoc | Adopted (N11) |
 | D-053 | Reconciliation separates "different scope", "the world changed" and "it was a mistake", and sees the source message; the pipeline version is not bumped | Adopted (N11) |
 | D-054 | The agent's reply cache is scoped to the session | Adopted (N11) |
@@ -498,7 +498,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 - **Why:** a runaway generation and a false moderation refusal are the same class of problem ("this model can't produce a result for this input"), and another provider's model gets through. Fallback results are cached like any other.
 - **Consequences:** a timing-out session waits for the SDK's retries (4 × 120 s) before falling back, but no longer fails the whole question. After the change the rebuild succeeded on qwen's first try, so the fallback was never triggered; all test-set memory was extracted by qwen3.8-flash.
 
-## D-051 Forgetting a fact also deletes rounds that restated it without citing it
+## D-051 Forgetting a fact also deletes messages that restated it without citing it
 
 - **Status:** adopted (N10; fixes D-046's known limit).
 - **Context:** while recording the README's demo GIF, forgetting "Ana turns 30 on October 3" in the UI (following the demo guide) and then asking "When is my sister's birthday?" still produced October 3. In the September chat the assistant had restated "her birthday is October 3rd" in a later reply, before the birthday was a citable fact; after deleting the source and replaying, the extractor pulled the fact out of that restatement again. An open session's greeting had also mentioned it without citing. The scripted replay passed only because it deleted every fact about Ana, which happened to delete the restating round too.
@@ -508,6 +508,14 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
   3. The forget report counts restated rounds (`restated`) and regrown facts (`regrown`) separately.
 - **Why:** forgetting means "this can't be recalled any more", not just "delete the sentence it came from". Citations are lineage; uncited restatements can only be found by content. Checking regrown facts alone is not enough, because open sessions are never consolidated yet keep the text in the model's window. Vectors propose candidates and the model decides: true restatements score 0.6–0.9 in cosine similarity and mere mentions of the same person 0.5–0.57, too close for a threshold.
 - **Consequences:** one or two cheap calls per forgotten fact, plus a rebuild per regrowth round (15–35 s in the demo space). Limits: only the top 8 rounds are checked; deleting images doesn't search for restatements; the model may delete loosely related content (erring towards deletion, as privacy requires).
+- **Revision (after N11, 2026-10-13): delete only the message that reveals it; restatements found by content don't start a citation cascade.**
+  - **Found:** re-recording the demo GIF with the N11 code, forgetting "Ana turns 30 on October 3" deleted 14 messages (8 "later replies that cited it", 4 restatements) and took the facts from 14 to 8: the day's whole chat was gone, and so was "I've switched to EU 40 for running shoes". Two mechanisms compounded. Restatements were deleted as whole rounds, so the September round where the user switched to EU 40 went, user message included, because the assistant's reply mentioned Ana's gift in passing. The citation cascade then started from that round too, deleting every fact extracted from it and every later reply that cited the EU 40 fact. In the N10 recording those replies happened not to mention the birthday.
+  - **Change:**
+    1. The restatement check gives the model the candidate rounds message by message and deletes only the messages it confirms; whatever else the user said in that round stays.
+    2. Restatements found by content (and the sources of regrown facts) are deleted without starting a citation cascade; the cascade starts only from the fact's own source.
+    3. In an open session, a round leaves the working memory if either its user message or its reply was deleted.
+  - **Result:** the re-recorded GIF deletes 4 messages (the source round, plus 2 replies that mentioned the birthday in passing: one in September, one in today's greeting), and facts go from 16 to 14. The last question gets "the only person I have on file is Ana, who you bought trekking poles for, but you never said she was your sister or mentioned a birthday". A regression test covers the case: the user's EU 40 message in the restating round, and a later answer citing it, both stay.
+  - **New limit:** once the source round is deleted, a later message that refers to it by pronoun loses its referent. In one recording, "The trekking poles are perfect, I'll get those for her" was re-extracted as "plans to buy trekking poles for Lena" (the only woman left in memory). A real fix would change the extraction prompt (don't guess an unresolved referent), which invalidates every cached extraction in the evaluation spaces, so it was not done; the demo script now says "for Ana".
 
 ## D-052 Controller v2: image-space accuracy table, visual-detail questions never go to L0; test sets only replayed post hoc
 

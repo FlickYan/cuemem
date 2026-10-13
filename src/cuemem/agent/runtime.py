@@ -221,11 +221,19 @@ class Agent:
 
     def prune(self, session: ChatSession) -> int:
         """遗忘之后同步会话状态：工作记忆里被删的轮去掉，图片编号作废，核心记忆快照重取
-        （画像是按剩下的日志重建的）。返回去掉的轮数。"""
+        （画像是按剩下的日志重建的）。返回去掉的轮数。
+
+        用户的话或助手的回复被删，都整轮去掉：转述只删回复（D-051），留下一句没有回复的问话
+        在上下文里没有意义。"""
         with session.lock:
             space, sid = session.space_id, session.session_id
             existing = {t.id for t in self.system.db.get_turns(space, sid)}
-            kept = [e for e in session.window if stable_id(space, sid, e.user_idx) in existing]
+            kept = [
+                e
+                for e in session.window
+                if stable_id(space, sid, e.user_idx) in existing
+                and stable_id(space, sid, e.user_idx + 1) in existing
+            ]
             removed = len(session.window) - len(kept)
             session.window = kept
             for label, idx in list(session.upload_turns.items()):

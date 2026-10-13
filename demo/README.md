@@ -37,7 +37,7 @@ uv run cuemem serve              # 打开 http://127.0.0.1:7860/
 | 1:05 | 发 `Can you find shoes that look like the pair I showed you in August?` | 轨迹里有八月那张照片：从记忆里召回、原图交给模型（"original photo shown to the model"），再按图在商品目录里找同款；回答下方是商品图 |
 | 1:40 | 发 `How has my shoe budget changed since we first talked?` | $120 → $180。如果控制器选了 L0，轨迹里会看到模型自己调用了 memory_search 补查——"控制器先选、模型兜底"；也可以在 Memory controller settings 里把 Recall 切到 l2，看深度检索的规划与补检索 |
 | 2:10 | 切到 Memory 页 | 画像；事实时间线里被取代的预算，以及取代它的新事实；实体图；图库 |
-| 2:30 | Forget a → fact → 选 "Ana turns 30 on October 3…" → Forget | 删的是这条事实出自的那一轮对话、后来引用过它的回复，以及没有引用、只是顺口转述它的轮（九月那次回复里的"她 10 月 3 日生日，早点下单"，或今天问候时提到的生日，D-051），提示里会写 "including N that restated it without citing"；事实与画像按剩下的日志重建 |
+| 2:30 | Forget a → fact → 选 "…Ana who turns 30 on October 3rd." → Forget | 删的是这条事实出自的那一轮对话、后来引用过它的回复，以及没有引用、只是顺口转述它的轮（九月那次回复里的"她 10 月 3 日生日，早点下单"，或今天问候时提到的生日，D-051；只删这条回复，同一轮里用户说的话保留），提示里会写 "including N that restated it without citing"；事实与画像按剩下的日志重建 |
 | 2:50 | 回到 Chat，发 `When is my sister's birthday?` | 答"不知道"。屏幕上的聊天记录还在，但 Cue 的上下文和记忆里已经没有了 |
 
 可以顺带讲的：
