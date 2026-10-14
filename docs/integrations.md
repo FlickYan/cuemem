@@ -27,24 +27,30 @@ CueMem 接进现成 Agent 框架的四种方式，从改动最少到最深：
 from agents import Agent, RunConfig, Runner
 from cuemem import Memory
 from cuemem.integrations.openai_agents import (
-    CueMemSession, close_sessions, memory_input_filter, memory_tools,
+    CueMemSession,
+    close_sessions,
+    memory_input_filter,
+    memory_tools,
 )
 
 memory = Memory(preset="deepseek")
 
-def user_of(context):                 # 多个用户共用一个 Agent 时按运行上下文给身份
+
+def user_of(context):  # 多个用户共用一个 Agent 时按运行上下文给身份
     return context["user_id"]
+
 
 agent = Agent(name="Assistant", model=..., tools=memory_tools(memory, user_id=user_of))
 config = RunConfig(
     call_model_input_filter=memory_input_filter(memory, user_id=user_of),
-    trace_include_sensitive_data=False,   # 注入的记忆不上传到 SDK 的 trace 后台
+    trace_include_sensitive_data=False,  # 注入的记忆不上传到 SDK 的 trace 后台
 )
 
 async with CueMemSession("chat-1", memory, user_id="alice") as session:
-    await Runner.run(agent, "I moved to Lisbon", session=session,
-                     run_config=config, context={"user_id": "alice"})
-close_sessions(memory)                # 退出前、memory.close() 之前
+    await Runner.run(
+        agent, "I moved to Lisbon", session=session, run_config=config, context={"user_id": "alice"}
+    )
+close_sessions(memory)  # 退出前、memory.close() 之前
 ```
 
 - 会话：写入时标记为进行中、不抽取；`async with` 结束、`end()`、空闲 30 分钟或 `close_sessions()` 时交给后台抽取。之后同一个 SDK 会话再有对话，写进新的一段（对话日期是新的）。
@@ -62,16 +68,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from cuemem import Memory
 from cuemem.integrations.langgraph import CueMemMiddleware
 
-memory = Memory(preset="deepseek")             # 异步应用用 AsyncMemory
+memory = Memory(preset="deepseek")  # 异步应用用 AsyncMemory
 cuemem = CueMemMiddleware(memory, tools=True)  # 同时给模型 recall / remember / forget
 agent = create_agent(llm, tools, middleware=[cuemem], checkpointer=InMemorySaver())
 
 config = {"configurable": {"thread_id": "t1", "user_id": "alice"}}
 out = agent.invoke({"messages": [{"role": "user", "content": "I moved to Munich"}]}, config)
-out["cuemem"]               # 这一轮控制器的决定：level、reasons、recalled
+out["cuemem"]  # 这一轮控制器的决定：level、reasons、recalled
 
-cuemem.end_thread(config)   # 对话结束：整段抽取（空闲 30 分钟的线程也会交出）
-cuemem.close()              # 应用退出时，memory.close() 之前；异步用 aend_thread / aclose
+cuemem.end_thread(config)  # 对话结束：整段抽取（空闲 30 分钟的线程也会交出）
+cuemem.close()  # 应用退出时，memory.close() 之前；异步用 aend_thread / aclose
 ```
 
 - 身份：`user_id` 不在构造时固定时，从 `config["configurable"]` 取；部署在 LangGraph Server 上时优先用登录的用户，不信任客户端传来的 ID。
@@ -91,16 +97,19 @@ import anthropic
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
-memory = Memory()                   # 默认配置（通义）；或 Memory(preset="deepseek")
+memory = Memory()  # 默认配置（通义）；或 Memory(preset="deepseek")
 client = anthropic.Anthropic()
 
 with CueMemMemoryTool(memory, user_id="alice") as tool:
-    history = []                    # 只追加：with_recall 只动最新一句用户消息
+    history = []  # 只追加：with_recall 只动最新一句用户消息
     for text in ["I moved to Lisbon in 2026-09.", "What should I cook tonight?"]:
         user = {"role": "user", "content": text}
         history, evidence = with_recall([*history, user], memory, user_id="alice")
         runner = client.beta.messages.tool_runner(
-            model="claude-opus-5-5", max_tokens=16000, tools=[tool], messages=history,
+            model="claude-opus-5-5",
+            max_tokens=16000,
+            tools=[tool],
+            messages=history,
         )
         for message in runner:
             history.append(message.to_param())

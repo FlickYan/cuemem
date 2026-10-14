@@ -34,24 +34,30 @@ Install with `uv sync --extra integrations`, or separately with `--extra openai-
 from agents import Agent, RunConfig, Runner
 from cuemem import Memory
 from cuemem.integrations.openai_agents import (
-    CueMemSession, close_sessions, memory_input_filter, memory_tools,
+    CueMemSession,
+    close_sessions,
+    memory_input_filter,
+    memory_tools,
 )
 
 memory = Memory(preset="deepseek")
 
-def user_of(context):                 # one Agent shared by many users: identity from the run context
+
+def user_of(context):  # one Agent shared by many users: identity from the run context
     return context["user_id"]
+
 
 agent = Agent(name="Assistant", model=..., tools=memory_tools(memory, user_id=user_of))
 config = RunConfig(
     call_model_input_filter=memory_input_filter(memory, user_id=user_of),
-    trace_include_sensitive_data=False,   # keep recalled memories out of SDK traces
+    trace_include_sensitive_data=False,  # keep recalled memories out of SDK traces
 )
 
 async with CueMemSession("chat-1", memory, user_id="alice") as session:
-    await Runner.run(agent, "I moved to Lisbon", session=session,
-                     run_config=config, context={"user_id": "alice"})
-close_sessions(memory)                # at shutdown, before memory.close()
+    await Runner.run(
+        agent, "I moved to Lisbon", session=session, run_config=config, context={"user_id": "alice"}
+    )
+close_sessions(memory)  # at shutdown, before memory.close()
 ```
 
 - **Sessions:**
@@ -77,16 +83,17 @@ from langgraph.checkpoint.memory import InMemorySaver
 from cuemem import Memory
 from cuemem.integrations.langgraph import CueMemMiddleware
 
-memory = Memory(preset="deepseek")             # AsyncMemory for async apps
+memory = Memory(preset="deepseek")  # AsyncMemory for async apps
 cuemem = CueMemMiddleware(memory, tools=True)  # also gives the model recall / remember / forget
 agent = create_agent(llm, tools, middleware=[cuemem], checkpointer=InMemorySaver())
 
 config = {"configurable": {"thread_id": "t1", "user_id": "alice"}}
 out = agent.invoke({"messages": [{"role": "user", "content": "I moved to Munich"}]}, config)
-out["cuemem"]               # the controller's decision this turn: level, reasons, recalled
+out["cuemem"]  # the controller's decision this turn: level, reasons, recalled
 
-cuemem.end_thread(config)   # conversation over: extract the whole thread (idle threads go after 30 min)
-cuemem.close()              # at shutdown, before memory.close(); async: aend_thread / aclose
+# Conversation over: extract the whole thread (idle threads are handed over after 30 min)
+cuemem.end_thread(config)
+cuemem.close()  # at shutdown, before memory.close(); async: aend_thread / aclose
 ```
 
 - **Identity:** when `user_id` is not fixed at construction, it is taken from `config["configurable"]`. On LangGraph Server, the authenticated user takes precedence over any id the client sends.
@@ -113,16 +120,19 @@ import anthropic
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
-memory = Memory()                   # default config (Qwen); or Memory(preset="deepseek")
+memory = Memory()  # default config (Qwen); or Memory(preset="deepseek")
 client = anthropic.Anthropic()
 
 with CueMemMemoryTool(memory, user_id="alice") as tool:
-    history = []                    # append-only: with_recall only touches the newest user message
+    history = []  # append-only: with_recall only touches the newest user message
     for text in ["I moved to Lisbon in 2026-09.", "What should I cook tonight?"]:
         user = {"role": "user", "content": text}
         history, evidence = with_recall([*history, user], memory, user_id="alice")
         runner = client.beta.messages.tool_runner(
-            model="claude-opus-5-5", max_tokens=16000, tools=[tool], messages=history,
+            model="claude-opus-5-5",
+            max_tokens=16000,
+            tools=[tool],
+            messages=history,
         )
         for message in runner:
             history.append(message.to_param())
