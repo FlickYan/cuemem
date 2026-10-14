@@ -138,6 +138,13 @@ def test_search_and_answer(memory: Memory) -> None:
         len(memory.search("Where do I live?", user_id="alice", mode="l1", limit=1)["results"]) == 1
     )
 
+    # Mem0 v3 的写法：filters 与 top_k
+    v3 = memory.search("Where do I live?", filters={"user_id": "alice"}, top_k=1, mode="l1")
+    assert len(v3["results"]) == 1
+    assert memory.get_all(filters={"user_id": "alice"})["results"][0]["object"] == "Berlin"
+    with pytest.raises(ValueError, match="Unsupported filters"):
+        memory.search("x", filters={"user_id": "alice", "categories": ["home"]})
+
     auto = memory.search("Where do I live?", user_id="alice", at=SEP)
     assert auto["level"] in {"L0", "L1", "L2"} and auto["reasons"]
 

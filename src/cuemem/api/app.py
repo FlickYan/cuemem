@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, get_args
+from typing import TYPE_CHECKING, Annotated, Any, get_args
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -30,6 +30,9 @@ from cuemem.api.service import ChatService
 from cuemem.errors import CueMemError
 from cuemem.memory import RecallMode
 from cuemem.read.controller import Router
+
+if TYPE_CHECKING:
+    from cuemem.api.proxy import MemoryProxy
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TOKEN_ENV = "CUEMEM_API_TOKEN"
@@ -110,9 +113,18 @@ def _ui_login(token: str | None) -> Callable[[str, str], bool] | None:
 
 
 def create_app(
-    service: ChatService, *, upload_dir: Path, ui: bool = True, token: str | None = None
+    service: ChatService,
+    *,
+    upload_dir: Path,
+    ui: bool = True,
+    token: str | None = None,
+    proxy: MemoryProxy | None = None,
 ) -> FastAPI:
-    """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。"""
+    """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。
+
+    proxy：同时提供 OpenAI 兼容的记忆代理（/v1/chat/completions，N12），与界面共用一个记忆系统，
+    经代理写入的对话可以在界面里浏览。
+    """
     app = FastAPI(
         title="CueMem",
         version=__version__,
@@ -234,6 +246,12 @@ def create_app(
             return service.consolidate(space)
 
     app.include_router(api)
+    if proxy is not None:
+        from cuemem.api.proxy import proxy_router
+
+        app.include_router(
+            proxy_router(proxy, dependencies=[Depends(_token_check(token))] if token else [])
+        )
     if ui:
         import gradio as gr
 

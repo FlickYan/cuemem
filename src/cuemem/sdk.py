@@ -100,6 +100,15 @@ class Memory:
         """与 Mem0 同名的构造方式：config 是嵌套的配置字典（字段见 configs/default.yaml）。"""
         return cls(config, **kwargs)
 
+    @classmethod
+    def from_system(cls, system: MemorySystem) -> Memory:
+        """包住一个已经打开的记忆系统（同一个进程里共用，例如 HTTP 服务与记忆代理）。
+        本地模式的向量库同一时间只能被一个对象打开，不能再 Memory() 一个新的。"""
+        memory = cls.__new__(cls)
+        memory.settings = system.settings
+        memory.system = system
+        return memory
+
     # ---------- 写入 ----------
 
     def add(
@@ -122,7 +131,7 @@ class Memory:
         """
         space = space_for(user_id, agent_id)
         when = _as_datetime(timestamp) or datetime.now().replace(microsecond=0)
-        turns, temporary = _turns(messages, when)
+        turns, temporary = parse_messages(messages, when)
         try:
             if not turns:
                 return {"results": [], "session_id": None, "turn_ids": [], "status": "empty"}
@@ -177,9 +186,16 @@ class Memory:
         at: datetime | None = None,
         router: Router = "learned",
         lam: float | None = None,
+        filters: Mapping[str, Any] | None = None,
+        top_k: int | None = None,
     ) -> dict[str, Any]:
         """检索（不回答）。mode="auto" 由检索控制器选 L0 / L1 / L2，结果里的 level 与 reasons
-        说明它为什么这么选；L0 表示这句话不需要回忆，只返回画像。limit 截断结果条数。"""
+        说明它为什么这么选；L0 表示这句话不需要回忆，只返回画像。limit 截断结果条数。
+
+        filters={"user_id": …, "agent_id": …} 与 top_k 是 Mem0 v3 的写法，与 user_id、limit 等价。
+        """
+        user_id, agent_id = _scope(user_id, agent_id, filters)
+        limit = limit or top_k
         space = space_for(user_id, agent_id)
         if not self.system.db.get_sessions(space):
             return _empty(self.system, space)
@@ -215,9 +231,13 @@ class Memory:
         valid_at: str | None = None,
         known_at: datetime | None = None,
         limit: int | None = None,
+        filters: Mapping[str, Any] | None = None,
+        top_k: int | None = None,
     ) -> dict[str, Any]:
         """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at="2025-06" 是那时
         现实中成立的事实，known_at 是系统在那一刻相信的事实。"""
+        user_id, agent_id = _scope(user_id, agent_id, filters)
+        limit = limit or top_k
         space = space_for(user_id, agent_id)
         current = not include_superseded and valid_at is None and known_at is None
         facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
@@ -347,7 +367,7 @@ def _threaded[**P, R](method: Callable[P, R]) -> Callable[P, Any]:
 # ---------- 输入 ----------
 
 
-def _turns(messages: MessagesIn, when: datetime) -> tuple[list[TurnIn], list[Path]]:
+def parse_messages(messages: MessagesIn, when: datetime) -> tuple[list[TurnIn], list[Path]]:
     """OpenAI 格式的消息 → 发言。返回发言与需要事后删除的临时图片文件。"""
     if isinstance(messages, str):
         items: list[Message] = [{"role": "user", "content": messages}]
@@ -420,6 +440,20 @@ def _image_file(url: str) -> tuple[Path, bool]:
     if not path.is_file():
         raise ValueError(f"Image not found: {url}")
     return path, False
+
+
+def _scope(
+    user_id: str | None, agent_id: str | None, filters: Mapping[str, Any] | None
+) -> tuple[str | None, str | None]:
+    """Mem0 v3 把 user_id、agent_id 放在 filters 里；两种写法都认。"""
+    if not filters:
+        return user_id, agent_id
+    unknown = set(filters) - {"user_id", "agent_id", "run_id"}
+    if unknown:
+        raise ValueError(
+            f"Unsupported filters: {sorted(unknown)}. Memories are scoped by user_id and agent_id."
+        )
+    return filters.get("user_id", user_id), filters.get("agent_id", agent_id)
 
 
 def _as_datetime(value: datetime | str | float | None) -> datetime | None:

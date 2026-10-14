@@ -66,6 +66,31 @@ def chat_completion_body(
     }
 
 
+def sse_body(content: str) -> bytes:
+    """流式聊天补全的响应：每个词一个 data 块，最后是用量与 [DONE]。"""
+    chunks = []
+    for i, word in enumerate(content.split(" ")):
+        piece = word if i == 0 else " " + word
+        delta = {"role": "assistant", "content": piece} if i == 0 else {"content": piece}
+        chunks.append(
+            {
+                "id": "c",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": delta}],
+            }
+        )
+    chunks.append(
+        {
+            "id": "c",
+            "object": "chat.completion.chunk",
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        }
+    )
+    lines = [f"data: {json.dumps(c)}\n\n" for c in chunks] + ["data: [DONE]\n\n"]
+    return "".join(lines).encode()
+
+
 class FakeAPI:
     """chat_replies 按顺序消费，元素可以是字符串或"由请求体生成回复"的函数；只剩一个时重复使用。"""
 
@@ -120,6 +145,12 @@ class FakeAPI:
                             "type": "data_inspection_failed",
                         }
                     },
+                )
+            if body.get("stream"):  # 流式（N12 的记忆代理）：按词切成几个 SSE 块
+                return httpx2.Response(
+                    200,
+                    content=sse_body(content),
+                    headers={"content-type": "text/event-stream"},
                 )
             return httpx2.Response(
                 200,

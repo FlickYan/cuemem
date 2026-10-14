@@ -17,6 +17,7 @@ cuemem chat --space S [--at T]        在终端里与 Agent 对话（N8）
 cuemem serve [--port 7860]            启动 HTTP 接口与演示界面（FastAPI + Gradio）
 cuemem demo SCRIPT [--until N]        按演示剧本回放对话并核对回答
 cuemem mcp --space S                  以 MCP Server（stdio）提供 remember / recall / forget
+cuemem proxy [--port 8787]            OpenAI 兼容的记忆代理：改 base_url 即接入（N12）
 cuemem migrate-vectors --to URL       把本地向量库复制到 Qdrant 服务端（N11）
 """
 
@@ -54,7 +55,7 @@ from cuemem.evals.splits import load_split, save_split, stratified_ids
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.llm.peak import describe, next_peak_start, peak_end
-from cuemem.memory import AskMode, MemorySystem
+from cuemem.memory import AskMode, MemorySystem, RecallMode
 from cuemem.read.controller import Router
 from cuemem.store.sqlite import MemoryDB
 from cuemem.write.consolidate import ConsolidationReport
@@ -401,18 +402,22 @@ def serve(
     import uvicorn
 
     from cuemem.api.app import TOKEN_ENV, create_app
+    from cuemem.api.proxy import MemoryProxy
 
     settings, service = _service(space, scenario, router, lam)
     token = os.environ.get(TOKEN_ENV) or None  # _service 加载配置时已读入 .env
+    proxy = MemoryProxy(service.system)  # 同一个记忆系统：经代理写入的对话在界面里也能看到
     try:
         app_ = create_app(
             service,
             upload_dir=settings.paths.media.parent / "uploads",
             ui=not no_ui,
             token=token,
+            proxy=proxy,
         )
         console.print(
             f"界面：[bold]http://{host}:{port}/[/bold] · 接口文档：http://{host}:{port}/docs"
+            f" · OpenAI 兼容的记忆代理：http://{host}:{port}/v1"
         )
         if token:
             console.print(f"已启用访问令牌（{TOKEN_ENV}）：接口要带 Bearer 令牌，界面要先登录")
@@ -423,7 +428,58 @@ def serve(
             )
         uvicorn.run(app_, host=host, port=port, log_level="warning")
     finally:
+        proxy.close_all()
         service.close()
+
+
+@app.command()
+def proxy(
+    host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="端口")] = 8787,
+    user: Annotated[
+        str | None,
+        typer.Option(
+            help="请求里没有 user 字段、也没有 X-CueMem-User 头时用的用户；不填则不碰记忆"
+        ),
+    ] = None,
+    mode: Annotated[str, typer.Option(help="检索档位：auto（控制器选）、l0、l1、l2")] = "auto",
+    idle_minutes: Annotated[float, typer.Option(help="会话空闲多少分钟后结束并抽取事实")] = 30.0,
+) -> None:
+    """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
+    import uvicorn
+
+    from cuemem.api.app import TOKEN_ENV
+    from cuemem.api.proxy import MemoryProxy, create_proxy_app
+
+    if mode not in get_args(RecallMode):
+        console.print(f"[red]--mode 只能是 {'、'.join(get_args(RecallMode))}[/red]")
+        raise typer.Exit(1)
+    settings = load_settings(peak_policy="warn")
+    system = MemorySystem.from_settings(settings)
+    token = os.environ.get(TOKEN_ENV) or None
+    memory_proxy = MemoryProxy(
+        system, default_user=user, mode=cast(RecallMode, mode), idle_minutes=idle_minutes
+    )
+    try:
+        console.print(
+            f"记忆代理：[bold]http://{host}:{port}/v1[/bold]（OpenAI 兼容；"
+            f"上游默认模型 {settings.roles['agent'].model}）"
+        )
+        console.print(
+            "用户：请求体的 user 字段，或请求头 X-CueMem-User"
+            + (f"；默认 {user}" if user else "；没有时原样转发、不碰记忆")
+        )
+        if token:
+            console.print(f"已启用访问令牌（{TOKEN_ENV}）：OpenAI SDK 的 api_key 填这个令牌")
+        elif host not in ("127.0.0.1", "localhost", "::1"):
+            console.print(
+                f"[yellow]注意：[/yellow]监听 {host} 但没有设置 {TOKEN_ENV}，"
+                "能连到这台机器的人都能用你的上游 Key、读写记忆"
+            )
+        uvicorn.run(create_proxy_app(memory_proxy, token=token), host=host, port=port)
+    finally:
+        memory_proxy.close_all()
+        system.close()
 
 
 @app.command()
