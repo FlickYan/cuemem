@@ -678,6 +678,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
   - Presets as Python dicts: YAML matches the default config, so users can write their own preset the same way (`--preset path/to/my.yaml`).
 - **Consequences:**
   - Requests under the default config are byte-for-byte unchanged (including parameter order), so existing LLM and embedding caches still hit; `tests/test_providers.py` checks this.
+  - One behaviour change: with an explicit config file (`CUEMEM_CONFIG`), relative paths used to resolve against the config file's grandparent directory; they now resolve against the data directory. No script in the repository relied on the old behaviour.
   - A built wheel was checked outside the repository: data goes to `~/.cuemem` and presets apply. The Docker image was built and run locally: the SDK inside the container, HTTP import and recall, and the Qdrant server under compose all worked.
   - **Limits:**
     - The OpenAI and Ollama presets are covered by offline tests only and have not been evaluated on real models.
