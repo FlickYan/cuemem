@@ -2,13 +2,15 @@
 
     import anthropic
     from cuemem import Memory
-    from cuemem.integrations.claude import CueMemMemoryTool
+    from cuemem.integrations.claude import CueMemMemoryTool, with_recall
 
-    memory = Memory(preset="deepseek")
+    memory = Memory()  # 默认配置用通义千问；只有 DeepSeek 的 Key 时 Memory(preset="deepseek")
     tool = CueMemMemoryTool(memory, user_id="alice")
+    history, evidence = with_recall(
+        [{"role": "user", "content": "I moved to Lisbon last month."}], memory, user_id="alice"
+    )
     runner = anthropic.Anthropic().beta.messages.tool_runner(
-        model="claude-opus-5-5", max_tokens=16000, tools=[tool],
-        messages=[{"role": "user", "content": "I moved to Lisbon last month."}],
+        model="claude-opus-5-5", max_tokens=16000, tools=[tool], messages=history
     )
     runner.until_done()
 
@@ -21,25 +23,41 @@
   删除一律拒绝，并告诉 Claude 该怎么做；
 - Claude 自己的文件：原文存在数据目录下的 claude_memory.sqlite（按记忆空间分开）。create、
   str_replace、insert 的每次改动另写一条笔记进 CueMem 的原始日志（一条笔记一个会话，与 MCP 的
-  remember 相同，后台抽取成事实）。新文件写全文；之后的改动只写改了的行和它们原来的样子（只是挪了
-  位置的不算），对账据此把旧事实标成被取代，没变的内容也不会被重复抽取。rename 只搬动文件与出处，
-  不写笔记（没有新信息）；delete 遗忘这个文件写进日志的全部笔记，由剩下的日志重建派生记忆，返回
-  哪些事实不再记得、哪些旧版本恢复为当前。create 已有的文件时覆盖（Claude 的工具说明就是
-  "创建或覆盖"；报错的话它会先删再建，白白触发一次遗忘）。
+  remember 相同，后台抽取成事实）。新文件写全文；之后的改动只写改了的行（连同所在的标题）：
+  换掉的旧行注明"被取代"，删掉的旧行注明"不再适用"，都带上它最初写下的日期，对账据此把旧事实
+  标成被取代（历史保留），没变的内容也不会被重复抽取。标题决定含义：一行从"# 过敏"挪到
+  "# 以前的过敏"是改动（注明从哪里挪来），只在同一节里挪位置的不算。rename 只搬动文件与出处，
+  不写笔记；delete 遗忘这个文件写进日志的全部笔记，由剩下的日志重建派生记忆，返回哪些事实不再
+  记得、哪些旧版本恢复为当前。create 已有的文件时覆盖（Claude 的工具说明就是"创建或覆盖"）。
+
+删掉一行不等于遗忘（不可逆的遗忘只在删除文件时发生）：删掉的那一行可能只是过时了，也可能是
+整理；笔记写成"不再适用"，历史保留，工具结果告诉 Claude 要彻底遗忘就删掉文件再重建。
 
 遗忘在两个方向上都成立（D-021）：文件的某条笔记在别处被遗忘（Memory.delete、MCP 的 forget、
-转述追查）之后，这个文件也从 /memories 里去掉——不知道被遗忘的信息在文件的哪几行，留着就泄露了；
-文件里其余的信息仍在 CueMem 里（facts.md），Claude 需要时可以重写。
+转述追查）之后，这个文件从 /memories 里去掉——不知道被遗忘的信息在文件的哪几行，留着就泄露了；
+它其余的笔记仍在 CueMem 里，记录保留（facts.md 注明出自"已去掉"的文件），删除这个路径或
+clear_all_memory 照样能遗忘它们。整个记忆空间被删除（Memory.delete_all）之后，下次访问时这个
+空间的文件全部清掉；直接用本模块的 delete_all 则当场清掉。文件原文不在 Memory.export 里（导出
+的是原始日志，其中有每次改动的笔记）。
+
+几个工具实例（例如每个请求一个）可以共用一个存储文件：同一进程里同一个记忆空间的读改写串行；
+跨进程时保存前核对文件没有被别人改过，改过就撤销刚写的笔记并报错，让 Claude 重新查看。
 
 路径只认 /memories 下的；拒绝 . 与 ..、隐藏名、反斜杠、控制字符、百分号编码、过深过长的路径。
 单个文件、文件数、总字符数都有上限；查看超过 16000 字符时截断，提示用 view_range 往下翻。
 
-with_recall（可选）：调用模型之前先过检索控制器（L0 只给画像），证据块与记忆代理
-（api/proxy.py）同一个格式、同一个位置，放在最后一句用户消息的开头。
+with_recall / awith_recall（可选）：调用模型之前先过检索控制器（L0 只给画像），证据块与记忆
+代理（api/proxy.py）同一个格式、同一个位置，放在最新一句用户消息的开头（后面跟着的
+mid-conversation system 消息不算）。返回的列表就是之后的对话历史：下一轮在它后面追加，再调用
+with_recall——只往后加，已经发出去的消息一个字节都不改（Claude Opus 5.5 等模型的 preserved
+thinking 要求前缀不变，否则 400 或丢掉思考块，提示缓存也失效）。检索出错时照常返回原消息，
+level 为 "error"，这一轮只是不带记忆。
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import os
 import re
@@ -47,7 +65,10 @@ import sqlite3
 import threading
 import unicodedata
 import uuid
-from collections.abc import Collection, Mapping, Sequence
+import warnings
+import weakref
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -69,7 +90,7 @@ from anthropic.types.beta import (
 from anyio import to_thread
 
 from cuemem.api.proxy import MEMORY_NOTE, _inject
-from cuemem.core.models import Fact
+from cuemem.core.models import Fact, Turn
 from cuemem.core.timeutil import day
 from cuemem.core.trace import record_event
 from cuemem.memory import RecallMode
@@ -77,11 +98,14 @@ from cuemem.read.controller import english_reason
 from cuemem.read.facts import fact_status
 from cuemem.read.reader import memory_blocks
 from cuemem.sdk import AsyncMemory, Memory, space_for
+from cuemem.store.sqlite import MemoryDB
 
 __all__ = [
     "AsyncCueMemMemoryTool",
     "CueMemMemoryTool",
     "Evidence",
+    "awith_recall",
+    "delete_all",
     "with_recall",
 ]
 
@@ -110,14 +134,16 @@ _PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
 PROFILE_HEAD = (
     "# Profile\n"
     "The most important facts that are currently true about the user (core memory), kept up "
-    "to date by the memory system. Read-only.\n\n"
+    "to date by the memory system. Read-only; already remembered, so don't copy it into your "
+    "files.\n\n"
 )
 FACTS_HEAD = (
     "# Facts\n"
     "What the memory system currently knows, extracted from your memory files and past "
     "conversations and kept up to date automatically. Each line: [fact id] (when it was said; "
-    "since when; status) statement. Read-only: to make the memory system forget something you "
-    "wrote, delete the file it came from.\n\n"
+    "since when; status) statement. Read-only and already remembered, so don't copy it into "
+    "your files. To make the memory system forget something you wrote, delete the file it came "
+    "from.\n\n"
 )
 HISTORY_HEAD = (
     "# History\n"
@@ -127,18 +153,40 @@ HISTORY_HEAD = (
 )
 ROOT_NOTE = (
     "\n\nprofile.md, facts.md and history/ are kept up to date by the memory system from your "
-    "memory files and past conversations, and are read-only. Every change to your own files is "
-    "also saved to long-term memory; deleting a file makes the memory system forget what that "
-    "file added."
+    "memory files and past conversations, and are read-only. They and the memories recalled "
+    "into the conversation are already remembered: don't copy them into your files. Every "
+    "change to your own files is also saved to long-term memory, so write absolute dates "
+    '("in 2026-09", not "last month"). A line you remove is recorded as no longer applying, and '
+    "deleting a file makes the memory system forget what that file added."
+)
+REMOVED_NOTE = (
+    "\n\nRemoving a line does not make the memory system forget it: it records that the line "
+    "no longer applies (for example, that the user no longer lives there) and keeps its "
+    "history. If the user asked you to forget something, delete this file and create it again "
+    "without it: deleting a file makes the memory system forget what the file added."
 )
 
 
 class _Note(NamedTuple):
-    """文件的一次改动写进 CueMem 原始日志的那条笔记。"""
+    """文件的一次改动写进 CueMem 原始日志的那条笔记。live=False：文件已经去掉，笔记还在。"""
 
     path: str
     session_id: str
     turn_id: str
+    live: bool = True
+
+
+class _State(NamedTuple):
+    """一个记忆空间里 Claude 的文件与出处（每个命令开始时读一次）。"""
+
+    files: dict[str, str]
+    notes: list[_Note]  # 现有文件的笔记
+    orphans: list[_Note]  # 已经去掉的文件留下的笔记
+    turns: dict[str, Turn]  # 笔记在原始日志里的那一条
+
+
+class _Conflict(Exception):
+    """保存时发现文件已经被别的进程改过。"""
 
 
 # ---------- 旁边的文件存储 ----------
@@ -159,24 +207,44 @@ CREATE TABLE IF NOT EXISTS notes (
     turn_id TEXT NOT NULL,
     command TEXT NOT NULL,
     ts TEXT NOT NULL,
+    live INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (space_id, turn_id)
 );
 CREATE INDEX IF NOT EXISTS notes_by_path ON notes (space_id, path);
+CREATE TABLE IF NOT EXISTS spaces (
+    space_id TEXT PRIMARY KEY,
+    epoch TEXT NOT NULL
+);
 """
 
 
 class _FileStore:
-    """Claude 写的文件原文，与每次改动写进原始日志的笔记（出处）。几个工具实例可以共用一个文件。"""
+    """Claude 写的文件原文，与每次改动写进原始日志的笔记（出处）。几个工具实例可以共用一个文件。
+
+    里面是用户的个人信息：文件只给本人读写（-wal、-shm 随数据库文件的权限），删除时覆写
+    （secure_delete），删完把 WAL 写回并截断，不在磁盘上留下被删的原文。"""
 
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fresh = not path.exists()
+        if not path.exists():  # 先以 0600 建好空文件，SQLite 建 -wal、-shm 时沿用这个权限
+            with contextlib.suppress(FileExistsError):
+                os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        for extra in (Path(f"{path}-wal"), Path(f"{path}-shm")):
+            try:
+                if extra.exists() and extra.stat().st_mode & 0o077:
+                    os.chmod(extra, 0o600)
+            except OSError:  # 别人的文件：改不了就算了
+                pass
+        self.path = path
         self._conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
         self._lock = threading.Lock()
+        self._conn.execute("PRAGMA secure_delete=ON")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
-        if fresh:  # 文件里是用户的个人信息：只给本人读写
-            os.chmod(path, 0o600)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(notes)")}
+        if "live" not in columns:  # 早期版本的存储
+            self._conn.execute("ALTER TABLE notes ADD COLUMN live INTEGER NOT NULL DEFAULT 1")
+            self._conn.commit()
 
     def files(self, space: str) -> dict[str, str]:
         with self._lock:
@@ -185,33 +253,68 @@ class _FileStore:
             ).fetchall()
         return {path: content for path, content in rows}
 
-    def notes(self, space: str, paths: Collection[str] | None = None) -> list[_Note]:
+    def notes(self, space: str) -> list[_Note]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT path, session_id, turn_id FROM notes WHERE space_id = ? "
+                "SELECT path, session_id, turn_id, live FROM notes WHERE space_id = ? "
                 "ORDER BY ts, turn_id",
                 (space,),
             ).fetchall()
-        wanted = set(paths) if paths is not None else None
-        return [_Note(*row) for row in rows if wanted is None or row[0] in wanted]
+        return [_Note(path, session, turn, bool(live)) for path, session, turn, live in rows]
 
-    def save(self, space: str, path: str, content: str, note: _Note | None, command: str) -> None:
+    def save(
+        self,
+        space: str,
+        path: str,
+        content: str,
+        note: _Note | None,
+        command: str,
+        expected: str | None,
+    ) -> None:
+        """存原文与出处。expected 是读到的原文（None：读的时候还没有这个文件）；文件在此期间
+        被别的进程改过时抛出 _Conflict，什么都不写。"""
         now = datetime.now().isoformat(timespec="seconds")
         with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO files (space_id, path, content, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (space_id, path) "
-                "DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-                (space, path, content, now, now),
-            )
+            if expected is None:
+                cursor = self._conn.execute(
+                    "INSERT INTO files (space_id, path, content, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT (space_id, path) DO NOTHING",
+                    (space, path, content, now, now),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE files SET content = ?, updated_at = ? "
+                    "WHERE space_id = ? AND path = ? AND content = ?",
+                    (content, now, space, path, expected),
+                )
+            if cursor.rowcount != 1:
+                raise _Conflict(path)
             if note is not None:
                 self._conn.execute(
-                    "INSERT INTO notes (space_id, path, session_id, turn_id, command, ts) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO notes (space_id, path, session_id, turn_id, command, ts, live) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1)",
                     (space, path, note.session_id, note.turn_id, command, now),
                 )
 
+    def prune(self, space: str, paths: Sequence[str], dead_turns: Sequence[str]) -> None:
+        """笔记在别处被遗忘了：去掉这些文件（它们其余的笔记留作记录），删掉死了的笔记。"""
+        with self._lock, self._conn:
+            for path in paths:
+                self._conn.execute(
+                    "DELETE FROM files WHERE space_id = ? AND path = ?", (space, path)
+                )
+                self._conn.execute(
+                    "UPDATE notes SET live = 0 WHERE space_id = ? AND path = ? AND live = 1",
+                    (space, path),
+                )
+            for turn in dead_turns:
+                self._conn.execute(
+                    "DELETE FROM notes WHERE space_id = ? AND turn_id = ?", (space, turn)
+                )
+        self._checkpoint()
+
     def remove(self, space: str, paths: Sequence[str]) -> None:
+        """删除这些路径的文件与全部笔记（包括已经去掉的文件留下的）。"""
         with self._lock, self._conn:
             for path in paths:
                 self._conn.execute(
@@ -220,20 +323,74 @@ class _FileStore:
                 self._conn.execute(
                     "DELETE FROM notes WHERE space_id = ? AND path = ?", (space, path)
                 )
+        self._checkpoint()
+
+    def purge(self, space: str) -> int:
+        """删掉这个记忆空间的一切，返回删掉的文件数。"""
+        with self._lock, self._conn:
+            removed = self._conn.execute("DELETE FROM files WHERE space_id = ?", (space,)).rowcount
+            self._conn.execute("DELETE FROM notes WHERE space_id = ?", (space,))
+            self._conn.execute("DELETE FROM spaces WHERE space_id = ?", (space,))
+        self._checkpoint()
+        return int(removed)
 
     def move(self, space: str, moves: Mapping[str, str]) -> None:
-        """改名：文件与它的笔记一起搬（目标路径事先确认过都不存在）。"""
+        """改名：文件与它的笔记一起搬（目标路径事先确认过都不存在）；已经去掉的文件的笔记不动。"""
         with self._lock, self._conn:
             for old, new in moves.items():
-                for table in ("files", "notes"):
-                    self._conn.execute(
-                        f"UPDATE {table} SET path = ? WHERE space_id = ? AND path = ?",
-                        (new, space, old),
-                    )
+                self._conn.execute(
+                    "UPDATE files SET path = ? WHERE space_id = ? AND path = ?", (new, space, old)
+                )
+                self._conn.execute(
+                    "UPDATE notes SET path = ? WHERE space_id = ? AND path = ? AND live = 1",
+                    (new, space, old),
+                )
+        self._checkpoint()
+
+    def epoch(self, space: str) -> str | None:
+        """第一次写入时 CueMem 里这个记忆空间的建立时间：之后对不上就是空间被删过。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT epoch FROM spaces WHERE space_id = ?", (space,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_epoch(self, space: str, epoch: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO spaces (space_id, epoch) VALUES (?, ?)", (space, epoch)
+            )
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _checkpoint(self) -> None:
+        """把 WAL 写回数据库并截断：被删的原文不留在 WAL 里。"""
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+class _SpaceLock:
+    """同一个存储文件、同一个记忆空间的读改写串行（同一进程里的所有工具实例共用一把）。"""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+
+
+_SPACE_LOCKS: weakref.WeakValueDictionary[tuple[str, str], _SpaceLock] = (
+    weakref.WeakValueDictionary()
+)
+_SPACE_LOCKS_GUARD = threading.Lock()
+
+
+def _space_lock(store: Path, space: str) -> _SpaceLock:
+    key = (str(store.resolve()), space)
+    with _SPACE_LOCKS_GUARD:
+        lock = _SPACE_LOCKS.get(key)
+        if lock is None:
+            lock = _SPACE_LOCKS[key] = _SpaceLock()
+        return lock
 
 
 # ---------- 记忆工具 ----------
@@ -242,7 +399,7 @@ class _FileStore:
 class CueMemMemoryTool(BetaAbstractMemoryTool):
     """Claude 记忆工具的后端：/memories 里是 CueMem 生成的只读视图与 Claude 自己的文件。
 
-    memory：Memory 或 AsyncMemory；user_id、agent_id 定记忆空间（与 SDK 相同）。
+    memory：Memory 或 AsyncMemory；user_id、agent_id 定记忆空间（与 SDK 相同；不能含 "/"）。
     store：文件存储的 SQLite 路径（默认数据目录下的 claude_memory.sqlite）。
     wait=True：每次改动同步抽取成事实（测试、脚本用）；默认交给后台线程（Memory 默认开着）。
     线程安全；交给 client.beta.messages.tool_runner(tools=[...])，或直接调用各命令方法。
@@ -265,26 +422,27 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         self.memory = _sync(memory)
         self.user_id = user_id
         self.agent_id = agent_id
-        self.space = space_for(user_id, agent_id)
+        self.space = _space(user_id, agent_id)
         self.wait = wait
         self.max_file_chars = max_file_chars
         self.max_files = max_files
         self.max_total_chars = max_total_chars
-        default = self.memory.settings.paths.db.parent / STORE_NAME
-        self.store = _FileStore(Path(store) if store is not None else default)
-        self._lock = threading.RLock()
+        path = _store_path(self.memory, store)
+        self.store = _FileStore(path)
+        self._space_lock = _space_lock(path, self.space)
 
     # ---------- 命令 ----------
 
     def view(self, command: BetaMemoryTool20250818ViewCommand) -> str:
         path = _normalize(command.path)
-        with self._lock:
-            files, notes = self._own()
+        with self._space_lock.lock:
+            state = self._own()
+            files = state.files
             if path in files:
                 return _show(path, files[path], command.view_range)
             if _is_history_file(path):
                 return _show(path, self._history(path), command.view_range)
-            generated = self._generated(notes)
+            generated = self._generated(state)
             if path in generated:
                 return _show(path, generated[path], command.view_range)
             tree = {**generated, **files}
@@ -298,8 +456,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         text = command.file_text
         if not isinstance(text, str):
             raise ToolError("Error: file_text must be a string.")
-        with self._lock:
-            files, _ = self._own()
+        with self._space_lock.lock:
+            state = self._own()
+            files = state.files
             self._writable(path, files)
             existed = path in files
             if not existed and len(files) >= self.max_files:
@@ -310,13 +469,18 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
             self._check_size(path, text, files)
             if existed and files[path] == text:
                 return f"File created successfully at: {path}"
+            removed = False
             if existed:  # 覆盖：只写改了的行，没变的内容不再进日志（否则会被重复抽取）
-                note = _change_note(path, files[path], text, "rewritten")
+                note, removed = _change_note(
+                    path, files[path], text, "rewritten", self._written(state, path)
+                )
             else:
                 note = f"Memory note {path}:\n{text}" if text.strip() else None
-            self._save(path, text, note, "create")
+            self._save(path, text, note, "create", files.get(path))
             if existed:
-                return f"File overwritten successfully at: {path}"
+                return f"File overwritten successfully at: {path}" + (
+                    REMOVED_NOTE if removed else ""
+                )
             return f"File created successfully at: {path}"
 
     def str_replace(self, command: BetaMemoryTool20250818StrReplaceCommand) -> str:
@@ -325,8 +489,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         new = getattr(command, "new_str", None) or ""  # new_str 可以省略：删掉 old_str
         if not isinstance(old, str) or not isinstance(new, str):
             raise ToolError("Error: old_str and new_str must be strings.")
-        with self._lock:
-            files, _ = self._own()
+        with self._space_lock.lock:
+            state = self._own()
+            files = state.files
             content = self._file(
                 path, files, f"Error: The path {path} does not exist. Please provide a valid path."
             )
@@ -347,12 +512,17 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
             pos = content.find(old)
             updated = content[:pos] + new + content[pos + len(old) :]
             self._check_size(path, updated, files)
+            removed = False
             if updated != content:
-                note = _change_note(path, content, updated, "edited")
-                self._save(path, updated, note, "str_replace")
+                note, removed = _change_note(
+                    path, content, updated, "edited", self._written(state, path)
+                )
+                self._save(path, updated, note, "str_replace", content)
             return (
                 "The memory file has been edited. Here is the snippet showing the change (with "
-                "line numbers):\n" + _snippet(updated, content[:pos].count("\n"))
+                "line numbers):\n"
+                + _snippet(updated, content[:pos].count("\n"))
+                + (REMOVED_NOTE if removed else "")
             )
 
     def insert(self, command: BetaMemoryTool20250818InsertCommand) -> str:
@@ -360,8 +530,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         line, text = command.insert_line, command.insert_text
         if not isinstance(text, str):
             raise ToolError("Error: insert_text must be a string.")
-        with self._lock:
-            files, _ = self._own()
+        with self._space_lock.lock:
+            state = self._own()
+            files = state.files
             content = self._file(path, files, f"Error: The path {path} does not exist")
             lines = _lines(content)
             if not isinstance(line, int) or isinstance(line, bool) or not 0 <= line <= len(lines):
@@ -372,29 +543,38 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
             added = text.rstrip("\n")
             updated = "\n".join([*lines[:line], added, *lines[line:]]) + "\n"
             self._check_size(path, updated, files)
-            self._save(path, updated, _change_note(path, content, updated, "added"), "insert")
+            # 插入一个标题会改变它下面几行的含义：同样按改动前后的差别写笔记
+            note, _ = _change_note(path, content, updated, "added", self._written(state, path))
+            self._save(path, updated, note, "insert", content)
             return f"The file {path} has been edited."
 
     def delete(self, command: BetaMemoryTool20250818DeleteCommand) -> str:
         path = _normalize(command.path)
         if path == ROOT:
             raise ToolError("Error: Cannot delete the /memories directory itself")
-        with self._lock:
-            files, _ = self._own()
+        with self._space_lock.lock:
+            state = self._own()
             _not_generated(path)
-            targets = [path] if path in files else [p for p in files if p.startswith(path + "/")]
-            if not targets:
+            targets = [p for p in state.files if _inside(p, path)]
+            # 已经去掉的文件留下的笔记：facts.md 注明出自这个路径，删除这个路径也遗忘它们
+            removed = sorted(
+                {n.path for n in state.orphans if _inside(n.path, path)} - set(targets)
+            )
+            if not targets and not removed:
                 raise ToolError(f"Error: The path {path} does not exist")
-            report = self._forget(targets)
-            self.store.remove(self.space, targets)
+            paths = targets + removed
+            notes = [n for n in [*state.notes, *state.orphans] if n.path in paths]
+            report = self._forget(notes, len(set(paths)))
+            self.store.remove(self.space, paths)
             return f"Successfully deleted {path}\n{report}"
 
     def rename(self, command: BetaMemoryTool20250818RenameCommand) -> str:
         old, new = _normalize(command.old_path), _normalize(command.new_path)
         if old == ROOT:
             raise ToolError("Error: Cannot rename the /memories directory itself")
-        with self._lock:
-            files, notes = self._own()
+        with self._space_lock.lock:
+            state = self._own()
+            files = state.files
             _not_generated(old)
             _not_generated(new)
             if old in files:
@@ -405,7 +585,7 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
                     raise ToolError(f"Error: The path {old} does not exist")
                 if new.startswith(old + "/"):
                     raise ToolError(f"Error: Cannot move {old} into itself")
-            tree = {**self._generated(notes), **files}
+            tree = {**self._generated(state), **files}
             if new == ROOT or new in tree or _has_children(tree, new):
                 raise ToolError(f"Error: The destination {new} already exists")
             for target in moves.values():
@@ -415,14 +595,15 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
             return f"Successfully renamed {old} to {new}"
 
     def clear_all_memory(self) -> str:
-        """删除 Claude 写的全部文件，并遗忘它们写进日志的笔记（生成的视图之外的对话记忆不动；
-        要删掉这个用户的全部记忆，用 Memory.delete_all）。"""
-        with self._lock:
-            files, _ = self._own()
-            if not files:
+        """删除 Claude 写的全部文件，并遗忘它们（包括已经去掉的文件）写进日志的笔记。对话里
+        直接写进 CueMem 的记忆不动；要删掉这个用户的全部记忆，用本模块的 delete_all。"""
+        with self._space_lock.lock:
+            state = self._own()
+            notes = [*state.notes, *state.orphans]
+            if not state.files and not notes:
                 return "All memory cleared"
-            report = self._forget(sorted(files))
-            self.store.remove(self.space, sorted(files))
+            report = self._forget(notes, len(set(state.files) | {n.path for n in notes}))
+            self.store.purge(self.space)
             return f"All memory cleared\n{report}"
 
     # ---------- 其他 ----------
@@ -443,31 +624,45 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
 
     # ---------- 内部 ----------
 
-    def _own(self) -> tuple[dict[str, str], list[_Note]]:
-        """Claude 的文件与笔记。笔记在别处被遗忘了的文件先去掉（见模块说明）。"""
+    def _own(self) -> _State:
+        """Claude 的文件与笔记。记忆空间被删过（Memory.delete_all）就全部清掉；笔记在别处被遗忘
+        了的文件先去掉（见模块说明）。"""
+        db = self.memory.system.db
+        recorded = self.store.epoch(self.space)
+        if recorded is not None and recorded != _core_epoch(db, self.space):
+            removed = self.store.purge(self.space)
+            logger.info("Removed %d memory file(s) of a deleted memory space", removed)
+            record_event("claude_memory_purged", space=self.space, files=removed)
         files = self.store.files(self.space)
         notes = self.store.notes(self.space)
-        if not notes:
-            return files, notes
         ids = [n.turn_id for n in notes]
-        alive: set[str] = set()
+        turns: dict[str, Turn] = {}
         for start in range(0, len(ids), 500):
             chunk = ids[start : start + 500]
-            alive |= {t.id for t in self.memory.system.db.get_turns(self.space, ids=chunk)}
-        tainted = sorted({n.path for n in notes if n.turn_id not in alive})
-        if not tainted:
-            return files, notes
-        self.store.remove(self.space, tainted)
-        logger.info("Removed %d memory file(s) whose notes were forgotten elsewhere", len(tainted))
-        record_event("claude_memory_pruned", space=self.space, files=len(tainted))
-        kept = {p: c for p, c in files.items() if p not in tainted}
-        return kept, [n for n in notes if n.path not in tainted]
+            turns.update({t.id: t for t in db.get_turns(self.space, ids=chunk)})
+        dead = [n for n in notes if n.turn_id not in turns]
+        if dead:
+            tainted = sorted({n.path for n in dead if n.live})
+            self.store.prune(self.space, tainted, [n.turn_id for n in dead])
+            if tainted:
+                logger.info(
+                    "Removed %d memory file(s) whose notes were forgotten elsewhere", len(tainted)
+                )
+                record_event("claude_memory_pruned", space=self.space, files=len(tainted))
+            files = {p: c for p, c in files.items() if p not in tainted}
+            notes = [
+                n._replace(live=n.live and n.path not in tainted)
+                for n in notes
+                if n.turn_id in turns
+            ]
+        return _State(files, [n for n in notes if n.live], [n for n in notes if not n.live], turns)
 
-    def _generated(self, notes: Sequence[_Note]) -> dict[str, str]:
+    def _generated(self, state: _State) -> dict[str, str]:
         """生成的只读文件：profile.md、facts.md，以及 history/ 里有过变化的事实。"""
         facts = self.memory.system.facts(self.space)
         chains = _chains(facts)
-        source = {n.turn_id: n.path for n in notes}
+        source = {n.turn_id: n.path for n in state.notes}
+        source.update({n.turn_id: f"{n.path} (removed)" for n in state.orphans})
         out = {PROFILE: self._profile(), FACTS: _facts_file(facts, chains, source)}
         changed = {id(c): c for c in chains.values() if len(c) > 1}.values()
         latest = sorted(changed, key=lambda c: (c[-1].recorded_at, c[-1].id), reverse=True)
@@ -487,6 +682,20 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         if fact_id not in chains:
             raise ToolError(f"The path {path} does not exist. Please provide a valid path.")
         return _history_file(chains[fact_id])
+
+    def _written(self, state: _State, path: str) -> dict[str, str]:
+        """这个文件里每一行最近一次写下（不是被引用）的日期：笔记里引用旧行时注明，抽取据此
+        理解旧行里的相对时间，也知道它是哪天说的。"""
+        written: dict[str, str] = {}
+        for note in state.notes:
+            turn = state.turns.get(note.turn_id)
+            if note.path != path or turn is None:
+                continue
+            for line in turn.text.split("\n")[1:]:  # 第一行是 "Memory note ..."
+                text = line.strip()
+                if text and not text.startswith(("(", "#")):
+                    written[text] = day(turn.ts)
+        return written
 
     def _file(self, path: str, files: Mapping[str, str], missing: str) -> str:
         """要修改的文件：生成的只读文件报只读；目录与不存在的路径报不存在（按文档的约定）。"""
@@ -514,12 +723,21 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
                 f"{self.max_total_chars}. Delete or shorten files you no longer need first."
             )
 
-    def _save(self, path: str, content: str, note_text: str | None, command: str) -> None:
+    def _save(
+        self,
+        path: str,
+        content: str,
+        note_text: str | None,
+        command: str,
+        expected: str | None,
+    ) -> None:
         """先把这次改动写进 CueMem 的原始日志（写不进去就整个失败，文件不动），再存原文与出处。
+        存不进去（包括文件刚被别的进程改过）时撤销刚写的笔记，文件与记忆保持一致。
         note_text 为 None（只是空白之类，没有新信息）时只存原文。
 
         会话 ID 带上微秒：同一秒里的几次改动（一轮里并行的工具调用）按 ID 排序就是先后顺序，
         后台一起巩固时对账才不会把新版本当成旧的。"""
+        self._ensure_epoch()
         note = None
         if note_text is not None and note_text.strip():
             now = datetime.now()
@@ -540,15 +758,54 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
                     f"); {path} was not changed. Try again later."
                 ) from exc
             note = _Note(path, session, out["turn_ids"][0]) if out["turn_ids"] else None
-        self.store.save(self.space, path, content, note, command)
+        try:
+            self.store.save(self.space, path, content, note, command, expected)
+        except Exception as exc:
+            if note is not None:
+                self._rollback(note)
+            if isinstance(exc, _Conflict):
+                raise ToolError(
+                    f"Error: {path} was changed by another conversation at the same time; "
+                    "nothing was saved. View it again and redo the change."
+                ) from exc
+            logger.warning("Could not save memory file %s: %s", path, exc, exc_info=True)
+            raise ToolError(
+                f"Error: Could not save {path} ({type(exc).__name__}); it was not changed. Try "
+                "again later."
+            ) from exc
 
-    def _forget(self, paths: Sequence[str]) -> str:
-        """遗忘这些文件写进日志的全部笔记（删日志、重建派生记忆），并说明遗忘了什么。"""
-        notes = self.store.notes(self.space, paths)
+    def _rollback(self, note: _Note) -> None:
+        """撤销刚写进日志、文件却没存上的笔记（否则记忆里有、哪个文件都不认）。"""
+        try:
+            self._settle()
+            self.memory.system.forget_memories(self.space, session_ids=[note.session_id])
+        except Exception as exc:
+            logger.error("Could not undo memory note %s of %s: %s", note.turn_id, note.path, exc)
+            record_event("claude_memory_rollback_failed", space=self.space, turn=note.turn_id)
+
+    def _ensure_epoch(self) -> None:
+        if self.store.epoch(self.space) is None:
+            db = self.memory.system.db
+            db.ensure_space(self.space)
+            self.store.set_epoch(self.space, _core_epoch(db, self.space) or "")
+
+    def _settle(self) -> None:
+        """后台还在抽取这个空间的笔记的话，先在这里做完（只等这个空间，不等别的用户）。
+        做不完（模型出错）也照样往下遗忘：被删的会话排着的抽取任务随之作废。"""
+        if self.memory.system.worker is None:
+            return
+        try:
+            self.memory.consolidate(user_id=self.user_id, agent_id=self.agent_id)
+        except Exception as exc:
+            logger.warning("Could not finish pending extraction before forgetting: %s", exc)
+
+    def _forget(self, notes: Sequence[_Note], files: int) -> str:
+        """遗忘这些笔记（删日志、重建派生记忆），并说明遗忘了什么。"""
         sessions = sorted({n.session_id for n in notes})
         if not sessions:
-            return "It had added nothing to long-term memory."
-        self.memory.wait()  # 后台还在抽取这些笔记的话，等它做完再删
+            subject = "It" if files == 1 else "They"
+            return f"{subject} had added nothing to long-term memory."
+        self._settle()
         system = self.memory.system
         before = system.facts(self.space)
         current = {f.id for f in before if f.is_current}
@@ -557,7 +814,7 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         except Exception as exc:
             logger.warning("Could not forget memory notes: %s", exc, exc_info=True)
             raise ToolError(
-                f"Error: Could not forget what {paths[0]} added to long-term memory "
+                f"Error: Could not forget what {notes[0].path} added to long-term memory "
                 f"({type(exc).__name__}); the file was kept. Try again later."
             ) from exc
         after = system.facts(self.space, current_only=True)
@@ -566,7 +823,7 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         known = {f.id for f in before}
         back = [f for f in after if f.id not in current and f.id in known]  # 旧版本恢复为当前
         own = report.turns_deleted - report.cascaded
-        what = "this file" if len(paths) == 1 else f"these {len(paths)} files"
+        what = "this file" if files == 1 else f"these {files} files"
         repeated = (
             f" and {report.cascaded} later message(s) that repeated them" if report.cascaded else ""
         )
@@ -622,6 +879,31 @@ class AsyncCueMemMemoryTool(BetaAsyncAbstractMemoryTool):
         self.sync.close()
 
 
+def delete_all(
+    memory: Memory,
+    *,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    store: str | Path | None = None,
+) -> dict[str, Any]:
+    """Memory.delete_all 加上 Claude 的文件：这个用户（或 Agent）的全部记忆，以及记忆工具
+    存的文件原文，当场删除（被遗忘权）。只调用 Memory.delete_all 的话，文件在下次访问时才清掉。
+    异步代码里放进线程执行：await asyncio.to_thread(delete_all, memory.sync, user_id=...)。"""
+    space = _space(user_id, agent_id)
+    out = memory.delete_all(user_id=user_id, agent_id=agent_id)
+    path = _store_path(memory, store)
+    if not path.exists():  # 从没用过记忆工具：不为了删除建一个空的存储
+        out["memory_files_deleted"] = 0
+        return out
+    files = _FileStore(path)
+    try:
+        with _space_lock(files.path, space).lock:
+            out["memory_files_deleted"] = files.purge(space)
+    finally:
+        files.close()
+    return out
+
+
 # ---------- 调用模型之前：检索控制器 ----------
 
 
@@ -629,7 +911,9 @@ class AsyncCueMemMemoryTool(BetaAsyncAbstractMemoryTool):
 class Evidence:
     """一次自动回忆的结果。"""
 
-    level: str  # "L0" / "L1" / "L2"；"none"：没有检索（没有记忆，或最后一条不是用户的话）
+    # "L0" / "L1" / "L2"；"none"：没有检索（没有记忆，或最新的不是用户的话）；
+    # "error"：检索出错（reasons 里是错误），这一轮不带记忆
+    level: str
     reasons: list[str]
     recalled: int  # 注入的记忆条数（画像、事实、对话片段）
     block: str  # 注入的证据块；空：什么都没加
@@ -643,26 +927,68 @@ def with_recall(
     agent_id: str | None = None,
     mode: RecallMode = "auto",
 ) -> tuple[list[BetaMessageParam], Evidence]:
-    """对最后一句用户消息先跑检索控制器，把证据块放在它的开头（返回新的列表，原列表不动）。
+    """对最新一句用户消息先跑检索控制器，把证据块放在它的开头（返回新的列表，原列表不动）。
 
     与记忆代理同一个格式：L0 只给画像（没有画像就什么都不加），L1 / L2 再加带有效期的事实与
-    对话片段。最后一条是工具结果（工具循环的中途）时不检索。
+    对话片段。末尾的 mid-conversation system 消息跳过，证据放进它前面那句用户消息；最新的是
+    工具结果（工具循环的中途）或助手的话时不检索。
+
+    返回的列表就是之后的历史：下一轮在它后面追加用户消息再调用（只往后加）。不要每轮从
+    不带证据的消息重新拼——那样会改动已经发出去的消息，Claude Opus 5.5 这样的模型会拒绝
+    （preserved thinking），提示缓存也会失效。检索出错时给出 RuntimeWarning，原样返回消息，
+    level 为 "error"。这个函数会等网络请求：异步代码里用 awith_recall。
     """
+    space = _space(user_id, agent_id)
     out = [dict(m) for m in messages]
-    evidence = _recall(out, _sync(memory), space_for(user_id, agent_id), mode)
+    at = _newest_user(out)
+    if at is None:
+        return cast("list[BetaMessageParam]", out), Evidence("none", [], 0, "")
+    try:
+        evidence = _recall(out[at], _sync(memory), space, mode)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.debug("Recall failed", exc_info=True)
+        record_event("claude_recall_failed", space=space, error=error)
+        warnings.warn(
+            f"CueMem could not recall memories; continuing without them: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return cast("list[BetaMessageParam]", out), Evidence("error", [error], 0, "")
     if evidence.block:
-        out = _inject(out, evidence.block)
+        out = [*_inject(out[: at + 1], evidence.block), *out[at + 1 :]]
     return cast("list[BetaMessageParam]", out), evidence
 
 
-def _recall(
-    messages: list[dict[str, Any]], memory: Memory, space: str, mode: RecallMode
-) -> Evidence:
-    """最后一句用户消息 → 控制器选档、取回记忆、排成证据块（记忆代理的 _recall 去掉会话部分）。"""
+async def awith_recall(
+    messages: Sequence[Mapping[str, Any]],
+    memory: Memory | AsyncMemory,
+    *,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    mode: RecallMode = "auto",
+) -> tuple[list[BetaMessageParam], Evidence]:
+    """with_recall 的异步版本：检索（向量、路由与 L2 的模型调用）在工作线程里跑，不阻塞事件循环。"""
+    call = functools.partial(
+        with_recall, messages, memory, user_id=user_id, agent_id=agent_id, mode=mode
+    )
+    return await to_thread.run_sync(call)
+
+
+def _newest_user(messages: Sequence[Mapping[str, Any]]) -> int | None:
+    """最新一句用户消息的位置（末尾的 system 消息跳过）；最新的不是用户的话时返回 None。"""
+    for at in range(len(messages) - 1, -1, -1):
+        role = messages[at].get("role")
+        if role == "system":
+            continue
+        return at if role == "user" else None
+    return None
+
+
+def _recall(message: Mapping[str, Any], memory: Memory, space: str, mode: RecallMode) -> Evidence:
+    """用户消息 → 控制器选档、取回记忆、排成证据块（记忆代理的 _recall 去掉会话部分）。"""
     none = Evidence("none", [], 0, "")
-    if not messages or messages[-1].get("role") != "user":
-        return none
-    content = messages[-1].get("content")
+    content = message.get("content")
     blocks = content if isinstance(content, list) else []
     if any(_block_get(b, "type") == "tool_result" for b in blocks):
         return none
@@ -748,6 +1074,11 @@ def _not_generated(path: str) -> None:
 
 def _has_children(tree: Mapping[str, str], path: str) -> bool:
     return any(p.startswith(path + "/") for p in tree)
+
+
+def _inside(path: str, top: str) -> bool:
+    """path 就是 top，或者在目录 top 里面。"""
+    return path == top or path.startswith(top + "/")
 
 
 def _no_file_above(path: str, tree: Mapping[str, str]) -> None:
@@ -872,42 +1203,117 @@ def _size(n: int) -> str:
 # ---------- 笔记 ----------
 
 
-def _change_note(path: str, before: str, after: str, verb: str) -> str | None:
-    """改动写进日志的笔记：改了的行（连同上方最近的标题），以及它们原来的样子。
+class _Item(NamedTuple):
+    """文件里的一行内容（标题本身不算），连同它上方的各级标题：标题决定这一行的含义。"""
 
-    只写改动处而不是整个文件：没变的内容一遍遍进日志，会被重复抽取（同一条事实取代自己），
-    检索时也会挤掉别的对话片段。只是挪了位置的行不算改动；没有新信息（只改了空白）时返回 None。
+    headings: tuple[str, ...]  # 从外到内
+    line: str  # 原样（去掉行尾空白）
+    text: str  # 去掉首尾空白，用来比较
+
+    @property
+    def key(self) -> tuple[tuple[str, ...], str]:
+        return self.headings, self.text
+
+
+def _items(content: str) -> list[_Item]:
+    items: list[_Item] = []
+    stack: list[tuple[int, str]] = []  # (级别, 标题)
+    for line in _lines(content):
+        text = line.strip()
+        if not text:
+            continue
+        if line.startswith("#"):
+            level = len(text) - len(text.lstrip("#"))
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, text))
+            continue
+        items.append(_Item(tuple(h for _, h in stack), line.rstrip(), text))
+    return items
+
+
+def _change_note(
+    path: str, before: str, after: str, verb: str, written: Mapping[str, str]
+) -> tuple[str | None, bool]:
+    """改动写进日志的笔记，以及有没有删掉旧行（不是换掉）。
+
+    只写改了的行（连同上方的标题）而不是整个文件：没变的内容一遍遍进日志，会被重复抽取（同一条
+    事实取代自己），检索时也会挤掉别的对话片段。每一行连同它所在的标题比较：在同一节里挪位置不算
+    改动；挪到别的标题下是改动（"# 待办" 下的一项挪到 "# 已完成"），注明从哪里挪来。换掉的旧行
+    注明被取代，删掉的旧行注明不再适用，都带上它最初写下的日期（written：行 → 日期）。没有新
+    信息（只改了空白或标题下没有内容）时返回 None。
     """
-    old, new = _lines(before), _lines(after)
+    old, new = _items(before), _items(after)
     hunks = [
-        (old[i1:i2], new[j1:j2], j1)
-        for tag, i1, i2, j1, j2 in SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        (range(i1, i2), range(j1, j2))
+        for tag, i1, i2, j1, j2 in SequenceMatcher(
+            None, [x.key for x in old], [x.key for x in new], autojunk=False
+        ).get_opcodes()
         if tag != "equal"
     ]
-    removed = {x.strip() for was, _, _ in hunks for x in was}
-    moved = removed & {x.strip() for _, now, _ in hunks for x in now}
+    removed = [i for was, _ in hunks for i in was]
+    added = [j for _, now in hunks for j in now]
+    # 同一节里只是挪了位置：两边都不算
+    same: dict[tuple[tuple[str, ...], str], list[int]] = defaultdict(list)
+    for i in removed:
+        same[old[i].key].append(i)
+    gone: set[int] = set()
+    kept: set[int] = set()
+    for j in added:
+        if same[new[j].key]:
+            gone.add(same[new[j].key].pop(0))
+            kept.add(j)
+    # 挪到了别的标题下：记在新位置，注明原来在哪
+    elsewhere: dict[str, list[int]] = defaultdict(list)
+    for i in removed:
+        if i not in gone:
+            elsewhere[old[i].text].append(i)
+    came_from: dict[int, int] = {}
+    for j in added:
+        if j not in kept and elsewhere[new[j].text]:
+            came_from[j] = elsewhere[new[j].text].pop(0)
+            gone.add(came_from[j])
     parts: list[str] = []
-    shown = ""  # 已经写过的标题
-    for was_lines, now_lines, at in hunks:
-        was = [x for x in was_lines if x.strip() and x.strip() not in moved]
-        now = [x for x in now_lines if x.strip() and x.strip() not in moved]
-        quoted = "\n".join(was)
-        if now:
-            heading = _heading(new[:at])
-            if heading and heading != shown and not now[0].startswith("#"):
-                parts.append(heading)
-                shown = heading
-            parts += now
-            if was:
-                parts.append(f'(This replaces: "{quoted}")')
-        elif was:
-            parts.append(f'(Removed: "{quoted}")')
-    return f"Memory note {path} ({verb}):\n" + "\n".join(parts) if parts else None
+    shown: tuple[str, ...] = ()  # 已经写出的标题
+    removed_any = False
+    for was, now in hunks:
+        printed = False
+        for j in now:
+            if j in kept:
+                continue
+            item = new[j]
+            if item.headings != shown:
+                common = 0
+                while (
+                    common < min(len(shown), len(item.headings))
+                    and shown[common] == item.headings[common]
+                ):
+                    common += 1
+                parts += item.headings[common:]
+                shown = item.headings
+            line = item.line
+            if j in came_from:
+                origin = old[came_from[j]].headings
+                line += f' (moved here from "{origin[-1]}")' if origin else " (moved here)"
+            parts.append(line)
+            printed = True
+        for i in was:
+            if i in gone:
+                continue
+            removed_any = removed_any or not printed
+            parts.append(_quote(old[i], written, shown, replaced=printed))
+    if not parts:
+        return None, removed_any
+    return f"Memory note {path} ({verb}):\n" + "\n".join(parts), removed_any
 
 
-def _heading(lines: Sequence[str]) -> str:
-    """上方最近的 Markdown 标题：给改动的那几行补上下文（"## 饮食" 下的 "- 不吃辣"）。"""
-    return next((line for line in reversed(lines) if line.startswith("#")), "")
+def _quote(item: _Item, written: Mapping[str, str], shown: tuple[str, ...], replaced: bool) -> str:
+    """换掉或删掉的一行旧内容：注明它原来在哪个标题下、哪天写的。"""
+    where = f' under "{item.headings[-1]}"' if item.headings and item.headings != shown else ""
+    when = f", written on {written[item.text]}" if item.text in written else ""
+    if replaced:
+        return f'(This replaces "{item.text}"{where}{when}.)'
+    return f'(Removed "{item.text}"{where}{when}: it no longer applies.)'
 
 
 # ---------- 生成的文件 ----------
@@ -992,6 +1398,29 @@ def _statements(facts: Sequence[Fact]) -> list[str]:
 
 def _sync(memory: Memory | AsyncMemory) -> Memory:
     return memory.sync if isinstance(memory, AsyncMemory) else memory
+
+
+def _space(user_id: str | None, agent_id: str | None) -> str:
+    """记忆空间 ID（与 SDK 的 space_for 相同）。ID 里不许有 "/"，也不许 Agent 叫 "agent"：
+    space_for 用 "/" 拼接，否则 user_id="a/b" 与 user_id="b"、agent_id="a" 会落进同一个空间，
+    彼此看到对方的文件与记忆。"""
+    for name, value in (("user_id", user_id), ("agent_id", agent_id)):
+        if value is not None and "/" in value:
+            raise ValueError(f"{name} must not contain '/' (got {value!r}).")
+    if user_id and agent_id == "agent":
+        raise ValueError('agent_id "agent" is reserved when a user_id is given.')
+    return space_for(user_id, agent_id)
+
+
+def _store_path(memory: Memory, store: str | Path | None) -> Path:
+    return Path(store) if store is not None else memory.settings.paths.db.parent / STORE_NAME
+
+
+def _core_epoch(db: MemoryDB, space: str) -> str | None:
+    """CueMem 里这个记忆空间的建立时间；空间不存在（被删除了）时为 None。"""
+    with db.transaction() as conn:
+        row = conn.execute("SELECT created_at FROM spaces WHERE id = ?", (space,)).fetchone()
+    return None if row is None else str(row[0])
 
 
 def _block_get(block: Any, key: str) -> Any:

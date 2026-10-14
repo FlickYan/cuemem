@@ -1,74 +1,99 @@
 """Claude 的记忆工具 + CueMem：Claude 自己读写 /memories，CueMem 把每次改动变成有版本的事实。
 
-    uv sync --extra local --extra anthropic
+    uv sync --extra anthropic
     export ANTHROPIC_API_KEY=sk-ant-...   # Claude
-    export DEEPSEEK_API_KEY=sk-...        # CueMem 的抽取（deepseek 预设，向量在本机算）
+    export DASHSCOPE_API_KEY=sk-ws-...    # CueMem 的默认配置：通义千问（QwenCloud）抽取事实、算向量
     CUEMEM_HOME=$(mktemp -d) uv run python examples/integrations/claude_example.py
 
-两段对话。第一段告诉 Claude 搬到了里斯本、吃素：它先看 /memories（profile.md、facts.md 是 CueMem
-生成的只读视图），再把这些写进自己的文件；每次改动另有一条笔记进 CueMem 的原始日志，抽取成事实。
-第二段是新的对话：调用模型之前先过检索控制器（with_recall），再问晚饭吃什么。最后打印
-/memories/facts.md，以及删掉 Claude 的文件时 CueMem 遗忘了什么。
+中国大陆的通义千问（千问 AI 平台 / 阿里云百炼）的 Key 不以 sk-ws- 开头，再设两个接口地址：
+
+    export CUEMEM_PROVIDERS__QWEN__BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+    export CUEMEM_EMBEDDING__NATIVE_URL=https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
+
+只有 DeepSeek 的 Key 时用 deepseek 预设（向量在本机算）：
+
+    uv sync --extra anthropic --extra local
+    CUEMEM_PRESET=deepseek DEEPSEEK_API_KEY=sk-... CUEMEM_HOME=$(mktemp -d) \
+        uv run python examples/integrations/claude_example.py
+
+两段对话。第一段（两句话）告诉 Claude 搬到了里斯本、吃素：它先看 /memories（profile.md、facts.md
+是 CueMem 生成的只读视图），再把这些写进自己的文件；每次改动另有一条笔记进 CueMem 的原始日志，
+抽取成事实。第二段是新的对话，问晚饭吃什么。每句话发出之前先过检索控制器（with_recall）。
+最后打印 /memories/facts.md，以及删掉 Claude 的文件时 CueMem 遗忘了什么。
 
 模型用 claude-opus-5-5，开着服务端的拒答兜底（fallbacks="default"，安全分类器误拒时换模型重答）。
-CueMem 也可以不用 DeepSeek：设 DASHSCOPE_API_KEY、不设 CUEMEM_PRESET，用默认配置（通义千问）。
+它的思考块绑定在对话上：历史只能往后加（见 Conversation.send），改动已经发出去的消息会被拒绝。
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import anthropic
+from anthropic.types.beta import BetaMessageParam
 
 from cuemem import Memory
-from cuemem.integrations.claude import CueMemMemoryTool, with_recall
+from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
 MODEL = "claude-opus-5-5"
 USER = "claude-demo"
 SYSTEM = "You are a friendly personal assistant. Keep answers short."
 
 
-def chat(client: anthropic.Anthropic, tool: CueMemMemoryTool, memory: Memory, text: str) -> None:
-    # 检索控制器先决定要不要回忆、回忆多深；证据块放在这句话的开头（L0 只带画像）
-    messages, evidence = with_recall([{"role": "user", "content": text}], memory, user_id=USER)
-    print(f"\nUser: {text}\n[memory controller: {evidence.level}, {evidence.recalled} item(s)]")
-    runner = client.beta.messages.tool_runner(
-        model=MODEL,
-        max_tokens=16000,
-        system=SYSTEM,
-        output_config={"effort": "medium"},
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        tools=[tool],
-        messages=messages,
-    )
-    for message in runner:  # 每一步：Claude 用记忆工具，或者给出回答
-        for block in message.content:
-            if block.type == "tool_use":
-                args: Any = block.input
-                where = args.get("path") or f"{args.get('old_path')} -> {args.get('new_path')}"
-                print(f"  memory.{args.get('command')} {where}")
-    final = runner.until_done()
-    if final.stop_reason == "refusal":
-        print("Assistant declined to answer.")
-        return
-    print("Assistant: " + "".join(b.text for b in final.content if b.type == "text"))
+class Conversation:
+    """一段对话：自己保存历史，只往后加。"""
+
+    def __init__(self, client: anthropic.Anthropic, tool: CueMemMemoryTool, memory: Memory):
+        self.client, self.tool, self.memory = client, tool, memory
+        self.history: list[BetaMessageParam] = []
+
+    def send(self, text: str) -> None:
+        # 检索控制器先决定要不要回忆、回忆多深；证据块只放进这一句的开头（L0 只带画像）。
+        # 返回的列表就是之后的历史：前面的消息（连同它们当时带的证据）原样不动
+        user: BetaMessageParam = {"role": "user", "content": text}
+        self.history, evidence = with_recall([*self.history, user], self.memory, user_id=USER)
+        print(f"\nUser: {text}\n[memory controller: {evidence.level}, {evidence.recalled} item(s)]")
+        runner = self.client.beta.messages.tool_runner(
+            model=MODEL,
+            max_tokens=16000,
+            system=SYSTEM,
+            output_config={"effort": "medium"},
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            tools=[self.tool],
+            messages=self.history,
+        )
+        final = None
+        for message in runner:  # 每一步：Claude 用记忆工具，或者给出回答
+            self.history.append(message.to_param())  # 思考块、工具调用原样留在历史里
+            for block in message.content:
+                if block.type == "tool_use":
+                    args: Any = block.input
+                    where = args.get("path") or f"{args.get('old_path')} -> {args.get('new_path')}"
+                    print(f"  memory.{args.get('command')} {where}")
+            results = runner.generate_tool_call_response()  # 工具结果（runner 自己也用这一份）
+            if results is not None:
+                self.history.append(results)
+            final = message
+        if final is None or final.stop_reason == "refusal":
+            print("Assistant declined to answer.")
+            return
+        print("Assistant: " + "".join(b.text for b in final.content if b.type == "text"))
 
 
 def main() -> None:
-    memory = Memory(preset=os.environ.get("CUEMEM_PRESET") or "deepseek")
-    memory.delete_all(user_id=USER)  # 演示用户从空白开始
+    memory = Memory()  # 不设 CUEMEM_PRESET 时是默认配置（通义千问）
+    delete_all(memory, user_id=USER)  # 演示用户从空白开始：记忆与 Claude 的文件一起删
     client = anthropic.Anthropic()
     with CueMemMemoryTool(memory, user_id=USER) as tool:
-        tool.clear_all_memory()
-
         print("=== Conversation 1 ===")
-        chat(client, tool, memory, "Hi! I just moved to Lisbon, and I'm vegetarian.")
+        first = Conversation(client, tool, memory)
+        first.send("Hi! I just moved to Lisbon.")
+        first.send("Also, I'm vegetarian.")
         memory.wait()  # 等后台把 Claude 的笔记抽取成事实，好让下一段马上用上
 
         print("\n=== Conversation 2 (new conversation) ===")
-        chat(client, tool, memory, "Can you suggest a dinner idea for tonight?")
+        Conversation(client, tool, memory).send("Can you suggest a dinner idea for tonight?")
         memory.wait()
 
         print("\n=== /memories/facts.md (generated by CueMem) ===")
