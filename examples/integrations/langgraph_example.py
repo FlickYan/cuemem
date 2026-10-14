@@ -36,8 +36,8 @@ def main() -> None:
         home = os.environ.get("CUEMEM_HOME") or stack.enter_context(tempfile.TemporaryDirectory())
         preset = os.environ.get("CUEMEM_PRESET", "deepseek")
         memory = stack.enter_context(Memory(preset=preset, home=home))
-        # user_id 不固定：每次调用从 config["configurable"]["user_id"] 里取；
-        # tools=True 顺带给模型 recall / remember / forget 三个工具
+        # user_id 不固定：每次调用从 config["configurable"]["user_id"] 里取（LangGraph Server 上
+        # 有登录用户时用登录用户）；tools=True 顺带给模型 recall / remember / forget 三个工具
         cuemem = CueMemMiddleware(memory, tools=True)
         agent = create_agent(
             llm,
@@ -66,9 +66,11 @@ def main() -> None:
         print()
 
         # 周五，新的线程：模型的上下文里没有周一的对话，靠 CueMem 想起来
-        friday = chat("friday", "What long run would you suggest for me this weekend?")
+        chat("friday", "What long run would you suggest for me this weekend?")
         chat("friday", "What's the capital of Australia?")  # 与记忆无关：控制器多半选 L0
-        cuemem.end_thread(friday, wait=True)  # 应用里在对话结束（或会话超时）时调用
+        # 应用退出前：进行中的线程（friday）都交给后台抽取；不调用时空闲 30 分钟后也会交出
+        cuemem.close()
+        memory.wait()
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ jobs:
         with:
           enable-cache: true
       - name: 安装依赖
-        run: uv sync --locked
+        run: uv sync --locked --extra integrations  # 框架集成的测试与类型检查也要跑（N12）
       - name: 代码风格
         run: |
           uv run ruff check .
