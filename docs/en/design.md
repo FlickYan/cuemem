@@ -300,6 +300,10 @@ A predicate's **cardinality** decides the conflict rules:
   - for each deleted fact, the nearest rounds are retrieved, including open sessions;
   - a cheap model goes through their messages one by one and confirms which still reveal the information. Mentioning the same person or topic does not count.
   - Only those messages are deleted, and no citation cascade starts from them (revised after N11): what else the user said in the same round stays. After the rebuild, any fact that grows back from elsewhere has its source deleted as well, for up to 3 rounds.
+- **Gaps are marked on re-extraction** (after N11, D-059). Once the source is deleted, a remaining message may point into it with a pronoun ("I'll get those for her"), and the model would pin it on someone else.
+  - **How gaps are found:** message numbers are never reused, so the gaps left by forgetting are where the numbering jumps.
+  - **What the extractor sees:** re-extraction marks each gap `[deleted]` and says that a pronoun next to a gap must not be resolved to someone else.
+  - **Effect on the cache:** sessions that were never edited send byte-for-byte the same requests, so all cached extractions stay valid.
 - **Isolation.** Memory spaces share nothing.
 
 ## 6. Read path
@@ -376,6 +380,13 @@ $$
 - In a space with photos, a question with a visual cue or a position cue (a new feature, `q_scene`, used only by this rule and not by the classifiers) is lifted from L0 to L1 + photos.
 - The gate, the reasoning-type model and λ are unchanged. The frozen v1 is kept as `controller_model_v1.json` for reproducing N7 and N9; the `retrieval.controller` setting chooses the model file.
 - Development set 81.2% → 81.7%; post-hoc test replay 81.6% → 81.9%, all of it on MemLens. For a new reader, recalibrating the accuracy table does not help, while setting λ per reader does (λ = 15 recovers most of the gap to always-L2 at 16–24% lower cost).
+
+**After N11: controller v3** (D-058):
+
+- **The problem:** the image-space accuracy table comes from MemLens, where nearly every question is about an image. As a result, v2 attached photos to 96–98% of questions in spaces with photos. In the demo, the budget question also got the photo of a friend's shoes, and the agent answered the previous question (find look-alike shoes) again.
+- **The change:** v3 adds a threshold. Photos are considered only if the question has a visual cue or the best caption match is at least 0.64, a value chosen on the development set. Otherwise the controller chooses among the actions without photos.
+- **The result:** development accuracy is unchanged, and the share of questions with photos falls from 98% to 31%. In the post-hoc test replay, cost per 1,000 questions is 16% lower and accuracy moves by about 1 point either way (n.s.).
+- **Reproducibility:** the frozen v2 is kept as `controller_model_v2.json`.
 
 **Online learning (extension).** In production only the chosen action's outcome is observed (partial feedback), so the problem becomes a contextual bandit (LinUCB / Thompson sampling):
 

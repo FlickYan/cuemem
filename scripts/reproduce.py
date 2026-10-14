@@ -38,10 +38,11 @@ V4 = {"CUEMEM_EMBEDDING__MODEL": "text-embedding-v4"}
 QFLASH = {"CUEMEM_ROLES__READER__MODEL": "qwen3.8-flash"}
 QSMALL = {"CUEMEM_ROLES__READER__MODEL": "qwen3.6-35b-a3b"}
 DSPRO = {"CUEMEM_ROLES__READER__MODEL": "deepseek-v4-pro"}
-# N7 训练、N8 演示与 N9 冻结评测用的都是 v1 控制器；N11 起默认是 v2
-# （src/cuemem/read/controller_model.json）
+# N7 训练、N8 演示与 N9 冻结评测用的都是 v1 控制器；N11 用 v2；之后默认是 v3
+# （src/cuemem/read/controller_model.json，D-058）
 V1 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v1.json"}
-NODE_ENV = {"N7": V1, "N8": V1, "N9": V1}
+V2 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v2.json"}
+NODE_ENV = {"N7": V1, "N8": V1, "N9": V1, "N11": V2}
 NO_CACHE = {"CUEMEM_LLM_CACHE_MODE": "off"}
 # 外部基线 Mem0（N11）：mem0ai 不是依赖，临时装上；spaCy 与 fastembed 让它的混合检索完整生效
 SPACY_SM = (
@@ -188,6 +189,7 @@ STEPS: list[Step] = [
     script("N9", "scripts/n9_report.py"),  # results.json、图与 tables.md
     # N11：测试集之后的补做（控制器 v2 只在开发集上选，测试集只作事后重放）
     script("N11", "scripts/n11_controller_v2.py"),  # 导出 v2 并写 controller_v2.json
+    script("N11", "scripts/n11_see_gate.py"),  # 导出 v3（再感知的门槛，D-058）并写 see_gate.json
     script("N11", "scripts/n11_latency.py"),  # 离线；服务端那一组要先起 Qdrant（见脚本说明）
     Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "locomo", "--split", "test200r",
                  "--methods", "M0", "--name", "locomo-test200r-mem0", "--workers", "12",

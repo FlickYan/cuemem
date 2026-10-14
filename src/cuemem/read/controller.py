@@ -31,10 +31,12 @@ from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyz
 
 Level = Literal["L0", "L1", "L2"]
 Router = Literal["learned", "hybrid", "rule", "llm"]
-# 默认是 v2（N11，有图的空间直接查有图的准确率表）；v1 是 N7 导出、N9 测试集上冻结评测的那一版，
-# 复现 N7 / N9 的数字时用它（配置 retrieval.controller，scripts/reproduce.py 会自动指定）
+# 默认是 v3（N11 之后：v2 + 只在问到图时看图，D-058）；v2 是 N11 导出的那一版（有图的空间直接查
+# 有图的准确率表），v1 是 N7 导出、N9 测试集上冻结评测的那一版。复现某个节点的数字时用当时的文件
+# （配置 retrieval.controller，scripts/reproduce.py 会自动指定）
 DEFAULT_MODEL = Path(__file__).with_name("controller_model.json")
 V1_MODEL = Path(__file__).with_name("controller_model_v1.json")
+V2_MODEL = Path(__file__).with_name("controller_model_v2.json")
 # 混合方案（B6h）：门控估计的 P(none) 落在这个区间里才问 LLM；LLM 判"无关"时 P(none) 取
 # HYBRID_CONFIDENCE，判"需要记忆"时取 1 − HYBRID_CONFIDENCE。两个数都是事先定的，没有在评测数据上调
 HYBRID_BAND = (0.1, 0.9)
@@ -132,6 +134,9 @@ class ControllerModel:
     accuracy_images: dict[str, dict[str, float]] | None = None
     # v2：有图的空间里，这些问题线索之一成立时不选 L0，至少快速召回并看图（D-052）
     image_floor: list[str] | None = None
+    # v3：再感知的门槛（D-058）。有图的空间里，问题带画面线索（cues 里的特征之一成立），或者图片
+    # 描述的检索相似度不低于 caption_min，才考虑看图；为空时不设门槛（v2）
+    see_gate: dict[str, Any] | None = None
     gate_intercept: float = 0.0
     clip: float = 5.0  # 标准化后的特征截断在 ±clip 以内（与训练时一致）
     meta: dict[str, Any] = field(default_factory=dict)
@@ -154,6 +159,7 @@ class ControllerModel:
             "clip",
             "accuracy_images",
             "image_floor",
+            "see_gate",
         }
         gate = raw.get("gate")
         return cls(
@@ -172,6 +178,7 @@ class ControllerModel:
             clip=float(raw.get("clip", 5.0)),
             accuracy_images=raw.get("accuracy_images"),
             image_floor=raw.get("image_floor"),
+            see_gate=raw.get("see_gate"),
             meta={k: v for k, v in raw.items() if k not in known},
         )
 
@@ -232,6 +239,15 @@ class ControllerModel:
                 out[f"{lv}+see"] = min(1.0, max(0.0, out[lv] + gain))
         return out
 
+    def about_images(self, features: dict[str, float]) -> bool:
+        """这条消息是不是在问之前分享过的图（再感知的门槛）。没有门槛时总是 True。"""
+        gate = self.see_gate
+        if not gate:
+            return True
+        if any(features.get(name, 0.0) > 0 for name in gate.get("cues", [])):
+            return True
+        return features.get("p_caption_top1", 0.0) >= float(gate.get("caption_min", 0.0))
+
     def action_cost(self, action: str) -> float:
         level = action.removesuffix("+see")
         return self.cost[level] + (self.cost.get("see", 0.0) if action.endswith("+see") else 0.0)
@@ -276,6 +292,10 @@ class LearnedController:
         lam = self.lam if lam is None else lam
         types = self.model.type_proba(features, p_none=p_none)
         proba = self.model.action_proba(types, has_images=has_images)
+        if has_images and not self.model.about_images(features):
+            # 门槛（D-058）：有图的准确率表来自 MemLens，那里几乎每道题都问图，看图总是更准；
+            # 照搬到真实对话，有图的空间里问预算、问尺码也会附上原图，模型会被图带偏
+            proba = {a: p for a, p in proba.items() if not a.endswith("+see")}
         # 舍到 9 位小数再比较：与离线训练（evals/routing.py 的 decide）的平局规则逐位一致
         utility = {a: round(p - lam * self.model.action_cost(a), 9) for a, p in proba.items()}
         action = max(utility, key=lambda a: (utility[a], -self.model.action_cost(a)))

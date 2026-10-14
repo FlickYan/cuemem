@@ -54,6 +54,18 @@ For each fact:
 Also list the named entities that appear in the facts (people, pets, places, organizations, products, events) with their type, other names used for them in this conversation, and a short description; and summarize the conversation in one or two sentences. Write the descriptions and the summary in the same language as the statements.
 Return empty lists if nothing is worth remembering."""  # noqa: E501
 
+# 遗忘删掉了会话里的发言时（D-021，发言编号不复用，留下空缺）才加的说明。剩下的发言可能用代词
+# 指着被删的内容（"那副登山杖正合适，我给她买了"）；不说明的话，模型会从剩下的人里挑一个顶上
+# （演示里成了"给 Lena 买"）。没有空缺的会话渲染结果不变，已有的抽取缓存照常命中（D-059）
+DELETED_NOTE = (
+    "Some messages in this conversation were deleted at the user's request; each gap is marked "
+    '[deleted]. Do not reconstruct or guess what they said. A pronoun such as "her", "him", '
+    '"them" or "those" next to a deleted gap usually pointed to something in the deleted '
+    "message: do not resolve it to a person or thing named elsewhere in the conversation. Write "
+    'such a fact without the name (for example "someone"), or leave it out. This overrides the '
+    "rule to use names instead of pronouns."
+)
+
 _ENTITY_TYPES = set(get_args(EntityType))
 _CATEGORIES = set(get_args(FactCategory))
 _TURN_NUMBER = re.compile(r"\d+")
@@ -179,6 +191,7 @@ def render_session(
     *,
     assistant_chars: int | None,
     image_notes: Mapping[str, Sequence[str]] | None = None,
+    deleted_from: int | None = None,
 ) -> str:
     """把会话渲染成带轮次编号的文本。
 
@@ -188,6 +201,9 @@ def render_session(
 
     image_notes（N6）：发言 ID → 这条发言里各张图的描述，填回 "<image>" 的位置。只有带图的
     会话才多一行说明，不带图的会话渲染结果与之前完全相同（抽取缓存照常命中）。
+
+    deleted_from：会话里有发言被遗忘删掉时，这一段（超长会话切成的窗口）第一句应有的编号；
+    空缺标成 [deleted]，并加一行说明（DELETED_NOTE）。为 None（没删过）时渲染结果不变。
     """
     names = participants(turns)
     who = ", ".join(names) if names != ["User", "Assistant"] else "User, Assistant (AI)"
@@ -202,16 +218,28 @@ def render_session(
             "Images shared in the conversation are shown as [Image: description]; treat what "
             "they show as information the speaker shared."
         )
-    lines.append("")
+    body: list[str] = []
+    expected = deleted_from
     for turn in turns:
+        if expected is not None:
+            if turn.idx > expected:
+                body.append("[deleted]")
+            expected = turn.idx + 1
         label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
         text = turn.text.strip()
         if turn.role == "assistant" and assistant_chars is not None and len(text) > assistant_chars:
             text = text[:assistant_chars].rstrip() + " […]"
         if notes.get(turn.id):
             text = inline_images(text, notes[turn.id])
-        lines.append(f"[t{turn.idx}] {label}: {text}")
-    return "\n".join(lines)
+        body.append(f"[t{turn.idx}] {label}: {text}")
+    if "[deleted]" in body:
+        lines.append(DELETED_NOTE)
+    return "\n".join([*lines, "", *body])
+
+
+def gaps(turns: Sequence[Turn]) -> bool:
+    """发言编号有没有空缺（遗忘删掉了其中的发言）。编号从 0 起连续时没有。"""
+    return any(t.idx != i for i, t in enumerate(turns))
 
 
 def conversation_language(turns: Sequence[Turn]) -> str:
@@ -261,11 +289,20 @@ class Extractor:
             attempts=0,
         )
         summaries: list[str] = []
+        deleted = gaps(turns)
+        start = 0
         for window in self._windows(turns):
+            messages = self.messages(
+                window,
+                started_at,
+                image_notes=image_notes,
+                deleted_from=start if deleted else None,
+            )
+            start = window[-1].idx + 1
             with span("extract", session=session_id, turns=len(window)):
                 structured = self.llm.structured(
                     self.role,
-                    self.messages(window, started_at, image_notes=image_notes),
+                    messages,
                     ExtractionOutput,
                     model=self.model,
                     cache_scope=cache_scope,
@@ -291,6 +328,7 @@ class Extractor:
         started_at: datetime,
         *,
         image_notes: Mapping[str, Sequence[str]] | None = None,
+        deleted_from: int | None = None,
     ) -> list[Message]:
         names = participants(turns)
         if names == ["User", "Assistant"]:
@@ -300,7 +338,11 @@ class Extractor:
             subject_hint = "the speaker's name (" + ", ".join(names) + ")"
         system = EXTRACTION_SYSTEM.format(focus=focus, subject_hint=subject_hint)
         text = render_session(
-            turns, started_at, assistant_chars=self.assistant_chars, image_notes=image_notes
+            turns,
+            started_at,
+            assistant_chars=self.assistant_chars,
+            image_notes=image_notes,
+            deleted_from=deleted_from,
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": text}]
 

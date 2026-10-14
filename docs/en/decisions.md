@@ -61,6 +61,8 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 | D-055 | External baseline Mem0: same models, same reader and judge, its own write and read pipeline | Adopted (N11) |
 | D-056 | Deployment: a clear error when the local store is locked; payload indexes on the server; a migration command; an optional access token | Adopted (N11) |
 | D-057 | The gate on real traffic: first messages of real chatbot conversations (WildChat) | Adopted (N11) |
+| D-058 | Controller v3: in a space with photos, look at them only when the question is about one | Adopted (after N11) |
+| D-059 | Gaps left by forgetting are marked on re-extraction; a pronoun next to a gap is not pinned on someone else | Adopted (after N11) |
 
 ## D-001 A separate controller decides when and how deeply to retrieve, not the LLM
 
@@ -515,7 +517,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
     2. Restatements found by content (and the sources of regrown facts) are deleted without starting a citation cascade; the cascade starts only from the fact's own source.
     3. In an open session, a round leaves the working memory if either its user message or its reply was deleted.
   - **Result:** the re-recorded GIF deletes 4 messages (the source round, plus 2 replies that mentioned the birthday in passing: one in September, one in today's greeting), and facts go from 16 to 14. The last question gets "the only person I have on file is Ana, who you bought trekking poles for, but you never said she was your sister or mentioned a birthday". A regression test covers the case: the user's EU 40 message in the restating round, and a later answer citing it, both stay.
-  - **New limit:** once the source round is deleted, a later message that refers to it by pronoun loses its referent. In one recording, "The trekking poles are perfect, I'll get those for her" was re-extracted as "plans to buy trekking poles for Lena" (the only woman left in memory). A real fix would change the extraction prompt (don't guess an unresolved referent), which invalidates every cached extraction in the evaluation spaces, so it was not done; the demo script now says "for Ana".
+  - **New limit:** once the source round is deleted, a later message that refers to it by pronoun loses its referent. In one recording, "The trekking poles are perfect, I'll get those for her" was re-extracted as "plans to buy trekking poles for Lena" (the only woman left in memory). A real fix would change the extraction prompt (don't guess an unresolved referent), which invalidates every cached extraction in the evaluation spaces, so it was not done; the demo script now says "for Ana". Resolved later by D-059: gaps left by forgetting are marked on re-extraction, the sentence becomes "for someone else", and the pipeline version stays.
 
 ## D-052 Controller v2: image-space accuracy table, visual-detail questions never go to L0; test sets only replayed post hoc
 
@@ -594,3 +596,54 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
   2. Pair each with a test memory space and run the probe, as for N9's mixed stream; apply the frozen v1 and v2 controllers offline: false recall, gate AUC, and the cost with these messages replacing the synthetic non-memory queries. The zero-shot LLM router (B6z: qwen3.8-flash looking at the message alone) also judges the same messages, and with the hybrid (B6h) serves as a comparison.
   3. Only conversation hashes are committed (`evals/mixed/wildchat_test.json`); `cuemem data download wildchat` downloads the shard only when named (datasets gained an `optional` flag), from a URL pinned to the release commit.
 - **Limits:** messages after the first are the ones more likely to need memory, and those are unlabelled; WildChat's users (of a free GPT web app) are not any particular product's users. The check only answers whether real messages that don't need long-term memory are wrongly sent to retrieval.
+
+## D-058 Controller v3: in a space with photos, look at them only when the question is about one
+
+- **Status:** adopted (after N11; finds and fixes "the agent answers the previous question again").
+- **Context:** the agent now and then answered the previous question again: once in N11's script replay (S3·4) and once while re-recording the README GIF. It was written off as a random reader error.
+  - **Reproduction:** in a sandbox copy with the cache off, the first 4 messages of the demo's third chat were run 6 times. The error came back twice: once the reply answered only the previous question, once it answered both.
+  - **What the request showed:** the user asked "How has my shoe budget changed since we first talked?", but the controller chose L1 + photos and attached the photo of a friend's shoes just before the user's message. The previous message happened to be "find shoes that look like the pair I showed you", so the model ran the image search again.
+  - **Root cause, controller v2:** in a space with photos it reads an accuracy table built from MemLens. Nearly every MemLens question is about an image, so looking always scores better. v2 therefore attached photos to 96–98% of questions in such spaces; in the demo, even "Hi Cue, I'm back!" got one.
+- **Decision:**
+  1. A threshold for re-perception. In a space with photos, looking at photos is considered only if the question has a visual cue (`q_visual`, `q_scene`) or the best image-caption match `p_caption_top1` is at least τ. Otherwise the controller chooses among the actions without photos, and the level is still chosen by accuracy and cost. The gate, the type model, the accuracy tables and λ are unchanged.
+  2. τ is chosen on the development set only, under D-052's protocol: the largest τ whose accuracy on MemLens 32K dev100 is no lower than v2's. That is 0.64. The test sets are only replayed post hoc.
+  3. The frozen v2 is kept as `controller_model_v2.json` and is pinned for reproducing N11; the default becomes v3 (`scripts/n11_see_gate.py` evaluates and exports it).
+- **Alternatives:**
+  - Visual cues only, ignoring caption similarity: only about a quarter of MemLens questions have visual words, and development accuracy drops 3 points (60.0%).
+  - A prompt fix in the agent ("earlier messages have already been answered"): treats the symptom. The photo would still pull unrelated questions off course, and looking costs extra.
+- **Consequences:**
+  - **Development set:** for every τ from 0.30 to 0.64, accuracy stays at 62–63%, within one question; v2 scores 63.0%. The share of questions with photos falls from 98% to 31%. A hundred questions cannot separate differences this small: the threshold does not hurt accuracy, but it is not shown to help.
+  - **Post-hoc test replay:**
+    - MemLens 32K: 62.6% → 61.5% (+9 / −11, n.s.).
+    - MemLens 128K: 61.0% → 62.1% (+9 / −7, n.s.).
+    - Questions with photos: 96–97% → 31–33%, with 16% lower cost per 1,000 questions.
+    - Text datasets: unchanged, question by question.
+  - **Demo:**
+    - Re-running the same 4 messages 8 times, the fourth message never got a photo and was answered correctly every time.
+    - A full replay of the script passes 14 / 14.
+    - The levels changed: the greeting and the size question get L1, the look-alike search gets L2 + photos, and the budget question gets L1. Expected levels in the script are reported, not checked.
+  - **Limits:**
+    - τ is an absolute similarity and must be re-chosen for a new embedding model.
+    - A question about a photo that has no visual words and does not match the caption misses the photo. Its caption still comes back as text with the recalled memories.
+
+## D-059 Gaps left by forgetting are marked when a session is re-extracted; a pronoun next to a gap is not pinned on someone else
+
+- **Status:** adopted (after N11; resolves the limit recorded in D-051's revision).
+- **Context:** after forgetting deletes the source round, the session is re-extracted, and "The trekking poles are perfect, I'll get those for her" has lost its referent.
+  - **Why the model guesses:** the extraction prompt asks for names instead of pronouns, so the model picks someone from what is left. Earlier in the same chat the assistant had mentioned Lena ("a match to Lena's look"), so the fact became "buys trekking poles for Lena".
+  - **Reproduction:** the demo's second chat was rebuilt as it looks after forgetting and extracted 12 times with the cache off. All 12 named Lena.
+- **Decision:**
+  1. Message numbers are never reused (D-021), so a gap left by forgetting is where the numbering jumps. When a session is rendered for extraction, each gap is marked `[deleted]`, and a note tells the model:
+     - do not reconstruct what was deleted;
+     - a pronoun next to a gap usually pointed into the deleted message, so do not resolve it to someone or something named elsewhere: write "someone", or leave the fact out;
+     - this overrides the rule to use names instead of pronouns.
+  2. Only sessions with gaps are rendered this way. Every other request is byte-for-byte unchanged, so the pipeline version is not bumped and all cached extractions stay valid.
+     - Checked: none of the 42,071 sessions in the evaluation spaces has a gap.
+     - A long session split into windows is judged as a whole: later windows don't start at 0, and that is not a gap.
+- **Alternatives:**
+  - Change the system prompt for every session ("don't guess an unclear referent"): this would invalidate about 4.8k cached extractions in the evaluation spaces, the rebuild would cost money, and it might move the evaluation numbers.
+  - Also delete the messages around a gap: this deletes more, including things the user did not ask to forget.
+- **Consequences:**
+  - On the same rebuilt chat, the first wording of the note gave "someone" 7 times out of 12. Naming "a pronoun next to a gap" and stating that the note overrides the names rule gave "someone" 8 out of 8. The promotion, the $180 budget and the switch to EU 40 were still extracted.
+  - In a sandbox built from the original script ("for her"), forgetting only the birthday fact, as in the UI, deleted 3 messages and took facts from 15 to 12. The poles fact was re-extracted as "Maya purchased trekking poles for someone else."
+  - The demo script keeps "for Ana", since the README GIF was recorded with it.

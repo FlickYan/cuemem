@@ -99,6 +99,40 @@ def test_extractor_maps_turns_and_splits_long_sessions(
     assert request["enable_thinking"] is False  # 抽取用 qwen3.8-flash，关闭思考模式
 
 
+def test_deleted_gaps_are_marked_only_where_messages_were_deleted(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """遗忘留下的空缺标成 [deleted] 并加说明（剩下的代词不要套到别人身上）；没删过的会话、
+    超长会话后面的窗口（编号本来就不从 0 起）都不标，渲染结果与之前相同、抽取缓存照常命中。"""
+    turns = session(
+        ("user", "My friend Lena runs."),
+        ("assistant", "Nice."),
+        ("user", "My sister Ana turns 30."),
+        ("assistant", "Happy birthday to Ana!"),
+        ("user", "I'll get those poles for her."),
+        ("assistant", "Great."),
+    )
+    plain = render_session(turns, WHEN, assistant_chars=None)
+    assert "[deleted]" not in plain and "deleted at the user's request" not in plain
+    assert render_session(turns, WHEN, assistant_chars=None, deleted_from=0) == plain
+    kept = [turns[i] for i in (0, 1, 4, 5)]
+    text = render_session(kept, WHEN, assistant_chars=None, deleted_from=0)
+    assert "deleted at the user's request" in text
+    assert "[t1] Assistant: Nice.\n[deleted]\n[t4] User: I'll get those poles for her." in text
+
+    reply = {"summary": "s", "facts": [], "entities": []}
+    fake_api.chat_replies = [json.dumps(reply)]
+    extractor = Extractor(LLMClient(settings, http_client=fake_api.client()), max_chars=30)
+    extractor.extract("s1", turns, WHEN)  # 切成几个窗口，后面的窗口编号不从 0 起
+    first = len(fake_api.chat_requests)
+    assert first > 1
+    extractor.extract("s1", [turns[i] for i in (0, 1, 2, 3, 5)], WHEN)  # 删了第 4 句
+    prompts = [r["messages"][1]["content"] for r in fake_api.chat_requests]
+    assert not any("[deleted]" in p for p in prompts[:first])
+    marked = [p for p in prompts[first:] if "[deleted]" in p]
+    assert len(marked) == 1 and "[deleted]\n[t5]" in marked[0]
+
+
 def test_predicate_normalization() -> None:
     assert normalize_predicate("Lives In") == "lives_in"
     assert normalize_predicate("employer") == "works_at"

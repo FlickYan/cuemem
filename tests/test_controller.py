@@ -243,6 +243,27 @@ def test_image_floor_lifts_visual_questions_out_of_l0(tmp_path: Path) -> None:
     assert toy_controller(tmp_path).decide(visual, has_images=True).level == "L0"
 
 
+def test_see_gate_keeps_pictures_out_of_unrelated_questions(tmp_path: Path) -> None:
+    """门槛（D-058）：有图的空间里，问题不带画面线索、图片描述也不像时，只在不看图的动作里选；
+    问到图（线索或描述相似）时照常看图。没有门槛的模型文件（v2）行为不变。"""
+    images = {
+        t: {"L0": 0.0, "L1": 0.4, "L2": 0.45, "L1+see": 0.65, "L2+see": 0.8}
+        for t in ("multi", "single")
+    }
+    images["none"] = dict.fromkeys(("L0", "L1", "L2", "L1+see", "L2+see"), 1.0)
+    gate = {"cues": ["q_visual", "q_scene"], "caption_min": 0.6}
+    v2 = toy_controller(tmp_path, accuracy_images=images)
+    v3 = toy_controller(tmp_path, accuracy_images=images, see_gate=gate)
+    budget = {"q_aggregation": -1.0, "p_round_top1": 1.0, "p_caption_top1": 0.37}
+    assert v2.decide(budget, has_images=True).see
+    decision = v3.decide(budget, has_images=True)
+    assert not decision.see and decision.level in ("L1", "L2")
+    assert not any(k.endswith("+see") for k in decision.scores if k.startswith("p:"))
+    for about in ({"q_visual": 1.0}, {"p_caption_top1": 0.65}):
+        assert v3.decide({**budget, **about}, has_images=True).see
+    assert v3.decide(budget, has_images=False) == v2.decide(budget, has_images=False)
+
+
 def test_scene_reference_cue() -> None:
     assert query_features("What color is the metal structure on the far left?")["q_scene"] == 1
     assert query_features("Examine the readout shown in the photo.")["q_scene"] == 1

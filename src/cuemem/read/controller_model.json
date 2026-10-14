@@ -1,5 +1,5 @@
 {
- "version": "n11-two-stage-v2",
+ "version": "n11-two-stage-v3",
  "clip": 5.0,
  "features": [
   "m_facts",
@@ -755,8 +755,8 @@
   "q_visual",
   "q_scene"
  ],
- "changes": "v2（N11）：门控与推理类型模型与 v1 相同；有图的空间直接查有图数据的准确率表；有图的空间里问画面细节时不选 L0",
- "created": "2026-10-13",
+ "changes": "v2（N11）：门控与推理类型模型与 v1 相同；有图的空间直接查有图数据的准确率表；有图的空间里问画面细节时不选 L0；v3（N11 之后，D-058）：有图的空间里，问题带画面线索或图片描述的检索相似度不低于 0.64 才考虑看图",
+ "created": "2026-10-14",
  "accuracy_images": {
   "abstention": {
    "L0": 0.7594,
@@ -814,5 +814,12 @@
    "L2": 1.0,
    "L2+see": 1.0
   }
+ },
+ "see_gate": {
+  "cues": [
+   "q_visual",
+   "q_scene"
+  ],
+  "caption_min": 0.64
  }
 }

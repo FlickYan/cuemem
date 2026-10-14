@@ -38,7 +38,7 @@ from cuemem.config import PROJECT_ROOT, load_settings
 from cuemem.evals import routing as R
 from cuemem.evals.datasets import dataset_path
 from cuemem.evals.runner import EvalRunner, ProbeQuery, RunConfig
-from cuemem.read.controller import DEFAULT_MODEL, V1_MODEL, LearnedController
+from cuemem.read.controller import V1_MODEL, V2_MODEL, LearnedController
 
 IDS = PROJECT_ROOT / "evals" / "mixed" / "wildchat_test.json"
 OUT = PROJECT_ROOT / "docs" / "results" / "n11-improvements" / "wildchat.json"
@@ -178,7 +178,7 @@ def report(settings: Any) -> None:
     if not sources["wildchat"]:
         raise SystemExit(f"{RUN} 还没有探针结果：先运行 probe")
     result: dict[str, Any] = {"n_memory": len(memory)}
-    for version, path in (("v1", V1_MODEL), ("v2", DEFAULT_MODEL)):
+    for version, path in (("v1", V1_MODEL), ("v2", V2_MODEL)):
         ctrl = LearnedController.load(path)
         out: dict[str, Any] = {}
         for name, items in sources.items():
@@ -219,7 +219,7 @@ def report(settings: Any) -> None:
                 f"{out[name]['gate_auc']}，比总是 L1 省 {out[name]['saving_vs_always_l1']}%"
             )
         result[version] = out
-    ctrl = LearnedController.load(DEFAULT_MODEL)
+    ctrl = LearnedController.load(V2_MODEL)
     recalled = [
         (round(ctrl.model.type_proba(it.features).get("none", 0.0), 3), it.sample_id, it.question)
         for it in sources["wildchat"]

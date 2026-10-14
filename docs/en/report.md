@@ -535,6 +535,18 @@ Two changes; the gate, the reasoning-type model and λ (still 30) are unchanged 
 
   False recall on real first messages lies between Dolly (6.6%) and the generated questions (27.9%), so the synthetic stream was the harder one, and the "whether to recall" half of the conclusion holds on real messages. What the gate wrongly sends to retrieval is mostly first-person messages about the user's own experiences. Limitation: later messages in a conversation are the ones likely to need memory, and those are not labelled; "20% of queries need memory" is still an assumption.
 
+**Later: controller v3** (D-058).
+
+- **What the investigation found:** looking into "the agent answers the previous question again" showed that the image-space accuracy table comes from MemLens, where nearly every question is about an image. As a result, v2 attached photos to 96–98% of questions in spaces with photos. In the demo, the budget question got the photo of a friend's shoes, and the agent ran the image search again.
+- **The change:** v3 considers photos only if the question has a visual cue or the best caption match is at least 0.64, a value chosen on the development set.
+- **Development set:** accuracy is unchanged.
+- **Post-hoc test replay:**
+  - MemLens 32K: 62.6% → 61.5% (n.s.);
+  - MemLens 128K: 61.0% → 62.1% (n.s.);
+  - questions with photos fall to 31–33%, and cost drops 16%;
+  - the text datasets are unchanged question by question.
+- **Demo:** re-running the same 4 messages 8 times, none got a photo and all were answered correctly.
+
 ### 12.2 External baseline: Mem0
 
 | Dataset (questions) | Mem0 | Naive RAG | CueMem L1 | CueMem controller | CueMem L2 | Full context |
@@ -579,7 +591,12 @@ Human audit: 50 judgements were sampled from N9, stratified by dataset (LongMemE
 ### 12.4 Write path and forgetting
 
 - **Reconciliation now separates "different scope", "the world changed" and "it was a mistake"** (D-053). This fixes the two errors in N9's error analysis: "up at 6:00 on Fridays" replaced "up at 6:30 on weekdays", and "moved to Singapore" was labelled a correction. The live test showed that the prompt alone was not enough: the reconciler only saw the extracted "Mia is 31", which cannot tell a correction from a birthday, so each new fact in the gray zone now comes with the message it was taken from. On a new four-session conversation run 5 times, different scope / the world changed / it was a mistake were right 5 / 5 each (N9's prompt: 3 / 5, 5 / 5, 0 / 5). It is one conversation and the prompt was revised against it, so this is not an overall accuracy for reconciliation. Prompt text is not part of the consolidation fingerprint, so the existing evaluation spaces are not rebuilt.
-- **The agent's reply cache is scoped to the session** (D-054). Forgetting clears only the sessions it affects, so demo replays no longer fail now and then because another session's cache was cleared. Two full replays each passed 13 of 14 checks, including the checks after forgetting. The two misses: a keyword check that was too literal (the reply kept the vegan constraint without the word "vegan"; relaxed), and the agent answering the previous question again (the facts were reconciled correctly, and the same turn had passed the three replays before).
+- **The agent's reply cache is scoped to the session** (D-054). Forgetting clears only the sessions it affects, so demo replays no longer fail now and then because another session's cache was cleared. Two full replays each passed 13 of 14 checks, including the checks after forgetting. The two misses: a keyword check that was too literal (the reply kept the vegan constraint without the word "vegan"; relaxed), and the agent answering the previous question again (the facts were reconciled correctly, and the same turn had passed the three replays before). It later turned out not to be random: the controller had attached a photo to that budget question (controller v3, §12.1).
+- **Gaps left by forgetting are marked on re-extraction** (D-059).
+  - **The problem:** after the source round was deleted, "I'll get those for her" was re-extracted as "for Lena", in 12 out of 12 tries on the rebuilt chat.
+  - **The change:** message numbers are never reused, so a gap is where the numbering jumps. Re-extraction marks it `[deleted]` and says that a pronoun next to a gap must not be pinned on someone else.
+  - **The result:** 8 out of 8 tries wrote "for someone".
+  - **Effect on the cache:** only sessions with deleted messages send different requests, so the cached extractions of the evaluation spaces stay valid.
 
 ### 12.5 Scale and deployment
 
