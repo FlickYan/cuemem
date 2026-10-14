@@ -76,8 +76,13 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, NamedTuple, cast
 
-from anthropic.lib.tools import BetaAbstractMemoryTool, BetaAsyncAbstractMemoryTool, ToolError
-from anthropic.types.beta import (
+# 没装 anthropic 可选依赖时 mypy 也要能跑（CI 装了，本地 uv sync 默认不装）
+from anthropic.lib.tools import (  # type: ignore[import-not-found, unused-ignore]
+    BetaAbstractMemoryTool,
+    BetaAsyncAbstractMemoryTool,
+    ToolError,
+)
+from anthropic.types.beta import (  # type: ignore[import-not-found, unused-ignore]
     BetaCacheControlEphemeralParam,
     BetaMemoryTool20250818CreateCommand,
     BetaMemoryTool20250818DeleteCommand,
