@@ -327,7 +327,7 @@ N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻�
 - [x] 抽取的补充说明（D-064）：`consolidation.instructions`，不填时提示词与巩固指纹都不变
 - [x] Docker 镜像与 compose（加 Qdrant 服务端），在本地构建并实际运行验证
 - [x] 示例：`examples/quickstart.py`（SDK）、`examples/openai_proxy.py`（OpenAI SDK 只改 base_url）
-- [ ] 需要 API Key 与预算的：OpenAI、Ollama 预设在真实模型上的评测；同一协议下的更多外部基线（Graphiti、LangMem、Letta、Mem0 v3）
+- [ ] 需要 API Key 与预算的：OpenAI、Ollama 预设在真实模型上的评测；同一协议下的更多外部基线（Graphiti、LangMem、Cognee、A-MEM、Letta）
 - [ ] 框架集成（LangGraph store、OpenAI Agents SDK、Vercel AI SDK、Claude memory tool 后端）、多租户鉴权、记忆的元数据与过期
 
 **验收结果**：

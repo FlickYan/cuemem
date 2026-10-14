@@ -1,0 +1,122 @@
+# 框架集成（N12）
+
+[English](en/integrations.md)
+
+CueMem 接进现成 Agent 框架的四种方式，从改动最少到最深：
+
+| 方式 | 适合 | 谁决定要不要想起 | 见 |
+|---|---|---|---|
+| OpenAI 兼容的记忆代理 | 任何用 OpenAI SDK 的应用，代码不动 | 控制器（每轮） | `cuemem proxy`，README |
+| MCP Server | Claude Code、Claude Desktop 等 MCP 客户端 | 模型调用 `recall`（控制器只决定深浅） | `cuemem mcp` |
+| 框架集成（本页） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool | 控制器（每次调用模型之前），模型还可以用工具补查 | `cuemem.integrations.*` |
+| Python SDK | 自己写的 Agent 循环 | 调用方 | `from cuemem import Memory` |
+
+三个集成共用 `cuemem/evidence.py`：控制器先选档（L0 不检索、只给画像），取回的事实与对话片段排成与记忆代理、回答模型相同的证据块，放在最新一句用户消息的开头；系统提示与之前的消息不动，供应商的前缀缓存照常命中。工具（recall / remember / forget）的名字、说明与语义与 MCP 相同。
+
+安装：`uv sync --extra integrations`（或分别 `--extra openai-agents`、`--extra langgraph`、`--extra anthropic`）。只有 DeepSeek 的 Key 时加上 `--extra local` 并用 `Memory(preset="deepseek")`。
+
+## OpenAI Agents SDK
+
+`cuemem.integrations.openai_agents`（openai-agents 0.23）。三样东西可以分开用：
+
+- `memory_tools(memory, user_id=...)`：recall、remember、forget 三个工具；
+- `memory_input_filter(memory, user_id=...)`：交给 `RunConfig.call_model_input_filter`，SDK 每次调用模型之前先过控制器、注入证据（只改这次发给模型的副本）；
+- `CueMemSession(session_id, memory, user_id=...)`：Session 协议的实现。内层会话（默认 SQLiteSession）原样保存短期历史，用户与助手的文字同时写进 CueMem（一问一答为一轮），对话结束后整段抽取成事实。
+
+```python
+from agents import Agent, RunConfig, Runner
+from cuemem import Memory
+from cuemem.integrations.openai_agents import (
+    CueMemSession, close_sessions, memory_input_filter, memory_tools,
+)
+
+memory = Memory(preset="deepseek")
+
+def user_of(context):                 # 多个用户共用一个 Agent 时按运行上下文给身份
+    return context["user_id"]
+
+agent = Agent(name="Assistant", model=..., tools=memory_tools(memory, user_id=user_of))
+config = RunConfig(
+    call_model_input_filter=memory_input_filter(memory, user_id=user_of),
+    trace_include_sensitive_data=False,   # 注入的记忆不上传到 SDK 的 trace 后台
+)
+
+async with CueMemSession("chat-1", memory, user_id="alice") as session:
+    await Runner.run(agent, "I moved to Lisbon", session=session,
+                     run_config=config, context={"user_id": "alice"})
+close_sessions(memory)                # 退出前、memory.close() 之前
+```
+
+- 会话：写入时标记为进行中、不抽取；`async with` 结束、`end()`、空闲 30 分钟或 `close_sessions()` 时交给后台抽取。之后同一个 SDK 会话再有对话，写进新的一段（对话日期是新的）。
+- 服务端保存对话状态（`conversation_id`、`previous_response_id`）时用 `memory_input_filter(..., placement="instructions")`：证据接在这次调用的 instructions 后面，不会随用户消息存到服务端。
+- 遗忘：`pop_item`、`clear_session` 撤回的消息在长期记忆里一并遗忘；forget 工具删掉的发言，下次读历史时也从内层会话里去掉。
+- 输入护栏拦下的、模型没有回应过的用户消息不写进长期记忆。
+
+## LangGraph / LangChain
+
+`cuemem.integrations.langgraph`（langgraph 1.2、langchain 1.4）。LangChain 1.x 的 `create_agent` 用中间件 `CueMemMiddleware`；仍在用 `langgraph.prebuilt.create_react_agent` 的，用 `recall_hook` / `save_hook`（pre_model_hook / post_model_hook）；也可以只用 `memory_tools`。
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.memory import InMemorySaver
+from cuemem import Memory
+from cuemem.integrations.langgraph import CueMemMiddleware
+
+memory = Memory(preset="deepseek")             # 异步应用用 AsyncMemory
+cuemem = CueMemMiddleware(memory, tools=True)  # 同时给模型 recall / remember / forget
+agent = create_agent(llm, tools, middleware=[cuemem], checkpointer=InMemorySaver())
+
+config = {"configurable": {"thread_id": "t1", "user_id": "alice"}}
+out = agent.invoke({"messages": [{"role": "user", "content": "I moved to Munich"}]}, config)
+out["cuemem"]               # 这一轮控制器的决定：level、reasons、recalled
+
+cuemem.end_thread(config)   # 对话结束：整段抽取（空闲 30 分钟的线程也会交出）
+cuemem.close()              # 应用退出时，memory.close() 之前；异步用 aend_thread / aclose
+```
+
+- 身份：`user_id` 不在构造时固定时，从 `config["configurable"]` 取；部署在 LangGraph Server 上时优先用登录的用户，不信任客户端传来的 ID。
+- 一个 LangGraph 线程对应 CueMem 的一个会话。结构化输出、`return_direct` 工具结束的轮也会写入；LangChain 的 SummarizationMiddleware 生成的摘要不会被当成用户的话。
+- 遗忘：forget 删的是 CueMem 里的原始日志与派生记忆；当前线程的检查点里那几条消息还在（检查点不归 CueMem 管）。
+
+## Claude 的 memory tool
+
+`cuemem.integrations.claude`（anthropic 1.14，工具类型 `memory_20250818`）。Claude 的 memory tool 在客户端执行：模型对 `/memories` 目录做 view、create、str_replace、insert、delete、rename。`CueMemMemoryTool` 把这个目录接到 CueMem 上：
+
+- 只读的生成文件：`/memories/profile.md`（画像）、`/memories/facts.md`（当前事实，带日期、ID 与有效状态），写入时报错说明；
+- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；
+- 路径严格校验（不能出 `/memories`），有大小上限；`with_recall` / `awith_recall` 在发给 Claude 之前先过控制器、注入证据。
+
+```python
+import anthropic
+from cuemem import Memory
+from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
+
+memory = Memory()                   # 默认配置（通义）；或 Memory(preset="deepseek")
+client = anthropic.Anthropic()
+
+with CueMemMemoryTool(memory, user_id="alice") as tool:
+    history = []                    # 只追加：with_recall 只动最新一句用户消息
+    for text in ["I moved to Lisbon in 2026-09.", "What should I cook tonight?"]:
+        user = {"role": "user", "content": text}
+        history, evidence = with_recall([*history, user], memory, user_id="alice")
+        runner = client.beta.messages.tool_runner(
+            model="claude-opus-5-5", max_tokens=16000, tools=[tool], messages=history,
+        )
+        for message in runner:
+            history.append(message.to_param())
+            results = runner.generate_tool_call_response()
+            if results is not None:
+                history.append(results)
+
+delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
+```
+
+- 没有在真实的 Claude 上跑过（开发环境没有 Anthropic 的 Key；DeepSeek 的 Anthropic 兼容接口不接受 `memory_20250818`）。离线测试直接驱动工具的各个命令；联网冒烟用 DeepSeek 驱动了同样的命令（以普通工具的形式）。
+- 从文件里删掉一行，记作"这一条不再成立"，由抽取与对账决定后果；只有删掉整个文件才确定遗忘。
+- Claude 的文件不在 `Memory.export` 里（导出只有原始日志里的笔记）。
+
+## 局限
+
+- 进行中的会话按进程记在内存里：多个进程共用一个数据目录（Qdrant 服务端）时，一个进程可能提前交出另一个进程还在进行的会话。
+- 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
+- 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。

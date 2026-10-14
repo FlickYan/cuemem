@@ -45,6 +45,8 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 # 响应头里写着控制器的决定：X-CueMem-Level: L0（不检索）/ L1 / L2
 ```
 
+也可以接进 Agent 框架：OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool，每次调用模型之前由控制器决定要不要想起（见[框架集成](docs/integrations.md)）。
+
 另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server、记忆的导出与导入（`cuemem export / import`），以及 Docker 镜像（`docker compose up`）。示例见 [examples/](examples/)。
 
 ## 它要解决什么
@@ -93,7 +95,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | 遗忘 | 删出处的对话、沿引用扩散、找没有引用的转述；可预演 | `delete` | 编辑记忆 | `remove_episode` | `forget_matching`，可预演 |
 | 评测 | 方法事先冻结、测试集只用一次、同一判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
 
-CueMem 的短板在产品层：只有 Python、只支持 SQLite + Qdrant、只有一个共享的访问令牌、还没有框架集成（见[还差什么](docs/landscape.md#7-还差什么)）。
+CueMem 的短板在产品层：只有 Python、只支持 SQLite + Qdrant、只有一个共享的访问令牌、框架集成目前只有三个（见[还差什么](docs/landscape.md#7-还差什么)）。
 
 ## 快速开始
 
@@ -161,6 +163,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [路线图](docs/roadmap.md) | 实施节点、验收标准、进度 |
 | [相关工作](docs/related-work.md) | 与 MemGPT、Mem0、Zep、HippoRAG、Adaptive-RAG、MemLens 等的对比与定位 |
 | [开源同类项目](docs/landscape.md)（[English](docs/en/landscape.md)） | 与 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 等 12 个项目逐项对比；各家公开的分数；N12 借鉴了什么、还差什么 |
+| [框架集成](docs/integrations.md)（[English](docs/en/integrations.md)） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool 的用法与局限 |
 | [设计决策记录](docs/decisions.md)（[English](docs/en/decisions.md)） | 每个重要取舍的背景、备选方案与理由 |
 | [演示指南](demo/README.md)（[English](demo/README.en.md)） | 3 分钟演示：准备、步骤、讲什么 |
 
