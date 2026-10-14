@@ -108,14 +108,21 @@ class ExternalBaseline(ABC):
             self.embedder: TextEmbedder = build_embedder(settings, ledger=llm.ledger)
             self.gateway = Gateway(llm, self.embedder)
             self.gateway.start()
+            # 这次运行的协议：外部系统内部调用的模型与向量模型；写入记录里存一份，换了就重建
+            model = settings.models[settings.roles["extractor"].model].model_id
+            self.protocol = f"{model}|{self.embedder.name}:{self.embedder.dim}"
             self.setup()
             self._ready = True
 
     def _ensure_built(
         self, key: str, directory: Path, sessions: Sequence[EvalSession]
     ) -> dict[str, Any] | None:
-        if (directory / "build.json").exists():
-            return None
+        record = directory / "build.json"
+        if record.exists():
+            built = json.loads(record.read_text("utf-8")).get("protocol")
+            # 换了协议（抽取模型或向量模型）的写入不能复用；旧记录没有这个字段，按同一协议处理
+            if built is None or built == self.protocol:
+                return None
         with self._lock:
             if key in self._failed:
                 raise RuntimeError(
@@ -139,6 +146,7 @@ class ExternalBaseline(ABC):
         usage = _diff(self.gateway.usage(self.bucket(key)), before)
         stats = {
             **stats,
+            "protocol": self.protocol,
             "sessions": len(sessions),
             "seconds": round((datetime.now() - started).total_seconds(), 1),
             **usage,

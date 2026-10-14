@@ -230,6 +230,10 @@ def test_external_baseline_builds_once_and_records_usage(
         assert stored["chat_calls"] == 1
         second = toy.answer(ctx)  # 已写入：不再重建
         assert "toy_build" not in second.details and toy.builds == 1
+        assert stored["protocol"] == f"qwen3.8-flash|{toy.embedder.name}:{toy.embedder.dim}"
+        toy.protocol = "deepseek-flash|other:384"  # 换了协议：重建
+        third = toy.answer(ctx)
+        assert "toy_build" in third.details and toy.builds == 2
     finally:
         toy.gateway.stop()
     assert space_key("locomo:conv-42") == "locomo_conv-42"
