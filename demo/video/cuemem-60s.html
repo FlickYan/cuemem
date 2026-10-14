@@ -321,7 +321,7 @@ sup.cite { font-size: 16px; font-weight: 700; color: var(--teal-d); margin-left:
       <div class="group" id="g3">
         <div class="msg user"><span class="typed" data-text="Can you find shoes that look like the pair I showed you in August?"></span></div>
         <div class="trace" id="trace3">
-          <span class="trace-k">controller</span><span class="chip teal">L1 fast recall</span><span class="chip amber">+ re-look at photos</span>
+          <span class="trace-k">controller</span><span class="chip teal">L2 deep recall</span><span class="chip amber">+ re-look at photos</span>
           <span class="to-model">to the model:<span class="slot" id="slot"><img src="../shop/photos/lena-shoes.jpg" alt=""></span></span>
         </div>
         <div class="tool" id="tool3"><span class="typed" data-text="find_similar_products(image='i1', max_price=180)"></span><span class="ret" id="ret3"> → 5 products · 14 ms</span></div>
@@ -411,11 +411,11 @@ sup.cite { font-size: 16px; font-weight: 700; color: var(--teal-d); margin-left:
     <svg class="overlay"><path id="ctrl-path" d=""/></svg>
     <div class="decide" id="decide">
       <div class="d-head"><span>action</span><span>expected accuracy − λ × cost</span></div>
-      <div class="d-row"><span>L0 · profile only</span><span class="track"><i style="--v:.05"></i></span><b>0.05</b><em></em></div>
-      <div class="d-row"><span>L1 · fast recall</span><span class="track"><i style="--v:.81"></i></span><b>0.81</b><em></em></div>
-      <div class="d-row"><span>L2 · deep recall</span><span class="track"><i style="--v:.76"></i></span><b>0.76</b><em></em></div>
-      <div class="d-row" id="win"><span>L1 + photos</span><span class="track"><i style="--v:.95"></i></span><b>0.95</b><em id="chosen">chosen</em></div>
-      <div class="d-row"><span>L2 + photos</span><span class="track"><i style="--v:.89"></i></span><b>0.89</b><em></em></div>
+      <div class="d-row"><span>L0 · profile only</span><span class="track"><i style="--v:.02"></i></span><b>0.02</b><em></em></div>
+      <div class="d-row"><span>L1 · fast recall</span><span class="track"><i style="--v:.41"></i></span><b>0.41</b><em></em></div>
+      <div class="d-row"><span>L2 · deep recall</span><span class="track"><i style="--v:.39"></i></span><b>0.39</b><em></em></div>
+      <div class="d-row"><span>L1 + photos</span><span class="track"><i style="--v:.64"></i></span><b>0.64</b><em></em></div>
+      <div class="d-row" id="win"><span>L2 + photos</span><span class="track"><i style="--v:.68"></i></span><b>0.68</b><em id="chosen">chosen</em></div>
     </div>
     <div class="side">
       <div class="stat-card lam" id="sc0"><small>the cost knob</small><span class="big">λ</span><p>how much one extra correct answer is worth; a larger λ saves more</p></div>
