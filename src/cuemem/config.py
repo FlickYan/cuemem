@@ -319,16 +319,18 @@ def load_settings(
     config_path: Path | str | None = None,
     *,
     preset: str | None = None,
+    home: Path | str | None = None,
     env_file: Path | None = None,
     **overrides: Any,
 ) -> Settings:
-    """加载配置；路径字段相对于数据目录（home_dir）解析。
+    """加载配置；路径字段相对于数据目录解析（home 不填时为 home_dir()）。
 
     preset：叠加在配置文件上的预设（名字或 YAML 路径），不填时看环境变量 CUEMEM_PRESET。
+    overrides：嵌套的字典与 YAML 深度合并（例如 embedding={"model": ...} 只改这一个字段）。
     已存在的环境变量优先于 .env 中的值。
     """
     path = Path(config_path or os.environ.get("CUEMEM_CONFIG") or DEFAULT_CONFIG).resolve()
-    root = home_dir()
+    root = Path(home).expanduser().resolve() if home is not None else home_dir()
     load_dotenv(env_file or env_file_path(root), override=False)
     files = [path]
     if chosen := preset or os.environ.get("CUEMEM_PRESET"):

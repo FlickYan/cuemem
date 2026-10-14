@@ -137,6 +137,9 @@ RESTATED_SYSTEM = (
 )
 
 
+REGROW_ROUNDS = 3  # 遗忘后追查复述的轮数上限（每轮要重建一次派生记忆）
+
+
 class RegrownOutput(BaseModel):
     same: list[int] = Field(default_factory=list)
 
@@ -346,14 +349,19 @@ class MemorySystem:
             self.worker.submit(space_id)
         return report
 
-    def append(self, space_id: str, session: SessionIn, first_idx: int) -> IngestReport:
+    def append(
+        self, space_id: str, session: SessionIn, first_idx: int, *, enqueue: bool = True
+    ) -> IngestReport:
         """往会话里追加发言（Agent 每轮写回新的一问一答，序号从 first_idx 起），在线写入、
-        不调用 LLM。会话进行中不登记巩固任务（见 open_session）。"""
+        不调用 LLM。会话进行中不登记巩固任务（见 open_session）；enqueue=False 时也不登记
+        （SDK 的 infer=False：只记日志，下次 consolidate 时再抽取）。"""
         with start_trace("append", self.tracer, space=space_id, session=session.session_id):
             report = self.writer.append(space_id, session, first_idx)
-            queued = self.consolidator.enqueue(
-                space_id, [session.session_id], skip=self.open_sessions(space_id)
-            )
+            queued = 0
+            if enqueue:
+                queued = self.consolidator.enqueue(
+                    space_id, [session.session_id], skip=self.open_sessions(space_id)
+                )
         if queued and self.worker is not None:
             self.worker.submit(space_id)
         return report
@@ -641,6 +649,61 @@ class MemorySystem:
             if wanted & set(unit.source_turn_ids):
                 out.extend(t for t in unit.source_turn_ids if t not in out)
         return out
+
+    def forget_memories(
+        self,
+        space_id: str,
+        *,
+        session_ids: Sequence[str] = (),
+        turn_ids: Sequence[str] = (),
+        fact_ids: Sequence[str] = (),
+        media_ids: Sequence[str] = (),
+    ) -> ForgetReport:
+        """按记忆遗忘：会话、发言、事实或图片（服务层、SDK 与 MCP 共用，N12 从服务层移来）。
+
+        原始日志是唯一的事实来源：删一条事实或一张图，删的是它出自的那一轮对话（用户的话与助手
+        的回复），然后由剩下的日志重建所有派生记忆（D-021）。删事实时还要追没有引用、追不到的
+        转述（D-051）：先在原始日志里找复述了它的发言（包括进行中的会话）一起删；重建之后如果
+        同样的信息又从别处长了出来，再删它的出处，最多再追 REGROW_ROUNDS 轮。按内容找到的转述
+        只删那条发言、不沿引用扩散：同一轮里用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。
+        """
+        sources: list[str] = []
+        statements: list[str] = []
+        if fact_ids:
+            for fact in self.db.get_facts(space_id, ids=list(fact_ids)):
+                sources.extend(fact.source_turn_ids)
+                statements.append(fact.statement)
+        if media_ids:
+            items = self.db.get_media(space_id, ids=list(media_ids))
+            sources.extend(m.source_turn_id for m in items)
+        # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
+        turns = [*turn_ids, *self.round_turns(space_id, sources)]
+        restated = self.restating_turns(space_id, statements, exclude=turns)
+        report = self.forget(
+            space_id,
+            session_ids=list(session_ids),
+            turn_ids=list(dict.fromkeys(turns)),
+            restated_turn_ids=restated,
+        )
+        report = replace(report, restated=len(restated))
+        for _ in range(REGROW_ROUNDS if statements else 0):
+            regrown = self.regrown_facts(space_id, statements)
+            if not regrown:
+                break
+            more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
+            report = report.merged(
+                replace(self.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
+            )
+        return report
+
+    def delete_space(self, space_id: str) -> ForgetReport:
+        """删除整个记忆空间（SDK 的 delete_all，N12）：先按会话遗忘全部日志（连带清理缓存、
+        trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合。"""
+        report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
+        self.db.delete_space(space_id)
+        self.vectors.delete_space(space_id)
+        self.db.vacuum()
+        return report
 
     # ---------- 读取 ----------
 

@@ -320,3 +320,25 @@ class LearnedController:
             "L0" if action.startswith("L0") else "L1" if action.startswith("L1") else "L2"
         )
         return RouteDecision(level, reasons, see=action.endswith("+see"), scores=scores)
+
+
+# 控制器给的理由用中文标签（CLI 是中文的）；接口、界面、MCP 与 SDK 给英文（N12 从服务层移来）
+REASON_EN = {
+    "单点事实": "single fact",
+    "多会话 / 多跳": "multi-session",
+    "时间推理": "temporal",
+    "知识更新": "knowledge update",
+    "偏好与建议": "preference / advice",
+    "开放推断": "open inference",
+    "拒答": "probably not in memory",
+    "与记忆无关": "no memory needed",
+}
+
+
+def english_reason(text: str) -> str:
+    if text == IMAGE_FLOOR_REASON:
+        return "asks about details in a photo: recall and look at it"
+    for zh, en in REASON_EN.items():
+        if text.startswith(zh):
+            return en + text[len(zh) :]
+    return text.replace("llm:", "LLM said ")

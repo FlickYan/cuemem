@@ -644,6 +644,14 @@ class MemoryDB:
             facts.sort(key=lambda f: order.get(f.id, len(order)))
         return facts
 
+    def fact_space(self, fact_id: str) -> str | None:
+        """事实所在的记忆空间（事实 ID 由空间派生，全局唯一；SDK 按 ID 取事实用，N12）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT space_id FROM facts WHERE id = ?", (fact_id,)
+            ).fetchone()
+        return row[0] if row else None
+
     def get_entities(self, space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
         sql = f"SELECT {_ENTITY_COLUMNS} FROM entities WHERE space_id = ?"
         args: list[Any] = [space_id]

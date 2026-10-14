@@ -10,7 +10,7 @@ import re
 import threading
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -23,32 +23,9 @@ from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import stable_id
 from cuemem.core.models import Fact, SessionIn, TurnIn
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
-from cuemem.read.controller import IMAGE_FLOOR_REASON, Router
+from cuemem.read.controller import Router, english_reason
 
 Scenario = Literal["shop", "plain"]
-# 控制器给的理由用中文标签（CLI 是中文的）；接口、界面与 MCP 给英文
-REGROW_ROUNDS = 3  # 遗忘后追查复述的轮数上限（每轮要重建一次派生记忆）
-
-REASON_EN = {
-    "单点事实": "single fact",
-    "多会话 / 多跳": "multi-session",
-    "时间推理": "temporal",
-    "知识更新": "knowledge update",
-    "偏好与建议": "preference / advice",
-    "开放推断": "open inference",
-    "拒答": "probably not in memory",
-    "与记忆无关": "no memory needed",
-}
-
-
-def english_reason(text: str) -> str:
-    if text == IMAGE_FLOOR_REASON:
-        return "asks about details in a photo: recall and look at it"
-    for zh, en in REASON_EN.items():
-        if text.startswith(zh):
-            return en + text[len(zh) :]
-    return text.replace("llm:", "LLM said ")
-
 
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"
 
@@ -379,40 +356,14 @@ class ChatService:
         fact_ids: Sequence[str] = (),
         media_ids: Sequence[str] = (),
     ) -> ForgetReport:
-        """遗忘。原始日志是唯一的事实来源：删一条事实或一张图，删的是它出自的那一轮对话
-        （用户的话与助手的回复），然后由剩下的日志重建所有派生记忆（D-021）。
-        删事实时还要追没有引用、追不到的转述（D-051）：先在原始日志里找复述了它的发言
-        （包括进行中的会话）一起删；重建之后如果同样的信息又从别处长了出来，再删它的出处，
-        最多再追 REGROW_ROUNDS 轮。按内容找到的转述只删那条发言、不沿引用扩散：同一轮里
-        用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。进行中的会话同步去掉被删的内容。"""
-        sources: list[str] = []
-        statements: list[str] = []
-        if fact_ids:
-            for fact in self.system.db.get_facts(space_id, ids=list(fact_ids)):
-                sources.extend(fact.source_turn_ids)
-                statements.append(fact.statement)
-        if media_ids:
-            sources.extend(
-                m.source_turn_id for m in self.system.db.get_media(space_id, ids=list(media_ids))
-            )
-        # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
-        turns = [*turn_ids, *self.system.round_turns(space_id, sources)]
-        restated = self.system.restating_turns(space_id, statements, exclude=turns)
-        report = self.system.forget(
+        """遗忘（逻辑见 MemorySystem.forget_memories）；进行中的会话同步去掉被删的内容。"""
+        report = self.system.forget_memories(
             space_id,
-            session_ids=list(session_ids),
-            turn_ids=list(dict.fromkeys(turns)),
-            restated_turn_ids=restated,
+            session_ids=session_ids,
+            turn_ids=turn_ids,
+            fact_ids=fact_ids,
+            media_ids=media_ids,
         )
-        report = replace(report, restated=len(restated))
-        for _ in range(REGROW_ROUNDS if statements else 0):
-            regrown = self.system.regrown_facts(space_id, statements)
-            if not regrown:
-                break
-            more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
-            report = report.merged(
-                replace(self.system.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
-            )
         for session in self.open_sessions(space_id):
             self.agent.prune(session)
         return report
