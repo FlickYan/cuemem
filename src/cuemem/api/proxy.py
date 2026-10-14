@@ -6,8 +6,8 @@
 对标 Mem0 的 proxy（OpenAI 兼容的包装）与 Supermemory 的 Memory Router（改 base URL 的透明代理）。
 它们每一轮都检索；这里每一轮先过检索控制器（N7）：
 
-1. **想起**：对最后一句用户消息跑控制器，选 L0（不检索，只给画像）/ L1 / L2；当前会话里已经
-   写进记忆的轮在请求里原样存在，检索时排除；
+1. **想起**：对最后一句用户消息跑控制器，选 L0（不检索，只给画像）/ L1 / L2；当前会话里
+   已经写进记忆、并且原样还在请求里的轮，检索时排除；
 2. **注入**：取到的画像、带有效期的事实与对话片段排成和 reader 相同的证据块，放在最后一句
    用户消息的前面（与 Mem0 的 proxy 相同的位置）；系统提示与之前的消息不动，
    供应商的前缀缓存照常命中；
@@ -18,7 +18,9 @@
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-042）。
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent）；会话：请求头
-X-CueMem-Session，不给时按空闲间隔自动切分。都没有又没配默认用户时，请求原样转发、不碰记忆。
+X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）或者空闲
+超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
+都没有用户、又没配默认用户时，请求原样转发、不碰记忆。
 """
 
 from __future__ import annotations
@@ -173,12 +175,20 @@ class MemoryProxy:
         for run in runs:
             self.system.close_session(run.space, run.session_id)
 
-    def _run(self, space: str, explicit: str | None) -> Run:
+    def _run(self, space: str, explicit: str | None, *, fresh: bool = False) -> Run:
+        """这次请求属于哪个会话。fresh：请求里没有之前的对话（调用方开始了新的一段），
+        没指定会话时结束上一段、开新的一段——会话的边界跟着调用方的对话走。"""
         now = self._clock()
         self.close_idle()
         key = (space, explicit)
         with self._lock:
             run = self._runs.get(key)
+            if run is not None and fresh and explicit is None:
+                self._runs.pop(key)
+                ended: Run | None = run
+                run = None
+            else:
+                ended = None
             if run is None:
                 when = datetime.now()
                 sid = explicit or f"proxy-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
@@ -186,7 +196,9 @@ class MemoryProxy:
                 self._runs[key] = run
                 self.system.open_session(space, sid)  # 进行中：每轮照常写入，但不抽取
             run.last_seen = now
-            return run
+        if ended is not None:
+            self.system.close_session(ended.space, ended.session_id)
+        return run
 
     # ---------- 内部 ----------
 
@@ -208,7 +220,8 @@ class MemoryProxy:
         space = space_for(user_id, agent_id)
         explicit = headers.get("x-cuemem-session")
         session = _SESSION_ID.sub("_", explicit)[:80] if explicit else None
-        run = self._run(space, session)
+        earlier = [m for m in messages[:-1] if m.get("role") in ("user", "assistant")]
+        run = self._run(space, session, fresh=not earlier)
         turn = Turn(space=space, user_id=user_id, agent_id=agent_id, run=run)
         last = messages[-1]
         if last.get("role") != "user":  # 工具调用的后续请求：只写回回答
@@ -217,10 +230,13 @@ class MemoryProxy:
         query = _text(last.get("content"))
         if not query.strip() or not self.system.db.get_sessions(space):
             return turn
-        rounds = self.system.db.list_units(space, kinds=["round"], session_ids=[run.session_id])
         now = datetime.now()
         recall = self.system.retrieve(
-            space, query, question_time=now, mode=self.mode, exclude=[u.id for u in rounds]
+            space,
+            query,
+            question_time=now,
+            mode=self.mode,
+            exclude=self._in_context(space, run.session_id, earlier),
         )
         turn.level = recall.level.upper()
         if recall.decision is not None:
@@ -237,6 +253,18 @@ class MemoryProxy:
             turn.block = "\n\n".join([MEMORY_NOTE, *blocks])
         record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
         return turn
+
+    def _in_context(self, space: str, session_id: str, earlier: list[dict[str, Any]]) -> list[str]:
+        """当前会话里已经原样在请求中的轮（检索时排除，名额留给请求里没有的）。按内容比对：
+        调用方可能删减了历史，或者在同一会话里开了别的对话，不能假定写进去的都还在。"""
+        present = {_text(m.get("content")).strip() for m in earlier}
+        rounds = self.system.db.list_units(space, kinds=["round"], session_ids=[session_id])
+        turns = {t.id: t for t in self.system.db.get_turns(space, session_id)}
+        return [
+            u.id
+            for u in rounds
+            if all(t in turns and turns[t].text.strip() in present for t in u.source_turn_ids)
+        ]
 
     def _upstream(self, body: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, str]]:
         """请求体 → 上游的请求体、地址与鉴权头。model 是配置里的别名或模型 ID，否则用默认模型。"""

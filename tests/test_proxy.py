@@ -72,9 +72,13 @@ def client(proxy: MemoryProxy) -> Iterator[TestClient]:
         yield test_client
 
 
-def chat(client: TestClient, text: str, **extra: Any) -> Any:
+def chat(
+    client: TestClient, text: str, history: list[dict[str, Any]] | None = None, **extra: Any
+) -> Any:
+    """发一句话；history 是这段对话之前的消息（不给时是一段新对话的第一句）。"""
     headers = extra.pop("headers", {})
-    body = {"model": "qwen3.8-flash", "messages": [SYSTEM, {"role": "user", "content": text}]}
+    messages = [SYSTEM, *(history or []), {"role": "user", "content": text}]
+    body = {"model": "qwen3.8-flash", "messages": messages}
     return client.post("/v1/chat/completions", json={**body, **extra}, headers=headers)
 
 
@@ -98,8 +102,12 @@ def test_remembers_across_sessions(
     ]
     assert system.facts("alice") == []
 
-    # 同一会话的第二轮：当前会话已经在请求里，检索时排除，没有可注入的记忆
-    second = chat(client, "Recommend a coat", user="alice")
+    # 同一段对话的第二轮：前一轮已经在请求里，检索时排除，没有可注入的记忆
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    second = chat(client, "Recommend a coat", history, user="alice")
     assert second.headers["x-cuemem-session"] == session
     assert "<memory>" not in upstream.proxied[-1]["messages"][-1]["content"]
 
@@ -127,6 +135,21 @@ def test_remembers_across_sessions(
     # 写回的是用户的原话，不带注入的记忆
     stored = system.db.get_turns("alice", third.headers["x-cuemem-session"])
     assert stored[0].text == "Where should I buy winter boots?"
+
+
+def test_a_new_conversation_starts_a_new_session(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    first = chat(client, "I live in Berlin", user="alice")
+    # 30 分钟内开了一段新对话（请求里没有之前的消息）：上一段结束、交给后台抽取；
+    # 上一段的原话已经不在请求里，可以被想起来（原始日志写入后立即可检索）
+    second = chat(client, "Where should I buy winter boots?", user="alice")
+    assert second.headers["x-cuemem-session"] != first.headers["x-cuemem-session"]
+    assert "I live in Berlin" in upstream.proxied[-1]["messages"][-1]["content"]
+    assert first.headers["x-cuemem-session"] not in system.open_sessions("alice")
+    assert system.worker is not None
+    system.worker.wait()
+    assert "The user lives in Berlin." in {f.statement for f in system.facts("alice")}
 
 
 def test_streaming_is_relayed_and_written_back(

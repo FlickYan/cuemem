@@ -1,0 +1,37 @@
+# CueMem + Qdrant 服务端（N12）。本地模式的向量库同一时间只能被一个进程打开、规模大了会变慢（D-005、
+# D-056）；这里改用 Qdrant 服务端。
+#   cp .env.example .env    # 填 Key（或者 CUEMEM_PRESET=ollama，不要 Key）
+#   docker compose up -d
+#   界面 http://localhost:7860/ · 接口文档 /docs · OpenAI 兼容的记忆代理 http://localhost:7860/v1
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    volumes:
+      - qdrant-storage:/qdrant/storage
+
+  cuemem:
+    build: .
+    image: cuemem:latest
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    ports:
+      - "7860:7860"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CUEMEM_VECTOR_STORE__URL: http://qdrant:6333
+      CUEMEM_PRESET: ${CUEMEM_PRESET:-}
+      CUEMEM_API_TOKEN: ${CUEMEM_API_TOKEN:-}
+      # 用宿主机上的 Ollama 时：
+      # CUEMEM_PROVIDERS__OLLAMA__BASE_URL: http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - cuemem-data:/data
+
+volumes:
+  qdrant-storage:
+  cuemem-data:
