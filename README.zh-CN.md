@@ -3,11 +3,11 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-[English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/XbGL0nc12-I)
+[English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
 > N0–N11 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署）。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
-<a href="https://youtu.be/XbGL0nc12-I"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
+<a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
 
 ![演示：跨会话回忆、尺码的更新、按八月的照片找同款、预算的变化与遗忘](docs/assets/demo.gif)
 

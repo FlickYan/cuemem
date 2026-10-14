@@ -2,7 +2,7 @@
 
 **Cue-driven, self-regulating, multimodal long-term memory for LLM agents**
 
-English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/XbGL0nc12-I)
+English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/HbGS0_Yo4kI)
 
 CueMem gives an LLM agent a memory that lasts across months of conversations:
 
@@ -13,7 +13,7 @@ CueMem gives an LLM agent a memory that lasts across months of conversations:
 
 The question the project studies is **who should decide whether to recall, and how deeply**. One option is the LLM itself, calling a search tool. The other is a cheap, trainable controller that runs before the LLM is called and never calls an LLM itself. CueMem builds the controller, evaluates both approaches on three public benchmarks under a frozen protocol, and reports where each one wins.
 
-<a href="https://youtu.be/XbGL0nc12-I"><img alt="CueMem in 60 seconds: watch the intro on YouTube" src="docs/assets/video-thumbnail.png" width="720"></a>
+<a href="https://youtu.be/HbGS0_Yo4kI"><img alt="CueMem in 60 seconds: watch the intro on YouTube" src="docs/assets/video-thumbnail.png" width="720"></a>
 
 ![A shopping assistant that remembers: cross-session recall, a changed shoe size, finding the pair from a photo shared in August, a budget that changed, and forgetting a fact](docs/assets/demo.gif)
 
