@@ -2,7 +2,7 @@
 
 **Cue-driven, self-regulating, multimodal long-term memory for LLM agents**
 
-English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/HbGS0_Yo4kI)
+English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [vs. Mem0, Letta, Zep…](docs/en/landscape.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/HbGS0_Yo4kI)
 
 CueMem gives an LLM agent a memory that lasts across months of conversations:
 
@@ -18,6 +18,42 @@ The question the project studies is **who should decide whether to recall, and h
 ![A shopping assistant that remembers: cross-session recall, a changed shoe size, finding the pair from a photo shared in August, a budget that changed, and forgetting a fact](docs/assets/demo.gif)
 
 *The demo: Cue, a shopping assistant, on its third chat with a user. It recalls her across sessions, knows her shoe size changed, finds look-alikes of a photo she shared two months earlier, explains how her budget changed (with citations), and forgets a fact on request. The right-hand panel shows what the controller chose and why, what went into the context, and which memories the answer cites.*
+
+## Use it
+
+As a library, with the same method names as Mem0:
+
+```python
+from cuemem import Memory
+
+# OPENAI_API_KEY; "ollama" runs locally with no key; leave it out for DeepSeek + Qwen
+m = Memory(preset="openai")
+
+# Written online, extracted into facts; returns ADD / UPDATE events
+events = m.add("I moved to Munich last month.", user_id="alice", wait=True)["results"]
+
+m.search("Where do I live now?", user_id="alice")  # the controller decides how deeply to recall
+m.answer("Where do I live now?", user_id="alice")  # an answer that cites the facts it used
+m.history(events[0]["id"])  # every version of the fact: when and why it changed
+m.delete(events[0]["id"], dry_run=True)  # what forgetting would delete, before deleting anything
+```
+
+Or as a drop-in proxy for any app that uses an OpenAI-compatible API, with no code changes beyond the base URL:
+
+```bash
+uv run cuemem --preset openai proxy          # http://127.0.0.1:8787/v1
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="unused")
+messages = [{"role": "user", "content": "Any tips for my next running shoes?"}]
+client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="alice")
+# Response headers say what the controller did: X-CueMem-Level: L0 (no recall) / L1 / L2
+```
+
+Also: an HTTP API with a memory browser (`cuemem serve`), an MCP server, export and import of a user's memory (`cuemem export / import`), and a Docker image (`docker compose up`). See [Quick start](#quick-start) and the [examples](examples/).
 
 ## Results at a glance
 
@@ -94,9 +130,23 @@ The full analysis is in the [technical report](docs/en/report.md): controller be
   - the trace UI shows every decision;
   - there is also an HTTP API and an MCP server.
 
+## How CueMem compares
+
+Checked against twelve open-source memory projects on 2026-10-14; the full comparison, with sources and every project's self-reported scores, is in [docs/en/landscape.md](docs/en/landscape.md).
+
+| | CueMem | Mem0 | Letta | Graphiti / Zep | Supermemory |
+|---|---|---|---|---|---|
+| Who decides to recall | **A trainable controller**, before the LLM is called (L0 / L1 / L2, photos or not) | The app (`search`); the proxy recalls every turn | The LLM, through tools | The app (`search`) | The app, or every turn through its proxy / middleware |
+| When a fact changes | Invalidated, not deleted; two timelines; `history()` | v3 is add-only | The LLM rewrites a block | Invalidated, not deleted; two timelines | Newest wins, history kept |
+| Images | Originals kept and looked at again at answer time | Turned into text | Not seen | Text and JSON only | OCR |
+| Forgetting | Deletes the source conversation, follows citations, finds uncited restatements; dry run | `delete` | Edit memory | `remove_episode` | `forget_matching`, dry run |
+| Evaluation | Frozen methods, test sets used once, external baseline under the same judge | Own benchmark repo | Blog | Paper | Own |
+
+CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, no framework integrations yet ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
+
 ## Quick start
 
-Requires Python 3.12 and [uv](https://docs.astral.sh/uv/). The models are DeepSeek and Qwen (via QwenCloud) behind OpenAI-compatible APIs.
+Requires Python 3.12 and [uv](https://docs.astral.sh/uv/). The default models are DeepSeek and Qwen (via QwenCloud) behind OpenAI-compatible APIs; `--preset openai` switches everything to OpenAI, and `--preset ollama` runs everything locally without keys (run `ollama pull llama3.1:8b` and `ollama pull nomic-embed-text` first).
 
 ```bash
 uv sync                                   # install
@@ -111,6 +161,8 @@ uv run cuemem ask "Where do I work now?" --space demo-en --at 2025-10-10 --show-
 uv run cuemem ask "How many times have I changed jobs?" --space demo-en --mode auto --show-context
 uv run cuemem forget --space demo-en --session s4             # derived facts, vectors and caches go too
 uv run cuemem usage --today                                   # calls and cost
+uv run cuemem export --space demo-en -o demo-en.json          # raw log + photos; import elsewhere with cuemem import
+uv run cuemem --preset ollama doctor                          # the same commands work with any preset
 ```
 
 Command-line messages are in Chinese. The agent, the web UI, the demo and the MCP tools are in English. Without API keys you can still try writing and retrieval offline with hash embeddings (`CUEMEM_EMBEDDING__BACKEND=hash`); answering still needs an LLM.
@@ -123,6 +175,8 @@ uv run cuemem serve                       # UI at http://127.0.0.1:7860/ , API d
 uv run cuemem chat --space me             # chat in the terminal; "/image path text" attaches a photo
 uv run cuemem demo demo/shop/script.json --fresh   # replay the whole script with 14 checks
 claude mcp add cuemem -- uv --directory "$PWD" run cuemem mcp --space me   # memory as MCP tools
+uv run cuemem proxy                       # OpenAI-compatible memory proxy at http://127.0.0.1:8787/v1
+uv run python examples/quickstart.py --preset openai   # the SDK in one script
 ```
 
 Evaluation and reproduction:
@@ -136,7 +190,7 @@ uv run python scripts/reproduce.py --only N9      # the final evaluation (near-f
 
 Development: `uv run pytest` (offline, no keys), `uv run pytest -m live` (needs keys), `uv run ruff check . && uv run mypy`.
 
-Deployment (N11). By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory. For more, run a Qdrant server and protect the API with a token:
+Deployment (N11, N12). By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory. Installed with pip, it keeps its data in `~/.cuemem` (`CUEMEM_HOME` to change it). `docker compose up -d` runs the UI, the HTTP API and the memory proxy on port 7860 with a Qdrant server. Without Docker, run a Qdrant server and protect the API with a token:
 
 ```bash
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1
@@ -150,11 +204,14 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 
 | Path | What is there |
 |---|---|
+| `src/cuemem/sdk.py` | The Python SDK (`Memory`, `AsyncMemory`), shaped like Mem0's |
+| `src/cuemem/configs/` | Default config and presets (`openai`, `ollama`), shipped in the package |
 | `src/cuemem/write/` | Online writer; consolidation: extraction, entity linking, fact reconciliation, captions, profile |
 | `src/cuemem/read/` | Naive, L1 and L2 retrieval; probe; controller; reader; agentic reader |
 | `src/cuemem/store/` | SQLite (log and derived memory), Qdrant local (vectors), content-addressed media |
 | `src/cuemem/llm/`, `embed/` | Model clients with response cache, cost ledger, off-peak scheduling; embeddings |
-| `src/cuemem/agent/`, `api/` | Agent loop and context assembly; HTTP API, Gradio UI, MCP server, demo replay |
+| `src/cuemem/agent/`, `api/` | Agent loop and context assembly; HTTP API, Gradio UI, MCP server, OpenAI-compatible memory proxy, demo replay |
+| `src/cuemem/portable.py` | Export and import of a memory space |
 | `src/cuemem/evals/` | Datasets, splits, runner, judge, metrics, routing analysis |
 | `scripts/` | Experiment scripts for every node, `reproduce.py`, figure generators |
 | `docs/` | Report, design, decisions, roadmap, per-node results |
@@ -166,10 +223,11 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 | Technical report: system, final results, controller, readers, ablations, errors, lessons | [English](docs/en/report.md) · [中文](docs/report.md) |
 | Design: motivation, architecture, controller, multimodal memory, evaluation plan | [English](docs/en/design.md) · [中文](docs/design.md) |
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
-| Decision records (57 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| Comparison with open-source peers: capabilities, published scores, what N12 borrowed, what is missing | [English](docs/en/landscape.md) · [中文](docs/landscape.md) |
+| Decision records (64 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
 | Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 
-The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
+The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
 
 ## Licence
 

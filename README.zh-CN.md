@@ -3,13 +3,49 @@
 **线索驱动、可自我调控的多模态 Agent 长期记忆系统**
 *Cue-driven, metacognitive, multimodal long-term memory for LLM agents*
 
-[English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
+[English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [与 Mem0、Letta、Zep 等的对比](docs/landscape.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
-> N0–N11 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署）。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 <a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
 
 ![演示：跨会话回忆、尺码的更新、按八月的照片找同款、预算的变化与遗忘](docs/assets/demo.gif)
+
+## 用法
+
+当作库用，方法名与 Mem0 相同（N12）：
+
+```python
+from cuemem import Memory
+
+# OPENAI_API_KEY；"ollama" 全部跑在本机、不要 Key；不填用 DeepSeek + 通义
+m = Memory(preset="openai")
+
+# 在线写入、抽取成事实；返回 ADD / UPDATE 事件
+events = m.add("我上个月搬到了慕尼黑。", user_id="alice", wait=True)["results"]
+
+m.search("我现在住哪？", user_id="alice")  # 检索控制器决定要不要想起、想多深
+m.answer("我现在住哪？", user_id="alice")  # 回答并引用用到的事实
+m.history(events[0]["id"])  # 这条事实的每个版本：何时、为什么变了
+m.delete(events[0]["id"], dry_run=True)  # 先预演遗忘会删掉什么，再真的删
+```
+
+或者当作 OpenAI 兼容的记忆代理：应用只改 base_url，代码不动。
+
+```bash
+uv run cuemem --preset openai proxy          # http://127.0.0.1:8787/v1
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="unused")
+messages = [{"role": "user", "content": "下一双跑鞋有什么建议？"}]
+client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="alice")
+# 响应头里写着控制器的决定：X-CueMem-Level: L0（不检索）/ L1 / L2
+```
+
+另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server、记忆的导出与导入（`cuemem export / import`），以及 Docker 镜像（`docker compose up`）。示例见 [examples/](examples/)。
 
 ## 它要解决什么
 
@@ -45,9 +81,23 @@
 - N0 规划里的 L1 重排、L2 图扩散、证据不足时自动升级都实现了，但实测没有收益或收益不抵成本，默认关闭。
 - **部署**：默认用嵌入式的 SQLite 与 Qdrant 本地模式，单进程；可以切到 Qdrant 服务端（见下），HTTP 接口可选访问令牌。
 
+## 与同类项目的比较
+
+2026-10-14 与 12 个开源记忆项目逐项核对过，完整的对比、来源与各家自己报告的分数见 [docs/landscape.md](docs/landscape.md)。
+
+| | CueMem | Mem0 | Letta | Graphiti / Zep | Supermemory |
+|---|---|---|---|---|---|
+| 谁决定要不要想起 | **可训练的控制器**，在调用 LLM 之前（L0 / L1 / L2，看不看原图） | 应用调用 `search`；代理每轮都检索 | LLM 自己调工具 | 应用调用 `search` | 应用，或代理 / 中间件每轮注入 |
+| 事实变了怎么办 | 失效而不删除，两条时间轴，`history()` | v3 只增不改 | LLM 改写记忆块 | 失效而不删除，两条时间轴 | 新的取代旧的，保留历史 |
+| 图片 | 保存原图，回答时取回再看 | 转成文字 | 未见 | 只支持文本与 JSON | OCR |
+| 遗忘 | 删出处的对话、沿引用扩散、找没有引用的转述；可预演 | `delete` | 编辑记忆 | `remove_episode` | `forget_matching`，可预演 |
+| 评测 | 方法事先冻结、测试集只用一次、同一判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
+
+CueMem 的短板在产品层：只有 Python、只支持 SQLite + Qdrant、只有一个共享的访问令牌、还没有框架集成（见[还差什么](docs/landscape.md#7-还差什么)）。
+
 ## 快速开始
 
-需要 Python 3.12 与 [uv](https://docs.astral.sh/uv/)。模型使用 DeepSeek 与通义千问的 API（OpenAI 兼容接口；通义经 QwenCloud 接入）。
+需要 Python 3.12 与 [uv](https://docs.astral.sh/uv/)。默认模型是 DeepSeek 与通义千问的 API（OpenAI 兼容接口；通义经 QwenCloud 接入）；`--preset openai` 全部换成 OpenAI，`--preset ollama` 全部跑在本机、不要 Key（先 `ollama pull llama3.1:8b` 与 `ollama pull nomic-embed-text`）。
 
 ```bash
 uv sync                                  # 安装依赖，创建 .venv
@@ -61,6 +111,8 @@ uv run cuemem ask "我一共换过几次工作？" --space demo --mode auto --sh
 uv run cuemem ask "我一共换过几次工作？" --space demo --mode auto --router hybrid --lam 10   # 拿不准时问 LLM；λ 越小越舍得花钱
 uv run cuemem forget --space demo --session s4   # 遗忘一段会话：派生的事实、向量、缓存一并清除
 uv run cuemem usage --today              # 调用量与成本（名义成本 / 估算花费）
+uv run cuemem forget --space demo --fact <事实ID> --dry-run   # 预演：会删哪些发言、哪些事实随之消失
+uv run cuemem export --space demo -o demo.json   # 导出原始日志与原图；在别处用 cuemem import 导入、重新巩固
 uv run cuemem search-image photo.jpg --space demo   # 以图搜图："我之前给你看过这个吗？"
 uv run cuemem data download              # 下载评测数据集（LongMemEval_S、LoCoMo、MemLens 32K / 128K 与图片）
 uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4）；dev100 为正式开发集
@@ -76,11 +128,13 @@ uv run cuemem serve                      # 界面 http://127.0.0.1:7860/ ，接�
 uv run cuemem chat --space me            # 在终端里对话；/image 路径 文字 附图，/end 结束会话并巩固
 uv run cuemem demo demo/shop/script.json --fresh   # 整段剧本回放并核对（14 项检查）
 claude mcp add cuemem -- uv --directory "$PWD" run cuemem mcp --space me   # 把记忆作为 MCP 工具交给 Claude Code
+uv run cuemem proxy                      # OpenAI 兼容的记忆代理：http://127.0.0.1:8787/v1（N12）
+uv run python examples/quickstart.py --preset openai   # SDK 的完整示例
 ```
 
 演示步骤见 [demo/README.md](demo/README.md)。
 
-部署相关（N11）：
+部署相关（N11、N12）。pip 安装后数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`docker compose up -d` 在 7860 端口同时提供界面、接口与记忆代理，并带一个 Qdrant 服务端。不用 Docker 时：
 
 ```bash
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1        # Qdrant 服务端（本地模式同一时间只允许一个进程打开数据目录）
@@ -106,6 +160,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [设计文档](docs/design.md)（[English](docs/en/design.md)） | 动机、架构、检索控制器、多模态、评测方案、技术选型 |
 | [路线图](docs/roadmap.md) | 实施节点、验收标准、进度 |
 | [相关工作](docs/related-work.md) | 与 MemGPT、Mem0、Zep、HippoRAG、Adaptive-RAG、MemLens 等的对比与定位 |
+| [开源同类项目](docs/landscape.md)（[English](docs/en/landscape.md)） | 与 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 等 12 个项目逐项对比；各家公开的分数；N12 借鉴了什么、还差什么 |
 | [设计决策记录](docs/decisions.md)（[English](docs/en/decisions.md)） | 每个重要取舍的背景、备选方案与理由 |
 | [演示指南](demo/README.md)（[English](demo/README.en.md)） | 3 分钟演示：准备、步骤、讲什么 |
 
@@ -133,6 +188,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N9 | 完整评测与分析 | 已完成 |
 | N10 | 包装 | 已完成 |
 | N11 | 测试集之后的补做 | 已完成 |
+| N12 | 对标开源同类项目：SDK、记忆代理、预设、导出导入、Docker | 已完成 |
 
 ## 结果
 

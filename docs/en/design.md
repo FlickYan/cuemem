@@ -767,15 +767,18 @@ rag/
 │   ├── write/         # online write, consolidation (extraction / linking / reconciliation / summaries / profile / captions)
 │   ├── read/          # probe, controller, L1, L2, reranking, reader, memory tools
 │   ├── agent/         # hand-written agent loop: context assembly, tools, sessions; the shopping scenario
-│   ├── api/           # service layer, FastAPI, Gradio UI, MCP server, demo replay
+│   ├── api/           # service layer, FastAPI, Gradio UI, MCP server, demo replay; OpenAI-compatible memory proxy (N12)
+│   ├── configs/       # YAML configuration: defaults and presets (openai, ollama), shipped in the package (N12)
 │   ├── memory.py      # facade: write, consolidate, retrieve, answer, forget
+│   ├── sdk.py         # Python SDK: Memory / AsyncMemory, shaped like Mem0's (N12)
+│   ├── portable.py    # export and import of a memory space (N12)
 │   └── evals/         # evaluation: datasets, splits, methods, judge, runner, metrics, reports, routing analysis
 ├── evals/             # development / test splits and the mixed stream (committed)
 ├── demo/shop/         # demo: product catalogue, generated images, script
-├── examples/          # toy conversations (English and Chinese)
+├── examples/          # toy conversations (English and Chinese); SDK and memory-proxy examples (N12)
 ├── tests/
-├── src/cuemem/configs/  # YAML configuration: defaults and presets (openai, ollama), shipped in the package (N12)
 ├── scripts/           # experiment and report scripts for every node, reproduce.py
+├── Dockerfile, docker-compose.yml   # container image; CueMem + a Qdrant server (N12)
 └── docs/
 ```
 

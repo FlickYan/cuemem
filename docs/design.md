@@ -684,14 +684,18 @@ rag/
 │   ├── write/         # 在线写入、异步巩固（抽取 / 消歧 / 对账 / 摘要 / 画像 / 图片描述）
 │   ├── read/          # 探针、控制器、L1、L2、重排、Reader、记忆工具
 │   ├── agent/         # 自研 agent loop：上下文装配、工具、会话；导购场景（N8）
-│   ├── api/           # 服务层、FastAPI、Gradio 界面、MCP Server、剧本回放（N8）
+│   ├── api/           # 服务层、FastAPI、Gradio 界面、MCP Server、剧本回放（N8）；OpenAI 兼容的记忆代理（N12）
+│   ├── configs/       # YAML 配置：默认配置与预设（openai、ollama），随包发布（N12）
 │   ├── memory.py      # 门面：写入、巩固、检索、回答、遗忘
+│   ├── sdk.py         # Python SDK：Memory / AsyncMemory，接口形状照 Mem0（N12）
+│   ├── portable.py    # 记忆空间的导出与导入（N12）
 │   └── evals/         # 评测：数据加载、划分、方法、判分、运行器、指标、报告、路由分析
 ├── evals/             # 开发集 / 测试集划分、混合流（提交进仓库）
 ├── demo/shop/         # 演示：商品目录、生成的图片、剧本（N8）
+├── examples/          # 示例对话（中英）、SDK 与记忆代理的示例（N12）
 ├── tests/
-├── src/cuemem/configs/  # YAML 配置：默认配置与预设（openai、ollama），随包发布（N12）
 ├── scripts/           # 各节点的实验与报告脚本
+├── Dockerfile, docker-compose.yml   # 容器镜像；CueMem + Qdrant 服务端（N12）
 └── docs/
 ```
 

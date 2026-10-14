@@ -67,6 +67,11 @@
 | D-057 | 门控在真实流量上的检验：WildChat 里真实用户消息的第一句 | 已采纳（N11） |
 | D-058 | 控制器 v3：有图的空间里，只在问到图时才看图 | 已采纳（N11 之后） |
 | D-059 | 遗忘留下的空缺在重新抽取时标出来；挨着空缺的代词不套到别人身上 | 已采纳（N11 之后） |
+| D-060 | 换模型供应商：配置随包发布、数据目录、预设（openai、ollama）与 OpenAI 兼容的向量接口；Docker | 已采纳（N12） |
+| D-061 | Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义（版本链、控制器、遗忘） | 已采纳（N12） |
+| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12） |
+| D-063 | 导出与导入只搬原始日志；遗忘可以预演 | 已采纳（N12） |
+| D-064 | 抽取的补充说明（custom instructions） | 已采纳（N12） |
 
 ## D-001 检索时机与深度由解耦的控制器决定，而不是由 LLM 自主决定
 
@@ -941,3 +946,85 @@
   - 同样重建的会话，第一版说明有 7 / 12 次写成"某人"；把"挨着空缺的代词"写明、并声明优先于"用名字"之后，8 / 8 次都写成"某人"。同一段里的升职、预算 $180、换 40 码照常抽出。
   - 在沙盒里按原来"给她买"的剧本建好记忆，再照界面上的流程只遗忘生日这一条：删了 3 条发言，事实 15 → 12，登山杖那条重新抽成"Maya 给别人买了登山杖"。
   - 演示剧本保留"给 Ana 买"，因为 README 动图是按它录的。
+
+## D-060 换模型供应商：配置随包发布、数据目录、预设与 OpenAI 兼容的向量接口
+
+- **状态**：已采纳（N12）
+- **背景**：对照 Mem0、Graphiti、Cognee（[对比](landscape.md)），CueMem 拿来就用的门槛很高。
+  - 默认配置在仓库的 `configs/` 里，相对路径以仓库根目录为基准：pip 安装后找不到配置，数据也会往 site-packages 旁边写。
+  - 模型只有 DeepSeek 与通义；向量只认通义的原生接口。没有 OpenAI，也没有不要 Key 的本地模型。
+  - 客户端每次请求都带 `temperature` 与 `max_tokens`，OpenAI 的推理模型（GPT-5 系列）会拒绝。
+- **决策**：
+  1. 默认配置移到 `src/cuemem/configs/`，随包发布。数据目录：`CUEMEM_HOME` 优先；在源码仓库里运行时仍是仓库根目录（data/、runs/ 与之前一样）；安装后是 `~/.cuemem`。`.env` 也放在数据目录。
+  2. 预设（`configs/presets/*.yaml`）与默认配置深度合并：`openai`（gpt-5.4-mini + text-embedding-3-small）、`ollama`（llama3.1:8b + nomic-embed-text，与 Mem0 文档的本地示例相同，不要 Key）。用 `CUEMEM_PRESET`、`cuemem --preset` 或 `Memory(preset=...)` 选。默认的供应商仍在配置里，`configure` 只问用得到的 Key，`doctor` 标出没用到的。
+  3. `embedding.backend: openai`：OpenAI 兼容的 `/embeddings`，地址取供应商的 base_url。只有 dense 向量，关键词检索本来就由本地 BM25 承担（D-026）。返回的维度与配置不符时明确报错。
+  4. 模型目录可以声明参数差异：`fixed_temperature`（不带 temperature）、`max_tokens_param`（`max_completion_tokens`）。供应商的 `api_key_env` 可以为空（本地服务）；重排与图片向量可以关掉（`rerank.provider: null`、`multimodal_embedding.backend: none`）；回答模型不能看图时只给文字描述、不附原图。
+  5. Docker 镜像（数据卷 `/data`，非 root）与 compose（加 Qdrant 服务端）。
+- **备选**：
+  - 接 LiteLLM，一次支持上百种模型：多一层依赖与一套参数约定；本项目的模型调用已经统一在 OpenAI 兼容接口上，缺的只是向量接口与几处参数差异。
+  - 把预设写成 Python 字典：YAML 与默认配置同一种写法，用户可以照着写自己的预设（`--preset path/to/my.yaml`）。
+- **后果**：
+  - 默认配置下的请求逐字不变（参数顺序也不变），已有的 LLM 与向量缓存照常命中；`tests/test_providers.py` 专门测了这一点。
+  - 用构建出的 wheel 在仓库外验证过：数据目录落在 `~/.cuemem`，预设生效。Docker 镜像在本地构建并运行过：容器里的 SDK、HTTP 导入与召回、compose 下的 Qdrant 服务端都正常。
+  - **局限**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上评测；价格按 OpenRouter 转列的标价记（开发环境访问不了 OpenAI 官网）。巩固的相似度阈值按通义向量调过（N3），换向量模型后可能偏松或偏紧；单值事实遇到同谓词总会交给 LLM 判断，影响有限。换了向量模型的数据目录不能混用：数据库记着建库时的向量模型，打开时报 ConfigMismatchError。
+
+## D-061 Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义
+
+- **状态**：已采纳（N12）
+- **背景**：Mem0 的 `Memory().add(...)` / `.search(...)` 几乎成了这类库的通用接口；CueMem 只有 `MemorySystem` 这个内部门面，要先构造 `Conversation`、`SessionIn`，再理解空间、巩固与档位。
+- **决策**：`from cuemem import Memory`（另有 `AsyncMemory`、`Memory.from_config`）。
+  1. 方法名与返回形状照 Mem0：`add / search / get_all / get / history / delete / delete_all`，结果是 `{"results": [...]}`，每条带 `memory` 文本；兼容 Mem0 v3 的 `filters={"user_id": ...}` 与 `top_k=`。
+  2. 作用域：`user_id`、`agent_id` 合起来定一个记忆空间（`alice`、`agent/shop`、`shop/alice`），`run_id` 是空间里的一个会话。`add` 接受 OpenAI 格式的消息（内容块里的图片可以是 data URL 或本地路径）。
+  3. 语义保持 CueMem 的：
+     - `add` 先在线写入（不调用 LLM，立即可检索），抽取在后台完成；`wait=True` 同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件，UPDATE 附上被取代的旧版本与原因（现实变了 / 说错了）；`infer=False` 只记日志。
+     - 事实不就地改写：`history()` 返回整条版本链；`get_all` 默认只给当前的，`valid_at`、`known_at` 分别按两条时间轴回放。
+     - `search` 先过检索控制器，返回档位与英文理由；L0 表示这句话不需要回忆，只给画像。
+     - `delete` 是被遗忘权：删事实出自的对话与没有引用的转述，再重建；`delete_all` 删除整个空间。
+  4. 遗忘的编排从服务层移到 `MemorySystem.forget_memories`，SDK、HTTP 接口与 MCP 共用。
+- **备选**：照搬 Mem0 的 `update(memory_id, text)`：就地改写一条事实会绕过原始日志，派生记忆就不能再从日志重建（D-021）。要改一条事实，应当像用户那样说一句更正，由对账生成新版本。
+- **后果**：`tests/test_sdk.py` 覆盖写入事件、版本链、按时间轴回放、作用域隔离、图片消息、只记日志再巩固、删除后旧版本恢复、后台抽取与异步版本。返回值与报错用英文，与 HTTP 接口、MCP、界面一致；命令行仍是中文。
+
+## D-062 OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面
+
+- **状态**：已采纳（N12）
+- **背景**：Mem0 的 proxy、Supermemory 的 Memory Router、Memobase 的 OpenAI 补丁都让应用"改个 base_url 就有记忆"，而且每一轮都检索。CueMem 的核心结论正是"不必每轮都检索"：混合流里控制器比总是检索省 41%（真实流量上 46%，D-057）。代理是展示这一点最直接的形态。
+- **决策**：`cuemem proxy`（单独运行，默认端口 8787），`cuemem serve` 也挂上同样的 `/v1/chat/completions` 与 `/v1/models`。
+  1. **身份**：请求体的 `user` 字段或请求头 `X-CueMem-User`（可加 `X-CueMem-Agent`）；都没有、又没配默认用户时原样转发，不碰记忆。
+  2. **想起**：对最后一句用户消息跑控制器。当前会话里已经写进记忆、并且原样还在请求里的轮，检索时排除。
+  3. **注入**：与 reader 相同的证据块（画像、带有效期的事实、按时间排列的对话片段），包在 `<memory>` 里放在最后一句用户消息的开头，与 Mem0 的 proxy 相同的位置。系统提示与之前的消息不动，供应商的前缀缓存照常命中。L0 只给画像，什么都没取到时不加任何东西。
+  4. **转发**：`model` 是配置里的别名或模型 ID，否则用 agent 角色的模型；按模型目录补上供应商特有的参数（关思考模式等）与推理模型的参数差异；流式与非流式都支持，响应原样返回。控制器的决定写在响应头 `X-CueMem-Level / -Reasons / -Recalled / -Session` 里，响应体不加字段（严格的客户端不受影响）。上游出错时原样返回、不写记忆。
+  5. **写回**：用户的话（含 data URL 与本地图片）与回答在线写入。会话进行中不抽取，结束后整段抽取（与 Agent 相同，D-045）。会话的边界：`X-CueMem-Session` 指定；不指定时，请求里没有之前的消息（调用方开始了新的一段对话）或空闲超过 30 分钟就开新会话。
+- **备选**：
+  - 把记忆放进系统提示（Memobase 的补丁）：每轮系统提示都变，前缀缓存全部失效。
+  - 每轮都检索：与 Mem0、Supermemory 相同，但丢掉了控制器的意义。需要时可以 `--mode l1`。
+  - 在响应体里加 `cuemem` 字段：有的客户端严格校验响应结构。
+- **后果**：
+  - `tests/test_proxy.py` 用 TestClient 覆盖跨会话召回与注入、新对话开新会话、流式转发与写回、模型映射、没有用户时原样转发、上游报错、工具调用的后续请求、访问令牌。
+  - 另用官方 OpenAI SDK 端到端跑过（本地假的上游）：非流式、流式、原始响应头、`/v1/models` 都正常。
+  - 端到端时发现一个问题：起初假定当前会话写进去的轮都还在请求里。调用方在空闲时间内开了新的一段对话时，上一段既不在请求里、也不会被检索到。已经改为按内容比对，并且新对话开新会话（上面第 2、5 条）。
+  - **局限**：并行的多段对话不带会话头时会混进同一个会话；网络图片不下载、不写进记忆。
+
+## D-063 导出与导入只搬原始日志；遗忘可以预演
+
+- **状态**：已采纳（N12）
+- **背景**：Letta 的 Agent File、Cognee 的 COGX、MemOS 的 dump / load 都把"记忆可以带走"当作基本能力；Supermemory 与 Redis Agent Memory Server 的遗忘可以先 dry run。CueMem 两样都没有，而遗忘又是不可恢复、会级联的操作。
+- **决策**：
+  1. 导出格式 `cuemem.space`（JSON，version 1）：会话、发言（序号、角色、原文、时间、说话人）与图片原文件（base64）；另附派生记忆的快照（带版本链的事实与画像），只给别的系统读，导入时不用。
+  2. 导入 = 写回原始日志，再由巩固重新生成派生记忆：派生记忆是日志的函数（D-021），换了抽取模型、换了机器也一致，不会搬来一份过期的派生结果。遗忘留下的序号空缺照原样保留（按连续的序号分段写入），重新抽取时照样标出来（D-059）。导入是幂等的。
+  3. 入口：`cuemem export / import`、SDK 的 `export()` / `load()`、HTTP 的 `GET /api/spaces/{space}/export` 与 `POST /api/spaces/import`。
+  4. 遗忘的预演：`cuemem forget --dry-run`（并支持 `--fact`）、SDK 的 `delete(id, dry_run=True)`、HTTP 的 `dry_run`。预演与真正的遗忘共用目标的计算（沿引用扩散、按内容找转述），列出会删的发言与随之消失的事实，什么都不删。
+- **备选**：导出派生记忆、导入时直接写入：快，但事实 ID、实体合并、画像都依赖抽取模型与对账的历史，搬过去就和目标机器上的日志对不上了。
+- **后果**：
+  - 测试覆盖往返（序号空缺、图片哈希与字节、时间、重新抽取、幂等）、格式校验与命令行。
+  - **没有导出的**：回复引用了哪些记忆的溯源表（导入后事实 ID 重新生成，对不上）。因此对导入的空间，遗忘不能沿引用扩散，按内容找转述（D-051）照常工作。
+  - 预演里没有"重建之后又长出来"的那一步（D-051 的 regrown，要真的重建才知道），输出里写明了。
+
+## D-064 抽取的补充说明（custom instructions）
+
+- **状态**：已采纳（N12）
+- **背景**：不同场景要记的东西不同：导购要记尺码、预算与品牌，陪伴类应用要记心情与人际关系。Mem0 有 `custom_instructions`，Graphiti 有 `custom_extraction_instructions` 与自定义实体类型；CueMem 的抽取提示是固定的。
+- **决策**：`consolidation.instructions`（SDK 里 `Memory(instructions=...)`）。它以"应用的补充说明，冲突时优先"的形式追加在抽取的系统提示最后。
+  - **不填时**：提示词逐字不变，巩固配置的指纹也不变（这个字段不计入），已有的抽取缓存与已巩固的空间都不受影响。
+  - **填了以后**：指纹改变，已巩固的空间在下次巩固时重建派生记忆。
+- **备选**：自定义实体与事实类型（Graphiti）：要改输出结构、对账规则与谓词登记表，改动面大；先用文字说明覆盖最常见的需求。
+- **后果**：测试覆盖提示词的拼接、SDK 参数与指纹的变化。没有评测补充说明对抽取质量的影响。

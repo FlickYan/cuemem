@@ -63,6 +63,11 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 | D-057 | The gate on real traffic: first messages of real chatbot conversations (WildChat) | Adopted (N11) |
 | D-058 | Controller v3: in a space with photos, look at them only when the question is about one | Adopted (after N11) |
 | D-059 | Gaps left by forgetting are marked on re-extraction; a pronoun next to a gap is not pinned on someone else | Adopted (after N11) |
+| D-060 | Switching model providers: config shipped in the package, a data directory, presets (openai, ollama), an OpenAI-compatible embedding API; Docker | Adopted (N12) |
+| D-061 | A Python SDK in Mem0's shape, with CueMem's semantics (version chain, controller, forgetting) | Adopted (N12) |
+| D-062 | An OpenAI-compatible memory proxy: the controller decides first, evidence goes before the last user message | Adopted (N12) |
+| D-063 | Export and import move only the raw log; forgetting can be previewed | Adopted (N12) |
+| D-064 | Extra extraction instructions (custom instructions) | Adopted (N12) |
 
 ## D-001 A separate controller decides when and how deeply to retrieve, not the LLM
 
@@ -647,3 +652,101 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
   - On the same rebuilt chat, the first wording of the note gave "someone" 7 times out of 12. Naming "a pronoun next to a gap" and stating that the note overrides the names rule gave "someone" 8 out of 8. The promotion, the $180 budget and the switch to EU 40 were still extracted.
   - In a sandbox built from the original script ("for her"), forgetting only the birthday fact, as in the UI, deleted 3 messages and took facts from 15 to 12. The poles fact was re-extracted as "Maya purchased trekking poles for someone else."
   - The demo script keeps "for Ana", since the README GIF was recorded with it.
+
+## D-060 Switching model providers: config shipped in the package, a data directory, presets and an OpenAI-compatible embedding API
+
+- **Status:** adopted (N12).
+- **Context:** compared with Mem0, Graphiti and Cognee ([comparison](landscape.md)), CueMem was hard to pick up and use.
+  - The default config lived in the repository's `configs/`, and relative paths resolved against the repository root. A pip-installed copy could not find its config and would write data next to site-packages.
+  - The only models were DeepSeek and Qwen, and embeddings only went through Qwen's native API. There was no OpenAI and no local model that runs without a key.
+  - Every request carried `temperature` and `max_tokens`, which OpenAI's reasoning models (the GPT-5 family) reject.
+- **Decision:**
+  1. The default config moves to `src/cuemem/configs/` and ships with the package. The data directory is `CUEMEM_HOME` if set; in a source checkout it is still the repository root (data/ and runs/ as before); an installed copy uses `~/.cuemem`. `.env` lives in the data directory too.
+  2. Presets (`configs/presets/*.yaml`) are deep-merged over the default config:
+     - `openai`: gpt-5.4-mini + text-embedding-3-small;
+     - `ollama`: llama3.1:8b + nomic-embed-text, the same local setup as Mem0's docs, with no key.
+     They are chosen with `CUEMEM_PRESET`, `cuemem --preset` or `Memory(preset=...)`. The default providers stay in the config; `configure` asks only for the keys that are used, and `doctor` marks the unused providers.
+  3. `embedding.backend: openai` calls an OpenAI-compatible `/embeddings` at the provider's base_url. It returns dense vectors only; keyword retrieval was already done by the local BM25 (D-026). A dimension that does not match the config is a clear error.
+  4. Optional components:
+     - the model catalogue can declare parameter quirks: `fixed_temperature` (send no temperature) and `max_tokens_param` (`max_completion_tokens`);
+     - a provider's `api_key_env` may be empty (local servers);
+     - reranking and image embeddings can be turned off (`rerank.provider: null`, `multimodal_embedding.backend: none`);
+     - a reader that cannot see images gets the text descriptions only, without the original photos.
+  5. A Docker image (data volume `/data`, non-root) and a compose file that adds a Qdrant server.
+- **Alternatives:**
+  - LiteLLM, for hundreds of models at once: another dependency and another set of parameter conventions. CueMem's model calls already go through one OpenAI-compatible client; what was missing was the embedding API and a few parameter quirks.
+  - Presets as Python dicts: YAML matches the default config, so users can write their own preset the same way (`--preset path/to/my.yaml`).
+- **Consequences:**
+  - Requests under the default config are byte-for-byte unchanged (including parameter order), so existing LLM and embedding caches still hit; `tests/test_providers.py` checks this.
+  - A built wheel was checked outside the repository: data goes to `~/.cuemem` and presets apply. The Docker image was built and run locally: the SDK inside the container, HTTP import and recall, and the Qdrant server under compose all worked.
+  - **Limits:**
+    - The OpenAI and Ollama presets are covered by offline tests only and have not been evaluated on real models.
+    - OpenAI prices are taken from OpenRouter's listing, because the development environment could not reach OpenAI's site.
+    - The consolidation similarity thresholds were tuned on Qwen embeddings (N3) and may be too loose or too strict for another embedding model. The effect is limited: a single-valued fact that meets the same predicate always goes to the LLM.
+    - A data directory cannot mix embedding models: the database records the model it was built with and raises ConfigMismatchError otherwise.
+
+## D-061 A Python SDK in Mem0's shape, with CueMem's semantics
+
+- **Status:** adopted (N12).
+- **Context:** Mem0's `Memory().add(...)` / `.search(...)` has become the common interface for this kind of library. CueMem only had `MemorySystem`, an internal facade: you had to build a `Conversation` and `SessionIn` and understand spaces, consolidation and levels first.
+- **Decision:** `from cuemem import Memory` (plus `AsyncMemory` and `Memory.from_config`).
+  1. Method names and result shape follow Mem0: `add / search / get_all / get / history / delete / delete_all`, returning `{"results": [...]}` with a `memory` text on each item. Mem0 v3's `filters={"user_id": ...}` and `top_k=` are accepted too.
+  2. **Scope:** `user_id` and `agent_id` together name a memory space (`alice`, `agent/shop`, `shop/alice`); `run_id` is one session within it. `add` takes OpenAI-format messages; images in content blocks may be data URLs or local paths.
+  3. **The semantics stay CueMem's:**
+     - `add` writes online first (no LLM call, searchable right away) and extracts in the background. `wait=True` extracts synchronously and returns Mem0-style ADD / UPDATE events; an UPDATE carries the superseded versions and the reason (the world changed / it was a mistake). `infer=False` only logs.
+     - Facts are never rewritten in place. `history()` returns the whole version chain; `get_all` returns current facts by default, and `valid_at` / `known_at` replay either timeline.
+     - `search` goes through the controller and returns the level and reasons in English. L0 means the message needs no recall, so only the profile is returned.
+     - `delete` is the right to be forgotten: it deletes the conversation a fact came from and the uncited restatements, then rebuilds. `delete_all` removes the whole space.
+  4. The orchestration of forgetting moves from the service layer to `MemorySystem.forget_memories`, shared by the SDK, the HTTP API and MCP.
+- **Alternative:** copying Mem0's `update(memory_id, text)`. Rewriting a fact in place bypasses the raw log, and derived memory could no longer be rebuilt from it (D-021). To change a fact, say a correction as a user would, and reconciliation creates the new version.
+- **Consequences:** `tests/test_sdk.py` covers add events, the version chain, replaying either timeline, scope isolation, image messages, logging first and consolidating later, an older version restored after deletion, background extraction and the async variant. Results and errors are in English, like the HTTP API, MCP and UI; the CLI stays in Chinese.
+
+## D-062 An OpenAI-compatible memory proxy: the controller decides first, evidence goes before the last user message
+
+- **Status:** adopted (N12).
+- **Context:** Mem0's proxy, Supermemory's Memory Router and Memobase's OpenAI patch give an app memory "by changing the base_url", and they retrieve on every turn. CueMem's central finding is that every turn does not need retrieval: in a mixed stream the controller costs 41% less than always retrieving (46% on real traffic, D-057). A proxy is the most direct way to show it.
+- **Decision:** `cuemem proxy` runs on its own (port 8787 by default), and `cuemem serve` mounts the same `/v1/chat/completions` and `/v1/models`.
+  1. **Identity:** the request's `user` field or the `X-CueMem-User` header (optionally `X-CueMem-Agent`). Without either and without a default user, the request is forwarded as is and memory is not touched.
+  2. **Recall:** the controller runs on the last user message. Rounds of the current session that are already in memory, and still verbatim in the request, are excluded from retrieval.
+  3. **Injection:** the same evidence block the reader uses (profile, facts with validity, excerpts in time order), wrapped in `<memory>` and put at the start of the last user message, where Mem0's proxy puts it. The system prompt and earlier messages are untouched, so provider prefix caching keeps working. L0 adds the profile only; if nothing was found, nothing is added.
+  4. **Forwarding:**
+     - `model` is a configured alias or model ID; otherwise the agent role's model is used.
+     - Provider-specific parameters (turning thinking off, …) and reasoning-model quirks come from the model catalogue.
+     - Streaming and non-streaming are both supported, and responses are returned as is.
+     - The decision goes in the `X-CueMem-Level / -Reasons / -Recalled / -Session` response headers, not the body, so strict clients are unaffected.
+     - Upstream errors are returned as is and nothing is written.
+  5. **Write-back:** the user's message (with data-URL and local images) and the answer are written online. Nothing is extracted while a session is open; the whole session is extracted when it ends, as in the agent (D-045). Session boundaries come from `X-CueMem-Session`. Without it, a new session starts when the request has no earlier messages (the caller started a new conversation) or after 30 idle minutes.
+- **Alternatives:**
+  - Memory in the system prompt (Memobase's patch): the system prompt changes every turn, so prefix caching never hits.
+  - Retrieving every turn, as Mem0 and Supermemory do: it gives up the point of the controller. Use `--mode l1` if that is wanted.
+  - A `cuemem` field in the response body: some clients validate the response strictly.
+- **Consequences:**
+  - `tests/test_proxy.py` uses TestClient to cover cross-session recall and injection, a new conversation starting a new session, streaming relay and write-back, model mapping, pass-through without a user, upstream errors, tool follow-ups and the access token.
+  - It was also run end to end with the official OpenAI SDK against a local fake upstream: non-streaming, streaming, raw response headers and `/v1/models` all worked.
+  - That end-to-end run found a bug in the first version. It assumed that every round written to the current session was still in the request. When a caller started a new conversation within the idle window, the previous one was neither in the request nor retrievable. It is now compared by content, and a new conversation starts a new session (points 2 and 5 above).
+  - **Limits:** parallel conversations without session headers are merged into one session; image URLs are not downloaded or stored.
+
+## D-063 Export and import move only the raw log; forgetting can be previewed
+
+- **Status:** adopted (N12).
+- **Context:** Letta's Agent File, Cognee's COGX and MemOS's dump / load treat portable memory as a basic capability. Supermemory and Redis Agent Memory Server let you dry-run forgetting. CueMem had neither, and forgetting is irreversible and cascades.
+- **Decision:**
+  1. The export format `cuemem.space` (JSON, version 1) holds sessions, messages (index, role, text, time, speaker) and the original image files (base64). A snapshot of derived memory (facts with their version chains, and the profile) is attached for other systems to read; import ignores it.
+  2. Import writes the raw log back and lets consolidation regenerate derived memory. Derived memory is a function of the log (D-021), so the result is consistent across extraction models and machines, and no stale derived state is carried over. Gaps left by forgetting are preserved (each run of consecutive indices is written separately) and are marked again on re-extraction (D-059). Import is idempotent.
+  3. Entry points: `cuemem export / import`; the SDK's `export()` / `load()`; HTTP `GET /api/spaces/{space}/export` and `POST /api/spaces/import`.
+  4. Forgetting dry run: `cuemem forget --dry-run` (which now also takes `--fact`), the SDK's `delete(id, dry_run=True)`, and `dry_run` in the HTTP API. The preview shares the target computation with real forgetting (following citations, finding restatements by content), lists the messages that would be deleted and the facts that would go with them, and deletes nothing.
+- **Alternative:** exporting derived memory and writing it straight in on import. Faster, but fact IDs, entity merges and the profile depend on the extraction model and the reconciliation history, and would no longer match the target's log.
+- **Consequences:**
+  - Tests cover the round trip (index gaps, image hashes and bytes, times, re-extraction, idempotence), format validation and the CLI.
+  - **Not exported:** the provenance table of which memories each reply cited, since fact IDs are regenerated on import. On an imported space, forgetting therefore cannot follow citations; finding restatements by content (D-051) still works.
+  - The preview lacks the "regrew after rebuilding" step (D-051's regrown facts, which needs a real rebuild); the output says so.
+
+## D-064 Extra extraction instructions (custom instructions)
+
+- **Status:** adopted (N12).
+- **Context:** different apps need different things remembered: a shopping assistant needs sizes, budgets and brands; a companion app needs moods and relationships. Mem0 has `custom_instructions`; Graphiti has `custom_extraction_instructions` and custom entity types. CueMem's extraction prompt was fixed.
+- **Decision:** `consolidation.instructions` (`Memory(instructions=...)` in the SDK) is appended to the end of the extraction system prompt as "additional instructions from the application, which take precedence when they conflict".
+  - **When empty:** the prompt is byte-for-byte unchanged and so is the consolidation fingerprint (the field is left out of it), so cached extractions and consolidated spaces are unaffected.
+  - **When set:** the fingerprint changes, and consolidated spaces rebuild their derived memory on the next consolidation.
+- **Alternative:** custom entity and fact types (Graphiti). That changes the output schema, the reconciliation rules and the predicate registry; plain-text instructions cover the common need first.
+- **Consequences:** tests cover the prompt, the SDK parameter and the fingerprint change. The effect of instructions on extraction quality has not been evaluated.
