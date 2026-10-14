@@ -15,6 +15,7 @@ paths:
   eval_runs: runs/eval
   eval_spaces: data/eval-spaces   # 评测题目的记忆空间存在磁盘上复用，第二次运行不用重新写入与巩固
   media: data/media               # 原图按内容哈希存放（N6）
+  models: data/models             # 本机模型（fastembed 的向量模型，N12）
 
 # 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
 llm_cache_mode: read_write

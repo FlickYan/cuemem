@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fakes import FakeAPI
 from PIL import Image
@@ -20,7 +22,12 @@ from cuemem.config import (
     load_settings,
     presets,
 )
-from cuemem.embed import OpenAICompatibleEmbedder, build_embedder, build_image_embedder
+from cuemem.embed import (
+    FastEmbedTextEmbedder,
+    OpenAICompatibleEmbedder,
+    build_embedder,
+    build_image_embedder,
+)
 from cuemem.errors import EmbeddingAPIError
 from cuemem.llm import Ledger, LLMClient, ResponseCache
 from cuemem.memory import build_reranker
@@ -33,7 +40,7 @@ READER_REPLY = '{"answer": "Blue.", "evidence_sufficient": true, "citations": []
 def test_default_config_ships_inside_the_package() -> None:
     assert DEFAULT_CONFIG.is_relative_to(PACKAGE_DIR)
     assert DEFAULT_CONFIG.is_file()
-    assert {"openai", "ollama"} <= set(presets())
+    assert {"openai", "ollama", "deepseek"} <= set(presets())
 
 
 def test_home_dir_can_be_overridden(
@@ -162,3 +169,35 @@ def test_reader_drops_pictures_for_text_only_models(
     assert answer.answer == "Blue."
     content = fake_api.chat_requests[-1]["messages"][-1]["content"]
     assert isinstance(content, str)  # 没有图片内容块
+
+
+class _FakeFastEmbed:
+    """fastembed.TextEmbedding 的替身：按文本长度生成向量，记下收到的文本。"""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+        self.seen: list[str] = []
+
+    def embed(self, texts: list[str], batch_size: int = 32) -> Iterator[list[float]]:
+        for text in texts:
+            self.seen.append(text)
+            yield [float(len(text) % 5 + 1)] + [0.5] * (self.dim - 1)
+
+
+def test_deepseek_preset_runs_embeddings_locally(clean_env: None, tmp_path: Path) -> None:
+    loaded = load_settings(preset="deepseek", home=tmp_path)
+    assert {rc.model for rc in loaded.roles.values()} == {"deepseek-flash"}
+    assert loaded.embedding.backend == "fastembed" and loaded.embedding.dim == 384
+    assert loaded.used_providers() == ["deepseek"]  # 向量不需要任何供应商的 Key
+    assert build_image_embedder(loaded) is None and loaded.rerank.provider is None
+    embedder = build_embedder(loaded, use_cache=False)
+    assert isinstance(embedder, FastEmbedTextEmbedder)
+    fake = _FakeFastEmbed(384)
+    embedder._model = fake  # 不下载模型
+    batch = embedder.embed(["I live in Berlin", ""], "query")
+    assert batch.dense.shape == (2, 384) and batch.sparse is None
+    assert fake.seen == ["I live in Berlin", " "]  # 空文本用空格占位；不加查询指令
+    assert abs(float(np.linalg.norm(batch.dense[0])) - 1.0) < 1e-5
+    with pytest.raises(EmbeddingAPIError, match=r"embedding\.dim"):
+        embedder._model = _FakeFastEmbed(8)
+        embedder.embed(["x"], "document")

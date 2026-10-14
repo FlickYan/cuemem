@@ -112,8 +112,9 @@ class RoleConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     # dashscope：通义原生接口（dense + sparse）；openai：OpenAI 兼容的 /embeddings 接口
-    # （OpenAI、Ollama、vLLM、硅基流动……，地址取供应商的 base_url，N12）；hash：离线哈希向量
-    backend: Literal["dashscope", "openai", "hash"] = "dashscope"
+    # （OpenAI、Ollama、vLLM、硅基流动……，地址取供应商的 base_url，N12）；
+    # fastembed：本机 ONNX 推理，不要 Key（可选依赖 cuemem[local]，N12）；hash：离线哈希向量
+    backend: Literal["dashscope", "openai", "fastembed", "hash"] = "dashscope"
     provider: str = "qwen"
     model: str = "text-embedding-v4"
     dim: int = 1024
@@ -176,6 +177,7 @@ class PathsConfig(BaseModel):
     eval_runs: Path = Path("runs/eval")  # 每次评测运行一个子目录
     eval_spaces: Path = Path("data/eval-spaces")  # 评测用的记忆空间（写入与巩固的结果），跨运行复用
     media: Path = Path("data/media")  # 原图，按内容哈希存放（N6）
+    models: Path = Path("data/models")  # 本机模型（fastembed 下载的向量模型，N12）
 
     def resolve_against(self, root: Path) -> PathsConfig:
         """把相对路径解析为以 root 为基准的绝对路径。"""
@@ -262,7 +264,8 @@ class Settings(BaseSettings):
         for role, rc in self.roles.items():
             if rc.model not in self.models:
                 raise ValueError(f"角色 {role} 引用了未定义的模型 {rc.model}")
-        if self.embedding.backend != "hash" and self.embedding.provider not in self.providers:
+        local = self.embedding.backend in ("hash", "fastembed")
+        if not local and self.embedding.provider not in self.providers:
             raise ValueError(f"向量配置引用了未定义的供应商 {self.embedding.provider}")
         if self.rerank.provider is not None and self.rerank.provider not in self.providers:
             raise ValueError(f"重排配置引用了未定义的供应商 {self.rerank.provider}")
@@ -274,7 +277,7 @@ class Settings(BaseSettings):
         预设叠加在默认配置上，默认的供应商仍在配置里但用不到；configure 只问用得到的 Key。
         """
         used = {self.models[rc.model].provider for rc in self.roles.values()}
-        if self.embedding.backend != "hash":
+        if self.embedding.backend not in ("hash", "fastembed"):
             used.add(self.embedding.provider)
         if self.multimodal_embedding.backend == "dashscope":
             used.add(self.multimodal_embedding.provider)

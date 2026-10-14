@@ -28,6 +28,10 @@ dependencies = [
     "uvicorn>=0.54",
 ]
 
+[project.optional-dependencies]
+# 本机向量（embedding.backend: fastembed，预设 deepseek 用它）：ONNX 推理，不要 Key
+local = ["fastembed>=0.9"]
+
 [project.scripts]
 cuemem = "cuemem.cli:app"
 

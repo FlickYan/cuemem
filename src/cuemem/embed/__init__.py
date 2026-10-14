@@ -9,6 +9,7 @@ from cuemem.embed.base import EmbeddingBatch, EmbedKind, SparseVector, TextEmbed
 from cuemem.embed.cache import CachedEmbedder, EmbeddingCache
 from cuemem.embed.dashscope import DashScopeTextEmbedder
 from cuemem.embed.hashing import HashEmbedder
+from cuemem.embed.local import FastEmbedTextEmbedder
 from cuemem.embed.multimodal import (
     DashScopeMultimodalEmbedder,
     HashMultimodalEmbedder,
@@ -24,6 +25,7 @@ __all__ = [
     "EmbedKind",
     "EmbeddingBatch",
     "EmbeddingCache",
+    "FastEmbedTextEmbedder",
     "HashEmbedder",
     "ImageEmbedder",
     "OpenAICompatibleEmbedder",
@@ -46,6 +48,8 @@ def build_embedder(
     inner: TextEmbedder
     if cfg.backend == "hash":
         inner = HashEmbedder(cfg.dim)
+    elif cfg.backend == "fastembed":
+        inner = FastEmbedTextEmbedder(cfg, cache_dir=settings.paths.models, ledger=ledger)
     else:
         provider = settings.providers[cfg.provider]
         api_key = provider.api_key()
