@@ -38,8 +38,8 @@ from scripted import ScriptedModel, echo_extraction
 import cuemem.integrations.openai_agents as oa
 from cuemem import AsyncMemory, Memory
 from cuemem.api.mcp import build_server
-from cuemem.api.proxy import MEMORY_NOTE
 from cuemem.config import Settings
+from cuemem.evidence import MEMORY_NOTE
 from cuemem.integrations.openai_agents import (
     CueMemSession,
     close_idle_sessions,

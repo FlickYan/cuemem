@@ -18,7 +18,7 @@
 - memory_tools：recall / remember / forget 三个工具，名字、说明与语义与 MCP（api/mcp.py）相同；
 - memory_input_filter：交给 RunConfig.call_model_input_filter，SDK 每次调用模型之前把输入给它。
   对最新一句用户消息先跑检索控制器：L0 不检索、只给画像（没有画像就什么都不加），L1 / L2 取回
-  事实与对话片段，排成与记忆代理（api/proxy.py）相同的证据块。只改这次发给模型的副本。每一轮的
+  事实与对话片段，排成与记忆代理相同的证据块（cuemem.evidence）。只改这次发给模型的副本。每一轮的
   第一次调用都重新检索；同一轮里工具调用之后的再次调用沿用这一轮的证据（遗忘之后重新检索）。
   进行中的会话里、原样已在输入中的轮不参与检索；
 - CueMemSession：Session 协议的实现。内层会话（默认内存里的 SQLiteSession）原样保存短期历史；
@@ -71,7 +71,7 @@ import uuid
 import weakref
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from types import TracebackType
 from typing import Any, Literal, cast
@@ -91,13 +91,10 @@ from agents.run_config import (  # type: ignore[import-not-found, unused-ignore]
     ModelInputData,
 )
 
-from cuemem.api.mcp import format_recall
-from cuemem.api.proxy import MEMORY_NOTE
-from cuemem.api.service import _status
 from cuemem.core.trace import record_event
+from cuemem.evidence import format_listing, recall_evidence, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
-from cuemem.read.controller import Router, english_reason
-from cuemem.read.reader import memory_blocks
+from cuemem.read.controller import Router
 from cuemem.sdk import AsyncMemory, Memory, space_for
 
 __all__ = [
@@ -314,7 +311,12 @@ def memory_tools(
 
     @function_tool(name_override="recall", description_override=RECALL_DESCRIPTION)
     def recall(ctx: RunContextWrapper[Any], query: str, deep: bool = False) -> str:
-        return format_recall(_recall(sync.system, who.space(ctx.context), query, deep=deep))
+        # 与 MCP 的 recall 相同（at_least_l1）：控制器选了 L0 时改走 L1
+        space = who.space(ctx.context)
+        mode: RecallMode = "l2" if deep else "auto"
+        return format_listing(
+            recall_listing(sync.system, space, query, mode=mode, at_least_l1=True)
+        )
 
     @function_tool(name_override="remember", description_override=REMEMBER_DESCRIPTION)
     def remember(ctx: RunContextWrapper[Any], text: str) -> str:
@@ -337,45 +339,9 @@ def memory_tools(
     return [recall, remember, forget]
 
 
-def _recall(system: MemorySystem, space: str, query: str, *, deep: bool) -> dict[str, Any]:
-    """MCP recall 的检索部分（ChatService.recall，at_least_l1）：控制器选了 L0 时改走 L1。"""
-    recall = system.retrieve(space, query, mode="l2" if deep else "auto")
-    raised = recall.level == "l0"
-    if raised:
-        recall = system.retrieve(space, query, mode="l1")
-    view, decision = recall.view, recall.decision
-    reasons = (
-        ["raised from L0: the caller asked to recall"]
-        if raised
-        else [english_reason(r) for r in decision.reasons]
-        if decision
-        else []
-    )
-    return {
-        "level": recall.level.upper(),
-        "reasons": reasons,
-        "profile": view.core.text if view.core is not None else "",
-        "facts": [
-            {
-                "id": fh.fact.id,
-                "statement": fh.fact.statement,
-                "said_on": fh.fact.recorded_at.isoformat(),
-                "status": _status(fh.fact),
-            }
-            for fh in view.facts
-        ],
-        "excerpts": [
-            {"id": hit.unit.id, "ts": hit.unit.ts.isoformat(), "text": hit.unit.text}
-            for hit in sorted(view.rounds, key=lambda h: h.unit.ts)
-        ],
-    }
-
-
 def _forget_ids(system: MemorySystem, space: str, ids: Sequence[str]) -> ForgetReport:
-    """按 recall 给出的 ID 遗忘（ChatService.forget_ids）：事实 ID，或对话片段（轮）的 ID。"""
-    fact_ids = [f.id for f in system.db.get_facts(space, ids=list(ids))]
-    rounds = system.db.get_units(space, list(ids))
-    turns = [t for unit in rounds if unit.kind == "round" for t in unit.source_turn_ids]
+    """按 recall 给出的 ID 遗忘：事实 ID，或对话片段（轮）的 ID。缓存的证据随之作废。"""
+    fact_ids, turns = resolve_ids(system, space, ids)
     report = system.forget_memories(space, fact_ids=fact_ids, turn_ids=turns)
     _shared(system).forgot(space)
     return report
@@ -386,7 +352,8 @@ def _forget_ids(system: MemorySystem, space: str, ids: Sequence[str]) -> ForgetR
 
 @dataclass(frozen=True)
 class Evidence:
-    """一次自动回忆的结果。"""
+    """一次自动回忆的结果。不直接用 cuemem.evidence.Evidence：这里的会进缓存、在并发的运行之间
+    共用，保持不可变；level 多一个 "none"；也不带 Recall（缓存不留住整份检索结果）。"""
 
     query: str
     level: str  # "L0" / "L1" / "L2"；"none"：这个空间还没有记忆
@@ -495,35 +462,23 @@ class MemoryInputFilter:
         return ModelInputData(input=injected, instructions=model_data.instructions)
 
     def _recall(self, space: str, query: str, present: Collection[str]) -> Evidence:
-        """与记忆代理的 _recall 相同：控制器选档、排出证据块；L0 只给画像。"""
+        """与记忆代理相同：控制器选档、排出证据块；L0 只给画像。"""
         system = self.memory.system
         _adopt(system, space)
         _sweep(system)
         if not system.db.get_sessions(space):
             return Evidence(query, "none", ["no memories yet"], 0, "")
-        now = datetime.now()
-        recall = system.retrieve(
+        found = recall_evidence(
+            system,
             space,
             query,
-            question_time=now,
             mode=self.mode,
             router=self.router,
             lam=self.lam,
             exclude=_in_context(system, space, present),
         )
-        reasons = [english_reason(r) for r in recall.decision.reasons] if recall.decision else []
-        view = recall.view
-        if recall.level == "l0":  # 不需要回忆：只给画像（没有画像就什么都不加）
-            view = replace(view, rounds=[], facts=[], attach=[])
-        blocks, refs, _ = memory_blocks(view, now, relative_time=True)
-        if not view.rounds:  # 没取到对话片段时不留一个空的"(none)"块
-            blocks = blocks[:-1]
-        has_profile = view.core is not None and bool(view.core.text)
-        recalled = len(refs) + int(has_profile)
-        block = "\n\n".join([MEMORY_NOTE, *blocks]) if blocks else ""
-        level = recall.level.upper()
-        record_event("agents_recall", space=space, level=level, recalled=recalled)
-        return Evidence(query, level, reasons, recalled, block)
+        record_event("agents_recall", space=space, level=found.level, recalled=found.recalled)
+        return Evidence(query, found.level, found.reasons, found.recalled, found.block)
 
     def _get(self, cache: OrderedDict[Any, tuple[float, Evidence]], key: Any) -> Evidence | None:
         with self._lock:
@@ -595,7 +550,9 @@ def _in_context(system: MemorySystem, space: str, present: Collection[str]) -> l
 
 
 def _with_note(message: Mapping[str, Any], note: str) -> dict[str, Any]:
-    """把证据块放在这句用户消息的开头（新的条目，不改原来的；与记忆代理的 _inject 相同）。"""
+    """把证据块放在这句用户消息的开头（新的条目，不改原来的）。不用 inject_evidence：这里是
+    Responses 格式（内容块是 input_text），这句用户消息也不一定是最后一个条目（后面可能还有
+    工具调用）。"""
     content = message.get("content")
     if isinstance(content, list):
         return {**message, "content": [{"type": "input_text", "text": f"{note}\n\n"}, *content]}
@@ -1071,7 +1028,8 @@ def _latest_user(items: Sequence[Any]) -> tuple[int, Mapping[str, Any]] | None:
 
 
 def _text(content: Any) -> str:
-    """内容（字符串或内容块）里的文字；图片、文件等不算。"""
+    """内容（字符串或内容块）里的文字；图片、文件等不算。不用 message_text：Responses 格式的文字块
+    是 input_text / output_text，不只是 text。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):

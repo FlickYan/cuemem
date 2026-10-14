@@ -46,8 +46,8 @@ clear_all_memory 照样能遗忘它们。整个记忆空间被删除（Memory.de
 路径只认 /memories 下的；拒绝 . 与 ..、隐藏名、反斜杠、控制字符、百分号编码、过深过长的路径。
 单个文件、文件数、总字符数都有上限；查看超过 16000 字符时截断，提示用 view_range 往下翻。
 
-with_recall / awith_recall（可选）：调用模型之前先过检索控制器（L0 只给画像），证据块与记忆
-代理（api/proxy.py）同一个格式、同一个位置，放在最新一句用户消息的开头（后面跟着的
+with_recall / awith_recall（可选）：调用模型之前先过检索控制器（L0 只给画像），证据块由
+cuemem.evidence 排成，与记忆代理同一个格式、同一个位置，放在最新一句用户消息的开头（后面跟着的
 mid-conversation system 消息不算）。返回的列表就是之后的对话历史：下一轮在它后面追加，再调用
 with_recall——只往后加，已经发出去的消息一个字节都不改（Claude Opus 5.5 等模型的 preserved
 thinking 要求前缀不变，否则 400 或丢掉思考块，提示缓存也失效）。检索出错时照常返回原消息，
@@ -69,7 +69,7 @@ import warnings
 import weakref
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -94,14 +94,12 @@ from anthropic.types.beta import (  # type: ignore[import-not-found, unused-igno
 )
 from anyio import to_thread
 
-from cuemem.api.proxy import MEMORY_NOTE, _inject
 from cuemem.core.models import Fact, Turn
 from cuemem.core.timeutil import day
 from cuemem.core.trace import record_event
+from cuemem.evidence import inject_evidence, recall_evidence
 from cuemem.memory import RecallMode
-from cuemem.read.controller import english_reason
 from cuemem.read.facts import fact_status
-from cuemem.read.reader import memory_blocks
 from cuemem.sdk import AsyncMemory, Memory, space_for
 from cuemem.store.sqlite import MemoryDB
 
@@ -961,7 +959,7 @@ def with_recall(
         )
         return cast("list[BetaMessageParam]", out), Evidence("error", [error], 0, "")
     if evidence.block:
-        out = [*_inject(out[: at + 1], evidence.block), *out[at + 1 :]]
+        out = [*inject_evidence(out[: at + 1], evidence.block), *out[at + 1 :]]
     return cast("list[BetaMessageParam]", out), evidence
 
 
@@ -991,12 +989,13 @@ def _newest_user(messages: Sequence[Mapping[str, Any]]) -> int | None:
 
 
 def _recall(message: Mapping[str, Any], memory: Memory, space: str, mode: RecallMode) -> Evidence:
-    """用户消息 → 控制器选档、取回记忆、排成证据块（记忆代理的 _recall 去掉会话部分）。"""
+    """用户消息 → 控制器选档、取回记忆、排成证据块（cuemem.evidence，与记忆代理相同）。"""
     none = Evidence("none", [], 0, "")
     content = message.get("content")
     blocks = content if isinstance(content, list) else []
     if any(_block_get(b, "type") == "tool_result" for b in blocks):
         return none
+    # 不用 evidence.message_text：Anthropic 格式的内容块也可以是 SDK 对象，text 可能为 None
     query = (
         content
         if isinstance(content, str)
@@ -1007,23 +1006,10 @@ def _recall(message: Mapping[str, Any], memory: Memory, space: str, mode: Recall
     system = memory.system
     if not query.strip() or not system.db.get_sessions(space):
         return none
-    now = datetime.now()
-    recall = system.retrieve(space, query, question_time=now, mode=mode)
-    view = recall.view
-    if recall.level == "l0":  # 不需要回忆：只给画像
-        view = replace(view, rounds=[], facts=[], attach=[])
-    parts, refs, _ = memory_blocks(view, now, relative_time=True)
-    if not view.rounds:  # 没取到对话片段时不留一个空的"(none)"块
-        parts = parts[:-1]
-    level = recall.level.upper()
-    reasons = [english_reason(r) for r in recall.decision.reasons] if recall.decision else []
-    if not parts:
-        return Evidence(level, reasons, 0, "")
-    has_profile = view.core is not None and bool(view.core.text)
-    record_event("claude_recall", space=space, level=level, recalled=len(refs))
-    return Evidence(
-        level, reasons, len(refs) + int(has_profile), "\n\n".join([MEMORY_NOTE, *parts])
-    )
+    found = recall_evidence(system, space, query, mode=mode)
+    if found.block:
+        record_event("claude_recall", space=space, level=found.level, recalled=found.recalled)
+    return Evidence(found.level, found.reasons, found.recalled, found.block)
 
 
 # ---------- 路径 ----------

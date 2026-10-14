@@ -24,8 +24,8 @@ from fakes import FakeAPI  # noqa: E402
 from scripted import ScriptedModel  # noqa: E402
 
 from cuemem import AsyncMemory, Memory  # noqa: E402
-from cuemem.api.proxy import MEMORY_NOTE  # noqa: E402
 from cuemem.config import Settings  # noqa: E402
+from cuemem.evidence import MEMORY_NOTE  # noqa: E402
 from cuemem.integrations.claude import (  # noqa: E402
     AsyncCueMemMemoryTool,
     CueMemMemoryTool,

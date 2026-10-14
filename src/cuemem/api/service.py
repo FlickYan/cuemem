@@ -26,7 +26,6 @@ from cuemem.evidence import fact_state, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
 from cuemem.read.controller import Router
 
-_status = fact_state  # 兼容旧的导入位置（集成改完后删掉）
 Scenario = Literal["shop", "plain"]
 
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"

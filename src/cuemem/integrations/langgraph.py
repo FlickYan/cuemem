@@ -65,7 +65,7 @@ import warnings
 import weakref
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated, Any, NotRequired, cast
 
@@ -91,12 +91,9 @@ from langgraph.runtime import Runtime, get_runtime  # type: ignore[import-not-fo
 from langgraph.types import Command  # type: ignore[import-not-found, unused-ignore]
 from pydantic import BaseModel
 
-from cuemem.api.mcp import format_recall
-from cuemem.api.proxy import MEMORY_NOTE
 from cuemem.core.trace import record_event
+from cuemem.evidence import format_listing, recall_evidence, recall_listing, resolve_ids
 from cuemem.memory import MemorySystem, RecallMode
-from cuemem.read.controller import english_reason
-from cuemem.read.reader import memory_blocks
 from cuemem.sdk import AsyncMemory, Memory, space_for
 
 __all__ = [
@@ -454,21 +451,9 @@ class ThreadMemory:
             return
         present = {_stored_text(m).strip() for m in earlier if _is_turn(m)}
         exclude = _in_context(system, space, session_for(thread), present) if thread else []
-        now = datetime.now()
-        found = system.retrieve(space, query, question_time=now, mode=self.mode, exclude=exclude)
-        evidence.level = found.level.upper()
-        if found.decision is not None:
-            evidence.reasons = [english_reason(r) for r in found.decision.reasons]
-        view = found.view
-        if found.level == "l0":  # 不需要回忆：只给画像（没有画像就什么都不加）
-            view = replace(view, rounds=[], facts=[], attach=[])
-        blocks, refs, _ = memory_blocks(view, now, relative_time=True)
-        if not view.rounds:  # 没取到对话片段时不留一个空的"(none)"块
-            blocks = blocks[:-1]
-        has_profile = view.core is not None and bool(view.core.text)
-        evidence.recalled = len(refs) + int(has_profile)
-        if blocks:
-            evidence.block = "\n\n".join([MEMORY_NOTE, *blocks])
+        found = recall_evidence(system, space, query, mode=self.mode, exclude=exclude)
+        evidence.level, evidence.reasons = found.level, found.reasons
+        evidence.recalled, evidence.block = found.recalled, found.block
         record_event(
             "langgraph_recall", space=space, level=evidence.level, recalled=evidence.recalled
         )
@@ -570,7 +555,10 @@ def memory_tools(
         return threads.identity(config, _context())
 
     def recall(query: str, config: RunnableConfig, deep: bool = False) -> str:
-        return _tool("recall", lambda: format_recall(_recall(sync, *who(config), query, deep)))
+        def run() -> str:
+            return format_listing(_recall(sync.system, space_for(*who(config)), query, deep))
+
+        return _tool("recall", run)
 
     def remember(text: str, config: RunnableConfig) -> str:
         def run() -> str:
@@ -587,9 +575,7 @@ def memory_tools(
         def run() -> str:
             space = space_for(*who(config))
             system = sync.system
-            fact_ids = [f.id for f in system.db.get_facts(space, ids=list(ids))]
-            rounds = system.db.get_units(space, list(ids))
-            turns = [t for unit in rounds if unit.kind == "round" for t in unit.source_turn_ids]
+            fact_ids, turns = resolve_ids(system, space, ids)
             try:
                 report = system.forget_memories(space, fact_ids=fact_ids, turn_ids=turns)
             finally:  # 这一回合缓存的证据块可能含有刚删掉的内容：作废，下次模型调用重新召回
@@ -626,38 +612,20 @@ def _tool(name: str, run: Callable[[], str]) -> str:
         raise ToolException(f"Memory {name} failed: {exc}") from exc
 
 
-def _recall(
-    memory: Memory, user: str | None, agent: str | None, query: str, deep: bool
-) -> dict[str, Any]:
-    """MCP recall 的语义：调用方已经决定要查记忆，控制器选了 L0 时改走 L1，
-    控制器只决定要不要查得更深。返回 format_recall 要的字典。"""
-    found = memory.search(query, user_id=user, agent_id=agent, mode="l2" if deep else "auto")
-    reasons = found["reasons"]
-    if found["level"] == "L0" and memory.system.db.get_sessions(space_for(user, agent)):
-        found = memory.search(query, user_id=user, agent_id=agent, mode="l1")
-        reasons = ["raised from L0: the caller asked to recall"]
-    results = found["results"]
-    excerpts = [
-        {"id": r["id"], "ts": r["created_at"], "text": r["memory"]}
-        for r in results
-        if r["type"] == "excerpt"
-    ]
-    return {
-        "level": found["level"],
-        "reasons": reasons,
-        "profile": found["profile"],
-        "facts": [
-            {
-                "id": r["id"],
-                "statement": r["memory"],
-                "said_on": r["created_at"],
-                "status": r["status"],
-            }
-            for r in results
-            if r["type"] == "fact"
-        ],
-        "excerpts": sorted(excerpts, key=lambda e: e["ts"]),
-    }
+def _recall(system: MemorySystem, space: str, query: str, deep: bool) -> dict[str, Any]:
+    """与 MCP 的 recall 相同的清单（控制器选了 L0 时改走 L1，见 recall_listing）。
+    空间里还没有记忆时与 SDK 的 search 相同：不检索（不为问题算向量），只给画像。"""
+    if not system.db.get_sessions(space):
+        core = system.core_memory(space)
+        profile = core.text if core is not None else ""
+        return {
+            "level": "L0",
+            "reasons": ["no memories yet"],
+            "profile": profile,
+            "facts": [],
+            "excerpts": [],
+        }
+    return recall_listing(system, space, query, mode="l2" if deep else "auto", at_least_l1=True)
 
 
 # ---------- create_agent 中间件（推荐） ----------

@@ -38,8 +38,8 @@ from test_sdk import moved, where_i_live
 import cuemem.integrations.langgraph as lg
 from cuemem import AsyncMemory, Memory
 from cuemem.api.mcp import build_server
-from cuemem.api.proxy import MEMORY_NOTE
 from cuemem.config import Settings
+from cuemem.evidence import MEMORY_NOTE
 from cuemem.integrations.langgraph import (
     CueMemMiddleware,
     ThreadMemory,
@@ -148,6 +148,7 @@ def test_tools_take_the_user_from_the_config(memory: Memory) -> None:
     assert f"[{fact['id']}]" in found and "The user lives in Berlin." in found
     # 别的用户什么都看不到；没有用户时给模型一条错误结果，不会写进某个默认空间
     bob = recall.invoke({"query": "Where do I live?"}, config={"configurable": {"user_id": "bob"}})
+    assert bob.startswith("Memory controller: L0 (no memories yet)")  # 空的空间不检索
     assert "No memories were retrieved" in bob
     assert "needs a user_id" in recall.invoke({"query": "Where do I live?"})
 
@@ -464,8 +465,9 @@ def down(*args: Any, **kwargs: Any) -> Any:
 
 
 def test_memory_tool_errors_go_back_to_the_model(
-    memory: Memory, monkeypatch: pytest.MonkeyPatch
+    lives_in_berlin: Memory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    memory = lives_in_berlin
     model = Recorder(
         responses=[
             AIMessage("", tool_calls=[tool_call("recall", query="Where do I live?")]),
@@ -480,7 +482,7 @@ def test_memory_tool_errors_go_back_to_the_model(
     assert "needs a user_id" in str(error.content)
     assert out["messages"][-1].content == "I can't recall that."
 
-    monkeypatch.setattr(memory, "search", down)
+    monkeypatch.setattr(memory.system, "retrieve", down)
     recall, _, _ = memory_tools(memory, user_id="alice")
     found = recall.invoke(tool_call("recall", query="Where do I live?"))
     assert found.status == "error" and "embedding service is down" in str(found.content)

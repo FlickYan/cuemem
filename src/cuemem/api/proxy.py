@@ -43,12 +43,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from cuemem import __version__
 from cuemem.config import ModelSpec
 from cuemem.core.trace import record_event
-from cuemem.evidence import MEMORY_NOTE as MEMORY_NOTE  # 兼容旧的导入位置（集成改完后删掉）
 from cuemem.evidence import inject_evidence, message_text, recall_evidence
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.sdk import Memory, space_for
 
-_inject = inject_evidence  # 兼容旧的导入位置（集成改完后删掉）
 _SESSION_ID = re.compile(r"[^A-Za-z0-9_.:-]")
 
 
@@ -141,7 +139,7 @@ class MemoryProxy:
                 for line in response.iter_lines():
                     yield (line + "\n").encode()
                     if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
-                        pieces.append(_deltamessage_text(line[5:]))
+                        pieces.append(_delta_text(line[5:]))
             finally:
                 response.close()
                 self._write_back(turn, "".join(pieces))
@@ -326,7 +324,7 @@ def _image_url(block: dict[str, Any]) -> str:
     return str(value.get("url", "") if isinstance(value, dict) else value or "")
 
 
-def _deltamessage_text(payload: str) -> str:
+def _delta_text(payload: str) -> str:
     try:
         chunk = json.loads(payload)
     except json.JSONDecodeError:
