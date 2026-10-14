@@ -60,14 +60,21 @@ _IMAGE_SUFFIX = {
 
 
 def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
-    """user_id、agent_id → 记忆空间 ID。两者都给时是这个 Agent 对这个用户的记忆。"""
+    """user_id、agent_id → 记忆空间 ID。两者都给时是这个 Agent 对这个用户的记忆。
+
+    "/" 是分隔符，所以 ID 里的 "/" 与 "%" 先转义（URL 的百分号编码）：否则 user_id="agent/x"
+    与 agent_id="x" 会落进同一个空间。不含这两个字符的 ID 原样保留（"alice" 还是 "alice"）。"""
     if user_id and agent_id:
-        return f"{agent_id}/{user_id}"
+        return f"{_part(agent_id)}/{_part(user_id)}"
     if user_id:
-        return user_id
+        return _part(user_id)
     if agent_id:
-        return f"agent/{agent_id}"
+        return f"agent/{_part(agent_id)}"
     raise ValueError("Give user_id, agent_id, or both: memories are kept per user and per agent.")
+
+
+def _part(value: str) -> str:
+    return value.replace("%", "%25").replace("/", "%2F")
 
 
 class Memory:

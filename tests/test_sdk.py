@@ -180,6 +180,10 @@ def test_spaces_are_isolated_by_user_and_agent(memory: Memory) -> None:
     ] == ["Paris"]
     with pytest.raises(ValueError, match="user_id"):
         space_for()
+    # 分隔符转义：不同的 user / agent 组合不会落进同一个空间
+    combos = [("agent/x", None), (None, "x"), ("a/b", None), ("b", "a"), ("a%2Fb", None)]
+    assert len({space_for(user, agent) for user, agent in combos}) == len(combos)
+    assert space_for("alice") == "alice" and space_for("alice", "bot") == "bot/alice"
 
 
 def test_openai_messages_with_images(

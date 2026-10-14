@@ -231,13 +231,18 @@ class MemoryProxy:
         if not query.strip() or not self.system.db.get_sessions(space):
             return turn
         now = datetime.now()
-        recall = self.system.retrieve(
-            space,
-            query,
-            question_time=now,
-            mode=self.mode,
-            exclude=self._in_context(space, run.session_id, earlier),
-        )
+        try:
+            recall = self.system.retrieve(
+                space,
+                query,
+                question_time=now,
+                mode=self.mode,
+                exclude=self._in_context(space, run.session_id, earlier),
+            )
+        except Exception as exc:  # 想不起来不该让这一轮失败：不注入记忆，照常转发
+            record_event("proxy_recall_failed", space=space, error=f"{type(exc).__name__}: {exc}")
+            turn.level = "error"
+            return turn
         turn.level = recall.level.upper()
         if recall.decision is not None:
             turn.reasons = [english_reason(r) for r in recall.decision.reasons]
@@ -329,14 +334,17 @@ def _inject(messages: list[dict[str, Any]], block: str) -> list[dict[str, Any]]:
 
 
 def _storable(message: dict[str, Any]) -> dict[str, Any]:
-    """写回记忆的用户消息：网络图片不下载（只存 data URL 与本地图片），其余原样。"""
+    """写回记忆的用户消息：图片只存请求里自带的 data URL，其余原样。
+
+    网络图片不下载；本地路径与 file:// 一律不收——它们指向的是代理所在机器上的文件，
+    远程调用方不能借此把服务器上的文件写进自己的记忆。"""
     content = message.get("content")
     if not isinstance(content, list):
         return message
     kept = [
         block
         for block in content
-        if block.get("type") != "image_url" or not _image_url(block).startswith("http")
+        if block.get("type") != "image_url" or _image_url(block).startswith("data:")
     ]
     return {**message, "content": kept}
 
