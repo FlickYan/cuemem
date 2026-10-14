@@ -328,7 +328,8 @@ N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻�
 - [x] Docker 镜像与 compose（加 Qdrant 服务端），在本地构建并实际运行验证
 - [x] 示例：`examples/quickstart.py`（SDK）、`examples/openai_proxy.py`（OpenAI SDK 只改 base_url）
 - [ ] 需要 API Key 与预算的：OpenAI、Ollama 预设在真实模型上的评测；同一协议下的更多外部基线（Graphiti、LangMem、Cognee、A-MEM、Letta）
-- [ ] 框架集成（LangGraph store、OpenAI Agents SDK、Vercel AI SDK、Claude memory tool 后端）、多租户鉴权、记忆的元数据与过期
+- [x] 框架集成（D-066，[integrations.md](integrations.md)）：OpenAI Agents SDK（输入过滤器、Session、工具）、LangGraph / LangChain（中间件、pre/post model hook、工具）、Claude 的 memory tool 后端；每次调用模型之前控制器先选；召回证据收拢到 `cuemem/evidence.py`，代理、服务层、MCP 与集成共用
+- [ ] 还没做的：Vercel AI SDK 与 TypeScript、LangGraph 的 BaseStore、多租户鉴权、记忆的元数据与过期；Claude 的 memory tool 在真实的 Claude 上验证
 
 **验收结果**：
 - 离线测试从 228 条增加到 261 条，全部通过；ruff、mypy 通过。
