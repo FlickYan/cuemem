@@ -340,6 +340,14 @@ METHOD_NAMES = (
     "M0",
 )
 
+# N12：更多外部基线（evals/baselines/），都要用 uv 临时装上对应的包，见各模块说明
+EXTERNAL = {
+    "MG": ("cuemem.evals.baselines.graphiti", "GraphitiBaseline"),
+    "ML": ("cuemem.evals.baselines.langmem", "LangMemBaseline"),
+    "MC": ("cuemem.evals.baselines.cognee", "CogneeBaseline"),
+    "MA": ("cuemem.evals.baselines.amem", "AMemBaseline"),
+}
+
 
 # N4 定稿时的 L1 配置（带 BM25）：B4 及其消融固定用它，保证 N4 的结果可以复现
 N4_L1 = L1Config(sparse="bm25")
@@ -353,6 +361,17 @@ def _mem0() -> Method:
     from cuemem.evals.mem0_baseline import Mem0Baseline
 
     return Mem0Baseline()
+
+
+def _external(name: str) -> Callable[[], Method]:
+    def make() -> Method:
+        import importlib
+
+        module, cls = EXTERNAL[name]
+        method: Method = getattr(importlib.import_module(module), cls)()
+        return method
+
+    return make
 
 
 def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
@@ -440,6 +459,8 @@ def build_methods(names: Sequence[str], *, k: int = 10) -> list[Method]:
         "ORACLE": OracleSessions,
         # N11：外部基线 Mem0（需要临时装上 mem0ai，见 evals/mem0_baseline.py）
         "M0": _mem0,
+        # N12：Graphiti、LangMem、Cognee、A-MEM（见 evals/external.py 与 evals/baselines/）
+        **{name: _external(name) for name in EXTERNAL},
     }
     unknown = [n for n in names if n not in factories]
     if unknown:
