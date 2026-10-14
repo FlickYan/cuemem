@@ -25,9 +25,9 @@ from PIL import Image
 
 from cuemem.agent import Reply
 from cuemem.agent.runtime import RecalledItem, TurnTrace
-from cuemem.api.service import ChatService, english_reason
+from cuemem.api.service import ChatService
 from cuemem.memory import RecallMode
-from cuemem.read.controller import Router
+from cuemem.read.controller import Router, english_reason
 
 THEME = gr.themes.Soft(
     primary_hue="teal",

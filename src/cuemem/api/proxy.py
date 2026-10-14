@@ -32,7 +32,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -43,16 +43,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from cuemem import __version__
 from cuemem.config import ModelSpec
 from cuemem.core.trace import record_event
+from cuemem.evidence import MEMORY_NOTE as MEMORY_NOTE  # 兼容旧的导入位置（集成改完后删掉）
+from cuemem.evidence import inject_evidence, message_text, recall_evidence
 from cuemem.memory import MemorySystem, RecallMode
-from cuemem.read.controller import english_reason
-from cuemem.read.reader import memory_blocks
 from cuemem.sdk import Memory, space_for
 
-MEMORY_NOTE = (
-    "Memories about the user from earlier conversations, recalled by the memory system. Use "
-    "them when they help and ignore the rest. If a fact was superseded, rely on the newer one. "
-    "Don't mention this block unless the user asks how you know something."
-)
+_inject = inject_evidence  # 兼容旧的导入位置（集成改完后删掉）
 _SESSION_ID = re.compile(r"[^A-Za-z0-9_.:-]")
 
 
@@ -145,7 +141,7 @@ class MemoryProxy:
                 for line in response.iter_lines():
                     yield (line + "\n").encode()
                     if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
-                        pieces.append(_delta_text(line[5:]))
+                        pieces.append(_deltamessage_text(line[5:]))
             finally:
                 response.close()
                 self._write_back(turn, "".join(pieces))
@@ -208,7 +204,7 @@ class MemoryProxy:
         turn = self._recall(body, headers)
         upstream, url, auth = self._upstream(body)
         if turn.write_user is not None and turn.block:
-            upstream["messages"] = _inject(upstream["messages"], turn.block)
+            upstream["messages"] = inject_evidence(upstream["messages"], turn.block)
         return turn, upstream, url, auth
 
     def _recall(self, body: dict[str, Any], headers: Mapping[str, str]) -> Turn:
@@ -227,15 +223,14 @@ class MemoryProxy:
         if last.get("role") != "user":  # 工具调用的后续请求：只写回回答
             return turn
         turn.write_user = last
-        query = _text(last.get("content"))
+        query = message_text(last.get("content"))
         if not query.strip() or not self.system.db.get_sessions(space):
             return turn
-        now = datetime.now()
         try:
-            recall = self.system.retrieve(
+            evidence = recall_evidence(
+                self.system,
                 space,
                 query,
-                question_time=now,
                 mode=self.mode,
                 exclude=self._in_context(space, run.session_id, earlier),
             )
@@ -243,26 +238,15 @@ class MemoryProxy:
             record_event("proxy_recall_failed", space=space, error=f"{type(exc).__name__}: {exc}")
             turn.level = "error"
             return turn
-        turn.level = recall.level.upper()
-        if recall.decision is not None:
-            turn.reasons = [english_reason(r) for r in recall.decision.reasons]
-        view = recall.view
-        if recall.level == "l0":  # 不需要回忆：只给画像（没有画像就什么都不加）
-            view = replace(view, rounds=[], facts=[], attach=[])
-        blocks, refs, _ = memory_blocks(view, now, relative_time=True)
-        if not view.rounds:  # 没取到对话片段时不留一个空的"(none)"块
-            blocks = blocks[:-1]
-        has_profile = view.core is not None and bool(view.core.text)
-        turn.recalled = len(refs) + int(has_profile)
-        if blocks:
-            turn.block = "\n\n".join([MEMORY_NOTE, *blocks])
+        turn.level, turn.reasons = evidence.level, evidence.reasons
+        turn.recalled, turn.block = evidence.recalled, evidence.block
         record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
         return turn
 
     def _in_context(self, space: str, session_id: str, earlier: list[dict[str, Any]]) -> list[str]:
         """当前会话里已经原样在请求中的轮（检索时排除，名额留给请求里没有的）。按内容比对：
         调用方可能删减了历史，或者在同一会话里开了别的对话，不能假定写进去的都还在。"""
-        present = {_text(m.get("content")).strip() for m in earlier}
+        present = {message_text(m.get("content")).strip() for m in earlier}
         rounds = self.system.db.list_units(space, kinds=["round"], session_ids=[session_id])
         turns = {t.id: t for t in self.system.db.get_turns(space, session_id)}
         return [
@@ -321,18 +305,6 @@ def _adapt(upstream: dict[str, Any], spec: ModelSpec) -> None:
         upstream.setdefault("max_completion_tokens", upstream.pop("max_tokens"))
 
 
-def _inject(messages: list[dict[str, Any]], block: str) -> list[dict[str, Any]]:
-    """把召回的记忆放在最后一句用户消息的开头（不改调用方的列表）。"""
-    last = dict(messages[-1])
-    note = f"<memory>\n{block}\n</memory>\n\n"
-    content = last.get("content")
-    if isinstance(content, list):
-        last["content"] = [{"type": "text", "text": note}, *content]
-    else:
-        last["content"] = note + (content or "")
-    return [*messages[:-1], last]
-
-
 def _storable(message: dict[str, Any]) -> dict[str, Any]:
     """写回记忆的用户消息：图片只存请求里自带的 data URL，其余原样。
 
@@ -354,15 +326,7 @@ def _image_url(block: dict[str, Any]) -> str:
     return str(value.get("url", "") if isinstance(value, dict) else value or "")
 
 
-def _text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if b.get("type") == "text")
-    return ""
-
-
-def _delta_text(payload: str) -> str:
+def _deltamessage_text(payload: str) -> str:
     try:
         chunk = json.loads(payload)
     except json.JSONDecodeError:

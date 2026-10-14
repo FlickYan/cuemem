@@ -19,6 +19,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from cuemem.api.service import ChatService
+from cuemem.evidence import format_listing
 
 INSTRUCTIONS = """CueMem is a long-term memory of past conversations with this user.
 Call recall before answering anything that may depend on the user's past (preferences, plans, people, things they own or did). Call remember when the user shares something worth keeping. Cite memory ids when you rely on them, and use forget when the user asks you to delete something."""  # noqa: E501
@@ -62,24 +63,5 @@ def build_server(service: ChatService, space_id: str) -> MCPServer[Any]:
     return server
 
 
-def format_recall(found: dict[str, Any]) -> str:
-    lines = [f"Memory controller: {found['level']}" + _why(found)]
-    if found["profile"]:
-        lines += ["", "Profile:", found["profile"]]
-    if found["facts"]:
-        lines += ["", "Facts:"]
-        lines += [
-            f"[{f['id']}] (said {f['said_on'][:10]}; {f['status']}) {f['statement']}"
-            for f in found["facts"]
-        ]
-    if found["excerpts"]:
-        lines += ["", "Conversation excerpts:"]
-        for e in found["excerpts"]:
-            lines.append(f"[{e['id']}] {e['ts'][:16].replace('T', ' ')}\n{e['text']}")
-    if not found["facts"] and not found["excerpts"]:
-        lines += ["", "No memories were retrieved for this query."]
-    return "\n".join(lines)
-
-
-def _why(found: dict[str, Any]) -> str:
-    return f" ({', '.join(found['reasons'])})" if found["reasons"] else ""
+# MCP 的 recall 与各框架集成的 recall 工具用同一份文字格式（见 evidence.py）
+format_recall = format_listing
