@@ -210,6 +210,10 @@ class ConsolidationConfig(BaseModel):
     entity_gray_threshold: float = 0.75  # 介于两个阈值之间的实体交给 LLM 确认
     profile_max_chars: int = 1600  # 核心记忆的长度上限（约 400 tokens）
     profile_min_importance: int = 4  # 进入核心记忆的最低重要度（1–5）
+    # 应用给抽取的补充说明（N12，对标 Mem0 的 custom_instructions、Graphiti 的
+    # custom_extraction_instructions）：例如"导购场景：记下尺码、预算、品牌偏好，不记寒暄"。
+    # 改了会触发重建派生记忆（巩固配置的指纹变了）
+    instructions: str | None = None
     caption_images: bool = True  # 巩固时为图片生成描述（上下文感知与孤立两种，N6）
     caption_max_side: int = 768  # 送去描述的图片最长边（像素）
 

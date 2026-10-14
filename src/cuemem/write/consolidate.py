@@ -118,6 +118,7 @@ class Consolidator:
             assistant_chars=config.assistant_chars,
             max_chars=config.max_session_chars,
             fallback_model=config.fallback_model,
+            instructions=config.instructions,
         )
         self.resolver = EntityResolver(
             llm,
@@ -169,7 +170,9 @@ class Consolidator:
         """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。"""
         role = self.extractor.llm.settings.roles.get(self.extractor.role)
         model = self.extractor.model or (role.model if role else "")
-        config = json.dumps(self.config.model_dump(exclude={"workers"}), sort_keys=True)
+        # 没有补充说明时不计入指纹：加这个字段之前巩固过的空间不会被判为过期
+        exclude = {"workers"} | ({"instructions"} if self.config.instructions is None else set())
+        config = json.dumps(self.config.model_dump(exclude=exclude), sort_keys=True)
         return stable_id(PIPELINE_VERSION, model, config)
 
     def stale(self, space_id: str) -> bool:

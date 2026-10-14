@@ -7,7 +7,9 @@ cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
 cuemem consolidate --space S          巩固：抽取事实与实体、对账、摘要、核心记忆
 cuemem ask "问题" --space S [--at T]  检索记忆并回答
 cuemem inspect facts|entities|sources|profile --space S   记忆检查器
-cuemem forget --space S --session X   遗忘：删除会话及由它派生的一切
+cuemem forget --space S --session X   遗忘：删除会话及由它派生的一切（--fact、--dry-run 预演）
+cuemem export --space S [-o FILE]     导出记忆空间：原始日志、图片与事实快照（N12）
+cuemem import FILE [--space S]        导入：写回原始日志，再重新巩固（N12）
 cuemem spaces                         列出记忆空间
 cuemem usage [--today] [--run ID]     汇总调用量与成本
 cuemem data download [NAME...]       下载评测数据集
@@ -23,6 +25,7 @@ cuemem migrate-vectors --to URL       把本地向量库复制到 Qdrant 服务�
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import Iterator
@@ -201,6 +204,62 @@ def ingest(
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
 
 
+@app.command("export")
+def export_cmd(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    out: Annotated[
+        Path | None, typer.Option("--out", "-o", help="输出文件；不填则输出到标准输出")
+    ] = None,
+    no_derived: Annotated[
+        bool, typer.Option("--no-derived", help="不附派生记忆（事实与画像）的快照")
+    ] = False,
+) -> None:
+    """导出记忆空间（N12）：原始日志与图片原文件，可选附上事实与画像的快照。"""
+    from cuemem.portable import export_space
+
+    with _open_system() as system:
+        try:
+            data = export_space(system, space, derived=not no_derived)
+        except KeyError as exc:
+            console.print(f"[red]没有记忆空间 {space}[/red]")
+            raise typer.Exit(1) from exc
+    text = json.dumps(data, ensure_ascii=False, indent=1)
+    if out is None:
+        print(text)
+        return
+    out.write_text(text, encoding="utf-8")
+    turns = sum(len(s["turns"]) for s in data["sessions"])
+    console.print(f"已导出 {len(data['sessions'])} 个会话、{turns} 条发言到 [bold]{out}[/bold]")
+
+
+@app.command("import")
+def import_cmd(
+    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="cuemem export 的文件")],
+    space: Annotated[str | None, typer.Option(help="导入到这个空间（默认用文件里的）")] = None,
+    consolidate: Annotated[
+        bool, typer.Option("--consolidate", help="导入后立即巩固（重新抽取事实，需要 LLM）")
+    ] = False,
+) -> None:
+    """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。"""
+    from cuemem.portable import import_space
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    with _open_system() as system:
+        try:
+            report = import_space(system, data, space_id=space, consolidate=consolidate)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+        console.print(
+            f"记忆空间 [bold]{report['space_id']}[/bold]：{report['sessions']} 个会话，"
+            f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
+        )
+        if "consolidation" not in report:
+            console.print(
+                "[dim]提示：运行 cuemem consolidate 重新抽取事实与实体（需要 LLM）。[/dim]"
+            )
+
+
 @app.command("consolidate")
 def consolidate_cmd(
     space: Annotated[str, typer.Option(help="记忆空间 ID")],
@@ -219,17 +278,33 @@ def forget(
     space: Annotated[str, typer.Option(help="记忆空间 ID")],
     session: Annotated[list[str] | None, typer.Option(help="要遗忘的会话 ID（可多次指定）")] = None,
     turn: Annotated[list[str] | None, typer.Option(help="要遗忘的轮次 ID（可多次指定）")] = None,
+    fact: Annotated[
+        list[str] | None,
+        typer.Option(help="要遗忘的事实 ID（可多次指定）：删它出自的对话与没有引用的转述"),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="只预演：列出会删哪些发言与事实，什么都不删")
+    ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="不再确认，直接删除")] = False,
 ) -> None:
     """遗忘：删除原始轮次，并清除由它们派生的事实、摘要、向量与缓存（不可恢复）。"""
-    if not session and not turn:
-        console.print("[red]请用 --session 或 --turn 指定要遗忘的内容[/red]")
+    if not session and not turn and not fact:
+        console.print("[red]请用 --session、--turn 或 --fact 指定要遗忘的内容[/red]")
         raise typer.Exit(1)
-    targets = ", ".join([*(session or []), *(turn or [])])
+    if dry_run:
+        with _open_system() as system:
+            plan = system.preview_forget(
+                space, session_ids=session or [], turn_ids=turn or [], fact_ids=fact or []
+            )
+        _print_forget_plan(plan)
+        return
+    targets = ", ".join([*(session or []), *(turn or []), *(fact or [])])
     if not yes and not typer.confirm(f"将永久删除 {targets} 及其派生的全部记忆，确定吗？"):
         raise typer.Exit(1)
     with _open_system() as system:
-        report = system.forget(space, session_ids=session or [], turn_ids=turn or [])
+        report = system.forget_memories(
+            space, session_ids=session or [], turn_ids=turn or [], fact_ids=fact or []
+        )
         if report.turns_deleted == 0:
             console.print("没有找到要删除的内容。")
             return
@@ -1199,6 +1274,25 @@ def _live_check(settings: Settings) -> None:
         note = f"未在列表中：{missing}" if missing else "配置中的模型都在列表中"
         console.print(f"{provider} 模型列表：共 {len(available)} 个；{note}")
     ledger.close()
+
+
+def _print_forget_plan(plan: dict[str, Any]) -> None:
+    if not plan["turns"]:
+        console.print("没有找到要删除的内容。")
+        return
+    table = Table(title=f"预演：将删除 {len(plan['turns'])} 条发言（什么都还没删）")
+    for column in ("会话", "角色", "发言"):
+        table.add_column(column)
+    for turn in plan["turns"]:
+        table.add_row(turn["session_id"], turn["role"], escape(turn["text"][:120]))
+    console.print(table)
+    console.print(
+        f"沿引用扩散 {plan['cascaded']} 条；按内容找到的转述 {plan['restated']} 条；"
+        f"原图 {plan['images']} 张；会话 {', '.join(plan['sessions_affected'])}"
+    )
+    for item in plan["facts"]:
+        console.print(f"  事实将随之消失：{escape(item['memory'])}")
+    console.print("[dim]重建后还会再查一遍有没有从别处长出来的同样信息，预演里没有这一步。[/dim]")
 
 
 def _print_consolidation(report: ConsolidationReport) -> None:

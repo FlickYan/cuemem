@@ -54,6 +54,12 @@ For each fact:
 Also list the named entities that appear in the facts (people, pets, places, organizations, products, events) with their type, other names used for them in this conversation, and a short description; and summarize the conversation in one or two sentences. Write the descriptions and the summary in the same language as the statements.
 Return empty lists if nothing is worth remembering."""  # noqa: E501
 
+# 应用给抽取的补充说明（consolidation.instructions，N12）放在系统提示的最后
+INSTRUCTIONS_HEADER = (
+    "Additional instructions from the application (they take precedence over the defaults "
+    "above when they conflict):"
+)
+
 # 遗忘删掉了会话里的发言时（D-021，发言编号不复用，留下空缺）才加的说明。剩下的发言可能用代词
 # 指着被删的内容（"那副登山杖正合适，我给她买了"）；不说明的话，模型会从剩下的人里挑一个顶上
 # （演示里成了"给 Lena 买"）。没有空缺的会话渲染结果不变，已有的抽取缓存照常命中（D-059）
@@ -260,6 +266,7 @@ class Extractor:
         assistant_chars: int | None = 600,
         max_chars: int = 24_000,
         fallback_model: str | None = None,
+        instructions: str | None = None,
     ) -> None:
         self.llm = llm
         self.role = role
@@ -267,6 +274,7 @@ class Extractor:
         self.assistant_chars = assistant_chars
         self.max_chars = max_chars
         self.fallback_model = fallback_model
+        self.instructions = instructions.strip() if instructions else None
 
     def extract(
         self,
@@ -337,6 +345,8 @@ class Extractor:
             focus = "the speakers (" + ", ".join(names) + ")"
             subject_hint = "the speaker's name (" + ", ".join(names) + ")"
         system = EXTRACTION_SYSTEM.format(focus=focus, subject_hint=subject_hint)
+        if self.instructions:  # 没有补充说明时提示词逐字不变，已有的抽取缓存照常命中
+            system += f"\n\n{INSTRUCTIONS_HEADER}\n{self.instructions}"
         text = render_session(
             turns,
             started_at,

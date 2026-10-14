@@ -42,6 +42,7 @@ from cuemem.config import Settings, load_settings
 from cuemem.core.ids import stable_id
 from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
 from cuemem.memory import ForgetReport, MemorySystem, Recall
+from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router, english_reason
 from cuemem.read.facts import fact_status
 
@@ -74,7 +75,8 @@ class Memory:
 
     config：嵌套的字典，与默认配置（及预设）深度合并，例如
     {"roles": {"reader": {"model": "qwen3.8-flash"}}}；home：数据目录（默认 CUEMEM_HOME，
-    源码仓库里是仓库根目录，否则 ~/.cuemem）；background：后台线程抽取事实（默认开）。
+    源码仓库里是仓库根目录，否则 ~/.cuemem）；instructions：给抽取的补充说明（记什么、不记什么）；
+    background：后台线程抽取事实（默认开）。
     """
 
     def __init__(
@@ -83,6 +85,7 @@ class Memory:
         *,
         preset: str | None = None,
         home: str | Path | None = None,
+        instructions: str | None = None,
         background: bool = True,
         http_client: httpx2.Client | None = None,
     ) -> None:
@@ -90,6 +93,9 @@ class Memory:
             settings = config
         else:
             settings = load_settings(preset=preset, home=home, **dict(config or {}))
+        if instructions is not None:  # 抽取的补充说明（Mem0 叫 custom_instructions）
+            consolidation = settings.consolidation.model_copy(update={"instructions": instructions})
+            settings = settings.model_copy(update={"consolidation": consolidation})
         self.settings = settings
         self.system = MemorySystem.from_settings(settings, http_client=http_client)
         if background:
@@ -283,12 +289,19 @@ class Memory:
 
     # ---------- 遗忘 ----------
 
-    def delete(self, memory_id: str) -> dict[str, Any]:
+    def delete(self, memory_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         """遗忘一条事实（被遗忘权）：删掉它出自的那一轮对话与没有引用的转述，再用剩下的日志
-        重建派生记忆。被它取代过的旧事实会恢复为当前有效。"""
+        重建派生记忆。被它取代过的旧事实会恢复为当前有效。
+
+        dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。"""
         found = self._find(memory_id)
         if found is None:
             raise KeyError(f"No memory with id {memory_id}")
+        if dry_run:
+            return {
+                "message": "Dry run: nothing was deleted",
+                **self.system.preview_forget(found[0], fact_ids=[memory_id]),
+            }
         report = self.system.forget_memories(found[0], fact_ids=[memory_id])
         return {"message": "Memory deleted", **_forget_out(report)}
 
@@ -298,6 +311,31 @@ class Memory:
         """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图。"""
         report = self.system.delete_space(space_for(user_id, agent_id))
         return {"message": "All memories deleted", **_forget_out(report)}
+
+    # ---------- 导出与导入 ----------
+
+    def export(
+        self, *, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
+    ) -> dict[str, Any]:
+        """导出这个用户（或 Agent）的记忆：原始日志与图片原文件，可选附上事实与画像的快照。
+        格式见 cuemem/portable.py；json.dump 之后可以在别的机器上 load。"""
+        return export_space(self.system, space_for(user_id, agent_id), derived=derived)
+
+    def load(
+        self,
+        data: Mapping[str, Any],
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        """导入 export 的结果：写回原始日志，派生记忆重新抽取（wait=True 时同步完成）。
+        不给 user_id、agent_id 时导入到文件里原来的空间。"""
+        space = space_for(user_id, agent_id) if user_id or agent_id else None
+        report = import_space(self.system, data, space_id=space, consolidate=wait)
+        if not wait and self.system.worker is not None:
+            self.system.worker.submit(report["space_id"])
+        return report
 
     # ---------- 其他 ----------
 

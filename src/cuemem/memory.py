@@ -27,6 +27,7 @@ from cuemem.core.models import (
     Hit,
     MediaItem,
     SessionIn,
+    Turn,
 )
 from cuemem.core.trace import TraceSink, start_trace
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
@@ -439,17 +440,9 @@ class MemorySystem:
         """
         started = time.perf_counter()
         with start_trace("forget", self.tracer, space=space_id) as trace:
-            all_turns = self.db.get_turns(space_id)
-            asked, sessions = set(turn_ids), set(session_ids)
-            wanted_turns = {t.id for t in all_turns if t.id in asked or t.session_id in sessions}
-            cascaded = 0
-            if follow_citations and wanted_turns:
-                expanded = self._follow_citations(space_id, wanted_turns)
-                cascaded = len(expanded - wanted_turns)
-                wanted_turns = expanded
-            restated = set(restated_turn_ids)
-            wanted_turns |= {t.id for t in all_turns if t.id in restated}
-            targets = [t for t in all_turns if t.id in wanted_turns]
+            targets, cascaded = self._forget_targets(
+                space_id, session_ids, turn_ids, follow_citations, restated_turn_ids
+            )
             affected = sorted({t.session_id for t in targets})
             if not targets:
                 return ForgetReport(space_id, 0, [], 0, 0, 0, 0, 0.0)
@@ -506,6 +499,27 @@ class MemorySystem:
             )
             trace.attrs.update(turns_deleted=deleted, sessions=affected, cascaded=cascaded)
         return report
+
+    def _forget_targets(
+        self,
+        space_id: str,
+        session_ids: Sequence[str],
+        turn_ids: Sequence[str],
+        follow_citations: bool,
+        restated_turn_ids: Sequence[str],
+    ) -> tuple[list[Turn], int]:
+        """要删的发言（按日志顺序）与沿引用扩散多出来的条数。遗忘与预览共用。"""
+        all_turns = self.db.get_turns(space_id)
+        asked, sessions = set(turn_ids), set(session_ids)
+        wanted_turns = {t.id for t in all_turns if t.id in asked or t.session_id in sessions}
+        cascaded = 0
+        if follow_citations and wanted_turns:
+            expanded = self._follow_citations(space_id, wanted_turns)
+            cascaded = len(expanded - wanted_turns)
+            wanted_turns = expanded
+        restated = set(restated_turn_ids)
+        wanted_turns |= {t.id for t in all_turns if t.id in restated}
+        return [t for t in all_turns if t.id in wanted_turns], cascaded
 
     def _remove_traces(self, space_id: str, texts: Sequence[str]) -> int:
         """删除这个空间里、属性中含有被删原话的 trace（太短的话不作依据，免得误删）。"""
@@ -667,18 +681,7 @@ class MemorySystem:
         同样的信息又从别处长了出来，再删它的出处，最多再追 REGROW_ROUNDS 轮。按内容找到的转述
         只删那条发言、不沿引用扩散：同一轮里用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。
         """
-        sources: list[str] = []
-        statements: list[str] = []
-        if fact_ids:
-            for fact in self.db.get_facts(space_id, ids=list(fact_ids)):
-                sources.extend(fact.source_turn_ids)
-                statements.append(fact.statement)
-        if media_ids:
-            items = self.db.get_media(space_id, ids=list(media_ids))
-            sources.extend(m.source_turn_id for m in items)
-        # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
-        turns = [*turn_ids, *self.round_turns(space_id, sources)]
-        restated = self.restating_turns(space_id, statements, exclude=turns)
+        turns, restated, statements = self._forget_plan(space_id, turn_ids, fact_ids, media_ids)
         report = self.forget(
             space_id,
             session_ids=list(session_ids),
@@ -695,6 +698,65 @@ class MemorySystem:
                 replace(self.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
             )
         return report
+
+    def _forget_plan(
+        self,
+        space_id: str,
+        turn_ids: Sequence[str],
+        fact_ids: Sequence[str],
+        media_ids: Sequence[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """按记忆遗忘的第一步：（要删的发言，按内容找到的转述，被删事实的陈述）。"""
+        sources: list[str] = []
+        statements: list[str] = []
+        if fact_ids:
+            for fact in self.db.get_facts(space_id, ids=list(fact_ids)):
+                sources.extend(fact.source_turn_ids)
+                statements.append(fact.statement)
+        if media_ids:
+            items = self.db.get_media(space_id, ids=list(media_ids))
+            sources.extend(m.source_turn_id for m in items)
+        # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
+        turns = list(dict.fromkeys([*turn_ids, *self.round_turns(space_id, sources)]))
+        restated = self.restating_turns(space_id, statements, exclude=turns)
+        return turns, restated, statements
+
+    def preview_forget(
+        self,
+        space_id: str,
+        *,
+        session_ids: Sequence[str] = (),
+        turn_ids: Sequence[str] = (),
+        fact_ids: Sequence[str] = (),
+        media_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """遗忘的预演（N12，对标 Supermemory、Redis Agent Memory Server 的 dry_run）：
+        会删哪些发言（含沿引用扩散与按内容找到的转述）、哪些事实会随之消失，但什么都不删。
+
+        找转述要调用一次便宜的模型（与真正遗忘时相同，结果进缓存）。重建之后"又长出来"的
+        事实（REGROW_ROUNDS）要真的重建才知道，预演里没有；事实一栏只是出处全在被删发言里的那些。
+        """
+        turns, restated, _ = self._forget_plan(space_id, turn_ids, fact_ids, media_ids)
+        targets, cascaded = self._forget_targets(
+            space_id, session_ids, turns, follow_citations=True, restated_turn_ids=restated
+        )
+        doomed = {t.id for t in targets}
+        facts = [
+            f
+            for f in self.db.get_facts(space_id)
+            if f.source_turn_ids and set(f.source_turn_ids) <= doomed
+        ]
+        return {
+            "turns": [
+                {"id": t.id, "session_id": t.session_id, "role": t.role, "text": t.text}
+                for t in targets
+            ],
+            "sessions_affected": sorted({t.session_id for t in targets}),
+            "cascaded": cascaded,
+            "restated": len(restated),
+            "facts": [{"id": f.id, "memory": f.statement} for f in facts],
+            "images": len(self.db.get_media(space_id, turn_ids=sorted(doomed))) if doomed else 0,
+        }
 
     def delete_space(self, space_id: str) -> ForgetReport:
         """删除整个记忆空间（SDK 的 delete_all，N12）：先按会话遗忘全部日志（连带清理缓存、

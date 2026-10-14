@@ -29,6 +29,7 @@ from cuemem.agent import Reply
 from cuemem.api.service import ChatService
 from cuemem.errors import CueMemError
 from cuemem.memory import RecallMode
+from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router
 
 if TYPE_CHECKING:
@@ -64,6 +65,7 @@ class ForgetRequest(BaseModel):
     turn_ids: list[str] = Field(default_factory=list)
     fact_ids: list[str] = Field(default_factory=list)
     media_ids: list[str] = Field(default_factory=list)
+    dry_run: bool = Field(False, description="只预演：返回会删哪些发言与事实，什么都不删")
 
 
 @contextmanager
@@ -224,6 +226,15 @@ def create_app(
 
     @api.post("/api/spaces/{space}/forget")
     def forget(space: str, request: ForgetRequest) -> dict[str, Any]:
+        if request.dry_run:
+            with _errors():
+                return service.system.preview_forget(
+                    space,
+                    session_ids=request.session_ids,
+                    turn_ids=request.turn_ids,
+                    fact_ids=request.fact_ids,
+                    media_ids=request.media_ids,
+                )
         with _errors():
             report = service.forget(
                 space,
@@ -239,6 +250,21 @@ def create_app(
             "facts_after": report.facts_after,
             "images_deleted": report.images_deleted,
         }
+
+    @api.get("/api/spaces/{space}/export")
+    def export(space: str, derived: bool = True) -> dict[str, Any]:
+        """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。"""
+        with _errors():
+            return export_space(service.system, space, derived=derived)
+
+    @api.post("/api/spaces/import")
+    def import_(data: dict[str, Any], space: str | None = None) -> dict[str, Any]:
+        """导入 export 的结果（N12）：写回原始日志，派生记忆在后台重新抽取。"""
+        with _errors():
+            report = import_space(service.system, data, space_id=space)
+        if service.system.worker is not None:
+            service.system.worker.submit(report["space_id"])
+        return report
 
     @api.post("/api/spaces/{space}/consolidate")
     def consolidate(space: str) -> dict[str, Any]:
