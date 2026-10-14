@@ -79,32 +79,48 @@ def load_cells(
 
 
 def write_stats(
-    settings: Any, method: str, keys: set[str], runs_dir: Path, runs: list[str]
+    settings: Any,
+    dataset: str,
+    method: str,
+    keys: set[str],
+    runs_dir: Path,
+    runs: list[str],
 ) -> dict[str, Any]:
-    """写入的成本：外部系统取各空间的 build.json；CueMem 取运行里的写入与巩固统计。"""
+    """写入的成本：外部系统取各空间的 build.json；CueMem 取运行里的写入与巩固统计。
+
+    全上下文（B1）不写入；朴素检索（B2）只建索引（向量化，不调用 LLM）；L1 / L2 / 控制器用同一份
+    巩固后的记忆，写入成本相同。"""
     total: dict[str, float] = defaultdict(float)
     if method in SYSTEMS:
         root = settings.paths.eval_spaces / SYSTEMS[method]
         for key in keys:
-            path = root / re.sub(r"[^A-Za-z0-9_.-]", "_", key) / "build.json"
-            if not path.exists():
+            names = {re.sub(r"[^A-Za-z0-9_.-]", "_", f"{dataset}:{key}"), key}
+            found = [root / name / "build.json" for name in names if (root / name).is_dir()]
+            if not found or not found[0].exists():
                 continue
-            build = json.loads(path.read_text("utf-8"))
+            build = json.loads(found[0].read_text("utf-8"))
             total["spaces"] += 1
-            for field in ("cost", "spent", "chat_calls", "llm_calls", "seconds", "memories"):
-                total[field] += float(build.get(field, 0) or 0)
+            total["cost"] += float(build.get("cost", 0) or 0)
+            total["spent"] += float(build.get("spent", 0) or 0)
+            total["llm_calls"] += float(build.get("chat_calls", build.get("llm_calls", 0)) or 0)
+            seconds = build.get("seconds")
+            total["seconds"] += float(
+                seconds if seconds is not None else build.get("latency_ms", 0) / 1000
+            )
+            total["memories"] += float(build.get("memories", 0) or 0)
         return {k: round(v, 4) for k, v in total.items()}
+    wanted = {"B1": set(), "B2": {"ingest"}}.get(method, {"ingest", "consolidate"})
     stages: dict[tuple[str, str], dict[str, Any]] = {}
     for run in runs:
         for row in load_rows(runs_dir / run, "ingest.jsonl"):
             stages[(row["space_key"], row["stage"])] = row
     for (space, stage), row in stages.items():
-        if space.split(":")[-1] not in {k.split(":")[-1] for k in keys}:
+        if stage not in wanted or space not in keys:
             continue
         total["cost"] += row.get("cost", 0.0)
         total["spent"] += row.get("spent", row.get("cost", 0.0)) or 0.0
         total["llm_calls"] += row.get("llm_calls", 0)
-        total["seconds"] += (row.get("elapsed_ms") or 0.0) / 1000
+        total["seconds"] += (row.get("elapsed_ms") or row.get("latency_ms") or 0.0) / 1000
         total["spaces"] += stage == "consolidate"
     return {k: round(v, 4) for k, v in total.items()}
 
@@ -162,7 +178,7 @@ def main() -> None:
                 t: {"n": len(v), "accuracy": round(sum(v) / len(v), 3)}
                 for t, v in sorted(by_type.items())
             },
-            "write": write_stats(settings, method, keys, runs_dir, runs),
+            "write": write_stats(settings, args.dataset, method, keys, runs_dir, runs),
         }
     for ref in REFERENCES:
         if ref not in methods_present:
