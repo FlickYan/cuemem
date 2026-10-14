@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import ABORT_JSON, FakeAPI
+from fakes import ABORT_JSON, REJECT, FakeAPI
 from fastapi.testclient import TestClient
 from openai import OpenAI
 
@@ -17,9 +17,10 @@ from cuemem.config import Settings
 from cuemem.embed import build_embedder
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.external import ExternalBaseline, memory_hit, space_key
-from cuemem.evals.gateway import Gateway
+from cuemem.evals.gateway import Gateway, embed_kind
 from cuemem.evals.methods import MethodContext, build_methods
 from cuemem.llm import Ledger, LLMClient, ResponseCache
+from cuemem.llm.types import ChatResult
 from cuemem.read.reader import Reader
 
 HELLO = [{"role": "user", "content": "hi"}]
@@ -159,6 +160,76 @@ def test_openai_sdk_against_the_running_gateway(gateway: Gateway, fake_api: Fake
         assert gateway.usage("sdk")["chat_calls"] == 1
     finally:
         gateway.stop()
+
+
+TOOLS = [{"type": "function", "function": {"name": "save", "parameters": {"type": "object"}}}]
+
+
+def test_parallel_tool_calls_default_to_true_like_openai(
+    client: TestClient, gateway: Gateway, fake_api: FakeAPI
+) -> None:
+    """外部系统按 OpenAI 的默认（true）写；通义不设为 true 时一次只回一个工具调用。"""
+    two = [
+        {"id": "c1", "name": "save", "arguments": '{"a": 1}'},
+        {"id": "c2", "name": "save", "arguments": '{"a": 2}'},
+    ]
+    fake_api.chat_replies = [lambda body: {"tool_calls": two}]
+    client.post("/b/t/v1/chat/completions", json={"messages": HELLO, "tools": TOOLS})
+    assert fake_api.chat_requests[-1]["parallel_tool_calls"] is True
+    client.post(
+        "/b/t/v1/chat/completions",
+        json={"messages": HELLO, "tools": TOOLS, "parallel_tool_calls": False},
+    )
+    assert fake_api.chat_requests[-1]["parallel_tool_calls"] is False  # 写了就照原样转发
+    fake_api.chat_replies = ["no tool"]
+    bye = [{"role": "user", "content": "bye"}]  # 换个内容：同样的请求会命中响应缓存
+    client.post("/b/t/v1/chat/completions", json={"messages": bye, "tools": TOOLS})
+    client.post("/b/t/v1/chat/completions", json={"messages": HELLO, "parallel_tool_calls": True})
+    assert "parallel_tool_calls" not in fake_api.chat_requests[-1]  # 不带工具时不发
+    usage = gateway.usage("t")
+    assert usage["tool_requests"] == 3 and usage["tool_calls"] == 4
+    assert usage["multi_tool_replies"] == 2 and usage["no_tool_replies"] == 1
+    assert usage["chat_calls"] == 4
+
+
+def test_truncated_replies_are_counted(
+    client: TestClient, gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cut = ChatResult(content="half a", finish_reason="length", model_alias="m", model_id="m")
+    monkeypatch.setattr(gateway.llm, "chat", lambda *args, **kwargs: cut)
+    client.post("/b/t/v1/chat/completions", json={"messages": HELLO})
+    assert gateway.usage("t")["truncated_replies"] == 1
+
+
+def test_refusals_are_counted_apart_from_other_errors(
+    client: TestClient, gateway: Gateway, fake_api: FakeAPI
+) -> None:
+    """主模型与备用模型都拒绝算一次拒绝；外部系统吞掉错误时（如 trustcall 改写成提示重试），
+    调用方从桶里看得出是不是内容审核拒绝。"""
+    fake_api.chat_replies = [lambda body: REJECT]
+    assert client.post("/b/f/v1/chat/completions", json={"messages": HELLO}).status_code == 400
+    fake_api.chat_replies = [lambda body: ABORT_JSON]
+    assert client.post("/b/f/v1/chat/completions", json={"messages": HELLO}).status_code == 400
+    usage = gateway.usage("f")
+    assert usage["errors"] == 2 and usage["refusals"] == 1 and usage["chat_calls"] == 0
+
+
+def test_search_buckets_embed_queries(
+    client: TestClient, gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """检索阶段的桶按查询向量化（通义的 text_type=query），其余按文档。"""
+    kinds: list[str] = []
+    embed = gateway.embedder.embed
+
+    def spy(texts: Sequence[str], kind: Any) -> Any:
+        kinds.append(kind)
+        return embed(texts, kind)
+
+    monkeypatch.setattr(gateway.embedder, "embed", spy)
+    for bucket in ("langmem.search.locomo_conv-1", "langmem.build.locomo_conv-1", "default"):
+        client.post(f"/b/{bucket}/v1/embeddings", json={"input": "where does Ana live"})
+    assert kinds == ["query", "document", "document"]
+    assert embed_kind("graphiti.search.x") == "query" and embed_kind("search") == "document"
 
 
 # ---------- 外部基线的公共部分 ----------

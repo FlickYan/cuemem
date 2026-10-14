@@ -8,12 +8,16 @@ evals/external.py），只换"记忆从哪来"：
   最后一句检索最相关的 5 条已有记忆，再让模型用工具调用（trustcall）新增或修改记忆：每个会话一次
   抽取调用，与 CueMem 相同（trustcall 校验失败时会多一两次修补调用）。
 - **模型**：LangChain 的 `ChatOpenAI` 与 `OpenAIEmbeddings` 指向评测网关：聊天交给 extractor 角色
-  的模型，向量交给 CueMem 的向量器（请求里的模型名只是占位）。还没有已有记忆时不带
-  tool_choice（模型自己决定调不调工具）；有已有记忆时 trustcall 要求必须调用（"any"，ChatOpenAI
-  发出去是 "required"），网关原样转给模型。
+  的模型，向量交给 CueMem 的向量器（请求里的模型名只是占位）。每个会话只有一轮，LangMem 要求
+  模型"在一次回复里并行调用多个工具"（每条新记忆、每处修改各一个调用）；ChatOpenAI 不写
+  parallel_tool_calls（OpenAI 的默认就是 true），网关按 OpenAI 的默认发出 true——通义不设为 true
+  时一次只回一个工具调用，每个会话就只能记一条。还没有已有记忆时不带 tool_choice（模型自己决定
+  调不调工具）；有已有记忆时 trustcall 要求必须调用（"any"，ChatOpenAI 发出去是 "required"），
+  网关原样转给模型（通义的非思考模式不保证照做：没调用的回复计入 no_tool_replies）。
 - **检索**：`store.search(("memories",), query=问题, limit=60)`，即 LangMem 检索工具的做法；
   按名次装进约 4000 tokens（与 L1 的预算与装法相同：放不下的跳过，后面更短的还能放）。
-  每条记忆标上写下它的会话日期，交给同一个回答模型、同一套提示。
+  问题按查询向量化（网关对检索阶段的桶用 kind="query"，与 L1 相同；LangMem 参考的 OpenAI 向量
+  不分查询与文档，通义的分）。每条记忆标上写下它的会话日期，交给同一个回答模型、同一套提示。
 
 与 LangMem 自身默认（及唯一公开的 LoCoMo 跑法）不同的地方，以及原因：
 
@@ -30,8 +34,9 @@ evals/external.py），只换"记忆从哪来"：
    （`2023-05-08 (Mon) 13:56 | Caroline: …`）；另外按管理器返回的写入记下每条记忆第一次写下与
    最后一次修改所在的会话，回答模型看到的时间取最后一次（与第一次不同时在文本后注明）。
 4. 检索条数：LangMem 检索工具默认 limit=10，这里取 60（与 M0 两位说话人各 30 条相当），再按
-   L1 的 4000 tokens 装入，两者先到为准。LangMem 会把同一主题的信息合并成长记忆（试跑的
-   conv-42：90 条，平均约 250 tokens，最长约 3600），实际装进去的多是 8–24 条。
+   L1 的 4000 tokens 装入，两者先到为准。LangMem 会把同一主题的信息合并成长记忆（两次试跑的
+   conv-42：90 与 117 条，平均约 250 与 170 tokens，最长约 3600 与 600），实际装进去的多是
+   8–24 条。
 5. 存储：langgraph 自带的向量存储只有 InMemoryStore（其余要 Postgres 或另装 sqlite-vec），
    写完把条目与向量一起存成 store.json，检索时原样装回，不重新向量化。
 6. 记忆 ID：LangMem 用 uuid4 给新记忆与提示里的会话标签编号，每次重建提示都不同、响应缓存全部
@@ -39,34 +44,53 @@ evals/external.py），只换"记忆从哪来"：
    ID 依旧是不透明的随机串，重建时命中缓存、几乎不花钱。
 7. 其余全用默认：记忆提示 _MEMORY_INSTRUCTIONS、Memory 结构、enable_inserts=True、
    enable_deletes=False、query_limit=5、max_steps=1、没有 phases 与 query_model、
-   索引字段 "$"（整个 JSON 值做向量）。
-8. 抽取失败的会话（网关换了备用模型也失败）跳过并计数；超过一半失败时整份写入算失败。
-   trustcall 改不动的补丁（路径不对等）只记日志、跳过那次修改，这里数出来写进 build.json
-   （skipped_edits）。
-9. store.json 记下写入用的抽取模型与向量器；评测空间的目录不分预设，换了模型时拒绝装回，
-   要删掉目录重建。
+   索引字段 "$"（整个 JSON 值做向量）、不设 max_tokens（用模型自己的输出上限）。
+8. 失败：模型调用出错时 trustcall 自己会把错误写进提示重试（有已有记忆时），直到 LangGraph
+   的步数上限（25）报 GraphRecursionError，这里不改。最终失败的会话里，被内容审核拒绝的
+   （网关换了备用模型也拒绝，重试没用；看网关桶里的 refusals）跳过并计数，与 M0 相同；
+   其他错误让整份写入失败、不留 build.json，下次运行重建（定种子的 ID 让前面的会话全部命中
+   响应缓存）——跳过它们，后面的会话会建在缺了一块的存储上，出错时已写进存储的部分记忆也
+   对不上会话日期。被拒绝的与一条记忆都没写的会话合计超过 max(2, 10%) 时整份写入算失败；
+   带工具的回复满 10 次却没有一次并行调用多个工具时也算失败（并行工具调用没生效）。
+9. 写入记录（build.json）另外记下：每个会话写入的条数、没写入的会话、网关统计的工具调用
+   （tool_calls、multi_tool_replies、no_tool_replies）与被长度上限截断的回复
+   （truncated_replies，截断的工具调用 LangChain 会静默丢掉）、trustcall 跳过的补丁
+   （skipped_edits，路径不对等）与校验不过被丢掉的调用（dropped_calls）、各包的版本。
+   第二次试跑（deepseek 预设）：33 次抽取调用里 31 次一次回多个工具调用，共 169 个；DeepSeek
+   有 4 次给 Memory 传了空参数，trustcall 让它修补时它又附带的 9 条 Memory 调用被丢掉
+   （dropped_calls=9，trustcall 自身的行为）。通义预设下还没有实跑过：正式评测前先跑一份对话，
+   看 multi_tool_replies 与 no_tool_replies。
+10. store.json 与 build.json 记下写入用的抽取模型与向量器；评测空间的目录不分预设，换了模型
+    时删掉旧的写入重建，不沿用别的模型写出的记忆。
+11. 已知的限制：InMemoryStore 索引整个 JSON 值，CueMem 的向量器只取前 max_chars（6000）个
+    字符，本机的 bge-small 还只看前 512 tokens（约 2000 个字符）；LangMem 合并出的长记忆
+    （第一次试跑有两条一万多字符）尾部的内容因此检索不到，LangMem 参考的
+    text-embedding-3-small 能看 8191 tokens。build.json 记下最长记忆的字符数与超过 max_chars
+    的条数（第二次试跑最长 2415 个字符，没有超过的）。
 
 langmem 不是 CueMem 的依赖，评测时用 uv 临时装上（--extra local 只在用本机向量时需要，
-如 deepseek 预设）：
+如 deepseek 预设）。这里读写 InMemoryStore 的内部字段（_data、_vectors，在
+langgraph-checkpoint 里），按 trustcall 的日志数跳过的补丁，所以相关的包都钉在试过的版本：
 
     uv run --extra local --with langmem==0.0.30 --with langchain-openai==1.7.2 \\
+        --with langchain-core==1.6.10 --with langgraph==1.2.15 \\
+        --with langgraph-checkpoint==4.3.0 --with trustcall==0.0.39 \\
         cuemem eval run --dataset locomo --split test200r --methods ML \\
         --name locomo-test200r-langmem
-
-试过的版本：langmem 0.0.30、langgraph 1.2.15、trustcall 0.0.39、langchain-openai 1.7.2。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import random
-import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -82,42 +106,54 @@ CHAT_MODEL = "gpt-4o-mini"  # 只是请求里的名字（Mem0 论文用的模型
 EMBED_MODEL = "text-embedding-3-small"  # 同上：网关一律交给 CueMem 的向量器
 STORE_FILE = "store.json"
 MAX_OPEN = 8  # 同时装在内存里的存储
-_ids = threading.local()  # 当前线程正在写入的会话：给 LangMem 的 uuid4 定种子
+MAX_LOST = 2  # 被拒绝或没写入的会话最多容许 max(MAX_LOST, 10%) 个
+MIN_TOOL_REPLIES = 10  # 带工具的回复满这么多次还没有一次并行调用多个工具：并行没生效
+PACKAGES = (
+    "langmem",
+    "langchain-openai",
+    "langchain-core",
+    "langgraph",
+    "langgraph-checkpoint",
+    "trustcall",
+)
+
+# 正在写入的会话（给 LangMem 的 uuid4 定种子）与正在写入的对话（收集 trustcall 报告的问题）。
+# 用 ContextVar 而不是按线程记：LangChain 把同步的步骤放进线程池跑（复制上下文），
+# trustcall 丢掉校验不过的调用时就是在那里记的日志
+_rng: contextvars.ContextVar[random.Random | None] = contextvars.ContextVar(
+    "langmem_rng", default=None
+)
+_problems: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "langmem_problems", default=None
+)
 
 
 class _SeededUuid:
     """langmem.knowledge.extraction 里 uuid 模块的替身：写入时 uuid4 由（对话, 会话）定种子。
 
-    只替换这一个模块里的名字，别的库照常用真随机的 uuid4；不在写入线程里时也是真随机。"""
+    只替换这一个模块里的名字，别的库照常用真随机的 uuid4；不在写入中时也是真随机。"""
 
     def __getattr__(self, name: str) -> Any:
         return getattr(uuid, name)
 
     def uuid4(self) -> uuid.UUID:
-        rng: random.Random | None = getattr(_ids, "rng", None)
+        rng = _rng.get()
         if rng is None:
             return uuid.uuid4()
         return uuid.UUID(int=rng.getrandbits(128), version=4)
 
 
 class _Problems(logging.Handler):
-    """按线程记下 trustcall（logger "extraction"）报告的问题：补丁没能应用、找不到要改的记忆等。
-
-    trustcall 只记日志、跳过那次修改，不报错；写入统计里要看得到丢了多少。"""
+    """把 trustcall（logger "extraction"）报告的问题记到正在写入的那份对话名下：补丁没能应用、
+    找不到要改的记忆、工具调用校验不过被丢掉等。trustcall 只记日志、跳过，不报错。"""
 
     def __init__(self) -> None:
         super().__init__(logging.WARNING)
-        self._seen: dict[int, list[str]] = {}
-        self._mutex = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
-        with self._mutex:
-            self._seen.setdefault(record.thread or 0, []).append(record.getMessage()[:200])
-
-    def take(self) -> list[str]:
-        """取出（并清空）当前线程记下的问题。"""
-        with self._mutex:
-            return self._seen.pop(threading.get_ident(), [])
+        seen = _problems.get()
+        if seen is not None:
+            seen.append(record.getMessage()[:200])
 
 
 _PROBLEMS = _Problems()
@@ -125,7 +161,7 @@ _PROBLEMS = _Problems()
 
 def _import_langmem() -> None:
     try:
-        import langmem.knowledge.extraction as extraction  # type: ignore[import-not-found, unused-ignore]
+        import langmem.knowledge.extraction as extraction  # type: ignore[import-not-found, import-untyped, unused-ignore]
     except ImportError as exc:  # pragma: no cover - 取决于运行环境
         raise RuntimeError(
             "ML 需要 langmem 与 langchain-openai：用 uv run --with langmem==0.0.30 "
@@ -149,54 +185,108 @@ class LangMemBaseline(ExternalBaseline):
 
     # ---------- 写入 ----------
 
+    def _ensure_built(
+        self, key: str, directory: Path, sessions: Sequence[EvalSession]
+    ) -> dict[str, Any] | None:
+        # 评测空间的目录不分预设：别的模型写出的记忆不能沿用。删掉 build.json，基类就整个目录重建
+        record = directory / "build.json"
+        if record.exists() and not same_identity(record, self._identity()):
+            record.unlink()
+        return super()._ensure_built(key, directory, sessions)
+
     def build(self, key: str, directory: Path, sessions: Sequence[EvalSession]) -> dict[str, Any]:
         # 整份写入放在一个事件循环里：异步路径会把写入错误抛出来（同步的 invoke 在线程池里
-        # 写存储，向量请求失败时静默丢掉那条记忆），LangChain 缓存的异步 HTTP 客户端也不跨循环
+        # 写存储，向量请求失败时静默丢掉那条记忆）
         return asyncio.run(self._build(key, directory, sessions))
 
     async def _build(
         self, key: str, directory: Path, sessions: Sequence[EvalSession]
     ) -> dict[str, Any]:
+        import httpx
         from langgraph.store.memory import InMemoryStore  # type: ignore[import-not-found, unused-ignore]
-        from langmem import create_memory_store_manager  # type: ignore[import-not-found, unused-ignore]
+        from langmem import create_memory_store_manager  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        url = self.gateway.url(self.bucket(key))
-        store = InMemoryStore(index={"dims": self.embedder.dim, "embed": _embeddings(url)})
-        manager = create_memory_store_manager(_chat_model(url), namespace=NAMESPACE, store=store)
+        bucket = self.bucket(key)
+        url = self.gateway.url(bucket)
+        before = self.gateway.usage(bucket)
         written: dict[str, dict[str, str]] = {}
         updates = 0
-        failed: list[str] = []
-        _PROBLEMS.take()
-        ordered = sorted(sessions, key=lambda s: s.started_at)
-        for index, session in enumerate(ordered):
-            messages = session_messages(session)
-            if not messages:
-                continue
-            _ids.rng = random.Random(f"{key}|{index}|{session.session_id}")
-            try:
-                puts = await manager.ainvoke({"messages": messages})
-            except Exception as exc:  # 换了备用模型也失败的会话：跳过并计数，别的照常
-                failed.append(f"{session.session_id}: {type(exc).__name__}: {exc}"[:200])
-                continue
-            finally:
-                _ids.rng = None
-            updates += record_writes(written, puts, session)
-        problems = _PROBLEMS.take()
-        if len(failed) * 2 > len(ordered):
-            raise RuntimeError(f"LangMem 一半以上的会话抽取失败：{failed[:3]}")
+        puts_per_session: list[int] = []
+        refused: list[str] = []
+        empty: list[str] = []
+        problems: list[str] = []
+        collecting = _problems.set(problems)
+        # 每份写入一个 HTTP 客户端、用完关掉：LangChain 默认按 base_url 缓存异步客户端，每份
+        # 对话的桶地址都不同，缓存里会留下一个个绑在已关闭事件循环上的客户端。网关在本机：
+        # 不走环境变量里的代理（LangChain 的默认客户端也不走）
+        http = httpx.AsyncClient(trust_env=False)
+        try:
+            embed = _embeddings(url, http)
+            store = InMemoryStore(index={"dims": self.embedder.dim, "embed": embed})
+            model = _chat_model(url, http)
+            manager = create_memory_store_manager(model, namespace=NAMESPACE, store=store)
+            ordered = sorted(sessions, key=lambda s: s.started_at)
+            for number, session in enumerate(ordered):
+                messages = session_messages(session)
+                if not messages:
+                    continue
+                seeded = _rng.set(random.Random(f"{key}|{number}|{session.session_id}"))
+                refusals = self.gateway.usage(bucket)["refusals"]
+                try:
+                    puts = await manager.ainvoke({"messages": messages})
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    # trustcall 把模型调用的错误改写成提示重试，最后报的是 GraphRecursionError：
+                    # 是不是内容审核拒绝，看这个会话期间网关桶里的拒绝次数
+                    if self.gateway.usage(bucket)["refusals"] == refusals:
+                        raise RuntimeError(  # 整份作废：下次重建，前面的会话命中缓存
+                            f"LangMem 写入会话 {session.session_id} 失败：{error}"[:300]
+                        ) from exc
+                    refused.append(f"{session.session_id}: {error}"[:200])
+                    continue
+                finally:
+                    _rng.reset(seeded)
+                puts_per_session.append(len(puts))
+                if not puts:
+                    empty.append(session.session_id)
+                updates += record_writes(written, puts, session)
+        finally:
+            _problems.reset(collecting)
+            await http.aclose()
+        usage = self.gateway.usage(bucket)
+        replies = {
+            field: usage[field] - before.get(field, 0)
+            for field in ("tool_requests", "multi_tool_replies")
+        }
+        check_build(len(puts_per_session) + len(refused), refused, empty, replies)
         save_store(directory / STORE_FILE, store, written, self._identity())
+        sizes = [
+            len(json.dumps(item.value, sort_keys=True, ensure_ascii=False))
+            for items in store._data.values()
+            for item in items.values()
+        ]
+        skipped = [p for p in problems if p.startswith("Could not")]
+        dropped = [p for p in problems if not p.startswith("Could not")]
         return {
-            "memories": sum(len(items) for items in store._data.values()),
+            "memories": len(sizes),
             "updates": updates,
-            "failed_sessions": failed,
-            "skipped_edits": len(problems),  # trustcall 没能应用而跳过的修改
-            "skipped_edit_examples": problems[:3],
+            "puts_per_session": puts_per_session,
+            "empty_sessions": empty,
+            "refused_sessions": refused,
+            "skipped_edits": len(skipped),  # trustcall 没能应用而跳过的修改
+            "dropped_calls": len(dropped),  # trustcall 校验不过而丢掉的工具调用等
+            "problem_examples": [*skipped[:2], *dropped[:2]],
+            "longest_memory_chars": max(sizes, default=0),
+            "memories_over_embed_limit": sum(
+                size > self.llm.settings.embedding.max_chars for size in sizes
+            ),
+            "versions": package_versions(),
             **self._identity(),
         }
 
     def _identity(self) -> dict[str, Any]:
-        """写入用的模型：记进 store.json，检索时核对。评测空间的目录不分预设，换了模型
-        （如从 deepseek 预设换到通义）不能悄悄沿用别的模型写出的记忆。"""
+        """写入用的模型：记进 store.json 与 build.json，复用前核对。评测空间的目录不分预设，
+        换了模型（如从 deepseek 预设换到通义）不能悄悄沿用别的模型写出的记忆。"""
         return {
             "extractor": self.llm.settings.roles[self.gateway.role].model,
             "embedder": self.embedder.name,
@@ -219,7 +309,7 @@ class LangMemBaseline(ExternalBaseline):
         return kept, {"langmem_found": len(found), "evidence_tokens": tokens}
 
     def _store(self, key: str, directory: Path) -> tuple[Any, dict[str, dict[str, str]]]:
-        """装回（或复用）一份对话历史的存储；检索时的向量请求记在 search 桶里。"""
+        """装回（或复用）一份对话历史的存储；检索时的向量请求记在 search 桶里（按查询向量化）。"""
         with self._lock:
             if key in self._open:
                 self._open.move_to_end(key)
@@ -237,25 +327,31 @@ class LangMemBaseline(ExternalBaseline):
             self._open.pop(key, None)
 
 
-def _chat_model(url: str) -> Any:
+def _chat_model(url: str, http: Any) -> Any:
     from langchain_openai import ChatOpenAI  # type: ignore[import-not-found, unused-ignore]
 
     # 温度不设：网关用 extractor 角色的默认值。网关已在内部重试与换备用模型，这里只重试一次
     return ChatOpenAI(
-        model=CHAT_MODEL, base_url=url, api_key="unused", max_retries=1, use_responses_api=False
+        model=CHAT_MODEL,
+        base_url=url,
+        api_key="unused",
+        max_retries=1,
+        use_responses_api=False,
+        http_async_client=http,
     )
 
 
-def _embeddings(url: str) -> Any:
+def _embeddings(url: str, http: Any = None) -> Any:
     from langchain_openai import OpenAIEmbeddings  # type: ignore[import-not-found, unused-ignore]
 
     # 网关只收字符串：不按 tiktoken 切成 token id
-    return OpenAIEmbeddings(
+    return OpenAIEmbeddings(  # type: ignore[call-arg, unused-ignore]
         model=EMBED_MODEL,
         base_url=url,
         api_key="unused",
         check_embedding_ctx_length=False,
         max_retries=1,
+        http_async_client=http,
     )
 
 
@@ -297,6 +393,48 @@ def record_writes(
             entry.update(session=session.session_id, time=when)
             updates += 1
     return updates
+
+
+def check_build(
+    sessions: int, refused: Sequence[str], empty: Sequence[str], replies: Mapping[str, int]
+) -> None:
+    """整份写入能不能用；不能用时报错（不留 build.json，下次运行重建）。
+
+    sessions：交给管理器的会话数；replies：这份写入在网关桶里的 tool_requests 与
+    multi_tool_replies。"""
+    allowed = max(MAX_LOST, sessions // 10)
+    if len(refused) + len(empty) > allowed:
+        raise RuntimeError(
+            f"LangMem 有 {len(refused)} 个会话被内容审核拒绝、{len(empty)} 个会话一条记忆都没写"
+            f"（共 {sessions} 个，最多容许 {allowed} 个）：{[*refused, *empty][:3]}"
+        )
+    if replies.get("tool_requests", 0) >= MIN_TOOL_REPLIES and not replies.get(
+        "multi_tool_replies", 0
+    ):
+        raise RuntimeError(
+            f"LangMem 的 {replies['tool_requests']} 次抽取都只回了一个工具调用：并行工具调用"
+            "没有生效，每个会话只能记一条（检查网关是否发出 parallel_tool_calls）"
+        )
+
+
+def same_identity(record: Path, identity: Mapping[str, Any]) -> bool:
+    """build.json 里记下的抽取模型与向量器是否与当前相同（旧记录缺字段时算不同）。"""
+    try:
+        built = json.loads(record.read_text("utf-8"))
+    except (OSError, ValueError):
+        return False
+    return all(built.get(field) == value for field, value in identity.items())
+
+
+def package_versions() -> dict[str, str]:
+    """写入时实际用的版本（命令里钉住了，这里再记一份）。"""
+    versions = {}
+    for name in PACKAGES:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = "missing"
+    return versions
 
 
 def memory_text(value: Mapping[str, Any]) -> str:
@@ -386,7 +524,8 @@ def load_store(
 ) -> tuple[Any, dict[str, dict[str, str]]]:
     """store.json → InMemoryStore（向量原样装回）与每条记忆的写入会话。
 
-    写入用的模型与当前不同时拒绝装回（先核对，再导入 langgraph）。"""
+    写入用的模型与当前不同时拒绝装回（先核对，再导入 langgraph）。正常走不到这里：
+    _ensure_built 已按 build.json 核对过，不同就重建。"""
     payload = json.loads(path.read_text("utf-8"))
     if payload.get("identity") != dict(identity):
         raise RuntimeError(
