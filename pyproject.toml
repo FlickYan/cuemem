@@ -31,6 +31,11 @@ dependencies = [
 [project.optional-dependencies]
 # 本机向量（embedding.backend: fastembed，预设 deepseek 用它）：ONNX 推理，不要 Key
 local = ["fastembed>=0.9"]
+# 框架集成（N12，cuemem/integrations/）：按需安装
+langgraph = ["langgraph>=1.2", "langchain-core>=1.6"]
+openai-agents = ["openai-agents>=0.23"]
+anthropic = ["anthropic>=1.14"]
+integrations = ["langgraph>=1.2", "langchain-core>=1.6", "openai-agents>=0.23", "anthropic>=1.14"]
 
 [project.scripts]
 cuemem = "cuemem.cli:app"
