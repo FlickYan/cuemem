@@ -236,5 +236,5 @@ def test_external_baseline_builds_once_and_records_usage(
 
 
 def test_external_methods_are_registered_lazily() -> None:
-    with pytest.raises(ModuleNotFoundError):  # 适配器还没装上外部包时，构造时才报错
-        build_methods(["MG"])
+    # 适配器模块按需导入；外部包（这里是 graphiti-core）要到第一次回答时才导入，构造不需要它
+    assert [m.name for m in build_methods(["MG"])] == ["MG"]
