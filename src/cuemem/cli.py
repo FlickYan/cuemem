@@ -1,5 +1,6 @@
 """命令行入口。
 
+cuemem [--preset openai|ollama] …     换模型供应商（也可设 CUEMEM_PRESET，N12）
 cuemem configure                      交互式填写 API Key（写入 .env）
 cuemem doctor [--live]                检查配置、API Key 与连通性
 cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
@@ -65,9 +66,31 @@ app = typer.Typer(
 )
 console = Console()
 
+
+@app.callback()
+def main(
+    preset: Annotated[
+        str | None,
+        typer.Option(
+            "--preset",
+            help="换模型供应商的预设：openai、ollama（本地，不要 Key），或预设 YAML 的路径；"
+            "也可以设环境变量 CUEMEM_PRESET",
+        ),
+    ] = None,
+) -> None:
+    """CueMem：线索驱动的多模态 Agent 长期记忆系统"""
+    if preset:  # 各命令都通过 load_settings 读配置，它看这个环境变量（N12）
+        os.environ["CUEMEM_PRESET"] = preset
+
+
 DATETIME_FORMATS = ["%Y-%m-%d", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"]
 CURRENCY_SYMBOL = {"CNY": "¥", "USD": "$"}
-PROVIDER_LABELS = {"deepseek": "DeepSeek", "qwen": "QwenCloud（通义千问）"}
+PROVIDER_LABELS = {
+    "deepseek": "DeepSeek",
+    "qwen": "QwenCloud（通义千问）",
+    "openai": "OpenAI",
+    "ollama": "Ollama（本地）",
+}
 KEY_HINTS = {"qwen": "以 sk-ws- 开头"}  # 帮助区分同一平台上的其他 Key
 
 
@@ -101,8 +124,15 @@ def configure() -> None:
         f"配置将写入 [bold]{path}[/bold]（已在 .gitignore 中，不会被提交）。\n"
         "Key 输入时屏幕上不显示任何字符；直接回车表示保留当前值。\n"
     )
+    # 只问用得到的供应商（预设叠加在默认配置上，默认的供应商仍在配置里），不要 Key 的跳过
+    needed = {
+        name: provider
+        for name, provider in settings.providers.items()
+        if name in settings.used_providers() and provider.api_key_env is not None
+    }
     updates: dict[str, str | None] = {}
-    for name, provider in settings.providers.items():
+    for name, provider in needed.items():
+        assert provider.api_key_env is not None
         label = PROVIDER_LABELS.get(name, name)
         hint = f"（{KEY_HINTS[name]}）" if name in KEY_HINTS else ""
         updates[provider.api_key_env] = _prompt_secret(
@@ -113,7 +143,8 @@ def configure() -> None:
     summary = Table(title=f"已写入 {path.name}（仅本人可读写）")
     for column in ("供应商", "环境变量", "Key", "接口"):
         summary.add_column(column)
-    for name, provider in settings.providers.items():
+    for name, provider in needed.items():
+        assert provider.api_key_env is not None
         key = updates[provider.api_key_env]
         summary.add_row(
             PROVIDER_LABELS.get(name, name),
@@ -1017,9 +1048,15 @@ def _print_config(settings: Settings) -> None:
     providers = Table(title="供应商")
     for column in ("名称", "Base URL", "Key 环境变量", "状态"):
         providers.add_column(column)
+    used = settings.used_providers()
     for name, p in settings.providers.items():
-        status = "[green]已设置[/green]" if p.api_key() else "[red]未设置 Key[/red]"
-        providers.add_row(name, p.base_url, p.api_key_env, status)
+        if p.api_key_env is None:
+            status = "[green]不需要 Key[/green]"
+        else:
+            status = "[green]已设置[/green]" if p.api_key() else "[red]未设置 Key[/red]"
+        if name not in used:
+            status += "（未使用）"
+        providers.add_row(name, p.base_url, p.api_key_env or "—", status)
     console.print(providers)
 
     roles = Table(title="角色 → 模型")
@@ -1034,9 +1071,10 @@ def _print_config(settings: Settings) -> None:
 
     emb = settings.embedding
     detail = (
-        f"{emb.model}（{emb.provider}），{emb.dim} 维，sparse={'开' if emb.sparse else '关'}"
-        if emb.backend == "dashscope"
-        else f"离线哈希向量，{emb.dim} 维（仅用于测试与演示）"
+        f"离线哈希向量，{emb.dim} 维（仅用于测试与演示）"
+        if emb.backend == "hash"
+        else f"{emb.model}（{emb.provider}，{emb.backend} 接口），{emb.dim} 维，"
+        f"sparse={'开' if emb.sparse and emb.backend == 'dashscope' else '关'}"
     )
     console.print(f"向量：{detail}")
     vector_store = settings.vector_store.url or f"本地模式 {settings.paths.qdrant}"
@@ -1090,7 +1128,7 @@ def _live_check(settings: Settings) -> None:
     except Exception as exc:
         console.print(f"向量接口：[red]失败[/red] · {type(exc).__name__}: {exc}")
 
-    for provider in settings.providers:
+    for provider in settings.used_providers():
         if settings.providers[provider].api_key() is None:
             continue
         try:

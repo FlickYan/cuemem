@@ -1,7 +1,11 @@
 """配置加载。
 
-优先级（高 → 低）：显式参数 > 环境变量（前缀 CUEMEM_，嵌套用 __）> YAML 配置文件。
-API Key 不写进配置文件，而是从环境变量或项目根目录的 .env 中读取（用 cuemem configure 填写）。
+优先级（高 → 低）：显式参数 > 环境变量（前缀 CUEMEM_，嵌套用 __）> 预设 > YAML 配置文件。
+API Key 不写进配置文件，而是从环境变量或数据目录的 .env 中读取（用 cuemem configure 填写）。
+
+默认配置随包发布（cuemem/configs/default.yaml），pip 安装后也能用（N12，D-060）。
+数据目录：CUEMEM_HOME 优先；在源码仓库里运行时是仓库根目录（与之前一样），否则是 ~/.cuemem。
+预设（presets/*.yaml）叠加在默认配置上，换掉模型供应商：openai、ollama（本地，不要 Key）。
 """
 
 from __future__ import annotations
@@ -20,8 +24,10 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "default.yaml"
+PACKAGE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = PACKAGE_DIR.parents[1]  # 源码仓库的根目录（src 布局）；pip 安装后没有意义
+DEFAULT_CONFIG = PACKAGE_DIR / "configs" / "default.yaml"
+PRESETS_DIR = PACKAGE_DIR / "configs" / "presets"
 
 # QwenCloud（阿里模型平台的国际品牌）的原生向量接口：只有原生接口能同时返回 dense 与 sparse 向量
 QWENCLOUD_EMBEDDING_URL = (
@@ -36,8 +42,10 @@ QWENCLOUD_MULTIMODAL_EMBEDDING_URL = (
     "multimodal-embedding"
 )
 
-# YAML 文件路径通过 ContextVar 传给配置源，避免修改全局环境变量
-_config_path: ContextVar[Path] = ContextVar("cuemem_config_path", default=DEFAULT_CONFIG)
+# YAML 文件路径（默认配置在前、预设在后，深度合并）通过 ContextVar 传给配置源，避免修改全局环境变量
+_config_paths: ContextVar[tuple[Path, ...]] = ContextVar(
+    "cuemem_config_paths", default=(DEFAULT_CONFIG,)
+)
 
 Currency = Literal["CNY", "USD"]
 
@@ -54,15 +62,21 @@ class PeakHours(BaseModel):
     off_peak_factor: float = 0.5
 
 
+# 不需要 Key 的供应商（本地模型）用的占位 Key：OpenAI SDK 要求 Key 非空，本地服务会忽略它
+LOCAL_API_KEY = "local"
+
+
 class ProviderConfig(BaseModel):
     base_url: str
-    api_key_env: str
+    api_key_env: str | None = None  # 为空表示不需要 Key（Ollama、vLLM 等本地服务，N12）
     max_concurrency: int = 8
     timeout_s: float = 120.0
     max_retries: int = 3
     peak_hours: PeakHours | None = None  # 没有分时价格的供应商为空
 
     def api_key(self) -> str | None:
+        if self.api_key_env is None:
+            return LOCAL_API_KEY
         return os.environ.get(self.api_key_env) or None
 
 
@@ -84,6 +98,10 @@ class ModelSpec(BaseModel):
     context_window: int | None = None
     vision: bool = False
     extra_body: dict[str, Any] = Field(default_factory=dict)  # 供应商特有参数，如关闭思考模式
+    # 推理模型（如 OpenAI 的 GPT-5 系列）只接受默认温度：请求里不带 temperature（N12）
+    fixed_temperature: bool = False
+    # 输出长度上限的参数名：OpenAI 的新模型只认 max_completion_tokens
+    max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
 
 
 class RoleConfig(BaseModel):
@@ -93,7 +111,9 @@ class RoleConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    backend: Literal["dashscope", "hash"] = "dashscope"
+    # dashscope：通义原生接口（dense + sparse）；openai：OpenAI 兼容的 /embeddings 接口
+    # （OpenAI、Ollama、vLLM、硅基流动……，地址取供应商的 base_url，N12）；hash：离线哈希向量
+    backend: Literal["dashscope", "openai", "hash"] = "dashscope"
     provider: str = "qwen"
     model: str = "text-embedding-v4"
     dim: int = 1024
@@ -101,6 +121,8 @@ class EmbeddingConfig(BaseModel):
     batch_size: int = 10
     max_chars: int = 6000
     query_instruct: str | None = None
+    # openai 后端：请求里带 dimensions（只有支持截断维度的模型接受，如 text-embedding-3）
+    send_dimensions: bool = False
     native_url: str = QWENCLOUD_EMBEDDING_URL
     price_per_m: float = 0.07
     currency: Currency = "USD"
@@ -110,9 +132,12 @@ class EmbeddingConfig(BaseModel):
 
 
 class MultimodalEmbeddingConfig(BaseModel):
-    """图片向量（N6）：图片与文字映射到同一个向量空间，可以以文搜图、以图搜图。"""
+    """图片向量（N6）：图片与文字映射到同一个向量空间，可以以文搜图、以图搜图。
 
-    backend: Literal["dashscope", "hash"] = "dashscope"
+    none：不建图片向量（没有图文向量模型的供应商，N12）；图片仍然保存、生成描述、按描述检索。
+    """
+
+    backend: Literal["dashscope", "hash", "none"] = "dashscope"
     provider: str = "qwen"
     model: str = "tongyi-embedding-vision-plus"
     dim: int = 1152
@@ -127,9 +152,9 @@ class MultimodalEmbeddingConfig(BaseModel):
 
 
 class RerankConfig(BaseModel):
-    """重排模型（N5，L2 用）：QwenCloud 的 qwen3-rerank，原生接口。"""
+    """重排模型（N5，L2 用）：QwenCloud 的 qwen3-rerank，原生接口。provider 为空时 L2 不重排。"""
 
-    provider: str = "qwen"
+    provider: str | None = "qwen"
     model: str = "qwen3-rerank"
     url: str = QWENCLOUD_RERANK_URL
     price_per_m: float = 0.10  # 美元 / 百万 tokens（国际站标价）
@@ -220,7 +245,9 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        yaml_source = YamlConfigSettingsSource(settings_cls, yaml_file=_config_path.get())
+        yaml_source = YamlConfigSettingsSource(
+            settings_cls, yaml_file=list(_config_paths.get()), deep_merge=True
+        )
         return (init_settings, env_settings, yaml_source)
 
     @model_validator(mode="after")
@@ -231,34 +258,84 @@ class Settings(BaseSettings):
         for role, rc in self.roles.items():
             if rc.model not in self.models:
                 raise ValueError(f"角色 {role} 引用了未定义的模型 {rc.model}")
-        if self.embedding.backend == "dashscope" and self.embedding.provider not in self.providers:
+        if self.embedding.backend != "hash" and self.embedding.provider not in self.providers:
             raise ValueError(f"向量配置引用了未定义的供应商 {self.embedding.provider}")
-        if self.rerank.provider not in self.providers:
+        if self.rerank.provider is not None and self.rerank.provider not in self.providers:
             raise ValueError(f"重排配置引用了未定义的供应商 {self.rerank.provider}")
         return self
 
+    def used_providers(self) -> list[str]:
+        """实际用到的供应商：角色的模型、向量、图片向量、重排引用到的（按配置里的顺序）。
 
-def env_file_path(root: Path = PROJECT_ROOT) -> Path:
-    """本项目读写的 .env 位置：环境变量 CUEMEM_ENV_FILE 优先，否则为项目根目录下的 .env。"""
-    return Path(os.environ.get("CUEMEM_ENV_FILE") or root / ".env")
+        预设叠加在默认配置上，默认的供应商仍在配置里但用不到；configure 只问用得到的 Key。
+        """
+        used = {self.models[rc.model].provider for rc in self.roles.values()}
+        if self.embedding.backend != "hash":
+            used.add(self.embedding.provider)
+        if self.multimodal_embedding.backend == "dashscope":
+            used.add(self.multimodal_embedding.provider)
+        if self.rerank.provider is not None:
+            used.add(self.rerank.provider)
+        return [name for name in self.providers if name in used]
+
+
+def source_checkout() -> bool:
+    """是否在源码仓库里运行（uv sync 的可编辑安装也算）：数据、评测与演示文件都在仓库里。"""
+    return (PROJECT_ROOT / "pyproject.toml").is_file() and (PACKAGE_DIR.parent.name == "src")
+
+
+def home_dir() -> Path:
+    """数据目录：配置里的相对路径以它为基准，.env 也放在这里。
+
+    CUEMEM_HOME 优先；在源码仓库里运行时是仓库根目录（data/、runs/ 与之前一样）；
+    pip 安装后是 ~/.cuemem，不往 site-packages 里写东西。
+    """
+    if env := os.environ.get("CUEMEM_HOME"):
+        return Path(env).expanduser().resolve()
+    return PROJECT_ROOT if source_checkout() else Path.home() / ".cuemem"
+
+
+def env_file_path(root: Path | None = None) -> Path:
+    """本项目读写的 .env 位置：环境变量 CUEMEM_ENV_FILE 优先，否则为数据目录下的 .env。"""
+    return Path(os.environ.get("CUEMEM_ENV_FILE") or (root or home_dir()) / ".env")
+
+
+def presets() -> list[str]:
+    """可用的预设名（presets/*.yaml）。"""
+    return sorted(p.stem for p in PRESETS_DIR.glob("*.yaml"))
+
+
+def preset_path(name: str) -> Path:
+    """预设名或 YAML 文件路径 → 文件路径。"""
+    path = PRESETS_DIR / f"{name}.yaml"
+    if path.is_file():
+        return path
+    if Path(name).expanduser().is_file():
+        return Path(name).expanduser().resolve()
+    raise ValueError(f"没有预设 {name}；可用的有：{', '.join(presets())}")
 
 
 def load_settings(
     config_path: Path | str | None = None,
     *,
+    preset: str | None = None,
     env_file: Path | None = None,
     **overrides: Any,
 ) -> Settings:
-    """加载配置；路径字段相对于项目根目录（配置文件所在目录的上一级）解析。
+    """加载配置；路径字段相对于数据目录（home_dir）解析。
 
+    preset：叠加在配置文件上的预设（名字或 YAML 路径），不填时看环境变量 CUEMEM_PRESET。
     已存在的环境变量优先于 .env 中的值。
     """
     path = Path(config_path or os.environ.get("CUEMEM_CONFIG") or DEFAULT_CONFIG).resolve()
-    root = path.parent.parent
+    root = home_dir()
     load_dotenv(env_file or env_file_path(root), override=False)
-    token = _config_path.set(path)
+    files = [path]
+    if chosen := preset or os.environ.get("CUEMEM_PRESET"):
+        files.append(preset_path(chosen))
+    token = _config_paths.set(tuple(files))
     try:
         settings = Settings(**overrides)
     finally:
-        _config_path.reset(token)
+        _config_paths.reset(token)
     return settings.model_copy(update={"paths": settings.paths.resolve_against(root)})

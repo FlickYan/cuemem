@@ -1,4 +1,4 @@
-"""测试替身：模拟 OpenAI 兼容的聊天接口与 DashScope 原生向量接口，并记录收到的请求。"""
+"""测试替身：模拟 OpenAI 兼容的聊天与向量接口、DashScope 原生向量接口，并记录收到的请求。"""
 
 from __future__ import annotations
 
@@ -171,6 +171,27 @@ class FakeAPI:
                 json={
                     "output": {"embeddings": embeddings},
                     "usage": {"total_tokens": 5 * len(texts)},
+                },
+            )
+        if request.url.path.endswith("/embeddings"):  # OpenAI 兼容的向量接口（N12）
+            self.embed_requests.append(body)
+            texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            data = [
+                {
+                    "object": "embedding",
+                    "index": i,
+                    "embedding": [float(len(text) % 7 + 1)] + [0.5] * (self.embed_dim - 1),
+                }
+                for i, text in enumerate(texts)
+            ]
+            data.reverse()  # 故意打乱顺序，检验按 index 排序
+            return httpx2.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": data,
+                    "model": body["model"],
+                    "usage": {"prompt_tokens": 5 * len(texts), "total_tokens": 5 * len(texts)},
                 },
             )
         return httpx2.Response(404, json={"error": "not found"})

@@ -1,6 +1,8 @@
 # CueMem 默认配置。
 # 任何字段都可以用环境变量覆盖：前缀 CUEMEM_，嵌套用 __，例如 CUEMEM_ROLES__READER__MODEL=qwen3.8-flash。
-# 相对路径以项目根目录为基准。API Key 用 `uv run cuemem configure` 交互式写入 .env，不进仓库。
+# 相对路径以数据目录为基准：CUEMEM_HOME；在源码仓库里运行时是仓库根目录，pip 安装后是 ~/.cuemem。
+# API Key 用 `uv run cuemem configure` 交互式写入数据目录下的 .env，不进仓库。
+# 换模型供应商用预设（presets/ 下的 openai、ollama）：CUEMEM_PRESET=ollama，或 cuemem --preset ollama。
 
 paths:
   db: data/cuemem.sqlite

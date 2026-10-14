@@ -670,7 +670,7 @@ N1 已完成存储的技术验证（D-005）；向量接口的延迟与质量在
 | agent（对话 Agent，N8） | qwen3.8-flash | 在"查一次、读几条、再决定"的循环里最强（D-041）；能看图；没有分时价格（D-044） |
 | 换回答模型（N9） | qwen3.6-35b-a3b、qwen3.8-flash、deepseek-flash（deepseek-v4-pro 计划了，因余额未跑） | 覆盖不同能力档位，验证 H3（D-049） |
 
-模型 ID 与价格以 `configs/default.yaml` 为准，`cuemem doctor --live` 会核对连通性。DeepSeek V4 系列默认开启思考模式，抽取与回答时在请求中显式关闭。
+模型 ID 与价格以 `src/cuemem/configs/default.yaml` 为准，`cuemem doctor --live` 会核对连通性。DeepSeek V4 系列默认开启思考模式，抽取与回答时在请求中显式关闭。
 
 ### 9.4 代码结构
 
@@ -690,7 +690,7 @@ rag/
 ├── evals/             # 开发集 / 测试集划分、混合流（提交进仓库）
 ├── demo/shop/         # 演示：商品目录、生成的图片、剧本（N8）
 ├── tests/
-├── configs/           # YAML 配置
+├── src/cuemem/configs/  # YAML 配置：默认配置与预设（openai、ollama），随包发布（N12）
 ├── scripts/           # 各节点的实验与报告脚本
 └── docs/
 ```

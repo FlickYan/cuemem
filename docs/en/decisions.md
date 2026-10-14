@@ -139,7 +139,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 - **Status:** adopted (N1).
 - **Context:** DeepSeek is half price off-peak, both providers discount cache hits, Qwen has free quotas for new users, and local cache hits cost nothing. Comparing methods by actual spend would make the same experiment cost different amounts at different times.
 - **Decision:** the ledger records two costs per call. **Nominal cost** uses the peak, cache-miss list price, for comparisons and Pareto analysis. **Estimated spend** subtracts local cache hits, provider cache discounts and (from D-024) the off-peak discount, for budgets. Token counts and call counts are reported too.
-- **Consequences:** conclusions don't depend on when an experiment ran; prices live in `configs/default.yaml`.
+- **Consequences:** conclusions don't depend on when an experiment ran; prices live in `src/cuemem/configs/default.yaml`.
 
 ## D-011 Structured output: JSON mode + schema in the prompt + validated retries
 

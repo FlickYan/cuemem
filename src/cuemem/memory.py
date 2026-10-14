@@ -179,7 +179,8 @@ def build_reranker(
     http_client: httpx2.Client | None = None,
 ) -> Reranker | None:
     """重排模型（L2 用）。没有对应供应商的 Key 时返回 None，L2 不做重排。"""
-    provider = settings.providers.get(settings.rerank.provider)
+    name = settings.rerank.provider
+    provider = settings.providers.get(name) if name is not None else None
     api_key = provider.api_key() if provider is not None else None
     if api_key is None:
         return None

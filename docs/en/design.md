@@ -753,7 +753,7 @@ The development machine is an Apple M2 with **8 GB of RAM** and about **29 GB** 
 | agent (conversational agent, N8) | qwen3.8-flash | Strongest in the "search once, read, decide" loop (D-041); reads images; no time-of-day pricing (D-044) |
 | Reader experiments (N9) | qwen3.6-35b-a3b, qwen3.8-flash, deepseek-flash (deepseek-v4-pro planned, not run) | A spread of capability tiers to test H3 (D-049) |
 
-Model IDs and prices are in `configs/default.yaml`; `cuemem doctor --live` checks connectivity. DeepSeek V4 models have thinking on by default; requests turn it off explicitly for extraction and answering.
+Model IDs and prices are in `src/cuemem/configs/default.yaml`; `cuemem doctor --live` checks connectivity. DeepSeek V4 models have thinking on by default; requests turn it off explicitly for extraction and answering.
 
 ### 9.4 Code layout
 
@@ -774,7 +774,7 @@ rag/
 ├── demo/shop/         # demo: product catalogue, generated images, script
 ├── examples/          # toy conversations (English and Chinese)
 ├── tests/
-├── configs/           # YAML configuration
+├── src/cuemem/configs/  # YAML configuration: defaults and presets (openai, ollama), shipped in the package (N12)
 ├── scripts/           # experiment and report scripts for every node, reproduce.py
 └── docs/
 ```

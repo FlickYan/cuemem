@@ -1,4 +1,4 @@
-"""向量化：接口、实现（通义 DashScope / 离线哈希）与缓存。"""
+"""向量化：接口、实现（通义 DashScope / OpenAI 兼容接口 / 离线哈希）与缓存。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from cuemem.embed.multimodal import (
     HashMultimodalEmbedder,
     ImageEmbedder,
 )
+from cuemem.embed.openai_compat import OpenAICompatibleEmbedder
 from cuemem.errors import MissingAPIKeyError
 from cuemem.llm.ledger import Ledger
 
@@ -25,6 +26,7 @@ __all__ = [
     "EmbeddingCache",
     "HashEmbedder",
     "ImageEmbedder",
+    "OpenAICompatibleEmbedder",
     "SparseVector",
     "TextEmbedder",
     "build_embedder",
@@ -52,7 +54,12 @@ def build_embedder(
                 f"向量化需要环境变量 {provider.api_key_env}，请运行 uv run cuemem configure；"
                 "离线试用可设置 CUEMEM_EMBEDDING__BACKEND=hash"
             )
-        inner = DashScopeTextEmbedder(cfg, api_key, http_client=http_client, ledger=ledger)
+        if cfg.backend == "openai":
+            inner = OpenAICompatibleEmbedder(
+                cfg, api_key, provider.base_url, http_client=http_client, ledger=ledger
+            )
+        else:
+            inner = DashScopeTextEmbedder(cfg, api_key, http_client=http_client, ledger=ledger)
     if not use_cache:
         return inner
     return CachedEmbedder(
@@ -68,6 +75,8 @@ def build_image_embedder(
 ) -> ImageEmbedder | None:
     """图片向量器（N6）。文本向量用离线哈希时也用哈希；没有 Key 时返回 None（不建图片向量）。"""
     cfg = settings.multimodal_embedding
+    if cfg.backend == "none":
+        return None
     if cfg.backend == "hash" or settings.embedding.backend == "hash":
         return HashMultimodalEmbedder()
     provider = settings.providers.get(cfg.provider)

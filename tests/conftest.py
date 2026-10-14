@@ -14,6 +14,7 @@ from cuemem.config import PathsConfig, Settings, load_settings
 GUARDED_ENV = (
     "DEEPSEEK_API_KEY",
     "DASHSCOPE_API_KEY",
+    "OPENAI_API_KEY",
     "CUEMEM_PROVIDERS__QWEN__BASE_URL",
     "CUEMEM_EMBEDDING__NATIVE_URL",
 )

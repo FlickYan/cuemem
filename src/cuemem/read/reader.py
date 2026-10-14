@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from cuemem.core.models import Answer, FactHit, Hit, MediaItem, SessionIn
-from cuemem.core.trace import span
+from cuemem.core.trace import record_event, span
 from cuemem.llm.client import LLMClient, Message
 from cuemem.read.facts import ImageMode, MemoryView, Validity, format_facts
 from cuemem.read.plan import TEMPORAL_TYPES, QueryPlan, range_text
@@ -370,6 +370,9 @@ class Reader:
     ) -> ReaderOutput | NotedReaderOutput:
         """组装请求。纯文本时 user 消息是一个字符串（与 N4 之前的请求逐字相同，缓存照常命中）；
         带图时改用内容块：对话里的图按原位插入，再感知的原图附在证据之后、问题之前。"""
+        if pictures and not self.llm.vision(self.role):  # 回答模型看不了图：只给文字描述
+            record_event("pictures_dropped", role=self.role, pictures=len(pictures))
+            pictures = ()
         head = f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
         tail = f"Question: {question}"
         content: str | list[dict[str, Any]]

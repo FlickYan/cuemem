@@ -302,6 +302,13 @@ class LLMClient:
                 ]
         raise StructuredOutputError(f"{max_attempts} 次尝试后仍未得到合法 JSON：{last_error}")
 
+    def vision(self, role: str, model: str | None = None) -> bool:
+        """这个角色（或指定的模型）能不能看图。不能时调用方不附图片（本地纯文本模型，N12）。"""
+        role_cfg = self.settings.roles.get(role)
+        alias = model or (role_cfg.model if role_cfg else None)
+        spec = self.settings.models.get(alias) if alias is not None else None
+        return spec is not None and spec.vision
+
     def list_models(self, provider: str) -> list[str]:
         """列出供应商可用的模型 ID，用于核对配置（不是所有供应商都支持）。"""
         return sorted(m.id for m in self._client(provider).models.list())
@@ -321,16 +328,18 @@ class LLMClient:
         if alias is None:
             raise KeyError(f"角色 {role} 没有配置模型，调用时也没有指定 model")
         spec = self.settings.models[alias]
-        params: dict[str, Any] = {
-            "temperature": temperature
-            if temperature is not None
-            else (role_cfg.temperature if role_cfg else 0.0)
-        }
+        params: dict[str, Any] = {}
+        if not spec.fixed_temperature:  # 推理模型只接受默认温度，不带这个参数（N12）
+            params["temperature"] = (
+                temperature
+                if temperature is not None
+                else (role_cfg.temperature if role_cfg else 0.0)
+            )
         limit = (
             max_tokens if max_tokens is not None else (role_cfg.max_tokens if role_cfg else None)
         )
         if limit is not None:
-            params["max_tokens"] = limit
+            params[spec.max_tokens_param] = limit
         if response_format is not None:
             params["response_format"] = response_format
         if tools:
