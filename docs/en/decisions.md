@@ -68,6 +68,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 | D-062 | An OpenAI-compatible memory proxy: the controller decides first, evidence goes before the last user message | Adopted (N12) |
 | D-063 | Export and import move only the raw log; forgetting can be previewed | Adopted (N12) |
 | D-064 | Extra extraction instructions (custom instructions) | Adopted (N12) |
+| D-066 | Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool; one shared implementation of recalled evidence | Adopted (N12) |
 
 ## D-001 A separate controller decides when and how deeply to retrieve, not the LLM
 
@@ -751,3 +752,23 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
   - **When set:** the fingerprint changes, and consolidated spaces rebuild their derived memory on the next consolidation.
 - **Alternative:** custom entity and fact types (Graphiti). That changes the output schema, the reconciliation rules and the predicate registry; plain-text instructions cover the common need first.
 - **Consequences:** tests cover the prompt, the SDK parameter and the fingerprint change. The effect of instructions on extraction quality has not been evaluated.
+
+## D-066 Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool; one shared implementation of recalled evidence
+
+- **Status:** adopted (N12).
+- **Context:** Mem0, Graphiti, Supermemory and others integrate with a dozen frameworks each, and "how do I plug this into the agent framework I already use" is the first question a user asks. CueMem had the SDK, HTTP, MCP and the memory proxy. A framework integration has to settle two things: who decides whether to recall, and when a conversation is over and goes to extraction.
+- **Decision:** three modules under `cuemem.integrations`, each an optional dependency (`--extra openai-agents / langgraph / anthropic`, together `integrations`); usage is in [integrations](integrations.md).
+  1. **The controller decides first.** All three run the controller before every model call (L0 gives the profile only). The evidence block is the one the proxy and the reader use, placed at the start of the latest user message; the system prompt and earlier messages are untouched. The model can also search with recall / remember / forget tools, which have the same names and meaning as the MCP tools.
+  2. **OpenAI Agents SDK:** `memory_input_filter` plugs into `call_model_input_filter`. `CueMemSession` implements the Session protocol: an inner session keeps the exact short-term history, and each question and answer becomes one CueMem round. With server-managed conversation state, `placement="instructions"` keeps the evidence out of what the server stores.
+  3. **LangGraph / LangChain:** the LangChain 1.x middleware `CueMemMiddleware` recalls in wrap_model_call, changing only the request sent to the model, and writes back in after_agent, however the turn ends. The older `create_react_agent` uses `recall_hook` / `save_hook`. One thread is one session. On LangGraph Server the authenticated user is the identity, not an id the client sends.
+  4. **Claude's memory tool** (`memory_20250818`): the `/memories` directory is backed by CueMem. `profile.md` and `facts.md` are read-only generated files. Files Claude creates live in a small side store; every change is also written to the raw log as a note, which consolidation turns into facts; deleting a file forgets what it contributed.
+  5. **When a conversation ends:** on `end()` / `end_thread()`, leaving the context manager, 30 idle minutes, or `close_sessions()` / `close()`, the session goes to background extraction. Sessions a process did not hand over are handed over by the next process.
+  6. **One implementation of recalled evidence.** The review found "recall → lay out evidence → inject" written once in the proxy and once in each integration, and the integrations imported private functions. It now lives in `cuemem/evidence.py`: `recall_evidence` / `inject_evidence` (automatic recall) and `recall_listing` / `format_listing` / `resolve_ids` (a listing for another agent, and forgetting by id). The proxy, the service layer, MCP and the three integrations all use it, with unchanged behaviour.
+- **Alternatives:**
+  - A LangGraph `BaseStore` backend: a Store is a generic key-value store whose reads and writes the app schedules, so there is no place for the controller. It could be added later as a read-only view of the facts.
+  - Memory in the system prompt: it changes every turn, so prefix caching never hits (as in D-062).
+  - Tools only, letting the model decide: that is Letta's approach and the opposite of CueMem's claim that the controller decides before the LLM is called. The tools stay as a way to search further.
+- **Consequences:**
+  - Each integration was implemented, then reviewed from two angles (faithfulness to the framework, correctness), and revised before merging. Real problems the reviews found: CI did not install the optional dependencies, so the integration tests were always skipped; a question and its answer were split into two rounds; cached evidence was reused across turns; LangChain's conversation summary was written back as the user's words; identity came from client-controlled configurable; the proxy and integrations read `file://` and local image paths. All are fixed, with regression tests.
+  - 2,592 lines of offline tests; all three integrations had a live smoke test on the deepseek preset. Claude's memory tool has not been run against the real Claude API: there was no Anthropic key, and DeepSeek's Anthropic-compatible endpoint rejects `memory_20250818`, so the smoke test declared the same backend as a regular tool.
+  - **Limits:** open sessions are tracked in memory per process; only text evidence is injected, so when the controller wants to look at a photo, the photo is not attached to the model call; no TypeScript or Vercel AI SDK yet.
