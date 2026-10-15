@@ -12,19 +12,22 @@
   evals/datasets.py）写在 `<数据集>-anon_<历史>` 下，build.json 记下写法（session_ids），与原始
   ID 的写入不混用。
 - **写入的身份**分两部分，都记在 build.json 里：
-  - 协议（protocol，"抽取模型|向量模型:维度"，见 protocol_of）：外部系统内部调用的模型。评测空间
-    的目录（paths.eval_spaces / <系统>）不分协议，所以协议不同的写入**不删也不复用**，报
-    ConfigMismatchError：pds 协议（只用 DeepSeek）的写入在 data/eval-spaces，pq 协议（只用通义）
-    的在 data/eval-spaces-qwen，换协议要用 CUEMEM_PATHS__EVAL_SPACES 换目录。没记协议的旧记录
-    按当前协议处理；记协议之前的 Graphiti、LangMem 写入记了 extractor 与 embedder，照样核对。
+  - 协议（protocol，"抽取模型|向量模型:维度"，见 protocol_of）：外部系统内部调用的模型（抽取
+    模型记配置里的别名：同一个 model_id 的不同设置，如 deepseek-flash 与开了思考的
+    deepseek-flash-thinking，算不同的协议）。评测空间的目录（paths.eval_spaces / <系统>）不分
+    协议，所以协议不同的写入**不删也不复用**，报 ConfigMismatchError：pds 协议（只用 DeepSeek）
+    的写入在 data/eval-spaces，pq 协议（只用通义）的在 data/eval-spaces-qwen，换协议要用
+    CUEMEM_PATHS__EVAL_SPACES 换目录。没记协议的旧记录（如 Mem0 早先的写入）按当前协议处理；
+    记协议之前的 Graphiti、LangMem 写入记了 extractor 与 embedder，照样核对。
   - 写入标记（build_tag，子类设，如外部系统的版本与写入格式）：变了就清掉旧写入重建（同一协议，
     换的只是写法）。有这个字段之前，A-MEM 与 Cognee 把它接在 protocol 后面，照样认得出来。
 - **检索**：子类返回一组证据（Hit），交给同一个回答模型、同一套提示
   （与 B2 朴素检索、M0 的格式相同）。检索时经网关的请求（`<系统>.search.<空间>` 桶，如 LangMem
-  与 Cognee 向量化问题）在网关的服务线程里执行，不在这道题的 trace 里：网关把这期间这个桶的
-  用量事件转记进这道题的 trace（Gateway.forward），于是算进 results.jsonl 的 usage、report.md
-  的回答成本与 --max-cost。同一份对话历史的检索在空间锁里串行，所以同一个空间的题并行回答时
-  也是逐题准确的；每题检索时经网关的用量另记在 details 的 search_usage 里，桶里仍有总数。
+  与 Cognee 向量化问题）在网关的服务线程里执行，不在这道题的 trace 里：网关把检索期间开始的
+  这个桶的请求的用量事件转记进这道题的 trace（Gateway.forward），于是算进 results.jsonl 的
+  usage、report.md 的回答成本与 --max-cost。同一份对话历史的检索在空间锁里串行，所以同一个空间
+  的题并行回答时也是逐题准确的；每题检索时经网关的用量另记在 details 的 search_usage 里，桶里
+  仍有总数。检索超时放弃、检索结束后才处理完的请求只进桶，不记到哪道题名下。
 
 外部系统都不是 CueMem 的依赖，评测时用 uv 临时装上，例如：
 
@@ -86,7 +89,6 @@ class ExternalBaseline(ABC):
         self._build_spent = 0.0
         self._failed: dict[str, str] = {}
         self._schemes: dict[str, SessionIds] = {}  # 写入目录 → 会话 ID 的写法
-        self._model_ids: dict[str, str] = {}  # 模型别名 → model_id（认旧的写入记录用）
 
     # ---------- 子类实现 ----------
 
@@ -131,14 +133,12 @@ class ExternalBaseline(ABC):
     def _retrieve(
         self, key: str, directory: Path, ctx: MethodContext
     ) -> tuple[list[Hit], dict[str, Any], dict[str, Any]]:
-        """检索一道题。检索时经网关的请求（search 桶）的用量事件转记进这道题的 trace（见模块
-        说明）；调用方持有这个空间的锁，同一个桶这段时间里只有这道题在用，前后两次读桶的差就是
-        它的用量（另外返回，记进 details）。"""
+        """检索一道题。检索期间开始的、经网关的请求（search 桶）的用量事件转记进这道题的 trace
+        （见模块说明），用量另外返回（记进 details）；调用方持有这个空间的锁，同一个桶这段时间里
+        只有这道题在用。"""
         bucket = self.bucket(key, "search")
-        before = self.gateway.usage(bucket)
-        with self.gateway.forward(bucket, current_trace()):
+        with self.gateway.forward(bucket, current_trace()) as searched:
             hits, details = self.retrieve(key, directory, ctx.sample, ctx.sessions)
-        searched = _diff(self.gateway.usage(bucket), before)
         return hits, details, {field: searched.get(field, 0) for field in SEARCH_FIELDS}
 
     def bucket(self, key: str, stage: str = "build") -> str:
@@ -157,7 +157,6 @@ class ExternalBaseline(ABC):
             self.gateway.start()
             # 这次运行的协议：外部系统内部调用的模型与向量模型；写入记录里存一份，对不上就报错
             self.protocol = protocol_of(settings, self.embedder)
-            self._model_ids = model_ids(settings)
             self.setup()
             self._ready = True
 
@@ -178,7 +177,7 @@ class ExternalBaseline(ABC):
         if record.exists():
             stored = json.loads(record.read_text("utf-8"))
             # 另一个协议（抽取模型或向量模型）的写入：报错，不删也不复用（目录不分协议）
-            check_protocol(stored, self.protocol, directory, self.system, self._model_ids)
+            check_protocol(stored, self.protocol, directory, self.system)
             # 写入标记不同（写法变了），或会话 ID 的写法不同（写入里存着会话 ID，见
             # datasets.build_matches_session_ids）：同一协议的旧写入作废，重建
             tag = self.recorded_tag(stored)
@@ -240,15 +239,13 @@ def space_key(space_id: str) -> str:
 
 
 def protocol_of(settings: Settings, embedder: TextEmbedder) -> str:
-    """这次运行的写入协议"抽取模型|向量模型:维度"：外部系统内部调用的模型（extractor 角色的
-    model_id）与向量模型。与 report.run_protocol 同一写法。"""
-    model = settings.models[settings.roles["extractor"].model].model_id
-    return f"{model}|{embedder.name}:{embedder.dim}"
+    """这次运行的写入协议"抽取模型|向量模型:维度"：外部系统内部调用的模型与向量模型。与
+    report.run_protocol 同一写法。
 
-
-def model_ids(settings: Settings) -> dict[str, str]:
-    """模型别名 → model_id：记协议之前的 Graphiti、LangMem 写入记的是 extractor 的别名。"""
-    return {alias: spec.model_id for alias, spec in settings.models.items()}
+    抽取模型记 extractor 角色在配置里的别名，不是 model_id：同一个 model_id 可以有不同的调用
+    设置（如 deepseek-flash 与开了思考的 deepseek-flash-thinking），写出的记忆不同，算不同的协议
+    （记协议之前的 Graphiti、LangMem 写入记的也是别名）。现存的写入记录里两者都相同。"""
+    return f"{settings.roles['extractor'].model}|{embedder.name}:{embedder.dim}"
 
 
 def split_protocol(protocol: str) -> tuple[str, str]:
@@ -258,36 +255,27 @@ def split_protocol(protocol: str) -> tuple[str, str]:
     return "|".join(parts[:2]), "|".join(parts[2:])
 
 
-def recorded_protocol(
-    record: Mapping[str, Any], aliases: Mapping[str, str] | None = None
-) -> str | None:
+def recorded_protocol(record: Mapping[str, Any]) -> str | None:
     """写入记录的协议（不含写入标记）；没记协议的旧记录返回 None（按当前协议处理）。
 
-    记 protocol 之前的 Graphiti、LangMem 写入记了 extractor（模型别名，aliases 换成 model_id）与
-    embedder（Graphiti 的带维度；LangMem 的不带，维度另记在 dim），照样认出协议（与
-    report._protocol_match 相同）。"""
+    记 protocol 之前的 Graphiti、LangMem 写入记了 extractor（模型别名）与 embedder（Graphiti 的
+    带维度；LangMem 的不带，维度另记在 dim），照样认出协议（与 report._protocol_match 相同）。"""
     if record.get("protocol"):
         return split_protocol(str(record["protocol"]))[0]
     extractor, embedder = record.get("extractor"), record.get("embedder")
     if not extractor or not embedder:
         return None
-    model = (aliases or {}).get(str(extractor), str(extractor))
     dim = f":{record['dim']}" if record.get("dim") is not None else ""
-    return f"{model}|{embedder}{dim}"
+    return f"{extractor}|{embedder}{dim}"
 
 
-def check_protocol(
-    record: Mapping[str, Any],
-    protocol: str,
-    directory: Path,
-    system: str,
-    aliases: Mapping[str, str] | None = None,
-) -> None:
+def check_protocol(record: Mapping[str, Any], protocol: str, directory: Path, system: str) -> None:
     """写好的写入是另一个协议的（抽取模型或向量模型不同）时报 ConfigMismatchError。
 
     不删、也不复用：评测空间的目录不分协议，删了要花钱重写（Graphiti 一个协议约 $10、几个
-    小时），复用则是拿别的模型写的记忆（与不同维度的向量）来比。"""
-    built = recorded_protocol(record, aliases)
+    小时），复用则是拿别的模型写的记忆（与不同维度的向量）来比。每道题各报一次，报错里只有
+    写入目录（<eval_spaces>/<系统>/<空间>）因题而异：report.error_groups 把它换成占位符归并。"""
+    built = recorded_protocol(record)
     if built is None or built == protocol:
         return
     raise ConfigMismatchError(
@@ -295,7 +283,7 @@ def check_protocol(
         "不复用，也不覆盖。评测空间的目录不分协议，换协议要换目录：pds 协议（只用 DeepSeek）"
         "用默认的 data/eval-spaces，pq 协议（只用通义）设 "
         "CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen，别的协议指向另一个目录"
-        "（见 scripts/n12_baselines.py）；确实不要这份写入了，先把这个目录挪走再运行。"
+        "（见 scripts/n12_baselines.py）；确实不要这份写入了，先把它的目录挪走再运行。"
     )
 
 

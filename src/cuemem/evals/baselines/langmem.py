@@ -74,8 +74,8 @@ evals/external.py），只换"记忆从哪来"：
    （skipped_edits，记作写入丢了）。
 10. store.json 与 build.json 记下写入用的抽取模型（别名）与向量器；评测空间的目录不分协议，
     换了模型时不沿用别的模型写出的记忆，也不删掉它：基类按 build.json 的协议核对，另一个协议的
-    写入直接报错（见 evals/external.py；记协议之前的写入按 extractor、embedder 与 dim 核对），
-    装回 store.json 时再按别名核对一遍。
+    写入直接报错（协议里的抽取模型也是别名，见 evals/external.py；记协议之前的写入按 extractor、
+    embedder 与 dim 核对），装回 store.json 时再核对一遍。
 11. 已知的限制：InMemoryStore 索引整个 JSON 值，CueMem 的向量器只取前 max_chars（6000）个
     字符，本机的 bge-small 还只看前 512 tokens（约 2000 个字符）；LangMem 合并出的长记忆
     （第一次试跑有两条一万多字符）尾部的内容因此检索不到，LangMem 参考的
@@ -611,8 +611,8 @@ def load_store(
     """store.json → InMemoryStore（向量原样装回）与每条记忆的写入会话。
 
     写入用的模型与当前不同时拒绝装回（先核对，再导入 langgraph）。基类已按 build.json 的协议
-    （model_id 与向量模型）核对过；这里还按别名核对，model_id 相同而别名不同（如 deepseek-flash
-    与 deepseek-flash-thinking）时也报错，同样不删。"""
+    （抽取模型的别名与向量模型，见 evals/external.protocol_of）核对过，这里按 store.json 自己记的
+    再核对一遍（build.json 被换过时），同样报错、不删。"""
     payload = json.loads(path.read_text("utf-8"))
     if payload.get("identity") != dict(identity):
         raise ConfigMismatchError(

@@ -11,7 +11,7 @@ import pytest
 from fakes import FakeAPI
 
 from cuemem.config import Settings
-from cuemem.errors import ConfigMismatchError, EmbeddingAPIError
+from cuemem.errors import EmbeddingAPIError
 from cuemem.evals.datasets import load_longmemeval
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.evals.report import build_report, load_rows
@@ -153,40 +153,70 @@ def test_errors_are_recorded_and_retried(eval_settings: Settings, fake_api: Fake
     assert not (summary.run_dir / "results.jsonl").exists()  # 出错的组合不算完成，下次会重试
 
 
-MISMATCH = (
-    "/data/eval-spaces/toy/longmemeval_s_q 是另一个协议（a|e:8）的 toy 写入，这次运行的协议是 "
-    "b|e:8：不复用，也不覆盖。……设 CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen"
-)
-
-
 class MismatchedMethod:
-    """像写入目录里是另一个协议的写入的外部基线：每道题都报同一个配置错误，不花钱。"""
+    """像写入目录里是另一个协议的写入的外部基线：每道题按自己的写入目录（<eval_spaces>/graphiti/
+    <空间>）报协议错误（与 ExternalBaseline 同一个 check_protocol），不花钱。"""
 
     name, label, needs_index, needs_consolidation = "MX", "协议对不上", False, False
 
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
     def answer(self, ctx: MethodContext) -> MethodOutput:
-        raise ConfigMismatchError(MISMATCH)
+        from cuemem.evals.external import check_protocol, space_key
+
+        directory = self.root / "graphiti" / space_key(ctx.space_id)
+        check_protocol({"protocol": "a|e:8"}, "b|e:8", directory, "graphiti")
+        raise AssertionError("协议对不上时应当报错")
 
 
 def test_config_mismatch_from_a_baseline_is_reported_once(
     eval_settings: Settings, fake_api: FakeAPI
 ) -> None:
-    """外部基线的协议报错每道题各记一次（errors.jsonl），其余方法照常；报告与命令行按报错归并，
-    只列一次，带上解决办法。"""
+    """外部基线的协议报错每道题各记一次（errors.jsonl，每道题的写入目录不同），其余方法照常；
+    报告与命令行把写入目录里的空间名换成占位符归并，只列一次，带上解决办法。"""
     from cuemem.evals.report import error_groups, pending_errors
 
     fake_api.chat_replies = [fake_model]
     config = RunConfig(name="mismatch", dataset="longmemeval_s", split=None, methods=["B0"])
     runner = EvalRunner(eval_settings, config, http_client=fake_api.client())
-    runner.methods = [*runner.methods, MismatchedMethod()]
+    root = eval_settings.paths.eval_spaces
+    runner.methods = [*runner.methods, MismatchedMethod(root)]
     summary = runner.run(load_longmemeval(FIXTURES / "longmemeval_mini.json"))
     assert (summary.completed, summary.errors) == (3, 3)
-    assert error_groups(pending_errors(summary.run_dir)) == [
-        ("MX", f"ConfigMismatchError: {MISMATCH}", 3)
-    ]
+    raw = {e["error"] for e in load_rows(summary.run_dir, "errors.jsonl")}
+    assert len(raw) == 3  # 每道题一个空间、一个写入目录
+    [(method, error, n)] = error_groups(pending_errors(summary.run_dir))
+    assert (method, n) == ("MX", 3)
+    assert error.startswith(f"ConfigMismatchError: {root / 'graphiti' / '<空间>'} 是另一个协议")
+    assert "CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen" in error
     report = build_report(summary.run_dir).read_text(encoding="utf-8")
     assert "有 3 个组合出错未计入结果" in report
-    assert f"  - MX × 3：ConfigMismatchError: {MISMATCH}" in report
+    assert f"  - MX × 3：{error}" in report and "另有" not in report
+
+
+def test_error_groups_ignore_what_differs_per_question() -> None:
+    """归并时只把因题而异的部分换成占位符：外部基线写入目录里的空间名与上游的请求 ID；
+    外部系统自己的包路径、别的报错照原样，不同的报错不并在一起。"""
+    from cuemem.evals.report import error_groups
+
+    def limited(request_id: str) -> str:
+        return f"RateLimitError: Error code: 429 - Too many requests. (request_id: {request_id})"
+
+    errors = [
+        {"method": "MC", "error": limited("0d00bab8-57d0-4752-910e-6ea9b3ca5b33")},
+        {"method": "MC", "error": limited("3df0f52c-30f4-427a-880a-75aab843b077")},
+        {"method": "ML", "error": "ConfigMismatchError: /d/langmem/longmemeval_s-anon_q1 是另一个"},
+        {"method": "ML", "error": "ConfigMismatchError: /d/langmem/longmemeval_s-anon_q2 是另一个"},
+        {"method": "M0", "error": "ImportError: /venv/site-packages/mem0/memory/main.py"},
+        {"method": "M0", "error": "ImportError: /venv/site-packages/mem0/vector_stores/qdrant.py"},
+    ]
+    assert error_groups(errors) == [
+        ("MC", limited("<id>"), 2),
+        ("ML", "ConfigMismatchError: /d/langmem/<空间> 是另一个", 2),
+        ("M0", "ImportError: /venv/site-packages/mem0/memory/main.py", 1),
+        ("M0", "ImportError: /venv/site-packages/mem0/vector_stores/qdrant.py", 1),
+    ]
 
 
 class FailingEmbedder:

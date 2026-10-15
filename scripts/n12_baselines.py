@@ -13,9 +13,11 @@ pds-locomo-mem0、pds-locomo-graphiti。脚本把这些运行里同一批题的�
   判分 qwen3.8-max，向量 qwen3.7-text-embedding（查询与文档分开向量化）、重排 qwen3-rerank。
   CUEMEM_PRESET=qwen，要 DASHSCOPE_API_KEY；写入放在另一个目录：
   CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen。外部基线（M0、MG、ML、MC、MA）的写入目录
-  不分协议，build.json 记下协议（抽取模型|向量模型:维度）：忘了设这个变量时，它们遇到 pds 的
-  写入既不复用、也不删掉重建，每道题报 ConfigMismatchError（运行结束时归并列出，见
-  evals/external.py），设好目录重跑即可。
+  不分协议，build.json 记下协议（抽取模型|向量模型:维度）：忘了设这个变量时，MG、ML、MC、MA
+  遇到 pds 的写入既不复用、也不删掉重建，每道题报 ConfigMismatchError（运行结束时归并列出，见
+  evals/external.py），设好目录重跑即可。M0 的写入记录早先不记协议（新写的才记，记了的同样
+  报错），data/eval-spaces 与 data/eval-spaces-qwen 下现存的 M0 写入都没记，按当前协议处理，
+  **会被悄悄复用**：跑 M0 前务必确认这个变量。
 - qwen：N9 / N11 的原协议（抽取 qwen3.8-flash、向量 qwen3.7-text-embedding、回答 deepseek-flash、
   判分 qwen3.8-max）。抽取与向量与 pq 相同，写入也在 data/eval-spaces-qwen。
 

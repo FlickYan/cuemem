@@ -38,6 +38,8 @@ from matplotlib.transforms import Bbox
 
 from cuemem.config import home_dir
 from cuemem.evals.datasets import (
+    ANON_SUFFIX,
+    DATASETS,
     SessionIds,
     build_matches_session_ids,
     run_session_ids,
@@ -279,12 +281,12 @@ def write_stages(method: str) -> set[str]:
 
 def run_protocol(info: dict[str, Any]) -> str | None:
     """运行记录里的写入协议"抽取模型|向量模型:维度"，与外部基线 build.json 的 protocol 同一写法
-    （ExternalBaseline._setup）。运行记录不全时返回 None（不核对）。"""
+    （evals/external.protocol_of：抽取模型记配置里的别名）。运行记录不全时返回 None（不核对）。"""
     extractor = (info.get("roles") or {}).get("extractor") or {}
     embedding = info.get("embedding") or {}
-    if not extractor.get("model_id") or not embedding.get("model"):
+    if not extractor.get("model") or not embedding.get("model"):
         return None
-    return f"{extractor['model_id']}|{embedding['model']}:{embedding.get('dim')}"
+    return f"{extractor['model']}|{embedding['model']}:{embedding.get('dim')}"
 
 
 def write_cost(
@@ -507,11 +509,30 @@ def pending_errors(
     ]
 
 
+# 报错里因题而异的部分：外部基线的写入目录 <eval_spaces>/<系统>/<空间>（如协议对不上的报错，
+# evals/external.check_protocol）与上游的请求 ID（UUID）。空间名是"<数据集>_<对话历史>"
+# （external.space_key；会话 ID 改写过的数据集名带 -anon），按已知的数据集名认：外部系统自己的
+# 包路径（如 site-packages/mem0/vector_stores/）不会被当成写入目录
+_SPACE_DIR = re.compile(
+    rf"([/\\])({'|'.join(map(re.escape, EXTERNAL_SYSTEMS.values()))})([/\\])"
+    rf"(?:{'|'.join(map(re.escape, sorted(DATASETS, key=len, reverse=True)))})"
+    rf"(?:{re.escape(ANON_SUFFIX)})?_[A-Za-z0-9_.-]+"
+)
+_UUID = re.compile(r"\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b")
+
+
+def error_pattern(error: str) -> str:
+    """报错 → 归并用的写法：写入目录里的空间名换成 <空间>，请求 ID 换成 <id>。"""
+    return _UUID.sub("<id>", _SPACE_DIR.sub(r"\1\2\3<空间>", error))
+
+
 def error_groups(errors: Sequence[dict[str, Any]]) -> list[tuple[str, str, int]]:
     """出错的组合按（方法，报错）归并，次数多的在前：（方法，报错，组合数）。同一个配置问题
-    （如外部基线的写入目录里是另一个协议的写入）每道题各记一次，归并后只列一次。"""
+    （如外部基线的写入目录里是另一个协议的写入）每道题各记一次，归并后只列一次：报错里因题
+    而异的部分（error_pattern）先换成占位符，列出的是换过的报错。"""
     counts = Counter(
-        (str(e.get("method") or e.get("stage") or "?"), str(e.get("error") or "")) for e in errors
+        (str(e.get("method") or e.get("stage") or "?"), error_pattern(str(e.get("error") or "")))
+        for e in errors
     )
     return [(method, error, n) for (method, error), n in counts.most_common()]
 

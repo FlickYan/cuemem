@@ -27,8 +27,8 @@
 （如 trustcall 把模型调用的错误改写成提示重试）在写入记录里看得到。
 
 请求在网关的服务线程里执行，用量只进桶、不进调用方的 trace。外部系统检索时（回答一道题的中途）
-经网关的请求，用 `forward(桶, trace)` 把这段时间里这个桶的用量事件（LLM、向量）另外转记进那道题
-的 trace，于是算进它的回答用量；桶里照常累计。
+经网关的请求，用 `forward(桶, trace)` 把这段时间里开始的这个桶的请求的用量事件（LLM、向量）另外
+转记进那道题的 trace，于是算进它的回答用量，这段时间的用量也另外给出；桶里照常累计。
 
 出错时照 OpenAI 的语义回给外部系统，由它们按自己的策略处理：
 - **限流**：上游的 429 在 LLM 客户端里已经由 SDK 退避重试过（providers.*.max_retries 次，照上游
@@ -53,7 +53,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 import uvicorn
@@ -107,6 +107,26 @@ class BucketUsage:
         out["latency_ms"] = round(self.latency_ms, 1)
         return out
 
+    def add(self, other: BucketUsage) -> None:
+        """加上另一份用量（一次请求的）。"""
+        for f in fields(self):
+            value = getattr(other, f.name)
+            if isinstance(value, dict):
+                mine = getattr(self, f.name)
+                for key, n in value.items():
+                    mine[key] = mine.get(key, 0) + n
+            else:
+                setattr(self, f.name, getattr(self, f.name) + value)
+
+
+@dataclass
+class _Window:
+    """forward 的一段时间：转记给哪个 trace，这段时间里开始的请求的用量；离开后 open 为 False。"""
+
+    trace: Trace | None
+    usage: BucketUsage = field(default_factory=BucketUsage)
+    open: bool = True
+
 
 class Gateway:
     """OpenAI 兼容的 /chat/completions、/embeddings、/models，背后是 CueMem 的客户端。
@@ -132,7 +152,7 @@ class Gateway:
             else llm.settings.consolidation.fallback_model
         )
         self._usage: dict[str, BucketUsage] = {}
-        self._forward: dict[str, Trace] = {}  # 桶 → 另外转记用量事件的 trace（见 forward）
+        self._forward: dict[str, _Window] = {}  # 桶 → 正在转记的一段时间（见 forward）
         self._lock = threading.Lock()
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
@@ -180,37 +200,52 @@ class Gateway:
             return self._bucket(bucket).as_dict()
 
     @contextmanager
-    def forward(self, bucket: str, trace: Trace | None) -> Iterator[None]:
-        """这段时间里发到 bucket 的请求，用量事件（LLM、向量……）另外转记进 trace（桶里照常累计）。
+    def forward(self, bucket: str, trace: Trace | None) -> Iterator[dict[str, Any]]:
+        """这段时间里开始的、发到 bucket 的请求：用量事件（LLM、向量……）另外转记进 trace，用量另外
+        累计，离开时填进 yield 出去的字典（as_dict 的字段）。桶里照常累计。
 
         外部系统检索时经网关的请求在网关的服务线程里执行，不在那道题的 trace 里；转记过去，它们
-        就算进那道题的用量。一个桶同一时间只转给一个 trace：调用方保证这段时间里只有这一道题在用
-        这个桶（ExternalBaseline 在空间锁里检索），否则别的题的请求也会记到它名下。请求在离开这段
-        时间之后才处理完（调用方超时放弃了）的，只进桶。trace 为 None 时什么也不做。"""
-        if trace is None:
-            yield
-            return
+        就算进那道题的用量。一个桶同一时间只转给一段时间：调用方保证这段时间里只有这一道题在用
+        这个桶（ExternalBaseline 在空间锁里检索），否则别的题的请求也会记到它名下。请求按开始时
+        的转记目标记账：在这段时间里开始、离开之后才处理完的（调用方超时放弃了），只进桶，不转记
+        给这道题，也不转记给那时正在用这个桶的下一道题。trace 为 None 时只累计用量。"""
+        window = _Window(trace)
+        used: dict[str, Any] = {}
         with self._lock:
             previous = self._forward.get(bucket)
-            self._forward[bucket] = trace
+            self._forward[bucket] = window
         try:
-            yield
+            yield used
         finally:
             with self._lock:
+                window.open = False
+                used.update(window.usage.as_dict())
                 if previous is None:
                     self._forward.pop(bucket, None)
                 else:
                     self._forward[bucket] = previous
 
-    def _relay(self, bucket: str, trace: Trace) -> None:
-        """一次请求（trace 是网关为它开的）的事件转记到 forward 指定的 trace，标上桶名。"""
+    def _window(self, bucket: str) -> _Window | None:
+        """一次请求开始时这个桶的转记目标（见 forward）。"""
         with self._lock:
-            target = self._forward.get(bucket)
-        if target is None or target is trace:  # 网关的请求本来就在那个 trace 里时不重复记
-            return
-        for event in list(trace.events):
-            data = {k: v for k, v in event.items() if k not in ("kind", "t_ms")}
-            target.add_event(event["kind"], **{**data, "bucket": bucket})
+            return self._forward.get(bucket)
+
+    def _commit(
+        self, bucket: str, usage: BucketUsage, trace: Trace, window: _Window | None
+    ) -> None:
+        """一次请求的用量记进桶。请求开始时这个桶在 forward 里、而那段时间还没结束的，用量也记进
+        那段时间，请求的事件（trace 是网关为它开的）转记进那段时间的 trace，标上桶名。"""
+        with self._lock:
+            self._bucket(bucket).add(usage)
+            if window is None or not window.open:
+                return
+            window.usage.add(usage)
+            target = window.trace
+            if target is None or target is trace:  # 网关的请求本来就在那个 trace 里时不重复记
+                return
+            for event in list(trace.events):
+                data = {k: v for k, v in event.items() if k not in ("kind", "t_ms")}
+                target.add_event(event["kind"], **{**data, "bucket": bucket})
 
     # ---------- 接口 ----------
 
@@ -290,21 +325,24 @@ class Gateway:
             "json_schema",
         )
         requested = str(body.get("model") or "")
+        window = self._window(bucket)  # 开始时的转记目标
+        usage = BucketUsage()
         with start_trace("gateway", bucket=bucket) as trace:
             try:
                 result, alias, fallback_used = self._call(messages, kwargs, primary)
             except Exception as exc:  # 包括备用模型也失败的情况
-                self._count_error(
-                    bucket,
+                _count_error(
+                    usage,
                     requested,
                     refused=isinstance(exc, ContentFilteredError),
                     rate_limited=isinstance(exc, RateLimitError),
                 )
+                # 失败之前的调用（如被拒的主模型）的事件也转记
+                self._commit(bucket, usage, trace, window)
                 raise
-            finally:  # 失败之前的调用（如被拒的主模型）也记账
-                self._relay(bucket, trace)
-        self._count_chat(bucket, requested, trace, fallback_used)
-        self._count_reply(bucket, result, tools is not None, json_mode)
+        _count_chat(usage, requested, trace, fallback_used)
+        _count_reply(usage, result, tools is not None, json_mode)
+        self._commit(bucket, usage, trace, window)
         return result, alias
 
     def _call(
@@ -349,24 +387,25 @@ class Gateway:
         if not all(isinstance(t, str) for t in texts):
             raise HTTPException(400, "input must be a string or a list of strings (no token ids).")
         failure: EmbeddingAPIError | None = None
+        window = self._window(bucket)  # 开始时的转记目标
         with start_trace("gateway", bucket=bucket) as trace:
             try:
                 batch = self.embedder.embed(texts, embed_kind(bucket))
             except EmbeddingAPIError as exc:  # 向量器自己已经按退避重试过：网关不再重试
                 failure = exc
-        self._relay(bucket, trace)
         from cuemem.evals.runner import usage_from_trace
 
         usage = usage_from_trace(trace)  # 失败之前已经完成的分批也花了钱
-        with self._lock:
-            entry = self._bucket(bucket)
-            entry.embedding_calls += 1
-            entry.embedded_texts += len(texts) if failure is None else 0
-            entry.embedding_tokens += int(usage["embedding_tokens"])
-            entry.embedding_errors += int(failure is not None)
-            entry.rate_limited += int(failure is not None and failure.status == 429)
-            entry.cost += float(usage["cost"])
-            entry.spent += float(usage["spent"])
+        counted = BucketUsage(
+            embedding_calls=1,
+            embedded_texts=len(texts) if failure is None else 0,
+            embedding_tokens=int(usage["embedding_tokens"]),
+            embedding_errors=int(failure is not None),
+            rate_limited=int(failure is not None and failure.status == 429),
+            cost=float(usage["cost"]),
+            spent=float(usage["spent"]),
+        )
+        self._commit(bucket, counted, trace, window)
         if failure is not None:
             if failure.status == 429:
                 return _rate_limited(str(failure), failure.retry_after)
@@ -393,48 +432,47 @@ class Gateway:
     def _bucket(self, bucket: str) -> BucketUsage:
         return self._usage.setdefault(bucket, BucketUsage())
 
-    def _count_chat(self, bucket: str, requested: str, trace: Any, fallback: bool) -> None:
-        from cuemem.evals.runner import usage_from_trace
 
-        usage = usage_from_trace(trace)
-        refreshes = sum(1 for e in trace.events if e["kind"] == "llm_cache_refresh")
-        with self._lock:
-            entry = self._bucket(bucket)
-            entry.chat_calls += int(usage["llm_calls"])
-            entry.cache_hits += int(usage["llm_cache_hits"])
-            entry.fallbacks += int(fallback)
-            entry.json_refreshes += refreshes
-            entry.input_tokens += int(usage["input_tokens"])
-            entry.output_tokens += int(usage["output_tokens"])
-            entry.cached_input_tokens += int(usage["cached_input_tokens"])
-            entry.cost += float(usage["cost"])
-            entry.spent += float(usage["spent"])
-            entry.latency_ms += float(usage["latency_ms"] or 0.0)
-            entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
+# 一次请求的用量先记在它自己的 BucketUsage 里，再由 Gateway._commit 一并记进桶与 forward 的那段时间
 
-    def _count_reply(
-        self, bucket: str, result: ChatResult, with_tools: bool, json_mode: bool = False
-    ) -> None:
-        calls = len(result.tool_calls)
-        with self._lock:
-            entry = self._bucket(bucket)
-            entry.truncated_replies += int(result.finish_reason == "length")
-            entry.bad_json_replies += int(json_mode and unparsable_json(result))
-            if with_tools:
-                entry.tool_requests += 1
-                entry.tool_calls += calls
-                entry.multi_tool_replies += int(calls > 1)
-                entry.no_tool_replies += int(calls == 0)
 
-    def _count_error(
-        self, bucket: str, requested: str, *, refused: bool, rate_limited: bool = False
-    ) -> None:
-        with self._lock:
-            entry = self._bucket(bucket)
-            entry.errors += 1
-            entry.refusals += int(refused)
-            entry.rate_limited += int(rate_limited)
-            entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
+def _count_chat(entry: BucketUsage, requested: str, trace: Any, fallback: bool) -> None:
+    from cuemem.evals.runner import usage_from_trace
+
+    usage = usage_from_trace(trace)
+    entry.chat_calls += int(usage["llm_calls"])
+    entry.cache_hits += int(usage["llm_cache_hits"])
+    entry.fallbacks += int(fallback)
+    entry.json_refreshes += sum(1 for e in trace.events if e["kind"] == "llm_cache_refresh")
+    entry.input_tokens += int(usage["input_tokens"])
+    entry.output_tokens += int(usage["output_tokens"])
+    entry.cached_input_tokens += int(usage["cached_input_tokens"])
+    entry.cost += float(usage["cost"])
+    entry.spent += float(usage["spent"])
+    entry.latency_ms += float(usage["latency_ms"] or 0.0)
+    entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
+
+
+def _count_reply(
+    entry: BucketUsage, result: ChatResult, with_tools: bool, json_mode: bool = False
+) -> None:
+    calls = len(result.tool_calls)
+    entry.truncated_replies += int(result.finish_reason == "length")
+    entry.bad_json_replies += int(json_mode and unparsable_json(result))
+    if with_tools:
+        entry.tool_requests += 1
+        entry.tool_calls += calls
+        entry.multi_tool_replies += int(calls > 1)
+        entry.no_tool_replies += int(calls == 0)
+
+
+def _count_error(
+    entry: BucketUsage, requested: str, *, refused: bool, rate_limited: bool = False
+) -> None:
+    entry.errors += 1
+    entry.refusals += int(refused)
+    entry.rate_limited += int(rate_limited)
+    entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
 
 
 async def _json_body(request: Request) -> dict[str, Any]:

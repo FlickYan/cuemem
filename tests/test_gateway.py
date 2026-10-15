@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -14,15 +15,23 @@ from fakes import ABORT_JSON, NO_BALANCE, RATE_LIMIT, REJECT, FakeAPI
 from fastapi.testclient import TestClient
 from openai import OpenAI, RateLimitError
 
-from cuemem.config import Settings
+from cuemem.config import RoleConfig, Settings
 from cuemem.core.trace import Trace, start_trace
 from cuemem.embed import build_embedder
 from cuemem.embed.dashscope import DashScopeTextEmbedder
 from cuemem.errors import ConfigMismatchError
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
-from cuemem.evals.external import ExternalBaseline, memory_hit, recorded_protocol, space_key
+from cuemem.evals.external import (
+    ExternalBaseline,
+    check_protocol,
+    memory_hit,
+    protocol_of,
+    recorded_protocol,
+    space_key,
+)
 from cuemem.evals.gateway import Gateway, _retry_after, embed_kind
 from cuemem.evals.methods import MethodContext, build_methods
+from cuemem.evals.report import run_protocol
 from cuemem.evals.runner import usage_from_trace
 from cuemem.llm import Ledger, LLMClient, ResponseCache
 from cuemem.llm.types import ChatResult
@@ -573,12 +582,42 @@ def test_recorded_protocol_reads_every_existing_record_shape() -> None:
     assert recorded_protocol({"protocol": f"{pds}|amem@ceffb86|max_tokens=4096|v4"}) == pds
     assert recorded_protocol({"protocol": f"{pds}|cognee==1.6.4|beam-turn-pair"}) == pds
     assert recorded_protocol({"protocol": pds, "build_tag": "x"}) == pds
-    # 记协议之前的 Graphiti（embedder 带维度）与 LangMem（维度另记在 dim）；extractor 是别名
+    # 记协议之前的 Graphiti（embedder 带维度）与 LangMem（维度另记在 dim）；extractor 是别名，
+    # 与协议里的抽取模型同一写法
     graphiti = {"graphiti_protocol": 2, "extractor": "deepseek-flash"}
     assert recorded_protocol({**graphiti, "embedder": "BAAI/bge-small-en-v1.5:384"}) == pds
-    langmem = {"extractor": "flash", "embedder": "BAAI/bge-small-en-v1.5", "dim": 384}
-    assert recorded_protocol(langmem, {"flash": "deepseek-flash"}) == pds
+    langmem = {"extractor": "deepseek-flash", "embedder": "BAAI/bge-small-en-v1.5", "dim": 384}
+    assert recorded_protocol(langmem) == pds
+    thinking = {**langmem, "extractor": "deepseek-flash-thinking"}
+    assert recorded_protocol(thinking) == "deepseek-flash-thinking|BAAI/bge-small-en-v1.5:384"
     assert recorded_protocol({"memories": 3, "perspectives": ["Ana"]}) is None  # Mem0 早先的
+
+
+def test_protocol_tells_apart_settings_of_one_model(offline_settings: Settings) -> None:
+    """协议里的抽取模型记配置里的别名：deepseek-flash 与开了思考的 deepseek-flash-thinking 是
+    同一个 model_id，写出的记忆不同，算不同的协议，另一个的写入报错（按 model_id 核对时会被
+    悄悄复用）。运行记录里的协议（report.run_protocol）同一写法。"""
+    embedder = build_embedder(offline_settings, use_cache=False)
+
+    def extractor(model: str) -> Settings:
+        roles = {**offline_settings.roles, "extractor": RoleConfig(model=model)}
+        return offline_settings.model_copy(update={"roles": roles})
+
+    plain, thinking = extractor("deepseek-flash"), extractor("deepseek-flash-thinking")
+    models = offline_settings.models
+    assert models["deepseek-flash"].model_id == models["deepseek-flash-thinking"].model_id
+    built, current = protocol_of(plain, embedder), protocol_of(thinking, embedder)
+    assert built == f"deepseek-flash|{embedder.name}:{embedder.dim}"
+    assert current == f"deepseek-flash-thinking|{embedder.name}:{embedder.dim}"
+    directory = Path("data/eval-spaces/graphiti/locomo_conv-42")
+    with pytest.raises(ConfigMismatchError, match="deepseek-flash-thinking"):
+        check_protocol({"protocol": built}, current, directory, "graphiti")
+    check_protocol({"protocol": current}, current, directory, "graphiti")
+    info = {
+        "roles": {"extractor": {"model": "deepseek-flash-thinking", "model_id": "deepseek-flash"}},
+        "embedding": {"model": embedder.name, "dim": embedder.dim},
+    }
+    assert run_protocol(info) == current
 
 
 def test_gateway_forward_relays_one_bucket(
@@ -599,12 +638,12 @@ def test_gateway_forward_relays_one_bucket(
         assert test_client.post(f"/b/{bucket}/v1/chat/completions", json=body).status_code == 200
 
     with TestClient(gateway.app()) as test_client:
-        with gateway.forward("x.search.k", target):
+        with gateway.forward("x.search.k", target) as used:
             chat(test_client, "x.search.k", "one")
             chat(test_client, "other", "two")
             assert test_client.post("/b/x.search.k/v1/embeddings", json={"input": "q"}).is_success
         chat(test_client, "x.search.k", "three")
-        with gateway.forward("x.search.k", None):  # 不在 trace 里：什么也不做
+        with gateway.forward("x.search.k", None) as untraced:  # 不在 trace 里：只累计用量
             chat(test_client, "x.search.k", "four")
     assert [(e["kind"], e["bucket"]) for e in target.events] == [
         ("llm", "x.search.k"),
@@ -614,6 +653,47 @@ def test_gateway_forward_relays_one_bucket(
     assert usage["llm_calls"] == 1 and usage["input_tokens"] == 120
     assert usage["embedding_tokens"] == gateway.usage("x.search.k")["embedding_tokens"] > 0
     assert gateway.usage("x.search.k")["chat_calls"] == 3
+    assert (used["chat_calls"], used["embedding_calls"]) == (1, 1)
+    assert used["cost"] == pytest.approx(usage["cost"], abs=1e-6)  # as_dict 保留 6 位小数
+    assert used["models_requested"] == {"": 1}
+    assert (untraced["chat_calls"], untraced["embedding_calls"]) == (1, 0)
+
+
+def test_gateway_forward_leaves_late_requests_in_the_bucket(
+    offline_settings: Settings, llm: LLMClient, fake_api: FakeAPI
+) -> None:
+    """请求按开始时的转记目标记账：一道题的检索放弃了（如 Cognee 的检索超时）、而它发出的请求在
+    下一道题检索时才处理完，只进桶，不记到哪道题名下（以前记到了下一道题的 trace 与
+    search_usage 里）。"""
+    started, release = threading.Event(), threading.Event()
+
+    def slow(body: dict[str, Any]) -> str:
+        if "late" in json.dumps(body):
+            started.set()
+            assert release.wait(10)
+        return "ok"
+
+    fake_api.chat_replies = [slow]
+    gateway = Gateway(llm, build_embedder(offline_settings, use_cache=False))
+    first, second = Trace("q1"), Trace("q2")
+
+    def chat(test_client: TestClient, text: str) -> None:
+        body = {"messages": [{"role": "user", "content": text}]}
+        assert test_client.post("/b/x.search.k/v1/chat/completions", json=body).is_success
+
+    with TestClient(gateway.app()) as test_client, ThreadPoolExecutor(1) as pool:
+        with gateway.forward("x.search.k", first) as used_first:
+            late = pool.submit(chat, test_client, "late")
+            assert started.wait(10)
+        with gateway.forward("x.search.k", second) as used_second:
+            release.set()
+            late.result(10)
+            chat(test_client, "on time")
+    assert first.events == []
+    assert [(e["kind"], e["bucket"]) for e in second.events] == [("llm", "x.search.k")]
+    assert used_first["chat_calls"] == 0 and used_second["chat_calls"] == 1
+    assert used_second["cost"] == pytest.approx(usage_from_trace(second)["cost"], abs=1e-6)
+    assert gateway.usage("x.search.k")["chat_calls"] == 2  # 桶里两次都有
 
 
 def test_external_builds_keep_session_id_schemes_apart(llm: LLMClient, fake_api: FakeAPI) -> None:

@@ -55,7 +55,7 @@ from cuemem.evals.datasets import (
     build_matches_session_ids,
     storage_space_id,
 )
-from cuemem.evals.external import check_protocol, model_ids, protocol_of
+from cuemem.evals.external import check_protocol, protocol_of
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.llm.client import LLMClient, Message
 
@@ -179,7 +179,6 @@ class Mem0Baseline:
         self._ready = False
         self._build_spent = 0.0
         self._failed: dict[str, str] = {}  # 写入失败过的对话历史：不再反复重建（每次都要花钱）
-        self._model_ids: dict[str, str] = {}
 
     def _setup(self, llm: LLMClient) -> None:
         """第一次回答时初始化：沿用评测的 LLM 客户端（同一本账），向量器按同一份配置构造。"""
@@ -192,7 +191,6 @@ class Mem0Baseline:
             self.embedder = build_embedder(settings, ledger=llm.ledger)
             # 写入协议：记进 build.json，另一个协议的写入不复用也不删（见模块说明）
             self.protocol = protocol_of(settings, self.embedder)
-            self._model_ids = model_ids(settings)
             self.mem0 = _import_mem0(self.root / "_home")
             self._ready = True
 
@@ -239,7 +237,7 @@ class Mem0Baseline:
         record = directory / "build.json"
         if record.exists():
             stored = _read_json(record)
-            check_protocol(stored, self.protocol, directory, "Mem0", self._model_ids)
+            check_protocol(stored, self.protocol, directory, "Mem0")
             if session_ids == "native" or build_matches_session_ids(stored, session_ids):
                 return None
         with self._lock:
