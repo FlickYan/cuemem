@@ -123,17 +123,19 @@ The scores above cannot be compared. What can be compared directly is the extern
 | LangMem 0.0.30 | 78.0% | 30.0% | $0.563 / $0.225 |
 | Cognee 1.6.4 | 77.5% | 74.0% | $2.845 / $1.466 |
 | Graphiti (graphiti-core 0.30.2, Kuzu) | 59.0% | 41.5% | $9.992 / $4.515 |
-| A-MEM (agiresearch/A-mem@ceffb86) | MA-PENDING | MA-PENDING | MA-PENDING |
+| A-MEM (agiresearch/A-mem@ceffb86, k = 10) | 58.0% | 59.5% | $17.567 / $3.136 |
+| A-MEM, k = 40 (sensitivity, same build) | 75.0% | 65.0% | Same |
 
-Write costs are totals for the 7 conversations at list price, without caching (D-010); these are the figures to compare. Actual spend (after cache hits and discounts; it depends on timing and on what earlier pilot runs had cached, so it is for budgeting, not for comparing methods), pds / pq: CueMem $0.222 / $0.151, Mem0 $0.242 / $0.317, LangMem $0.239 / $0.064, Cognee $0.797 / $1.154, Graphiti $1.508 / $3.908, A-MEM MA-PENDING.
+Write costs are totals for the 7 conversations at list price, without caching (D-010); these are the figures to compare. Actual spend (after cache hits and discounts; it depends on timing and on what earlier pilot runs had cached, so it is for budgeting, not for comparing methods), pds / pq: CueMem $0.222 / $0.151, Mem0 $0.242 / $0.317, LangMem $0.239 / $0.064, Cognee $0.797 / $1.154, Graphiti $1.508 / $3.908, A-MEM $7.877 / $2.878.
 
-- **CueMem L2 is ahead of Mem0, LangMem, Cognee and Graphiti under both protocols, and every difference is significant**:
-  - pds: against Mem0 +17 / −5 (p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002), Graphiti +62 / −6 (p < 0.001);
-  - pq: against Mem0 +24 / −9 (p = 0.014), Cognee +30 / −8 (p < 0.001), LangMem and Graphiti both p < 0.001;
-  - against A-MEM: MA-PENDING;
+- **CueMem L2 is ahead of all five external systems under both protocols, and every difference is significant**:
+  - pds: against Mem0 +17 / −5 (p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002), Graphiti +62 / −6 (p < 0.001), A-MEM +64 / −6 (p < 0.001);
+  - pq: against Mem0 +24 / −9 (p = 0.014), Cognee +30 / −8 (p < 0.001), LangMem, Graphiti and A-MEM all p < 0.001;
+  - also against A-MEM with k = 40 (pds +32 / −8, p < 0.001);
   - it is above full context, but not significantly (pds +12 / −7, p = 0.36; pq +19 / −9, p = 0.087).
-- **L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under pds**: against Mem0 +14 / −11 (p = 0.69), LangMem +24 / −15 (p = 0.20), Cognee +20 / −10 (p = 0.10); against Graphiti +55 / −8 (p < 0.001). Under pq it is significantly ahead of Cognee, +25 / −10 (p = 0.017), and not significantly different from Mem0, +19 / −11 (p = 0.20). Against A-MEM: MA-PENDING.
-- **Model sensitivity**: CueMem, Mem0 and Cognee move by 0–3.5 points from pds to pq; Graphiti and LangMem drop sharply; A-MEM MA-PENDING.
+- **L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under pds**: against Mem0 +14 / −11 (p = 0.69), LangMem +24 / −15 (p = 0.20), Cognee +20 / −10 (p = 0.10); against Graphiti +55 / −8 and A-MEM +56 / −7 (p < 0.001), and against A-MEM with k = 40 +27 / −12 (p = 0.024). Under pq it is significantly ahead of Cognee, +25 / −10 (p = 0.017), and A-MEM (p < 0.001), and not significantly different from Mem0, +19 / −11 (p = 0.20).
+- **A-MEM is sensitive to how many notes it retrieves**: with the paper's main setting, k = 10, it is level with naive RAG; with k = 40, the authors' setting for GPT-4o-class models, it gains 17 points under pds (vs k = 10, +40 / −6, p < 0.001), at 29,550 input tokens per question, 2.4 times L2's.
+- **Model sensitivity**: CueMem, Mem0, Cognee and A-MEM (k = 10) move by 0–3.5 points from pds to pq; Graphiti and LangMem drop sharply.
   - Graphiti: with its own prompts, qwen3.8-flash extracts far fewer entities (1,253 → 462 over the 7 conversations; facts 3,426 → 1,774). Under pq each conversation logged 118–270 "Target entity not found" warnings, and those facts were dropped. Turn recall under pq is 0.545 (naive RAG 0.845, CueMem L1 0.95).
   - LangMem: qwen3.8-flash uses PatchDoc to merge new information into a few long memories (705 → 123), and the sessions that lost their writes go from 2 / 202 to 23 / 202.
   - Neither system's prompts or thresholds were re-tuned for Qwen. Conversely, CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), so pq is its home ground. pds is the protocol where no system's prompts were tuned for the model, and L2's lead holds there too.
@@ -168,7 +170,7 @@ In the order a user would run into them:
 
 1. **More framework integrations**: the OpenAI Agents SDK, LangGraph / LangChain and Claude's memory tool are done ([integrations](integrations.md)). Still missing: TypeScript and Vercel AI SDK middleware, a LangGraph `BaseStore`, CrewAI, AutoGen. The Claude memory tool backend has not been run against the real Claude API.
 2. **Multi-tenancy**: there is one shared access token. Memory spaces are isolated by user_id, but there is no per-user authentication. Multi-instance deployments need Postgres instead of SQLite.
-3. **More external baselines**: Graphiti, LangMem and Cognee have been run under the same protocol (LoCoMo, DeepSeek-only and Qwen-only protocols; see §4); A-MEM's full runs are still in progress (MA-PENDING). Not yet run: Letta, MemOS, Supermemory and others. Graphiti, LangMem, Cognee and A-MEM were run on LoCoMo only (Mem0 also has LongMemEval test100r runs, from N11 and the leak ablation): their LongMemEval writes would cost too much and take too long (Graphiti writes one episode per message; A-MEM takes about 15 s per turn under Qwen). Each configuration was run once.
+3. **More external baselines**: Graphiti, LangMem, Cognee and A-MEM have been run under the same protocol (LoCoMo, DeepSeek-only and Qwen-only protocols; see §4). Not yet run: Letta, MemOS, Supermemory and others. Graphiti, LangMem, Cognee and A-MEM were run on LoCoMo only (Mem0 also has LongMemEval test100r runs, from N11 and the leak ablation): their LongMemEval writes would cost too much and take too long (Graphiti writes one episode per message; A-MEM takes about 15 s per turn under Qwen). Each configuration was run once.
 4. **Validating the presets**: the OpenAI and Ollama presets are covered by offline tests only and have not been evaluated on real models. The consolidation similarity thresholds were tuned for Qwen embeddings and may need re-tuning for another embedding model.
 5. **Metadata and expiry**: Mem0's `metadata` filters and `expiration_date`; Supermemory's automatically expiring temporary facts.
 6. **An English CLI**: CLI messages are in Chinese. The SDK, HTTP API, MCP, proxy and UI are in English.

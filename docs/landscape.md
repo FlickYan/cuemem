@@ -111,17 +111,19 @@
 | LangMem 0.0.30 | 78.0% | 30.0% | $0.563 / $0.225 |
 | Cognee 1.6.4 | 77.5% | 74.0% | $2.845 / $1.466 |
 | Graphiti（graphiti-core 0.30.2，Kuzu） | 59.0% | 41.5% | $9.992 / $4.515 |
-| A-MEM（agiresearch/A-mem@ceffb86） | MA-PENDING | MA-PENDING | MA-PENDING |
+| A-MEM（agiresearch/A-mem@ceffb86，k = 10） | 58.0% | 59.5% | $17.567 / $3.136 |
+| A-MEM，k = 40（敏感性，复用同一份写入） | 75.0% | 65.0% | 同上 |
 
-写入成本是 7 段对话的合计，按标价、不计缓存（D-010），比较用这一列。实际花费（扣除缓存命中与折扣，随运行时间和此前试跑留下的缓存而变，只用于记账、不用于比较）pds / pq：CueMem $0.222 / $0.151，Mem0 $0.242 / $0.317，LangMem $0.239 / $0.064，Cognee $0.797 / $1.154，Graphiti $1.508 / $3.908，A-MEM MA-PENDING。
+写入成本是 7 段对话的合计，按标价、不计缓存（D-010），比较用这一列。实际花费（扣除缓存命中与折扣，随运行时间和此前试跑留下的缓存而变，只用于记账、不用于比较）pds / pq：CueMem $0.222 / $0.151，Mem0 $0.242 / $0.317，LangMem $0.239 / $0.064，Cognee $0.797 / $1.154，Graphiti $1.508 / $3.908，A-MEM $7.877 / $2.878。
 
-- **CueMem L2 在两个协议下都高于 Mem0、LangMem、Cognee 与 Graphiti，差异都显著**：
-  - pds：对 Mem0 +17 / −5（p = 0.017），LangMem +25 / −7（p = 0.002），Cognee +27 / −8（p = 0.002），Graphiti +62 / −6（p < 0.001）；
-  - pq：对 Mem0 +24 / −9（p = 0.014），Cognee +30 / −8（p < 0.001），LangMem 与 Graphiti 都是 p < 0.001；
-  - 对 A-MEM：MA-PENDING；
+- **CueMem L2 在两个协议下都高于五个外部系统，差异都显著**：
+  - pds：对 Mem0 +17 / −5（p = 0.017），LangMem +25 / −7（p = 0.002），Cognee +27 / −8（p = 0.002），Graphiti +62 / −6（p < 0.001），A-MEM +64 / −6（p < 0.001）；
+  - pq：对 Mem0 +24 / −9（p = 0.014），Cognee +30 / −8（p < 0.001），LangMem、Graphiti 与 A-MEM 都是 p < 0.001；
+  - 对 k = 40 的 A-MEM 也显著（pds +32 / −8，p < 0.001）；
   - 比全上下文高，但不显著（pds +12 / −7，p = 0.36；pq +19 / −9，p = 0.087）。
-- **检索时不调用 LLM 的 L1，在 pds 下与 Mem0、LangMem、Cognee 没有显著差别**：对 Mem0 +14 / −11（p = 0.69），LangMem +24 / −15（p = 0.20），Cognee +20 / −10（p = 0.10）；对 Graphiti +55 / −8（p < 0.001）。pq 下显著高于 Cognee（+25 / −10，p = 0.017），与 Mem0 没有显著差别（+19 / −11，p = 0.20）。对 A-MEM：MA-PENDING。
-- **换模型的影响**：CueMem、Mem0、Cognee 从 pds 换到 pq 只差 0–3.5 个点，Graphiti 与 LangMem 大幅掉分；A-MEM MA-PENDING。
+- **检索时不调用 LLM 的 L1，在 pds 下与 Mem0、LangMem、Cognee 没有显著差别**：对 Mem0 +14 / −11（p = 0.69），LangMem +24 / −15（p = 0.20），Cognee +20 / −10（p = 0.10）；对 Graphiti +55 / −8、A-MEM +56 / −7（p < 0.001），对 k = 40 的 A-MEM +27 / −12（p = 0.024）。pq 下显著高于 Cognee（+25 / −10，p = 0.017）与 A-MEM（p < 0.001），与 Mem0 没有显著差别（+19 / −11，p = 0.20）。
+- **A-MEM 对检索条数很敏感**：论文的主要设置 k = 10 时与朴素检索相当；作者给 GPT-4o 级模型的 k = 40 在 pds 下高出 17 个点（对 k = 10 +40 / −6，p < 0.001），但每题输入 29,550 tokens，是 L2 的 2.4 倍。
+- **换模型的影响**：CueMem、Mem0、Cognee、A-MEM（k = 10）从 pds 换到 pq 只差 0–3.5 个点，Graphiti 与 LangMem 大幅掉分。
   - Graphiti：用它自己的提示词，qwen3.8-flash 抽出的实体少得多（7 段对话 1,253 → 462 个，事实 3,426 → 1,774 条）；pq 下每段对话记下 118–270 条 "Target entity not found" 警告，这些事实被丢掉。pq 下的发言召回 0.545（朴素检索 0.845，CueMem L1 0.95）。
   - LangMem：qwen3.8-flash 用 PatchDoc 把新信息并进少数几条长记忆（705 → 123 条），丢了写入的会话 2 / 202 → 23 / 202。
   - 这两家的提示词与阈值都没有为通义重调。反过来，CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调出来的（N3–N7），pq 对它是主场；pds 下没有哪个系统为模型调过提示词，L2 的领先同样成立。
@@ -156,7 +158,7 @@ N11 在原协议下（抽取与向量用通义、回答 deepseek-flash、判分 
 
 1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺 TypeScript 与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
 2. **多租户**：只有一个共享的访问令牌；记忆空间按 user_id 隔离，但没有按用户鉴权。多实例部署需要把 SQLite 换成 Postgres。
-3. **更多外部基线**：Graphiti、LangMem、Cognee 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4），A-MEM 的完整运行还在进行（MA-PENDING）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
+3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的元数据与过期**：Mem0 的 `metadata` 过滤与 `expiration_date`、Supermemory 的临时事实自动过期。
 6. **命令行的英文界面**：CLI 的提示目前是中文；SDK、HTTP、MCP、代理与界面是英文。
