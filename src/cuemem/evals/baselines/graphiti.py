@@ -48,7 +48,11 @@ kg_architecture_agent_memory：locomo_eval/ 与 zep_longmem_eval.ipynb）写入�
    3 条因此整条写入失败）；网关的写法 30 条全部成功。
 5. 解析失败时重新采样：回复解析不了时，Graphiti 原样重发（最多 4 次，温度 1，本意是重新采样），
    网关的响应缓存却只会还回同一个坏回复。这里重试时把 max_tokens 减 1，请求落到新的缓存键上，
-   真正重新采样（回复都很短，上限差一个 token 不影响结果）；第一次请求不变。
+   真正重新采样（回复都很短，上限差一个 token 不影响结果）；第一次请求不变。回复是 JSON 却
+   不合 schema 时 Graphiti 不重试（`Model(**回复)` 报错，整条 episode 失败），而通义的 JSON 模式
+   不保证 schema：通义预设试点的 conv-42 前 125 条发言里 4 条因此失败（回了裸列表 `[]`、
+   `[{...}]`，或在整数列表里放 null），超过第 11 条的 1% 上限、整份作废。这里按 Graphiti 自己
+   解析的规则校验（check_reply），不合就当作解析失败、同样重新采样；合 schema 的回复照旧。
 6. 发言时间：同一会话里每条发言的时间都是会话时间，而 Graphiti 取"前 10 条消息"时只按时间
    排序，同一时刻的发言先后不定。这里给会话里第 i 条发言加 i 秒，并让整份历史的时间严格递增
    （LongMemEval 约五分之一的历史里有开始时间相同的会话，不然两段会话的发言会交错进上下文），
@@ -65,7 +69,12 @@ kg_architecture_agent_memory：locomo_eval/ 与 zep_longmem_eval.ipynb）写入�
 10. 请求网关的超时放宽到 5 小时：评测遇到分时价格的高峰时段会暂停到高峰结束
     （peak_policy=wait），Graphiti 的请求要能等下去，否则超时重试几次后整条 episode 失败。
 11. 写入失败的处理：重试后仍失败的发言跳过并记下；超过 1% 的发言失败（或连续 10 条失败）时
-    整份作废，不留写入记录，下次运行重建（成功过的调用都在缓存里，重建几乎不花钱）。
+    整份作废，不留写入记录，下次运行重建（成功过的调用都在缓存里，重建几乎不花钱）。被内容
+    审核拒绝的发言（这条发言期间网关桶里的 refusals 增加了；没有备用模型或备用模型也拒绝）
+    与 M0、ML 一样跳过并计数（refused_episodes），不算失败、不计入连续失败，超过 max(2, 5%)
+    条才整份作废。通义预设试点的 conv-42 有 7–16 条发言被拒（每次运行不全相同；发言与上下文
+    都很平常，如会话 19、23 里聊散步、读书、看电影），其中会话 29 开头曾连续 10 条被拒，按
+    旧规则整份作废。
 
 写入记录（build.json）记下写入协议、抽取模型与向量模型，任何一项变了就自动重建；Graphiti 自己
 的告警（抽取的实体名对不上而丢掉的事实、消歧编号越界、JSON 解析失败……）按类型计数记在
@@ -132,6 +141,7 @@ PROGRESS_EVERY = 25
 MAX_OPEN = 8  # 同时打开的图（每份对话历史一个 Kuzu 库）
 MAX_FAILURE_STREAK = 10  # 连续这么多条发言写入失败：多半是网关或供应商出了问题，整份放弃
 MAX_FAILED_SHARE = 0.01  # 失败的发言超过这个比例：图缺得太多，整份作废（见模块说明第 11 条）
+MAX_REFUSED, MAX_REFUSED_SHARE = 2, 0.05  # 被内容审核拒绝的发言最多容许 max(2, 5%) 条
 GATEWAY_TIMEOUT = 5 * 3600.0  # 秒：高峰时段网关会暂停到高峰结束（见模块说明第 10 条）
 KUZU_MAX_DB_SIZE = 1 << 36  # 每个库的地址空间上限（64GB；默认 8TB，见模块说明第 3 条）
 KUZU_BUFFER_POOL = 1 << 30  # 每个库的缓冲池（1GB；默认可用 80% 的内存）
@@ -295,11 +305,13 @@ class GraphitiBaseline(ExternalBaseline):
             if (body := episode_body(turn)) is not None
         ]
         failed: list[str] = []
+        refused: list[str] = []
         streak = 0
         previous: datetime | None = None
         for done, (session, index, body) in enumerate(todo, start=1):
             when = previous = reference_time(session.started_at, index, after=previous)
             name = f"{session.session_id}#{index}"
+            refusals = self.gateway.usage(self.bucket(key))["refusals"]
             try:
                 result = await graphiti.add_episode(
                     name=name,
@@ -310,7 +322,11 @@ class GraphitiBaseline(ExternalBaseline):
                     group_id=group,
                 )
             except Exception as exc:  # 重试后仍失败的发言：跳过并记下，别的照常
-                failed.append(f"{name}: {type(exc).__name__}: {exc}"[:200])
+                note = f"{name}: {type(exc).__name__}: {exc}"[:200]
+                if self.gateway.usage(self.bucket(key))["refusals"] > refusals:
+                    refused.append(note)  # 内容审核误拒：跳过并计数（见模块说明第 11 条）
+                    continue
+                failed.append(note)
                 streak += 1
                 if streak >= MAX_FAILURE_STREAK:
                     raise RuntimeError(f"连续 {streak} 条发言写入失败：{failed[-1]}") from exc
@@ -324,28 +340,33 @@ class GraphitiBaseline(ExternalBaseline):
                 [node.uuid for node in result.nodes],
             )
             if done % PROGRESS_EVERY == 0:
-                self._progress(key, directory, done, len(todo), len(failed), counts)
-        if len(failed) > MAX_FAILED_SHARE * len(todo):
-            raise RuntimeError(
-                f"{len(failed)} / {len(todo)} 条发言写入失败（上限 {MAX_FAILED_SHARE:.0%}）："
-                f"{failed[-1]}"
-            )
+                self._progress(key, directory, done, len(todo), len(failed), len(refused), counts)
+        check_episodes(len(todo), failed, refused)
         graph.ledger.save()
         return {
             "episodes": len(graph.ledger.episodes),
             "failed_episodes": failed,
+            "refused_episodes": refused,
             "warnings": dict(counts.most_common()),
             **await graph_counts(graph.driver, group),
         }
 
     def _progress(
-        self, key: str, directory: Path, done: int, total: int, failed: int, counts: Counter[str]
+        self,
+        key: str,
+        directory: Path,
+        done: int,
+        total: int,
+        failed: int,
+        refused: int,
+        counts: Counter[str],
     ) -> None:
         usage = self.gateway.usage(self.bucket(key))
         progress = {
             "episodes": done,
             "of": total,
             "failed": failed,
+            "refused": refused,
             "warnings": sum(counts.values()),
             "chat_calls": usage["chat_calls"],
             "spent": usage["spent"],
@@ -630,9 +651,12 @@ def _resampling_client_type() -> type[Any]:
         ) -> dict[str, Any]:
             attempt = self.attempts.get(id(messages), 0)
             self.attempts[id(messages)] = attempt + 1
-            return await super()._generate_response(
+            reply: dict[str, Any] = await super()._generate_response(
                 messages, response_model, max_tokens - attempt, *args, **kwargs
             )
+            if response_model is not None:  # 不合 schema 也重新采样（见模块说明第 5 条）
+                check_reply(reply, response_model)
+            return reply
 
     return ResamplingClient
 
@@ -736,6 +760,42 @@ def entity_hit(key: str, node: Any, score: float, rank: int, ledger: EpisodeLedg
         route="graphiti_entity",
         kind="entity",
     )
+
+
+class SchemaMismatch(json.JSONDecodeError):
+    """回复是合法的 JSON，却不是要的结构。继承 JSONDecodeError：Graphiti 的重试只认它这类错误。"""
+
+
+def check_reply(reply: Any, model: type[Any]) -> None:
+    """回复不合 response_model 时报 SchemaMismatch，让 Graphiti 重试（重新采样）。
+
+    Graphiti 拿到回复后用 `Model(**reply)` 解析，不合就让整条 episode 失败；通义的 JSON 模式
+    不保证 schema（试点里约 3% 的 episode 因此失败：回了裸列表 `[]`、`[{...}]`，或在整数列表
+    里放 null）。校验与 Graphiti 自己的解析相同，合 schema 的回复照常返回。"""
+    if not isinstance(reply, dict):
+        name = getattr(model, "__name__", "the schema")
+        logging.getLogger("graphiti_core").warning(f"Reply is not a JSON object for {name}")
+        raise SchemaMismatch(f"Expected a JSON object for {name}", json.dumps(reply)[:200], 0)
+    try:
+        model.model_validate(reply)
+    except ValueError as exc:  # pydantic 的 ValidationError 是 ValueError
+        name = getattr(model, "__name__", "the schema")
+        logging.getLogger("graphiti_core").warning(f"Reply does not match {name}")
+        raise SchemaMismatch(f"Reply does not match {name}: {exc}"[:500], "", 0) from exc
+
+
+def check_episodes(total: int, failed: Sequence[str], refused: Sequence[str]) -> None:
+    """整份写入能不能用（见模块说明第 11 条）：失败的发言超过 1%，或被内容审核拒绝的超过
+    max(2, 5%) 时报错，不留写入记录。"""
+    if len(failed) > MAX_FAILED_SHARE * total:
+        raise RuntimeError(
+            f"{len(failed)} / {total} 条发言写入失败（上限 {MAX_FAILED_SHARE:.0%}）：{failed[-1]}"
+        )
+    allowed = max(MAX_REFUSED, int(MAX_REFUSED_SHARE * total))
+    if len(refused) > allowed:
+        raise RuntimeError(
+            f"{len(refused)} / {total} 条发言被内容审核拒绝（最多容许 {allowed} 条）：{refused[-1]}"
+        )
 
 
 def ranked(passages: Sequence[str], scores: Sequence[float]) -> list[tuple[str, float]]:

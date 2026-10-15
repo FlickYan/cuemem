@@ -199,6 +199,18 @@ def test_check_build_rejects_crippled_builds() -> None:
     ml.check_build(3, [], [], {"tool_requests": 3, "multi_tool_replies": 0})  # 太少，看不出来
 
 
+def test_sessions_where_the_model_chose_no_change_are_not_lost_writes() -> None:
+    """通义在有已有记忆时（tool_choice=required）常回一个空补丁的 PatchDoc：这是模型的判断，
+    不算写入丢了；没调用工具、被截断、trustcall 跳过或丢掉了调用，才算丢了。"""
+    start = {"tool_calls": 4, "no_tool_replies": 0, "truncated_replies": 0}
+    called = {**start, "tool_calls": 5}
+    assert ml.chose_no_change(start, called, [])
+    assert not ml.chose_no_change(start, called, ["Could not apply patch: Invalid 'path'"])
+    assert not ml.chose_no_change(start, {**start, "no_tool_replies": 1}, [])
+    assert not ml.chose_no_change(start, {**called, "truncated_replies": 1}, [])
+    assert not ml.chose_no_change(start, start, [])  # 一个工具调用也没有
+
+
 def test_same_identity(tmp_path: Path) -> None:
     record = tmp_path / "build.json"
     record.write_text(json.dumps({**IDENTITY, "memories": 3}), "utf-8")
@@ -290,8 +302,8 @@ def test_store_written_by_other_models_is_rebuilt(
 
 def _fake_model(body: dict[str, Any]) -> str | dict[str, Any]:
     """LangMem 的抽取（带工具）：第一个会话新增一条记忆，第二个会话用 PatchDoc 改写它，
-    第三个会话给一个改不了的补丁（路径不存在），第四个会话被内容审核拒绝；
-    回答模型（不带工具）：返回固定答案。"""
+    第三个会话给一个改不了的补丁（路径不存在），第四个会话被内容审核拒绝，第五个会话回一个
+    空补丁（"不用改"，通义常这样回）；回答模型（不带工具）：返回固定答案。"""
     if not body.get("tools"):
         return '{"answer": "Berlin", "evidence_sufficient": true, "citations": ["m1"]}'
     transcript = " ".join(
@@ -316,6 +328,11 @@ def _fake_model(body: dict[str, Any]) -> str | dict[str, Any]:
         }
         call = {"id": "c2", "name": "PatchDoc", "arguments": json.dumps(patch)}
         return {"tool_calls": [call]}
+    if "movie" in transcript:
+        system = body["messages"][0]["content"]
+        doc_id = re.search(r"<instance id=(\S+) ", system).group(1)  # type: ignore[union-attr]
+        patch = {"json_doc_id": doc_id, "planned_edits": "No changes needed.", "patches": []}
+        return {"tool_calls": [{"id": "c3", "name": "PatchDoc", "arguments": json.dumps(patch)}]}
     memory = json.dumps({"content": "Ana moved to Berlin in late July 2026."})
     return {"tool_calls": [{"id": "c1", "name": "Memory", "arguments": memory}]}
 
@@ -323,10 +340,12 @@ def _fake_model(body: dict[str, Any]) -> str | dict[str, Any]:
 def _sessions() -> list[EvalSession]:
     gym = [EvalTurn(role="user", text="I joined a gym.", speaker="Ben")]
     passport = [EvalTurn(role="user", text="My passport number is 123.", speaker="Ana")]
+    movie = [EvalTurn(role="user", text="I watched a movie.", speaker="Ben")]
     return [
         *_two_people(),
         EvalSession("session_3", datetime(2026, 8, 9, 9, 0), gym),
         EvalSession("session_4", datetime(2026, 8, 10, 9, 0), passport),
+        EvalSession("session_5", datetime(2026, 8, 11, 9, 0), movie),
     ]
 
 
@@ -344,17 +363,21 @@ def test_build_and_retrieve_through_the_gateway(
         assert out.response == "Berlin"
         build = out.details["langmem_build"]
         assert build["memories"] == 1 and build["updates"] == 1
-        # 第三个会话唯一的修改没能应用：一条也没写，记作空会话（3 个会话里 1 个，仍可用）
-        assert build["puts_per_session"] == [1, 1, 0] and build["empty_sessions"] == ["session_3"]
+        # 第三个会话唯一的修改没能应用：一条也没写，记作写入丢了（仍在容许之内）；第五个会话
+        # 模型明说不用改（空补丁）：不算写入丢了，另记一笔
+        assert build["puts_per_session"] == [1, 1, 0, 0] and build["empty_sessions"] == [
+            "session_3"
+        ]
+        assert build["unchanged_sessions"] == ["session_5"]
         # 第四个会话被内容审核拒绝（网关换了备用模型也拒绝）：跳过并计数，整份写入照常
         (refused,) = build["refused_sessions"]
         assert refused.startswith("session_4: GraphRecursionError")
         assert build["refusals"] >= 1 and build["errors"] == build["refusals"]
-        assert build["chat_calls"] == 3 and build["embedded_texts"] >= 2
+        assert build["chat_calls"] == 4 and build["embedded_texts"] >= 2
         # 网关按 OpenAI 的默认要求并行工具调用；每次回复的工具调用记在写入记录里
         extraction = [r for r in fake_api.chat_requests if r.get("tools")]
         assert all(r["parallel_tool_calls"] is True for r in extraction)
-        assert build["tool_requests"] == 3 and build["tool_calls"] == 3
+        assert build["tool_requests"] == 4 and build["tool_calls"] == 4
         assert build["no_tool_replies"] == 0 and build["truncated_replies"] == 0
         # 第三个会话的补丁改不了：trustcall 只记日志、跳过，统计里要看得到
         assert build["skipped_edits"] == 1 and build["dropped_calls"] == 0
