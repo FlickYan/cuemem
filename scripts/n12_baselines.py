@@ -15,9 +15,9 @@ pds-locomo-mem0、pds-locomo-graphiti。脚本把这些运行里同一批题的�
   CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen。外部基线（M0、MG、ML、MC、MA）的写入目录
   不分协议，build.json 记下协议（抽取模型|向量模型:维度）：忘了设这个变量时，MG、ML、MC、MA
   遇到 pds 的写入既不复用、也不删掉重建，每道题报 ConfigMismatchError（运行结束时归并列出，见
-  evals/external.py），设好目录重跑即可。M0 的写入记录早先不记协议（新写的才记，记了的同样
-  报错），data/eval-spaces 与 data/eval-spaces-qwen 下现存的 M0 写入都没记，按当前协议处理，
-  **会被悄悄复用**：跑 M0 前务必确认这个变量。
+  evals/external.py），设好目录重跑即可。M0 的写入记录早先不记协议，没记的按当前协议处理、
+  会被悄悄复用；本机 data/eval-spaces*（pds、pq 与原协议的泄漏对照）下现存的 214 份 M0 写入
+  已按所在目录补记了协议（2026-10-15），别处更早的写入要照样补记，或者跑之前确认这个变量。
 - qwen：N9 / N11 的原协议（抽取 qwen3.8-flash、向量 qwen3.7-text-embedding、回答 deepseek-flash、
   判分 qwen3.8-max）。抽取与向量与 pq 相同，写入也在 data/eval-spaces-qwen。
 
@@ -158,8 +158,8 @@ def load_cells(
 def eval_spaces_for(protocol: str, settings: Any, override: Path | None = None) -> Path:
     """外部基线的写入目录：--eval-spaces > 协议对应的目录（PROTOCOL_SPACES）> 当前配置的
     paths.eval_spaces。不跟着当前配置走：pq 的写入与 pds 的目录名相同（如 mem0/locomo_conv-42），
-    忘了设 CUEMEM_PATHS__EVAL_SPACES 时会读到 pds 的写入：记了协议的对不上、计入 mismatched，
-    Mem0 早先的写入没记协议，会被悄悄算进来。相对路径相对数据目录。"""
+    忘了设 CUEMEM_PATHS__EVAL_SPACES 时会读到 pds 的写入：记了协议的对不上、计入 mismatched；
+    没记协议的旧写入（补记之前的 Mem0）会被算进来。相对路径相对数据目录。"""
     if override is not None:
         return override if override.is_absolute() else home_dir() / override
     if protocol in PROTOCOL_SPACES:
