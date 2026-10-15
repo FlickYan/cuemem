@@ -1,0 +1,511 @@
+{
+ "orig": {
+  "runs": {
+   "raw": [
+    "orig-lme-raw-cuemem",
+    "orig-lme-raw-mem0"
+   ],
+   "anon": [
+    "orig-lme-cuemem",
+    "orig-lme-mem0"
+   ],
+   "label": [
+    "orig-lme-label-cuemem",
+    "orig-lme-label-mem0"
+   ]
+  },
+  "methods": {
+   "B1": {
+    "label": "Full context",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.81,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.81,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     }
+    },
+    "paired": {
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B2": {
+    "label": "Naive RAG",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.82,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.86,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.87,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 4,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 0,
+      "losses": 5,
+      "p": 0.0625,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 6,
+      "p": 0.2891,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B4-nobm25": {
+    "label": "CueMem L1",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.92,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.9,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.92,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 3,
+      "losses": 1,
+      "p": 0.625,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 1,
+      "losses": 1,
+      "p": 1.0,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 4,
+      "losses": 2,
+      "p": 0.6875,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B5": {
+    "label": "CueMem L2",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.93,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.96,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.95,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 2,
+      "losses": 4,
+      "p": 0.6875,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 0,
+      "losses": 3,
+      "p": 0.25,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B6": {
+    "label": "CueMem controller",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.88,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.89,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.9,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 3,
+      "losses": 2,
+      "p": 1.0,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 2,
+      "losses": 4,
+      "p": 0.6875,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   }
+  },
+  "pooled": {
+   "label_vs_anon": {
+    "wins": 12,
+    "losses": 9,
+    "net_points": 0.75,
+    "note": "summed over retrieval methods on the same questions (not independent)"
+   },
+   "raw_vs_label": {
+    "wins": 5,
+    "losses": 14,
+    "net_points": -2.25,
+    "note": "summed over retrieval methods on the same questions (not independent)"
+   },
+   "raw_vs_anon": {
+    "wins": 8,
+    "losses": 14,
+    "net_points": -1.5,
+    "note": "summed over retrieval methods on the same questions (not independent)"
+   }
+  }
+ },
+ "pq": {
+  "runs": {
+   "raw": [
+    "pq-lme-raw-cuemem",
+    "pq-lme-warm-b1",
+    "pq-lme-raw-mem0"
+   ],
+   "anon": [
+    "pq-lme-cuemem",
+    "pq-lme-mem0"
+   ],
+   "label": [
+    "pq-lme-label-cuemem",
+    "pq-lme-label-mem0"
+   ]
+  },
+  "methods": {
+   "B1": {
+    "label": "Full context",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.77,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.77,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 0,
+      "losses": 0,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B2": {
+    "label": "Naive RAG",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.82,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.83,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.84,
+      "abstention_n": 5,
+      "abstention_accuracy": 1.0
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 4,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 2,
+      "losses": 4,
+      "p": 0.6875,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 3,
+      "losses": 4,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B4-nobm25": {
+    "label": "CueMem L1",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.9,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.91,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.89,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 1,
+      "losses": 3,
+      "p": 0.625,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 2,
+      "losses": 1,
+      "p": 1.0,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B5": {
+    "label": "CueMem L2",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.94,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.93,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.93,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.6
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 3,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 2,
+      "losses": 1,
+      "p": 1.0,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 1,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "B6": {
+    "label": "CueMem controller",
+    "arms": {
+     "raw": {
+      "n": 100,
+      "accuracy": 0.89,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "anon": {
+      "n": 100,
+      "accuracy": 0.9,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.87,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 5,
+      "p": 0.4531,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     },
+     "raw_vs_label": {
+      "n": 100,
+      "wins": 2,
+      "losses": 0,
+      "p": 0.5,
+      "meaning": "renaming noise only (same labels, rounds reordered)"
+     },
+     "raw_vs_anon": {
+      "n": 100,
+      "wins": 2,
+      "losses": 3,
+      "p": 1.0,
+      "meaning": "leak + renaming noise (pre-fix vs post-fix)"
+     }
+    }
+   },
+   "M0": {
+    "label": "Mem0 2.2.1",
+    "arms": {
+     "raw": {
+      "n": 93,
+      "accuracy": 0.828,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {}
+   }
+  },
+  "pooled": {
+   "label_vs_anon": {
+    "wins": 10,
+    "losses": 14,
+    "net_points": -1.0,
+    "note": "summed over retrieval methods on the same questions (not independent)"
+   },
+   "raw_vs_label": {
+    "wins": 8,
+    "losses": 6,
+    "net_points": 0.5,
+    "note": "summed over retrieval methods on the same questions (not independent)"
+   },
+   "raw_vs_anon": {
+    "wins": 9,
+    "losses": 11,
+    "net_points": -0.5,
+    "note": "summed over retrieval methods on the same questions (not independent)"
+   }
+  }
+ }
+}
