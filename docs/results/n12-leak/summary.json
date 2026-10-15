@@ -274,6 +274,60 @@
     "p": 0.2863,
     "note": "summed over retrieval methods on the same questions (not independent)"
    }
+  },
+  "vs_mem0": {
+   "anon": {
+    "B2_vs_M0": {
+     "n": 100,
+     "wins": 12,
+     "losses": 5,
+     "p": 0.1435
+    },
+    "B4-nobm25_vs_M0": {
+     "n": 100,
+     "wins": 15,
+     "losses": 4,
+     "p": 0.0192
+    },
+    "B5_vs_M0": {
+     "n": 100,
+     "wins": 19,
+     "losses": 2,
+     "p": 0.0002
+    },
+    "B6_vs_M0": {
+     "n": 100,
+     "wins": 17,
+     "losses": 7,
+     "p": 0.0639
+    }
+   },
+   "label": {
+    "B2_vs_M0": {
+     "n": 100,
+     "wins": 10,
+     "losses": 8,
+     "p": 0.8145
+    },
+    "B4-nobm25_vs_M0": {
+     "n": 100,
+     "wins": 9,
+     "losses": 2,
+     "p": 0.0654
+    },
+    "B5_vs_M0": {
+     "n": 100,
+     "wins": 12,
+     "losses": 2,
+     "p": 0.0129
+    },
+    "B6_vs_M0": {
+     "n": 100,
+     "wins": 12,
+     "losses": 7,
+     "p": 0.3593
+    }
+   }
   }
  },
  "pq": {
@@ -537,6 +591,34 @@
     "net_points": -0.5,
     "p": 0.8238,
     "note": "summed over retrieval methods on the same questions (not independent)"
+   }
+  },
+  "vs_mem0": {
+   "raw": {
+    "B2_vs_M0": {
+     "n": 100,
+     "wins": 7,
+     "losses": 8,
+     "p": 1.0
+    },
+    "B4-nobm25_vs_M0": {
+     "n": 100,
+     "wins": 12,
+     "losses": 5,
+     "p": 0.1435
+    },
+    "B5_vs_M0": {
+     "n": 100,
+     "wins": 14,
+     "losses": 3,
+     "p": 0.0127
+    },
+    "B6_vs_M0": {
+     "n": 100,
+     "wins": 14,
+     "losses": 8,
+     "p": 0.2863
+    }
    }
   }
  }
