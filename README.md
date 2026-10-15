@@ -146,7 +146,7 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 | Forgetting | Deletes the source conversation, follows citations, finds uncited restatements; dry run | `delete` | Edit memory | `remove_episode` | `forget_matching`, dry run |
 | Evaluation | Frozen methods, test sets used once, external baselines under the same models and judge | Own benchmark repo | Blog | Paper | Own |
 
-**Same protocol, same models (N12).** We ran five open-source memory systems ourselves on 200 LoCoMo questions (A-MEM is still running). Each uses its own write and read pipeline; the extraction model, embeddings, reader and judge are the same as CueMem's. There are two protocols, DeepSeek only and Qwen only, with one run per configuration.
+**Same protocol, same models (N12).** We ran five open-source memory systems ourselves on 200 LoCoMo questions. Each uses its own write and read pipeline; the extraction model, embeddings, reader and judge are the same as CueMem's. There are two protocols, DeepSeek only and Qwen only, with one run per configuration.
 
 | LoCoMo test200r | DeepSeek only | Qwen only |
 |---|---|---|
@@ -155,10 +155,10 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 | LangMem 0.0.30 | 78.0% | 30.0% |
 | Cognee 1.6.4 | 77.5% | 74.0% |
 | Graphiti (graphiti-core 0.30.2) | 59.0% | 41.5% |
-| A-MEM | MA-PENDING | MA-PENDING |
+| A-MEM (k = 10 / k = 40) | 58.0% / 75.0% | 59.5% / 65.0% |
 | Full context | 84.5% | 80.0% |
 
-L2 is significantly ahead of Mem0, LangMem, Cognee and Graphiti under both protocols (paired sign tests, p ≤ 0.017); against A-MEM: MA-PENDING. L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under DeepSeek (against A-MEM: MA-PENDING). Graphiti and LangMem drop sharply under Qwen: with their own prompts, qwen3.8-flash extracts far fewer entities and memories. CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), so the Qwen-only protocol is its home ground; DeepSeek-only is the protocol where no system was tuned for the model, and L2's lead holds there too. Details in the Chinese [N12 external baselines](docs/results/n12-baselines/README.md) and the [comparison](docs/en/landscape.md#same-protocol-comparison-n12).
+L2 is significantly ahead of all five systems under both protocols (paired sign tests, p ≤ 0.017), A-MEM with k = 40 included. L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under DeepSeek, and is significantly ahead of Graphiti and A-MEM. A-MEM is shown at the paper's main setting (k = 10) and at the authors' setting for GPT-4o-class models (k = 40), which uses 2.4 times L2's input per question. Graphiti and LangMem drop sharply under Qwen: with their own prompts, qwen3.8-flash extracts far fewer entities and memories. CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), so the Qwen-only protocol is its home ground; DeepSeek-only is the protocol where no system was tuned for the model, and L2's lead holds there too. Details in the Chinese [N12 external baselines](docs/results/n12-baselines/README.md) and the [comparison](docs/en/landscape.md#same-protocol-comparison-n12).
 
 CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, three framework integrations so far ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
 

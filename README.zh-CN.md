@@ -95,7 +95,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | 遗忘 | 删出处的对话、沿引用扩散、找没有引用的转述；可预演 | `delete` | 编辑记忆 | `remove_episode` | `forget_matching`，可预演 |
 | 评测 | 方法事先冻结、测试集只用一次、同样的模型与判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
 
-**同一协议下的对比（N12）**：我们自己在 LoCoMo 200 题上跑了 5 个开源记忆系统（A-MEM 还在跑），各用自己的写入与检索流程，抽取模型、向量、回答模型与判分都和 CueMem 相同；只用 DeepSeek、只用通义两个协议，每个配置跑一次。
+**同一协议下的对比（N12）**：我们自己在 LoCoMo 200 题上跑了 5 个开源记忆系统，各用自己的写入与检索流程，抽取模型、向量、回答模型与判分都和 CueMem 相同；只用 DeepSeek、只用通义两个协议，每个配置跑一次。
 
 | LoCoMo test200r | 只用 DeepSeek | 只用通义 |
 |---|---|---|
@@ -104,10 +104,10 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | LangMem 0.0.30 | 78.0% | 30.0% |
 | Cognee 1.6.4 | 77.5% | 74.0% |
 | Graphiti（graphiti-core 0.30.2） | 59.0% | 41.5% |
-| A-MEM | MA-PENDING | MA-PENDING |
+| A-MEM（k = 10 / k = 40） | 58.0% / 75.0% | 59.5% / 65.0% |
 | 全上下文 | 84.5% | 80.0% |
 
-L2 在两个协议下都显著高于 Mem0、LangMem、Cognee 与 Graphiti（配对符号检验 p ≤ 0.017），对 A-MEM：MA-PENDING；检索时不调用 LLM 的 L1 在只用 DeepSeek 时与 Mem0、LangMem、Cognee 没有显著差别（对 A-MEM：MA-PENDING）。Graphiti 与 LangMem 在通义下大幅掉分：用它们自己的提示词，qwen3.8-flash 抽出的实体与记忆少得多。CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调的（N3–N7），只用通义对它是主场；只用 DeepSeek 时没有哪个系统为模型调过提示词，L2 的领先同样成立。详见 [N12 外部基线](docs/results/n12-baselines/README.md)与[对比文档](docs/landscape.md#同一协议下的对比n12)。
+L2 在两个协议下都显著高于这 5 个系统（配对符号检验 p ≤ 0.017，k = 40 的 A-MEM 也在内）；检索时不调用 LLM 的 L1 在只用 DeepSeek 时与 Mem0、LangMem、Cognee 没有显著差别，显著高于 Graphiti 与 A-MEM。A-MEM 列了论文的主要设置（k = 10）与作者给 GPT-4o 级模型的设置（k = 40），后者每题的输入是 L2 的 2.4 倍。Graphiti 与 LangMem 在通义下大幅掉分：用它们自己的提示词，qwen3.8-flash 抽出的实体与记忆少得多。CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调的（N3–N7），只用通义对它是主场；只用 DeepSeek 时没有哪个系统为模型调过提示词，L2 的领先同样成立。详见 [N12 外部基线](docs/results/n12-baselines/README.md)与[对比文档](docs/landscape.md#同一协议下的对比n12)。
 
 CueMem 的短板在产品层：只有 Python、只支持 SQLite + Qdrant、只有一个共享的访问令牌、框架集成目前只有三个（见[还差什么](docs/landscape.md#7-还差什么)）。
 
