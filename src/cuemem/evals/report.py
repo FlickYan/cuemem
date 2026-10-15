@@ -33,6 +33,7 @@ from matplotlib.legend import Legend
 from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 from matplotlib.transforms import Bbox
 
+from cuemem.config import home_dir
 from cuemem.evals.metrics import bootstrap_ci, mean, percentile
 from cuemem.read.probe import DONT_KNOW
 
@@ -83,6 +84,14 @@ METHOD_ORDER = list(METHOD_LABELS)
 # build.json（evals/external.py、evals/mem0_baseline.py），触发写入的那道题的 details 里也有一份
 # （<系统名>_build）
 EXTERNAL_SYSTEMS = {"M0": "mem0", "MG": "graphiti", "ML": "langmem", "MC": "cognee", "MA": "amem"}
+# 各协议（运行名的第一段，如 pq-locomo-mem0 的 pq；D-065）的写入目录，相对数据目录。pq 与 qwen
+# 的抽取模型、向量模型相同，共用一份写入；同一个数据目录下 pds 与 pq 的写入目录名相同（如
+# mem0/locomo_conv-42），不能靠当前的配置区分。与 scripts/n12_baselines.py 共用
+PROTOCOL_SPACES = {
+    "pds": Path("data/eval-spaces"),
+    "pq": Path("data/eval-spaces-qwen"),
+    "qwen": Path("data/eval-spaces-qwen"),
+}
 # 参照点：中性色空心，形状区分
 REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o", "B3": "^", "B4-text": "v"}
 
@@ -284,9 +293,11 @@ def write_cost(
     - CueMem：运行里的写入与巩固记录（ingests，即 ingest.jsonl；同一份历史的同一阶段只取最后
       一次），用到哪些阶段见 write_stages。L1 / L2 / 控制器共用一份巩固后的记忆，写入成本相同；
       spaces 只数巩固过的对话历史。
-    - 外部基线（EXTERNAL_SYSTEMS）：各对话历史的 build.json（eval_spaces 下）；找不到时取 rows 里
-      触发写入的那道题记下的统计（<系统名>_build）。给了 protocol 时，build.json 记的协议对不上的
-      不算（例如 pq 的运行读到了 pds 的写入目录），计入 mismatched；没记协议的旧记录照算。
+    - 外部基线（EXTERNAL_SYSTEMS）：每份对话历史有两处写入记录——rows 里触发写入的那道题记下的
+      统计（<系统名>_build，运行自己写入时才有）与 eval_spaces 下的 build.json。给了 protocol 时
+      按协议挑（_pick_build）：先取协议对得上的（运行自己的记录优先），再取没记协议的（Mem0 从来
+      不记；运行自己的优先）；记的协议对不上的不算（例如 pq 的运行读到了 pds 的写入目录），全都
+      对不上时计入 mismatched。旧记录没有 protocol 字段，但记了 extractor 与 embedder 的照样核对。
       耗时取 build.json 的 seconds（墙钟），M0 没有这一项，取各次调用的延迟之和。
     """
     return _write_cost(
@@ -320,14 +331,13 @@ def _write_cost(
             if row.get("method") == method and isinstance(build, dict):
                 details[row["space_key"]] = build
         for key in sorted(keys):
-            candidates = [_load_build(eval_spaces, system, dataset, key), details.get(key)]
+            candidates = [details.get(key), _load_build(eval_spaces, system, dataset, key)]
             found = [b for b in candidates if b is not None]
-            usable = [b for b in found if _same_protocol(b.get("protocol"), protocol)]
-            if not usable:
+            build = _pick_build(found, protocol)
+            if build is None:
                 if found:
                     total["mismatched"] += 1
                 continue
-            build = usable[0]
             total["spaces"] += 1
             total["cost"] += float(build.get("cost", 0) or 0)
             total["spent"] += float(build.get("spent", 0) or 0)
@@ -374,26 +384,65 @@ def _load_build(
     return None
 
 
-def _same_protocol(built: Any, expected: str | None) -> bool:
-    """build.json 记的协议是否就是这次运行的（外部系统可能在后面加上自己的版本，如 Cognee）。"""
-    if expected is None or not built:
-        return True
-    return str(built) == expected or str(built).startswith(f"{expected}|")
+def _pick_build(found: Sequence[dict[str, Any]], protocol: str | None) -> dict[str, Any] | None:
+    """同一份对话历史的几处写入记录（按优先顺序：运行自己的、build.json）里挑一条：先取协议
+    对得上的，再取没记协议的；记的协议对不上的不取。"""
+    matches = [_protocol_match(b, protocol) for b in found]
+    for wanted in (True, None):
+        for build, match in zip(found, matches, strict=True):
+            if match is wanted:
+                return build
+    return None
 
 
-def _eval_spaces(info: dict[str, Any], fallback: Path | None) -> Path | None:
-    """外部基线写入记录所在的目录：运行记录里记了（N12 起）且还在就用它，否则用调用方给的。"""
+def _protocol_match(build: dict[str, Any], expected: str | None) -> bool | None:
+    """写入记录的协议与这次运行的是否一致：True / False；没有记（Mem0、更早的记录）或不知道这次
+    运行的协议时为 None。外部系统可能在协议后面加上自己的版本（如 Cognee 的 |cognee==1.6.4）。
+
+    ExternalBaseline 记协议之前的记录（如 pds 的 graphiti/locomo_conv-42）没有 protocol，但记了
+    extractor 与 embedder，照样核对；那时 embedder 可能不带维度（LangMem），这时只比模型名。"""
+    if expected is None:
+        return None
+    built = build.get("protocol")
+    if built:
+        return str(built) == expected or str(built).startswith(f"{expected}|")
+    extractor, embedder = build.get("extractor"), build.get("embedder")
+    if not extractor or not embedder:
+        return None
+    want_extractor, _, want_embedder = expected.partition("|")
+    if ":" not in str(embedder):
+        want_embedder = want_embedder.split(":")[0]
+    return str(extractor) == want_extractor and str(embedder) == want_embedder
+
+
+def _eval_spaces(
+    info: dict[str, Any], fallback: Path | None, run_name: str
+) -> tuple[Path | None, str | None]:
+    """外部基线写入记录所在的目录，与怎么定的（报告里注明；运行记录里记了时为 None）：
+
+    1. 运行记录里记了（N12 起）且还在就用它；
+    2. 否则（更早的运行）按运行名的协议前缀（PROTOCOL_SPACES，如 pq-locomo-mem0 → 数据目录下的
+       data/eval-spaces-qwen），目录在才用——当前的配置可能是另一个协议的；
+    3. 都不行时用调用方给的（当前配置的 paths.eval_spaces）。调用方没给目录时不找写入目录。"""
     recorded = info.get("eval_spaces")
     if recorded and Path(recorded).is_dir():
-        return Path(recorded)
-    return fallback
+        return Path(recorded), None
+    if fallback is None:
+        return None, None
+    prefix = run_name.split("-", 1)[0]
+    if prefix in PROTOCOL_SPACES:
+        inferred = home_dir() / PROTOCOL_SPACES[prefix]
+        if inferred.is_dir():
+            return inferred, f"运行记录里没有记写入目录，按运行名的协议前缀 {prefix} 推断"
+    return fallback, "运行记录里没有记写入目录，用的是当前配置的 paths.eval_spaces"
 
 
 def build_report(run_dir: Path, *, eval_spaces: Path | None = None) -> Path:
     """生成 report.md 与两张散点图，返回 report.md 的路径。
 
     eval_spaces：评测记忆空间的目录（paths.eval_spaces），外部基线的写入记录从这里读；运行记录
-    里记了就用运行记录里的（同一个数据目录下 pds 与 pq 的写入分放两处，不能靠当前的配置）。"""
+    里记了就用运行记录里的，没记的旧运行按运行名的协议前缀推断（_eval_spaces；同一个数据目录下
+    pds 与 pq 的写入分放两处，不能靠当前的配置）。"""
     info = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     rows = load_rows(run_dir, "results.jsonl")
     ingests = load_rows(run_dir, "ingest.jsonl")
@@ -403,6 +452,8 @@ def build_report(run_dir: Path, *, eval_spaces: Path | None = None) -> Path:
         e for e in load_rows(run_dir, "errors.jsonl") if (e["sample_id"], e["method"]) not in done
     ]
     stats = method_stats(rows)
+    run_name = info["config"].get("name") or run_dir.name
+    spaces, spaces_note = _eval_spaces(info, eval_spaces, run_name)
     has_plot = bool(stats)
     if has_plot:
         for mode in THEMES:
@@ -414,7 +465,8 @@ def build_report(run_dir: Path, *, eval_spaces: Path | None = None) -> Path:
         ingests,
         errors,
         has_plot=has_plot,
-        eval_spaces=_eval_spaces(info, eval_spaces),
+        eval_spaces=spaces,
+        eval_spaces_note=spaces_note,
     )
     path = run_dir / "report.md"
     path.write_text(markdown, encoding="utf-8")
@@ -478,6 +530,7 @@ def render_markdown(
     *,
     has_plot: bool,
     eval_spaces: Path | None = None,
+    eval_spaces_note: str | None = None,
 ) -> str:
     cfg = info["config"]
     roles = info["roles"]
@@ -576,7 +629,7 @@ def render_markdown(
     consolidated = _latest_per_space([r for r in ingests if r.get("stage") == "consolidate"])
     if consolidated:
         lines += ["", *_consolidation_section(consolidated)]
-    lines += _write_section(stats, writes, eval_spaces)
+    lines += _write_section(stats, writes, eval_spaces, eval_spaces_note)
     ingest_cost = sum(r["cost"] for r in online)
     ingest_tokens = sum(r["embedding_tokens"] for r in online)
     consolidate_cost = sum(r["cost"] for r in consolidated)
@@ -688,9 +741,13 @@ def _method_writes(
 
 
 def _write_section(
-    stats: Sequence[MethodStats], writes: dict[str, MethodWrite], eval_spaces: Path | None
+    stats: Sequence[MethodStats],
+    writes: dict[str, MethodWrite],
+    eval_spaces: Path | None,
+    eval_spaces_note: str | None = None,
 ) -> list[str]:
-    """各方法的一次性写入成本，与 scripts/n12_baselines.py 同一口径（write_cost）。"""
+    """各方法的一次性写入成本，与 scripts/n12_baselines.py 同一口径（write_cost）。
+    eval_spaces_note：写入目录不是运行记录里记的时，怎么定的（_eval_spaces），注明在表下。"""
     if all(writes[s.method].kind == "none" for s in stats):
         return []
     lines = [
@@ -726,6 +783,8 @@ def _write_section(
                 "（build.json 记的抽取模型、向量模型与这次运行不同），没有计入；"
                 "检查 paths.eval_spaces（pq 协议的写入在 data/eval-spaces-qwen）。"
             )
+    if eval_spaces_note and any(w.kind == "external" for w in writes.values()):
+        notes.append(f"- 外部基线的写入记录取自 `{eval_spaces}`：{eval_spaces_note}。")
     if "M0" in writes:
         notes.append("- M0 的写入记录没有墙钟耗时，耗时一栏是各次调用的延迟之和。")
     return lines + (["", *notes] if notes else [])

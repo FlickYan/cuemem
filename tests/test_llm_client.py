@@ -251,6 +251,61 @@ def test_identical_retry_after_bad_json_bypasses_the_cache(
     assert len(fake_api.chat_requests) == 2
 
 
+def test_concurrent_identical_retries_count_one_refresh(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """拿到坏 JSON 后两个同样的重试同时到：只有一个重新调用，另一个等它、读缓存里的新回复；
+    llm_cache_refresh（网关的 json_refreshes）只记真的重新调用的那一次。"""
+    import threading
+
+    from cuemem.core.trace import Trace, start_trace
+
+    started, release, waiting = threading.Event(), threading.Event(), threading.Event()
+
+    def slow(body: dict[str, object]) -> str:
+        started.set()
+        release.wait(5)
+        return '{"name": "Ana", "city": "Berlin"}'
+
+    fake_api.chat_replies = [BROKEN, slow]
+    client = make_client(settings, fake_api)
+    claim = client._claim
+
+    def watched_claim(key: str) -> threading.Event | None:
+        event = claim(key)
+        if event is not None:  # 这个线程要等别的线程的同样请求
+            waiting.set()
+        return event
+
+    client._claim = watched_claim  # type: ignore[method-assign]
+    assert client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True).content
+    traces: list[Trace] = []
+    results: list[ChatResult] = []
+
+    def retry() -> None:
+        with start_trace("retry") as trace:
+            traces.append(trace)
+            results.append(
+                client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+            )
+
+    first = threading.Thread(target=retry)
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=retry)
+    second.start()
+    assert waiting.wait(5)
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert len(fake_api.chat_requests) == 2  # 第一次的坏回复 + 一次重新调用
+    assert sorted(r.from_cache for r in results) == [False, True]
+    assert {r.content for r in results} == {'{"name": "Ana", "city": "Berlin"}'}
+    refreshes = [e for t in traces for e in t.events if e["kind"] == "llm_cache_refresh"]
+    assert len(refreshes) == 1
+
+
 def test_bad_json_replay_is_unchanged_without_opt_in(settings: Settings, fake_api: FakeAPI) -> None:
     """不要求的调用方照旧：解析不了的回复也缓存，同样的请求从缓存里拿到同一个回复。"""
     fake_api.chat_replies = [BROKEN, '{"name": "Ana"}']

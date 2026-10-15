@@ -158,6 +158,64 @@ def test_external_write_cost_reads_build_records(spaces: Path) -> None:
     assert write_cost("MG", KEYS, dataset="locomo", eval_spaces=spaces) == {}
 
 
+def test_write_records_are_ranked_by_protocol(tmp_path: Path) -> None:
+    """同一份对话历史两处写入记录（运行自己的 <系统>_build、写入目录下的 build.json）：协议对得上
+    的优先（运行自己的在前），再取没记协议的；旧的 pds 写入（没有 protocol，只有 extractor 与
+    embedder）也按这两项核对，不会当成没记协议的混进 pq 的成本。"""
+    pds = tmp_path / "data" / "eval-spaces"
+    # pds 的旧写入：Graphiti 的 embedder 带维度，LangMem 的不带
+    build(
+        pds,
+        "graphiti",
+        "conv-1",
+        extractor="deepseek-flash",
+        embedder="BAAI/bge-small-en-v1.5:384",
+        cost=1.4177,
+        chat_calls=2014,
+    )
+    build(
+        pds,
+        "langmem",
+        "conv-1",
+        extractor="deepseek-flash",
+        embedder="BAAI/bge-small-en-v1.5",
+        cost=0.0816,
+        chat_calls=33,
+    )
+    build(pds, "mem0", "conv-1", cost=0.2, llm_calls=58)  # Mem0 从来不记协议
+    own = {"protocol": QWEN, "cost": 0.6325, "chat_calls": 1688}
+    rows = [result("MG", "q1", "conv-1", graphiti_build=own)]
+    one = {"conv-1"}
+
+    # pq 的运行用了 pds 的写入目录（旧运行没记 eval_spaces、当前配置是 pds 的）：取运行自己的记录
+    mg = write_cost("MG", one, dataset="locomo", eval_spaces=pds, protocol=QWEN, rows=rows)
+    assert mg["cost"] == 0.6325 and mg["llm_calls"] == 1688 and "mismatched" not in mg
+    # 没有运行自己的记录时，旧的 pds 写入按 extractor / embedder 判为别的协议，不算
+    for method in ("MG", "ML"):
+        other = write_cost(method, one, dataset="locomo", eval_spaces=pds, protocol=QWEN)
+        assert other == {"mismatched": 1}
+    # pds 的运行照常认它们（LangMem 的 embedder 没带维度：只比模型名）
+    assert write_cost("MG", one, dataset="locomo", eval_spaces=pds, protocol=DEEPSEEK)["cost"]
+    ml = write_cost("ML", one, dataset="locomo", eval_spaces=pds, protocol=DEEPSEEK)
+    assert ml["cost"] == 0.0816 and ml["spaces"] == 1
+
+    # 都没记协议（Mem0）：运行自己的记录优先于写入目录里的
+    rows = [result("M0", "q1", "conv-1", mem0_build={"cost": 0.1, "llm_calls": 58})]
+    m0 = write_cost("M0", one, dataset="locomo", eval_spaces=pds, protocol=QWEN, rows=rows)
+    assert m0["cost"] == 0.1
+    assert write_cost("M0", one, dataset="locomo", eval_spaces=pds, protocol=QWEN)["cost"] == 0.2
+
+    # 协议对得上的 build.json 优先于运行自己的、没记协议的记录；对不上的运行自己的记录不取
+    qwen = tmp_path / "data" / "eval-spaces-qwen"
+    build(qwen, "graphiti", "conv-1", protocol=QWEN, cost=0.6)
+    unstamped = [result("MG", "q1", "conv-1", graphiti_build={"cost": 9.0})]
+    mg = write_cost("MG", one, dataset="locomo", eval_spaces=qwen, protocol=QWEN, rows=unstamped)
+    assert mg["cost"] == 0.6
+    stale = [result("MG", "q1", "conv-1", graphiti_build={"protocol": DEEPSEEK, "cost": 9.0})]
+    mg = write_cost("MG", one, dataset="locomo", eval_spaces=qwen, protocol=QWEN, rows=stale)
+    assert mg["cost"] == 0.6
+
+
 def run_info(name: str, methods: list[str], **extra: Any) -> dict[str, Any]:
     model = {"model": "qwen3.8-flash", "model_id": "qwen3.8-flash"}
     return {
@@ -244,6 +302,38 @@ def test_report_without_build_records_uses_build_details(tmp_path: Path) -> None
     assert "| MC | 它自己的写入（build.json） | 1 / 1 | $0.2500 |" in report
     assert "| 写入 · MC（cognee） | $0.2500 |" in report
     assert "| 写入（向量化） |" not in report  # 只有外部基线的运行：没有 CueMem 的写入
+
+
+@pytest.mark.filterwarnings("ignore:No artists with labels")
+def test_report_of_old_run_infers_build_directory_from_run_name(
+    clean_env: None, tmp_path: Path, spaces: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N12 之前的运行没在 run.json 里记 eval_spaces：报告按运行名的协议前缀找写入目录
+    （pq-… → data/eval-spaces-qwen），不跟着当前配置（这里给的是 pds 的目录）读到 pds 的同名写入；
+    推断不了时用当前配置的，并在报告里注明。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path))
+    pds = tmp_path / "data" / "eval-spaces"
+    build(pds, "mem0", "conv-1", cost=5.0, llm_calls=58)
+    build(pds, "mem0", "conv-2", cost=5.0, llm_calls=58)
+    rows = [result("M0", "q1", "conv-1"), result("M0", "q2", "conv-2")]
+
+    old_pq = tmp_path / "runs" / "pq-locomo-mem0"
+    write_run(old_pq, rows)
+    report = build_report(old_pq, eval_spaces=pds).read_text("utf-8")
+    assert "| M0 | 它自己的写入（build.json） | 2 / 2 | $0.3000 |" in report
+    assert f"- 外部基线的写入记录取自 `{spaces}`：运行记录里没有记写入目录" in report
+
+    unknown = tmp_path / "runs" / "smoke-mem0"
+    write_run(unknown, rows)
+    report = build_report(unknown, eval_spaces=pds).read_text("utf-8")
+    assert "| M0 | 它自己的写入（build.json） | 2 / 2 | $10.0000 |" in report
+    assert f"- 外部基线的写入记录取自 `{pds}`：运行记录里没有记写入目录，用的是当前配置" in report
+
+    recorded = tmp_path / "runs" / "pq-locomo-mem0-new"
+    write_run(recorded, rows, eval_spaces=str(spaces))
+    report = build_report(recorded, eval_spaces=pds).read_text("utf-8")
+    assert "| M0 | 它自己的写入（build.json） | 2 / 2 | $0.3000 |" in report
+    assert "- 外部基线的写入记录取自" not in report
 
 
 def load_script() -> Any:

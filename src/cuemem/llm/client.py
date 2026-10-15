@@ -142,8 +142,6 @@ class LLMClient:
                 and self.settings.llm_cache_mode != "read_only"
                 and self._bad_json_seen(key)
             )
-            if refresh:
-                record_event("llm_cache_refresh", role=role, model=alias)
             while True:
                 if not refresh:
                     hit = self._from_cache(key, role, alias, spec)
@@ -162,6 +160,9 @@ class LLMClient:
                     break
                 waiting.wait()
                 refresh = False  # 别的线程刚请求过同样的内容：缓存里是新的回复，直接用
+            # 真的要重新调用时才记：同时到的同样重试里，等别的线程结果的那些读的是缓存
+            if refresh:
+                record_event("llm_cache_refresh", role=role, model=alias)
         try:
             result = self._call_api(
                 role, alias, spec, messages, params, key if caching else "", cache_scope

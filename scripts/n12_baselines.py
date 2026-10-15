@@ -38,9 +38,10 @@ evals/mem0_baseline.py，--methods M0 / MG / ML / MC / MA，运行名 `<协议>-
     uv run python scripts/n12_baselines.py --protocol pq --dataset locomo
 
 写入成本与 report.md 同一口径（cuemem.evals.report.write_cost）：CueMem 取运行里的写入与巩固
-记录，外部基线取各自的 build.json。外部基线的写入目录按协议选（PROTOCOL_SPACES，与当前的
-CUEMEM_PATHS__EVAL_SPACES 无关；--eval-spaces 可以另行指定），build.json 记的协议与运行的抽取
-模型、向量模型对不上的不算（计入 mismatched）。
+记录，外部基线取各自的写入记录（运行里触发写入的那道题记下的统计，或写入目录下的 build.json；
+协议对得上的优先）。外部基线的写入目录按协议选（PROTOCOL_SPACES，与当前的
+CUEMEM_PATHS__EVAL_SPACES 无关；--eval-spaces 可以另行指定），记的协议与运行的抽取模型、向量
+模型对不上的不算（都对不上时计入 mismatched）。
 """
 
 from __future__ import annotations
@@ -53,7 +54,13 @@ from pathlib import Path
 from typing import Any
 
 from cuemem.config import home_dir, load_settings
-from cuemem.evals.report import EXTERNAL_SYSTEMS, load_rows, run_protocol, write_cost
+from cuemem.evals.report import (
+    EXTERNAL_SYSTEMS,
+    PROTOCOL_SPACES,
+    load_rows,
+    run_protocol,
+    write_cost,
+)
 from cuemem.evals.routing import sign_test
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,12 +79,8 @@ LABELS = {
 }
 # 外部系统的写入统计放在写入目录的哪个子目录（方法 → 系统名），与报告共用
 SYSTEMS = EXTERNAL_SYSTEMS
-# 各协议的写入目录（相对数据目录）：pq 与 qwen 的抽取模型、向量模型相同，共用一份写入
-PROTOCOL_SPACES = {
-    "pds": Path("data/eval-spaces"),
-    "pq": Path("data/eval-spaces-qwen"),
-    "qwen": Path("data/eval-spaces-qwen"),
-}
+# 各协议的写入目录（相对数据目录）：PROTOCOL_SPACES，与报告共用（报告给没记写入目录的旧运行
+# 按运行名推断）；pq 与 qwen 的抽取模型、向量模型相同，共用一份写入
 REFERENCES = ("B4-nobm25", "B5")
 
 
@@ -134,9 +137,9 @@ def write_stats(
     protocol: str | None = None,
     rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """写入的成本，与 report.md 同一口径（cuemem.evals.report.write_cost）：外部系统取各空间的
-    build.json（eval_spaces 下，默认是当前配置的 paths.eval_spaces；协议对不上的不算）；CueMem
-    取这些运行里的写入与巩固统计。
+    """写入的成本，与 report.md 同一口径（cuemem.evals.report.write_cost）：外部系统取 rows 里
+    触发写入的那道题记下的统计或各空间的 build.json（eval_spaces 下，默认是当前配置的
+    paths.eval_spaces；协议对得上的优先，对不上的不算）；CueMem 取这些运行里的写入与巩固统计。
 
     全上下文（B1）不写入；朴素检索（B2）只建索引（向量化，不调用 LLM）；L1 / L2 / 控制器用同一份
     巩固后的记忆，写入成本相同。"""
