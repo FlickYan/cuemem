@@ -6,11 +6,13 @@
 # 局限：
 # - 回答（qwen3.8-flash）与判分（qwen3.8-max）同一家族，D-008 说的"给自己打分"的偏差比默认配置大；
 #   N11 的第二判分实验里两家判分的一致率 94.7–97.9%。
-# - 内容审核误拒时没有别家的备用模型可换（默认配置换 deepseek-flash），被拒的会话照常跳过并计数。
+# - 备用模型换成同一家的 qwen3.7-plus（默认配置是另一家的 deepseek-flash）：qwen3.8-flash 在 JSON 模式下
+#   偶尔生成失控、请求超时（D-050），换个模型就能过；内容审核误拒是平台对输入的审核，换模型多半没用，
+#   被拒的会话照常跳过并计数。
 
 roles:
   reader: {model: qwen3.8-flash}
   vlm: {model: qwen3.8-flash}
 
 consolidation:
-  fallback_model: null
+  fallback_model: qwen3.7-plus
