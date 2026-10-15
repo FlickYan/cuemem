@@ -232,6 +232,7 @@ def test_graph_from_another_setup_is_rebuilt(
     method.llm = SimpleNamespace(settings=SimpleNamespace(roles=roles))  # type: ignore[assignment]
     method.embedder = SimpleNamespace(name="qwen3.7-text-embedding", dim=1024)  # type: ignore[assignment]
     method.gateway = SimpleNamespace(usage=lambda bucket: {"spent": 0.0})  # type: ignore[assignment]
+    method.protocol = "qwen3.8-flash|qwen3.7-text-embedding:1024"  # 基类的指纹，setup() 里设
     built: list[str] = []
     monkeypatch.setattr(method, "build", lambda key, directory, sessions: built.append(key) or {})
     directory = tmp_path / "locomo_conv-1"
