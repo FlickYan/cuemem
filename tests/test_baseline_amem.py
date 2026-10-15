@@ -1,10 +1,12 @@
-"""外部基线 MA（A-MEM）：笔记格式、链接解析、检索结果到证据的转换、持久化。
+"""外部基线 MA（A-MEM）：笔记格式、链接解析、检索结果到证据的转换（含检索指标）、持久化、
+调用失败的处理、k 与写入缓存的协议。
 
 不装 A-MEM 也能跑：A-MEM 只在 setup / build 里导入，这里测纯函数与替换进 A-MEM 的两个方法；
 需要 A-MEM 的端到端写入与检索用 importorskip。"""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections import OrderedDict
@@ -13,12 +15,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx2
 import pytest
+from openai import APIConnectionError, BadRequestError, InternalServerError
 
+from cuemem.errors import ConfigMismatchError
 from cuemem.evals.baselines.amem import (
+    BUILD_VERSION,
+    DEFAULT_K,
+    K_ENV,
     MAX_TOKENS,
     NOTES,
-    TOP_K,
     AMemBaseline,
     Note,
     _consolidate_memories,
@@ -28,20 +35,26 @@ from cuemem.evals.baselines.amem import (
     expand,
     link_targets,
     load_notes,
+    merge_rounds,
+    models_of,
     note_content,
     note_document,
     note_text,
     parse_keywords,
+    round_starts,
     save_notes,
     strings,
     to_hits,
+    top_k,
     when_text,
 )
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.methods import build_methods
+from cuemem.evals.metrics import retrieval_metrics
 
 MAY8 = datetime(2023, 5, 8, 13, 56)
 MAY25 = datetime(2023, 5, 25, 9, 5)
+REQUEST = httpx2.Request("POST", "http://127.0.0.1/b/amem.build.x/v1/chat/completions")
 
 
 def _locomo() -> list[EvalSession]:
@@ -50,7 +63,7 @@ def _locomo() -> list[EvalSession]:
         MAY25,
         [
             EvalTurn("user", "I ran a charity race last Saturday.", "Melanie"),
-            EvalTurn("user", "  ", "Caroline"),  # 空话跳过
+            EvalTurn("user", "  ", "Caroline"),  # 空话跳过（但占着下标）
             EvalTurn("user", "Amazing! I joined a support group.", "Caroline"),
         ],
     )
@@ -65,18 +78,26 @@ def _locomo() -> list[EvalSession]:
     return [later, first]  # 故意乱序：写入时按时间排
 
 
-def _note(i: int, *, links: list[Any] | None = None, when: datetime = MAY8) -> Note:
+def _note(i: int, *, links: list[Any] | None = None, when: datetime = MAY8, turn: int = -1) -> Note:
     return Note(
         id=f"id-{i}",
         content=f"Speaker A says : line {i}",
         timestamp=when_text(when),
         session_id="session_1",
         session_time=when,
+        turn_index=turn,
         keywords=[f"k{i}"],
         context=f"context {i}",
         tags=[f"t{i}"],
         links=links or [],
     )
+
+
+def _error(kind: type[Exception], status: int = 500) -> Exception:
+    if kind is APIConnectionError:
+        return APIConnectionError(request=REQUEST)
+    response = httpx2.Response(status, request=REQUEST)
+    return kind("simulated", response=response, body=None)
 
 
 def test_note_format_follows_the_paper() -> None:
@@ -117,13 +138,15 @@ def test_expand_follows_links_and_dedupes() -> None:
     assert expand([], notes, ids, k=5) == []
 
 
-def test_hits_carry_session_dates_and_paper_format() -> None:
-    notes = [_note(0), _note(1, when=MAY25)]
+def test_hits_carry_session_dates_turns_and_paper_format() -> None:
+    notes = [_note(0), _note(1, when=MAY25, turn=4)]
     hits = to_hits("locomo_conv-1", notes, [(1, False), (0, True)], {1: 0.8})
     assert [h.unit.id for h in hits] == ["id-1", "id-0"]
     assert [h.route for h in hits] == ["amem", "amem_link"]
     assert hits[0].unit.ts == MAY25 and hits[0].unit.session_id == "session_1"
     assert hits[0].score == 0.8 and hits[1].score == 0.0 and hits[1].rank == 2
+    # 一条笔记就是一句话：发言下标交给检索指标；旧写入（-1）不知道是哪一句，不标
+    assert hits[0].unit.meta["turn_indices"] == [4] and "turn_indices" not in hits[1].unit.meta
     assert hits[0].unit.text == note_text(notes[1])
     assert note_text(notes[1]).splitlines() == [
         "memory content: Speaker A says : line 1",
@@ -131,6 +154,53 @@ def test_hits_carry_session_dates_and_paper_format() -> None:
         "memory keywords: k1",
         "memory tags: t1",
     ]
+
+
+def _chat_session() -> EvalSession:
+    """LongMemEval 式的会话：用户发言与其后的助手回复是同一轮。"""
+    texts = [("user", "q0"), ("assistant", "a1"), ("assistant", "a2"), ("user", "q3")]
+    return EvalSession("s1", MAY8, [EvalTurn(role, text) for role, text in texts])
+
+
+def test_retrieved_notes_count_for_turn_recall() -> None:
+    """取到证据那句话的笔记，发言召回就是 1（以前不标下标，发言召回恒为 0）。"""
+    sessions = _locomo()
+    notes = [
+        Note(f"n{i}", "c", "", sid, MAY8, turn_index=turn)
+        for i, (sid, turn) in enumerate([("session_1", 0), ("session_2", 2), ("session_2", 0)])
+    ]
+    hits = to_hits("locomo_conv-1", notes, [(2, False), (1, False), (0, True)], {})
+    merge_rounds(hits, sessions)  # LoCoMo 每句各成一轮：不变
+    assert [h.unit.meta["turn_indices"] for h in hits] == [[0], [2], [0]]
+    metrics = retrieval_metrics(
+        hits,
+        evidence_sessions={"session_2"},
+        evidence_turns={("session_2", 2)},
+        relevant_units=1,
+    )
+    assert metrics["turn_recall_any"] == 1.0 and metrics["turn_recall_all"] == 1.0
+    assert metrics["turn_ndcg"] == pytest.approx(1 / 1.584962500721156)  # 排第 2
+
+
+def test_notes_of_one_round_count_once() -> None:
+    """同一轮的几句话各是一条笔记：发言下标并到排得最前的那条上，NDCG 不会超过 1。"""
+    session = _chat_session()
+    assert round_starts(session) == [0, 0, 0, 3]
+    notes = [Note(f"n{i}", "c", "", "s1", MAY8, turn_index=i) for i in range(4)]
+    hits = to_hits("lme_q1", notes, [(1, False), (3, False), (0, True), (2, True)], {})
+    merge_rounds(hits, [session])
+    assert [h.unit.meta["turn_indices"] for h in hits] == [[0, 1, 2], [3], [], []]
+    metrics = retrieval_metrics(
+        hits,
+        evidence_sessions={"s1"},
+        evidence_turns={("s1", 0), ("s1", 1)},  # 一轮里两句都是证据
+        relevant_units=1,
+    )
+    assert metrics["turn_ndcg"] == 1.0 and metrics["turn_recall_all"] == 1.0
+    # 只取到这一轮的用户发言、证据在助手回复里：不算命中（没取到的半轮不并进来）
+    hits = to_hits("lme_q1", notes, [(0, False)], {})
+    merge_rounds(hits, [session])
+    assert hits[0].unit.meta["turn_indices"] == [0]
 
 
 def test_parse_keywords() -> None:
@@ -142,9 +212,12 @@ def test_parse_keywords() -> None:
 
 
 def test_notes_round_trip(tmp_path: Path) -> None:
-    notes = [_note(0, links=["memory index:1", 1]), _note(1, when=MAY25)]
+    notes = [_note(0, links=["memory index:1", 1], turn=3), _note(1, when=MAY25, turn=0)]
     save_notes(tmp_path / NOTES, notes)
     assert load_notes(tmp_path / NOTES) == notes
+    legacy = notes[0].as_json()
+    del legacy["turn_index"]  # 第一版写入没有这个字段
+    assert Note.from_json(legacy).turn_index == -1
 
 
 def test_find_related_memories_labels_real_positions() -> None:
@@ -189,12 +262,7 @@ def test_find_related_memories_labels_real_positions() -> None:
     assert system.retriever.consolidations == 1
 
 
-def test_controller_sends_amem_request_and_counts_problems() -> None:
-    """请求照 A-MEM 的 OpenAIController（系统提示、temperature），回复上限放宽；
-    数失败、被截断与不是 JSON 的回复。"""
-    replies: list[Any] = [('{"a": 1}', "stop"), ('{"a": "cut', "length"), RuntimeError("boom")]
-    sent: list[dict[str, Any]] = []
-
+def _client(replies: list[Any], sent: list[dict[str, Any]]) -> Any:
     def create(**kwargs: Any) -> Any:
         sent.append(kwargs)
         reply = replies.pop(0)
@@ -204,30 +272,104 @@ def test_controller_sends_amem_request_and_counts_problems() -> None:
         message = SimpleNamespace(content=content)
         return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish)])
 
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    controller = _Controller(client, "deepseek-flash")
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def test_controller_sends_amem_request_and_counts_problems() -> None:
+    """请求照 A-MEM 的 OpenAIController（系统提示、temperature），回复上限放宽；
+    数被截断、不是 JSON 与被拒绝（400，不重试）的回复。"""
+    replies: list[Any] = [
+        ('{"a": 1}', "stop"),
+        ('{"a": "cut', "length"),
+        _error(BadRequestError, 400),
+    ]
+    sent: list[dict[str, Any]] = []
+    controller = _Controller(_client(replies, sent), "deepseek-flash", waits=(0.0,))
     schema = {"type": "json_object"}
     assert controller.get_completion("p", schema) == '{"a": 1}'
     assert sent[0]["messages"] == [
         {"role": "system", "content": "You must respond with a JSON object."},
         {"role": "user", "content": "p"},
     ]
-    assert sent[0]["temperature"] == 0.7 and sent[0]["max_tokens"] == MAX_TOKENS == 2000
+    assert sent[0]["temperature"] == 0.7 and sent[0]["max_tokens"] == MAX_TOKENS == 4096
     assert sent[0]["response_format"] == schema and sent[0]["model"] == "deepseek-flash"
     controller.get_completion("p", schema, temperature=0.5)
     assert sent[1]["temperature"] == 0.5
-    with pytest.raises(RuntimeError):
+    with pytest.raises(BadRequestError):
         controller.get_completion("p")
-    assert "response_format" not in sent[2]
-    assert (controller.calls, controller.failed) == (3, 1)
+    assert "response_format" not in sent[2] and len(sent) == 3  # 400 不重试
+    assert (controller.calls, controller.failed, controller.rejected) == (3, 0, 1)
     assert (controller.truncated, controller.invalid_json) == (1, 1)
-    assert controller.errors == ["RuntimeError: boom"]
+    assert controller.errors == ["BadRequestError: simulated"]
+    controller.check()  # 被拒绝的少数几次照 A-MEM 的做法跳过，写入继续
 
 
-def test_method_is_registered_without_the_package() -> None:
+def test_controller_retries_transient_errors_then_aborts_the_build() -> None:
+    """临时错误（5xx、连不上）等一会儿重试；用完重试仍失败就记进 failed，写入循环据此中止。"""
+    waited: list[float] = []
+    replies: list[Any] = [_error(InternalServerError), _error(APIConnectionError), ("{}", "stop")]
+    sent: list[dict[str, Any]] = []
+    controller = _Controller(
+        _client(replies, sent), "m", waits=(30.0, 120.0, 300.0), sleep=waited.append
+    )
+    assert controller.get_completion("p", {"type": "json_object"}) == "{}"
+    assert waited == [30.0, 120.0] and controller.retries == 2 and controller.failed == 0
+    controller.check()
+
+    # 空回复（DeepSeek 挂起很久后回空）也重试，不交给 A-MEM 当成"分析为空"
+    replies[:] = [(" ", "stop"), ('{"a": 1}', "stop")]
+    assert controller.get_completion("p", {"type": "json_object"}) == '{"a": 1}'
+    assert controller.empty_replies == 1 and controller.retries == 3
+    assert controller.invalid_json == 0 and waited[2:] == [30.0]
+
+    replies[:] = [_error(InternalServerError)] * 4
+    with pytest.raises(InternalServerError):
+        controller.get_completion("p")
+    assert waited[3:] == [30.0, 120.0, 300.0] and controller.failed == 1
+    with pytest.raises(RuntimeError, match="整份写入作废"):
+        controller.check()
+
+
+def test_controller_aborts_when_most_calls_are_rejected() -> None:
+    replies: list[Any] = [_error(BadRequestError, 400)] * 11 + [("{}", "stop")] * 9
+    controller = _Controller(_client(replies, []), "m", waits=())
+    for _ in range(20):
+        with contextlib.suppress(BadRequestError):
+            controller.get_completion("p")
+    with pytest.raises(RuntimeError, match="一多半被拒绝"):
+        controller.check()
+
+
+def test_k_defaults_to_the_paper_and_can_be_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(K_ENV, raising=False)
     (method,) = build_methods(["MA"])  # 构造时不导入 A-MEM
     assert isinstance(method, AMemBaseline)
-    assert method.name == "MA" and method.system == "amem" and TOP_K == 10
+    assert method.name == "MA" and method.system == "amem"
+    assert method.k == DEFAULT_K == 10 and "k=" not in method.label
+    monkeypatch.setenv(K_ENV, "40")  # 论文表 8 给 GPT-4o 级模型的 k
+    assert top_k() == 40
+    method = AMemBaseline()
+    assert method.k == 40 and method.label.endswith("k=40")
+    for bad in ("0", "-5", "ten"):
+        monkeypatch.setenv(K_ENV, bad)
+        with pytest.raises(ValueError, match=K_ENV):
+            AMemBaseline()
+
+
+def test_build_of_another_protocol_is_not_deleted(tmp_path: Path) -> None:
+    """换了抽取模型或向量模型（pds → qwen）：不删另一个协议的写入，报错让换目录；
+    只是 A-MEM 的写入参数变了（旧版写入）才交给基类重建。"""
+    pds = "deepseek-flash|BAAI/bge-small-en-v1.5:384"
+    current = f"{pds}|amem@ceffb86|max_tokens={MAX_TOKENS}|v{BUILD_VERSION}"
+    assert models_of(current) == pds and models_of(pds) == pds
+    baseline = AMemBaseline()
+    baseline.root, baseline.protocol = tmp_path, current.replace(pds, "qwen3.8-flash|qwen:1024")
+    directory = tmp_path / "locomo_conv-1"
+    directory.mkdir()
+    (directory / "build.json").write_text(json.dumps({"protocol": current}), "utf-8")
+    with pytest.raises(ConfigMismatchError, match="CUEMEM_PATHS__EVAL_SPACES"):
+        baseline._ensure_built("locomo_conv-1", directory, _locomo())
+    assert (directory / "build.json").exists()
 
 
 # ---------- 装了 A-MEM 时：经网关端到端写入与检索 ----------
@@ -257,15 +399,9 @@ def _fake_model(body: dict[str, Any]) -> str:
     return "{}"
 
 
-def test_build_and_retrieve_through_the_gateway(
-    offline_settings: Any, fake_api: Any, tmp_path: Path
-) -> None:
-    """装了 A-MEM 时：每句一条笔记，分析与演化经网关调用，写完存盘；重新打开后检索带出链接。"""
-    pytest.importorskip("agentic_memory.memory_system")
-    pytest.importorskip("chromadb")
+def _baseline(offline_settings: Any, fake_api: Any) -> AMemBaseline:
     from cuemem.llm import Ledger, LLMClient, ResponseCache
 
-    fake_api.chat_replies = [_fake_model]
     llm = LLMClient(
         offline_settings,
         cache=ResponseCache(None),
@@ -274,6 +410,21 @@ def test_build_and_retrieve_through_the_gateway(
     )
     baseline = AMemBaseline()
     baseline._setup(llm)
+    return baseline
+
+
+def test_build_and_retrieve_through_the_gateway(
+    offline_settings: Any, fake_api: Any, tmp_path: Path
+) -> None:
+    """装了 A-MEM 时：每句一条笔记，分析与演化经网关调用，写完存盘；重新打开后检索带出链接。"""
+    pytest.importorskip("agentic_memory.memory_system")
+    pytest.importorskip("chromadb")
+    from cuemem.core.trace import start_trace
+    from cuemem.evals.runner import usage_from_trace
+
+    fake_api.chat_replies = [_fake_model]
+    baseline = _baseline(offline_settings, fake_api)
+    assert baseline.protocol.endswith(f"|amem@ceffb86|max_tokens=4096|v{BUILD_VERSION}")
     key, sessions = "locomo_conv-1", _locomo()
     directory = baseline.root / key
     question = "When did Caroline go to a support group?"
@@ -281,28 +432,67 @@ def test_build_and_retrieve_through_the_gateway(
     try:
         built = baseline._ensure_built(key, directory, sessions)
         assert built is not None and built["memories"] == 4
-        assert built["failed_calls"] == 0 and built["invalid_json"] == 0
+        assert built["rejected_calls"] == 0 and built["invalid_json"] == 0
         assert built["truncated"] == 0 and built["max_tokens"] == MAX_TOKENS
+        assert built["empty_analyses"] == 0 and built["retries"] == 0
         assert fake_api.chat_requests[0]["max_tokens"] == MAX_TOKENS  # 网关照传给上游
         assert built["amem_calls"] == 7 and built["chat_calls"] == 7  # 4 次分析 + 3 次演化
         assert built["evolved"] == 3 and built["links"] >= 3 and built["unresolved_links"] == 0
         notes = load_notes(directory / NOTES)
         assert [n.session_id for n in notes] == ["session_1"] * 2 + ["session_2"] * 2
+        assert [n.turn_index for n in notes] == [0, 1, 0, 2]  # 空话占着下标
         assert notes[0].content == "Speaker Caroline says : I went to a support group yesterday."
         assert notes[0].timestamp == "1:56 pm on 8 May, 2023"
         assert notes[0].tags == ["evolved"] and notes[0].context == "Updated context."
         assert notes[3].keywords == ["support group"] and notes[3].tags == ["linked"]
 
         baseline.close(key)  # 模拟重新运行：从磁盘打开
-        hits, details = baseline.retrieve(key, directory, sample, sessions)
-        assert details["amem_query"] == "support group"
+        before = len(fake_api.chat_requests)
+        with start_trace("answer") as trace:  # 关键词那次调用与查询向量算进这道题的用量
+            hits, details = baseline.retrieve(key, directory, sample, sessions)
+        assert details["amem_query"] == "support group" and details["amem_k"] == DEFAULT_K
         assert details["amem_retrieved"] == 4 and len(hits) == 4  # 只有 4 条，全取到
-        assert details["amem_search"]["chat_calls"] == 1
+        usage = usage_from_trace(trace)
+        assert usage["llm_calls"] == 1 and usage["cost"] > 0
+        assert len(fake_api.chat_requests) == before + 1
+        sent = fake_api.chat_requests[-1]
+        assert sent["temperature"] == 0.7 and sent["response_format"] == {"type": "json_object"}
+        assert sent["messages"][0]["content"].startswith("You must respond with a JSON object.")
+        assert '"keywords"' in sent["messages"][0]["content"]  # schema 照网关的做法写进系统提示
+        search = baseline.gateway.usage(baseline.bucket(key, "search"))
+        assert search["chat_calls"] == 0 and search["embedding_calls"] == 0  # 不再经网关
         by_id = {h.unit.id: h for h in hits}
         assert by_id[notes[0].id].unit.ts == MAY8 and by_id[notes[3].id].unit.ts == MAY25
+        assert by_id[notes[3].id].unit.meta["turn_indices"] == [2]
         assert by_id[notes[0].id].unit.text.startswith("memory content: Speaker Caroline says")
-        usage = baseline.gateway.usage(baseline.bucket(key, "search"))
-        assert usage["embedding_calls"] >= 1 and usage["chat_calls"] == 1
     finally:
         baseline.close(key)
+        baseline.gateway.stop()
+
+
+def test_failed_call_aborts_the_build(offline_settings: Any, fake_api: Any) -> None:
+    """A-MEM 吞掉了演化调用的异常：写入中止，不留 build.json（下次运行重建）。"""
+    pytest.importorskip("agentic_memory.memory_system")
+    pytest.importorskip("chromadb")
+    sent: list[dict[str, Any]] = []
+
+    def create(**kwargs: Any) -> Any:
+        sent.append(kwargs)
+        content = _fake_model({"messages": kwargs["messages"]})
+        if "memory evolution agent" in kwargs["messages"][-1]["content"]:
+            raise _error(InternalServerError)
+        message = SimpleNamespace(content=content)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+
+    baseline = _baseline(offline_settings, fake_api)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    baseline._controller = lambda url: _Controller(client, "m", waits=())
+    key = "locomo_conv-1"
+    directory = baseline.root / key
+    try:
+        with pytest.raises(RuntimeError, match="整份写入作废"):
+            baseline._ensure_built(key, directory, _locomo())
+        assert len(sent) == 3  # 第 1 条分析、第 2 条分析、第 2 条的演化（失败）后就停了
+        assert not (directory / "build.json").exists() and key in baseline._failed
+    finally:
         baseline.gateway.stop()
