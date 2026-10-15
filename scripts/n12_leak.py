@@ -148,7 +148,8 @@ def main() -> None:
             print(f"  {entry['label']:<18} {accs}\n  {'':<18} {pairs}")
         for key, v in section["pooled"].items():
             print(
-                f"  pooled {key}: +{v['wins']}/-{v['losses']} (net {v['net_points']} pt, p={v['p']})"
+                f"  pooled {key}: +{v['wins']}/-{v['losses']}"
+                f" (net {v['net_points']} pt, p={v['p']})"
             )
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
