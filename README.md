@@ -142,7 +142,21 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 | When a fact changes | Invalidated, not deleted; two timelines; `history()` | v3 is add-only | The LLM rewrites a block | Invalidated, not deleted; two timelines | Newest wins, history kept |
 | Images | Originals kept and looked at again at answer time | Turned into text | Not seen | Text and JSON only | OCR |
 | Forgetting | Deletes the source conversation, follows citations, finds uncited restatements; dry run | `delete` | Edit memory | `remove_episode` | `forget_matching`, dry run |
-| Evaluation | Frozen methods, test sets used once, external baseline under the same judge | Own benchmark repo | Blog | Paper | Own |
+| Evaluation | Frozen methods, test sets used once, external baselines under the same models and judge | Own benchmark repo | Blog | Paper | Own |
+
+**Same protocol, same models (N12).** We ran five open-source memory systems ourselves on 200 LoCoMo questions. Each uses its own write and read pipeline; the extraction model, embeddings, reader and judge are the same as CueMem's. There are two protocols, DeepSeek only and Qwen only, with one run per configuration.
+
+| LoCoMo test200r | DeepSeek only | Qwen only |
+|---|---|---|
+| CueMem L1 / L2 | 82.5% / **87.0%** | 81.5% / **85.0%** |
+| Mem0 2.2.1 | 81.0% | 77.5% |
+| LangMem 0.0.30 | 78.0% | 30.0% |
+| Cognee 1.6.4 | 77.5% | 74.0% |
+| Graphiti (graphiti-core 0.30.2) | 59.0% | 41.5% |
+| A-MEM | MA-PENDING | MA-PENDING |
+| Full context | 84.5% | 80.0% |
+
+L2 is significantly ahead of Mem0, LangMem, Cognee and Graphiti under both protocols (paired sign tests, p ≤ 0.017). L1, which makes no LLM call when reading, is not significantly different from Mem0, LangMem and Cognee under DeepSeek. Graphiti and LangMem drop sharply under Qwen: with their own prompts, qwen3.8-flash extracts far fewer entities and memories. Details in the Chinese [N12 external baselines](docs/results/n12-baselines/README.md) and the [comparison](docs/en/landscape.md#same-protocol-comparison-n12).
 
 CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, three framework integrations so far ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
 
@@ -227,7 +241,8 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
 | Comparison with open-source peers: capabilities, published scores, what N12 borrowed, what is missing | [English](docs/en/landscape.md) · [中文](docs/landscape.md) |
 | Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | [English](docs/en/integrations.md) · [中文](docs/integrations.md) |
-| Decision records (64 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| Decision records (67 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| N12 results: same-protocol external baselines on LoCoMo; the LongMemEval session-ID leak, its fix and ablation | 中文: [external baselines](docs/results/n12-baselines/README.md), [session-ID leak](docs/results/n12-leak/README.md) |
 | Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 
 The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.

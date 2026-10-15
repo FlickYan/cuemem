@@ -93,7 +93,21 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | 事实变了怎么办 | 失效而不删除，两条时间轴，`history()` | v3 只增不改 | LLM 改写记忆块 | 失效而不删除，两条时间轴 | 新的取代旧的，保留历史 |
 | 图片 | 保存原图，回答时取回再看 | 转成文字 | 未见 | 只支持文本与 JSON | OCR |
 | 遗忘 | 删出处的对话、沿引用扩散、找没有引用的转述；可预演 | `delete` | 编辑记忆 | `remove_episode` | `forget_matching`，可预演 |
-| 评测 | 方法事先冻结、测试集只用一次、同一判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
+| 评测 | 方法事先冻结、测试集只用一次、同样的模型与判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
+
+**同一协议下的对比（N12）**：我们自己在 LoCoMo 200 题上跑了 5 个开源记忆系统，各用自己的写入与检索流程，抽取模型、向量、回答模型与判分都和 CueMem 相同；只用 DeepSeek、只用通义两个协议，每个配置跑一次。
+
+| LoCoMo test200r | 只用 DeepSeek | 只用通义 |
+|---|---|---|
+| CueMem L1 / L2 | 82.5% / **87.0%** | 81.5% / **85.0%** |
+| Mem0 2.2.1 | 81.0% | 77.5% |
+| LangMem 0.0.30 | 78.0% | 30.0% |
+| Cognee 1.6.4 | 77.5% | 74.0% |
+| Graphiti（graphiti-core 0.30.2） | 59.0% | 41.5% |
+| A-MEM | MA-PENDING | MA-PENDING |
+| 全上下文 | 84.5% | 80.0% |
+
+L2 在两个协议下都显著高于 Mem0、LangMem、Cognee 与 Graphiti（配对符号检验 p ≤ 0.017）；读时不调用 LLM 的 L1 在只用 DeepSeek 时与 Mem0、LangMem、Cognee 没有显著差别。Graphiti 与 LangMem 在通义下大幅掉分：用它们自己的提示词，qwen3.8-flash 抽出的实体与记忆少得多。详见 [N12 外部基线](docs/results/n12-baselines/README.md)与[对比文档](docs/landscape.md#同一协议下的对比n12)。
 
 CueMem 的短板在产品层：只有 Python、只支持 SQLite + Qdrant、只有一个共享的访问令牌、框架集成目前只有三个（见[还差什么](docs/landscape.md#7-还差什么)）。
 
@@ -164,6 +178,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [相关工作](docs/related-work.md) | 与 MemGPT、Mem0、Zep、HippoRAG、Adaptive-RAG、MemLens 等的对比与定位 |
 | [开源同类项目](docs/landscape.md)（[English](docs/en/landscape.md)） | 与 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 等 12 个项目逐项对比；各家公开的分数；N12 借鉴了什么、还差什么 |
 | [框架集成](docs/integrations.md)（[English](docs/en/integrations.md)） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool 的用法与局限 |
+| [N12 外部基线](docs/results/n12-baselines/README.md) | 同一协议下（只用 DeepSeek / 只用通义）与 Mem0、Graphiti、LangMem、Cognee、A-MEM 在 LoCoMo 上的对比：准确率、写入成本、配对检验、换模型的影响 |
+| [会话 ID 泄漏](docs/results/n12-leak/README.md) | LongMemEval 证据会话的 ID 泄漏：修复、三臂对照与对已发布数字的影响 |
 | [设计决策记录](docs/decisions.md)（[English](docs/en/decisions.md)） | 每个重要取舍的背景、备选方案与理由 |
 | [演示指南](demo/README.md)（[English](demo/README.en.md)） | 3 分钟演示：准备、步骤、讲什么 |
 

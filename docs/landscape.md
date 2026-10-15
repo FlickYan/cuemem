@@ -8,7 +8,7 @@
 
 ## 1. 结论
 
-- **研究部分在同类项目里少见**：把"要不要想起、想多深"做成可训练、可单独评测的控制器；双时间轴、失效而不删除；回答时取回原图再看一眼；测试集只用一次、方法事先冻结的评测，外部基线（Mem0）在同样的模型与判分下对比。这些在下面的项目里大多没有，或者没有公开的消融。
+- **研究部分在同类项目里少见**：把"要不要想起、想多深"做成可训练、可单独评测的控制器；双时间轴、失效而不删除；回答时取回原图再看一眼；测试集只用一次、方法事先冻结的评测，外部基线（Mem0；N12 加上 Graphiti、LangMem、Cognee、A-MEM）在同样的模型与判分下对比。这些在下面的项目里大多没有，或者没有公开的消融。
 - **N12 之前缺的是"能拿来用"的那一层**。用过 Mem0 的人第一反应是 `pip install` 之后三行代码，CueMem 当时做不到：
   - 配置文件放在仓库里、数据写在仓库目录下，pip 安装后跑不起来；
   - 模型只有 DeepSeek 与通义（向量还是通义的原生接口），没有 OpenAI、没有本地模型；
@@ -89,7 +89,45 @@
 | MemOS | 77.8（2025-11） | gpt-4o-mini | MemOS 仓库 | 自有评测框架 89.2 |
 | **CueMem** L1 / L2 / 控制器 | 90.5 / 93.2 / 90.5 | deepseek-flash | [技术报告](report.md) | 全上下文基线 73.0 |
 
-**唯一可以直接比较的一组**是 N11 在同样的抽取模型、向量、回答与判分下跑的开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（p = 0.049），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。这一组测的 mem0ai 2.2.1 就是只增不改的 v3 算法：PyPI 上的包版本号是 2.x，源码里的抽取提示写的是 "V3 Additive Extraction Prompt (ADD-only)"，`add` 不再让 LLM 决定 UPDATE / DELETE。
+### 同一协议下的对比（N12）
+
+上面的分数不能比。能直接比较的，是我们在同一协议下自己跑的外部系统（D-065）。完整的表格、各题型、成本与配对检验见 [N12 外部基线](results/n12-baselines/README.md)。
+
+- **做法**：每个系统用自己的写入与检索流程，作者公开了评测代码的照着它；抽取模型与向量（经评测网关）、回答提示、回答模型与判分都和 CueMem 相同。
+- **数据**：LoCoMo test200r（200 题，分层抽样，不含对抗题），7 段对话（conv-42、43、44、47、48、49、50），4,431 轮、202 个会话。外部系统只跑了 LoCoMo。
+- **两个协议**：
+  - pds（只用 DeepSeek）：所有角色都是 deepseek-flash，判分也是（与回答模型相同，有给自己打分的风险）；向量是本机的 BAAI/bge-small-en-v1.5；没有重排。
+  - pq（只用通义）：抽取、回答与外部系统内部的调用都是 qwen3.8-flash，判分 qwen3.8-max（与回答模型同一家族）；向量 qwen3.7-text-embedding，重排 qwen3-rerank。
+- 每个配置只跑一次；配对比较用同一批题上的精确符号检验。
+
+| 方法 | pds | pq | 写入的名义成本 pds / pq |
+|---|---|---|---|
+| 全上下文 | 84.5% | 80.0% | — |
+| 朴素检索（dense top-10） | 59.5% | 64.0% | $0 / $0.006 |
+| **CueMem L1** | 82.5% | 81.5% | $0.529 / $0.238 |
+| **CueMem L2** | **87.0%** | **85.0%** | 同上（L1、L2、控制器共用一份写入） |
+| CueMem 控制器 | 83.5% | 83.5% | 同上 |
+| Mem0 2.2.1（开源版） | 81.0% | 77.5% | $1.381 / $0.712 |
+| LangMem 0.0.30 | 78.0% | 30.0% | $0.563 / $0.225 |
+| Cognee 1.6.4 | 77.5% | 74.0% | $2.845 / $1.466 |
+| Graphiti（graphiti-core 0.30.2，Kuzu） | 59.0% | 41.5% | $9.992 / $4.515 |
+| A-MEM（agiresearch/A-mem@ceffb86） | MA-PENDING | MA-PENDING | MA-PENDING |
+
+写入成本是 7 段对话的合计，按标价、不计缓存（D-010）。实际花费（扣除缓存命中与折扣）pds / pq：CueMem $0.222 / $0.151，Mem0 $0.242 / $0.317，LangMem $0.239 / $0.064，Cognee $0.797 / $1.154，Graphiti $1.508 / $3.908。
+
+- **CueMem L2 在两个协议下都高于 Mem0、LangMem、Cognee 与 Graphiti，差异都显著**：
+  - pds：对 Mem0 +17 / −5（p = 0.017），LangMem +25 / −7（p = 0.002），Cognee +27 / −8（p = 0.002），Graphiti +62 / −6（p < 0.001）；
+  - pq：对 Mem0 +24 / −9（p = 0.014），Cognee +30 / −8（p < 0.001），LangMem 与 Graphiti 都是 p < 0.001；
+  - 比全上下文高，但不显著（pds +12 / −7，p = 0.36；pq +19 / −9，p = 0.087）。
+- **读时不调用 LLM 的 L1，在 pds 下与 Mem0、LangMem、Cognee 没有显著差别**：对 Mem0 +14 / −11（p = 0.69），LangMem +24 / −15（p = 0.20），Cognee +20 / −10（p = 0.10）；对 Graphiti +55 / −8（p < 0.001）。pq 下显著高于 Cognee（+25 / −10，p = 0.017），与 Mem0 没有显著差别（+19 / −11，p = 0.20）。
+- **换模型的影响**：CueMem、Mem0、Cognee 从 pds 换到 pq 只差 0–3.5 个点，Graphiti 与 LangMem 大幅掉分。
+  - Graphiti：用它自己的提示词，qwen3.8-flash 抽出的实体少得多（7 段对话 1,253 → 462 个，事实 3,426 → 1,774 条）；pq 下每段对话记下约 120–270 条 "Target entity not found" 警告，这些事实被丢掉。pq 下的发言召回 0.545（朴素检索 0.845，CueMem L1 0.95）。
+  - LangMem：qwen3.8-flash 用 PatchDoc 把新信息并进少数几条长记忆（705 → 123 条），丢了写入的会话 2 / 202 → 23 / 202。
+  - 这两家的提示词与阈值都没有为通义重调。反过来，CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调出来的（N3–N7），pq 对它是主场；pds 下没有哪个系统为模型调过提示词，L2 的领先同样成立。
+
+N11 在原协议下（抽取与向量用通义、回答 deepseek-flash、判分 qwen3.8-max）对比过开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（p = 0.049），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。N2–N11 发布的 LongMemEval 数字（包括这一组和上面 LongMemEval 表里 CueMem 一行）都带着会话 ID 泄漏，已修复并做了对照（D-067，[泄漏对照](results/n12-leak/README.md)）：CueMem 的数字没有可测的虚高；修复后同样设置下 L1 90% 对 Mem0 79%，Mem0 发布的 83% 可能高了几个点。
+
+这里测的 mem0ai 2.2.1 就是只增不改的 v3 算法：PyPI 上的包版本号是 2.x，源码里的抽取提示写的是 "V3 Additive Extraction Prompt (ADD-only)"，`add` 不再让 LLM 决定 UPDATE / DELETE。
 
 ## 5. N12 借鉴了什么
 
@@ -117,7 +155,7 @@
 
 1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺 TypeScript 与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
 2. **多租户**：只有一个共享的访问令牌；记忆空间按 user_id 隔离，但没有按用户鉴权。多实例部署需要把 SQLite 换成 Postgres。
-3. **更多外部基线**：在同一协议下跑 Graphiti、LangMem、Cognee、A-MEM、Letta（需要 API Key 与预算）。
+3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。外部系统只跑了 LoCoMo：在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的元数据与过期**：Mem0 的 `metadata` 过滤与 `expiration_date`、Supermemory 的临时事实自动过期。
 6. **命令行的英文界面**：CLI 的提示目前是中文；SDK、HTTP、MCP、代理与界面是英文。
