@@ -1,14 +1,18 @@
 """外部基线 MG（Graphiti）的测试：不联网、不调用模型。
 
-纯函数（发言格式、时间、证据转换、episode 账本）直接测，不需要 graphiti-core；最后一个测试把
-Graphiti 真正接到评测网关上（模型是脚本化的假接口），要装上它才跑：
+纯函数（发言格式、时间、证据转换、按轮计的检索指标、episode 账本、告警计数、重建判断）直接测，
+不需要 graphiti-core；最后几个测试把 Graphiti 真正接到评测网关上（模型与重排都是脚本化的
+假接口），要装上它才跑：
     uv run --with "graphiti-core[kuzu]==0.30.2" pytest tests/test_baseline_graphiti.py
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,21 +22,32 @@ import pytest
 from fakes import FakeAPI
 
 from cuemem.config import Settings
+from cuemem.core.trace import start_trace
 from cuemem.evals.baselines.graphiti import (
+    _WARNINGS,
+    BUILD_PROTOCOL,
     MAX_MESSAGE_CHARS,
     EpisodeLedger,
     GraphitiBaseline,
+    WarningCounter,
+    _resampling_client_type,
     entity_hit,
     episode_body,
     fact_hit,
     fact_text,
     group_id,
     keyword_query,
+    mark_rounds,
     naive,
+    ranked,
     reference_time,
+    round_starts,
+    warning_key,
 )
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
+from cuemem.evals.external import memory_hit
 from cuemem.evals.methods import MethodContext, build_methods
+from cuemem.evals.metrics import retrieval_metrics
 from cuemem.llm import Ledger, LLMClient, ResponseCache
 from cuemem.read.reader import Reader
 
@@ -56,6 +71,12 @@ def test_reference_time_keeps_the_day_and_orders_turns() -> None:
     aware = datetime(2023, 5, 7, 13, 56, tzinfo=UTC)
     assert reference_time(aware, 1).tzinfo is UTC
     assert naive(reference_time(MAY7, 0)) == MAY7
+    # 两段会话开始时间相同（LongMemEval 常见）：后一段接在前一段之后，不交错
+    last_of_first = reference_time(MAY7, 5)
+    second = reference_time(MAY7, 0, after=last_of_first)
+    assert (second - last_of_first).total_seconds() == 1 and second.date() == MAY7.date()
+    later = reference_time(MAY9, 0, after=last_of_first)  # 本来就更晚：不动
+    assert later == MAY9.replace(tzinfo=UTC)
 
 
 def test_group_id_and_keyword_query() -> None:
@@ -83,9 +104,9 @@ def test_ledger_round_trip_and_sources(tmp_path: Path) -> None:
     session, turns, said = ledger.source(["e2", "e3", "e1", "unknown"])
     assert (session, turns, said) == ("session_1", [3, 5], datetime(2023, 5, 7, 13, 56, 3))
     assert ledger.source(["unknown"]) == ("", [], None)
-    assert ledger.last_mention("ana") == ("session_2", MAY9)  # 最近一次提到
-    assert ledger.last_mention("berlin")[0] == "session_1"
-    assert ledger.last_mention("nobody") == ("", None)
+    assert ledger.last_mention("ana") == MAY9  # 最近一次提到
+    assert ledger.last_mention("berlin") == datetime(2023, 5, 7, 13, 56, 3)
+    assert ledger.last_mention("nobody") is None
     assert EpisodeLedger.load(tmp_path / "missing.json").episodes == {}
 
 
@@ -119,19 +140,112 @@ def test_facts_and_entities_become_dated_evidence(tmp_path: Path) -> None:
     hit = entity_hit("locomo_conv-1", ana, 0.3, 1, ledger)
     assert hit.unit.text == "About Ana (entity summary): Ana lives in Berlin."
     assert hit.unit.kind == "entity" and hit.unit.ts == MAY9
-    assert hit.unit.session_id == "session_2" and "turn_indices" not in hit.unit.meta
+    # 实体摘要跨会话累积：不标会话，不算进会话召回
+    assert hit.unit.session_id == "" and "turn_indices" not in hit.unit.meta
     stranger = SimpleNamespace(uuid="x", name="X", summary="", created_at=MAY7)
     assert entity_hit("k", stranger, 0.0, 2, ledger).unit.text.endswith("(no summary)")
 
 
-def test_graph_built_with_another_embedder_is_refused(tmp_path: Path) -> None:
-    # 换了向量模型（比如 deepseek 预设的本机 bge-small 换成通义）：图里的向量没法和查询比
+def _fact(session: str, turns: list[int], rank: int) -> Any:
+    hit = memory_hit("k", f"fact:{rank}", "fact", MAY7, rank, session_id=session)
+    hit.unit.meta["turn_indices"] = turns
+    return hit
+
+
+def test_metrics_count_each_round_once() -> None:
+    # LoCoMo：两人都是 user，每条发言一轮。三条事实出自同一条证据发言，不能算三次
+    locomo = EvalSession("session_7", MAY7, [EvalTurn(role="user", text="t")] * 4)
+    hits = [_fact("session_7", [0], 1), _fact("session_7", [0], 2), _fact("session_7", [0, 2], 3)]
+    mark_rounds(hits, [locomo])
+    assert [h.unit.meta["turn_indices"] for h in hits] == [[0], [], [2]]
+    metrics = retrieval_metrics(
+        hits,
+        evidence_sessions=["session_7"],
+        evidence_turns={("session_7", 0), ("session_7", 2)},
+        relevant_units=2,
+    )
+    assert metrics["turn_recall_all"] == 1.0 and metrics["turn_ndcg"] <= 1.0
+
+    duplicates = [_fact("session_7", [0], rank) for rank in (1, 2, 3)]
+    mark_rounds(duplicates, [locomo])
+    metrics = retrieval_metrics(
+        duplicates,
+        evidence_sessions=["session_7"],
+        evidence_turns={("session_7", 0), ("session_7", 2)},
+        relevant_units=2,
+    )
+    assert metrics["turn_recall_all"] == 0.5 and metrics["turn_ndcg"] < 1.0  # 原来是 1.0、1.31
+
+    # LongMemEval：一问一答为一轮，与 CueMem 的命中单位、relevant_units 相同
+    chat = EvalSession(
+        "s1",
+        MAY7,
+        [EvalTurn(role=role, text="t") for role in ("user", "assistant", "user", "assistant")],
+    )
+    assert round_starts(chat) == [0, 0, 2, 2]
+    hits = [_fact("s1", [3], 1), _fact("s1", [2], 2), _fact("s1", [0], 3), _fact("other", [9], 4)]
+    mark_rounds(hits, [chat])
+    assert [h.unit.meta["turn_indices"] for h in hits] == [[2, 3], [], [0, 1], [9]]
+    metrics = retrieval_metrics(
+        hits, evidence_sessions=["s1"], evidence_turns={("s1", 2)}, relevant_units=1
+    )
+    assert metrics["turn_recall_all"] == 1.0 and metrics["turn_ndcg"] == 1.0
+
+
+def test_cross_encoder_ranking_follows_graphiti_convention() -> None:
+    assert ranked(["a", "b", "c"], [0.1, 0.9, 0.1]) == [("b", 0.9), ("a", 0.1), ("c", 0.1)]
+    assert ranked([], []) == []
+
+
+def test_graphiti_warnings_are_counted_per_build() -> None:
+    handler = WarningCounter()
+    unmatched = {
+        "msg": "Source entity not found in nodes for edge relation: %s",
+        "levelname": "WARNING",
+    }
+    decode = {"msg": "Error in generating LLM response: line 1 column 5", "levelname": "ERROR"}
+    handler.emit(logging.makeLogRecord(unmatched))  # 不在写入中：不计、不报错
+    counts: Counter[str] = Counter()
+    token = _WARNINGS.set(counts)
+    try:
+        for relation in ("LIKES", "OWNS"):
+            handler.emit(logging.makeLogRecord({**unmatched, "args": (relation,)}))
+        handler.emit(logging.makeLogRecord(decode))
+    finally:
+        _WARNINGS.reset(token)
+    assert counts == {
+        "WARNING: Source entity not found in nodes for edge relation: %s": 2,
+        "ERROR: Error in generating LLM response: line # column #": 1,
+    }
+    record = logging.makeLogRecord(
+        {"msg": "Error executing Kuzu query: x\nMATCH ...", "levelname": "ERROR"}
+    )
+    assert warning_key(record) == "ERROR: Error executing Kuzu query: x"
+
+
+def test_graph_from_another_setup_is_rebuilt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 换了抽取模型、向量模型或写入协议：旧图不复用、也不让每道题都报错，而是重建
     method = GraphitiBaseline()
-    method.embedder = SimpleNamespace(name="qwen-embedding", dim=1024)  # type: ignore[assignment]
-    (tmp_path / "build.json").write_text(json.dumps({"embedder": "BAAI/bge-small:384"}), "utf-8")
-    question = SimpleNamespace(question="Where does Ana live?")
-    with pytest.raises(RuntimeError, match="删掉这个目录重建"):
-        method.retrieve("locomo_conv-1", tmp_path, question, [])  # type: ignore[arg-type]
+    roles = {"extractor": SimpleNamespace(model="qwen3.8-flash")}
+    method.llm = SimpleNamespace(settings=SimpleNamespace(roles=roles))  # type: ignore[assignment]
+    method.embedder = SimpleNamespace(name="qwen3.7-text-embedding", dim=1024)  # type: ignore[assignment]
+    method.gateway = SimpleNamespace(usage=lambda bucket: {"spent": 0.0})  # type: ignore[assignment]
+    built: list[str] = []
+    monkeypatch.setattr(method, "build", lambda key, directory, sessions: built.append(key) or {})
+    directory = tmp_path / "locomo_conv-1"
+    directory.mkdir()
+    record = directory / "build.json"
+    current = {"graphiti_protocol": BUILD_PROTOCOL, "extractor": "qwen3.8-flash"}
+    current["embedder"] = "qwen3.7-text-embedding:1024"
+    record.write_text(json.dumps(current), "utf-8")
+    assert method._ensure_built("locomo_conv-1", directory, []) is None and built == []
+    for stale in ({"extractor": "deepseek-flash"}, {"graphiti_protocol": 1}, {"embedder": "x:384"}):
+        record.write_text(json.dumps({**current, **stale}), "utf-8")
+        assert method._ensure_built("locomo_conv-1", directory, []) is not None
+        assert method._replaced["locomo_conv-1"] == stale  # build() 把它记进新的写入记录
+    assert built == ["locomo_conv-1"] * 3
 
 
 def test_method_is_registered_without_the_package() -> None:
@@ -190,11 +304,17 @@ def _empty(schema: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("rerank", [True, False], ids=["cross_encoder", "rrf"])
 def test_graphiti_end_to_end_through_the_gateway(
-    offline_settings: Settings, fake_api: FakeAPI
+    offline_settings: Settings,
+    fake_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    rerank: bool,
 ) -> None:
     pytest.importorskip("graphiti_core")
     pytest.importorskip("kuzu")
+    if not rerank:  # 没有重排模型（deepseek 预设）：事实检索退回 RRF
+        monkeypatch.setattr("cuemem.memory.build_reranker", lambda *args, **kwargs: None)
     fake_api.chat_replies = [_fake_model]
     llm = LLMClient(
         offline_settings,
@@ -228,18 +348,37 @@ def test_graphiti_end_to_end_through_the_gateway(
     method = GraphitiBaseline()
     ctx = MethodContext(sample, sessions, Reader(llm), None, "locomo:conv-1")
     try:
-        first = method.answer(ctx)
+        with start_trace("answer") as trace:
+            first = method.answer(ctx)
         build = first.details["graphiti_build"]
         assert build["episodes"] == 3 and build["failed_episodes"] == []
         assert build["entities"] == 2 and build["facts"] >= 1 and build["chat_calls"] > 0
         assert build["embedder"] == f"{method.embedder.name}:{method.embedder.dim}"
+        assert build["graphiti_protocol"] == BUILD_PROTOCOL and isinstance(build["warnings"], dict)
         assert first.response == "Berlin"
         fact = next(h for h in first.hits if h.route == "graphiti_fact")
         assert fact.unit.text == "Ana lives in Berlin (Date range: 2023-04-30 - present)"
         assert fact.unit.session_id == "session_1" and 0 in fact.unit.meta["turn_indices"]
         names = {h.unit.text.split(" (entity")[0] for h in first.hits if h.route != "graphiti_fact"}
         assert names == {"About Ana", "About Berlin"}
-        assert first.details["search_usage"]["embedding_calls"] == 1
+        assert all(h.unit.session_id == "" for h in first.hits if h.route == "graphiti_entity")
+        # 查询向量由 CueMem 的向量器在这道题里算（query 模式），检索时不再经网关
+        assert first.details["search_usage"]["embedding_calls"] == 0
+        candidates = first.details["candidates"]
+        assert set(candidates) == {"fact_bm25", "fact_cosine", "entity_bm25", "entity_cosine"}
+        assert candidates["fact_bm25"] >= 1 and candidates["entity_bm25"] >= 1
+        # 脚本化的模型有一次给的实体名对不上，Graphiti 丢掉那条事实并告警：计进写入记录
+        unmatched = "WARNING: Target entity not found in nodes for edge relation: %s"
+        assert build["warnings"] == {unmatched: 1}
+        kinds = {event["kind"] for event in trace.events}
+        if rerank:
+            assert first.details["edge_reranker"] == "cross_encoder:qwen3-rerank"
+            # 重排对原问题打分（不是去掉标点的 BM25 查询），用量记进这道题的 trace
+            assert fake_api.rerank_requests[-1]["input"]["query"] == "Where does Ana live?"
+            assert "rerank" in kinds
+        else:
+            assert first.details["edge_reranker"] == "rrf" and not fake_api.rerank_requests
+            assert "rerank" not in kinds
 
         method.close("locomo_conv-1")  # 关掉再打开：库与账本都从磁盘读
         second = method.answer(ctx)
@@ -250,3 +389,28 @@ def test_graphiti_end_to_end_through_the_gateway(
     finally:
         method.close("locomo_conv-1")
         method.gateway.stop()
+
+
+def test_retries_resample_instead_of_replaying_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Graphiti 对解析不了的回复原样重发；网关缓存会还回同一个坏回复。重试的请求要换个缓存键
+    pytest.importorskip("graphiti_core")
+    import tenacity
+    from graphiti_core.llm_client.client import LLMClient as GraphitiLLM
+    from graphiti_core.llm_client.config import LLMConfig
+    from graphiti_core.prompts.models import Message
+
+    retrying = GraphitiLLM._generate_response_with_retry.retry
+    monkeypatch.setattr(retrying, "wait", tenacity.wait_none())  # 不等退避
+    sent: list[int] = []
+    replies = iter(["not json", '{"ok": true}'])
+
+    async def create(**kwargs: Any) -> Any:
+        sent.append(kwargs["max_tokens"])
+        message = SimpleNamespace(content=next(replies))
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    client = _resampling_client_type()(LLMConfig(api_key="x", model="m"), client=fake)
+    messages = [Message(role="system", content="Extract."), Message(role="user", content="Hi")]
+    assert asyncio.run(client.generate_response(messages)) == {"ok": True}
+    assert sent == [client.max_tokens, client.max_tokens - 1] and client.attempts == {}
