@@ -26,7 +26,7 @@ N11 只有一个外部基线：开源的 Mem0 2.2（D-055），用的还是 CueM
 4. **写入成本**（名义成本，7 段对话）：
    - CueMem pds $0.53、pq $0.24；
    - LangMem 与 CueMem 相近（$0.56、$0.23；pq 上更低，但有 23 个会话没写进任何东西）；
-   - Mem0 $1.38、$0.71；Cognee $2.85、$1.47；
+   - Mem0 $1.38、$0.71；Cognee $2.84、$1.47；
    - Graphiti $9.99、$4.51：每条发言一个 episode，pds 下 14,240 次 LLM 调用，CueMem 是 438 次；
    - A-MEM：MA-PENDING。
 
