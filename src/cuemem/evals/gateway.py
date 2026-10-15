@@ -25,11 +25,24 @@
 每个桶另外统计失败的请求与其中被内容审核拒绝的、带工具的请求、返回的工具调用、一次回多个
 工具调用的回复、带工具却没调用的回复、因长度上限被截断的回复：外部系统吞掉或静默丢掉的东西
 （如 trustcall 把模型调用的错误改写成提示重试）在写入记录里看得到。
+
+出错时照 OpenAI 的语义回给外部系统，由它们按自己的策略处理：
+- **限流**：上游的 429 在 LLM 客户端里已经由 SDK 退避重试过（providers.*.max_retries 次，照上游
+  的 Retry-After 等），仍然限流时回 429 并带上上游的 Retry-After，由外部系统自己退避重试，网关
+  不再加一层重试；向量请求同样（向量器自己重试 embedding.max_attempts 次）。按桶计入
+  rate_limited。以前它是一个没有说明的 500：Cognee 之类按"服务器出错"处理（它对 429 会放慢
+  派发，对 500 不会），写入记录里也看不出是限流。
+- **其他上游错误**（5xx、连不上、余额不足等）回 502，消息里带上上游的报错；内容审核拒绝与
+  请求不合法回 400。
+- **解析不了的 JSON**：JSON 模式的回复解析不了时，外部系统多半把同样的请求再发一次；LLM 客户端
+  记下这个请求，再来时不读缓存、重新调用（retry_bad_json，见 LLMClient.chat），否则每次重试都
+  从缓存里拿到同一个坏回复。按桶计入 bad_json_replies 与 json_refreshes。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 import time
@@ -41,12 +54,12 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from openai import APITimeoutError, BadRequestError
+from openai import APIError, APITimeoutError, BadRequestError, RateLimitError
 
 from cuemem.core.trace import start_trace
 from cuemem.embed.base import EmbedKind, TextEmbedder
-from cuemem.errors import ContentFilteredError, CueMemError
-from cuemem.llm.client import LLMClient, Message
+from cuemem.errors import ContentFilteredError, CueMemError, EmbeddingAPIError
+from cuemem.llm.client import LLMClient, Message, unparsable_json
 from cuemem.llm.types import ChatResult
 
 DEFAULT_BUCKET = "default"
@@ -60,19 +73,23 @@ class BucketUsage:
     chat_calls: int = 0
     cache_hits: int = 0
     fallbacks: int = 0
-    errors: int = 0  # 最终失败的请求（换了备用模型也失败的算一次）
+    errors: int = 0  # 最终失败的聊天请求（换了备用模型也失败的算一次）
     refusals: int = 0  # 其中被内容审核拒绝的（重试也没用）
+    rate_limited: int = 0  # 回了 429 的请求（聊天与向量）：上游重试之后仍然限流
     tool_requests: int = 0  # 带工具的请求
     tool_calls: int = 0  # 返回的工具调用
     multi_tool_replies: int = 0  # 一次回了多个工具调用的回复（并行工具调用生效）
     no_tool_replies: int = 0  # 带工具却没有调用的回复（例如通义没照 tool_choice=required 做）
     truncated_replies: int = 0  # finish_reason 为 length：输出被长度上限截断
+    bad_json_replies: int = 0  # JSON 模式的回复解析不了（外部系统多半会重试）
+    json_refreshes: int = 0  # 其后同样的请求再来：不读缓存、重新调用的次数
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
     embedding_calls: int = 0
     embedded_texts: int = 0
     embedding_tokens: int = 0
+    embedding_errors: int = 0  # 最终失败的向量请求（含限流）
     cost: float = 0.0
     spent: float = 0.0
     latency_ms: float = 0.0
@@ -226,22 +243,35 @@ class Gateway:
             "tool_choice": body.get("tool_choice") if tools else None,
             "parallel_tool_calls": (parallel is None or bool(parallel)) if tools else None,
             "cache_scope": f"gateway|{bucket}",
+            # 解析不了的 JSON 回复之后，同样的请求（外部系统的重试）不读缓存
+            "retry_bad_json": True,
         }
+        json_mode = isinstance(response_format, dict) and response_format.get("type") in (
+            "json_object",
+            "json_schema",
+        )
         requested = str(body.get("model") or "")
         with start_trace("gateway", bucket=bucket) as trace:
             try:
                 result, alias, fallback_used = self._call(messages, kwargs, primary)
             except Exception as exc:  # 包括备用模型也失败的情况
-                self._count_error(bucket, requested, refused=isinstance(exc, ContentFilteredError))
+                self._count_error(
+                    bucket,
+                    requested,
+                    refused=isinstance(exc, ContentFilteredError),
+                    rate_limited=isinstance(exc, RateLimitError),
+                )
                 raise
         self._count_chat(bucket, requested, trace, fallback_used)
-        self._count_reply(bucket, result, tools is not None)
+        self._count_reply(bucket, result, tools is not None, json_mode)
         return result, alias
 
     def _call(
         self, messages: list[Message], kwargs: dict[str, Any], primary: str
     ) -> tuple[ChatResult, str, bool]:
-        """先用主模型；内容审核误拒、超时或 JSON 生成被中止时换备用模型。"""
+        """先用主模型；内容审核误拒、超时或 JSON 生成被中止时换备用模型。
+
+        限流不换模型（RateLimitError 原样抛出，由接口回 429）：换了模型就不是同一个协议了。"""
         try:
             return self.llm.chat(self.role, messages, **kwargs), primary, False
         except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
@@ -257,9 +287,13 @@ class Gateway:
             result, alias = self.chat(bucket, body)
         except HTTPException:
             raise
+        except RateLimitError as exc:  # LLM 客户端已经按 SDK 的退避重试过：网关不再重试
+            return _rate_limited(str(exc), _retry_after(exc.response.headers))
         except (ContentFilteredError, BadRequestError) as exc:
             return _error(400, str(exc), "invalid_request_error")
         except (APITimeoutError, CueMemError) as exc:
+            return _error(502, f"{type(exc).__name__}: {exc}", "upstream_error")
+        except APIError as exc:  # 其余的上游错误：5xx、连不上、余额不足（402）等
             return _error(502, f"{type(exc).__name__}: {exc}", "upstream_error")
         completion = _completion(result, alias)
         if body.get("stream"):
@@ -273,18 +307,28 @@ class Gateway:
         texts = [raw] if isinstance(raw, str) else list(raw or [])
         if not all(isinstance(t, str) for t in texts):
             raise HTTPException(400, "input must be a string or a list of strings (no token ids).")
+        failure: EmbeddingAPIError | None = None
         with start_trace("gateway", bucket=bucket) as trace:
-            batch = self.embedder.embed(texts, embed_kind(bucket))
+            try:
+                batch = self.embedder.embed(texts, embed_kind(bucket))
+            except EmbeddingAPIError as exc:  # 向量器自己已经按退避重试过：网关不再重试
+                failure = exc
         from cuemem.evals.runner import usage_from_trace
 
-        usage = usage_from_trace(trace)
+        usage = usage_from_trace(trace)  # 失败之前已经完成的分批也花了钱
         with self._lock:
             entry = self._bucket(bucket)
             entry.embedding_calls += 1
-            entry.embedded_texts += len(texts)
+            entry.embedded_texts += len(texts) if failure is None else 0
             entry.embedding_tokens += int(usage["embedding_tokens"])
+            entry.embedding_errors += int(failure is not None)
+            entry.rate_limited += int(failure is not None and failure.status == 429)
             entry.cost += float(usage["cost"])
             entry.spent += float(usage["spent"])
+        if failure is not None:
+            if failure.status == 429:
+                return _rate_limited(str(failure), failure.retry_after)
+            return _error(502, f"{type(failure).__name__}: {failure}", "upstream_error")
         dimensions = body.get("dimensions")
         data = []
         for i, row in enumerate(batch.dense):
@@ -311,11 +355,13 @@ class Gateway:
         from cuemem.evals.runner import usage_from_trace
 
         usage = usage_from_trace(trace)
+        refreshes = sum(1 for e in trace.events if e["kind"] == "llm_cache_refresh")
         with self._lock:
             entry = self._bucket(bucket)
             entry.chat_calls += int(usage["llm_calls"])
             entry.cache_hits += int(usage["llm_cache_hits"])
             entry.fallbacks += int(fallback)
+            entry.json_refreshes += refreshes
             entry.input_tokens += int(usage["input_tokens"])
             entry.output_tokens += int(usage["output_tokens"])
             entry.cached_input_tokens += int(usage["cached_input_tokens"])
@@ -324,22 +370,28 @@ class Gateway:
             entry.latency_ms += float(usage["latency_ms"] or 0.0)
             entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
 
-    def _count_reply(self, bucket: str, result: ChatResult, with_tools: bool) -> None:
+    def _count_reply(
+        self, bucket: str, result: ChatResult, with_tools: bool, json_mode: bool = False
+    ) -> None:
         calls = len(result.tool_calls)
         with self._lock:
             entry = self._bucket(bucket)
             entry.truncated_replies += int(result.finish_reason == "length")
+            entry.bad_json_replies += int(json_mode and unparsable_json(result))
             if with_tools:
                 entry.tool_requests += 1
                 entry.tool_calls += calls
                 entry.multi_tool_replies += int(calls > 1)
                 entry.no_tool_replies += int(calls == 0)
 
-    def _count_error(self, bucket: str, requested: str, *, refused: bool) -> None:
+    def _count_error(
+        self, bucket: str, requested: str, *, refused: bool, rate_limited: bool = False
+    ) -> None:
         with self._lock:
             entry = self._bucket(bucket)
             entry.errors += 1
             entry.refusals += int(refused)
+            entry.rate_limited += int(rate_limited)
             entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
 
 
@@ -446,3 +498,22 @@ def _as_stream(completion: dict[str, Any]) -> Iterator[bytes]:
 
 def _error(status: int, message: str, kind: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message[:1000], "type": kind}}, status)
+
+
+def _rate_limited(message: str, retry_after: str | None) -> JSONResponse:
+    """429，照 OpenAI 的格式；上游给了 Retry-After 就带上（OpenAI SDK 照它等待后重试）。"""
+    headers = {"Retry-After": retry_after} if retry_after else None
+    body = {"error": {"message": message[:1000], "type": "rate_limit_error", "code": "rate_limit"}}
+    return JSONResponse(body, 429, headers=headers)
+
+
+def _retry_after(headers: Any) -> str | None:
+    """上游响应的 Retry-After（秒数或 HTTP 日期，原样转发）；只有 retry-after-ms 时换算成秒。"""
+    value = headers.get("retry-after")
+    if value:
+        return str(value)
+    millis = headers.get("retry-after-ms")
+    try:
+        return str(max(1, math.ceil(float(millis) / 1000))) if millis else None
+    except ValueError:
+        return None

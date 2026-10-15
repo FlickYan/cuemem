@@ -615,6 +615,9 @@ class EvalRunner:
                     "pipeline_version": PIPELINE_VERSION,
                     **self.settings.consolidation.model_dump(),
                 },
+                # 记忆空间与外部基线写入记录的目录：报告据此读外部基线的写入成本（N12；
+                # 同一个数据目录下 pds 与 pq 协议的写入分放两处）
+                "eval_spaces": str(self.settings.paths.eval_spaces),
                 "git": _git_version(),
                 "created": now,
                 "resumed": [],

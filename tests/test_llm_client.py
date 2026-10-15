@@ -9,7 +9,9 @@ from pydantic import BaseModel
 
 from cuemem.config import Settings
 from cuemem.errors import CacheMissError, MissingAPIKeyError, StructuredOutputError
-from cuemem.llm import Ledger, LLMClient, ResponseCache, Usage, chat_cost
+from cuemem.llm import ChatResult, Ledger, LLMClient, ResponseCache, ToolCall, Usage, chat_cost
+from cuemem.llm.cache import request_key
+from cuemem.llm.client import unparsable_json
 
 HELLO = [{"role": "user", "content": "hi"}]
 
@@ -221,3 +223,116 @@ def test_structured_retries_when_provider_aborts_json(settings: Settings) -> Non
     result = client.structured("extractor", [{"role": "user", "content": "hi"}], Out)
     assert result.value.answer == "ok" and result.attempts == 2
     assert api.chat_requests[1]["messages"][-1]["content"].startswith("Reply with one short")
+
+
+# ---------- 解析不了的 JSON 回复与响应缓存（N12，评测网关） ----------
+
+JSON_MODE = {"type": "json_object"}
+BROKEN = '{"name": "Ana", "city": "Ber'  # 生成失控、被截断的 JSON
+
+
+def test_identical_retry_after_bad_json_bypasses_the_cache(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """外部系统拿到解析不了的 JSON 后把同样的请求再发一次：不读缓存、重新调用，并覆盖缓存里的
+    坏回复；之后同样的请求照常命中缓存（拿到的是新的、能解析的回复）。"""
+    fake_api.chat_replies = [BROKEN, '{"name": "Ana", "city": "Berlin"}']
+    client = make_client(settings, fake_api)
+
+    def ask() -> ChatResult:
+        return client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+
+    assert ask().content == BROKEN
+    retried = ask()  # 外部系统的重试：重新调用
+    assert not retried.from_cache and retried.content == '{"name": "Ana", "city": "Berlin"}'
+    assert len(fake_api.chat_requests) == 2
+    third = ask()
+    assert third.from_cache and third.content == '{"name": "Ana", "city": "Berlin"}'
+    assert len(fake_api.chat_requests) == 2
+
+
+def test_bad_json_replay_is_unchanged_without_opt_in(settings: Settings, fake_api: FakeAPI) -> None:
+    """不要求的调用方照旧：解析不了的回复也缓存，同样的请求从缓存里拿到同一个回复。"""
+    fake_api.chat_replies = [BROKEN, '{"name": "Ana"}']
+    client = make_client(settings, fake_api)
+    client.chat("extractor", HELLO, response_format=JSON_MODE)
+    again = client.chat("extractor", HELLO, response_format=JSON_MODE)
+    assert again.from_cache and again.content == BROKEN
+    assert len(fake_api.chat_requests) == 1
+
+
+def test_existing_cache_entries_still_hit(settings: Settings, fake_api: FakeAPI) -> None:
+    """缓存键不变：以前写进缓存的回复（能解析的、解析不了的）照常命中；解析不了的那条要等同样的
+    请求再来一次才重新调用。"""
+    spec = settings.models[settings.roles["extractor"].model]
+    client = make_client(settings, fake_api)
+    params = client._prepare("extractor", None, None, None, JSON_MODE, None, None)[2]
+
+    def key(messages: list[dict[str, str]]) -> str:  # 与改动之前同样的写法
+        return request_key(
+            {
+                "provider": spec.provider,
+                "model": spec.model_id,
+                "messages": messages,
+                "params": params,
+                "extra_body": spec.extra_body,
+            }
+        )
+
+    good = [{"role": "user", "content": "good"}]
+    bad = [{"role": "user", "content": "bad"}]
+    assert client.cache is not None
+    for messages, content in ((good, '{"ok": true}'), (bad, BROKEN)):
+        cached = {"content": content, "model_alias": spec.model_id, "model_id": spec.model_id}
+        client.cache.put(key(messages), spec.model_id, cached)
+
+    hit = client.chat("extractor", good, response_format=JSON_MODE, retry_bad_json=True)
+    assert hit.from_cache and hit.content == '{"ok": true}'
+    first = client.chat("extractor", bad, response_format=JSON_MODE, retry_bad_json=True)
+    assert first.from_cache and first.content == BROKEN  # 第一次照常命中，重跑可复现
+    assert fake_api.chat_requests == []
+    fake_api.chat_replies = ['{"ok": false}']
+    retried = client.chat("extractor", bad, response_format=JSON_MODE, retry_bad_json=True)
+    assert not retried.from_cache and retried.content == '{"ok": false}'
+    assert len(fake_api.chat_requests) == 1
+
+
+def test_read_only_cache_serves_bad_json_instead_of_calling(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    fake_api.chat_replies = [BROKEN]
+    client = make_client(settings, fake_api)
+    client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+    client.settings = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    again = client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+    assert again.from_cache and again.content == BROKEN
+    assert len(fake_api.chat_requests) == 1
+
+
+def test_structured_output_still_replays_from_cache(settings: Settings, fake_api: FakeAPI) -> None:
+    """CueMem 自己的 JSON 调用（抽取、对账等都走 structured）不受影响：第一次的坏回复与带校验
+    错误的重试都缓存，重跑整个从缓存复现，不再调用 API。"""
+    fake_api.chat_replies = [BROKEN, '{"name": "Max", "breed": "corgi"}']
+    client = make_client(settings, fake_api)
+    messages = [{"role": "user", "content": "Max 是柯基"}]
+    first = client.structured("extractor", messages, Pet)
+    assert first.attempts == 2 and len(fake_api.chat_requests) == 2
+    again = client.structured("extractor", messages, Pet)
+    assert again.value == first.value and again.attempts == 2
+    assert again.result.from_cache and len(fake_api.chat_requests) == 2
+
+
+def test_unparsable_json() -> None:
+    def reply(content: str | None, tool_calls: list[ToolCall] | None = None) -> ChatResult:
+        return ChatResult(
+            content=content, tool_calls=tool_calls or [], model_alias="m", model_id="m"
+        )
+
+    assert not unparsable_json(reply('{"a": [1, 2]}'))
+    assert not unparsable_json(reply('```json\n{"a": 1}\n```'))  # 去掉 markdown 围栏
+    assert unparsable_json(reply(BROKEN))
+    assert unparsable_json(reply(""))
+    assert unparsable_json(reply(None))
+    assert unparsable_json(reply('{"a": "line\nbreak"}'))  # 字符串里原样的换行：严格解析不过
+    call = ToolCall(id="c1", name="save", arguments="{}")
+    assert not unparsable_json(reply(None, [call]))
