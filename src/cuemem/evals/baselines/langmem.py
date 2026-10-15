@@ -53,8 +53,9 @@ evals/external.py），只换"记忆从哪来"：
    对不上会话日期。被拒绝的与写入丢了的会话（没调用工具、补丁改不了、调用校验不过而一条也
    没写）合计超过 max(2, 10%) 时整份写入算失败（比例可用 CUEMEM_LANGMEM_MAX_LOST_SHARE 放宽，
    通义协议的完整运行用 0.25：通义下 LangMem 在一成多的会话里自己丢写入）；带工具的回复
-   满 10 次却没有一次并行调用多个工具时也算失败（并行工具调用没生效）。模型调用了 PatchDoc 却明说"不用改"（patches 为空）
-   的会话是 LangMem 照常的结果、不算写入丢了，另记在 unchanged_sessions 里：有已有记忆时
+   满 10 次却没有一次并行调用多个工具时也算失败（并行工具调用没生效）。模型调用了 PatchDoc
+   却明说"不用改"（patches 为空）的会话是 LangMem 照常的结果、不算写入丢了，另记在
+   unchanged_sessions 里：有已有记忆时
    trustcall 要求必须调用工具，通义觉得没有新东西时就这样回。只有会话里每个工具调用都是
    patches 为空列表的 PatchDoc 才这样算；patches 缺了、是对象或读不出列表的（trustcall 不记
    日志就跳过，这里记进 skipped_edits），参数不是合法 JSON 的（LangChain 放进
