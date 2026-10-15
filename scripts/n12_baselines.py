@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from cuemem.config import load_settings
+from cuemem.evals.datasets import storage_name
 from cuemem.evals.report import load_rows
 from cuemem.evals.routing import sign_test
 
@@ -93,8 +94,10 @@ def write_stats(
     total: dict[str, float] = defaultdict(float)
     if method in SYSTEMS:
         root = settings.paths.eval_spaces / SYSTEMS[method]
+        # 会话 ID 改写过的写入在 <数据集>-anon_<历史> 下（与评测运行时一样看环境变量）
+        stored = storage_name(dataset)
         for key in keys:
-            names = {re.sub(r"[^A-Za-z0-9_.-]", "_", f"{dataset}:{key}"), key}
+            names = {re.sub(r"[^A-Za-z0-9_.-]", "_", f"{stored}:{key}"), key}
             found = [root / name / "build.json" for name in names if (root / name).is_dir()]
             if not found or not found[0].exists():
                 continue

@@ -37,7 +37,10 @@ from cuemem.evals.datasets import (
     EvalSession,
     EvalSet,
     Sample,
+    SessionIds,
     sample_evidence_turns,
+    session_id_scheme,
+    storage_name,
     to_conversation,
     to_session_ins,
 )
@@ -78,6 +81,8 @@ class ProbeQuery:
     question: str
     question_time: datetime
     meta: dict[str, Any] = field(default_factory=dict)
+    # 空间的会话 ID 写法（见 datasets 的模块说明）；None 时按环境变量，与加载数据集时一致
+    session_ids: SessionIds | None = None
 
 
 @dataclass
@@ -222,6 +227,7 @@ class EvalRunner:
                     "question_type": s.question_type,
                     "is_abstention": s.is_abstention,
                 },
+                evalset.session_ids,
             )
             for s in samples
         ]
@@ -242,16 +248,19 @@ class EvalRunner:
                     done.add(json.loads(line)["sample_id"])
                 except (json.JSONDecodeError, KeyError):
                     continue
-        groups: dict[tuple[str, str], list[ProbeQuery]] = {}
+        groups: dict[tuple[str, str, SessionIds], list[ProbeQuery]] = {}
         for query in queries:
             if query.query_id not in done:
-                groups.setdefault((query.dataset, query.space_key), []).append(query)
+                scheme = query.session_ids or session_id_scheme(query.dataset)
+                groups.setdefault((query.dataset, query.space_key, scheme), []).append(query)
         self._on_start(sum(len(items) for items in groups.values()))
         counts = Counter[str]()
 
-        def run_group(dataset: str, space_key: str, items: list[ProbeQuery]) -> None:
+        def run_group(
+            dataset: str, space_key: str, scheme: SessionIds, items: list[ProbeQuery]
+        ) -> None:
             space_id = f"{dataset}:{space_key}"
-            system, _ = self._open_space(dataset, space_key)
+            system, _ = self._open_space(dataset, space_key, scheme)
             try:
                 if system.db.space_stats(space_id)["rounds"] == 0:
                     raise RuntimeError(f"空间 {space_id} 还没有构建，先跑一次评测或 --build-only")
@@ -286,8 +295,8 @@ class EvalRunner:
 
         with ThreadPoolExecutor(max_workers=max(1, self.config.workers)) as pool:
             futures = [
-                pool.submit(run_group, dataset, key, items)
-                for (dataset, key), items in groups.items()
+                pool.submit(run_group, dataset, key, scheme, items)
+                for (dataset, key, scheme), items in groups.items()
             ]
             for future in as_completed(futures):
                 future.result()
@@ -341,7 +350,7 @@ class EvalRunner:
         build: dict[str, Any] = {}
         try:
             if any(m.needs_index for _, methods in items for m in methods):
-                system, build = self._open_space(evalset.dataset, space_key)
+                system, build = self._open_space(evalset.dataset, space_key, evalset.session_ids)
                 with start_trace("ingest", space=space_id) as trace:
                     report = system.ingest(to_conversation(space_id, sessions))
                 row = {
@@ -396,7 +405,9 @@ class EvalRunner:
                 self._stop.set()
                 return
             try:
-                row = self._evaluate(sample, method, sessions, system, space_id)
+                row = self._evaluate(
+                    sample, method, sessions, system, space_id, evalset.session_ids
+                )
             except Exception as exc:
                 self._record_error(sample, method, exc, stage="answer")
                 return
@@ -425,8 +436,9 @@ class EvalRunner:
         sessions: list[EvalSession],
         system: MemorySystem | None,
         space_id: str,
+        session_ids: SessionIds = "native",
     ) -> dict[str, Any]:
-        ctx = MethodContext(sample, sessions, self.reader, system, space_id)
+        ctx = MethodContext(sample, sessions, self.reader, system, space_id, session_ids)
         with start_trace("answer", method=method.name, sample=sample.sample_id) as trace:
             output = method.answer(ctx)
         usage = usage_from_trace(trace)
@@ -491,9 +503,14 @@ class EvalRunner:
             relevant_units=relevant_units,
         )
 
-    def _open_space(self, dataset: str, space_key: str) -> tuple[MemorySystem, dict[str, Any]]:
+    def _open_space(
+        self, dataset: str, space_key: str, session_ids: SessionIds | None = None
+    ) -> tuple[MemorySystem, dict[str, Any]]:
         """打开这份对话历史的记忆空间。复用时（reuse_spaces）存在磁盘上，下次运行直接用；
-        build.json 记下首次构建时的写入与巩固统计，复用时报告里的写入成本照样有数。"""
+        build.json 记下首次构建时的写入与巩固统计，复用时报告里的写入成本照样有数。
+
+        会话 ID 改写过（anon）与保留原始 ID（raw）的空间放在不同目录（space_dir），数据库里
+        另记一份写法：对不上的空间作废重建，两种 ID 不会混在一个空间里。"""
         parts: dict[str, Any] = {
             "embedder": self.embedder,
             "llm": self.llm,
@@ -503,12 +520,13 @@ class EvalRunner:
         }
         if not self.config.reuse_spaces:
             return MemorySystem.ephemeral(self.settings, **parts), {}
-        directory = space_dir(self.settings, dataset, self.embedder, space_key)
+        scheme = session_ids or session_id_scheme(dataset)
+        directory = space_dir(self.settings, dataset, self.embedder, space_key, scheme)
         try:
-            system = MemorySystem.on_disk(self.settings, directory, **parts)
-        except ConfigMismatchError:  # 换了向量模型：旧空间作废，重建
+            system = _on_disk(self.settings, directory, scheme, parts)
+        except ConfigMismatchError:  # 换了向量模型或会话 ID 的写法：旧空间作废，重建
             shutil.rmtree(directory, ignore_errors=True)
-            system = MemorySystem.on_disk(self.settings, directory, **parts)
+            system = _on_disk(self.settings, directory, scheme, parts)
         path = directory / "build.json"
         build = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         build["_path"] = str(path)
@@ -525,8 +543,8 @@ class EvalRunner:
             return
         self._append("ingest.jsonl", {**build[stage], "reused": True})
 
-    def _check_resume(self, info: dict[str, Any]) -> None:
-        _check_resume_compatible(info, self.settings, self.config)
+    def _check_resume(self, info: dict[str, Any], session_ids: SessionIds = "native") -> None:
+        _check_resume_compatible(info, self.settings, self.config, session_ids)
 
     def _drop_failed(
         self,
@@ -619,8 +637,10 @@ class EvalRunner:
                 "created": now,
                 "resumed": [],
             }
+            if evalset.session_ids != "native":  # LoCoMo 的 run.json 不变
+                info["session_ids"] = evalset.session_ids
         else:
-            self._check_resume(info)
+            self._check_resume(info, evalset.session_ids)
             info["resumed"].append(now)
             info["config"]["methods"] = sorted(
                 set(info["config"]["methods"]) | set(self.config.methods)
@@ -628,12 +648,21 @@ class EvalRunner:
         path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _check_resume_compatible(info: dict[str, Any], settings: Settings, config: RunConfig) -> None:
-    """续跑同名运行时，关键配置必须一致；否则新旧结果会混在一个目录里（N4 差点发生过）。"""
+def _check_resume_compatible(
+    info: dict[str, Any],
+    settings: Settings,
+    config: RunConfig,
+    session_ids: SessionIds = "native",
+) -> None:
+    """续跑同名运行时，关键配置必须一致；否则新旧结果会混在一个目录里（N4 差点发生过）。
+
+    会话 ID 的写法也要一致：改写之前的运行没有记下写法，LongMemEval / MemLens 的都是原始 ID。"""
     previous = info.get("config", {})
+    before_ids = info.get("session_ids") or session_id_scheme(str(previous.get("dataset")), True)
     checks = {
         "数据集": (previous.get("dataset"), config.dataset),
         "划分": (previous.get("split"), config.split),
+        "会话 ID": (before_ids, session_ids),
         "向量模型": (info.get("embedding", {}).get("model"), settings.embedding.model),
         "回答模型": (
             info.get("roles", {}).get("reader", {}).get("model"),
@@ -652,10 +681,39 @@ def _safe_name(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", key)
 
 
-def space_dir(settings: Settings, dataset: str, embedder: TextEmbedder, space_key: str) -> Path:
-    """评测记忆空间的目录：按向量模型分开存，换模型对比时两套空间可以共存。"""
+def space_dir(
+    settings: Settings,
+    dataset: str,
+    embedder: TextEmbedder,
+    space_key: str,
+    session_ids: SessionIds | None = None,
+) -> Path:
+    """评测记忆空间的目录：按向量模型分开存，换模型对比时两套空间可以共存。
+
+    会话 ID 改写过的空间放在 <数据集>-anon 下，与之前（原始 ID）的空间分开（见 datasets 的
+    storage_name）；session_ids 为 None 时按环境变量，与加载数据集时一致。LoCoMo 不变。"""
     model = _safe_name(f"{embedder.name}-{embedder.dim}")
-    return settings.paths.eval_spaces / dataset / model / _safe_name(space_key)
+    folder = storage_name(dataset, session_ids)
+    return settings.paths.eval_spaces / folder / model / _safe_name(space_key)
+
+
+SESSION_IDS_META = "session_ids"  # 评测空间的数据库里记下的会话 ID 写法
+
+
+def _on_disk(
+    settings: Settings, directory: Path, scheme: SessionIds, parts: dict[str, Any]
+) -> MemorySystem:
+    """打开磁盘上的评测空间；LongMemEval / MemLens 的空间核对会话 ID 的写法（不一致时报
+    ConfigMismatchError，调用方删掉重建）。改写之前建的空间没有这条记录，都是原始 ID：
+    它们在原来的目录里，只会被原始 ID 的运行打开，第一次打开时记为 raw。LoCoMo 不记。"""
+    system = MemorySystem.on_disk(settings, directory, **parts)
+    if scheme != "native":
+        try:
+            system.db.check_or_set_meta(SESSION_IDS_META, scheme)
+        except ConfigMismatchError:
+            system.close()
+            raise
+    return system
 
 
 def _git_version() -> str:

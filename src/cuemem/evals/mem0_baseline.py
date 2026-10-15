@@ -44,7 +44,12 @@ from cuemem.core.trace import start_trace
 from cuemem.embed import build_embedder
 from cuemem.embed.base import EmbedKind, TextEmbedder
 from cuemem.errors import ContentFilteredError
-from cuemem.evals.datasets import EvalSession
+from cuemem.evals.datasets import (
+    EvalSession,
+    SessionIds,
+    build_matches_session_ids,
+    storage_space_id,
+)
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.llm.client import LLMClient, Message
 
@@ -183,10 +188,12 @@ class Mem0Baseline:
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
         self._setup(ctx.reader.llm)
-        key = re.sub(r"[^A-Za-z0-9_.-]", "_", ctx.space_id)  # 如 locomo:conv-42 → locomo_conv-42
+        # 如 locomo:conv-42 → locomo_conv-42；会话 ID 改写过的另存（longmemeval_s-anon_<题号>）
+        stored = storage_space_id(ctx.space_id, ctx.session_ids)
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", stored)
         found: list[tuple[str | None, dict[str, Any]]] = []
         with self._space_lock(key):
-            built = self._ensure_built(key, ctx.sessions)
+            built = self._ensure_built(key, ctx.sessions, ctx.session_ids)
             memory = self._memory(key)
             for me in _perspectives(ctx.sessions):
                 results = memory.search(
@@ -204,14 +211,22 @@ class Mem0Baseline:
 
     # ---------- 写入 ----------
 
-    def _ensure_built(self, key: str, sessions: Sequence[EvalSession]) -> dict[str, Any] | None:
+    def _ensure_built(
+        self, key: str, sessions: Sequence[EvalSession], session_ids: SessionIds = "native"
+    ) -> dict[str, Any] | None:
         """第一次用到这份对话历史时写入 Mem0；写完留下 build.json，之后的运行直接复用。
 
         写入在独立线程里做：不算进当前这道题的回答用量（评测 trace 绑定在调用线程上），
         单独统计后写进 build.json。中途失败的半成品下次整个重建。
+
+        记忆的元数据里存着会话 ID（证据的抬头会显示它）：LongMemEval / MemLens 的写入记下
+        会话 ID 的写法，对不上就重建（改写之前的写入没有这条记录，都是原始 ID）。
         """
         directory = self.root / key
-        if (directory / "build.json").exists():
+        record = directory / "build.json"
+        if record.exists() and (
+            session_ids == "native" or build_matches_session_ids(_read_json(record), session_ids)
+        ):
             return None
         with self._lock:
             if key in self._failed:
@@ -228,7 +243,9 @@ class Mem0Baseline:
             with self._lock:
                 self._failed[key] = f"{type(exc).__name__}: {exc}"[:300]
             raise
-        (directory / "build.json").write_text(json.dumps(stats, indent=2), "utf-8")
+        if session_ids != "native":  # LoCoMo 的写入记录不变
+            stats["session_ids"] = session_ids
+        record.write_text(json.dumps(stats, indent=2), "utf-8")
         with self._lock:
             self._build_spent += float(stats.get("spent", 0.0))
         return stats
@@ -326,6 +343,15 @@ class Mem0Baseline:
             return
         memory.close()
         memory.vector_store.client.close()
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """读写入记录；读不了时当作空记录（于是按原始 ID 处理，对不上就重建）。"""
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _perspectives(sessions: Sequence[EvalSession]) -> list[str | None]:

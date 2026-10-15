@@ -146,6 +146,9 @@ CONTAINS = "Document chunk mentions "  # Cognee 的块 → 实体包含边的文
 SECRET_ENV = re.compile(r"^AWS_|KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL", re.IGNORECASE)
 PREFIX = re.compile(r"\ASession: (\d+)\nTurn: (\d+)\n(?:Part: \d+/\d+\n)?Time anchor: [^\n]*\n+")
 LESSON = re.compile(r"\A# Session learning \(session s(\d{4})_[^)\n]*\)\n*")
+# 会话蒸馏的会话 ID 写成 s<编号>_session（distill_session_id）；写入记录里记下它，早先带着题号的
+# 蒸馏写入不再复用（只涉及做了蒸馏的历史，LoCoMo 不做蒸馏、不受影响）
+LESSON_TAG = "session"
 SESSION_FILE = re.compile(r"\As(\d{4})_")  # 会话文件名（Cognee 的 Data.name）→ 会话编号
 
 
@@ -263,9 +266,14 @@ def manifest(sessions: Sequence[EvalSession]) -> dict[str, Any]:
     return {"two_people": pairs_of_people, "sessions": rows}
 
 
-def distill_session_id(number: int, dataset: str) -> str:
-    """会话蒸馏用的会话 ID；蒸馏出的经验文档开头写着它，检索时据此找回是哪个会话。"""
-    return f"s{number:04d}_{dataset}"
+def distill_session_id(number: int) -> str:
+    """会话蒸馏用的会话 ID；蒸馏出的经验文档开头写着它，检索时据此找回是哪个会话。
+
+    只用会话编号：经验文档要交给 cognify 的模型抽图谱，Cognee 还按它建节点集
+    （session_learnings:<会话 ID>，实体的关系里看得到）。早先这里带着数据集名，也就是题号，
+    LongMemEval 拒答题的题号以 _abs 结尾，等于把"这题该拒答"写进了记忆（N12 修复）。
+    子进程的数据都在这份历史自己的目录里，编号已经不会重。"""
+    return f"s{number:04d}_{LESSON_TAG}"
 
 
 def split_prefix(text: str) -> tuple[int | None, int | None, str]:
@@ -591,7 +599,7 @@ async def _build(directory: Path) -> dict[str, Any]:
             )
 
         steps: list[Any] = [ingest()]
-        session_id = distill_session_id(int(row["number"]), dataset)
+        session_id = distill_session_id(int(row["number"]))
         if ingest_beam is not None:  # 与 local_ingest 相同：写入的同时逐轮分析
             turns = ingest_beam.parse_turns(path)
             steps.append(
@@ -993,12 +1001,26 @@ class CogneeBaseline(ExternalBaseline):
         if not reply.get("ok"):
             raise RuntimeError(f"Cognee 写入失败：{reply.get('error')}")
         items = sum(len(row["items"]) for row in plan["sessions"])
+        lessons = {"lesson_ids": LESSON_TAG} if plan["distill"] else {}  # LoCoMo 的记录不变
         return {
             "dataset": plan["dataset"],
             "distill": plan["distill"],
             "chunks_written": items,
+            **lessons,
             **reply["stats"],
         }
+
+    def _ensure_built(
+        self, key: str, directory: Path, sessions: Sequence[EvalSession]
+    ) -> dict[str, Any] | None:
+        """做了会话蒸馏、但蒸馏的会话 ID 还带着题号的写入（见 distill_session_id）不能复用：
+        删掉写入记录，交给基类重建。"""
+        record = directory / "build.json"
+        if record.exists():
+            built = json.loads(record.read_text("utf-8"))
+            if built.get("distill") and built.get("lesson_ids") != LESSON_TAG:
+                record.unlink()
+        return super()._ensure_built(key, directory, sessions)
 
     # ---------- 检索 ----------
 

@@ -231,7 +231,11 @@ def test_memlens_loader_and_judge(tmp_path: Path, images: dict[str, Path], fake_
     turn = evalset.haystacks["q_1"][0].turns[0]
     assert turn.images == [str(target)] and sample.meta["question_subtype"] == "arithmetic"
     assert turn.has_answer  # 证据会话里带关键图片的发言是证据发言
-    assert not sample.is_abstention and sample.evidence_session_ids == ["s1"]
+    # 会话 ID 按时间顺序改写成 session_<i>，证据随之改写，原 ID 只留作追溯
+    assert not sample.is_abstention and sample.evidence_session_ids == ["session_1"]
+    assert evalset.session_ids == "anon"
+    assert evalset.haystacks["q_1"][0].session_id == "session_1"
+    assert evalset.haystacks["q_1"][0].source_id == "s1"
 
     prompt = memlens_prompt(sample, "$10")
     assert "[MSR — Arithmetic]" in prompt and prompt.endswith("[Scoring Rationale]:")
