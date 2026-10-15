@@ -1,0 +1,16 @@
+# 通义预设（N12）：只有 QwenCloud（DASHSCOPE_API_KEY）一家的 Key 时用。默认配置里只有回答模型
+# （reader、vlm）用 DeepSeek，这里换成 qwen3.8-flash；抽取、规划、向量、重排、图片向量与判分都和
+# 默认配置相同。
+#   CUEMEM_PRESET=qwen                 # 或 cuemem --preset qwen …、Memory(preset="qwen")
+#
+# 局限：
+# - 回答（qwen3.8-flash）与判分（qwen3.8-max）同一家族，D-008 说的"给自己打分"的偏差比默认配置大；
+#   N11 的第二判分实验里两家判分的一致率 94.7–97.9%。
+# - 内容审核误拒时没有别家的备用模型可换（默认配置换 deepseek-flash），被拒的会话照常跳过并计数。
+
+roles:
+  reader: {model: qwen3.8-flash}
+  vlm: {model: qwen3.8-flash}
+
+consolidation:
+  fallback_model: null
