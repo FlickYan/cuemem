@@ -49,10 +49,11 @@ evals/external.py），只换"记忆从哪来"：
    列出），每条最多带 k 条。
 7. 回答：论文的评测按题型用不同的回答提示（对抗题甚至把标准答案列成选项之一），这里与所有
    方法一样交给同一个回答模型、同一套提示，A-MEM 只负责检索。检索用的关键词那次 LLM 调用不经
-   网关，直接用评测的 LLM 客户端在回答线程里发同样的请求（extractor 角色的模型、A-MEM 控制器的
-   系统提示与 temperature、网关同样的 JSON 约束），这样它算进每道题的用量与 --max-cost（经网关
-   就只落在网关的桶里）。关键词按"查询"向量化：通义的向量区分查询与文档，CueMem 与 M0 的检索
-   也这样（A-MEM 自己的 all-MiniLM 不区分；deepseek 预设的 bge-small 也不区分）。
+   HTTP，直接用评测的 LLM 客户端在回答线程里发同样的请求（extractor 角色的模型、A-MEM 控制器的
+   系统提示与 temperature、网关同样的 JSON 约束与备用模型），这样它算进每道题的用量与
+   --max-cost（经网关就只落在网关的桶里）。关键词按"查询"向量化，与网关对检索阶段的桶
+   （`amem.search.<空间>`）的做法、CueMem 与 M0 的检索相同：通义的向量区分查询与文档（A-MEM
+   自己的 all-MiniLM 不区分；deepseek 预设的 bge-small 也不区分）。
 8. 说话人：两人对话（LoCoMo）照论文写 `Speaker <名字> says : …`（论文原文少一个空格，
    "Speaker Carolinesays"，这里补上）；用户与助手的对话（LongMemEval）用 user / assistant 当名字。
 9. 结构化输出与回复上限：A-MEM 用 OpenAI 的 json_schema（strict）；网关把它改成 JSON 模式并把
@@ -92,9 +93,10 @@ deepseek 预设）。它依赖 sentence-transformers，会顺带装上 torch（�
     # 作者给 GPT-4o 级模型的 k（敏感性运行，复用上面的写入）
     CUEMEM_PRESET=deepseek CUEMEM_AMEM_K=40 uv run --extra local --with "agentic-memory @ $AMEM" \\
         cuemem eval run --dataset locomo --split test200r --methods MA --name pds-locomo-amem-k40
-    # qwen 协议（要 DASHSCOPE_API_KEY）：写入放在另一个目录，不碰 pds 的写入
-    CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen uv run --with "agentic-memory @ $AMEM" \\
-        cuemem eval run --dataset locomo --split test200r --methods MA --name qwen-locomo-amem
+    # pq 协议（只用通义，要 DASHSCOPE_API_KEY）：写入放在另一个目录，不碰 pds 的写入
+    CUEMEM_PRESET=qwen CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen \\
+        uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \\
+        --split test200r --methods MA --peak warn --name pq-locomo-amem
 
 试过的版本：agiresearch/A-mem@ceffb86、chromadb 1.5.9（Python 3.12）。试跑（deepseek 预设）：
 conv-42（29 个会话、629 句）写入 {calls4096} 次调用、{minutes4096} 分钟，名义 ${cost4096}。
@@ -770,7 +772,8 @@ class AMemBaseline(ExternalBaseline):
         self, key: str, directory: Path, sample: Sample, sessions: Sequence[EvalSession]
     ) -> tuple[list[Hit], dict[str, Any]]:
         space = self._open(key, directory)
-        query = self._keywords(sample.question)
+        query, query_model = self._keywords(key, sample.question)
+        # 查询向量也在本线程算：与网关对检索阶段的桶的做法相同（kind="query"），用量记进这道题
         vector = self.embedder.embed([query], "query").dense[0].tolist()
         found = space.store.nearest(vector, self.k)
         ranked: list[int] = []
@@ -786,30 +789,38 @@ class AMemBaseline(ExternalBaseline):
         return hits, {
             "amem_k": self.k,
             "amem_query": query,
+            "amem_query_model": query_model,
             "amem_retrieved": len(ranked),
             "amem_linked": sum(1 for _, linked in picked if linked),
             "amem_tokens": sum(estimate_tokens(h.unit.text) for h in hits),
         }
 
-    def _keywords(self, question: str) -> str:
+    def _keywords(self, key: str, question: str) -> tuple[str, str]:
         """论文评测代码的 generate_query_llm：请求与写入时相同（A-MEM 控制器的系统提示与
-        temperature，JSON 约束照网关写进系统提示），但在回答线程里直接用评测的 LLM 客户端发，
-        用量算进这道题（见模块说明第 7 条）。内容审核拒绝时照评测代码的兜底，用问题原文检索。"""
+        temperature，JSON 约束照网关写进系统提示），但在回答线程里发，用量算进这道题（见模块说明
+        第 7 条）。选模型也与网关相同：内容审核误拒、超时或 JSON 生成失控时换备用模型（通义预设是
+        qwen3.7-plus，D-050）。备用模型也被内容审核拒绝时照评测代码的兜底，用问题原文检索。
+        返回（检索用的文本，回答它的模型别名）。"""
         messages: list[Message] = [
             {"role": "system", "content": JSON_SYSTEM},
             {"role": "user", "content": QUERY_PROMPT.format(question=question)},
         ]
+        primary = self.llm.settings.roles[self.gateway.role].model
+        kwargs: dict[str, Any] = {
+            "temperature": 0.7,
+            "max_tokens": MAX_TOKENS,
+            "response_format": {"type": "json_object"},
+            "cache_scope": f"gateway|{self.bucket(key, 'search')}",
+        }
         try:
-            result = self.llm.chat(
-                self.gateway.role,
-                _with_schema(messages, QUERY_SCHEMA),
-                temperature=0.7,
-                max_tokens=MAX_TOKENS,
-                response_format={"type": "json_object"},
+            # 网关自己的选模型逻辑；不走 gateway.chat，因为它按"当前 trace"给桶记账，在回答
+            # 线程里会把这道题此前的用量也记进检索的桶
+            result, alias, _ = self.gateway._call(
+                _with_schema(messages, QUERY_SCHEMA), kwargs, primary
             )
         except ContentFilteredError:
-            return question
-        return parse_keywords(result.content, question)
+            return question, ""
+        return parse_keywords(result.content, question), alias
 
     def _open(self, key: str, directory: Path) -> _Space:
         """打开（或复用）一份写好的对话；最多同时开 MAX_OPEN 个，多了关掉最久没用的。"""

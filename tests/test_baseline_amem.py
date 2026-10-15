@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx2
 import pytest
+from fakes import ABORT_JSON, REJECT, FakeAPI
 from openai import APIConnectionError, BadRequestError, InternalServerError
 
 from cuemem.errors import ConfigMismatchError
@@ -356,6 +357,44 @@ def test_k_defaults_to_the_paper_and_can_be_raised(monkeypatch: pytest.MonkeyPat
             AMemBaseline()
 
 
+def test_query_keywords_pick_the_model_like_the_gateway(
+    offline_settings: Any, fake_api: FakeAPI
+) -> None:
+    """检索的关键词调用在回答线程里发（用量进这道题），选模型与网关相同：JSON 生成失控时换备用
+    模型；备用模型也被内容审核拒绝时用问题原文检索。不经网关的桶。"""
+    from cuemem.core.trace import start_trace
+    from cuemem.embed import build_embedder
+    from cuemem.evals.gateway import Gateway
+    from cuemem.evals.runner import usage_from_trace
+    from cuemem.llm import Ledger, LLMClient, ResponseCache
+
+    llm = LLMClient(
+        offline_settings,
+        cache=ResponseCache(None),
+        ledger=Ledger(None),
+        http_client=fake_api.client(),
+    )
+    baseline = AMemBaseline()
+    baseline.llm = llm
+    baseline.gateway = Gateway(llm, build_embedder(offline_settings, use_cache=False))
+    question = "When did Caroline go to the support group?"
+    fake_api.chat_replies = [lambda body: '{"keywords": "Caroline, support group"}']
+    with start_trace("answer") as trace:
+        assert baseline._keywords("c1", question) == ("Caroline, support group", "qwen3.8-flash")
+    assert usage_from_trace(trace)["llm_calls"] == 1
+    sent = fake_api.chat_requests[-1]
+    assert sent["temperature"] == 0.7 and sent["max_tokens"] == MAX_TOKENS
+    assert sent["response_format"] == {"type": "json_object"}
+    fake_api.chat_replies = [
+        lambda body: ABORT_JSON if body["model"] == "qwen3.8-flash" else '{"keywords": "a, b"}'
+    ]
+    # 换个问题：同样的请求会命中缓存
+    assert baseline._keywords("c1", "Who?") == ("a, b", "deepseek-flash")  # 备用模型
+    fake_api.chat_replies = [lambda body: REJECT]
+    assert baseline._keywords("c1", "Where?") == ("Where?", "")
+    assert baseline.gateway.usage(baseline.bucket("c1", "search"))["chat_calls"] == 0
+
+
 def test_build_of_another_protocol_is_not_deleted(tmp_path: Path) -> None:
     """换了抽取模型或向量模型（pds → qwen）：不删另一个协议的写入，报错让换目录；
     只是 A-MEM 的写入参数变了（旧版写入）才交给基类重建。"""
@@ -451,6 +490,7 @@ def test_build_and_retrieve_through_the_gateway(
         with start_trace("answer") as trace:  # 关键词那次调用与查询向量算进这道题的用量
             hits, details = baseline.retrieve(key, directory, sample, sessions)
         assert details["amem_query"] == "support group" and details["amem_k"] == DEFAULT_K
+        assert details["amem_query_model"] == "qwen3.8-flash"
         assert details["amem_retrieved"] == 4 and len(hits) == 4  # 只有 4 条，全取到
         usage = usage_from_trace(trace)
         assert usage["llm_calls"] == 1 and usage["cost"] > 0
