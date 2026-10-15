@@ -34,6 +34,8 @@ from cuemem.evals.baselines.amem import (
     _find_related_memories,
     clean_analysis,
     expand,
+    fits,
+    json_schema_of,
     link_targets,
     load_notes,
     merge_rounds,
@@ -285,7 +287,7 @@ def test_controller_sends_amem_request_and_counts_problems() -> None:
         _error(BadRequestError, 400),
     ]
     sent: list[dict[str, Any]] = []
-    controller = _Controller(_client(replies, sent), "deepseek-flash", waits=(0.0,))
+    controller = _Controller(_client(replies, sent), "deepseek-flash", waits=(0.0,), resamples=0)
     schema = {"type": "json_object"}
     assert controller.get_completion("p", schema) == '{"a": 1}'
     assert sent[0]["messages"] == [
@@ -303,6 +305,61 @@ def test_controller_sends_amem_request_and_counts_problems() -> None:
     assert (controller.truncated, controller.invalid_json) == (1, 1)
     assert controller.errors == ["BadRequestError: simulated"]
     controller.check()  # 被拒绝的少数几次照 A-MEM 的做法跳过，写入继续
+
+
+ANALYSIS: dict[str, Any] = {  # A-MEM 的 analyze_content 发的 response_format（没有 required）
+    "type": "json_schema",
+    "json_schema": {
+        "name": "response",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "keywords": {"type": "array", "items": {"type": "string"}},
+                "context": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+}
+ECHO = json.dumps(ANALYSIS["json_schema"]["schema"])  # 通义 JSON 模式偶尔把 schema 原样回显
+WRAPPED = '{"type": "object", "properties": {"keywords": ["a"], "context": "c", "tags": ["t"]}}'
+VALID = '{"keywords": ["a"], "context": "c", "tags": ["t"], "extra": 1}'
+
+
+def test_fits_requires_an_object_with_every_schema_field() -> None:
+    schema = json_schema_of(ANALYSIS)
+    assert schema is not None and fits(VALID, schema)  # 多出的字段无妨
+    assert not fits(ECHO, schema) and not fits(WRAPPED, schema)
+    assert not fits('{"keywords": ["a"], "context": "c"}', schema)  # 缺字段
+    assert not fits('[{"keywords": [], "context": "", "tags": []}]', schema)  # 列表
+    assert not fits('{"keywords": ["a", "b', schema) and not fits(None, schema)  # 截断
+    assert fits('{"keywords": "a, b", "context": ["x"], "tags": []}', schema)  # 类型不细查
+    assert json_schema_of({"type": "json_object"}) == {} and json_schema_of(None) is None
+    assert fits("{}", {}) and not fits("[]", {})
+
+
+def test_controller_resamples_replies_that_do_not_fit_the_schema() -> None:
+    """回复不合 schema 时重新采样，每次把回复上限减 1（落到网关缓存的新键上）；最多两次，
+    仍不合就照原样交给 A-MEM（它放弃这次分析或演化），不算调用失败。"""
+    replies: list[Any] = [(ECHO, "stop"), (WRAPPED, "stop"), (VALID, "stop")]
+    sent: list[dict[str, Any]] = []
+    controller = _Controller(_client(replies, sent), "m", waits=())
+    assert controller.get_completion("p", ANALYSIS) == VALID
+    assert [request["max_tokens"] for request in sent] == [MAX_TOKENS, MAX_TOKENS - 1, 4094]
+    assert all(request["response_format"] == ANALYSIS for request in sent)
+    assert (controller.calls, controller.resampled, controller.unusable) == (1, 2, 0)
+    assert controller.schema_mismatch == 2 and controller.invalid_json == 0
+
+    cut = '{"keywords": ["a", "b'
+    replies[:] = [(cut, "length"), ("[]", "stop"), (cut, "length")]
+    assert controller.get_completion("p", ANALYSIS) == cut
+    assert (controller.calls, controller.resampled, controller.unusable) == (2, 4, 1)
+    assert (controller.truncated, controller.invalid_json, controller.schema_mismatch) == (2, 2, 3)
+    controller.check()  # 不能用的回复照 A-MEM 的做法放弃，写入继续
+
+    replies[:] = [("not json", "stop")]
+    assert controller.get_completion("p") == "not json"  # 没有 response_format：不查
+    assert controller.resampled == 4 and controller.invalid_json == 2
 
 
 def test_controller_retries_transient_errors_then_aborts_the_build() -> None:
@@ -390,6 +447,13 @@ def test_query_keywords_pick_the_model_like_the_gateway(
     ]
     # 换个问题：同样的请求会命中缓存
     assert baseline._keywords("c1", "Who?") == ("a, b", "deepseek-flash")  # 备用模型
+    # 回显 schema：重新采样（上限减 1，落到缓存的新键上）
+    echo = json.dumps({"type": "object", "properties": {"keywords": {"type": "string"}}})
+    fake_api.chat_replies = [
+        lambda body: echo if body["max_tokens"] == MAX_TOKENS else '{"keywords": "falls"}'
+    ]
+    assert baseline._keywords("c1", "Where did she hike?") == ("falls", "qwen3.8-flash")
+    assert [r["max_tokens"] for r in fake_api.chat_requests[-2:]] == [MAX_TOKENS, MAX_TOKENS - 1]
     fake_api.chat_replies = [lambda body: REJECT]
     assert baseline._keywords("c1", "Where?") == ("Where?", "")
     assert baseline.gateway.usage(baseline.bucket("c1", "search"))["chat_calls"] == 0
@@ -418,6 +482,8 @@ def _fake_model(body: dict[str, Any]) -> str:
     """假的抽取模型：按提示回 A-MEM 的笔记分析、演化决定，或检索用的关键词。"""
     prompt = body["messages"][-1]["content"]
     if "Generate a structured analysis" in prompt:
+        if "How was it?" in prompt and body.get("max_tokens") == MAX_TOKENS:  # 回显 schema
+            return json.dumps({"type": "object", "properties": {"keywords": {"type": "array"}}})
         content = prompt.rsplit("Content for analysis:", 1)[-1]
         keyword = "support group" if "support group" in content else "chat"
         return json.dumps({"keywords": [keyword], "context": "A talk.", "tags": ["life"]})
@@ -475,7 +541,10 @@ def test_build_and_retrieve_through_the_gateway(
         assert built["truncated"] == 0 and built["max_tokens"] == MAX_TOKENS
         assert built["empty_analyses"] == 0 and built["retries"] == 0
         assert fake_api.chat_requests[0]["max_tokens"] == MAX_TOKENS  # 网关照传给上游
-        assert built["amem_calls"] == 7 and built["chat_calls"] == 7  # 4 次分析 + 3 次演化
+        assert built["amem_calls"] == 7  # 4 次分析 + 3 次演化
+        # 第 2 条的分析先回显了 schema：重新采样一次（上限减 1），之后合规
+        assert built["chat_calls"] == 8 and built["resampled"] == 1
+        assert built["schema_mismatch"] == 1 and built["unusable_replies"] == 0
         assert built["evolved"] == 3 and built["links"] >= 3 and built["unresolved_links"] == 0
         notes = load_notes(directory / NOTES)
         assert [n.session_id for n in notes] == ["session_1"] * 2 + ["session_2"] * 2

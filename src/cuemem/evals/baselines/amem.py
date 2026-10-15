@@ -40,10 +40,12 @@ evals/external.py），只换"记忆从哪来"：
    上下文与标签重新向量化。
 6. k：默认 10，论文的主要设置（"we primarily employ k=10"）与评测代码的默认值。论文表 8 给
    GPT-4o-mini / GPT-4o 调到 40–50（按题型，但最小是 40，统一取 40 用不着题型），作者的 README
-   也说要调 k 才能复现论文的数字；deepseek-flash 与它们同档，所以 k=40 才是作者对这一档模型的
-   设置。主结果仍用 10，是为了证据量与其他方法可比：笔记演化后很长（上下文平均约 500 字符、
-   二十个标签），每条又带出它链接的笔记（平均 3.4 条），试跑的 conv-42 上 k=10 已经平均给回答
-   模型约 9k tokens（CueMem L1 约 4k），k=40 约 27k。k=40 作为作者设置的敏感性运行：环境变量
+   也说要调 k 才能复现论文的数字；deepseek-flash、qwen3.8-flash 与它们同档，所以 k=40 才是作者
+   对这一档模型的设置。主结果仍用 10，是为了证据量与其他方法可比：笔记演化后很长，每条又带出
+   它链接的笔记。deepseek 预设（回复上限 2000）的试跑里上下文平均约 500 字符、二十个标签，
+   conv-42 上 k=10 平均给回答模型约 9k tokens（CueMem L1 约 4k），k=40 约 27k；pq 协议
+   （qwen3.8-flash 写的上下文短一半）的前 3 题 k=10 约 3k–7k，k=40 约 12k–23k。
+   k=40 作为作者设置的敏感性运行：环境变量
    CUEMEM_AMEM_K=40，运行名另起（见下面的命令）；k 只影响检索，写入照样复用，只多花回答的
    tokens。评测的 --k 管不到 MA（外部基线构造时不带参数）。链接带出的笔记去重（论文代码会重复
    列出），每条最多带 k 条。
@@ -61,25 +63,34 @@ evals/external.py），只换"记忆从哪来"：
    OpenAIController（系统提示"You must respond with a JSON object."、temperature 0.7），回复
    上限是 4096 tokens：论文代码与这个版本的控制器是 1000，作者现在的 A-mem-sys 不设上限。演化
    的回复要把 5 个邻居的上下文和标签都重写一遍，deepseek-flash 还按行排版 JSON，回复越来越长；
-   截断的 JSON 解析不了，A-MEM 就放弃这次演化（试跑 conv-42：上限 1000 时 1257 次调用有 129 次
-   截断，2000 时 36 次，4096 时 {truncated4096} 次）。4096 实际上就是不设上限，又是各家都接受
-   的值。代价是演化成功得多，邻居的上下文被改写得更长：1000 → 2000 时上下文平均 305 → 516 字符，
-   每条证据长约 40%。
+   截断的 JSON 解析不了，A-MEM 就放弃这次演化（deepseek-flash 试跑 conv-42：上限 1000 时 1257 次
+   调用有 129 次截断，2000 时 36 次）。4096 实际上就是不设上限，又是各家都接受的值。代价是演化
+   成功得多，邻居的上下文被改写得更长：1000 → 2000 时上下文平均 305 → 516 字符，每条证据长约
+   40%。
+   JSON 模式不保证 schema（strict 的结构化输出保证），所以回复不合 schema 时重新采样，最多两次：
+   回复解析不了（被截断）、不是 JSON 对象、或缺了 schema 里列的字段（见 fits）。同样的请求只会从
+   网关的缓存里拿回同一个坏回复，所以第 i 次重采样把回复上限减 i（回复远短于上限，不影响结果；
+   与 MG 的做法相同）；仍不合就照原样交给 A-MEM，它照旧放弃。pq 协议第一次试跑（不重采样）的
+   conv-42 上：14 / 629 次分析回的是 schema 本身（`{"type": "object", "properties": …}`，其中
+   6 次把内容包在 properties 里），分析因此为空；5 次演化在 4096 处截断，都是 qwen3.8-flash
+   的 JSON 生成失控（actions 里无休止地列数字，D-050 那种，加大上限也没用）；1 次演化回了列表。
+   这 6 次演化被放弃。重采样后见文末的试跑。
 10. 失败：A-MEM 自己吞掉 LLM 的异常（分析失败就留空，演化失败就不演化），笔记会悄悄缺了分析或
    演化；论文代码里演化的调用出错会直接中断。这里：网关回 5xx、连不上之类的临时错误与空回复
    （DeepSeek 高峰时把请求挂起十几分钟后回空）等 30 秒、2 分钟、5 分钟各重试一次，仍然失败就
    中止整份写入（不写 build.json，下次运行重建）；供应商拒绝的请求（400，如内容审核，重试也
-   一样）照 A-MEM 的做法跳过并计数，超过一半才算写入失败。被截断的回复、不是 JSON 的回复与
-   分析为空的笔记也计数，写进 build.json。
+   一样）照 A-MEM 的做法跳过并计数，超过一半才算写入失败。被截断、不是 JSON、不合 schema 的
+   回复（每次采样都数）、因此重采样的次数、重采样完仍不能用的调用与分析为空的笔记也计数，写进
+   build.json。
 11. 网关客户端不设超时，也不让 SDK 重发：网关背后是评测的 LLM 客户端，高峰时段（wait 策略）
    它暂停到高峰结束，A-MEM 与其他方法一样等着；客户端超时只会让 A-MEM 吞掉异常、丢掉分析或
    演化，而 SDK 重发的请求与原请求相同，LLM 客户端会把它合并到还在等的那次调用上，并不会重新
    请求上游。DeepSeek 有时把请求挂起十几分钟（只发空行保活，高峰时更常见），写入就等它；
    挂起后回的空内容按第 10 条重试。
 12. 写入缓存：基类按抽取模型与向量模型区分协议，这里再加上 A-MEM 的提交、回复上限与写入格式的
-    版本，变了旧写入就作废重建。换抽取模型或向量模型（例如从 pds 换到 qwen 协议）时不覆盖已有
-    的写入，直接报错：基类会把另一协议的写入删掉重建，而评测空间的目录不分协议。qwen 协议要用
-    另一个目录：CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen（与 scripts/n12_baselines.py
+    版本，变了旧写入就作废重建。换抽取模型或向量模型（例如从 pds 换到 pq 协议）时不覆盖已有
+    的写入，直接报错：基类会把另一协议的写入删掉重建，而评测空间的目录不分协议。用通义的协议要
+    用另一个目录：CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen（与 scripts/n12_baselines.py
     相同）。
 
 A-MEM 不是 CueMem 的依赖，评测时用 uv 临时装上（--extra local 只在用本机向量时需要，如
@@ -98,8 +109,9 @@ deepseek 预设）。它依赖 sentence-transformers，会顺带装上 torch（�
         uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \\
         --split test200r --methods MA --peak warn --name pq-locomo-amem
 
-试过的版本：agiresearch/A-mem@ceffb86、chromadb 1.5.9（Python 3.12）。试跑（deepseek 预设）：
-conv-42（29 个会话、629 句）写入 {calls4096} 次调用、{minutes4096} 分钟，名义 ${cost4096}。
+试过的版本：agiresearch/A-mem@ceffb86、chromadb 1.5.9（Python 3.12）。conv-42（29 个会话、
+629 句）的写入：deepseek 预设、回复上限 2000（第一版）1257 次调用、77 分钟，名义 $1.44（错峰
+实际 $0.69）；{PQ2}
 """
 
 from __future__ import annotations
@@ -124,7 +136,6 @@ from cuemem.errors import ConfigMismatchError, ContentFilteredError
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.external import ExternalBaseline, memory_hit
 from cuemem.evals.gateway import _with_schema
-from cuemem.llm.client import Message
 from cuemem.read.l1 import estimate_tokens
 
 REPO = "git+https://github.com/agiresearch/A-mem"
@@ -133,7 +144,9 @@ DEFAULT_K = 10  # 论文的主要设置与评测代码的默认值（见模块�
 K_ENV = "CUEMEM_AMEM_K"  # 改 k（作者给 GPT-4o 级模型的是 40）
 MAX_TOKENS = 4096  # A-MEM 的 OpenAIController 是 1000，A-mem-sys 不设上限（见模块说明第 9 条）
 # 写入格式的版本：笔记、向量化的文本或演化的替换方法改了就加一，旧写入作废重建
-BUILD_VERSION = 2  # 2：笔记记下发言下标；回复上限 4096；调用失败时中止写入
+# 2：笔记记下发言下标；回复上限 4096；调用失败时中止写入
+# 3：回复不合 schema（解析不了、被截断、回显 schema、不是对象）时重新采样
+BUILD_VERSION = 3
 JSON_SYSTEM = "You must respond with a JSON object."  # A-MEM 的 OpenAIController 的系统提示
 NOTES = "notes.json"  # 写完后的全部笔记（含演化后的上下文、标签与链接），按写入顺序
 CHROMA = "chroma"  # 持久化的 Chroma 目录
@@ -145,6 +158,9 @@ MAX_OPEN = 8  # 同时打开的对话（每份一个 Chroma）
 # 网关的临时错误（5xx、连不上、限流）重试前等多久（秒）。网关背后的 LLM 客户端已经按 SDK 的
 # 退避重试过几次，到这里多半是上游短暂不可用，所以等得更久
 RETRY_WAITS = (30.0, 120.0, 300.0)
+# 回复不合 schema 时最多再采样几次（见模块说明第 9 条）：第 i 次重采样把回复上限减 i，请求落到
+# 网关缓存的新键上（与 MG 的做法相同）
+RESAMPLES = 2
 
 
 class EmptyReplyError(Exception):
@@ -162,7 +178,7 @@ QUERY_PROMPT = (
     "text.\n\nExample response format:\n"
     '{{"keywords": "keyword1, keyword2, keyword3"}}'
 )  # 照搬原文，只去掉了缩进
-QUERY_SCHEMA = {
+QUERY_SCHEMA: dict[str, Any] = {
     "name": "response",
     "schema": {
         "type": "object",
@@ -390,6 +406,35 @@ def parse_keywords(response: str | None, question: str) -> str:
     return text.strip() or question
 
 
+def json_schema_of(response_format: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """A-MEM 请求里的 response_format → 要的 JSON schema（只要求 JSON 对象时是空 schema）。"""
+    if not response_format:
+        return None
+    if response_format.get("type") == "json_schema":
+        wrapper = response_format.get("json_schema") or {}
+        return dict(wrapper.get("schema") or wrapper)
+    return {} if response_format.get("type") == "json_object" else None
+
+
+def fits(content: str | None, schema: Mapping[str, Any]) -> bool:
+    """回复能不能当作 OpenAI 结构化输出（strict）给的结果：是 JSON 对象，schema 里列的字段都在。
+
+    网关把 json_schema 改成 JSON 模式，模型就不保证照 schema 回：被截断（qwen3.8-flash 偶尔生成
+    失控，D-050）、把 schema 原样回显成 `{"type": "object", "properties": …}`、回一个列表。A-MEM
+    对这些一律放弃（分析留空、不演化）。字段的值不细查：A-MEM 自己与这里的整理都容忍类型出入
+    （如链接给成整数序号、关键词给成一个字符串）。"""
+    try:
+        data = json.loads(content or "")
+    except json.JSONDecodeError:
+        return False
+    return shaped(data, schema)
+
+
+def shaped(data: Any, schema: Mapping[str, Any]) -> bool:
+    """解析好的回复是 JSON 对象，schema 里列的字段都在（见 fits）。"""
+    return isinstance(data, dict) and all(key in data for key in schema.get("properties") or {})
+
+
 def save_notes(path: Path, notes: Sequence[Note]) -> None:
     rows = [note.as_json() for note in notes]
     path.write_text(json.dumps(rows, ensure_ascii=False, indent=1), "utf-8")
@@ -407,8 +452,9 @@ class _Controller:
     客户端指向评测网关，回复上限是 MAX_TOKENS。
 
     A-MEM 自己会吞掉异常，所以这里先处理再交给它：临时错误按 waits 重试；仍然失败的记进
-    failed（写入循环见到就中止整份写入），供应商拒绝的（400）记进 rejected。顺带数调用、
-    被截断与不是 JSON 的回复。"""
+    failed（写入循环见到就中止整份写入），供应商拒绝的（400）记进 rejected。回复不合 schema
+    时重新采样，最多 resamples 次（见模块说明第 9 条），仍不合就照原样交给 A-MEM（它会放弃）。
+    顺带数调用、被截断、不是 JSON 与不合 schema 的回复（每次采样都数）。"""
 
     def __init__(
         self,
@@ -418,12 +464,14 @@ class _Controller:
         *,
         waits: Sequence[float] = RETRY_WAITS,
         sleep: Callable[[float], None] = time.sleep,
+        resamples: int = RESAMPLES,
     ) -> None:
         self.client = client
         self.model = model
         self.max_tokens = max_tokens
         self.waits = tuple(waits)
         self.sleep = sleep
+        self.resamples = resamples
         self.calls = 0
         self.failed = 0
         self.rejected = 0
@@ -431,6 +479,9 @@ class _Controller:
         self.empty_replies = 0
         self.truncated = 0
         self.invalid_json = 0
+        self.schema_mismatch = 0  # 是 JSON，却不是对象或缺了 schema 里的字段（如回显 schema）
+        self.resampled = 0  # 因此多发的请求
+        self.unusable = 0  # 重采样完仍不合 schema、照原样交给 A-MEM 的调用
         self.errors: list[str] = []
         self._lock = threading.Lock()
 
@@ -439,6 +490,27 @@ class _Controller:
     ) -> str:
         with self._lock:
             self.calls += 1
+        schema = json_schema_of(response_format)
+        content = ""
+        for attempt in range(self.resamples + 1):
+            if attempt:
+                with self._lock:
+                    self.resampled += 1
+            # 第 i 次重采样把上限减 i：同样的请求只会从网关的缓存里拿回同一个坏回复
+            content = self._sample(prompt, response_format, temperature, self.max_tokens - attempt)
+            if schema is None or fits(content, schema):
+                return content
+        with self._lock:
+            self.unusable += 1
+        return content
+
+    def _sample(
+        self,
+        prompt: str,
+        response_format: dict[str, Any] | None,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
         extra: dict[str, Any] = {"response_format": response_format} if response_format else {}
 
         def send() -> Any:
@@ -449,7 +521,7 @@ class _Controller:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens,
                 **extra,
             )
             if not str(response.choices[0].message.content or "").strip():
@@ -462,12 +534,17 @@ class _Controller:
         content = str(choice.message.content or "")
         with self._lock:
             self.truncated += choice.finish_reason == "length"
-        if response_format is not None:
+        schema = json_schema_of(response_format)
+        if schema is not None:
             try:
-                json.loads(content)
+                data = json.loads(content)
             except json.JSONDecodeError:
                 with self._lock:
                     self.invalid_json += 1
+            else:
+                if not shaped(data, schema):
+                    with self._lock:
+                        self.schema_mismatch += 1
         return content
 
     def attempt(self, call: Callable[[], Any]) -> Any:
@@ -736,7 +813,8 @@ class AMemBaseline(ExternalBaseline):
                             out.write(
                                 f"{datetime.now():%H:%M:%S} {len(origin)}/{total} notes, "
                                 f"{system.evo_cnt} evolved, {llm.rejected} rejected calls, "
-                                f"{llm.retries} retries, {elapsed:.0f}s\n"
+                                f"{llm.retries} retries, {llm.resampled} resampled, "
+                                f"{llm.unusable} unusable, {elapsed:.0f}s\n"
                             )
             notes = [
                 _note(system.memories[note_id], session, index)
@@ -759,8 +837,13 @@ class AMemBaseline(ExternalBaseline):
             "rejected_calls": llm.rejected,
             "retries": llm.retries,
             "empty_replies": llm.empty_replies,
+            # 以下三项按每次采样数；resampled 是因此多发的请求，unusable_replies 是重采样完仍
+            # 不合 schema、被 A-MEM 放弃的调用
             "truncated": llm.truncated,
             "invalid_json": llm.invalid_json,
+            "schema_mismatch": llm.schema_mismatch,
+            "resampled": llm.resampled,
+            "unusable_replies": llm.unusable,
             "error_samples": llm.errors,  # 不能叫 errors：基类会用网关桶里的错误计数覆盖它
             "max_tokens": llm.max_tokens,
             "amem_commit": COMMIT,
@@ -799,28 +882,35 @@ class AMemBaseline(ExternalBaseline):
         """论文评测代码的 generate_query_llm：请求与写入时相同（A-MEM 控制器的系统提示与
         temperature，JSON 约束照网关写进系统提示），但在回答线程里发，用量算进这道题（见模块说明
         第 7 条）。选模型也与网关相同：内容审核误拒、超时或 JSON 生成失控时换备用模型（通义预设是
-        qwen3.7-plus，D-050）。备用模型也被内容审核拒绝时照评测代码的兜底，用问题原文检索。
+        qwen3.7-plus，D-050）。回复不合 schema 时与写入一样重新采样（见模块说明第 9 条）。备用
+        模型也被内容审核拒绝时照评测代码的兜底，用问题原文检索。
         返回（检索用的文本，回答它的模型别名）。"""
-        messages: list[Message] = [
-            {"role": "system", "content": JSON_SYSTEM},
-            {"role": "user", "content": QUERY_PROMPT.format(question=question)},
-        ]
+        messages = _with_schema(
+            [
+                {"role": "system", "content": JSON_SYSTEM},
+                {"role": "user", "content": QUERY_PROMPT.format(question=question)},
+            ],
+            QUERY_SCHEMA,
+        )
         primary = self.llm.settings.roles[self.gateway.role].model
-        kwargs: dict[str, Any] = {
-            "temperature": 0.7,
-            "max_tokens": MAX_TOKENS,
-            "response_format": {"type": "json_object"},
-            "cache_scope": f"gateway|{self.bucket(key, 'search')}",
-        }
-        try:
-            # 网关自己的选模型逻辑；不走 gateway.chat，因为它按"当前 trace"给桶记账，在回答
-            # 线程里会把这道题此前的用量也记进检索的桶
-            result, alias, _ = self.gateway._call(
-                _with_schema(messages, QUERY_SCHEMA), kwargs, primary
-            )
-        except ContentFilteredError:
-            return question, ""
-        return parse_keywords(result.content, question), alias
+        content, alias = "", ""
+        for attempt in range(RESAMPLES + 1):
+            kwargs: dict[str, Any] = {
+                "temperature": 0.7,
+                "max_tokens": MAX_TOKENS - attempt,  # 重采样落到缓存的新键上
+                "response_format": {"type": "json_object"},
+                "cache_scope": f"gateway|{self.bucket(key, 'search')}",
+            }
+            try:
+                # 网关自己的选模型逻辑；不走 gateway.chat，因为它按"当前 trace"给桶记账，在
+                # 回答线程里会把这道题此前的用量也记进检索的桶
+                result, alias, _ = self.gateway._call(messages, kwargs, primary)
+            except ContentFilteredError:
+                return question, ""
+            content = result.content or ""
+            if fits(content, QUERY_SCHEMA["schema"]):
+                break
+        return parse_keywords(content, question), alias
 
     def _open(self, key: str, directory: Path) -> _Space:
         """打开（或复用）一份写好的对话；最多同时开 MAX_OPEN 个，多了关掉最久没用的。"""
