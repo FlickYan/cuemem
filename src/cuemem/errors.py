@@ -18,7 +18,17 @@ class StructuredOutputError(CueMemError):
 
 
 class EmbeddingAPIError(CueMemError):
-    """向量化接口返回错误或格式异常。"""
+    """向量化接口返回错误或格式异常。
+
+    status 是最后一次响应的 HTTP 状态码（重试用尽时；格式异常、网络错误时为 None），
+    retry_after 是它的 Retry-After 头：评测网关据此把限流原样转告外部系统（N12）。"""
+
+    def __init__(
+        self, message: str, *, status: int | None = None, retry_after: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
 class ConfigMismatchError(CueMemError):

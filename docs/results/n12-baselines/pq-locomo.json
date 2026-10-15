@@ -214,11 +214,11 @@
       },
       "write": {
         "spaces": 7.0,
-        "cost": 1.3815,
-        "spent": 0.242,
+        "cost": 0.7122,
+        "spent": 0.3168,
         "llm_calls": 404.0,
-        "seconds": 1887.9716,
-        "memories": 4059.0
+        "seconds": 3538.259,
+        "memories": 2907.0
       }
     }
   },

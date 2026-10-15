@@ -106,7 +106,9 @@ class DashScopeTextEmbedder:
                 self._wait(attempt, response.status_code, response.headers.get("retry-after"))
                 continue
             raise EmbeddingAPIError(
-                f"向量接口返回 HTTP {response.status_code}：{response.text[:300]}"
+                f"向量接口返回 HTTP {response.status_code}：{response.text[:300]}",
+                status=response.status_code,
+                retry_after=response.headers.get("retry-after"),
             )
         raise EmbeddingAPIError("向量接口重试次数用尽")
 

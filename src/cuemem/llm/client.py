@@ -82,6 +82,7 @@ class LLMClient:
         self._lock = threading.Lock()
         self._notified: set[tuple[str, datetime]] = set()
         self._inflight: dict[str, threading.Event] = {}  # 正在请求中的缓存键（相同请求合并）
+        self._bad_json: set[str] = set()  # 上次拿到解析不了的 JSON 的缓存键（见 retry_bad_json）
 
     def chat(
         self,
@@ -97,11 +98,18 @@ class LLMClient:
         parallel_tool_calls: bool | None = None,
         use_cache: bool = True,
         cache_scope: str | None = None,
+        retry_bad_json: bool = False,
     ) -> ChatResult:
         """调用一次聊天补全。role 决定默认模型与参数，model 可显式指定模型别名。
 
         parallel_tool_calls 只在带工具时发出（通义不设为 true 时一次只回一个工具调用，N12）。
         cache_scope 标记缓存条目所属的记忆空间，遗忘时据此清理。
+
+        retry_bad_json：给照 OpenAI 的方式重试的外部系统用（评测网关，N12）。JSON 模式的回复解析
+        不了时记下这个请求；同样的请求再来（外部系统的重试）时不读缓存，重新调用并覆盖缓存里的
+        坏回复——否则每次重试都从缓存里拿到同一个坏回复。缓存键不变，能解析的回复照常命中缓存；
+        解析不了的回复照常缓存（外部系统换一个请求接着修时，重跑能原样复现）。CueMem 自己的
+        结构化输出（structured）重试时带上校验错误，请求本来就不同，不用它。
         """
         alias, spec, params = self._prepare(
             role,
@@ -114,6 +122,7 @@ class LLMClient:
             parallel_tool_calls,
         )
         caching = use_cache and self.cache is not None and self.settings.llm_cache_mode != "off"
+        json_guard = retry_bad_json and _json_mode(params)
         key = ""
         if caching:
             assert self.cache is not None
@@ -126,25 +135,56 @@ class LLMClient:
                     "extra_body": spec.extra_body,
                 }
             )
+            # 上次同样的请求拿到的是解析不了的 JSON：这是外部系统的重试，不读缓存
+            # （只读缓存模式下不调用 API，照常读缓存）
+            refresh = (
+                json_guard
+                and self.settings.llm_cache_mode != "read_only"
+                and self._bad_json_seen(key)
+            )
             while True:
-                hit = self._from_cache(key, role, alias, spec)
-                if hit is not None:
-                    return hit
-                if self.settings.llm_cache_mode == "read_only":
-                    raise CacheMissError(f"read_only 模式下缓存未命中：role={role}, model={alias}")
+                if not refresh:
+                    hit = self._from_cache(key, role, alias, spec)
+                    if hit is not None:
+                        if json_guard:
+                            self._note_json(key, hit)
+                        return hit
+                    if self.settings.llm_cache_mode == "read_only":
+                        raise CacheMissError(
+                            f"read_only 模式下缓存未命中：role={role}, model={alias}"
+                        )
                 # 相同请求合并（single-flight）：别的线程正在请求同样的内容时，等它的结果，
                 # 不重复花钱；它失败了（没写进缓存）就由本线程接着请求
                 waiting = self._claim(key)
                 if waiting is None:
                     break
                 waiting.wait()
+                refresh = False  # 别的线程刚请求过同样的内容：缓存里是新的回复，直接用
+            # 真的要重新调用时才记：同时到的同样重试里，等别的线程结果的那些读的是缓存
+            if refresh:
+                record_event("llm_cache_refresh", role=role, model=alias)
         try:
-            return self._call_api(
+            result = self._call_api(
                 role, alias, spec, messages, params, key if caching else "", cache_scope
             )
         finally:
             if caching:
                 self._release(key)
+        if json_guard and caching:
+            self._note_json(key, result)
+        return result
+
+    def _bad_json_seen(self, key: str) -> bool:
+        with self._lock:
+            return key in self._bad_json
+
+    def _note_json(self, key: str, result: ChatResult) -> None:
+        """记下（或清掉）这个请求"上次拿到的是解析不了的 JSON"。"""
+        with self._lock:
+            if unparsable_json(result):
+                self._bad_json.add(key)
+            else:
+                self._bad_json.discard(key)
 
     def _from_cache(self, key: str, role: str, alias: str, spec: ModelSpec) -> ChatResult | None:
         assert self.cache is not None
@@ -443,6 +483,28 @@ class LLMClient:
             spent=0.0 if result.from_cache else round(discounted, 6),
             latency_ms=round(result.latency_ms, 1),
         )
+
+
+def _json_mode(params: dict[str, Any]) -> bool:
+    response_format = params.get("response_format")
+    return isinstance(response_format, dict) and response_format.get("type") in (
+        "json_object",
+        "json_schema",
+    )
+
+
+def unparsable_json(result: ChatResult) -> bool:
+    """JSON 模式的回复解析不了：去掉 markdown 围栏后仍不是合法 JSON（空回复也算）。
+
+    按 json.loads 的默认（严格）规则：字符串里有原样的换行等控制字符也算解析不了，外部系统
+    多数照这个规则解析。带工具调用的回复不算（内容不是给调用方解析的）。"""
+    if result.tool_calls:
+        return False
+    try:
+        json.loads(_strip_code_fence(result.content or ""))
+    except ValueError:  # 包括 json.JSONDecodeError
+        return True
+    return False
 
 
 def _is_aborted_json(exc: BadRequestError) -> bool:

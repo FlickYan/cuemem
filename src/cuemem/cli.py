@@ -1011,7 +1011,7 @@ def eval_run(
             f"本次实际花费 ${summary.spent:.4f}"
         )
         return
-    report_path = build_report(summary.run_dir)
+    report_path = build_report(summary.run_dir, eval_spaces=settings.paths.eval_spaces)
     note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
     console.print(
         f"完成 {summary.completed} / {summary.planned} 个组合，出错 {summary.errors} 个{note}；"
@@ -1070,7 +1070,7 @@ def eval_report(
     if not (run_dir / "run.json").exists():
         console.print(f"[red]找不到运行目录 {run_dir}[/red]")
         raise typer.Exit(1)
-    path = build_report(run_dir)
+    path = build_report(run_dir, eval_spaces=settings.paths.eval_spaces)
     _print_method_stats(run_dir)
     console.print(f"报告：{path}")
 
