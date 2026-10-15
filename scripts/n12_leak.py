@@ -131,6 +131,7 @@ def main() -> None:
                 "wins": wins,
                 "losses": losses,
                 "net_points": round(100 * (wins - losses) / questions, 2) if questions else None,
+                "p": round(sign_test(wins, losses), 4),
                 "note": "summed over retrieval methods on the same questions (not independent)",
             }
         summary[protocol] = section
@@ -146,7 +147,9 @@ def main() -> None:
             )
             print(f"  {entry['label']:<18} {accs}\n  {'':<18} {pairs}")
         for key, v in section["pooled"].items():
-            print(f"  pooled {key}: +{v['wins']}/-{v['losses']} (net {v['net_points']} pt)")
+            print(
+                f"  pooled {key}: +{v['wins']}/-{v['losses']} (net {v['net_points']} pt, p={v['p']})"
+            )
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     print(f"\n→ {OUT.relative_to(ROOT)}")

@@ -224,25 +224,54 @@
       "meaning": "leak + renaming noise (pre-fix vs post-fix)"
      }
     }
+   },
+   "M0": {
+    "label": "Mem0 2.2.1",
+    "arms": {
+     "anon": {
+      "n": 100,
+      "accuracy": 0.79,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     },
+     "label": {
+      "n": 100,
+      "accuracy": 0.85,
+      "abstention_n": 5,
+      "abstention_accuracy": 0.8
+     }
+    },
+    "paired": {
+     "label_vs_anon": {
+      "n": 100,
+      "wins": 9,
+      "losses": 3,
+      "p": 0.146,
+      "meaning": "leak only (same spaces, only the evidence-header IDs differ)"
+     }
+    }
    }
   },
   "pooled": {
    "label_vs_anon": {
-    "wins": 12,
-    "losses": 9,
-    "net_points": 0.75,
+    "wins": 21,
+    "losses": 12,
+    "net_points": 1.8,
+    "p": 0.1628,
     "note": "summed over retrieval methods on the same questions (not independent)"
    },
    "raw_vs_label": {
     "wins": 5,
     "losses": 14,
     "net_points": -2.25,
+    "p": 0.0636,
     "note": "summed over retrieval methods on the same questions (not independent)"
    },
    "raw_vs_anon": {
     "wins": 8,
     "losses": 14,
     "net_points": -1.5,
+    "p": 0.2863,
     "note": "summed over retrieval methods on the same questions (not independent)"
    }
   }
@@ -478,8 +507,8 @@
     "label": "Mem0 2.2.1",
     "arms": {
      "raw": {
-      "n": 93,
-      "accuracy": 0.828,
+      "n": 100,
+      "accuracy": 0.83,
       "abstention_n": 5,
       "abstention_accuracy": 0.8
      }
@@ -492,18 +521,21 @@
     "wins": 10,
     "losses": 14,
     "net_points": -1.0,
+    "p": 0.5413,
     "note": "summed over retrieval methods on the same questions (not independent)"
    },
    "raw_vs_label": {
     "wins": 8,
     "losses": 6,
     "net_points": 0.5,
+    "p": 0.7905,
     "note": "summed over retrieval methods on the same questions (not independent)"
    },
    "raw_vs_anon": {
     "wins": 9,
     "losses": 11,
     "net_points": -0.5,
+    "p": 0.8238,
     "note": "summed over retrieval methods on the same questions (not independent)"
    }
   }
