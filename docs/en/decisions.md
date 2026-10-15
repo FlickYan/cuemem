@@ -68,7 +68,9 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 | D-062 | An OpenAI-compatible memory proxy: the controller decides first, evidence goes before the last user message | Adopted (N12) |
 | D-063 | Export and import move only the raw log; forgetting can be previewed | Adopted (N12) |
 | D-064 | Extra extraction instructions (custom instructions) | Adopted (N12) |
+| D-065 | Same-protocol comparison with more external baselines: Graphiti, LangMem, Cognee, A-MEM; a DeepSeek-only (pds) and a Qwen-only (pq) protocol | Adopted (N12) |
 | D-066 | Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool; one shared implementation of recalled evidence | Adopted (N12) |
+| D-067 | LongMemEval session-ID leak: fix, measure, disclose | Adopted (N12) |
 
 ## D-001 A separate controller decides when and how deeply to retrieve, not the LLM
 
@@ -753,6 +755,108 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 - **Alternative:** custom entity and fact types (Graphiti). That changes the output schema, the reconciliation rules and the predicate registry; plain-text instructions cover the common need first.
 - **Consequences:** tests cover the prompt, the SDK parameter and the fingerprint change. The effect of instructions on extraction quality has not been evaluated.
 
+## D-065 Same-protocol comparison with more external baselines
+
+- **Status:** adopted (N12).
+- **Context:**
+  - Before N12, Mem0 was the only external system run inside the same evaluation (D-055). For other comparable projects there were only the scores each project reports itself, with different readers, judges, prompts and question sets; they cannot be compared directly with this project's numbers ([comparison](landscape.md) §4).
+  - The question: with the same models and the same reader and judge, changing only where the memory comes from, is CueMem's write and read path better or worse than comparable projects, and what does writing cost?
+  - Four open-source projects that run locally were added: Graphiti (the open core of Zep, a temporal knowledge graph), LangMem (LangChain's memory library), Cognee (knowledge graph + vectors) and A-MEM (Zettelkasten-style notes; the paper comes with LoCoMo evaluation code). Letta is still left out: its agent manages memory itself, which is closer to B3 (D-055).
+- **Decision:**
+  1. **Eval gateway** (`evals/gateway.py`): CueMem's own LLM client and embedder behind an OpenAI-compatible chat and embeddings API. Each external system keeps its own client, with `base_url` pointing at the gateway.
+     - Every chat request goes to the extractor role's model, and every embedding request to the same embedder; one ledger, one cache.
+     - A bucket name in the URL keeps usage separate per system and per conversation history, and the usage is recorded in build.json.
+     - External systems get the OpenAI semantics they assume: a request with tools and no `parallel_tool_calls` is sent with true (otherwise Qwen returns one tool call at a time); buckets of the retrieval stage (`<system>.search.<space>`) embed in query mode; an upstream rate limit comes back as 429 with Retry-After and is counted; an unparsable JSON-mode reply is not replayed from the cache when the same request comes again.
+  2. **Adapters follow the authors' evaluation code** (`evals/baselines/`), or the documented usage where no evaluation code is published. Answering and judging stay outside the systems: the evidence each one retrieves is labelled with its source session's time and goes to the same reader with the same prompt.
+     - **MG** Graphiti (graphiti-core 0.30.2, embedded Kuzu): follows the Zep paper's evaluation code; one episode per message; retrieves 20 facts and 20 entities.
+     - **ML** LangMem 0.0.30: the background memory manager from its docs, run once per session. The "hot path" the Mem0 paper used for LangMem is not copied: feeding an agent message by message makes calls grow with the square of the conversation length, and the memories are the agent's rewritten prose, with no dates.
+     - **MC** Cognee 1.6.4: follows Cognee's own setup on the long-conversation benchmark BEAM; one chunk per turn, HYBRID_COMPLETION retrieval; all 20 chunks, 20 entities and 5 facts go to the reader.
+     - **MA** A-MEM (agiresearch/A-mem@ceffb86): follows the paper's LoCoMo evaluation code; one note per message, with memory evolution; retrieval with k = 10.
+     - **M0** Mem0 2.2.1 keeps N11's adapter (D-055). This version is the add-only V3 algorithm.
+
+     Every departure from a system's default usage, and the reason for it, is written in that module's docstring.
+  3. **Two protocols.** Within a protocol every system (CueMem, and the calls inside the external systems) uses the same models:
+     - **pds** (DeepSeek only, `CUEMEM_PRESET=deepseek`): every role is deepseek-flash, the judge too; embeddings are local BAAI/bge-small-en-v1.5 (fastembed, 384-d, no query instruction); no reranker and no fallback model. Builds in data/eval-spaces.
+     - **pq** (Qwen only, `CUEMEM_PRESET=qwen`, a preset added in N12): the extractor, planner, reader and other roles use qwen3.8-flash, the judge qwen3.8-max; embeddings qwen3.7-text-embedding (1024-d, separate query and document modes); reranking qwen3-rerank; consolidation and gateway fallback qwen3.7-plus. Builds in data/eval-spaces-qwen (`CUEMEM_PATHS__EVAL_SPACES`).
+     - Why pq exists: the DeepSeek balance ran out halfway through (CNY 0.08 left on 2026-10-15), so a Qwen-only protocol was added to finish the comparison. The account was later topped up and the other systems were also run under pds (A-MEM still in progress: MA-PENDING). Both protocols are reported: how much the same systems change under another provider's models is part of the result.
+     - Neither protocol meets D-008: in pds the reader judges itself, and in pq the judge is from the reader's model family. In N11's second-judge experiment, deepseek-flash and qwen3.8-max agreed on 94.7–97.9% of judgements.
+  4. **Rules:**
+     - within a protocol: the same extraction model and embeddings (through the gateway), the same reader and reader prompt, and the same judge;
+     - each system uses its own write and read pipeline, and its algorithm is not changed (for the changes needed just to run, see point 7);
+     - one run per configuration; paired exact sign tests on the same questions;
+     - write usage of the external systems (MG, ML, MC, MA) is read from the gateway buckets, and that of M0 and CueMem from the trace recorded while writing; both are kept apart from answer usage, and comparisons use nominal cost (D-010).
+  5. **The four new external systems run LoCoMo test200r only** (Mem0 ran LongMemEval test100r in N11 and again in N12's leak ablation; see D-067): 200 stratified non-adversarial questions over the last 7 conversations (conv-42, 43, 44, 47, 48, 49, 50; 4,431 turns, 202 sessions). Seven conversations need seven builds. In LongMemEval each question has its own history, so test100r needs 100 builds:
+     - N11's Mem0 build cost $9.76 nominal on LongMemEval test100r and $0.70 on LoCoMo;
+     - Graphiti writes one episode per message; its module docstring estimates about 49,000 messages for test100r, several hundred dollars and more than a day of writing;
+     - A-MEM makes two LLM calls per message and must make them one message at a time: about 15 s per message under Qwen.
+
+     LangMem's and Cognee's LongMemEval builds were not estimated separately; they also run LoCoMo only, so the four new systems are compared on the same questions. CueMem's own methods are still evaluated on LongMemEval; the numbers re-run on test100r after the session-ID fix are in D-067 (test400 was not re-run).
+  6. **Additions in the adapters so the systems run on these two providers** (every occurrence is counted in build.json):
+     - A reply that is JSON but does not match the schema is resampled (MG, MA). OpenAI's strict structured output guarantees the schema; the JSON modes of DeepSeek and Qwen do not. A resample lowers the reply limit slightly so that the request lands on a new cache key; otherwise the cache would return the same bad reply.
+     - Wrong refusals by content moderation (the refused messages are ordinary) are handled differently per system:
+       - MG skips and counts refused messages; only above max(2, 5%) messages is the build rejected;
+       - ML skips and counts refused sessions, which count towards the same limit as sessions that lost their writes (next item);
+       - MA skips and counts refused calls, as A-MEM itself does (the note is kept, without analysis or evolution); only above one half is the build rejected;
+       - M0 (N11's adapter) skips and counts every session that still fails after the fallback model, with no limit.
+     - LangMem's lost writes are counted as they are (an unreadable PatchDoc patch also counts as lost). The build check used to reject a build when refused and lost sessions together exceeded max(2, 10%) of sessions; under pq it rejected 4 of 7 conversations. Full runs in both protocols use 25% (`CUEMEM_LANGMEM_MAX_LOST_SHARE=0.25`; the default is still 10%), and the losses are still recorded.
+     - A failed Cognee session is deleted and written once more; if it fails again it is skipped and counted, and only above one half is the build rejected.
+  7. **Departures from default usage needed just to run** (these two change Graphiti's retrieval):
+     - Graphiti's BFS depth is 1 (default 3: Kuzu's variable-length path query used more than 12 GB at depth 3);
+     - Graphiti's built-in rerankers cannot be used: under pq, qwen3-rerank is wrapped as its cross-encoder; pds has no reranker, so fact retrieval falls back to the default of Graphiti's basic search, an RRF of BM25 and vectors.
+  8. **Deliberately not tuned:**
+     - Graphiti's 0.6 cosine threshold: under pq the vector channel is not empty, with a median of 8 fact candidates per question;
+     - LangMem's prompts and defaults;
+     - A-MEM's k: the main result uses the paper's main setting of 10. The authors use 40 for GPT-4o-class models (the same tier as the models here), and their README says k must be tuned to reproduce the paper's numbers. 10 was chosen so that the amount of evidence stays comparable with the other methods (in a deepseek-preset pilot on conv-42, k = 10 gave about 9k tokens on average and k = 40 about 27k, against about 4k for CueMem L1). This may put A-MEM at a disadvantage; the sensitivity run with k = 40 (`CUEMEM_AMEM_K=40`) is under consequences;
+     - Cognee's evidence for the reader is not capped, as in its BEAM report;
+     - every system's extraction prompts, CueMem's included.
+- **Alternatives:**
+  - Quoting each project's own scores: different readers, judges and prompts make a difference of a point or two meaningless (landscape §4).
+  - Tuning each system (thresholds, prompts, k): it could only be done on these test questions, which means using the test set to make choices (D-048), and tuning every system to its best multiplies the work and the cost. The price of not tuning is CueMem's home advantage, recorded under consequences.
+  - Running the external systems on LongMemEval too: see point 5 for cost and time.
+- **Consequences:**
+  - Results (LoCoMo test200r, 200 questions, accuracy %):
+
+  | Method | pds | pq |
+  |---|---|---|
+  | B1 full context | 84.5 | 80.0 |
+  | B2 naive RAG (dense top-10) | 59.5 | 64.0 |
+  | CueMem L1 (B4-nobm25) | 82.5 | 81.5 |
+  | CueMem L2 (B5) | 87.0 | 85.0 |
+  | CueMem controller (B6) | 83.5 | 83.5 |
+  | M0 Mem0 2.2.1 | 81.0 | 77.5 |
+  | MG Graphiti 0.30.2 | 59.0 | 41.5 |
+  | ML LangMem 0.0.30 | 78.0 | 30.0 |
+  | MC Cognee 1.6.4 | 77.5 | 74.0 |
+  | MA A-MEM | MA-PENDING | MA-PENDING |
+
+  - Paired tests (questions CueMem wins / loses):
+    - pds: L2 beats M0 +17 / −5 (p = 0.017), ML +25 / −7 (p = 0.002), MC +27 / −8 (p = 0.002) and MG +62 / −6 (p < 0.001). L1 cannot be told apart from M0 (+14 / −11, p = 0.69), ML (+24 / −15, p = 0.20) or MC (+20 / −10, p = 0.10), and beats MG +55 / −8 (p < 0.001).
+    - pq: L2 beats M0 +24 / −9 (p = 0.014) and MC +30 / −8 (p = 0.0005); L1 beats MC +25 / −10 (p = 0.017) and cannot be told apart from M0 (+19 / −11, p = 0.20). MG and ML fall far behind under pq (L1 vs MG +85 / −5, vs ML +107 / −4, p < 0.001).
+    - MA: MA-PENDING.
+    - A-MEM sensitivity run with k = 40 (the authors' setting for GPT-4o-class models): MA-PENDING.
+    - In both protocols L2 is significantly above all four finished external systems (A-MEM: MA-PENDING), but L2 uses from just over two to nearly four times as many input tokens per question (for L2 this includes its planning and sufficiency-check calls). Mean input per question: under pds, L2 12,255 tokens and the four external systems 3,358–5,683 (answer cost $4.108 vs $1.092–1.787 per 1k questions); under pq, 14,022 vs 3,611–6,689. L1, with an input size similar to theirs (4,333 tokens under pds), cannot be told apart from M0, ML or MC in pds and is significantly above MG only. L2 and full context cannot be told apart (pds +12 / −7, p = 0.36; pq +19 / −9, p = 0.087).
+  - **Model sensitivity:** the external systems' prompts and pipelines were mostly written against OpenAI models, and another provider's models can break them.
+    - Graphiti 59.0 → 41.5. Over the 7 conversations, entities 1,253 → 462 and facts 3,426 → 1,774: with Graphiti's own prompts, qwen3.8-flash extracts few entities, and under pq each conversation logged 118–270 "Target entity not found" warnings (4–15 per conversation under pds; a fact whose endpoint matches no entity is dropped). Turn recall (any) under pq: Graphiti 54.5%, B2 84.5%, CueMem L1 95.0% (the methods pass different numbers of items to the reader, so only the rough ordering is meaningful). Under pq, 5 messages of conv-42 were refused by moderation and skipped (built before the qwen3.7-plus fallback was added; the other six conversations had 0). Under pds Graphiti is level with naive RAG (59.0 vs 59.5; under pds Graphiti has no reranker, see point 7).
+    - LangMem 78.0 → 30.0. Qwen uses PatchDoc to merge new information into a few long memories: 705 → 123 memories; sessions that lost their writes 2 / 202 → 23 / 202, plus 5 sessions where Qwen explicitly returned an empty PatchDoc ("no change").
+    - Cognee 77.5 → 74.0, with no failed, retried or dropped sessions in either protocol; Mem0 81.0 → 77.5; CueMem L1 82.5 → 81.5, L2 87.0 → 85.0.
+    - A-MEM: MA-PENDING.
+  - **Home advantage:** CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), which is exactly the pq setup, so pq favours CueMem. In pds no system's prompts were tuned for deepseek-flash (CueMem's consolidation similarity thresholds were also tuned on Qwen embeddings), so the comparison is fairer. In pds, L2 is still significantly above the four external systems and L1 is level with M0, ML and MC; in pq, L1 is significantly above MC and still level with M0 (A-MEM: MA-PENDING).
+  - **Write cost** (7 conversations; nominal cost / estimated spend, and LLM calls):
+
+  | System | pds: nominal / spend | pds: calls | pq: nominal / spend | pq: calls |
+  |---|---|---|---|---|
+  | CueMem (shared by L1, L2, controller) | $0.529 / $0.2222 | 438 | $0.2376 / $0.1511 | 393 |
+  | Mem0 | $1.3815 / $0.242 | 404 | $0.7122 / $0.3168 | 404 |
+  | LangMem | $0.563 / $0.2386 | 211 | $0.2252 / $0.0635 | 207 |
+  | Cognee | $2.845 / $0.7975 | 4,547 | $1.4659 / $1.1542 | 4,549 |
+  | Graphiti | $9.9923 / $1.5084 | 14,240 | $4.5147 / $3.9077 | 12,092 |
+  | A-MEM | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING |
+
+  Estimated spend excludes local cache hits (a conversation used in a pilot costs almost nothing), provider cache discounts and DeepSeek's off-peak half price (all pds runs were off-peak; Qwen has no off-peak price), so it depends on the order of runs and is not on the same basis in the two protocols; compare nominal cost (D-010). CueMem's nominal write cost is below Mem0's, Cognee's and Graphiti's in both protocols (A-MEM: MA-PENDING); LangMem's is close to CueMem's, but under pq LangMem lost the writes of more than a tenth of the sessions.
+  - Ledger (data/ledger.sqlite, excluding calls served from the local cache; as of 2026-10-15 14:00 UTC, with the A-MEM full runs still in progress; totals after they finish: MA-PENDING): Qwen since the key became available, $22.61 actual spend (after provider cache discounts; $29.56 nominal without discounts). DeepSeek since 2026-10-14 19:00 UTC (pds pilots and full runs, the reader in the leak ablation), $12.04 actual spend (after cache discounts and the off-peak half price; $33.72 nominal without discounts); every DeepSeek run used `--peak wait` and ran off-peak only.
+  - Full numbers (accuracy by question type, confidence intervals, answer cost, write calls and time, all paired tests) are in [pds-locomo.json](../results/n12-baselines/pds-locomo.json) and [pq-locomo.json](../results/n12-baselines/pq-locomo.json) (regenerate with `scripts/n12_baselines.py --protocol pds|pq --dataset locomo`).
+  - **Limits:** one run per configuration; neither protocol's judge meets D-008; the four new external systems were evaluated only on LoCoMo's 7 conversations and 200 questions; the adapters are this project's code following the authors' evaluation code, not runs by the authors; under pds Graphiti has no reranker and fact retrieval uses RRF, which is not the recipe of Zep's evaluation; neither pds nor pq is the N9 / N11 protocol, so their numbers are not compared directly with N9 / N11; for CueMem's home advantage, see above.
+
 ## D-066 Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool; one shared implementation of recalled evidence
 
 - **Status:** adopted (N12).
@@ -772,3 +876,54 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
   - Each integration was implemented, then reviewed from two angles (faithfulness to the framework, correctness), and revised before merging. Real problems the reviews found: CI did not install the optional dependencies, so the integration tests were always skipped; a question and its answer were split into two rounds; cached evidence was reused across turns; LangChain's conversation summary was written back as the user's words; identity came from client-controlled configurable; the proxy and integrations read `file://` and local image paths. All are fixed, with regression tests.
   - 2,592 lines of offline tests; all three integrations had a live smoke test on the deepseek preset. Claude's memory tool has not been run against the real Claude API: there was no Anthropic key, and DeepSeek's Anthropic-compatible endpoint rejects `memory_20250818`, so the smoke test declared the same backend as a regular tool.
   - **Limits:** open sessions are tracked in memory per process; only text evidence is injected, so when the controller wants to look at a photo, the photo is not attached to the model call; no TypeScript or Vercel AI SDK yet.
+
+## D-067 LongMemEval session-ID leak: fix, measure, disclose
+
+- **Status:** adopted (N12).
+- **Context:**
+  - In LongMemEval_S (`longmemeval_s_cleaned.json`), the IDs of all 948 evidence sessions start with `answer_` (the evidence IDs of all 30 abstention questions also contain `_abs`); other sessions are `sharegpt_`, `ultrachat_` or a hex string.
+  - `format_memories` in `read/reader.py` printed `· session <ID>` in the header of each retrieved item, so the reader could see which excerpts came from evidence sessions.
+  - **Affected:** every retrieval method: B2, the tool outputs of B3 / B6a, CueMem L1 / L2 / controller, M0, and MG / ML / MC / MA (their code path shows the same headers, but they were never run on LongMemEval; see D-065).
+  - **Not affected:** B0, L0, B1 (full context numbers sessions 1..n) and ORACLE. LoCoMo is not affected (`session_1..N` are chronological ordinals); MemLens raw IDs are `sess_<hash>` and do not reveal evidence.
+  - Of the LongMemEval numbers published from N2 to N11, those of the retrieval methods were all produced with this leak.
+  - The audit found a second leak: the session ID in Cognee's distillation contained the LongMemEval question ID (with `_abs` for abstention questions) and reached its lesson documents. It is fixed too; LoCoMo is not affected, and no published number used it.
+- **Decision:**
+  1. **Rewrite at load time:** LongMemEval and MemLens sessions become `session_<i>` in date order within each history (the same form LoCoMo uses). Evidence sessions and evidence turns are rewritten with them, so retrieval metrics are unchanged. The raw ID is kept in `EvalSession.source_id` for tracing only and never reaches a model's prompt.
+  2. **Switch** `CUEMEM_EVAL_RAW_SESSION_IDS` (LongMemEval / MemLens only):
+     - `=1` restores raw IDs, byte-for-byte as before the fix (old spaces, builds and caches still hit);
+     - `=label` keeps the rewritten IDs in the spaces and puts raw IDs back only in the evidence headers the reader sees. The only difference from the default is the session names in the headers, which isolates the leak itself.
+  3. **The two schemes never mix:** rewritten builds live under `<dataset>-anon` directories; the scheme is recorded in the space database, build.json and run.json; a build with the wrong scheme is not reused, and the comparison scripts stop with an error when runs with different schemes are put together. LoCoMo requests are byte-for-byte unchanged, with a test.
+  4. **Reproduction:** `scripts/reproduce.py` keeps raw IDs for the historical steps, so the prompts are word for word the same as then. With the response cache from that time, the published numbers reproduce; without it, a re-run varies with sampling (N12's raw arm is one example; see consequences).
+  5. **Measure:** three arms on LongMemEval test100r, with the same reader and judge (`scripts/n12_leak.py`), once under the original protocol (orig: extraction qwen3.8-flash, embeddings qwen3.7-text-embedding, reader deepseek-flash, judge qwen3.8-max) and once under pq. orig builds live in data/eval-spaces-default (the consolidation fingerprint includes the fallback model, so they cannot be shared with pq).
+     - **label vs anon:** only the evidence headers differ; this is the leak itself.
+     - **raw vs label:** same headers, only the IDs inside the spaces differ. Rounds within a session are ordered by a hash that contains the session ID, so renaming reorders them: this is renaming noise, present before the fix and on LoCoMo too.
+     - **raw vs anon:** both together, i.e. before vs after the fix.
+  6. **Disclose:** published numbers stay as they are; this record and the N12 leak ablation state the extent of the leak, the fix and the measured effect.
+- **Alternatives:**
+  - Only removing the session ID from the reader's headers: the session name is useful, since the reader uses it to tell which excerpts belong to the same session (LoCoMo shows it too). The ID also reaches prompts by other paths, Cognee's lesson documents being one, so changing the reader alone does not close the leak.
+  - Renumbering in the reader at display time: again only covers the reader. Rewriting once at load time keeps the raw ID away from everything downstream (CueMem's builds, the external systems, the retrieval metrics).
+  - Not disclosing and fixing it quietly: the numbers after the fix would no longer match the published ones without explanation, and the leak may have helped some method; without measuring, it is unknown which and by how much.
+- **Consequences:**
+  - Ablation (LongMemEval test100r, 100 questions, accuracy %):
+
+  | Method | orig raw | orig anon | orig label | pq raw | pq anon | pq label |
+  |---|---|---|---|---|---|---|
+  | B1 full context | 81.0 | 81.0 | — | 77.0 | 77.0 | — |
+  | B2 naive RAG | 82.0 | 86.0 | 87.0 | 82.0 | 83.0 | 84.0 |
+  | CueMem L1 | 92.0 | 90.0 | 92.0 | 90.0 | 91.0 | 89.0 |
+  | CueMem L2 | 93.0 | 96.0 | 95.0 | 94.0 | 93.0 | 93.0 |
+  | CueMem controller | 88.0 | 89.0 | 90.0 | 89.0 | 90.0 | 87.0 |
+  | M0 Mem0 2.2.1 | — | 79.0 | 85.0 | 83.0 | — | — |
+
+  B1 is not affected by the leak and has no label arm. Mem0's raw arm was not re-run under orig (N11's published 83.0% is that condition); under pq only Mem0's raw arm was run, and its anon and label arms were not. `ARMS` in `scripts/n12_leak.py` lists these three run names, and the runs that do not exist are skipped.
+  - Pooled label vs anon (summed over retrieval methods; same questions, so not independent): orig +21 / −12 (+1.8 points per method on average, p = 0.16, Mem0 included); pq +10 / −14 (Mem0 excluded: its anon and label arms were not run; −1.0 points, p = 0.54). No single method is significant; the largest is Mem0 under orig, +9 / −3 (p = 0.15).
+  - Published N11 test100r numbers (orig, raw IDs; CueMem's methods come from the N9 test runs, D-055): B1 80.0%, B2 86.0%, L1 92.0%, L2 96.0%, controller 92.0%, Mem0 83.0%. After the fix (orig, anon): L1 90.0%, Mem0 79.0%. The raw arm was re-run in N12; no answer of B1, B2 or L1 came from the response cache, so they were sampled afresh. Against the published numbers: B1 81.0 vs 80.0, B2 82.0 vs 86.0, L2 93.0 vs 96.0, controller 88.0 vs 92.0; only L1 matches. Arms are therefore compared only within the N12 runs.
+  - **Resolution:** 100 questions and one run per arm. Renaming noise alone (orig raw vs label, pooled +5 / −14, −2.25 points, p = 0.064) is larger than the leak effect measured (+1.8 points), and the N12 raw re-run differs from N11's published numbers by up to 4 points; B1, which does not depend on IDs, still moved by 1 point. Effects of a few points cannot be resolved here.
+  - **Conclusion:** on test100r, no inflation of L1, L2 or the controller by the leak was measured; Mem0's label vs anon is +9 / −3 (p = 0.15, not significant), so its published 83.0% may be a few points high; the gaps between retrieval methods and full context are unchanged.
+  - **Limits:**
+    - only B2, L1, L2, the controller and Mem0 were re-measured, on test100r. B3, B6a (whose model sees the same headers in tool outputs), ablations such as B2F and "L1 + take notes first", and N9's full test400 were not re-run, so the effect on their published numbers is unknown; the same holds for the LongMemEval part of D-041 (H3);
+    - the learned controller's accuracy table and λ were fit on outcomes from the leak era and have not been refit;
+    - the order of rounds within a session still depends on the IDs;
+    - one run per arm.
+  - LongMemEval and MemLens evaluations use rewritten IDs by default from now on.
+  - Raw data: [summary.json](../results/n12-leak/summary.json) (regenerate with `scripts/n12_leak.py`).
