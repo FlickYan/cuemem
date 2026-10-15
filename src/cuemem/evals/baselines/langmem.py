@@ -54,7 +54,10 @@ evals/external.py），只换"记忆从哪来"：
    没写）合计超过 max(2, 10%) 时整份写入算失败；带工具的回复满 10 次却没有一次并行调用多个
    工具时也算失败（并行工具调用没生效）。模型调用了 PatchDoc 却明说"不用改"（patches 为空）
    的会话是 LangMem 照常的结果、不算写入丢了，另记在 unchanged_sessions 里：有已有记忆时
-   trustcall 要求必须调用工具，通义觉得没有新东西时就这样回。
+   trustcall 要求必须调用工具，通义觉得没有新东西时就这样回。只有会话里每个工具调用都是
+   patches 为空列表的 PatchDoc 才这样算；patches 缺了、是对象或读不出列表的（trustcall 不记
+   日志就跳过，这里记进 skipped_edits），参数不是合法 JSON 的（LangChain 放进
+   invalid_tool_calls，trustcall 不看），仍算写入丢了。
 9. 写入记录（build.json）另外记下：每个会话写入的条数、没写入的会话、网关统计的工具调用
    （tool_calls、multi_tool_replies、no_tool_replies）与被长度上限截断的回复
    （truncated_replies，截断的工具调用 LangChain 会静默丢掉）、trustcall 跳过的补丁
@@ -89,12 +92,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import json
 import logging
 import random
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
@@ -132,6 +136,10 @@ _rng: contextvars.ContextVar[random.Random | None] = contextvars.ContextVar(
 _problems: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
     "langmem_problems", default=None
 )
+# 正在写入的对话里 trustcall 读到的空补丁（PatchDoc 的 patches 是空列表）：见 chose_no_change
+_empty_patches: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "langmem_empty_patches", default=None
+)
 
 
 class _SeededUuid:
@@ -165,15 +173,46 @@ class _Problems(logging.Handler):
 _PROBLEMS = _Problems()
 
 
+def _note(notes: contextvars.ContextVar[list[str] | None], text: str) -> None:
+    seen = notes.get()
+    if seen is not None:
+        seen.append(text[:200])
+
+
+def checked_patches(
+    read: Callable[[dict[str, Any]], list[Any]],
+) -> Callable[[dict[str, Any]], list[Any]]:
+    """trustcall 读 PatchDoc 补丁的 _ensure_patches 的替身：结果原样返回，只把读出空补丁的情况
+    分开记下。patches 是空列表（或解析出空列表的字符串）：模型明说不用改，记进 _empty_patches；
+    patches 缺了、是对象、是解析不出列表的字符串：trustcall 同样当作空补丁、不记日志就跳过，
+    这里记成跳过的修改（problems），不能算"不用改"。"""
+
+    @functools.wraps(read)
+    def ensure(args: dict[str, Any]) -> list[Any]:
+        patches = read(args)
+        if not patches:
+            raw = args.get("patches")
+            if patch_list(raw) == []:
+                _note(_empty_patches, str(args.get("json_doc_id")))
+            else:
+                _note(_problems, f"Could not read PatchDoc patches: {raw!r}")
+        return patches
+
+    return ensure
+
+
 def _import_langmem() -> None:
     try:
         import langmem.knowledge.extraction as extraction  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        import trustcall._base as trustcall_base  # type: ignore[import-not-found, import-untyped, unused-ignore]
     except ImportError as exc:  # pragma: no cover - 取决于运行环境
         raise RuntimeError(
             "ML 需要 langmem 与 langchain-openai：用 uv run --with langmem==0.0.30 "
             "--with langchain-openai ... 运行（见模块说明）"
         ) from exc
     extraction.uuid = _SeededUuid()
+    if not hasattr(trustcall_base._ensure_patches, "__wrapped__"):  # 只包一层
+        trustcall_base._ensure_patches = checked_patches(trustcall_base._ensure_patches)
     logger = logging.getLogger("extraction")  # trustcall 的 logger
     if _PROBLEMS not in logger.handlers:
         logger.addHandler(_PROBLEMS)
@@ -223,6 +262,8 @@ class LangMemBaseline(ExternalBaseline):
         unchanged: list[str] = []  # 模型调用了工具、却明说没有要改的（见模块说明第 8 条）
         problems: list[str] = []
         collecting = _problems.set(problems)
+        empty_patches: list[str] = []
+        counting = _empty_patches.set(empty_patches)
         # 每份写入一个 HTTP 客户端、用完关掉：LangChain 默认按 base_url 缓存异步客户端，每份
         # 对话的桶地址都不同，缓存里会留下一个个绑在已关闭事件循环上的客户端。网关在本机：
         # 不走环境变量里的代理（LangChain 的默认客户端也不走）
@@ -239,7 +280,7 @@ class LangMemBaseline(ExternalBaseline):
                     continue
                 seeded = _rng.set(random.Random(f"{key}|{number}|{session.session_id}"))
                 start = self.gateway.usage(bucket)
-                seen = len(problems)
+                seen, seen_empty = len(problems), len(empty_patches)
                 try:
                     puts = await manager.ainvoke({"messages": messages})
                 except Exception as exc:
@@ -257,10 +298,12 @@ class LangMemBaseline(ExternalBaseline):
                 puts_per_session.append(len(puts))
                 if not puts:
                     end = self.gateway.usage(bucket)
-                    lost = not chose_no_change(start, end, problems[seen:])
+                    no_change = len(empty_patches) - seen_empty
+                    lost = not chose_no_change(start, end, problems[seen:], no_change)
                     (empty if lost else unchanged).append(session.session_id)
                 updates += record_writes(written, puts, session)
         finally:
+            _empty_patches.reset(counting)
             _problems.reset(collecting)
             await http.aclose()
         usage = self.gateway.usage(bucket)
@@ -407,18 +450,36 @@ def record_writes(
 
 
 def chose_no_change(
-    start: Mapping[str, Any], end: Mapping[str, Any], problems: Sequence[str]
+    start: Mapping[str, Any], end: Mapping[str, Any], problems: Sequence[str], empty_patches: int
 ) -> bool:
     """一个会话一条也没写时，是不是模型自己说"不用改"：这个会话期间（网关桶在 start 与 end 时的
-    统计）模型调用了工具，没有不调用工具或被截断的回复，trustcall 也没报告跳过或丢掉的修改
-    （problems）。这样的会话只剩一种可能：模型调用 PatchDoc 却没给补丁（patches 为空），trustcall
-    照规矩不写。其余（没调用工具、补丁改不了、调用校验不过……）是写入丢了。"""
+    统计）模型调用了工具，每个工具调用都是 trustcall 读出空补丁的 PatchDoc（empty_patches，见
+    checked_patches；patches 是空列表，trustcall 照规矩不写），没有不调用工具或被截断的回复，
+    trustcall 也没报告跳过或丢掉的修改（problems）。其余是写入丢了：没调用工具、补丁改不了或读不出、
+    调用校验不过，以及 trustcall 不记日志就丢掉的调用（参数不是合法 JSON 的工具调用 LangChain
+    放进 invalid_tool_calls，trustcall 不看）——这些调用网关数到了，却不是读出的空补丁。"""
+    calls = end["tool_calls"] - start["tool_calls"]
     return (
-        end["tool_calls"] > start["tool_calls"]
+        calls > 0
+        and empty_patches == calls
         and end["no_tool_replies"] == start["no_tool_replies"]
         and end["truncated_replies"] == start["truncated_replies"]
         and not problems
     )
+
+
+def patch_list(raw: Any) -> list[Any] | None:
+    """PatchDoc 的 patches 能读成的列表（trustcall 也收 JSON 字符串形式的列表）；读不出时 None。"""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        if isinstance(parsed, list):
+            return parsed
+    return None
 
 
 def check_build(

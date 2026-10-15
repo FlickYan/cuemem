@@ -204,11 +204,42 @@ def test_sessions_where_the_model_chose_no_change_are_not_lost_writes() -> None:
     不算写入丢了；没调用工具、被截断、trustcall 跳过或丢掉了调用，才算丢了。"""
     start = {"tool_calls": 4, "no_tool_replies": 0, "truncated_replies": 0}
     called = {**start, "tool_calls": 5}
-    assert ml.chose_no_change(start, called, [])
-    assert not ml.chose_no_change(start, called, ["Could not apply patch: Invalid 'path'"])
-    assert not ml.chose_no_change(start, {**start, "no_tool_replies": 1}, [])
-    assert not ml.chose_no_change(start, {**called, "truncated_replies": 1}, [])
-    assert not ml.chose_no_change(start, start, [])  # 一个工具调用也没有
+    assert ml.chose_no_change(start, called, [], 1)
+    assert not ml.chose_no_change(start, called, ["Could not apply patch: Invalid 'path'"], 1)
+    assert not ml.chose_no_change(start, {**start, "no_tool_replies": 1}, [], 0)
+    assert not ml.chose_no_change(start, {**called, "truncated_replies": 1}, [], 1)
+    assert not ml.chose_no_change(start, start, [], 0)  # 一个工具调用也没有
+    # 调用了工具，trustcall 却没读到空补丁：调用被不记日志地丢掉了（参数不是合法 JSON 等）
+    assert not ml.chose_no_change(start, called, [], 0)
+    assert not ml.chose_no_change(start, {**start, "tool_calls": 6}, [], 1)  # 两个只有一个是
+
+
+def test_patchdoc_patches_that_cannot_be_read_are_skipped_edits() -> None:
+    """trustcall 读不出 patches（缺了、是对象、是解析不出列表的字符串）时与空补丁一样不记日志
+    就跳过：这里记成跳过的修改；真的空列表（含 JSON 字符串形式）才记作"不用改"。"""
+
+    def read(args: dict[str, Any]) -> list[Any]:  # trustcall 0.0.39 的 _ensure_patches 的行为
+        return ml.patch_list(args.get("patches")) or []
+
+    ensure = ml.checked_patches(read)
+    patch = [{"op": "replace", "path": "/content", "value": "new"}]
+    problems: list[str] = []
+    empty: list[str] = []
+    tokens = (ml._problems.set(problems), ml._empty_patches.set(empty))
+    try:
+        assert ensure({"json_doc_id": "a", "patches": patch}) == patch
+        assert ensure({"json_doc_id": "b", "patches": json.dumps(patch)}) == patch
+        assert ensure({"json_doc_id": "c", "patches": []}) == []
+        assert ensure({"json_doc_id": "d", "patches": "[]"}) == []
+        assert ensure({"json_doc_id": "e", "patches": patch[0]}) == []  # 对象，不是列表
+        assert ensure({"json_doc_id": "f", "planned_edits": json.dumps(patch)}) == []  # 缺了
+        assert ensure({"json_doc_id": "g", "patches": '[{"op": "replace"'}) == []
+    finally:
+        ml._empty_patches.reset(tokens[1])
+        ml._problems.reset(tokens[0])
+    assert empty == ["c", "d"]
+    assert len(problems) == 3 and all(p.startswith("Could not read PatchDoc") for p in problems)
+    assert ensure({"patches": {}}) == []  # 不在写入中：照常返回，不记
 
 
 def test_same_identity(tmp_path: Path) -> None:
@@ -303,7 +334,9 @@ def test_store_written_by_other_models_is_rebuilt(
 def _fake_model(body: dict[str, Any]) -> str | dict[str, Any]:
     """LangMem 的抽取（带工具）：第一个会话新增一条记忆，第二个会话用 PatchDoc 改写它，
     第三个会话给一个改不了的补丁（路径不存在），第四个会话被内容审核拒绝，第五个会话回一个
-    空补丁（"不用改"，通义常这样回）；回答模型（不带工具）：返回固定答案。"""
+    空补丁（"不用改"，通义常这样回）；另有读不出的补丁（concert）与参数不是合法 JSON 的调用
+    （museum），见 test_silently_dropped_patches_are_lost_writes；回答模型（不带工具）：返回
+    固定答案。"""
     if not body.get("tools"):
         return '{"answer": "Berlin", "evidence_sufficient": true, "citations": ["m1"]}'
     transcript = " ".join(
@@ -333,6 +366,15 @@ def _fake_model(body: dict[str, Any]) -> str | dict[str, Any]:
         doc_id = re.search(r"<instance id=(\S+) ", system).group(1)  # type: ignore[union-attr]
         patch = {"json_doc_id": doc_id, "planned_edits": "No changes needed.", "patches": []}
         return {"tool_calls": [{"id": "c3", "name": "PatchDoc", "arguments": json.dumps(patch)}]}
+    if "concert" in transcript:  # 补丁写成了对象：trustcall 读不出，不记日志就跳过
+        system = body["messages"][0]["content"]
+        doc_id = re.search(r"<instance id=(\S+) ", system).group(1)  # type: ignore[union-attr]
+        edit = {"op": "replace", "path": "/content", "value": "Ben went to a concert."}
+        patch = {"json_doc_id": doc_id, "planned_edits": "Add it.", "patches": edit}
+        return {"tool_calls": [{"id": "c4", "name": "PatchDoc", "arguments": json.dumps(patch)}]}
+    if "museum" in transcript:  # 参数不是合法 JSON：LangChain 放进 invalid_tool_calls
+        broken = '{"json_doc_id": "x", "patches": [{"op": "replace"'
+        return {"tool_calls": [{"id": "c5", "name": "PatchDoc", "arguments": broken}]}
     memory = json.dumps({"content": "Ana moved to Berlin in late July 2026."})
     return {"tool_calls": [{"id": "c1", "name": "Memory", "arguments": memory}]}
 
@@ -418,6 +460,39 @@ def test_build_and_retrieve_through_the_gateway(
             assert stored["items"][0]["key"] == key
         finally:
             rebuilt.gateway.stop()
+    finally:
+        method.gateway.stop()
+
+
+def test_silently_dropped_patches_are_lost_writes(
+    offline_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """trustcall 不记日志就丢掉的 PatchDoc（patches 是对象、参数不是合法 JSON）一条也没写：
+    算写入丢了，不能当成模型说"不用改"；真的空补丁才是。"""
+    pytest.importorskip("langmem")
+    pytest.importorskip("langchain_openai")
+    fake_api.chat_replies = [_fake_model]
+    llm = _llm(offline_settings, fake_api)
+    concert = [EvalTurn(role="user", text="I went to a concert.", speaker="Ben")]
+    museum = [EvalTurn(role="user", text="I visited a museum.", speaker="Ben")]
+    movie = [EvalTurn(role="user", text="I watched a movie.", speaker="Ben")]
+    sessions = [
+        *_two_people(),
+        EvalSession("session_3", datetime(2026, 8, 9, 9, 0), concert),
+        EvalSession("session_4", datetime(2026, 8, 10, 9, 0), museum),
+        EvalSession("session_5", datetime(2026, 8, 11, 9, 0), movie),
+    ]
+    ctx = MethodContext(_sample(), sessions, Reader(llm), None, "locomo:conv-1")
+    method = ml.LangMemBaseline()
+    try:
+        build = method.answer(ctx).details["langmem_build"]
+        assert build["puts_per_session"] == [1, 1, 0, 0, 0]
+        assert build["empty_sessions"] == ["session_3", "session_4"]
+        assert build["unchanged_sessions"] == ["session_5"]
+        assert build["tool_calls"] == 5 and build["errors"] == 0
+        # 读不出的补丁记成跳过的修改；不合法的 JSON 在 LangChain 那里就丢了，trustcall 看不到
+        assert build["skipped_edits"] == 1 and build["dropped_calls"] == 0
+        assert build["problem_examples"][0].startswith("Could not read PatchDoc patches: {")
     finally:
         method.gateway.stop()
 
