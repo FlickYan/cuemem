@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fakes import REJECT, FakeAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from scripted import ScriptedModel
 from test_sdk import where_i_live
 
@@ -249,3 +251,40 @@ def test_access_token(proxy: MemoryProxy, upstream: Upstream) -> None:
         assert chat(client, "hi", user="alice").status_code == 401
         ok = chat(client, "hi", user="alice", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200
+
+
+def test_server_side_image_paths_are_not_stored(
+    client: TestClient, system: MemorySystem, upstream: Upstream, tmp_path: Path
+) -> None:
+    secret = tmp_path / "server-only.png"
+    Image.new("RGB", (8, 8), "red").save(secret)
+    content = [
+        {"type": "text", "text": "Look at these"},
+        {"type": "image_url", "image_url": {"url": str(secret)}},
+        {"type": "image_url", "image_url": {"url": f"file://{secret}"}},
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+    ]
+    body = {
+        "model": "qwen3.8-flash",
+        "user": "alice",
+        "messages": [SYSTEM, {"role": "user", "content": content}],
+    }
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    turns = system.db.get_turns("alice")
+    assert turns[0].text == "Look at these" and not turns[0].media_ids
+    assert system.db.get_media("alice") == []  # 代理所在机器上的文件不会被写进记忆
+
+
+def test_recall_failure_does_not_fail_the_turn(
+    client: TestClient, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat(client, "I live in Berlin", user="alice")
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("vector store is down")
+
+    monkeypatch.setattr(system, "retrieve", broken)
+    response = chat(client, "Where do I live?", user="alice")
+    assert response.status_code == 200
+    assert response.headers["x-cuemem-level"] == "error"
+    assert response.json()["choices"][0]["message"]["content"] == "Happy to help, Alice!"

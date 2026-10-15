@@ -14,12 +14,11 @@ import pytest
 from fakes import TOY_CONVERSATION, FakeAPI
 from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
 
-from cuemem.api.service import english_reason
 from cuemem.config import Settings
 from cuemem.core.models import Conversation
 from cuemem.evals import routing as R
 from cuemem.memory import MemorySystem
-from cuemem.read.controller import ControllerModel, LearnedController, LLMRouter
+from cuemem.read.controller import ControllerModel, LearnedController, LLMRouter, english_reason
 from cuemem.read.probe import query_features
 
 ASKED = datetime(2025, 10, 10, 20, 0)

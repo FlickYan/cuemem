@@ -21,9 +21,10 @@ from cuemem.agent import Agent, ChatSession, Persona, Reply
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import stable_id
-from cuemem.core.models import Fact, SessionIn, TurnIn
+from cuemem.core.models import SessionIn, TurnIn
+from cuemem.evidence import fact_state, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
-from cuemem.read.controller import Router, english_reason
+from cuemem.read.controller import Router
 
 Scenario = Literal["shop", "plain"]
 
@@ -148,59 +149,17 @@ class ChatService:
         at: datetime | None = None,
         at_least_l1: bool = False,
     ) -> dict[str, Any]:
-        """检索控制器选档、取回记忆，原样交给调用方（另一个 Agent）去推理，不调用回答模型。
-
-        at_least_l1：调用方已经决定要查记忆（例如 MCP 的 recall），控制器选了 L0 时改走 L1，
-        控制器只决定要不要查得更深。
-        """
-        recall = self.system.retrieve(
+        """检索控制器选档、取回记忆，原样交给调用方（另一个 Agent）去推理（见 evidence.py）。"""
+        return recall_listing(
+            self.system,
             space_id,
             query,
-            question_time=at,
             mode=mode,
             router=router or self.agent.router,
             lam=lam,
+            at=at,
+            at_least_l1=at_least_l1,
         )
-        raised = at_least_l1 and recall.level == "l0"
-        if raised:
-            recall = self.system.retrieve(space_id, query, question_time=at, mode="l1")
-        view = recall.view
-        decision = recall.decision
-        return {
-            "level": recall.level.upper(),
-            "see": bool(decision and decision.see),
-            "reasons": (
-                ["raised from L0: the caller asked to recall"]
-                if raised
-                else [english_reason(r) for r in decision.reasons]
-                if decision
-                else []
-            ),
-            "profile": view.core.text if view.core is not None else "",
-            "facts": [
-                {
-                    "id": fh.fact.id,
-                    "statement": fh.fact.statement,
-                    "said_on": fh.fact.recorded_at.isoformat(),
-                    "status": _status(fh.fact),
-                }
-                for fh in view.facts
-            ],
-            "excerpts": [
-                {
-                    "id": hit.unit.id,
-                    "session_id": hit.unit.session_id,
-                    "ts": hit.unit.ts.isoformat(),
-                    "text": hit.unit.text,
-                    "turn_ids": hit.unit.source_turn_ids,
-                }
-                for hit in sorted(view.rounds, key=lambda h: h.unit.ts)
-            ],
-            "images": [
-                {"id": m.id, "caption": m.caption, "path": m.path, "attached": m.id in view.attach}
-                for m in view.media.values()
-            ],
-        }
 
     def remember(self, space_id: str, text: str, *, at: datetime | None = None) -> dict[str, str]:
         """记一条笔记（MCP 的 remember）：写成只有一句话的会话，在线写入、后台巩固。"""
@@ -219,9 +178,7 @@ class ChatService:
 
     def forget_ids(self, space_id: str, ids: Sequence[str]) -> ForgetReport:
         """按 recall 给出的 ID 遗忘：事实 ID，或对话片段（轮）的 ID。"""
-        fact_ids = [f.id for f in self.system.db.get_facts(space_id, ids=list(ids))]
-        rounds = self.system.db.get_units(space_id, list(ids))
-        turns = [t for unit in rounds if unit.kind == "round" for t in unit.source_turn_ids]
+        fact_ids, turns = resolve_ids(self.system, space_id, ids)
         return self.forget(space_id, fact_ids=fact_ids, turn_ids=turns)
 
     # ---------- 记忆浏览器 ----------
@@ -251,7 +208,7 @@ class ChatService:
                     "valid_from": fact.valid_from,
                     "valid_to": fact.valid_to,
                     "current": fact.is_current,
-                    "status": _status(fact),
+                    "status": fact_state(fact),
                     "superseded_by": fact.superseded_by,
                     "replaced_by": (
                         by_id[fact.superseded_by].statement if fact.superseded_by in by_id else None
@@ -376,16 +333,6 @@ class ChatService:
             if not session.closed:
                 self.agent.end(session)  # 登记巩固任务；进程退出后下次巩固时完成
         self.system.close()
-
-
-def _status(fact: Fact) -> str:
-    """界面上的有效状态：当前有效 / 何时因现实变化而失效 / 何时被更正。"""
-    if fact.is_current:
-        return "current"
-    when = f"{fact.invalidated_at:%Y-%m-%d}" if fact.invalidated_at else "?"
-    if fact.supersede_reason == "corrected":
-        return f"corrected on {when}"
-    return f"changed on {when}" + (f" (until {fact.valid_to})" if fact.valid_to else "")
 
 
 def _display(name: str, aliases: list[str]) -> str:

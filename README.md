@@ -53,6 +53,8 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 # Response headers say what the controller did: X-CueMem-Level: L0 (no recall) / L1 / L2
 ```
 
+Or inside an agent framework: the OpenAI Agents SDK, LangGraph / LangChain, and Claude's memory tool, with the controller deciding before every model call ([integrations](docs/en/integrations.md)).
+
 Also: an HTTP API with a memory browser (`cuemem serve`), an MCP server, export and import of a user's memory (`cuemem export / import`), and a Docker image (`docker compose up`). See [Quick start](#quick-start) and the [examples](examples/).
 
 ## Results at a glance
@@ -142,7 +144,7 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 | Forgetting | Deletes the source conversation, follows citations, finds uncited restatements; dry run | `delete` | Edit memory | `remove_episode` | `forget_matching`, dry run |
 | Evaluation | Frozen methods, test sets used once, external baseline under the same judge | Own benchmark repo | Blog | Paper | Own |
 
-CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, no framework integrations yet ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
+CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, three framework integrations so far ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
 
 ## Quick start
 
@@ -224,6 +226,7 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 | Design: motivation, architecture, controller, multimodal memory, evaluation plan | [English](docs/en/design.md) · [中文](docs/design.md) |
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
 | Comparison with open-source peers: capabilities, published scores, what N12 borrowed, what is missing | [English](docs/en/landscape.md) · [中文](docs/landscape.md) |
+| Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | [English](docs/en/integrations.md) · [中文](docs/integrations.md) |
 | Decision records (64 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
 | Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 

@@ -669,11 +669,13 @@ anthropic = [
 ]
 integrations = [
     { name = "anthropic" },
+    { name = "langchain" },
     { name = "langchain-core" },
     { name = "langgraph" },
     { name = "openai-agents" },
 ]
 langgraph = [
+    { name = "langchain" },
     { name = "langchain-core" },
     { name = "langgraph" },
 ]
@@ -701,6 +703,8 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'local'", specifier = ">=0.9" },
     { name = "gradio", specifier = ">=6.30" },
     { name = "httpx2", specifier = ">=2.13.1" },
+    { name = "langchain", marker = "extra == 'integrations'", specifier = ">=1.4" },
+    { name = "langchain", marker = "extra == 'langgraph'", specifier = ">=1.4" },
     { name = "langchain-core", marker = "extra == 'integrations'", specifier = ">=1.6" },
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.6" },
     { name = "langgraph", marker = "extra == 'integrations'", specifier = ">=1.2" },
@@ -1487,6 +1491,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a9/c4/1407df7512a5b36cc79840e01710dc575733c461b13ab866cae77eaf87f3/kiwisolver-1.5.1-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:482676e5bd48d70ac99d9fc78863469845421e01184fa83f1f9366dc49f7e974", size = 134002, upload-time = "2026-08-28T10:28:08.881Z" },
     { url = "https://files.pythonhosted.org/packages/16/45/c37a21ad5c0ab581a93c55ad544721aaa1f0ae94edb29c6a678a23d013e6/kiwisolver-1.5.1-graalpy312-graalpy250_312_native-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:072bdb15a3c19a5b5dbc8f8fb1f4e1884bf4f3507eeb4cc6334401274d37a5c0", size = 194292, upload-time = "2026-08-28T10:28:11.06Z" },
     { url = "https://files.pythonhosted.org/packages/a6/c1/69f00d627949580e43d57af0aa465df46868d7c29801c137a55374101294/kiwisolver-1.5.1-graalpy312-graalpy250_312_native-win_amd64.whl", hash = "sha256:a5a00665d1a0e26763a7338d7e911d4598fbc1d50dd0d6b7919b7dc6c5d6569f", size = 73362, upload-time = "2026-08-28T10:28:12.449Z" },
+]
+
+[[package]]
+name = "langchain"
+version = "1.4.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+    { name = "langgraph" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a2/aa/0fcaf5d7dbebcf7d0eb74293dca5aee6f0558242731f4dee4a800cc2431d/langchain-1.4.3.tar.gz", hash = "sha256:aed5c1a7cd581f70ddc076b75fdbcbae8031b8373983f86efd287aa70798abc2", size = 738607, upload-time = "2026-09-28T20:17:24.38Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/03/8cc027f9d297473de94f134546dae2bfca255161ebbda988522fc509e1d5/langchain-1.4.3-py3-none-any.whl", hash = "sha256:0334066939dd1c7551889727ed2d09a72dea7a6aed2193ffb61817fb658d8921", size = 164708, upload-time = "2026-09-28T20:17:22.978Z" },
 ]
 
 [[package]]

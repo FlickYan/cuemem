@@ -56,7 +56,7 @@
 | 部署 | Docker 镜像、compose（+ Qdrant 服务端）、MCP、HTTP | docker compose、托管平台、托管 MCP | `letta server` | REST、MCP 镜像 | Docker、云服务 | 本地模式、Docker、托管 MCP |
 | 存储后端 | SQLite + Qdrant（本地或服务端） | 约 26 种向量库 | Postgres 等 | Neo4j、FalkorDB、Neptune | LanceDB、pgvector、Kuzu、Neo4j…… | 托管 / 本地 |
 | 公开评测 | 测试集只用一次、方法事先冻结；三个基准、三种回答模型、消融、人工抽检、第二判分 | `memory-benchmarks` 仓库（平台版的模型未公开） | 博客 | 论文 | 自有评测 | 自有评测 |
-| 其他语言 / 框架集成 | 只有 Python（与 MCP、HTTP） | TS、十几个框架 | TS、Vercel AI SDK | 十几个框架 | TS、Rust、Claude Code 插件 | TS、Vercel AI SDK 中间件、多个框架 |
+| 其他语言 / 框架集成 | 只有 Python（与 MCP、HTTP、记忆代理）；OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool（[框架集成](integrations.md)） | TS、十几个框架 | TS、Vercel AI SDK | 十几个框架 | TS、Rust、Claude Code 插件 | TS、Vercel AI SDK 中间件、多个框架 |
 
 ## 4. 公开的分数（不能直接比较）
 
@@ -89,7 +89,7 @@
 | MemOS | 77.8（2025-11） | gpt-4o-mini | MemOS 仓库 | 自有评测框架 89.2 |
 | **CueMem** L1 / L2 / 控制器 | 90.5 / 93.2 / 90.5 | deepseek-flash | [技术报告](report.md) | 全上下文基线 73.0 |
 
-**唯一可以直接比较的一组**是 N11 在同样的抽取模型、向量、回答与判分下跑的开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（p = 0.049），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。那是 Mem0 2.x；只增不改的 v3 没有测过。
+**唯一可以直接比较的一组**是 N11 在同样的抽取模型、向量、回答与判分下跑的开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（p = 0.049），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。这一组测的 mem0ai 2.2.1 就是只增不改的 v3 算法：PyPI 上的包版本号是 2.x，源码里的抽取提示写的是 "V3 Additive Extraction Prompt (ADD-only)"，`add` 不再让 LLM 决定 UPDATE / DELETE。
 
 ## 5. N12 借鉴了什么
 
@@ -115,9 +115,9 @@
 
 按"用户最先会碰到"的顺序：
 
-1. **框架集成**：LangGraph 的 `BaseStore`、OpenAI Agents SDK、Vercel AI SDK 中间件、Claude 的 memory tool 后端（Supermemory 已经做了）。现在只能通过 SDK、HTTP、MCP 或代理接入。
+1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺 TypeScript 与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
 2. **多租户**：只有一个共享的访问令牌；记忆空间按 user_id 隔离，但没有按用户鉴权。多实例部署需要把 SQLite 换成 Postgres。
-3. **更多外部基线**：在同一协议下跑 Graphiti、LangMem、Letta，以及只增不改的 Mem0 v3（需要 API Key 与预算）。
+3. **更多外部基线**：在同一协议下跑 Graphiti、LangMem、Cognee、A-MEM、Letta（需要 API Key 与预算）。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的元数据与过期**：Mem0 的 `metadata` 过滤与 `expiration_date`、Supermemory 的临时事实自动过期。
 6. **命令行的英文界面**：CLI 的提示目前是中文；SDK、HTTP、MCP、代理与界面是英文。

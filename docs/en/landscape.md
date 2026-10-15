@@ -61,7 +61,7 @@ A few changes in 2025–2026 matter here:
 | Deployment | Docker image, compose (+ Qdrant server), MCP, HTTP | docker compose, hosted platform, hosted MCP | `letta server` | REST, MCP image | Docker, cloud | Local mode, Docker, hosted MCP |
 | Storage | SQLite + Qdrant (local or server) | ~26 vector stores | Postgres and others | Neo4j, FalkorDB, Neptune | LanceDB, pgvector, Kuzu, Neo4j, … | Hosted / local |
 | Published evaluation | Test sets used once, methods frozen; three benchmarks, three readers, ablations, hand audit, a second judge | `memory-benchmarks` repo (platform models undisclosed) | Blog | Paper | Own harness | Own harness |
-| Other languages / framework integrations | Python only (plus MCP, HTTP, the proxy) | TypeScript, a dozen frameworks | TypeScript, Vercel AI SDK | A dozen frameworks | TypeScript, Rust, Claude Code plugin | TypeScript, Vercel AI SDK middleware, several frameworks |
+| Other languages / framework integrations | Python only (plus MCP, HTTP, the proxy); OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool ([integrations](integrations.md)) | TypeScript, a dozen frameworks | TypeScript, Vercel AI SDK | A dozen frameworks | TypeScript, Rust, Claude Code plugin | TypeScript, Vercel AI SDK middleware, several frameworks |
 
 ## 4. Published scores (not comparable)
 
@@ -106,7 +106,7 @@ Against differences like these, a gap of one or two points means nothing.
 - LongMemEval, 100 questions: 83.0% vs 92.0% (p = 0.049).
 - Mem0's writes cost 2.3–2.9 times as much. It loses on temporal reasoning, knowledge updates and details the assistant gave.
 
-That was Mem0 2.x; the add-only v3 has not been tested.
+The mem0ai 2.2.1 tested here already is the add-only v3 algorithm: the PyPI package is numbered 2.x, but its source labels the extraction prompt "V3 Additive Extraction Prompt (ADD-only)", and `add` no longer asks the LLM to UPDATE or DELETE.
 
 ## 5. What N12 borrowed
 
@@ -132,9 +132,9 @@ That was Mem0 2.x; the add-only v3 has not been tested.
 
 In the order a user would run into them:
 
-1. **Framework integrations**: a LangGraph `BaseStore`, the OpenAI Agents SDK, Vercel AI SDK middleware, a backend for Claude's memory tool (Supermemory has one). Today the ways in are the SDK, HTTP, MCP and the proxy.
+1. **More framework integrations**: the OpenAI Agents SDK, LangGraph / LangChain and Claude's memory tool are done ([integrations](integrations.md)). Still missing: TypeScript and Vercel AI SDK middleware, a LangGraph `BaseStore`, CrewAI, AutoGen. The Claude memory tool backend has not been run against the real Claude API.
 2. **Multi-tenancy**: there is one shared access token. Memory spaces are isolated by user_id, but there is no per-user authentication. Multi-instance deployments need Postgres instead of SQLite.
-3. **More external baselines** under the same protocol: Graphiti, LangMem, Letta, and the add-only Mem0 v3. These need API keys and budget.
+3. **More external baselines** under the same protocol: Graphiti, LangMem, Cognee, A-MEM, Letta. These need API keys and budget.
 4. **Validating the presets**: the OpenAI and Ollama presets are covered by offline tests only and have not been evaluated on real models. The consolidation similarity thresholds were tuned for Qwen embeddings and may need re-tuning for another embedding model.
 5. **Metadata and expiry**: Mem0's `metadata` filters and `expiration_date`; Supermemory's automatically expiring temporary facts.
 6. **An English CLI**: CLI messages are in Chinese. The SDK, HTTP API, MCP, proxy and UI are in English.

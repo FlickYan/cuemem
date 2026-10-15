@@ -40,7 +40,7 @@ READER_REPLY = '{"answer": "Blue.", "evidence_sufficient": true, "citations": []
 def test_default_config_ships_inside_the_package() -> None:
     assert DEFAULT_CONFIG.is_relative_to(PACKAGE_DIR)
     assert DEFAULT_CONFIG.is_file()
-    assert {"openai", "ollama", "deepseek"} <= set(presets())
+    assert {"openai", "ollama", "deepseek", "qwen"} <= set(presets())
 
 
 def test_home_dir_can_be_overridden(

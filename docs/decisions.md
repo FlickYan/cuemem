@@ -72,6 +72,7 @@
 | D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12） |
 | D-063 | 导出与导入只搬原始日志；遗忘可以预演 | 已采纳（N12） |
 | D-064 | 抽取的补充说明（custom instructions） | 已采纳（N12） |
+| D-066 | 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份 | 已采纳（N12） |
 
 ## D-001 检索时机与深度由解耦的控制器决定，而不是由 LLM 自主决定
 
@@ -1029,3 +1030,23 @@
   - **填了以后**：指纹改变，已巩固的空间在下次巩固时重建派生记忆。
 - **备选**：自定义实体与事实类型（Graphiti）：要改输出结构、对账规则与谓词登记表，改动面大；先用文字说明覆盖最常见的需求。
 - **后果**：测试覆盖提示词的拼接、SDK 参数与指纹的变化。没有评测补充说明对抽取质量的影响。
+
+## D-066 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份
+
+- **状态**：已采纳（N12）
+- **背景**：Mem0、Graphiti、Supermemory 等都有十几个框架的集成，用户最先碰到的问题是"怎么接进我已经在用的 Agent 框架"。CueMem 之前只有 SDK、HTTP、MCP 与记忆代理。框架集成要回答两件事：谁决定要不要想起，对话什么时候算结束、交给抽取。
+- **决策**：`cuemem.integrations` 下三个模块，依赖都是可选的（`--extra openai-agents / langgraph / anthropic`，合称 `integrations`），用法见 [框架集成](integrations.md)。
+  1. **控制器先选**：三个集成都在每次调用模型之前过一遍控制器（L0 只给画像），证据块与记忆代理、回答模型相同，放在最新一句用户消息的开头，系统提示与之前的消息不动。模型另外可以用 recall / remember / forget 工具补查，工具与 MCP 同名同义。
+  2. **OpenAI Agents SDK**：`memory_input_filter` 接在 `call_model_input_filter` 上；`CueMemSession` 实现 Session 协议，内层会话原样保存短期历史，一问一答写成 CueMem 的一轮；服务端保存对话状态时用 `placement="instructions"`，证据不随用户消息存到服务端。
+  3. **LangGraph / LangChain**：LangChain 1.x 的中间件 `CueMemMiddleware`（召回在 wrap_model_call 里、只改这次发给模型的请求，写回在 after_agent，回合怎么结束都写回）；旧的 `create_react_agent` 用 `recall_hook` / `save_hook`。一个线程是一个会话；LangGraph Server 上用登录用户的身份，不信任客户端传的 ID。
+  4. **Claude 的 memory tool**（`memory_20250818`）：`/memories` 目录接到 CueMem 上。`profile.md`、`facts.md` 是只读的生成文件；Claude 自己建的文件存在旁边的小库里，每次改动同时作为笔记写进原始日志，由巩固抽成事实；删文件就遗忘它写进去的内容。
+  5. **会话的结束**：`end()` / `end_thread()`、上下文管理器退出、空闲 30 分钟、`close_sessions()` / `close()` 时交给后台抽取；进程没来得及交出的会话由下一个进程交出。
+  6. **一份召回证据**：评审查出"想起 → 排成证据 → 注入"在代理与三个集成里各写了一份，集成还导入了私有函数。收拢到 `cuemem/evidence.py`：`recall_evidence` / `inject_evidence`（自动想起）、`recall_listing` / `format_listing` / `resolve_ids`（给另一个 Agent 的清单与按 ID 遗忘）。代理、服务层、MCP 与三个集成都用它，行为不变。
+- **备选**：
+  - LangGraph 的 `BaseStore` 后端：Store 是通用键值存储，读写时机由应用决定，放不进控制器；以后可以补上，作为只读的事实视图。
+  - 把记忆写进系统提示：每轮都变，前缀缓存不命中（与 D-062 同）。
+  - 只给工具、让模型自己决定：这是 Letta 的做法，与 CueMem"调用 LLM 之前由控制器决定"的主张相反；工具保留作补查。
+- **后果**：
+  - 每个集成先实现，再由两个视角（对框架的忠实度、正确性）评审，按评审修订后才合并。评审查出的真问题包括：CI 没装可选依赖、集成测试一直跳过；一问一答被拆成两轮；证据缓存跨轮沿用；LangChain 的对话总结被当成用户的话写回；身份取自客户端可控的 configurable；代理与集成会读 `file://` 与本地路径的图片。这些都已修正并加了回归测试。
+  - 2,592 行测试（离线）；三个集成都在 deepseek 预设上做过联网冒烟。Claude 的 memory tool 没有在真实的 Claude 上跑过：没有 Anthropic 的 Key，DeepSeek 的 Anthropic 兼容接口不认 `memory_20250818`，冒烟时把同一个后端声明成普通工具。
+  - **局限**：进行中的会话按进程记在内存里；只注入文字证据，控制器想看原图时原图不附进模型调用；还没有 TypeScript 与 Vercel AI SDK。
