@@ -49,7 +49,13 @@ from cuemem.embed import build_embedder
 from cuemem.envfile import mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError
 from cuemem.evals.audit import export_audit, score_audit
-from cuemem.evals.datasets import DATASETS, EvalSet, dataset_path
+from cuemem.evals.datasets import (
+    DATASETS,
+    RAW_LABELS_VALUE,
+    RAW_SESSION_IDS_ENV,
+    EvalSet,
+    dataset_path,
+)
 from cuemem.evals.datasets import download as download_dataset
 from cuemem.evals.datasets import load as load_dataset
 from cuemem.evals.report import build_report, load_rows, method_stats
@@ -1011,7 +1017,7 @@ def eval_run(
             f"本次实际花费 ${summary.spent:.4f}"
         )
         return
-    report_path = build_report(summary.run_dir)
+    report_path = build_report(summary.run_dir, eval_spaces=settings.paths.eval_spaces)
     note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
     console.print(
         f"完成 {summary.completed} / {summary.planned} 个组合，出错 {summary.errors} 个{note}；"
@@ -1070,7 +1076,7 @@ def eval_report(
     if not (run_dir / "run.json").exists():
         console.print(f"[red]找不到运行目录 {run_dir}[/red]")
         raise typer.Exit(1)
-    path = build_report(run_dir)
+    path = build_report(run_dir, eval_spaces=settings.paths.eval_spaces)
     _print_method_stats(run_dir)
     console.print(f"报告：{path}")
 
@@ -1113,7 +1119,18 @@ def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSe
         )
         raise typer.Exit(1)
     ids = load_split(dataset, split) if split else None
-    return load_dataset(dataset, path, ids=ids)
+    evalset = load_dataset(dataset, path, ids=ids)
+    if evalset.session_ids == "raw":
+        console.print(
+            f"[yellow]{RAW_SESSION_IDS_ENV}=1：保留数据集的原始会话 ID（LongMemEval 的证据会话以 "
+            "answer_ 开头，拒答题的还带 _abs，会泄漏给回答模型），只用于复现这个泄漏的消融[/yellow]"
+        )
+    elif evalset.raw_labels:
+        console.print(
+            f"[yellow]{RAW_SESSION_IDS_ENV}={RAW_LABELS_VALUE}：会话 ID 照常改写，但证据抬头显示"
+            "原始 ID（泄漏的干净消融，只用于测量泄漏的影响）[/yellow]"
+        )
+    return evalset
 
 
 def _print_method_stats(run_dir: Path) -> None:

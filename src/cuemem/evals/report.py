@@ -7,13 +7,21 @@ L2（蓝）、规则版控制器（青），B2、B2F 只进表格。B0（下限�
 与 B3（模型自主检索）是参照点，用中性色空心标记、形状区分；消融变体只出现在表格里。
 浅色、深色各渲染一张，Markdown 里用 <picture> 按读者的主题自动切换。图中文字用英文，
 避免 CI 环境缺少中文字体。
+
+写入成本（一次性）按方法统计，口径与 scripts/n12_baselines.py 相同（两边都用 write_cost）：
+CueMem 取运行里的写入与巩固记录（ingest.jsonl），外部基线（M0、MG、ML、MC、MA）取它们各自的
+写入记录（<eval_spaces>/<系统>/<空间>/build.json）。图与"名义成本 / 题"只算回答。
+外部基线的写入按这次运行记下的会话 ID 写法找（run.json，datasets.run_session_ids；不看当前的
+环境变量）：LongMemEval / MemLens 改写过会话 ID 的写入在 <数据集>-anon_<空间> 下（N12 修复的
+泄漏），记的写法对不上的不算；LoCoMo 不受影响。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +36,14 @@ from matplotlib.legend import Legend
 from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 from matplotlib.transforms import Bbox
 
+from cuemem.config import home_dir
+from cuemem.evals.datasets import (
+    SessionIds,
+    build_matches_session_ids,
+    run_session_ids,
+    session_id_scheme,
+    storage_name,
+)
 from cuemem.evals.metrics import bootstrap_ci, mean, percentile
 from cuemem.read.probe import DONT_KNOW
 
@@ -65,8 +81,27 @@ METHOD_LABELS = {
     "B4-see-novis": ("消融：B4-see 去掉以文搜图", "B4-see no visual search"),
     "B5-see": ("L2 + 再感知原图", "B5-see L2 + re-perception"),
     "ORACLE": ("只给证据会话（上限参照）", "Oracle: evidence only"),
+    # 外部基线（N11、N12）：版本与 scripts/n12_baselines.py 的 LABELS 一致
+    "M0": ("外部基线：Mem0 2.2.1（开源版）", "M0 Mem0 2.2.1"),
+    "MG": ("外部基线：Graphiti（graphiti-core 0.30.2）", "MG Graphiti 0.30.2"),
+    "ML": ("外部基线：LangMem 0.0.30", "ML LangMem 0.0.30"),
+    "MC": ("外部基线：Cognee 1.6.4", "MC Cognee 1.6.4"),
+    "MA": ("外部基线：A-MEM（agiresearch/A-mem@ceffb86）", "MA A-MEM ceffb86"),
 }
 METHOD_ORDER = list(METHOD_LABELS)
+
+# 外部基线：方法 → 系统名。每份对话历史的写入记录在 <eval_spaces>/<系统名>/<数据集>_<空间>/
+# build.json（evals/external.py、evals/mem0_baseline.py），触发写入的那道题的 details 里也有一份
+# （<系统名>_build）
+EXTERNAL_SYSTEMS = {"M0": "mem0", "MG": "graphiti", "ML": "langmem", "MC": "cognee", "MA": "amem"}
+# 各协议（运行名的第一段，如 pq-locomo-mem0 的 pq；D-065）的写入目录，相对数据目录。pq 与 qwen
+# 的抽取模型、向量模型相同，共用一份写入；同一个数据目录下 pds 与 pq 的写入目录名相同（如
+# mem0/locomo_conv-42），不能靠当前的配置区分。与 scripts/n12_baselines.py 共用
+PROTOCOL_SPACES = {
+    "pds": Path("data/eval-spaces"),
+    "pq": Path("data/eval-spaces-qwen"),
+    "qwen": Path("data/eval-spaces-qwen"),
+}
 # 参照点：中性色空心，形状区分
 REFERENCE_MARKERS = {"B0": "s", "B1": "D", "ORACLE": "o", "B3": "^", "B4-text": "v"}
 
@@ -228,8 +263,208 @@ def method_stats(rows: Sequence[dict[str, Any]]) -> list[MethodStats]:
     return stats
 
 
-def build_report(run_dir: Path) -> Path:
-    """生成 report.md 与两张散点图，返回 report.md 的路径。"""
+# ---------- 写入成本（一次性） ----------
+
+
+def write_stages(method: str) -> set[str]:
+    """CueMem 的方法用到哪些写入阶段（ingest.jsonl 的 stage）：B0、B1、ORACLE 只读原文，不写入；
+    B2 只建索引（向量化，不调用 LLM）；其余（L0、事实检索、L1 / L2 / 控制器……）都用巩固后的
+    同一份记忆，写入成本相同。"""
+    if method in ("B0", "B1", "ORACLE"):
+        return set()
+    if method == "B2":
+        return {"ingest"}
+    return {"ingest", "consolidate"}
+
+
+def run_protocol(info: dict[str, Any]) -> str | None:
+    """运行记录里的写入协议"抽取模型|向量模型:维度"，与外部基线 build.json 的 protocol 同一写法
+    （ExternalBaseline._setup）。运行记录不全时返回 None（不核对）。"""
+    extractor = (info.get("roles") or {}).get("extractor") or {}
+    embedding = info.get("embedding") or {}
+    if not extractor.get("model_id") or not embedding.get("model"):
+        return None
+    return f"{extractor['model_id']}|{embedding['model']}:{embedding.get('dim')}"
+
+
+def write_cost(
+    method: str,
+    keys: Iterable[str],
+    *,
+    dataset: str,
+    ingests: Sequence[dict[str, Any]] = (),
+    eval_spaces: Path | None = None,
+    protocol: str | None = None,
+    rows: Sequence[dict[str, Any]] = (),
+    session_ids: SessionIds | None = None,
+) -> dict[str, float]:
+    """一个方法写入这些对话历史（结果里的 space_key）的一次性成本：名义成本 cost、实际花费 spent、
+    LLM 调用、耗时（秒）等。report.md 与 scripts/n12_baselines.py 用的都是它。
+
+    - CueMem：运行里的写入与巩固记录（ingests，即 ingest.jsonl；同一份历史的同一阶段只取最后
+      一次），用到哪些阶段见 write_stages。L1 / L2 / 控制器共用一份巩固后的记忆，写入成本相同；
+      spaces 只数巩固过的对话历史。
+    - 外部基线（EXTERNAL_SYSTEMS）：每份对话历史有两处写入记录——rows 里触发写入的那道题记下的
+      统计（<系统名>_build，运行自己写入时才有）与 eval_spaces 下的 build.json。给了 protocol 时
+      按协议挑（_pick_build）：先取协议对得上的（运行自己的记录优先），再取没记协议的（Mem0 从来
+      不记；运行自己的优先）；记的协议对不上的不算（例如 pq 的运行读到了 pds 的写入目录），全都
+      对不上时计入 mismatched。旧记录没有 protocol 字段，但记了 extractor 与 embedder 的照样核对。
+      耗时取 build.json 的 seconds（墙钟），M0 没有这一项，取各次调用的延迟之和。
+    - session_ids：这次运行的会话 ID 写法（datasets.run_session_ids(run.json)，不看环境变量）；
+      None 时按没记写法的运行处理（LongMemEval / MemLens 是原始 ID，LoCoMo 不改写）。改写过的
+      写入在 <数据集>-anon_<空间> 下；两处记录里写法对不上的（build_matches_session_ids）先剔除、
+      不参与按协议挑，剩下的都不能用时同样计入 mismatched。
+    """
+    return _write_cost(
+        method,
+        set(keys),
+        dataset=dataset,
+        ingests=ingests,
+        eval_spaces=eval_spaces,
+        protocol=protocol,
+        rows=rows,
+        session_ids=session_ids,
+    )[0]
+
+
+def _write_cost(
+    method: str,
+    keys: set[str],
+    *,
+    dataset: str,
+    ingests: Sequence[dict[str, Any]],
+    eval_spaces: Path | None,
+    protocol: str | None,
+    rows: Sequence[dict[str, Any]],
+    session_ids: SessionIds | None = None,
+) -> tuple[dict[str, float], int]:
+    """write_cost 的实现，另外返回找到了写入记录的对话历史数（报告里显示"几份里有几份"）。"""
+    total: dict[str, float] = defaultdict(float)
+    system = EXTERNAL_SYSTEMS.get(method)
+    if system is not None:
+        scheme = session_ids if session_ids is not None else session_id_scheme(dataset, raw=True)
+        stored = storage_name(dataset, scheme)  # 改写过会话 ID 的写入另存一处（<数据集>-anon）
+        details: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            build = (row.get("details") or {}).get(f"{system}_build")
+            if row.get("method") == method and isinstance(build, dict):
+                details[row["space_key"]] = build
+        for key in sorted(keys):
+            candidates = [details.get(key), _load_build(eval_spaces, system, stored, key)]
+            found = [b for b in candidates if b is not None]
+            # 会话 ID 写法对不上的记录（写入里存着会话 ID）不能算到这次运行上，不参与按协议挑
+            usable = [b for b in found if build_matches_session_ids(b, scheme)]
+            build = _pick_build(usable, protocol)
+            if build is None:
+                if found:
+                    total["mismatched"] += 1
+                continue
+            total["spaces"] += 1
+            total["cost"] += float(build.get("cost", 0) or 0)
+            total["spent"] += float(build.get("spent", 0) or 0)
+            total["llm_calls"] += float(build.get("chat_calls", build.get("llm_calls", 0)) or 0)
+            seconds = build.get("seconds")
+            total["seconds"] += float(
+                seconds if seconds is not None else (build.get("latency_ms") or 0) / 1000
+            )
+            total["memories"] += float(build.get("memories", 0) or 0)
+        return {k: round(v, 4) for k, v in total.items()}, int(total.get("spaces", 0))
+    wanted = write_stages(method)
+    stages: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in ingests:
+        stages[(row["space_key"], row.get("stage", "ingest"))] = row
+    covered: set[str] = set()
+    for (space, stage), row in stages.items():
+        if stage not in wanted or space not in keys:
+            continue
+        covered.add(space)
+        total["cost"] += row.get("cost", 0.0)
+        total["spent"] += row.get("spent", row.get("cost", 0.0)) or 0.0
+        total["llm_calls"] += row.get("llm_calls", 0)
+        total["seconds"] += (row.get("elapsed_ms") or row.get("latency_ms") or 0.0) / 1000
+        total["spaces"] += stage == "consolidate"
+    return {k: round(v, 4) for k, v in total.items()}, len(covered)
+
+
+def _load_build(
+    eval_spaces: Path | None, system: str, dataset: str, key: str
+) -> dict[str, Any] | None:
+    """<eval_spaces>/<系统>/<数据集>_<空间>/build.json（如 mem0/locomo_conv-42）；
+    旧的目录名不带数据集。dataset 是写入用的数据集名（datasets.storage_name：改写过会话 ID 的
+    带 -anon，如 mem0/longmemeval_s-anon_<题号>）。"""
+    if eval_spaces is None:
+        return None
+    root = eval_spaces / system
+    for name in (re.sub(r"[^A-Za-z0-9_.-]", "_", f"{dataset}:{key}"), key):
+        path = root / name / "build.json"
+        if path.is_file():
+            try:
+                build = json.loads(path.read_text("utf-8"))
+            except (OSError, ValueError):
+                return None
+            return build if isinstance(build, dict) else None
+    return None
+
+
+def _pick_build(found: Sequence[dict[str, Any]], protocol: str | None) -> dict[str, Any] | None:
+    """同一份对话历史的几处写入记录（按优先顺序：运行自己的、build.json）里挑一条：先取协议
+    对得上的，再取没记协议的；记的协议对不上的不取。"""
+    matches = [_protocol_match(b, protocol) for b in found]
+    for wanted in (True, None):
+        for build, match in zip(found, matches, strict=True):
+            if match is wanted:
+                return build
+    return None
+
+
+def _protocol_match(build: dict[str, Any], expected: str | None) -> bool | None:
+    """写入记录的协议与这次运行的是否一致：True / False；没有记（Mem0、更早的记录）或不知道这次
+    运行的协议时为 None。外部系统可能在协议后面加上自己的版本（如 Cognee 的 |cognee==1.6.4）。
+
+    ExternalBaseline 记协议之前的记录（如 pds 的 graphiti/locomo_conv-42）没有 protocol，但记了
+    extractor 与 embedder，照样核对；那时 embedder 可能不带维度（LangMem），这时只比模型名。"""
+    if expected is None:
+        return None
+    built = build.get("protocol")
+    if built:
+        return str(built) == expected or str(built).startswith(f"{expected}|")
+    extractor, embedder = build.get("extractor"), build.get("embedder")
+    if not extractor or not embedder:
+        return None
+    want_extractor, _, want_embedder = expected.partition("|")
+    if ":" not in str(embedder):
+        want_embedder = want_embedder.split(":")[0]
+    return str(extractor) == want_extractor and str(embedder) == want_embedder
+
+
+def _eval_spaces(
+    info: dict[str, Any], fallback: Path | None, run_name: str
+) -> tuple[Path | None, str | None]:
+    """外部基线写入记录所在的目录，与怎么定的（报告里注明；运行记录里记了时为 None）：
+
+    1. 运行记录里记了（N12 起）且还在就用它；
+    2. 否则（更早的运行）按运行名的协议前缀（PROTOCOL_SPACES，如 pq-locomo-mem0 → 数据目录下的
+       data/eval-spaces-qwen），目录在才用——当前的配置可能是另一个协议的；
+    3. 都不行时用调用方给的（当前配置的 paths.eval_spaces）。调用方没给目录时不找写入目录。"""
+    recorded = info.get("eval_spaces")
+    if recorded and Path(recorded).is_dir():
+        return Path(recorded), None
+    if fallback is None:
+        return None, None
+    prefix = run_name.split("-", 1)[0]
+    if prefix in PROTOCOL_SPACES:
+        inferred = home_dir() / PROTOCOL_SPACES[prefix]
+        if inferred.is_dir():
+            return inferred, f"运行记录里没有记写入目录，按运行名的协议前缀 {prefix} 推断"
+    return fallback, "运行记录里没有记写入目录，用的是当前配置的 paths.eval_spaces"
+
+
+def build_report(run_dir: Path, *, eval_spaces: Path | None = None) -> Path:
+    """生成 report.md 与两张散点图，返回 report.md 的路径。
+
+    eval_spaces：评测记忆空间的目录（paths.eval_spaces），外部基线的写入记录从这里读；运行记录
+    里记了就用运行记录里的，没记的旧运行按运行名的协议前缀推断（_eval_spaces；同一个数据目录下
+    pds 与 pq 的写入分放两处，不能靠当前的配置）。"""
     info = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     rows = load_rows(run_dir, "results.jsonl")
     ingests = load_rows(run_dir, "ingest.jsonl")
@@ -239,11 +474,22 @@ def build_report(run_dir: Path) -> Path:
         e for e in load_rows(run_dir, "errors.jsonl") if (e["sample_id"], e["method"]) not in done
     ]
     stats = method_stats(rows)
+    run_name = info["config"].get("name") or run_dir.name
+    spaces, spaces_note = _eval_spaces(info, eval_spaces, run_name)
     has_plot = bool(stats)
     if has_plot:
         for mode in THEMES:
             plot_pareto(stats, run_dir / f"pareto-{mode}.png", mode=mode, info=info)
-    markdown = render_markdown(info, rows, stats, ingests, errors, has_plot=has_plot)
+    markdown = render_markdown(
+        info,
+        rows,
+        stats,
+        ingests,
+        errors,
+        has_plot=has_plot,
+        eval_spaces=spaces,
+        eval_spaces_note=spaces_note,
+    )
     path = run_dir / "report.md"
     path.write_text(markdown, encoding="utf-8")
     return path
@@ -305,9 +551,12 @@ def render_markdown(
     errors: Sequence[dict[str, Any]],
     *,
     has_plot: bool,
+    eval_spaces: Path | None = None,
+    eval_spaces_note: str | None = None,
 ) -> str:
     cfg = info["config"]
     roles = info["roles"]
+    writes = _method_writes(info, rows, stats, ingests, eval_spaces)
     lines = [
         f"# 评测报告：{cfg['name']}",
         "",
@@ -402,11 +651,20 @@ def render_markdown(
     consolidated = _latest_per_space([r for r in ingests if r.get("stage") == "consolidate"])
     if consolidated:
         lines += ["", *_consolidation_section(consolidated)]
+    lines += _write_section(
+        stats,
+        writes,
+        eval_spaces,
+        eval_spaces_note,
+        session_ids=run_session_ids(info),
+        session_ids_recorded="session_ids" in info,
+    )
     ingest_cost = sum(r["cost"] for r in online)
     ingest_tokens = sum(r["embedding_tokens"] for r in online)
     consolidate_cost = sum(r["cost"] for r in consolidated)
     answer_cost = sum(s.total_cost for s in stats)
     judge_cost = sum(s.judge_cost for s in stats)
+    externals = [writes[s.method] for s in stats if writes[s.method].kind == "external"]
     lines += [
         "",
         "## 成本汇总（名义成本，美元）",
@@ -416,10 +674,11 @@ def render_markdown(
     ]
     for s in stats:
         lines.append(f"| 回答 · {s.method} | ${s.total_cost:.4f} | {s.n} 题 |")
-    lines.append(
-        f"| 写入（向量化） | ${ingest_cost:.4f} | {len(online)} 份对话历史，"
-        f"{ingest_tokens:,} tokens；检索类方法需要，一次写入可服务多次提问 |"
-    )
+    if online or not externals:
+        lines.append(
+            f"| 写入（向量化） | ${ingest_cost:.4f} | {len(online)} 份对话历史，"
+            f"{ingest_tokens:,} tokens；检索类方法需要，一次写入可服务多次提问 |"
+        )
     if consolidated:
         families = "、".join(dict.fromkeys(s.method.split("-")[0] for s in stats if s.uses_facts))
         lines.append(
@@ -427,7 +686,13 @@ def render_markdown(
             f"{len(consolidated)} 份对话历史；只有 {families or '用到事实的方法'} 系列需要，"
             "同样是一次性成本 |"
         )
-    total = answer_cost + ingest_cost + consolidate_cost + judge_cost
+    for w in externals:  # 外部系统各写各的，互不共用
+        lines.append(
+            f"| 写入 · {w.method}（{EXTERNAL_SYSTEMS[w.method]}） | ${w.cost:.4f} | "
+            f"{w.covered} 份对话历史，取它自己的写入记录（build.json）；一次性成本 |"
+        )
+    external_cost = sum(w.cost for w in externals)
+    total = answer_cost + ingest_cost + consolidate_cost + external_cost + judge_cost
     lines += [
         f"| 判分 | ${judge_cost:.4f} | 评测本身的开销，不计入方法成本 |",
         f"| **合计** | **${total:.4f}** | |",
@@ -438,7 +703,8 @@ def render_markdown(
         "判分模型与回答模型来自不同家族（D-008）。",
         "- 名义成本按高峰时段、未命中缓存的标价计算，便于不同时间的运行相互比较（D-010）；"
         "实际花费因缓存、错峰折扣会更低。",
-        '- "名义成本 / 题"只算回答本身；写入与巩固成本是一次性的，单独列出。',
+        '- "名义成本 / 题"只算回答本身；写入与巩固成本是一次性的，单独列出（外部基线的写入取'
+        "各自的写入记录 build.json，与 CueMem 的写入加巩固同一口径，见“写入成本”一节）。",
         "- 置信区间为 bootstrap 95%（2000 次重采样，固定种子）。",
         "- 延迟只统计实际调用了模型的题；全部命中本地缓存的方法显示为 —。",
     ]
@@ -447,6 +713,134 @@ def render_markdown(
             f"- 有 {len(errors)} 个组合出错未计入结果，详见 `errors.jsonl`；重新运行会自动重试。"
         )
     return "\n".join(lines) + "\n"
+
+
+WRITE_KINDS = {
+    "none": "不写入（直接读原文）",
+    "index": "向量化（建索引）",
+    "consolidate": "向量化 + 巩固（L1 / L2 / 控制器共用一份）",
+    "external": "它自己的写入（build.json）",
+}
+
+
+@dataclass
+class MethodWrite:
+    """一个方法的一次性写入成本（write_cost 的结果）与覆盖情况。"""
+
+    method: str
+    kind: str  # WRITE_KINDS 的键
+    stats: dict[str, float]
+    covered: int  # 找到写入记录的对话历史数
+    histories: int  # 这个方法答题用到的对话历史数
+
+    @property
+    def cost(self) -> float:
+        return float(self.stats.get("cost", 0.0))
+
+    @property
+    def missing(self) -> int:
+        """外部基线里一份写入记录也找不到的对话历史数，与 scripts/n12_baselines.py 的 missing
+        同一口径：找到了记录、但协议或会话 ID 写法对不上的另计 mismatched，不在这里重复计。"""
+        return self.histories - self.covered - int(self.stats.get("mismatched", 0))
+
+
+def _method_writes(
+    info: dict[str, Any],
+    rows: Sequence[dict[str, Any]],
+    stats: Sequence[MethodStats],
+    ingests: Sequence[dict[str, Any]],
+    eval_spaces: Path | None,
+) -> dict[str, MethodWrite]:
+    keys: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        keys[row["method"]].add(row["space_key"])
+    protocol = run_protocol(info)
+    scheme = run_session_ids(info)  # 这次运行的会话 ID 写法，不看当前的环境变量
+    out = {}
+    for s in stats:
+        if s.method in EXTERNAL_SYSTEMS:
+            kind = "external"
+        else:
+            stages = write_stages(s.method)
+            kind = "none" if not stages else "index" if stages == {"ingest"} else "consolidate"
+        cost, covered = _write_cost(
+            s.method,
+            keys[s.method],
+            dataset=info["config"]["dataset"],
+            ingests=ingests,
+            eval_spaces=eval_spaces,
+            protocol=protocol,
+            rows=rows,
+            session_ids=scheme,
+        )
+        out[s.method] = MethodWrite(s.method, kind, cost, covered, len(keys[s.method]))
+    return out
+
+
+def _write_section(
+    stats: Sequence[MethodStats],
+    writes: dict[str, MethodWrite],
+    eval_spaces: Path | None,
+    eval_spaces_note: str | None = None,
+    *,
+    session_ids: SessionIds = "native",
+    session_ids_recorded: bool = True,
+) -> list[str]:
+    """各方法的一次性写入成本，与 scripts/n12_baselines.py 同一口径（write_cost）。
+    eval_spaces_note：写入目录不是运行记录里记的时，怎么定的（_eval_spaces），注明在表下；
+    session_ids：这次运行的会话 ID 写法，外部基线按它找写入（LoCoMo 的 native 不注明）；
+    session_ids_recorded：run.json 里记了写法（修复泄漏之前的运行没记，是原始 ID）。"""
+    if all(writes[s.method].kind == "none" for s in stats):
+        return []
+    lines = [
+        "",
+        "## 写入成本（一次性，按方法）",
+        "",
+        "写入成本只花一次，之后的提问都复用；分摊到每题按本次运行这个方法答的题数计算。"
+        "CueMem 取运行里的写入与巩固记录，外部基线取它们各自的写入记录（build.json）。",
+        "",
+        "| 方法 | 写入 | 对话历史 | 名义成本 | LLM 调用 | 耗时 | 分摊到每题 | 回答 + 分摊 / 题 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    notes: list[str] = []
+    for s in stats:
+        w = writes[s.method]
+        if w.kind == "none":
+            blank = " — |" * 5
+            lines.append(f"| {s.method} | {WRITE_KINDS[w.kind]} |{blank} ${s.cost:.5f} |")
+            continue
+        share = w.cost / s.n if s.n else 0.0
+        lines.append(
+            f"| {s.method} | {WRITE_KINDS[w.kind]} | {w.covered} / {w.histories} "
+            f"| ${w.cost:.4f} | {w.stats.get('llm_calls', 0):,.0f} "
+            f"| {w.stats.get('seconds', 0):,.0f}s | ${share:.5f} | ${s.cost + share:.5f} |"
+        )
+        if w.kind == "external" and w.missing:
+            where = f"`{eval_spaces}`" if eval_spaces is not None else "（没有给出写入目录）"
+            notes.append(
+                f"- {s.method}：{w.missing} 份对话历史找不到写入记录（{where}），没有计入。"
+            )
+        if w.stats.get("mismatched"):
+            notes.append(
+                f"- {s.method}：{w.stats['mismatched']:.0f} 份对话历史的写入记录属于别的协议"
+                "或会话 ID 写法（记的抽取模型、向量模型或会话 ID 写法与这次运行不同），没有计入；"
+                "检查 paths.eval_spaces（pq 协议的写入在 data/eval-spaces-qwen）。"
+            )
+    if eval_spaces_note and any(w.kind == "external" for w in writes.values()):
+        notes.append(f"- 外部基线的写入记录取自 `{eval_spaces}`：{eval_spaces_note}。")
+    if session_ids != "native" and any(w.kind == "external" for w in writes.values()):
+        where = {
+            "anon": "改写过会话 ID 的写入（`<系统>/<数据集>-anon_<空间>`）",
+            "raw": "保留原始会话 ID 的写入（修复泄漏之前的写法，`<系统>/<数据集>_<空间>`）",
+        }[session_ids]
+        source = "run.json 记的" if session_ids_recorded else "run.json 没有记：修复泄漏之前的运行"
+        notes.append(
+            f"- 这次运行的会话 ID 写法是 {session_ids}（{source}）：外部基线只算{where}，"
+            "写法对不上的不算。"
+        )
+    if "M0" in writes:
+        notes.append("- M0 的写入记录没有墙钟耗时，耗时一栏是各次调用的延迟之和。")
+    return lines + (["", *notes] if notes else [])
 
 
 def _l2_section(rows: Sequence[dict[str, Any]], stats: Sequence[MethodStats]) -> list[str]:

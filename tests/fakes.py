@@ -18,6 +18,9 @@ ChatReply = str | Callable[[dict[str, Any]], str | dict[str, Any]]
 REJECT = "__REJECT__"  # 回复函数返回它时，模拟内容审核拒绝（HTTP 400）
 ABORT_JSON = "__ABORT_JSON__"  # 模拟 QwenCloud 在 JSON 模式下中止生成（HTTP 400）
 TIMEOUT = "__TIMEOUT__"  # 模拟请求超时（生成失控、迟迟不结束）
+# 模拟限流（HTTP 429）：带 FakeAPI.chat_rate_limit_headers 里的头（默认让 SDK 只等 1 毫秒）
+RATE_LIMIT = "__RATE_LIMIT__"
+NO_BALANCE = "__NO_BALANCE__"  # 模拟 DeepSeek 余额不足（HTTP 402，SDK 不重试）
 
 
 def chat_completion_body(
@@ -101,6 +104,7 @@ class FakeAPI:
         self.rerank_requests: list[dict[str, Any]] = []
         self.embed_status: list[int] = []  # 预设的状态码序列，用于模拟限流和错误
         self.embed_retry_after: str | None = None  # 出错响应附带的 Retry-After 头
+        self.chat_rate_limit_headers: dict[str, str] = {"retry-after-ms": "1"}
         self.cached_tokens = 0
         self.embed_dim = 8
 
@@ -115,6 +119,23 @@ class FakeAPI:
             content = reply(body) if callable(reply) else reply
             if content == TIMEOUT:
                 raise httpx2.ReadTimeout("timed out", request=request)
+            if content == RATE_LIMIT:
+                return httpx2.Response(
+                    429,
+                    json={
+                        "error": {
+                            "code": "Throttling.RateQuota",
+                            "message": "Requests rate limit exceeded, please try again later.",
+                            "type": "Throttling.RateQuota",
+                        }
+                    },
+                    headers=self.chat_rate_limit_headers,
+                )
+            if content == NO_BALANCE:
+                return httpx2.Response(
+                    402,
+                    json={"error": {"message": "Insufficient Balance", "type": "unknown_error"}},
+                )
             deepseek = "deepseek" in request.url.host
             if isinstance(content, dict):  # 工具调用
                 return httpx2.Response(

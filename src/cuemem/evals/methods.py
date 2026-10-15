@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from cuemem.core.models import FactHit, Hit
-from cuemem.evals.datasets import EvalSession, Sample, to_session_ins
+from cuemem.evals.datasets import EvalSession, Sample, SessionIds, to_session_ins
 from cuemem.memory import MemorySystem
 from cuemem.read.controller import Router
 from cuemem.read.facts import Validity
@@ -28,6 +28,8 @@ class MethodContext:
     reader: Reader
     system: MemorySystem | None  # 只有需要索引的方法才有
     space_id: str
+    # 会话 ID 的写法（见 datasets 的模块说明）：自己存写入的方法（M0 与外部基线）按它分开存
+    session_ids: SessionIds = "native"
 
 
 @dataclass

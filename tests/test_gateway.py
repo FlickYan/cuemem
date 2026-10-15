@@ -9,15 +9,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import ABORT_JSON, REJECT, FakeAPI
+from fakes import ABORT_JSON, NO_BALANCE, RATE_LIMIT, REJECT, FakeAPI
 from fastapi.testclient import TestClient
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from cuemem.config import Settings
 from cuemem.embed import build_embedder
+from cuemem.embed.dashscope import DashScopeTextEmbedder
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.external import ExternalBaseline, memory_hit, space_key
-from cuemem.evals.gateway import Gateway, embed_kind
+from cuemem.evals.gateway import Gateway, _retry_after, embed_kind
 from cuemem.evals.methods import MethodContext, build_methods
 from cuemem.llm import Ledger, LLMClient, ResponseCache
 from cuemem.llm.types import ChatResult
@@ -232,6 +233,129 @@ def test_search_buckets_embed_queries(
     assert embed_kind("graphiti.search.x") == "query" and embed_kind("search") == "document"
 
 
+# ---------- 限流、上游错误与解析不了的 JSON ----------
+
+
+def _max_retries(gateway: Gateway) -> int:
+    settings = gateway.llm.settings
+    provider = settings.models[settings.roles["extractor"].model].provider
+    return settings.providers[provider].max_retries
+
+
+def test_upstream_rate_limit_becomes_429_with_retry_after(
+    client: TestClient, gateway: Gateway, fake_api: FakeAPI
+) -> None:
+    """上游限流：LLM 客户端按 SDK 的退避重试过（providers.*.max_retries 次）仍然 429 时，网关回 429
+    并带上上游的 Retry-After；网关自己不再重试，也不换备用模型。按桶计入 rate_limited。"""
+    fake_api.chat_replies = [RATE_LIMIT]
+    fake_api.chat_rate_limit_headers = {"retry-after": "7", "retry-after-ms": "1"}
+    response = client.post("/b/r/v1/chat/completions", json={"messages": HELLO})
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "7"
+    assert response.json()["error"]["type"] == "rate_limit_error"
+    assert len(fake_api.chat_requests) == 1 + _max_retries(gateway)  # 只有 SDK 自己的重试
+    assert {r["model"] for r in fake_api.chat_requests} == {"qwen3.8-flash"}
+    usage = gateway.usage("r")
+    assert usage["rate_limited"] == 1 and usage["errors"] == 1 and usage["refusals"] == 0
+    assert usage["chat_calls"] == 0 and usage["fallbacks"] == 0
+
+    # 上游只给了 retry-after-ms：换算成秒（向上取整）
+    fake_api.chat_rate_limit_headers = {"retry-after-ms": "1"}
+    again = client.post("/b/r/v1/chat/completions", json={"messages": HELLO})
+    assert again.status_code == 429 and again.headers["retry-after"] == "1"
+    assert gateway.usage("r")["rate_limited"] == 2
+
+
+def test_rate_limit_reaches_openai_sdk_clients(gateway: Gateway, fake_api: FakeAPI) -> None:
+    """外部系统的 OpenAI SDK 看到的是 RateLimitError（会照 Retry-After 退避），不是 500。"""
+    fake_api.chat_replies = [RATE_LIMIT]
+    fake_api.chat_rate_limit_headers = {"retry-after": "3", "retry-after-ms": "1"}
+    gateway.start()
+    try:
+        sdk = OpenAI(base_url=gateway.url("sdk"), api_key="unused", max_retries=0)
+        with pytest.raises(RateLimitError) as caught:
+            sdk.chat.completions.create(model="anything", messages=HELLO)  # type: ignore[arg-type]
+        assert caught.value.response.headers["retry-after"] == "3"
+    finally:
+        gateway.stop()
+    assert gateway.usage("sdk")["rate_limited"] == 1
+
+
+def test_retry_after_header_parsing() -> None:
+    assert _retry_after({"retry-after": "12"}) == "12"
+    date = "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert _retry_after({"retry-after": date}) == date  # HTTP 日期原样转发
+    assert _retry_after({"retry-after-ms": "1500"}) == "2"
+    assert _retry_after({"retry-after-ms": "soon"}) is None
+    assert _retry_after({}) is None
+
+
+def test_other_upstream_errors_become_502(
+    client: TestClient, gateway: Gateway, fake_api: FakeAPI
+) -> None:
+    """余额不足（402）之类的上游错误回 502，带上上游的报错；不算限流。"""
+    fake_api.chat_replies = [NO_BALANCE]
+    response = client.post("/b/x/v1/chat/completions", json={"messages": HELLO})
+    assert response.status_code == 502
+    assert "Insufficient Balance" in response.json()["error"]["message"]
+    usage = gateway.usage("x")
+    assert usage["errors"] == 1 and usage["rate_limited"] == 0
+
+
+def test_identical_retry_after_bad_json_gets_a_fresh_reply(
+    client: TestClient, gateway: Gateway, fake_api: FakeAPI
+) -> None:
+    """外部系统（如 Cognee 的整次重试）拿到解析不了的 JSON 后把同样的请求再发一次：网关不从缓存里
+    再给同一个坏回复，而是重新调用，新回复覆盖缓存；按桶计入 bad_json_replies 与 json_refreshes。"""
+    fake_api.chat_replies = ['{"name": "An', '{"name": "Ana"}']
+    body = {"messages": HELLO, "response_format": {"type": "json_object"}}
+
+    def content() -> str:
+        reply = client.post("/b/j/v1/chat/completions", json=body)
+        return str(reply.json()["choices"][0]["message"]["content"])
+
+    assert content() == '{"name": "An'
+    assert content() == '{"name": "Ana"}'
+    assert content() == '{"name": "Ana"}'  # 之后照常命中缓存
+    assert len(fake_api.chat_requests) == 2
+    usage = gateway.usage("j")
+    assert usage["bad_json_replies"] == 1 and usage["json_refreshes"] == 1
+    assert usage["chat_calls"] == 3 and usage["cache_hits"] == 1
+
+    # json_schema 同样（网关改成 JSON 模式）；不要求 JSON 的回复不检查
+    schema = {"type": "json_schema", "json_schema": {"name": "P", "schema": {"type": "object"}}}
+    fake_api.chat_replies = ["not json"]
+    client.post("/b/k/v1/chat/completions", json={"messages": HELLO, "response_format": schema})
+    plain = {"messages": [{"role": "user", "content": "plain"}]}
+    client.post("/b/k/v1/chat/completions", json=plain)
+    client.post("/b/k/v1/chat/completions", json=plain)
+    assert gateway.usage("k")["bad_json_replies"] == 1
+    assert gateway.usage("k")["cache_hits"] == 1  # 文字回复照常命中缓存
+
+
+def test_embedding_errors_become_429_or_502(
+    settings: Settings, llm: LLMClient, fake_api: FakeAPI
+) -> None:
+    """向量器重试用尽仍被限流时回 429（带 Retry-After），其他错误回 502；网关不再重试。"""
+    fake_api.embed_dim = settings.embedding.dim
+    cfg = settings.embedding.model_copy(update={"max_attempts": 2})
+    embedder = DashScopeTextEmbedder(
+        cfg, "sk-test", http_client=fake_api.client(), sleep=lambda _: None
+    )
+    gateway = Gateway(llm, embedder)
+    fake_api.embed_status = [429, 429, 400]
+    fake_api.embed_retry_after = "3"
+    with TestClient(gateway.app()) as test_client:
+        limited = test_client.post("/b/e/v1/embeddings", json={"input": ["a"]})
+        assert limited.status_code == 429 and limited.headers["retry-after"] == "3"
+        assert test_client.post("/b/e/v1/embeddings", json={"input": ["a"]}).status_code == 502
+        assert test_client.post("/b/e/v1/embeddings", json={"input": ["a"]}).status_code == 200
+    assert len(fake_api.embed_requests) == 4  # 2（向量器自己的重试）+ 1 + 1
+    usage = gateway.usage("e")
+    assert usage["rate_limited"] == 1 and usage["embedding_errors"] == 2
+    assert usage["embedding_calls"] == 3 and usage["embedded_texts"] == 1
+
+
 # ---------- 外部基线的公共部分 ----------
 
 
@@ -299,6 +423,9 @@ def test_external_baseline_builds_once_and_records_usage(
         assert build["memories"] == 1 and build["sessions"] == 1 and build["chat_calls"] == 1
         stored = json.loads((toy.root / "locomo_conv-1" / "build.json").read_text("utf-8"))
         assert stored["chat_calls"] == 1
+        # 限流、坏 JSON 等计数与其他计数一样记进写入记录
+        for counter in ("rate_limited", "bad_json_replies", "json_refreshes", "embedding_errors"):
+            assert stored[counter] == 0 and build[counter] == 0
         second = toy.answer(ctx)  # 已写入：不再重建
         assert "toy_build" not in second.details and toy.builds == 1
         assert stored["protocol"] == f"qwen3.8-flash|{toy.embedder.name}:{toy.embedder.dim}"
@@ -308,6 +435,60 @@ def test_external_baseline_builds_once_and_records_usage(
     finally:
         toy.gateway.stop()
     assert space_key("locomo:conv-42") == "locomo_conv-42"
+
+
+def test_external_builds_keep_session_id_schemes_apart(llm: LLMClient, fake_api: FakeAPI) -> None:
+    """外部系统的写入里存着会话 ID（证据抬头会显示它）：改写过的另存一处、记下写法；
+    原始 ID 的写入沿用原来的位置；改写之前的写入（没记写法）不给改写后的运行用。"""
+    fake_api.chat_replies = [
+        lambda body: (
+            '{"answer": "ok", "evidence_sufficient": true, "citations": []}'
+            if "Question:" in json.dumps(body)
+            else "ok"
+        )
+    ]
+    when = datetime(2023, 5, 20, 9)
+    turns = [EvalTurn(role="user", text="I hike in the Alps.")]
+    sample = Sample(
+        "longmemeval_s", "q1_abs", "q1_abs", "Where do I hike?", "", "x", "x", True, when
+    )
+    toy = _Toy()
+    try:
+        anon = MethodContext(
+            sample,
+            [EvalSession("session_1", when, turns, source_id="answer_1")],
+            Reader(llm),
+            None,
+            "longmemeval_s:q1_abs",
+            "anon",
+        )
+        raw = MethodContext(
+            sample,
+            [EvalSession("answer_1", when, turns, source_id="answer_1")],
+            Reader(llm),
+            None,
+            "longmemeval_s:q1_abs",
+            "raw",
+        )
+        # 改写之前的写入：位置与原始 ID 的相同，没有记写法
+        legacy = toy.answer(MethodContext(sample, raw.sessions, Reader(llm), None, raw.space_id))
+        assert toy.builds == 1 and "toy_build" in legacy.details
+        record = toy.root / "longmemeval_s_q1_abs" / "build.json"
+        assert "session_ids" not in json.loads(record.read_text("utf-8"))
+
+        assert "toy_build" not in toy.answer(raw).details  # 原始 ID 的运行照常复用
+        first = toy.answer(anon)  # 改写后的运行：另存一处，重新写入
+        assert toy.builds == 2 and first.details["toy_build"]["session_ids"] == "anon"
+        anon_dir = toy.root / "longmemeval_s-anon_q1_abs"
+        assert json.loads((anon_dir / "build.json").read_text("utf-8"))["session_ids"] == "anon"
+        assert "toy_build" not in toy.answer(anon).details and toy.builds == 2
+        assert "toy_build" not in toy.answer(raw).details  # 原始 ID 的写入没被碰过
+
+        # 放错了地方的写入（记的写法对不上）：重建
+        (anon_dir / "build.json").write_text(json.dumps({"protocol": toy.protocol}), "utf-8")
+        assert "toy_build" in toy.answer(anon).details and toy.builds == 3
+    finally:
+        toy.gateway.stop()
 
 
 def test_external_methods_are_registered_lazily() -> None:

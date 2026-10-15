@@ -8,6 +8,8 @@
 - **写入**：每份对话历史（LoCoMo 一段对话；LongMemEval 一道题的历史）第一次用到时写入一次，
   写完留下 build.json（写入用量从网关的桶里读），之后的运行直接复用。写入在独立线程里做，不算进
   当前这道题的回答用量；半成品下次整个重建；失败过的历史不再反复重建（每次都要花钱）。
+  会话 ID 改写过的历史（LongMemEval / MemLens 的默认，见 evals/datasets.py）写在
+  `<数据集>-anon_<历史>` 下，build.json 记下写法（session_ids），与原始 ID 的写入不混用。
 - **检索**：子类返回一组证据（Hit），交给同一个回答模型、同一套提示
   （与 B2 朴素检索、M0 的格式相同）。
 
@@ -32,7 +34,13 @@ from typing import Any
 from cuemem.core.models import Hit, MemoryUnit, UnitKind
 from cuemem.embed import build_embedder
 from cuemem.embed.base import TextEmbedder
-from cuemem.evals.datasets import EvalSession, Sample
+from cuemem.evals.datasets import (
+    EvalSession,
+    Sample,
+    SessionIds,
+    build_matches_session_ids,
+    storage_space_id,
+)
 from cuemem.evals.gateway import Gateway
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.llm.client import LLMClient
@@ -56,6 +64,7 @@ class ExternalBaseline(ABC):
         self._ready = False
         self._build_spent = 0.0
         self._failed: dict[str, str] = {}
+        self._schemes: dict[str, SessionIds] = {}  # 写入目录 → 会话 ID 的写法
 
     # ---------- 子类实现 ----------
 
@@ -83,8 +92,11 @@ class ExternalBaseline(ABC):
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
         self._setup(ctx.reader.llm)
-        key = space_key(ctx.space_id)
+        # 会话 ID 改写过的历史另存一处（longmemeval_s-anon_<题号>），不与原始 ID 的写入混用
+        key = space_key(storage_space_id(ctx.space_id, ctx.session_ids))
         directory = self.root / key
+        with self._lock:
+            self._schemes[key] = ctx.session_ids
         with self._space_lock(key):
             built = self._ensure_built(key, directory, ctx.sessions)
             hits, details = self.retrieve(key, directory, ctx.sample, ctx.sessions)
@@ -118,10 +130,16 @@ class ExternalBaseline(ABC):
         self, key: str, directory: Path, sessions: Sequence[EvalSession]
     ) -> dict[str, Any] | None:
         record = directory / "build.json"
+        with self._lock:
+            scheme = self._schemes.get(key, "native")
         if record.exists():
-            built = json.loads(record.read_text("utf-8")).get("protocol")
-            # 换了协议（抽取模型或向量模型）的写入不能复用；旧记录没有这个字段，按同一协议处理
-            if built is None or built == self.protocol:
+            stored = json.loads(record.read_text("utf-8"))
+            built = stored.get("protocol")
+            # 换了协议（抽取模型或向量模型）的写入不能复用；旧记录没有这个字段，按同一协议处理。
+            # 会话 ID 的写法也要相同（写入里存着会话 ID，见 datasets.build_matches_session_ids）
+            if (built is None or built == self.protocol) and build_matches_session_ids(
+                stored, scheme
+            ):
                 return None
         with self._lock:
             if key in self._failed:
@@ -151,6 +169,8 @@ class ExternalBaseline(ABC):
             "seconds": round((datetime.now() - started).total_seconds(), 1),
             **usage,
         }
+        if scheme != "native":  # LoCoMo 的写入记录不变
+            stats["session_ids"] = scheme
         (directory / "build.json").write_text(
             json.dumps(stats, indent=2, ensure_ascii=False), "utf-8"
         )
