@@ -25,7 +25,10 @@ class ResponseCache:
     def __init__(self, path: Path | None) -> None:
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path) if path else ":memory:", check_same_thread=False)
+        # 几个评测进程共用一份缓存：写锁多等一会儿（默认 5 秒），免得忙时报 "database is locked"
+        self._conn = sqlite3.connect(
+            str(path) if path else ":memory:", check_same_thread=False, timeout=60.0
+        )
         self._lock = threading.Lock()
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
