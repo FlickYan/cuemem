@@ -199,6 +199,18 @@ def test_check_build_rejects_crippled_builds() -> None:
     ml.check_build(3, [], [], {"tool_requests": 3, "multi_tool_replies": 0})  # 太少，看不出来
 
 
+def test_lost_share_can_be_relaxed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 通义协议的完整运行放宽到 25%：30 个会话里丢 5 个（17%）照样可用，丢 8 个不行
+    parallel = {"tool_requests": 30, "multi_tool_replies": 6}
+    lost = [f"session_{i}" for i in range(5)]
+    with pytest.raises(RuntimeError, match="最多容许 3 个"):
+        ml.check_build(30, [], lost, parallel)
+    monkeypatch.setenv(ml.MAX_LOST_SHARE_ENV, "0.25")
+    ml.check_build(30, [], lost, parallel)
+    with pytest.raises(RuntimeError, match="最多容许 7 个"):
+        ml.check_build(30, [], [f"session_{i}" for i in range(8)], parallel)
+
+
 def test_sessions_where_the_model_chose_no_change_are_not_lost_writes() -> None:
     """通义在有已有记忆时（tool_choice=required）常回一个空补丁的 PatchDoc：这是模型的判断，
     不算写入丢了；没调用工具、被截断、trustcall 跳过或丢掉了调用，才算丢了。"""

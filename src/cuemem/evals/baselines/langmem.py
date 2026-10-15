@@ -51,8 +51,9 @@ evals/external.py），只换"记忆从哪来"：
    其他错误让整份写入失败、不留 build.json，下次运行重建（定种子的 ID 让前面的会话全部命中
    响应缓存）——跳过它们，后面的会话会建在缺了一块的存储上，出错时已写进存储的部分记忆也
    对不上会话日期。被拒绝的与写入丢了的会话（没调用工具、补丁改不了、调用校验不过而一条也
-   没写）合计超过 max(2, 10%) 时整份写入算失败；带工具的回复满 10 次却没有一次并行调用多个
-   工具时也算失败（并行工具调用没生效）。模型调用了 PatchDoc 却明说"不用改"（patches 为空）
+   没写）合计超过 max(2, 10%) 时整份写入算失败（比例可用 CUEMEM_LANGMEM_MAX_LOST_SHARE 放宽，
+   通义协议的完整运行用 0.25：通义下 LangMem 在一成多的会话里自己丢写入）；带工具的回复
+   满 10 次却没有一次并行调用多个工具时也算失败（并行工具调用没生效）。模型调用了 PatchDoc 却明说"不用改"（patches 为空）
    的会话是 LangMem 照常的结果、不算写入丢了，另记在 unchanged_sessions 里：有已有记忆时
    trustcall 要求必须调用工具，通义觉得没有新东西时就这样回。只有会话里每个工具调用都是
    patches 为空列表的 PatchDoc 才这样算；patches 缺了、是对象或读不出列表的（trustcall 不记
@@ -95,6 +96,7 @@ import contextvars
 import functools
 import json
 import logging
+import os
 import random
 import uuid
 from collections import OrderedDict
@@ -116,7 +118,11 @@ CHAT_MODEL = "gpt-4o-mini"  # 只是请求里的名字（Mem0 论文用的模型
 EMBED_MODEL = "text-embedding-3-small"  # 同上：网关一律交给 CueMem 的向量器
 STORE_FILE = "store.json"
 MAX_OPEN = 8  # 同时装在内存里的存储
-MAX_LOST = 2  # 被拒绝或没写入的会话最多容许 max(MAX_LOST, 10%) 个
+MAX_LOST = 2  # 被拒绝或没写入的会话最多容许 max(MAX_LOST, 比例) 个
+# 比例默认 10%。这道检查原本防的是流水线的毛病（并行工具调用没生效另有检查）；通义下 LangMem
+# 自己就会在一成多的会话里丢写入（补丁为空、路径写错），生产里也是悄悄丢掉，评测时可以放宽、
+# 照实记下丢了多少（build.json 的 empty_sessions）
+MAX_LOST_SHARE_ENV = "CUEMEM_LANGMEM_MAX_LOST_SHARE"
 MIN_TOOL_REPLIES = 10  # 带工具的回复满这么多次还没有一次并行调用多个工具：并行没生效
 PACKAGES = (
     "langmem",
@@ -482,6 +488,12 @@ def patch_list(raw: Any) -> list[Any] | None:
     return None
 
 
+def max_lost_share() -> float:
+    """写入丢了的会话最多占多少（CUEMEM_LANGMEM_MAX_LOST_SHARE，默认 0.1）。"""
+    raw = os.environ.get(MAX_LOST_SHARE_ENV, "").strip()
+    return float(raw) if raw else 0.1
+
+
 def check_build(
     sessions: int, refused: Sequence[str], empty: Sequence[str], replies: Mapping[str, int]
 ) -> None:
@@ -489,7 +501,7 @@ def check_build(
 
     sessions：交给管理器的会话数；empty：写入丢了的会话（模型明说不用改的不算，见
     chose_no_change）；replies：这份写入在网关桶里的 tool_requests 与 multi_tool_replies。"""
-    allowed = max(MAX_LOST, sessions // 10)
+    allowed = max(MAX_LOST, int(sessions * max_lost_share()))
     if len(refused) + len(empty) > allowed:
         raise RuntimeError(
             f"LangMem 有 {len(refused)} 个会话被内容审核拒绝、{len(empty)} 个会话的写入丢了"
