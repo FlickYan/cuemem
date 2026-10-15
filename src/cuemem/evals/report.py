@@ -737,6 +737,12 @@ class MethodWrite:
     def cost(self) -> float:
         return float(self.stats.get("cost", 0.0))
 
+    @property
+    def missing(self) -> int:
+        """外部基线里一份写入记录也找不到的对话历史数，与 scripts/n12_baselines.py 的 missing
+        同一口径：找到了记录、但协议或会话 ID 写法对不上的另计 mismatched，不在这里重复计。"""
+        return self.histories - self.covered - int(self.stats.get("mismatched", 0))
+
 
 def _method_writes(
     info: dict[str, Any],
@@ -809,10 +815,11 @@ def _write_section(
             f"| ${w.cost:.4f} | {w.stats.get('llm_calls', 0):,.0f} "
             f"| {w.stats.get('seconds', 0):,.0f}s | ${share:.5f} | ${s.cost + share:.5f} |"
         )
-        missing = w.histories - w.covered
-        if w.kind == "external" and missing:
+        if w.kind == "external" and w.missing:
             where = f"`{eval_spaces}`" if eval_spaces is not None else "（没有给出写入目录）"
-            notes.append(f"- {s.method}：{missing} 份对话历史找不到写入记录（{where}），没有计入。")
+            notes.append(
+                f"- {s.method}：{w.missing} 份对话历史找不到写入记录（{where}），没有计入。"
+            )
         if w.stats.get("mismatched"):
             notes.append(
                 f"- {s.method}：{w.stats['mismatched']:.0f} 份对话历史的写入记录属于别的协议"

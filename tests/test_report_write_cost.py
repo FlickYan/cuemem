@@ -280,8 +280,9 @@ def test_report_counts_external_write_cost(tmp_path: Path, spaces: Path) -> None
     assert "| M0 | 它自己的写入（build.json） | 2 / 2 | $0.3000 | 116 | 1,000s " in report
     assert "| $0.15000 | $0.15100 |" in report
     assert "| MC | 它自己的写入（build.json） | 1 / 2 | $0.2000 |" in report
-    assert "- MC：1 份对话历史找不到写入记录" in report
+    # conv-2 有写入记录，只是属于别的协议：只算 mismatched，不再同时算作找不到
     assert "- MC：1 份对话历史的写入记录属于别的协议" in report
+    assert "找不到写入记录" not in report
     assert "| 写入 · M0（mem0） | $0.3000 |" in report
     assert "| 写入 · MC（cognee） | $0.2000 |" in report
     # 合计：回答 10 × 0.001 + 向量化 0.002 + 巩固 0.06 + 外部 0.5 + 判分 10 × 0.0001
@@ -497,6 +498,7 @@ def test_report_reads_the_build_records_of_the_runs_session_ids(
     report = build_report(anon, eval_spaces=tmp_path / "elsewhere").read_text("utf-8")
     assert "| M0 | 它自己的写入（build.json） | 1 / 2 | $0.5000 | 40 |" in report
     assert "- M0：1 份对话历史的写入记录属于别的协议或会话 ID 写法" in report
+    assert "找不到写入记录" not in report  # q2 有原始 ID 的写入，写法对不上，不是找不到
     assert "- 这次运行的会话 ID 写法是 anon（run.json 记的）" in report
     assert "| 写入 · M0（mem0） | $0.5000 |" in report
 
@@ -517,6 +519,7 @@ def test_report_of_locomo_run_has_no_session_id_note(tmp_path: Path, spaces: Pat
     assert "会话 ID 写法" not in report
 
 
+@pytest.mark.filterwarnings("ignore:No artists with labels")
 @pytest.mark.parametrize("scheme", ["anon", "raw"])
 def test_n12_reads_the_build_records_of_the_runs_session_ids(
     clean_env: None,
@@ -526,7 +529,7 @@ def test_n12_reads_the_build_records_of_the_runs_session_ids(
     scheme: str,
 ) -> None:
     """N12 对比脚本把运行记下的写法交给 write_cost（不看环境变量），写入目录用运行记录里的数据集
-    全名（运行名里只是简写 lme）；找不到写入记录的历史单独计数。"""
+    全名（运行名里只是简写 lme）；找不到写入记录的历史单独计数，与 report.md 的说明同一口径。"""
     runs = tmp_path / "runs" / "eval"
     rows = [result("M0", f"q{i}", f"q{i}") for i in (1, 2, 3)]
     extra = {"session_ids": scheme} if scheme == "anon" else {}  # raw：修复之前的运行没记
@@ -549,3 +552,13 @@ def test_n12_reads_the_build_records_of_the_runs_session_ids(
     else:
         assert (write["spaces"], write["cost"], write["missing"]) == (2, 3.0, 1)
         assert "mismatched" not in write
+
+    # 同一次运行的 report.md 与 N12 对比脚本数得一样：找到记录但写法对不上的只算 mismatched，
+    # 不再同时算作找不到（以前 report.md 把 q2 两边都算了一次）
+    report = build_report(runs / "pq-lme-mem0").read_text("utf-8")
+    assert f"| M0 | 它自己的写入（build.json） | {write['spaces']:.0f} / 3 |" in report
+    assert f"- M0：{write['missing']:.0f} 份对话历史找不到写入记录" in report
+    if scheme == "anon":
+        assert f"- M0：{write['mismatched']:.0f} 份对话历史的写入记录属于别的协议" in report
+    else:
+        assert "属于别的协议" not in report
