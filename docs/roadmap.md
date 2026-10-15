@@ -317,7 +317,7 @@ N10 之后自查出 11 处不足，逐项处理。原则：不再用测试集做
 
 ### N12 对标开源同类项目（M，已完成，2026-10-14；外部基线与泄漏修复 2026-10-15）
 
-N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻结协议的评测）在同类项目里少见，但和 GitHub 上的 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 比，CueMem 缺"拿来就能用"的那一层：pip 安装后跑不起来、只认 DeepSeek 与通义、没有 Python SDK、不能改个 base_url 就接上、不能导出导入。N12 先做对比（[landscape.md](landscape.md)），再照主流项目把这一层补上，同时保住 CueMem 自己的语义。原则：默认配置下的请求逐字不变，已有的缓存、评测数字与已巩固的空间都不受影响；工程部分不调用付费 API，同一协议下的外部基线与泄漏对照（2026-10-15）调用了，花费见进度日志。
+N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻结协议的评测）在同类项目里少见，但和 GitHub 上的 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 比，CueMem 缺"拿来就能用"的那一层：pip 安装后跑不起来、只认 DeepSeek 与通义、没有 Python SDK、不能改个 base_url 就接上、不能导出导入。N12 先做对比（[landscape.md](landscape.md)），再照主流项目把这一层补上，同时保住 CueMem 自己的语义。原则（工程部分）：默认配置下的请求逐字不变，已有的缓存、评测数字与已巩固的空间都不受影响，不调用付费 API。2026-10-15 的评测工作是例外：同一协议下的外部基线与泄漏对照调用了付费 API（花费见进度日志）；泄漏修复（D-067）有意改了 LongMemEval / MemLens 评测的输入（会话 ID 改写成 `session_<i>`，写入另存在 `<数据集>-anon`），已发布的数字用原始 ID 复现（`CUEMEM_EVAL_RAW_SESSION_IDS=1`，复现脚本已经设好）。
 
 - [x] 同类项目对比（[landscape.md](landscape.md)，[English](en/landscape.md)）：12 个项目的记忆形态、谁决定检索、知识更新；能力对照；各家公开的分数与不能直接比较的原因；借鉴了什么、刻意没照搬什么、还差什么
 - [x] 换模型供应商（D-060）：默认配置随包发布、数据目录（`CUEMEM_HOME`，安装后 `~/.cuemem`）；预设 `openai`、`ollama`（深度合并，`--preset`）；OpenAI 兼容的向量接口；推理模型的参数差异；不要 Key 的本地服务；可选的重排与图片向量；回答模型看不了图时不附原图
@@ -328,9 +328,9 @@ N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻�
 - [x] Docker 镜像与 compose（加 Qdrant 服务端），在本地构建并实际运行验证
 - [x] 示例：`examples/quickstart.py`（SDK）、`examples/openai_proxy.py`（OpenAI SDK 只改 base_url）
 - [x] 只有一家供应商的 Key 也能跑：`deepseek` 预设与本机向量（fastembed，BAAI/bge-small-en-v1.5）；`qwen` 预设（`configs/presets/qwen.yaml`，只有 QwenCloud 的 Key 时用：回答模型换成 qwen3.8-flash；备用模型用同一家的 qwen3.7-plus，qwen3.8-flash 在 JSON 模式下偶尔生成失控时换它重试）
-- [x] 同一协议下的外部基线（D-065，[N12 外部基线](results/n12-baselines/README.md)）：评测网关（OpenAI 兼容的对话与向量接口，走 CueMem 自己的模型客户端，按桶记用量）；Graphiti（MG）、LangMem（ML）、Cognee（MC）、A-MEM（MA）的适配层，写入与检索照作者公开的评测代码；LoCoMo test200r 上 pds（只用 DeepSeek）与 pq（只用通义）两个协议
+- [x] 同一协议下的外部基线（D-065，[N12 外部基线](results/n12-baselines/README.md)）：评测网关（OpenAI 兼容的对话与向量接口，走 CueMem 自己的模型客户端，按桶记用量）；Graphiti（MG）、LangMem（ML）、Cognee（MC）、A-MEM（MA）的适配层，写入与检索照作者公开的评测代码（Graphiti 照 Zep 的 LoCoMo 评测、Cognee 照它的 BEAM 评测、A-MEM 照论文的复现代码；LangMem 没有作者的评测代码，照它文档里的后台记忆管理器）；LoCoMo test200r 上 pds（只用 DeepSeek）与 pq（只用通义）两个协议
 - [x] LongMemEval 会话 ID 泄漏的修复与对照（D-067，[泄漏对照](results/n12-leak/README.md)）：读入时把 LongMemEval 与 MemLens 的会话按日期改写成 `session_<i>`，原始 ID 只留在 `EvalSession.source_id`、不给模型看；两种写法的写入分开存；复现脚本对历史步骤沿用原始 ID；LongMemEval test100r 上 raw / anon / label 三臂对照；Cognee 会话蒸馏里带出题号的第二处泄漏一并修掉
-- [ ] 需要 API Key 与预算的：OpenAI、Ollama 预设在真实模型上的评测；更多外部基线（Letta、MemOS、Supermemory）；外部系统在 LongMemEval 上的对比（写入太贵、太慢）
+- [ ] 需要 API Key 与预算的：OpenAI、Ollama 预设在真实模型上的评测；更多外部基线（Letta、MemOS、Supermemory）；Graphiti、LangMem、Cognee、A-MEM 在 LongMemEval 上的对比（写入太贵、太慢）
 - [x] 框架集成（D-066，[integrations.md](integrations.md)）：OpenAI Agents SDK（输入过滤器、Session、工具）、LangGraph / LangChain（中间件、pre/post model hook、工具）、Claude 的 memory tool 后端；每次调用模型之前控制器先选；召回证据收拢到 `cuemem/evidence.py`，代理、服务层、MCP 与集成共用
 - [ ] 还没做的：Vercel AI SDK 与 TypeScript、LangGraph 的 BaseStore、多租户鉴权、记忆的元数据与过期；Claude 的 memory tool 在真实的 Claude 上验证
 
@@ -342,17 +342,17 @@ N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻�
 - 外部基线（LoCoMo test200r，准确率 pds / pq）：
   - CueMem L2 87.0% / 85.0%，L1 82.5% / 81.5%，控制器 83.5% / 83.5%；全上下文 84.5% / 80.0%；
   - Mem0 81.0% / 77.5%，LangMem 78.0% / 30.0%，Cognee 77.5% / 74.0%，Graphiti 59.0% / 41.5%，A-MEM MA-PENDING / MA-PENDING；
-  - L2 在两个协议下对 Mem0、LangMem、Cognee、Graphiti 都显著（p ≤ 0.017）；L1 在 pds 下与 Mem0、LangMem、Cognee 没有显著差别；
+  - L2 在两个协议下对 Mem0、LangMem、Cognee、Graphiti 都显著（p ≤ 0.017），对 A-MEM：MA-PENDING；L1 在 pds 下与 Mem0、LangMem、Cognee 没有显著差别（对 A-MEM：MA-PENDING）；
   - Graphiti 与 LangMem 在通义下大幅掉分：用它们自己的提示词，qwen3.8-flash 抽出的实体（1,253 → 462）与记忆（705 → 123）少得多。它们的提示词与阈值没有为通义重调；CueMem 的提示词是在通义上调的，pds 下没有这层主场优势，L2 的领先同样成立。
 - 泄漏对照（LongMemEval test100r，同样的回答与判分）：只差证据抬头里的 ID 的 label 对 anon，各检索方法合并后原协议 +21 / −12（p = 0.16），pq +10 / −14（p = 0.54），没有一个方法单独显著。CueMem 的 LongMemEval 数字没有可测的虚高；Mem0 发布的 83% 可能高了几个点（修复后原协议 79%，CueMem L1 90%）。
-- 没有做的：SDK、记忆代理、导出导入与 OpenAI / Ollama 预设都没有在真实模型上评测（`deepseek` 与 `qwen` 预设在外部基线里用过），N9 / N11 的数字不受影响，也不能说明这些功能的效果；外部系统只跑了 LoCoMo，每个配置只跑一次。
+- 没有做的：SDK、记忆代理、导出导入与 OpenAI / Ollama 预设都没有在真实模型上评测（`deepseek` 与 `qwen` 预设在外部基线里用过），N9 / N11 的数字不因这些功能改变，也不能说明这些功能的效果；Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照），每个配置只跑一次。
 
 **要点**：
 - 和 Mem0、Letta、Zep 比，CueMem 的差异在哪：谁决定检索、知识怎么更新、多模态怎么做、评测协议；为什么各家公开的分数不能直接比较；
 - 照搬接口形状、保留自己的语义：为什么不做 Mem0 的 `update()`（会绕过原始日志），为什么代理不是每轮都检索；
 - 改动怎么做到不影响已有结果：请求逐字不变、字段为空时不计入指纹、源码仓库里的数据目录不变；
 - 端到端验证查出的问题：只看单元测试会漏掉"调用方开了新对话"这种真实用法；
-- 怎么公平地跑别人的系统：同样的抽取模型、向量、回答与判分，写入与检索照作者的评测代码；换了模型以后 Graphiti、LangMem 为什么掉分；CueMem 在通义上的主场优势，以及为什么要有只用 DeepSeek 的协议；
+- 怎么公平地跑别人的系统：同样的抽取模型、向量、回答与判分，写入与检索各用自己的流程，作者公开了评测代码的照着它；换了模型以后 Graphiti、LangMem 为什么掉分；CueMem 在通义上的主场优势，以及为什么要有只用 DeepSeek 的协议；
 - 评测里的泄漏怎么量化：证据会话的 ID 都以 `answer_` 开头；raw / anon / label 三臂把泄漏本身与改名带来的噪声分开。
 
 ## 进度日志
@@ -382,6 +382,6 @@ N11 之后回头看：研究部分（控制器、双时间轴、再感知、冻�
 | 2026-10-14 | N12 | 对标开源同类项目：对比 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 等 12 个项目（[landscape.md](landscape.md)），照它们补上"拿来就能用"的一层：配置随包发布与数据目录、OpenAI / Ollama 预设与 OpenAI 兼容的向量接口（D-060）；Mem0 形状的 Python SDK（D-061）；OpenAI 兼容的记忆代理，控制器先选、不是每轮都检索（D-062）；导出 / 导入与遗忘预演（D-063）；抽取的补充说明（D-064）；Docker 镜像与 compose。默认配置的请求逐字不变；wheel、Docker、compose 与 OpenAI SDK 端到端都实际跑过；新功能没有在真实模型上评测 |
 | 2026-10-15 | N12 | 外部基线的两个协议（D-065）。只用 DeepSeek 的 pds 协议（所有角色 deepseek-flash，判分也是；本机 bge-small 向量；没有重排）做到一半，DeepSeek 余额用完（只剩 ¥0.08）。于是加了 `qwen` 预设与只用通义的 pq 协议：抽取、回答与外部系统内部的调用都是 qwen3.8-flash，判分 qwen3.8-max，向量 qwen3.7-text-embedding（查询与文档分开向量化），重排 qwen3-rerank，备用模型 qwen3.7-plus，写入另放在 `data/eval-spaces-qwen`。之后充值，pds 补齐。两个协议都是 LoCoMo test200r（7 段对话、200 题），外部系统各用自己的写入与检索流程，抽取模型、向量、回答与判分与 CueMem 相同 |
 | 2026-10-15 | N12 | 适配层与通义下的修订（试跑查出）。评测网关：有工具时默认 `parallel_tool_calls=true`（否则通义一次只返回一个工具调用），检索用的桶按查询向量化，限流时回 429 并计数，JSON 模式下解析不了的回复不从缓存重放。Graphiti：回复是 JSON 却不合 schema 时重新采样；被内容审核拒绝的 episode 跳过并计数（pq 下只有 conv-42 有 5 个，它是在加上 qwen3.7-plus 备用模型之前写入的）；BFS 深度从 3 降到 1（Kuzu 在深度 3 时超过 12 GB）。LangMem：读不出的 PatchDoc 补丁算丢失的写入，模型明说"不用改"的会话另记；pq 下按原来的检查（丢写入的会话超过 max(2, 10%) 就判写入失败）7 段对话有 4 段过不了，正式运行两个协议都放到 25%（`CUEMEM_LANGMEM_MAX_LOST_SHARE`，默认仍是 10%），丢失照实记录。Cognee 两个协议下都没有失败、重试或丢掉的会话。A-MEM：同样重新采样，整理时照论文代码的格式重新向量化（写入协议 v4），k = 10（论文默认） |
-| 2026-10-15 | N12 | 全量运行（LoCoMo test200r，准确率 pds / pq）：CueMem L2 87.0% / 85.0%、L1 82.5% / 81.5%、控制器 83.5% / 83.5%；Mem0 81.0% / 77.5%，LangMem 78.0% / 30.0%，Cognee 77.5% / 74.0%，Graphiti 59.0% / 41.5%，A-MEM MA-PENDING / MA-PENDING；全上下文 84.5% / 80.0%，朴素检索 59.5% / 64.0%。L2 在两个协议下对 Mem0、LangMem、Cognee、Graphiti 都显著（对 Mem0：pds +17 / −5，p = 0.017；pq +24 / −9，p = 0.014）；L1 在 pds 下与 Mem0、LangMem、Cognee 没有显著差别。Graphiti 与 LangMem 在通义下掉分：qwen3.8-flash 用它们自己的提示词抽出的实体 1,253 → 462、记忆 705 → 123；Graphiti 每段对话约 120–270 条事实因找不到实体被丢掉，LangMem 23 / 202 个会话丢了写入（pds 2 / 202）。没有为通义重调它们的提示词与阈值；CueMem 的提示词是在通义上调的，pds 下没有这层主场优势，L2 的领先同样成立。写入的名义成本（7 段对话）pds：CueMem $0.529、Mem0 $1.381、LangMem $0.563、Cognee $2.845、Graphiti $9.992 |
+| 2026-10-15 | N12 | 全量运行（LoCoMo test200r，准确率 pds / pq）：CueMem L2 87.0% / 85.0%、L1 82.5% / 81.5%、控制器 83.5% / 83.5%；Mem0 81.0% / 77.5%，LangMem 78.0% / 30.0%，Cognee 77.5% / 74.0%，Graphiti 59.0% / 41.5%，A-MEM MA-PENDING / MA-PENDING；全上下文 84.5% / 80.0%，朴素检索 59.5% / 64.0%。L2 在两个协议下对 Mem0、LangMem、Cognee、Graphiti 都显著（对 Mem0：pds +17 / −5，p = 0.017；pq +24 / −9，p = 0.014），对 A-MEM：MA-PENDING；L1 在 pds 下与 Mem0、LangMem、Cognee 没有显著差别（对 A-MEM：MA-PENDING）。Graphiti 与 LangMem 在通义下掉分：qwen3.8-flash 用它们自己的提示词抽出的实体 1,253 → 462、记忆 705 → 123；Graphiti 每段对话约 120–270 条事实因找不到实体被丢掉，LangMem 23 / 202 个会话丢了写入（pds 2 / 202）。没有为通义重调它们的提示词与阈值；CueMem 的提示词是在通义上调的，pds 下没有这层主场优势，L2 的领先同样成立。写入的名义成本（7 段对话）pds：CueMem $0.529、Mem0 $1.381、LangMem $0.563、Cognee $2.845、Graphiti $9.992、A-MEM MA-PENDING |
 | 2026-10-15 | N12 | 会话 ID 泄漏（D-067）：LongMemEval_S 的 948 个证据会话，ID 都以 `answer_` 开头（30 道拒答题的还带 `_abs`），而回答模型看到的每条检索证据都标着会话 ID，所有检索方法（含外部基线）都看得出哪些是证据会话。N2–N11 发布的 LongMemEval 数字都带着它；全上下文、ORACLE 与 LoCoMo、MemLens 不受影响。修复：读入时按日期改写成 `session_<i>`，原始 ID 只留在 `EvalSession.source_id`；两种写法的写入分开存；复现脚本对历史步骤沿用原始 ID，已发布的数字照样能复现。审计还查出 Cognee 会话蒸馏的 ID 带着题号，一并修掉（没有发布的数字用到它）。对照（test100r，原协议与 pq，raw / anon / label 三臂）：只差证据抬头的 label 对 anon，合并各检索方法原协议 +21 / −12（p = 0.16）、pq +10 / −14（p = 0.54），没有一个方法单独显著。CueMem 的数字没有可测的虚高；Mem0 发布的 83% 可能高了几个点（修复后 79%，L1 90%）。局限：控制器的准确率表与 λ 是在泄漏时的结果上拟合的；每臂只跑一次 |
 | 2026-10-15 | N12 | 花费（`data/ledger.sqlite`）：通义（Key 可用以来）约 $22（按供应商缓存折扣价，名义 $28.9）；DeepSeek（2026-10-14 19:00 UTC 起：pds 试跑、正式运行与泄漏对照的回答）约 $9.5（缓存折扣价，未计错峰半价；名义 $28.4）。DeepSeek 的运行都用 `--peak wait`，高峰时段暂停 |
