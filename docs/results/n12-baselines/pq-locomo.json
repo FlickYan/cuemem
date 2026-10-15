@@ -1,0 +1,277 @@
+{
+  "protocol": "pq",
+  "dataset": "locomo",
+  "runs": [
+    "pq-locomo-cuemem",
+    "pq-locomo-mem0"
+  ],
+  "questions": 200,
+  "dropped": {},
+  "labels": {
+    "B1": "Full context",
+    "B2": "Naive RAG (dense top-10)",
+    "B4-nobm25": "CueMem L1",
+    "B5": "CueMem L2",
+    "B6": "CueMem controller",
+    "M0": "Mem0 2.2.1 (OSS)"
+  },
+  "methods": {
+    "B1": {
+      "n": 200,
+      "accuracy": 0.8,
+      "ci95": [
+        0.7391,
+        0.8495
+      ],
+      "answer_cost_per_1k": 3.544,
+      "answer_tokens_mean": 23406,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.472
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.538
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.955
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.75
+        }
+      },
+      "write": {}
+    },
+    "B2": {
+      "n": 200,
+      "accuracy": 0.64,
+      "ci95": [
+        0.5714,
+        0.7033
+      ],
+      "answer_cost_per_1k": 0.215,
+      "answer_tokens_mean": 1231,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.306
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.154
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.766
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.75
+        }
+      },
+      "write": {
+        "cost": 0.0063,
+        "spent": 0.0063,
+        "llm_calls": 0.0,
+        "seconds": 115.9041,
+        "spaces": 0.0
+      }
+    },
+    "B4-nobm25": {
+      "n": 200,
+      "accuracy": 0.815,
+      "ci95": [
+        0.7554,
+        0.8627
+      ],
+      "answer_cost_per_1k": 0.79,
+      "answer_tokens_mean": 5034,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.556
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.538
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.919
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.85
+        }
+      },
+      "write": {
+        "cost": 0.2376,
+        "spent": 0.1511,
+        "llm_calls": 393.0,
+        "seconds": 1273.9147,
+        "spaces": 7.0
+      }
+    },
+    "B5": {
+      "n": 200,
+      "accuracy": 0.85,
+      "ci95": [
+        0.7939,
+        0.8929
+      ],
+      "answer_cost_per_1k": 2.293,
+      "answer_tokens_mean": 14022,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.639
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.692
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.946
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.825
+        }
+      },
+      "write": {
+        "cost": 0.2376,
+        "spent": 0.1511,
+        "llm_calls": 393.0,
+        "seconds": 1273.9147,
+        "spaces": 7.0
+      }
+    },
+    "B6": {
+      "n": 200,
+      "accuracy": 0.835,
+      "ci95": [
+        0.7773,
+        0.88
+      ],
+      "answer_cost_per_1k": 1.424,
+      "answer_tokens_mean": 8788,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.639
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.692
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.928
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.8
+        }
+      },
+      "write": {
+        "cost": 0.2376,
+        "spent": 0.1511,
+        "llm_calls": 393.0,
+        "seconds": 1273.9147,
+        "spaces": 7.0
+      }
+    },
+    "M0": {
+      "n": 200,
+      "accuracy": 0.775,
+      "ci95": [
+        0.7123,
+        0.8274
+      ],
+      "answer_cost_per_1k": 0.771,
+      "answer_tokens_mean": 4874,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.583
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.538
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.847
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.825
+        }
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 1.3815,
+        "spent": 0.242,
+        "llm_calls": 404.0,
+        "seconds": 1887.9716,
+        "memories": 4059.0
+      }
+    }
+  },
+  "paired": {
+    "B4-nobm25_vs_B1": {
+      "wins": 17,
+      "losses": 14,
+      "p": 0.7201
+    },
+    "B4-nobm25_vs_B2": {
+      "wins": 40,
+      "losses": 5,
+      "p": 0.0
+    },
+    "B4-nobm25_vs_B5": {
+      "wins": 8,
+      "losses": 15,
+      "p": 0.21
+    },
+    "B4-nobm25_vs_B6": {
+      "wins": 5,
+      "losses": 9,
+      "p": 0.424
+    },
+    "B4-nobm25_vs_M0": {
+      "wins": 19,
+      "losses": 11,
+      "p": 0.2005
+    },
+    "B5_vs_B1": {
+      "wins": 19,
+      "losses": 9,
+      "p": 0.0872
+    },
+    "B5_vs_B2": {
+      "wins": 48,
+      "losses": 6,
+      "p": 0.0
+    },
+    "B5_vs_B4-nobm25": {
+      "wins": 15,
+      "losses": 8,
+      "p": 0.21
+    },
+    "B5_vs_B6": {
+      "wins": 6,
+      "losses": 3,
+      "p": 0.5078
+    },
+    "B5_vs_M0": {
+      "wins": 24,
+      "losses": 9,
+      "p": 0.0135
+    }
+  }
+}
