@@ -107,9 +107,10 @@ deepseek 预设）。它依赖 sentence-transformers，会顺带装上 torch（�
     # pds 协议（只用 DeepSeek）
     CUEMEM_PRESET=deepseek uv run --extra local --with "agentic-memory @ $AMEM" \\
         cuemem eval run --dataset locomo --split test200r --methods MA --name pds-locomo-amem
-    # 作者给 GPT-4o 级模型的 k（敏感性运行，复用上面的写入）
+    # 作者给 GPT-4o 级模型的 k（敏感性运行，复用上面的写入）。运行名不能以 pds-locomo- 开头：
+    # 对比脚本会把它归进来，按名字排在 pds-locomo-amem 之后，覆盖 k=10 的结果
     CUEMEM_PRESET=deepseek CUEMEM_AMEM_K=40 uv run --extra local --with "agentic-memory @ $AMEM" \\
-        cuemem eval run --dataset locomo --split test200r --methods MA --name pds-locomo-amem-k40
+        cuemem eval run --dataset locomo --split test200r --methods MA --name k40-pds-locomo-amem
     # pq 协议（只用通义，要 DASHSCOPE_API_KEY）：写入放在另一个目录，不碰 pds 的写入
     CUEMEM_PRESET=qwen CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen \\
         uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \\

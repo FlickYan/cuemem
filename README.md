@@ -73,7 +73,7 @@ Everything below comes from test sets used once, with every method, prompt and t
 
 On MemLens, L1 and L2 attach the top-3 original photos at answer time ("re-perception").
 
-In the LongMemEval column, every row except full context was measured before N12 fixed a session-ID leak (D-067): the evidence headers showed session IDs that gave away the evidence sessions. The [leak ablation](docs/results/n12-leak/README.md) (Chinese) finds no measurable inflation for L1, L2 or the controller (agentic retrieval was not ablated), and the gap to full context is unchanged. The numbers are left as published.
+In the LongMemEval column, every row except full context was measured before N12 fixed a session-ID leak (D-067): the evidence headers showed session IDs that gave away the evidence sessions. The [leak ablation](docs/results/n12-leak/README.md) (Chinese) finds no measurable inflation for L1, L2 or the controller (agentic retrieval and "controller first, LLM may search more" were not ablated; the ablation used 100 of these questions and cannot rule out a point or two), and the gap to full context is unchanged. The numbers are left as published.
 
 1. **Memory beats a long context window.** On LongMemEval, L1 is 17.5 points more accurate than the full-context baseline at about 1/20 of the cost. On MemLens, full context loses 5.6 points going from 32K to 128K tokens of history, while L2 with photos stays flat.
 2. **The write path is the biggest single win.** The same naive retriever goes from 82.0% to 91.0% on LongMemEval (+53 / −17 questions, p < 0.001) once it can use the write path's output: facts with validity periods, fact-augmented index keys, and a profile.
@@ -146,7 +146,7 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 | Forgetting | Deletes the source conversation, follows citations, finds uncited restatements; dry run | `delete` | Edit memory | `remove_episode` | `forget_matching`, dry run |
 | Evaluation | Frozen methods, test sets used once, external baselines under the same models and judge | Own benchmark repo | Blog | Paper | Own |
 
-**Same protocol, same models (N12).** We ran five open-source memory systems ourselves on 200 LoCoMo questions. Each uses its own write and read pipeline; the extraction model, embeddings, reader and judge are the same as CueMem's. There are two protocols, DeepSeek only and Qwen only, with one run per configuration.
+**Same protocol, same models (N12).** We ran five open-source memory systems ourselves on 200 LoCoMo questions (A-MEM is still running). Each uses its own write and read pipeline; the extraction model, embeddings, reader and judge are the same as CueMem's. There are two protocols, DeepSeek only and Qwen only, with one run per configuration.
 
 | LoCoMo test200r | DeepSeek only | Qwen only |
 |---|---|---|
