@@ -24,7 +24,7 @@ The final evaluation used three test sets: LongMemEval test400, the last 7 LoCoM
 - **Letting the model retrieve for itself (ReAct) wins on some data and loses on other data.** It is the strongest method on text memory (LoCoMo 85.5%) and fails on image memory (MemLens 46.7%). "Controller first, LLM may search more" holds up on all three datasets, at the highest cost.
 - **Few errors are true retrieval misses.** Most come from the controller picking the wrong level, from miscounting, and from wrong LoCoMo gold answers (10 of 40 sampled errors).
 - **Every N2–N11 number can be replayed from the local cache with one command.** The controller's live runs match offline replay of the frozen model question by question.
-- **External systems under the same protocol (N12, 200 LoCoMo questions, §13).** With DeepSeek models only, L2 (87.0%) is significantly above Mem0 (81.0%), LangMem (78.0%), Cognee (77.5%) and Graphiti (59.0%); L1 (82.5%) is not significantly different from the first three. A-MEM: MA-PENDING. Graphiti and LangMem are sensitive to the extraction model: with Qwen models only, Graphiti drops to 41.5% and LangMem to 30.0%.
+- **External systems under the same protocol (N12, 200 LoCoMo questions, §13).** With DeepSeek models only, L2 (87.0%) is significantly above Mem0 (81.0%), LangMem (78.0%), Cognee (77.5%), Graphiti (59.0%) and A-MEM (58.0%); L1 (82.5%) is not significantly different from Mem0, LangMem and Cognee. With k = 40, the authors' setting for GPT-4o-class models, A-MEM rises to 75.0%, and L1 and L2 are still significantly higher. Graphiti and LangMem are sensitive to the extraction model: with Qwen models only, Graphiti drops to 41.5% and LangMem to 30.0%.
 
 ## 1. Problem
 
@@ -719,11 +719,13 @@ Accuracy / answer cost per 1,000 questions (writing excluded):
 | MG Graphiti | 59.0% / $1.09 | 41.5% / $0.74 |
 | ML LangMem | 78.0% / $1.48 | 30.0% / $0.69 |
 | MC Cognee | 77.5% / $1.79 | 74.0% / $1.04 |
-| MA A-MEM | MA-PENDING | MA-PENDING |
+| MA A-MEM (k = 10) | 58.0% / $3.48 | 59.5% / $0.88 |
+| MA A-MEM, k = 40 (sensitivity) | 75.0% / $8.97 | 65.0% / $2.49 |
 
-- **Under pds, L2 is significantly above Mem0, LangMem, Cognee and Graphiti**: against Mem0 +17 / −5 (p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002) and Graphiti +62 / −6 (p < 0.001). Against A-MEM: MA-PENDING.
-- **L1 is not significantly different from Mem0, LangMem or Cognee**: under pds, +14 / −11 (p = 0.69), +24 / −15 (p = 0.20) and +20 / −10 (p = 0.10). It is significantly above Graphiti only (+55 / −8, p < 0.001). L1 against A-MEM: MA-PENDING. In N11, on the original configuration, L1 and Mem0 were also level (81.0% against 80.5%).
-- **Under pq, CueMem leads by more**: L2 against Mem0 +24 / −9 (p = 0.014) and against Cognee +30 / −8 (p < 0.001); L1 against Cognee +25 / −10 (p = 0.017) and against Mem0 +19 / −11 (p = 0.20). Under pq, against A-MEM: MA-PENDING. This is CueMem's home ground (§13.1).
+- **Under pds, L2 is significantly above all five external systems**: against Mem0 +17 / −5 (p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002), Graphiti +62 / −6 (p < 0.001) and A-MEM +64 / −6 (p < 0.001); against A-MEM with k = 40 it is +32 / −8 (p < 0.001).
+- **L1 is not significantly different from Mem0, LangMem or Cognee**: under pds, +14 / −11 (p = 0.69), +24 / −15 (p = 0.20) and +20 / −10 (p = 0.10). It is significantly above Graphiti (+55 / −8) and A-MEM (+56 / −7, both p < 0.001), and above A-MEM with k = 40 at +27 / −12 (p = 0.024). In N11, on the original configuration, L1 and Mem0 were also level (81.0% against 80.5%).
+- **Under pq, CueMem leads by more**: L2 against Mem0 +24 / −9 (p = 0.014) and against Cognee +30 / −8 (p < 0.001); L1 against Cognee +25 / −10 (p = 0.017) and against Mem0 +19 / −11 (p = 0.20); against A-MEM, both L1 and L2 at p < 0.001. This is CueMem's home ground (§13.1).
+- **A-MEM is sensitive to how many notes it retrieves**: with the paper's main setting, k = 10, it is level with naive retrieval; with k = 40 it gains 17 points under pds (vs k = 10, +40 / −6, p < 0.001), but at 29,550 input tokens per question, 2.4 times L2's 12,255.
 - **L2 is not significantly different from full context**: +12 / −7 under pds (p = 0.36), +19 / −9 under pq (p = 0.087). The controller sits between L1 and L2; under pds, L2 beats it +7 / −0 (p = 0.016).
 
 ### 13.3 Switching models: Graphiti and LangMem are sensitive to the extraction model
@@ -742,7 +744,7 @@ The reader and the judge also change between the protocols (full context 84.5% �
   - Sessions that lost their writes go from 2 / 202 to 23 / 202; in 5 more sessions Qwen explicitly answered "no change" with an empty PatchDoc. Unreadable PatchDoc patches also count as lost writes.
   - The original build check rejected a build when more than max(2, 10%) of sessions lost writes; under pq that rejected 4 of the 7 conversations. Both protocols' full runs use 25% instead (`CUEMEM_LANGMEM_MAX_LOST_SHARE=0.25`; the default is still 10%), and the losses are recorded.
 - **Cognee's writes had no problems under either protocol**: no failed, retried or dropped sessions.
-- **A-MEM**: MA-PENDING.
+- **A-MEM is about the same under both protocols** (k = 10: 58.0% → 59.5%; k = 40: 75.0% → 65.0%). Under pds, deepseek-flash's evolution replies often ran into the 4,096-token limit, and 124 evolutions were abandoned (4 under pq).
 
 The external systems' prompts were written for their default models, and a change of extraction model can move their scores a lot. Under pq, CueMem is also on its home ground, so judge the external systems by pds.
 
@@ -756,7 +758,7 @@ The external systems' prompts were written for their default models, and a chang
   - turns blocked by content moderation are skipped and counted: 5 in Graphiti's pq conv-42 (built before the qwen3.7-plus fallback was added), 0 in the other six conversations;
   - LangMem builds pass with up to 25% of sessions losing their writes, and the losses are recorded (§13.3).
 - **Where Graphiti differs from its defaults.** BFS depth 1 instead of 3 (at depth 3, Kuzu's variable-length path query used more than 12 GB of memory). Under pq, facts are reranked with qwen3-rerank; pds has no reranker, so they go through RRF.
-- **Deliberately not retuned:** Graphiti's similarity threshold, LangMem's prompts, and A-MEM's k (the paper's default of 10; `CUEMEM_AMEM_K` allows a sensitivity run).
+- **Deliberately not retuned:** Graphiti's similarity threshold, LangMem's prompts, and A-MEM's k (the main result uses the paper's default of 10; the authors' k = 40 for GPT-4o-class models was run as a sensitivity check, §13.2).
 - **Cognee's context is uncapped.** Following its BEAM report, all 20 chunks, 20 entities and 5 facts go to the reader, so each question's reader input averages 5,683 / 6,689 tokens (pds / pq), against 4,333 / 5,034 for L1.
 
 ### 13.5 Cost
@@ -770,8 +772,8 @@ Writing the 7 conversations (202 sessions):
 | LangMem | $0.56 / $0.24 | 211 | $0.23 / $0.06 | 207 |
 | Cognee | $2.84 / $0.80 | 4,547 | $1.47 / $1.15 | 4,549 |
 | Graphiti | $9.99 / $1.51 | 14,240 | $4.51 / $3.91 | 12,092 |
-| A-MEM | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING |
+| A-MEM | $17.57 / $7.88 | 9,161 | $3.14 / $2.88 | 9,113 |
 
 - Nominal cost is at peak list price with no cache, so it compares across systems. Actual spend excludes local cache hits (requests already made in earlier pilots or rebuilds cost nothing) and includes the providers' cache and off-peak discounts; how much hits the cache depends on what ran before, so actual spend does not compare across systems.
-- Of the finished systems, Graphiti is the most expensive (A-MEM: MA-PENDING): every turn takes several LLM calls (entity extraction, entity resolution, fact extraction, deduplication and invalidation, …), and a conversation can only be written serially. Cognee makes one graph extraction and one summary call per chunk.
-- Spend during N12 (`data/ledger.sqlite`, excluding calls served from the local cache; pilots, the full runs of both protocols and the leak ablation; as of 2026-10-15 14:00 UTC, while the A-MEM full runs were still going; the total including them: MA-PENDING): Qwen $22.61 after provider cache discounts ($29.56 nominal); DeepSeek since 2026-10-14 19:00 UTC $12.04 after cache and off-peak discounts ($33.72 nominal). All DeepSeek calls ran off-peak (`--peak wait`).
+- Under pds the most expensive build is A-MEM's: two LLM calls per turn (analysis and evolution), and deepseek-flash writes long evolution replies (10.56M output tokens, against 3.58M under pq). Under pq it is Graphiti's: every turn takes several LLM calls (entity extraction, entity resolution, fact extraction, deduplication and invalidation, …), and a conversation can only be written serially. Cognee makes one graph extraction and one summary call per chunk.
+- Spend during N12 (`data/ledger.sqlite`, excluding calls served from the local cache; pilots, the full runs of both protocols, A-MEM's k = 40 runs and the leak ablation; as of 2026-10-15 16:30 UTC, after all runs had finished): Qwen $25.33 after provider cache discounts ($32.32 nominal); DeepSeek since 2026-10-14 19:00 UTC $19.01 after cache and off-peak discounts ($48.46 nominal). All DeepSeek calls ran off-peak (`--peak wait`).
