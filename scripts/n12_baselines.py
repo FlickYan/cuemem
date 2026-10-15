@@ -85,9 +85,45 @@ LABELS = {
 }
 # 外部系统的写入统计放在写入目录的哪个子目录（方法 → 系统名），与报告共用
 SYSTEMS = EXTERNAL_SYSTEMS
+# 敏感性运行：运行名以 <标签>-<协议>-<数据集>- 开头（不会被归进主结果），复用同一份写入，
+# 只换检索设置。名字 → （运行名的标签，方法，对照的主方法）
+SENSITIVITY = {"MA-k40": ("k40", "MA", "MA")}  # A-MEM 作者给 GPT-4o 级模型的 k = 40
 # 各协议的写入目录（相对数据目录）：PROTOCOL_SPACES，与报告共用（报告给没记写入目录的旧运行
 # 按运行名推断）；pq 与 qwen 的抽取模型、向量模型相同，共用一份写入
 REFERENCES = ("B4-nobm25", "B5")
+
+
+def paired(
+    a: tuple[dict[tuple[str, str], dict[str, Any]], str],
+    b: tuple[dict[tuple[str, str], dict[str, Any]], str],
+    questions: list[str],
+) -> dict[str, Any]:
+    """同一批题上甲对乙的赢 / 输题数（甲对、乙错算赢）与精确符号检验。a、b 是（结果表，方法）。"""
+    (ca, ma), (cb, mb) = a, b
+    wins = sum(1 for s in questions if ca[(s, ma)]["correct"] and not cb[(s, mb)]["correct"])
+    losses = sum(1 for s in questions if not ca[(s, ma)]["correct"] and cb[(s, mb)]["correct"])
+    return {"wins": wins, "losses": losses, "p": round(sign_test(wins, losses), 4)}
+
+
+def accuracy_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """准确率、Wilson 区间、回答成本（每千题）、每题输入 tokens 与分题型准确率。"""
+    correct = sum(bool(r["correct"]) for r in rows)
+    by_type: dict[str, list[bool]] = defaultdict(list)
+    for row in rows:
+        by_type[row["question_type"]].append(bool(row["correct"]))
+    return {
+        "n": len(rows),
+        "accuracy": round(correct / len(rows), 4),
+        "ci95": wilson(correct, len(rows)),
+        "answer_cost_per_1k": round(sum(r["usage"]["cost"] for r in rows) / len(rows) * 1000, 3),
+        "answer_tokens_mean": round(
+            sum(r["usage"].get("input_tokens", 0) for r in rows) / len(rows)
+        ),
+        "by_type": {
+            t: {"n": len(v), "accuracy": round(sum(v) / len(v), 3)}
+            for t, v in sorted(by_type.items())
+        },
+    }
 
 
 def wilson(correct: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -237,25 +273,9 @@ def main() -> None:
     }
     for method in methods_present:
         rows = [cells[(sid, method)] for sid in common]
-        correct = sum(bool(r["correct"]) for r in rows)
-        by_type: dict[str, list[bool]] = defaultdict(list)
-        for row in rows:
-            by_type[row["question_type"]].append(bool(row["correct"]))
         keys = {r["space_key"] for r in rows}
         out["methods"][method] = {
-            "n": len(rows),
-            "accuracy": round(correct / len(rows), 4),
-            "ci95": wilson(correct, len(rows)),
-            "answer_cost_per_1k": round(
-                sum(r["usage"]["cost"] for r in rows) / len(rows) * 1000, 3
-            ),
-            "answer_tokens_mean": round(
-                sum(r["usage"].get("input_tokens", 0) for r in rows) / len(rows)
-            ),
-            "by_type": {
-                t: {"n": len(v), "accuracy": round(sum(v) / len(v), 3)}
-                for t, v in sorted(by_type.items())
-            },
+            **accuracy_stats(rows),
             "write": write_stats(
                 settings,
                 datasets.get(sources[method], args.dataset),
@@ -275,17 +295,24 @@ def main() -> None:
         for other in methods_present:
             if other == ref:
                 continue
-            wins = sum(
-                1 for s in common if cells[(s, ref)]["correct"] and not cells[(s, other)]["correct"]
-            )
-            losses = sum(
-                1 for s in common if not cells[(s, ref)]["correct"] and cells[(s, other)]["correct"]
-            )
-            out["paired"][f"{ref}_vs_{other}"] = {
-                "wins": wins,
-                "losses": losses,
-                "p": round(sign_test(wins, losses), 4),
-            }
+            out["paired"][f"{ref}_vs_{other}"] = paired((cells, ref), (cells, other), common)
+    # 敏感性运行：同一批题，写入与主方法相同（成本见主方法），只看准确率与回答成本
+    for name, (tag, method, base) in SENSITIVITY.items():
+        variant, variant_runs, _ = load_cells(runs_dir, f"{tag}-{prefix}")
+        if base not in methods_present or not all((s, method) in variant for s in common):
+            continue
+        entry: dict[str, Any] = {
+            "runs": variant_runs,
+            **accuracy_stats([variant[(s, method)] for s in common]),
+            "write": f"same as {base}",
+            "paired": {f"{name}_vs_{base}": paired((variant, method), (cells, base), common)},
+        }
+        for ref in REFERENCES:
+            if ref in methods_present:
+                entry["paired"][f"{ref}_vs_{name}"] = paired(
+                    (cells, ref), (variant, method), common
+                )
+        out.setdefault("sensitivity", {})[name] = entry
     OUT.mkdir(parents=True, exist_ok=True)
     target = OUT / f"{args.protocol}-{args.dataset}.json"
     target.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", "utf-8")
@@ -308,6 +335,16 @@ def main() -> None:
         )
     for name, row in out["paired"].items():
         print(f"  {name}: +{row['wins']} / -{row['losses']}  p={row['p']:.3g}")
+    for name, entry in out.get("sensitivity", {}).items():
+        lo, hi = entry["ci95"]
+        print(
+            f"  敏感性 {name}（{', '.join(entry['runs'])}）："
+            f"{entry['accuracy']:.1%} [{lo:.1%}, {hi:.1%}]"
+            f"  回答 ${entry['answer_cost_per_1k']:.2f}/1k q"
+            f"  {entry['answer_tokens_mean']:,} tokens"
+        )
+        for pair, row in entry["paired"].items():
+            print(f"    {pair}: +{row['wins']} / -{row['losses']}  p={row['p']:.3g}")
     print(f"→ {target.relative_to(ROOT)}")
 
 

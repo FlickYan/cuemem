@@ -2,6 +2,7 @@
   "protocol": "pq",
   "dataset": "locomo",
   "runs": [
+    "pq-locomo-amem",
     "pq-locomo-cognee",
     "pq-locomo-cuemem",
     "pq-locomo-graphiti",
@@ -19,7 +20,8 @@
     "M0": "Mem0 2.2.1 (OSS)",
     "MG": "Graphiti (graphiti-core 0.30.2)",
     "ML": "LangMem 0.0.30",
-    "MC": "Cognee 1.6.4"
+    "MC": "Cognee 1.6.4",
+    "MA": "A-MEM (agiresearch/A-mem@ceffb86)"
   },
   "methods": {
     "B1": {
@@ -334,6 +336,42 @@
         "seconds": 15233.0,
         "memories": 0.0
       }
+    },
+    "MA": {
+      "n": 200,
+      "accuracy": 0.595,
+      "ci95": [
+        0.5258,
+        0.6606
+      ],
+      "answer_cost_per_1k": 0.877,
+      "answer_tokens_mean": 5555,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.472
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.154
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.658
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.675
+        }
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 3.1362,
+        "spent": 2.8779,
+        "llm_calls": 9113.0,
+        "seconds": 59440.1,
+        "memories": 4431.0
+      }
     }
   },
   "paired": {
@@ -377,6 +415,11 @@
       "losses": 10,
       "p": 0.0167
     },
+    "B4-nobm25_vs_MA": {
+      "wins": 52,
+      "losses": 8,
+      "p": 0.0
+    },
     "B5_vs_B1": {
       "wins": 19,
       "losses": 9,
@@ -416,6 +459,62 @@
       "wins": 30,
       "losses": 8,
       "p": 0.0005
+    },
+    "B5_vs_MA": {
+      "wins": 58,
+      "losses": 7,
+      "p": 0.0
+    }
+  },
+  "sensitivity": {
+    "MA-k40": {
+      "runs": [
+        "k40-pq-locomo-amem"
+      ],
+      "n": 200,
+      "accuracy": 0.65,
+      "ci95": [
+        0.5816,
+        0.7127
+      ],
+      "answer_cost_per_1k": 2.492,
+      "answer_tokens_mean": 16323,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.472
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.385
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.748
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.625
+        }
+      },
+      "write": "same as MA",
+      "paired": {
+        "MA-k40_vs_MA": {
+          "wins": 26,
+          "losses": 15,
+          "p": 0.1173
+        },
+        "B4-nobm25_vs_MA-k40": {
+          "wins": 40,
+          "losses": 7,
+          "p": 0.0
+        },
+        "B5_vs_MA-k40": {
+          "wins": 45,
+          "losses": 5,
+          "p": 0.0
+        }
+      }
     }
   }
 }

@@ -7,15 +7,15 @@ N11 只有一个外部基线：开源的 Mem0 2.2（D-055），用的还是 CueM
 - **pds**（只用 DeepSeek）：所有角色都是 deepseek-flash，向量在本机算。
 - **pq**（只用通义）：DeepSeek 的余额在工作中途用完（2026-10-15 只剩 CNY 0.08）时加的。之后充值，pds 也跑完了。
 
-原始数字：[pds-locomo.json](pds-locomo.json)、[pq-locomo.json](pq-locomo.json)（`scripts/n12_baselines.py` 从各次运行汇总，不调用 API）。A-MEM（MA）的完整运行还没结束，表里记作 MA-PENDING。
+原始数字：[pds-locomo.json](pds-locomo.json)、[pq-locomo.json](pq-locomo.json)（`scripts/n12_baselines.py` 从各次运行汇总，不调用 API）。A-MEM 另有一组 k = 40 的敏感性运行（复用同一份写入），在 JSON 的 `sensitivity` 里。
 
 ## 结论
 
 1. **pds（写入一侧没有一方针对这个模型调过）**：CueMem L2 87.0%，外部系统里最高的是 Mem0 81.0%。
-   - L2 对已出结果的四个外部系统都显著更好：Mem0 +17 / −5（p = 0.0169）、LangMem +25 / −7（p = 0.0021）、Cognee +27 / −8（p = 0.0019）、Graphiti +62 / −6（p < 0.001）。
-   - 但 L2 每题的输入是它们的两倍多到将近四倍（12,255 对 3,358–5,683 tokens，含规划与充分性检查的调用），回答成本每千题 $4.11 对 $1.09–1.79。
-   - 输入量与它们相近的 L1（82.5%，4,333 tokens）与 Mem0（81.0%）、LangMem（78.0%）、Cognee（77.5%）打平（p = 0.6900、0.1996、0.0987），只显著高于 Graphiti（59.0%）。
-2. **pq**：L2 85.0% 显著高于 Mem0（77.5%，p = 0.0135）与 Cognee（74.0%，p = 0.0005），每题输入同样多得多（14,022 对 3,611–6,689 tokens）；L1 81.5% 显著高于 Cognee（p = 0.0167），与 Mem0 打平（p = 0.2005）。
+   - L2 对五个外部系统都显著更好：Mem0 +17 / −5（p = 0.0169）、LangMem +25 / −7（p = 0.0021）、Cognee +27 / −8（p = 0.0019）、Graphiti +62 / −6（p < 0.001）、A-MEM +64 / −6（p < 0.001）。
+   - 但 L2 每题的输入是 Mem0、LangMem、Cognee、Graphiti 的两倍多到将近四倍（12,255 对 3,358–5,683 tokens，含规划与充分性检查的调用），回答成本每千题 $4.11 对 $1.09–1.79；A-MEM 每条笔记带出它链接的笔记，输入与 L2 相近（11,247 tokens，$3.48）。
+   - 输入量与 Mem0 等相近的 L1（82.5%，4,333 tokens）与 Mem0（81.0%）、LangMem（78.0%）、Cognee（77.5%）打平（p = 0.6900、0.1996、0.0987），显著高于 Graphiti（59.0%）与 A-MEM（58.0%）。
+2. **pq**：L2 85.0% 显著高于 Mem0（77.5%，p = 0.0135）与 Cognee（74.0%，p = 0.0005），对 A-MEM（59.5%）、Graphiti、LangMem 都是 p < 0.001，每题输入同样多得多（14,022 对 3,611–6,689 tokens）；L1 81.5% 显著高于 Cognee（p = 0.0167）与 A-MEM（p < 0.001），与 Mem0 打平（p = 0.2005）。
 3. **Graphiti 与 LangMem 对模型很敏感**：换成 qwen3.8-flash 后，Graphiti 从 59.0% 降到 41.5%，LangMem 从 78.0% 降到 30.0%。问题主要出在写入（§4）：
    - Graphiti 用自己的提示让 qwen3.8-flash 抽实体，抽得少，对不上实体的事实被丢掉；
    - LangMem 把新信息并进少数几条长记忆，202 个会话里有 23 个一条也没写进去。
@@ -28,11 +28,14 @@ N11 只有一个外部基线：开源的 Mem0 2.2（D-055），用的还是 CueM
    - LangMem 与 CueMem 相近（$0.56、$0.23；pq 上更低，但有 23 个会话没写进任何东西）；
    - Mem0 $1.38、$0.71；Cognee $2.84、$1.47；
    - Graphiti $9.99、$4.51：每条发言一个 episode，pds 下 14,240 次 LLM 调用，CueMem 是 438 次；
-   - A-MEM：MA-PENDING。
+   - A-MEM $17.57、$3.14：每句一条笔记，每条两次 LLM 调用（分析与演化），pds 下 9,161 次调用；deepseek-flash 的演化回复很长（输出 1,056 万 tokens，pq 358 万），所以 pds 下 A-MEM 是最贵的写入，pq 下最贵的仍是 Graphiti。
 
    回答成本上 L1 与 Mem0、LangMem 相近（pds 每千题 $1.38、$1.37、$1.48）。
 5. **主场优势**：CueMem 的抽取提示与阈值是用 qwen3.8-flash 与通义向量开发的（N3–N7），pq 是它的主场；pds 上写入一侧没有一方调过，但 deepseek-flash 是 CueMem 主实验的回答模型（§6）。L2 在 pds 上同样显著领先；L1 与 Mem0 在两个协议上都打平。
-6. **A-MEM**：MA-PENDING。
+6. **A-MEM 对检索条数很敏感**：
+   - 论文的主要设置 k = 10 时，pds 58.0%、pq 59.5%，与朴素检索相当（B2 59.5%、64.0%）；检索结果里含证据发言的题 pds 67.5%、pq 73.0%（L1 92.5%、95.0%）。两个协议之间差得不多，不像 Graphiti 与 LangMem。
+   - 换成作者给 GPT-4o 级模型的 k = 40（复用同一份写入）：pds 升到 75.0%（对 k = 10 +40 / −6，p < 0.001），pq 65.0%（+26 / −15，p = 0.1173）；每题输入 29,550 / 16,323 tokens，是 L2 的 2.4 倍 / 1.2 倍。
+   - L1 与 L2 对 k = 40 的 A-MEM 仍显著更好：pds L1 +27 / −12（p = 0.0237）、L2 +32 / −8（p = 0.0002）；pq 都是 p < 0.001。
 
 ## 1. 比较了什么、怎么比
 
@@ -152,7 +155,10 @@ agiresearch/A-mem@ceffb86（PyPI 上的 agentic-memory 0.1.2 不是 A-MEM）。�
   - 整理时照论文代码的格式重新向量化（写入协议 v4）。
   - 回复上限 4096 tokens（原版 1000，截断的 JSON 让演化被放弃）。
   - k = 40（作者给 GPT-4o-mini / GPT-4o 一档模型的设置）留作敏感性运行（`CUEMEM_AMEM_K=40`）。
-- **结果**：MA-PENDING。
+- **写入统计**（7 段对话，pds / pq）：笔记 4,431 / 4,431，演化成功 4,300 / 4,420，链接 15,961 / 12,871，整理 40 / 40 次。
+  - pds 下 deepseek-flash 的演化回复常写到 4096 tokens 的上限：428 次截断，重新采样救回 306 次，124 次演化因此放弃（每段对话的第一句没有邻居、不演化）。
+  - pq 下回复不合 schema 206 次、截断 49 次，重新采样后只有 4 次用不了，另有 36 次分析为空。
+  - 两个协议都没有被内容审核拒绝的调用。pq 有 2 次网关错误（几个评测进程共用的账本写锁超时，A-MEM 的重试接住了）。
 
 ## 3. 结果（LoCoMo test200r）
 
@@ -169,10 +175,11 @@ agiresearch/A-mem@ceffb86（PyPI 上的 agentic-memory 0.1.2 不是 A-MEM）。�
 | MG Graphiti 0.30.2 | 59.0% | 52.1–65.6% | $1.092 | 41.5% | 34.9–48.4% | $0.744 | 3,358 / 3,611 |
 | ML LangMem 0.0.30 | 78.0% | 71.8–83.2% | $1.481 | 30.0% | 24.1–36.7% | $0.693 | 4,623 / 4,382 |
 | MC Cognee 1.6.4 | 77.5% | 71.2–82.7% | $1.787 | 74.0% | 67.5–79.6% | $1.040 | 5,683 / 6,689 |
-| MA A-MEM | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING |
+| MA A-MEM（k = 10） | 58.0% | 51.1–64.6% | $3.475 | 59.5% | 52.6–66.1% | $0.877 | 11,247 / 5,555 |
+| MA A-MEM，k = 40（敏感性） | 75.0% | 68.6–80.5% | $8.966 | 65.0% | 58.2–71.3% | $2.492 | 29,550 / 16,323 |
 
 - 两个协议的单价不同（deepseek-flash 的输入标价是 qwen3.8-flash 的两倍），回答成本只在同一列里比。
-- 证据量相近：L1、Mem0、Graphiti、LangMem 每题的输入在 3,358–5,034 tokens 之间；Cognee 不截断，略多；L2（含规划与充分性检查的调用）与全上下文多得多。
+- 证据量相近：L1、Mem0、Graphiti、LangMem 每题的输入在 3,358–5,034 tokens 之间；Cognee 不截断，略多；L2（含规划与充分性检查的调用）与全上下文多得多。A-MEM 每条笔记带出它链接的笔记：k = 10 时 pq 5,555 tokens、pds 11,247 tokens（pds 的写入链接更多、演化改写的内容更长，见 §2），k = 40 时更多。
 - B2 只靠向量检索，pq 上更高（64.0% 对 59.5%）多半是向量模型的差别：pds 用的是本机的 384 维小模型，B2 的发言召回（任一）pds 67.0%、pq 84.5%。
 
 ### 3.2 写入
@@ -185,15 +192,16 @@ agiresearch/A-mem@ceffb86（PyPI 上的 agentic-memory 0.1.2 不是 A-MEM）。�
 | MG Graphiti | $9.9923 | $1.5084 | 14,240 | 7,265 | $4.5147 | $3.9077 | 12,092 | 30,421 |
 | ML LangMem | $0.5630 | $0.2386 | 211 | 23,276 | $0.2252 | $0.0635 | 207 | 1,006 |
 | MC Cognee | $2.8450 | $0.7975 | 4,547 | 10,111 | $1.4659 | $1.1542 | 4,549 | 15,233 |
-| MA A-MEM | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING |
+| MA A-MEM | $17.5673 | $7.8772 | 9,161 | 50,907 | $3.1362 | $2.8779 | 9,113 | 59,440 |
 
-7 段对话合计。**系统之间比名义成本**；实际花费与耗时受缓存与时段影响，不能横着比：
+7 段对话合计（A-MEM 的 k = 40 运行复用这份写入，没有写入成本）。**系统之间比名义成本**；实际花费与耗时受缓存与时段影响，不能横着比：
 
 - **名义成本**：按高峰时段、不计任何缓存的标价，相当于从头写一遍的价格。
 - **实际花费**：扣掉本地响应缓存的命中、供应商的前缀缓存折扣与 DeepSeek 的错峰折扣。写入在缓存里有现成结果时几乎为零：
   - pds 的 conv-42：Graphiti、LangMem 与 Cognee 的写入大多命中之前写入留下的缓存（Graphiti 2,014 次调用里 2,012 次）；
   - pds 的 Graphiti 运行中途续跑过一次，其余六段也各有 1,096–1,176 次调用命中缓存；
   - pq 的 LangMem 有 5 段对话的写入全部命中之前写入留下的缓存；pq 的 Graphiti conv-42 是 1,688 次里 1,453 次。
+  - A-MEM 的两个运行都在容器重启后续跑过一次：最终那次写入里，重启前已经做过的调用都命中缓存（pds 904 次、pq 1,153 次），耗时也因此偏短。
 - **LLM 调用**：最终那次写入的聊天调用次数（含命中缓存的）；CueMem 是写入与巩固。
 - **耗时**：每段对话最终那次写入的墙钟时间之和（各段并行写入），命中缓存的部分很快。Mem0 没有记墙钟，取各次调用的延迟之和。pds 的 LangMem 运行在北京时间 17:01 开始，正是 DeepSeek 的高峰时段，按 `--peak wait` 暂停到 18 点：其余六段对话（conv-42 命中缓存）各只有 25–32 次调用，耗时却在 3,827–3,940 秒。
 
@@ -210,9 +218,10 @@ CueMem L1、L2 对其他方法的赢 / 输题数（同一题上 CueMem 对、对
 | MG Graphiti | **+55 / −8（p < 0.001）** | **+62 / −6（p < 0.001）** | **+85 / −5（p < 0.001）** | **+89 / −2（p < 0.001）** |
 | ML LangMem | +24 / −15（p = 0.1996） | **+25 / −7（p = 0.0021）** | **+107 / −4（p < 0.001）** | **+113 / −3（p < 0.001）** |
 | MC Cognee | +20 / −10（p = 0.0987） | **+27 / −8（p = 0.0019）** | **+25 / −10（p = 0.0167）** | **+30 / −8（p = 0.0005）** |
-| MA A-MEM | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING |
+| MA A-MEM（k = 10） | **+56 / −7（p < 0.001）** | **+64 / −6（p < 0.001）** | **+52 / −8（p < 0.001）** | **+58 / −7（p < 0.001）** |
+| MA A-MEM，k = 40 | **+27 / −12（p = 0.0237）** | **+32 / −8（p = 0.0002）** | **+40 / −7（p < 0.001）** | **+45 / −5（p < 0.001）** |
 
-L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
+A-MEM 的 k = 40 对 k = 10：pds +40 / −6（p < 0.001），pq +26 / −15（p = 0.1173）。L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 
 ### 3.4 分题型
 
@@ -227,15 +236,16 @@ L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 | MG Graphiti | 64.0% | 58.3% | 57.5% | 23.1% | 45.0% | 27.8% | 50.0% | 23.1% |
 | ML LangMem | 86.5% | 63.9% | 77.5% | 46.2% | 33.3% | 27.8% | 22.5% | 30.8% |
 | MC Cognee | 83.8% | 66.7% | 80.0% | 46.2% | 86.5% | 47.2% | 77.5% | 30.8% |
-| MA A-MEM | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING | MA-PENDING |
+| MA A-MEM（k = 10） | 66.7% | 44.4% | 57.5% | 23.1% | 65.8% | 47.2% | 67.5% | 15.4% |
+| MA A-MEM，k = 40 | 85.6% | 66.7% | 67.5% | 30.8% | 74.8% | 47.2% | 62.5% | 38.5% |
 
 - pds 上 L2 在多跳（75.0%，外部系统最高 66.7%）与时间题（90.0%，外部系统最高 82.5%）上领先明显；单跳题上 L2 与 Mem0 接近（93.7% 对 91.0%），L1 与 Mem0 相当（90.1% 对 91.0%）。
-- pds 上 Graphiti 在每个题型上都是外部系统里最低的，不是某一类题的问题。
+- pds 上每个题型里外部系统的最低分都是 Graphiti 或 k = 10 的 A-MEM：单跳 Graphiti 64.0%，多跳 A-MEM 44.4%，时间题两者都是 57.5%，开放域两者都是 23.1%。
 - 开放域只有 13 题，一两道题就能改变排序，不要据此下结论。
 
 ## 4. 换模型的影响：Graphiti 与 LangMem 为什么在通义下掉这么多
 
-同一个系统、同样的代码，换的是整套模型：抽取与回答 deepseek-flash → qwen3.8-flash，向量 bge-small → 通义，判分 deepseek-flash → qwen3.8-max；Graphiti 还因为 pq 有重排模型而换了事实检索的配方（§2）。N11 在 LoCoMo 上实测 deepseek-flash 判分比 qwen3.8-max 宽松约 3.5 个点（[N11 §5.1](../n11-improvements/README.md)），所以 Mem0、Cognee、CueMem 几个点的变化分不清来自模型还是判分；Graphiti 与 LangMem 的大幅下降在写入统计里有直接证据（§4.1、§4.2）。
+同一个系统、同样的代码，换的是整套模型：抽取与回答 deepseek-flash → qwen3.8-flash，向量 bge-small → 通义，判分 deepseek-flash → qwen3.8-max；Graphiti 还因为 pq 有重排模型而换了事实检索的配方（§2）。N11 在 LoCoMo 上实测 deepseek-flash 判分比 qwen3.8-max 宽松约 3.5 个点（[N11 §5.1](../n11-improvements/README.md)），所以 Mem0、Cognee、A-MEM、CueMem 几个点的变化分不清来自模型还是判分；Graphiti 与 LangMem 的大幅下降在写入统计里有直接证据（§4.1、§4.2）。
 
 | 系统 | pds | pq |
 |---|---|---|
@@ -244,7 +254,8 @@ L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 | Cognee | 77.5% | 74.0% |
 | LangMem | 78.0% | **30.0%** |
 | Graphiti | 59.0% | **41.5%** |
-| A-MEM | MA-PENDING | MA-PENDING |
+| A-MEM（k = 10） | 58.0% | 59.5% |
+| A-MEM，k = 40 | 75.0% | 65.0% |
 
 ### 4.1 Graphiti：抽出的实体少，事实跟着丢
 
@@ -285,7 +296,7 @@ L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 - **Cognee**：准确率 77.5% → 74.0%（含判分的差别，见上）。两个协议下都没有失败、重写或丢弃的会话。实体 pds 1,261 个、pq 1,544 个；pds 的块受 bge-small 的 512 tokens 所限（上限 510），pq 是 4096。
 - **Mem0**：准确率 81.0% → 77.5%（含判分的差别，见上），单跳题降得最多（91.0% → 84.7%）。两个协议下都没有失败的会话；pq 下记忆 2,907 条（pds 4,059 条）。
 - **CueMem**：L1 pds 82.5%、pq 81.5%，L2 87.0%、85.0%。
-- **A-MEM**：MA-PENDING。
+- **A-MEM**：k = 10 时 58.0% → 59.5%，两个协议下差不多。笔记数相同（每句一条）；pds 下因回复截断放弃的演化多（124 次对 4 次），链接多（15,961 对 12,871 条）。检索结果里含证据发言的题 pds 67.5%、pq 73.0%。k = 40 时反过来 75.0% → 65.0%：pds 下多取的笔记更有用，原因没有单独查。
 
 ## 5. 适配层加了什么、刻意没调什么
 
@@ -308,7 +319,7 @@ L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 
 - **Graphiti 的向量相似度阈值 0.6**：pq 下向量路不是空的（中位数 8 条候选），保持默认。
 - **LangMem 的提示与 Memory 结构**：都用默认值。
-- **A-MEM 的 k = 10**：论文的主要设置；作者给 GPT-4o-mini / GPT-4o 一档模型的 k = 40 只作敏感性运行（结果：MA-PENDING）。
+- **A-MEM 的 k = 10**：论文的主要设置；作者给 GPT-4o-mini / GPT-4o 一档模型的 k = 40 只作敏感性运行（结果：pds 75.0%、pq 65.0%，见结论 6 与 §3）。
 - **Cognee 的检索配置**：BEAM 报告的固定配置，不截断。
 - **Mem0**：沿用 N11 的设置（每人 30 条）。
 - **CueMem**：没有为 deepseek-flash 或 bge-small 改提示与阈值；控制器没有按两个协议重新训练。
@@ -319,7 +330,7 @@ L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 - **pds 上写入一侧没有一方调过**：没有任何系统的抽取提示是针对 deepseek-flash 或 bge-small 写的；CueMem 的巩固阈值是按通义向量调的，换到 bge-small 可能偏松或偏紧（见 [deepseek 预设](../../../src/cuemem/configs/presets/deepseek.yaml)的说明）。
 - **但 pds 对 CueMem 的读路径不算完全中立**：deepseek-flash 是 N3–N11 主实验的回答模型，共用的回答提示、L1 的证据装法与控制器的准确率表都是在它上面定的。
 - 外部系统的公开评测多用 OpenAI 的模型（Zep、Mem0、A-MEM 的论文用 gpt-4o-mini 一类），两个协议都不是它们的主场。
-- 所以 pq 上的差距里有主场优势；pds 更接近"谁都没调过"（写入一侧）。pds 上 L2 对已出结果的四个外部系统仍显著领先（每题输入是它们的 2–4 倍），L1 与 Mem0、LangMem、Cognee 打平。
+- 所以 pq 上的差距里有主场优势；pds 更接近"谁都没调过"（写入一侧）。pds 上 L2 对五个外部系统仍显著领先（每题输入是 Mem0、LangMem、Cognee、Graphiti 的 2–4 倍，与 k = 10 的 A-MEM 相近），L1 与 Mem0、LangMem、Cognee 打平。
 
 ## 7. 局限
 
@@ -331,14 +342,16 @@ L2 对 L1：pds +15 / −6（p = 0.0784），pq +15 / −8（p = 0.2100）。
 - **向量器的输入上限**：所有方法共用 CueMem 的向量器，它只取前 6000 个字符，pds 的 bge-small 还只看前 512 tokens。受影响最大的是 LangMem 合并出的长记忆（超过 6000 字符的 pq 12 条、pds 2 条，尾部检索不到；LangMem 参考的 text-embedding-3-small 能看 8191 tokens），以及 Cognee 在 pds 下的块上限（从 4096 降到 510 tokens）。
 - **适配不等于上游的原样**：每个系统都有偏离上游的地方（§2，详见各模块的说明），原因都写明了，但它们仍可能影响结果。外部系统换成 OpenAI 的模型会怎样，没有测。
 - **写入的实际花费与耗时不能在系统之间比**（§3.2），只比名义成本。
-- **Letta 没有接入**；A-MEM 的结果还没出来（MA-PENDING）。
+- **A-MEM 的主结果用论文的 k = 10**：k = 40 高出很多（pds +17 个点），但证据也多得多（§3.1）。pds 下 124 次演化因回复超过 4096 tokens 被放弃（2.8%）。两个运行都在容器重启后续跑过一次，缓存接上，不改变结果。
+- **Letta 没有接入**。
 
 ## 8. 花费
 
-数字来自 `data/ledger.sqlite`（不含命中本地缓存的调用），包括 N12 的试跑、两个协议的完整运行与泄漏消融，不只是这里的两张表。截至 2026-10-15 14:00 UTC，A-MEM 的完整运行还在进行，含它的总数：MA-PENDING。
+数字来自 `data/ledger.sqlite`（不含命中本地缓存的调用），包括 N12 的试跑、两个协议的完整运行、A-MEM 的 k = 40 敏感性运行与泄漏消融，不只是这里的两张表。截至 2026-10-15 16:30 UTC，全部运行都已结束：
 
-- **通义**（从拿到 Key 起）：$22.61（扣除供应商的缓存折扣；名义 $29.56）。
-- **DeepSeek**（2026-10-14 19:00 UTC 起：pds 的试跑与完整运行、泄漏消融的回答）：$12.04（扣除缓存折扣与错峰半价；名义 $33.72）。所有 DeepSeek 的运行都用 `--peak wait`，只在非高峰时段调用。
+- **通义**（从拿到 Key 起）：$25.33（扣除供应商的缓存折扣；名义 $32.32）。
+- **DeepSeek**（2026-10-14 19:00 UTC 起：pds 的试跑与完整运行、泄漏消融的回答）：$19.01（扣除缓存折扣与错峰半价；名义 $48.46）。所有 DeepSeek 的运行都用 `--peak wait`，只在非高峰时段调用。
+- 14:00 UTC 时是通义 $22.61、DeepSeek $12.04；之后主要是 A-MEM 两个协议的完整运行与 k = 40 的运行。
 
 ## 9. 复现
 
@@ -372,6 +385,9 @@ uv run --extra local --with cognee==1.6.4 cuemem eval run --dataset locomo --spl
     --peak wait --workers 7 --max-cost 8 --methods MC --name pds-locomo-cognee
 uv run --extra local --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \
     --split test200r --peak wait --workers 7 --max-cost 15 --methods MA --name pds-locomo-amem
+CUEMEM_AMEM_K=40 uv run --extra local --with "agentic-memory @ $AMEM" cuemem eval run \
+    --dataset locomo --split test200r --peak wait --workers 7 --max-cost 6 --methods MA \
+    --name k40-pds-locomo-amem
 uv run python scripts/n12_baselines.py --protocol pds --dataset locomo
 ```
 
@@ -396,9 +412,11 @@ uv run --with cognee==1.6.4 cuemem eval run --dataset locomo --split test200r \
     --peak warn --workers 7 --max-cost 6 --methods MC --name pq-locomo-cognee
 uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \
     --split test200r --peak warn --workers 7 --max-cost 6 --methods MA --name pq-locomo-amem
+CUEMEM_AMEM_K=40 uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \
+    --split test200r --peak warn --workers 7 --max-cost 3 --methods MA --name k40-pq-locomo-amem
 uv run python scripts/n12_baselines.py --protocol pq --dataset locomo
 ```
 
 - `--max-cost`（实际花费的上限，超过后不再开始新题）与 `--workers`（并发数）都与各运行的 `run.json` 相同；已出结果的运行都答完了 200 题，没有碰到上限。
 - 运行名必须是 `<协议>-locomo-<系统>`：`n12_baselines.py` 把前缀为 `<协议>-locomo-` 的运行都归到一起，同一方法的结果按运行名的顺序后来的覆盖先来的。外部系统的写入目录按协议选，不看当前的 `CUEMEM_PATHS__EVAL_SPACES`。
-- A-MEM 的 k = 40 敏感性运行复用同一份写入：加 `CUEMEM_AMEM_K=40`，运行名不能以 `<协议>-locomo-` 开头（会被 `n12_baselines.py` 归进来、覆盖 k = 10 的 MA 结果），如 `k40-pds-locomo-amem`。
+- A-MEM 的 k = 40 敏感性运行复用同一份写入：加 `CUEMEM_AMEM_K=40`，运行名不能以 `<协议>-locomo-` 开头（会被 `n12_baselines.py` 归进来、覆盖 k = 10 的 MA 结果），要用 `k40-<协议>-locomo-amem`：脚本按这个名字另外汇总到 JSON 的 `sensitivity.MA-k40`。
