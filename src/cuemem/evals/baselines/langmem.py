@@ -50,16 +50,22 @@ evals/external.py），只换"记忆从哪来"：
    （网关换了备用模型也拒绝，重试没用；看网关桶里的 refusals）跳过并计数，与 M0 相同；
    其他错误让整份写入失败、不留 build.json，下次运行重建（定种子的 ID 让前面的会话全部命中
    响应缓存）——跳过它们，后面的会话会建在缺了一块的存储上，出错时已写进存储的部分记忆也
-   对不上会话日期。被拒绝的与一条记忆都没写的会话合计超过 max(2, 10%) 时整份写入算失败；
-   带工具的回复满 10 次却没有一次并行调用多个工具时也算失败（并行工具调用没生效）。
+   对不上会话日期。被拒绝的与写入丢了的会话（没调用工具、补丁改不了、调用校验不过而一条也
+   没写）合计超过 max(2, 10%) 时整份写入算失败；带工具的回复满 10 次却没有一次并行调用多个
+   工具时也算失败（并行工具调用没生效）。模型调用了 PatchDoc 却明说"不用改"（patches 为空）
+   的会话是 LangMem 照常的结果、不算写入丢了，另记在 unchanged_sessions 里：有已有记忆时
+   trustcall 要求必须调用工具，通义觉得没有新东西时就这样回。
 9. 写入记录（build.json）另外记下：每个会话写入的条数、没写入的会话、网关统计的工具调用
    （tool_calls、multi_tool_replies、no_tool_replies）与被长度上限截断的回复
    （truncated_replies，截断的工具调用 LangChain 会静默丢掉）、trustcall 跳过的补丁
    （skipped_edits，路径不对等）与校验不过被丢掉的调用（dropped_calls）、各包的版本。
    第二次试跑（deepseek 预设）：33 次抽取调用里 31 次一次回多个工具调用，共 169 个；DeepSeek
    有 4 次给 Memory 传了空参数，trustcall 让它修补时它又附带的 9 条 Memory 调用被丢掉
-   （dropped_calls=9，trustcall 自身的行为）。通义预设下还没有实跑过：正式评测前先跑一份对话，
-   看 multi_tool_replies 与 no_tool_replies。
+   （dropped_calls=9，trustcall 自身的行为）。通义预设的试跑（conv-42，qwen3.8-flash）：29 次
+   抽取调用全都调用了工具（no_tool_replies=0），8 次一次回多个、共 39 个；通义多用一个 PatchDoc
+   把新信息并进少数几条长记忆（共 20 条，最长 7461 个字符，2 条超过 max_chars），有 2 个会话
+   回了空补丁（unchanged_sessions），1 个会话的补丁把路径写成列表 ["content"]、trustcall 改不了
+   （skipped_edits，记作写入丢了）。
 10. store.json 与 build.json 记下写入用的抽取模型与向量器；评测空间的目录不分预设，换了模型
     时删掉旧的写入重建，不沿用别的模型写出的记忆。
 11. 已知的限制：InMemoryStore 索引整个 JSON 值，CueMem 的向量器只取前 max_chars（6000）个
@@ -214,6 +220,7 @@ class LangMemBaseline(ExternalBaseline):
         puts_per_session: list[int] = []
         refused: list[str] = []
         empty: list[str] = []
+        unchanged: list[str] = []  # 模型调用了工具、却明说没有要改的（见模块说明第 8 条）
         problems: list[str] = []
         collecting = _problems.set(problems)
         # 每份写入一个 HTTP 客户端、用完关掉：LangChain 默认按 base_url 缓存异步客户端，每份
@@ -231,14 +238,15 @@ class LangMemBaseline(ExternalBaseline):
                 if not messages:
                     continue
                 seeded = _rng.set(random.Random(f"{key}|{number}|{session.session_id}"))
-                refusals = self.gateway.usage(bucket)["refusals"]
+                start = self.gateway.usage(bucket)
+                seen = len(problems)
                 try:
                     puts = await manager.ainvoke({"messages": messages})
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     # trustcall 把模型调用的错误改写成提示重试，最后报的是 GraphRecursionError：
                     # 是不是内容审核拒绝，看这个会话期间网关桶里的拒绝次数
-                    if self.gateway.usage(bucket)["refusals"] == refusals:
+                    if self.gateway.usage(bucket)["refusals"] == start["refusals"]:
                         raise RuntimeError(  # 整份作废：下次重建，前面的会话命中缓存
                             f"LangMem 写入会话 {session.session_id} 失败：{error}"[:300]
                         ) from exc
@@ -248,7 +256,9 @@ class LangMemBaseline(ExternalBaseline):
                     _rng.reset(seeded)
                 puts_per_session.append(len(puts))
                 if not puts:
-                    empty.append(session.session_id)
+                    end = self.gateway.usage(bucket)
+                    lost = not chose_no_change(start, end, problems[seen:])
+                    (empty if lost else unchanged).append(session.session_id)
                 updates += record_writes(written, puts, session)
         finally:
             _problems.reset(collecting)
@@ -272,6 +282,7 @@ class LangMemBaseline(ExternalBaseline):
             "updates": updates,
             "puts_per_session": puts_per_session,
             "empty_sessions": empty,
+            "unchanged_sessions": unchanged,
             "refused_sessions": refused,
             "skipped_edits": len(skipped),  # trustcall 没能应用而跳过的修改
             "dropped_calls": len(dropped),  # trustcall 校验不过而丢掉的工具调用等
@@ -395,17 +406,32 @@ def record_writes(
     return updates
 
 
+def chose_no_change(
+    start: Mapping[str, Any], end: Mapping[str, Any], problems: Sequence[str]
+) -> bool:
+    """一个会话一条也没写时，是不是模型自己说"不用改"：这个会话期间（网关桶在 start 与 end 时的
+    统计）模型调用了工具，没有不调用工具或被截断的回复，trustcall 也没报告跳过或丢掉的修改
+    （problems）。这样的会话只剩一种可能：模型调用 PatchDoc 却没给补丁（patches 为空），trustcall
+    照规矩不写。其余（没调用工具、补丁改不了、调用校验不过……）是写入丢了。"""
+    return (
+        end["tool_calls"] > start["tool_calls"]
+        and end["no_tool_replies"] == start["no_tool_replies"]
+        and end["truncated_replies"] == start["truncated_replies"]
+        and not problems
+    )
+
+
 def check_build(
     sessions: int, refused: Sequence[str], empty: Sequence[str], replies: Mapping[str, int]
 ) -> None:
     """整份写入能不能用；不能用时报错（不留 build.json，下次运行重建）。
 
-    sessions：交给管理器的会话数；replies：这份写入在网关桶里的 tool_requests 与
-    multi_tool_replies。"""
+    sessions：交给管理器的会话数；empty：写入丢了的会话（模型明说不用改的不算，见
+    chose_no_change）；replies：这份写入在网关桶里的 tool_requests 与 multi_tool_replies。"""
     allowed = max(MAX_LOST, sessions // 10)
     if len(refused) + len(empty) > allowed:
         raise RuntimeError(
-            f"LangMem 有 {len(refused)} 个会话被内容审核拒绝、{len(empty)} 个会话一条记忆都没写"
+            f"LangMem 有 {len(refused)} 个会话被内容审核拒绝、{len(empty)} 个会话的写入丢了"
             f"（共 {sessions} 个，最多容许 {allowed} 个）：{[*refused, *empty][:3]}"
         )
     if replies.get("tool_requests", 0) >= MIN_TOOL_REPLIES and not replies.get(
