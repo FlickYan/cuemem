@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from cuemem.evals.datasets import (
+    RAW_SESSION_IDS_ENV,
     evidence_turns,
     load_locomo,
     load_longmemeval,
@@ -14,7 +17,8 @@ from cuemem.evals.datasets import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_longmemeval_loader() -> None:
+def test_longmemeval_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(RAW_SESSION_IDS_ENV, raising=False)
     evalset = load_longmemeval(FIXTURES / "longmemeval_mini.json")
     by_id = {s.sample_id: s for s in evalset.samples}
     assert set(by_id) == {"q-ssu", "q-tr", "q-cat_abs"}
@@ -24,11 +28,14 @@ def test_longmemeval_loader() -> None:
     assert ssu.ability == "information_extraction"
     assert not ssu.is_abstention
     assert ssu.question_time == datetime(2023, 6, 1, 10, 0)
-    assert ssu.evidence_session_ids == ["ssu-a"]
+    # 会话 ID 按时间顺序改写（原始 ID 会泄漏证据会话，见 test_eval_leak.py），原 ID 留作追溯
+    assert evalset.session_ids == "anon"
+    assert ssu.evidence_session_ids == ["session_1"]
     sessions = evalset.sessions_of(ssu)
-    assert [s.session_id for s in sessions] == ["ssu-a", "ssu-b", "ssu-c"]
+    assert [s.session_id for s in sessions] == ["session_1", "session_2", "session_3"]
+    assert [s.source_id for s in sessions] == ["ssu-a", "ssu-b", "ssu-c"]
     assert sessions[0].started_at == datetime(2023, 5, 20, 9, 0)
-    assert evidence_turns(sessions) == {("ssu-a", 0)}
+    assert evidence_turns(sessions) == {("session_1", 0)}
 
     assert by_id["q-tr"].answer == "12"  # 整数答案转成字符串
     assert by_id["q-tr"].ability == "temporal_reasoning"

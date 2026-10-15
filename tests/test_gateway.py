@@ -437,6 +437,60 @@ def test_external_baseline_builds_once_and_records_usage(
     assert space_key("locomo:conv-42") == "locomo_conv-42"
 
 
+def test_external_builds_keep_session_id_schemes_apart(llm: LLMClient, fake_api: FakeAPI) -> None:
+    """外部系统的写入里存着会话 ID（证据抬头会显示它）：改写过的另存一处、记下写法；
+    原始 ID 的写入沿用原来的位置；改写之前的写入（没记写法）不给改写后的运行用。"""
+    fake_api.chat_replies = [
+        lambda body: (
+            '{"answer": "ok", "evidence_sufficient": true, "citations": []}'
+            if "Question:" in json.dumps(body)
+            else "ok"
+        )
+    ]
+    when = datetime(2023, 5, 20, 9)
+    turns = [EvalTurn(role="user", text="I hike in the Alps.")]
+    sample = Sample(
+        "longmemeval_s", "q1_abs", "q1_abs", "Where do I hike?", "", "x", "x", True, when
+    )
+    toy = _Toy()
+    try:
+        anon = MethodContext(
+            sample,
+            [EvalSession("session_1", when, turns, source_id="answer_1")],
+            Reader(llm),
+            None,
+            "longmemeval_s:q1_abs",
+            "anon",
+        )
+        raw = MethodContext(
+            sample,
+            [EvalSession("answer_1", when, turns, source_id="answer_1")],
+            Reader(llm),
+            None,
+            "longmemeval_s:q1_abs",
+            "raw",
+        )
+        # 改写之前的写入：位置与原始 ID 的相同，没有记写法
+        legacy = toy.answer(MethodContext(sample, raw.sessions, Reader(llm), None, raw.space_id))
+        assert toy.builds == 1 and "toy_build" in legacy.details
+        record = toy.root / "longmemeval_s_q1_abs" / "build.json"
+        assert "session_ids" not in json.loads(record.read_text("utf-8"))
+
+        assert "toy_build" not in toy.answer(raw).details  # 原始 ID 的运行照常复用
+        first = toy.answer(anon)  # 改写后的运行：另存一处，重新写入
+        assert toy.builds == 2 and first.details["toy_build"]["session_ids"] == "anon"
+        anon_dir = toy.root / "longmemeval_s-anon_q1_abs"
+        assert json.loads((anon_dir / "build.json").read_text("utf-8"))["session_ids"] == "anon"
+        assert "toy_build" not in toy.answer(anon).details and toy.builds == 2
+        assert "toy_build" not in toy.answer(raw).details  # 原始 ID 的写入没被碰过
+
+        # 放错了地方的写入（记的写法对不上）：重建
+        (anon_dir / "build.json").write_text(json.dumps({"protocol": toy.protocol}), "utf-8")
+        assert "toy_build" in toy.answer(anon).details and toy.builds == 3
+    finally:
+        toy.gateway.stop()
+
+
 def test_external_methods_are_registered_lazily() -> None:
     # 适配器模块按需导入；外部包（这里是 graphiti-core）要到第一次回答时才导入，构造不需要它
     assert [m.name for m in build_methods(["MG"])] == ["MG"]

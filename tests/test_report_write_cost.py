@@ -393,3 +393,159 @@ def test_n12_pq_reads_its_own_build_records(
     module.main()
     out = json.loads((tmp_path / "out" / "pq-locomo.json").read_text("utf-8"))
     assert out["methods"]["M0"]["write"]["cost"] == 10.0
+
+
+# ---------- 会话 ID 的写法（N12 修复的泄漏，见 evals/datasets.py 与 test_eval_leak.py） ----------
+
+LME = "longmemeval_s"
+
+
+def lme_build(spaces: Path, system: str, folder: str, **stats: Any) -> None:
+    """写入目录下的 build.json；folder 是 <写入用的数据集名>_<题号>（改写过的带 -anon）。"""
+    path = spaces / system / folder / "build.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(stats), "utf-8")
+
+
+@pytest.fixture
+def lme_spaces(tmp_path: Path) -> Path:
+    """同一个写入目录里两种写法的写入并存：修复之前的（原始 ID，在原来的位置、没记写法）与
+    改写过会话 ID 的（<数据集>-anon_<题号>，记着 session_ids）。"""
+    root = tmp_path / "data" / "eval-spaces-qwen"
+    lme_build(root, "mem0", f"{LME}_q1", cost=1.0, llm_calls=50)
+    lme_build(root, "mem0", f"{LME}_q2", cost=2.0, llm_calls=50)
+    lme_build(root, "mem0", f"{LME}-anon_q1", cost=0.5, llm_calls=40, session_ids="anon")
+    # 放错了地方的写入：在 -anon 下却没记写法（= 原始 ID），不能算到改写后的运行上
+    lme_build(root, "mem0", f"{LME}-anon_q2", cost=0.25, llm_calls=40)
+    lme_build(root, "graphiti", f"{LME}_q1", protocol=QWEN, cost=0.9, seconds=90.0)
+    lme_build(
+        root, "graphiti", f"{LME}-anon_q1", protocol=QWEN, cost=0.6, seconds=60, session_ids="anon"
+    )
+    return root
+
+
+def test_external_write_cost_follows_the_runs_session_ids(lme_spaces: Path) -> None:
+    """改写过会话 ID 的运行只算 -anon 下、记着 anon 的写入；原始 ID 的运行（含修复之前、没记写法的
+    运行：session_ids=None）只算原来位置上的写入；写法对不上的计入 mismatched。"""
+    keys = {"q1", "q2"}
+    anon = write_cost("M0", keys, dataset=LME, eval_spaces=lme_spaces, session_ids="anon")
+    assert (anon["spaces"], anon["cost"], anon["mismatched"]) == (1, 0.5, 1)
+    raw = write_cost("M0", keys, dataset=LME, eval_spaces=lme_spaces, session_ids="raw")
+    assert (raw["spaces"], raw["cost"]) == (2, 3.0) and "mismatched" not in raw
+    assert write_cost("M0", keys, dataset=LME, eval_spaces=lme_spaces) == raw  # 没记写法 = raw
+
+    # 协议的核对照旧：两种写法各有一份协议对得上的 Graphiti 写入，各取各的
+    one = {"q1"}
+    kwargs: dict[str, Any] = {"dataset": LME, "eval_spaces": lme_spaces, "protocol": QWEN}
+    mg = write_cost("MG", one, session_ids="anon", **kwargs)
+    assert (mg["cost"], mg["seconds"]) == (0.6, 60)
+    mg = write_cost("MG", one, session_ids="raw", **kwargs)
+    assert (mg["cost"], mg["seconds"]) == (0.9, 90)
+    other = write_cost("MG", one, dataset=LME, eval_spaces=lme_spaces, protocol=DEEPSEEK)
+    assert other == {"mismatched": 1}
+
+
+def test_run_details_are_ranked_after_the_session_id_check(lme_spaces: Path) -> None:
+    """运行自己的写入记录（<系统>_build）照样先核对会话 ID 的写法，对得上的再按协议排（运行自己的
+    优先）；写法对不上的不会因为排在前面就被取。"""
+    one = {"q1"}
+    own_anon = {"protocol": QWEN, "cost": 0.7, "session_ids": "anon"}
+    rows = [{**result("MG", "q1", "q1", graphiti_build=own_anon), "dataset": LME}]
+    kwargs: dict[str, Any] = {"dataset": LME, "eval_spaces": lme_spaces, "protocol": QWEN}
+    assert write_cost("MG", one, rows=rows, session_ids="anon", **kwargs)["cost"] == 0.7
+    # 原始 ID 的运行读到一条改写后的记录：剔除，取原来位置上协议对得上的 build.json
+    raw = write_cost("MG", one, rows=rows, session_ids="raw", **kwargs)
+    assert raw["cost"] == 0.9 and "mismatched" not in raw
+    # 只有写法对不上的记录：计入 mismatched，不算成本
+    alone = write_cost("MG", one, dataset=LME, protocol=QWEN, rows=rows, session_ids="raw")
+    assert alone == {"mismatched": 1}
+
+
+def test_locomo_write_cost_ignores_the_session_id_scheme(spaces: Path) -> None:
+    """LoCoMo 的会话 ID 本来就是中性的（native）：写入的位置与核对都与修复之前相同，-anon 的目录
+    不会被读到。"""
+    (spaces / "mem0" / "locomo-anon_conv-1").mkdir()
+    (spaces / "mem0" / "locomo-anon_conv-1" / "build.json").write_text('{"cost": 99}', "utf-8")
+    keys = {"conv-1", "conv-2"}
+    before = write_cost("M0", keys, dataset="locomo", eval_spaces=spaces, protocol=QWEN)
+    native = write_cost(
+        "M0", keys, dataset="locomo", eval_spaces=spaces, protocol=QWEN, session_ids="native"
+    )
+    assert native == before and native["cost"] == 0.3 and native["spaces"] == 2
+
+
+def write_lme_run(run_dir: Path, rows: list[dict[str, Any]], spaces: Path, **extra: Any) -> None:
+    """一次 LongMemEval 的运行；extra 里给 session_ids 时记进 run.json（修复之后的运行都记）。"""
+    write_run(run_dir, [{**r, "dataset": LME} for r in rows], eval_spaces=str(spaces), **extra)
+    info = json.loads((run_dir / "run.json").read_text("utf-8"))
+    info["config"].update(dataset=LME, split="test100r")
+    (run_dir / "run.json").write_text(json.dumps(info), "utf-8")
+
+
+@pytest.mark.filterwarnings("ignore:No artists with labels")
+@pytest.mark.parametrize("env", ["", "1", "label"])
+def test_report_reads_the_build_records_of_the_runs_session_ids(
+    tmp_path: Path, lme_spaces: Path, monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    """report.md 按运行记下的写法找外部基线的写入：改写过的运行读 -anon 下的，没记写法的旧运行
+    （修复之前，原始 ID）读原来位置上的；当前的 CUEMEM_EVAL_RAW_SESSION_IDS 不起作用。"""
+    monkeypatch.setenv("CUEMEM_EVAL_RAW_SESSION_IDS", env)
+    rows = [result("M0", "q1", "q1"), result("M0", "q2", "q2")]
+
+    anon = tmp_path / "runs" / "pq-lme-mem0"
+    write_lme_run(anon, rows, lme_spaces, session_ids="anon")
+    report = build_report(anon, eval_spaces=tmp_path / "elsewhere").read_text("utf-8")
+    assert "| M0 | 它自己的写入（build.json） | 1 / 2 | $0.5000 | 40 |" in report
+    assert "- M0：1 份对话历史的写入记录属于别的协议或会话 ID 写法" in report
+    assert "- 这次运行的会话 ID 写法是 anon（run.json 记的）" in report
+    assert "| 写入 · M0（mem0） | $0.5000 |" in report
+
+    legacy = tmp_path / "runs" / "pq-lme-raw-mem0"
+    write_lme_run(legacy, rows, lme_spaces)  # 修复之前的运行：run.json 没记写法
+    report = build_report(legacy, eval_spaces=tmp_path / "elsewhere").read_text("utf-8")
+    assert "| M0 | 它自己的写入（build.json） | 2 / 2 | $3.0000 | 100 |" in report
+    assert "属于别的协议" not in report
+    assert "- 这次运行的会话 ID 写法是 raw（run.json 没有记：修复泄漏之前的运行）" in report
+
+
+@pytest.mark.filterwarnings("ignore:No artists with labels")
+def test_report_of_locomo_run_has_no_session_id_note(tmp_path: Path, spaces: Path) -> None:
+    run_dir = tmp_path / "runs" / "pq-locomo-mem0"
+    write_run(run_dir, [result("M0", "q1", "conv-1")], eval_spaces=str(spaces))
+    report = build_report(run_dir).read_text("utf-8")
+    assert "| M0 | 它自己的写入（build.json） | 1 / 1 | $0.1000 |" in report
+    assert "会话 ID 写法" not in report
+
+
+@pytest.mark.parametrize("scheme", ["anon", "raw"])
+def test_n12_reads_the_build_records_of_the_runs_session_ids(
+    clean_env: None,
+    tmp_path: Path,
+    lme_spaces: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scheme: str,
+) -> None:
+    """N12 对比脚本把运行记下的写法交给 write_cost（不看环境变量），写入目录用运行记录里的数据集
+    全名（运行名里只是简写 lme）；找不到写入记录的历史单独计数。"""
+    runs = tmp_path / "runs" / "eval"
+    rows = [result("M0", f"q{i}", f"q{i}") for i in (1, 2, 3)]
+    extra = {"session_ids": scheme} if scheme == "anon" else {}  # raw：修复之前的运行没记
+    write_lme_run(runs / "pq-lme-mem0", rows, lme_spaces, **extra)
+
+    module = load_script()
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path))
+    monkeypatch.setenv("CUEMEM_EVAL_RAW_SESSION_IDS", "1" if scheme == "anon" else "")
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    monkeypatch.setattr(module, "OUT", tmp_path / "out")
+    monkeypatch.setattr(sys, "argv", ["n12_baselines.py", "--protocol", "pq", "--dataset", "lme"])
+    module.main()
+
+    out = json.loads((tmp_path / "out" / "pq-lme.json").read_text("utf-8"))
+    assert out["session_ids"] == scheme
+    write = out["methods"]["M0"]["write"]
+    if scheme == "anon":
+        counts = (write["spaces"], write["cost"], write["mismatched"], write["missing"])
+        assert counts == (1, 0.5, 1, 1)
+    else:
+        assert (write["spaces"], write["cost"], write["missing"]) == (2, 3.0, 1)
+        assert "mismatched" not in write
