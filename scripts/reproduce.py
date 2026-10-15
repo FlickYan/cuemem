@@ -12,7 +12,11 @@
 - N8 的上下文布局实验（scripts/n8_context.py）关掉了本地缓存、每次真实调用，不在这里重跑；
 - 测试集（test400、LoCoMo 后 7 段对话、MemLens 官方 195 题）只在 N9 使用；
 - 标了"可选"的步骤还没有真正跑过、没有缓存，默认跳过，加 --with-optional 才执行
-  （N9 的大模型回答档 deepseek-v4-pro，名义成本约 $17）。
+  （N9 的大模型回答档 deepseek-v4-pro，名义成本约 $17）；
+- 这里的 LongMemEval / MemLens 数字都是 N12 修复会话 ID 泄漏之前跑的：证据会话的原始 ID
+  （answer_…）出现在回答模型看到的证据抬头里。所有步骤都设了 CUEMEM_EVAL_RAW_SESSION_IDS=1
+  （LEAK_ERA）：提示与当时逐字相同、缓存照常命中，续跑旧运行时会话 ID 的写法也对得上（LoCoMo
+  不受影响）。修复后的数字要另起运行名重跑，不在这里。
 
 用法：
     uv run python scripts/reproduce.py --dry-run          # 只列出要执行的命令
@@ -44,6 +48,8 @@ V1 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v1.json"}
 V2 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v2.json"}
 NODE_ENV = {"N7": V1, "N8": V1, "N9": V1, "N11": V2}
 NO_CACHE = {"CUEMEM_LLM_CACHE_MODE": "off"}
+# 文档里的数字都是修复会话 ID 泄漏之前的（见模块说明）：每一步都用原始会话 ID
+LEAK_ERA = {"CUEMEM_EVAL_RAW_SESSION_IDS": "1"}
 # 外部基线 Mem0（N11）：mem0ai 不是依赖，临时装上；spaCy 与 fastembed 让它的混合检索完整生效
 SPACY_SM = (
     "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/"
@@ -61,8 +67,12 @@ class Step:
     copy: tuple[str, str] | None = None  # （运行名，docs/results 下的目录）：复制报告与图
     optional: bool = False  # 没有缓存、要真花钱的步骤：默认跳过
 
+    def environment(self) -> dict[str, str]:
+        """这一步在当前环境之上另外设的环境变量（LEAK_ERA、节点的、这一步自己的）。"""
+        return {**LEAK_ERA, **NODE_ENV.get(self.node, {}), **self.env}
+
     def describe(self) -> str:
-        env = " ".join(f"{k}={v}" for k, v in {**NODE_ENV.get(self.node, {}), **self.env}.items())
+        env = " ".join(f"{k}={v}" for k, v in self.environment().items() if k not in LEAK_ERA)
         return f"[{self.node}] {env + ' ' if env else ''}{' '.join(self.command)}"
 
 
@@ -229,6 +239,8 @@ def main() -> None:
     parser.add_argument("--with-optional", action="store_true", help="也执行标了可选的步骤")
     args = parser.parse_args()
     steps = [s for s in STEPS if args.only is None or s.node == args.only]
+    leak_era = " ".join(f"{k}={v}" for k, v in LEAK_ERA.items())
+    print(f"（每一步都设了 {leak_era}：复现修复会话 ID 泄漏之前的数字）", flush=True)
     for step in steps:
         if step.optional and not args.with_optional:
             print(f"（跳过可选步骤）{step.describe()}", flush=True)
@@ -236,7 +248,7 @@ def main() -> None:
         print(step.describe(), flush=True)
         if args.dry_run:
             continue
-        env = {**os.environ, **NODE_ENV.get(step.node, {}), **step.env}
+        env = {**os.environ, **step.environment()}
         done = subprocess.run(step.command, cwd=ROOT, env=env, check=False)
         if done.returncode != 0:
             sys.exit(f"失败：{step.describe()}")

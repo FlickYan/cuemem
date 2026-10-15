@@ -42,6 +42,11 @@ evals/mem0_baseline.py，--methods M0 / MG / ML / MC / MA，运行名 `<协议>-
 协议对得上的优先）。外部基线的写入目录按协议选（PROTOCOL_SPACES，与当前的
 CUEMEM_PATHS__EVAL_SPACES 无关；--eval-spaces 可以另行指定），记的协议与运行的抽取模型、向量
 模型对不上的不算（都对不上时计入 mismatched）。
+
+会话 ID（N12 修复的泄漏，见 evals/datasets.py）：LongMemEval / MemLens 的写入按运行自己记下的
+写法找（run.json，datasets.run_session_ids；修复之前的运行没记，是原始 ID），不看当前的
+CUEMEM_EVAL_RAW_SESSION_IDS：改写过的写入在 `<数据集>-anon_<历史>` 下，记的写法对不上的同样
+不算。写法不同的运行（修复前后、label 消融）不放在一起比。LoCoMo 不受影响。
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from pathlib import Path
 from typing import Any
 
 from cuemem.config import home_dir, load_settings
+from cuemem.evals.datasets import SessionIds, run_raw_labels, run_session_ids
 from cuemem.evals.report import (
     EXTERNAL_SYSTEMS,
     PROTOCOL_SPACES,
@@ -125,6 +131,21 @@ def run_info(run_dir: Path) -> dict[str, Any]:
     return info
 
 
+def runs_session_ids(runs_dir: Path, runs: list[str]) -> SessionIds:
+    """这些运行的会话 ID 写法（各自 run.json 里记的，不看当前的环境变量）。混用了不同写法（或
+    label 消融）的运行不能放在一起比：修复泄漏之前的结果与之后的混在一起，直接报错。"""
+    modes: dict[str, tuple[SessionIds, bool]] = {}
+    for run in runs:
+        info = run_info(runs_dir / run)
+        modes[run] = (run_session_ids(info), run_raw_labels(info))
+    if len(set(modes.values())) > 1:
+        detail = "；".join(
+            f"{run}: {ids}{'+label' if labels else ''}" for run, (ids, labels) in modes.items()
+        )
+        raise SystemExit(f"这些运行的会话 ID 写法不同，不能放在一起比（{detail}）")
+    return next(iter(modes.values()))[0] if modes else "native"
+
+
 def write_stats(
     settings: Any,
     dataset: str,
@@ -132,6 +153,7 @@ def write_stats(
     keys: set[str],
     runs_dir: Path,
     runs: list[str],
+    scheme: SessionIds | None = None,
     *,
     eval_spaces: Path | None = None,
     protocol: str | None = None,
@@ -142,9 +164,12 @@ def write_stats(
     paths.eval_spaces；协议对得上的优先，对不上的不算）；CueMem 取这些运行里的写入与巩固统计。
 
     全上下文（B1）不写入；朴素检索（B2）只建索引（向量化，不调用 LLM）；L1 / L2 / 控制器用同一份
-    巩固后的记忆，写入成本相同。"""
+    巩固后的记忆，写入成本相同。scheme 是这些运行的会话 ID 写法（runs_session_ids；None 时按
+    没记写法的运行处理：LongMemEval / MemLens 是原始 ID）：改写过的写入在 <数据集>-anon_<历史>
+    下，记的写法或协议对不上的计入 mismatched；外部系统找不到任何写入记录的历史计入 missing，
+    都不算进成本。"""
     ingests = [row for run in runs for row in load_rows(runs_dir / run, "ingest.jsonl")]
-    return write_cost(
+    stats = write_cost(
         method,
         keys,
         dataset=dataset,
@@ -152,7 +177,13 @@ def write_stats(
         eval_spaces=eval_spaces if eval_spaces is not None else settings.paths.eval_spaces,
         protocol=protocol,
         rows=rows or [],
+        session_ids=scheme,
     )
+    if method in SYSTEMS:
+        missing = len(keys) - stats.get("spaces", 0) - stats.get("mismatched", 0)
+        if missing:
+            stats["missing"] = float(missing)
+    return stats
 
 
 def main() -> None:
@@ -173,8 +204,16 @@ def main() -> None:
     if not cells:
         print(f"没有 {prefix}* 的运行")
         return
+    # 会话 ID 的写法、写入协议与数据集名都按运行自己的记录（不看当前的环境变量与配置）：
+    # 运行名里的数据集只是简写（如 pq-lme-…），写入目录用的是数据集的全名
+    scheme = runs_session_ids(runs_dir, runs)
     eval_spaces = eval_spaces_for(args.protocol, settings, args.eval_spaces)
-    protocols = {run: run_protocol(run_info(runs_dir / run)) for run in runs}
+    infos = {run: run_info(runs_dir / run) for run in runs}
+    protocols = {run: run_protocol(info) for run, info in infos.items()}
+    datasets = {
+        run: str((info.get("config") or {}).get("dataset") or args.dataset)
+        for run, info in infos.items()
+    }
     methods_present = sorted(
         {m for _, m in cells}, key=lambda m: list(LABELS).index(m) if m in LABELS else 99
     )
@@ -187,6 +226,7 @@ def main() -> None:
         "protocol": args.protocol,
         "dataset": args.dataset,
         "runs": runs,
+        **({"session_ids": scheme} if scheme != "native" else {}),
         "questions": len(common),
         "dropped": {
             m: len(ids) - len(common) for m, ids in by_method.items() if len(ids) > len(common)
@@ -218,11 +258,12 @@ def main() -> None:
             },
             "write": write_stats(
                 settings,
-                args.dataset,
+                datasets.get(sources[method], args.dataset),
                 method,
                 keys,
                 runs_dir,
                 runs,
+                scheme,
                 eval_spaces=eval_spaces,
                 protocol=protocols.get(sources[method]),
                 rows=[r for (_, m), r in cells.items() if m == method],
@@ -249,12 +290,16 @@ def main() -> None:
     target = OUT / f"{args.protocol}-{args.dataset}.json"
     target.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", "utf-8")
     print(f"{args.protocol} / {args.dataset}：{len(common)} 题，运行 {runs}")
-    print(f"外部基线的写入目录：{eval_spaces}")
+    print(f"外部基线的写入目录：{eval_spaces}（会话 ID：{scheme}）")
     for method, row in out["methods"].items():
         lo, hi = row["ci95"]
         write = row["write"]
-        if write.get("mismatched"):
-            print(f"  ! {method}：{write['mismatched']:.0f} 份写入记录的协议与运行不符，没有计入")
+        for problem, what in (
+            ("missing", "找不到写入记录"),
+            ("mismatched", "的写入记录与运行的协议或会话 ID 写法不符"),
+        ):
+            if write.get(problem):
+                print(f"  ! {method}：{write[problem]:.0f} 份对话历史{what}，没有计入写入成本")
         print(
             f"  {LABELS.get(method, method):<34} {row['accuracy']:.1%} [{lo:.1%}, {hi:.1%}]"
             f"  回答 ${row['answer_cost_per_1k']:.2f}/1k q"

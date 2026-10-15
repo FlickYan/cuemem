@@ -49,7 +49,13 @@ from cuemem.embed import build_embedder
 from cuemem.envfile import mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError
 from cuemem.evals.audit import export_audit, score_audit
-from cuemem.evals.datasets import DATASETS, EvalSet, dataset_path
+from cuemem.evals.datasets import (
+    DATASETS,
+    RAW_LABELS_VALUE,
+    RAW_SESSION_IDS_ENV,
+    EvalSet,
+    dataset_path,
+)
 from cuemem.evals.datasets import download as download_dataset
 from cuemem.evals.datasets import load as load_dataset
 from cuemem.evals.report import build_report, load_rows, method_stats
@@ -1113,7 +1119,18 @@ def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSe
         )
         raise typer.Exit(1)
     ids = load_split(dataset, split) if split else None
-    return load_dataset(dataset, path, ids=ids)
+    evalset = load_dataset(dataset, path, ids=ids)
+    if evalset.session_ids == "raw":
+        console.print(
+            f"[yellow]{RAW_SESSION_IDS_ENV}=1：保留数据集的原始会话 ID（LongMemEval 的证据会话以 "
+            "answer_ 开头，拒答题的还带 _abs，会泄漏给回答模型），只用于复现这个泄漏的消融[/yellow]"
+        )
+    elif evalset.raw_labels:
+        console.print(
+            f"[yellow]{RAW_SESSION_IDS_ENV}={RAW_LABELS_VALUE}：会话 ID 照常改写，但证据抬头显示"
+            "原始 ID（泄漏的干净消融，只用于测量泄漏的影响）[/yellow]"
+        )
+    return evalset
 
 
 def _print_method_stats(run_dir: Path) -> None:

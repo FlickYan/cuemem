@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -136,8 +137,50 @@ def test_manifest_orders_sessions_and_records_turn_indices() -> None:
 
 def test_split_prefix_reads_turns_and_distilled_lessons() -> None:
     assert split_prefix("no prefix") == (None, None, "no prefix")
-    lesson = f"# Session learning (session {distill_session_id(7, 'longmemeval_s_q1')})\n\nX.\n"
+    lesson = f"# Session learning (session {distill_session_id(7)})\n\nX.\n"
     assert split_prefix(lesson) == (7, None, "# Session learning\n\nX.\n")
+    # 早先的写法（带着空间名）照样认得出编号
+    old = "# Session learning (session s0007_longmemeval_s_q1)\n\nX.\n"
+    assert split_prefix(old) == (7, None, "# Session learning\n\nX.\n")
+
+
+def test_distill_session_id_carries_no_question_id() -> None:
+    """经验文档的会话 ID 要交给 cognify 的模型：只能有会话编号，不能有题号
+    （LongMemEval 拒答题的题号以 _abs 结尾）。"""
+    assert distill_session_id(3) == "s0003_session"
+    assert "abs" not in distill_session_id(3) and "longmemeval" not in distill_session_id(3)
+
+
+def test_distilled_builds_with_old_lesson_ids_are_rebuilt(tmp_path: Path) -> None:
+    """做了会话蒸馏、蒸馏 ID 还带着题号的旧写入不复用；没做蒸馏的（LoCoMo）照常复用。"""
+    from cuemem.evals.baselines.cognee import LESSON_TAG
+
+    calls: list[str] = []
+
+    class Recording(CogneeBaseline):
+        def build(self, key: str, directory: Path, sessions: Any) -> dict[str, Any]:
+            calls.append(key)
+            return {}
+
+    baseline = Recording()
+    baseline.protocol = "p"
+    baseline.gateway = SimpleNamespace(usage=lambda bucket: {})
+    for key, record, rebuilt in (
+        ("locomo_conv-1", {"protocol": "p", "distill": False}, False),
+        ("longmemeval_s-anon_q1", {"protocol": "p", "distill": True}, True),
+        (
+            "longmemeval_s-anon_q2",
+            {"protocol": "p", "distill": True, "lesson_ids": LESSON_TAG, "session_ids": "anon"},
+            False,
+        ),
+    ):
+        directory = tmp_path / key
+        directory.mkdir()
+        (directory / "build.json").write_text(json.dumps(record))
+        baseline._schemes[key] = "native" if key.startswith("locomo") else "anon"
+        built = baseline._ensure_built(key, directory, [])
+        assert (built is not None) == rebuilt, key
+    assert calls == ["longmemeval_s-anon_q1"]
 
 
 def _rows() -> list[dict[str, Any]]:
