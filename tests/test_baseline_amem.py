@@ -32,7 +32,9 @@ from cuemem.evals.baselines.amem import (
     _consolidate_memories,
     _Controller,
     _find_related_memories,
+    _Store,
     clean_analysis,
+    consolidated_document,
     expand,
     fits,
     json_schema_of,
@@ -113,6 +115,10 @@ def test_note_format_follows_the_paper() -> None:
     document = note_document("hi", "a chat", ["x", "y"], "t1, t2")
     assert document == "content:hi context:a chat keywords: x, y tags: t1, t2"
     assert note_document("hi", None, None, []) == "content:hi context:General keywords:  tags: "
+    # 论文代码整理时的格式（memory_layer.py 的 consolidate_memories）：不带字段名，空格分隔
+    document = consolidated_document("hi", "a chat", ["x", "y"], "t1, t2")
+    assert document == "hi , a chat x y t1 t2"
+    assert consolidated_document("hi", None, None, []) == "hi , General  "
 
 
 def test_clean_analysis_keeps_usable_fields() -> None:
@@ -261,8 +267,41 @@ def test_find_related_memories_labels_real_positions() -> None:
     assert _find_related_memories(SimpleNamespace(memories={}), "q") == ("", [])
     _consolidate_memories(system)
     assert [row[0] for row in system.retriever.upserted] == ["n0", "n1", "n2"]
-    assert system.retriever.upserted[1][2]["context"] == "x1"
+    assert system.retriever.upserted[1][1] == "c1 , x1 k1 t1"  # 按当前的上下文、关键词与标签
+    assert system.retriever.upserted[1][2] == {"timestamp": "1:56 pm on 8 May, 2023"}
     assert system.retriever.consolidations == 1
+
+
+def test_store_embeds_the_add_and_consolidation_formats(tmp_path: Path) -> None:
+    """写入时与整理时向量化的文本格式不同（都照论文代码）；整理按 ID 覆盖原来的向量。"""
+    pytest.importorskip("chromadb")
+    embedded: list[str] = []
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        embedded.extend(texts)
+        return [[1.0, float(len(text))] for text in texts]
+
+    store = _Store(tmp_path / "chroma", embed)
+    try:
+        meta = {"context": "c", "keywords": ["k1", "k2"], "tags": ["t"], "timestamp": "x"}
+        store.add_document("hi", meta, "n0")
+        assert embedded == ["content:hi context:c keywords: k1, k2 tags: t"]
+        system = SimpleNamespace(
+            memories={
+                "n0": SimpleNamespace(
+                    id="n0", content="hi", context="c2", keywords=["k1"], tags=["t"], timestamp="x"
+                )
+            },
+            retriever=store,
+        )
+        _consolidate_memories(system)
+        assert embedded[-1] == "hi , c2 k1 t" and store.consolidations == 1
+        stored = store.collection.get(ids=["n0"], include=["documents", "metadatas"])
+        assert stored["documents"] == ["hi , c2 k1 t"]
+        assert stored["metadatas"] == [{"timestamp": "x"}]
+        assert int(store.collection.count()) == 1
+    finally:
+        store.close()
 
 
 def _client(replies: list[Any], sent: list[dict[str, Any]]) -> Any:

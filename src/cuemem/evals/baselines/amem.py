@@ -31,13 +31,18 @@ evals/external.py），只换"记忆从哪来"：
    传进来才有），这里先调用它的 `analyze_content`，结果传给 `add_note`——与论文代码
    （MemoryNote 构造时分析）和作者后来的 A-mem-sys 相同。
 4. 向量化的内容：这个版本只向量化笔记原文；论文（式 3）与评测代码向量化"原文 + 上下文 +
-   关键词 + 标签"，这里照论文代码的格式（`content:… context:… keywords: … tags: …`）。
+   关键词 + 标签"，这里照论文代码写入时的格式（`content:… context:… keywords: … tags: …`）；
+   整理时的格式不同，见第 5 条。
 5. 演化时邻居的编号：这个版本把 5 个邻居标成"memory index:0…4"（检索结果里的名次），随后
    update_neighbor 按这个名次去改整个记忆库的第 0…4 条（最早写入的几条，而不是这些邻居），
    strengthen 记下的链接也对不上任何笔记。这里照论文代码给邻居标上它们在记忆库里的真实序号，
    演化改的就是这些邻居，链接也能找到（A-mem-sys 用笔记 ID 修了同一个问题）。整理（每 100 次
    演化）在原版里重新加入已有 ID 会被 Chroma 忽略，什么也没更新；这里照论文代码按笔记当前的
-   上下文与标签重新向量化。
+   上下文、关键词与标签重新向量化，格式也照论文代码整理时的（`<原文> , <上下文> <关键词>
+   <标签>`：不带字段名，关键词与标签以空格分隔），与写入时的不同。之后新写入的笔记仍用写入时
+   的格式，所以与论文代码一样，最后一次整理前的笔记是整理的格式、之后的是写入的格式（conv-42
+   的 628 次演化整理 6 次，约 600 条是整理的格式）。A-mem-sys 写入与整理用同一种格式，这里
+   照论文代码。
 6. k：默认 10，论文的主要设置（"we primarily employ k=10"）与评测代码的默认值。论文表 8 给
    GPT-4o-mini / GPT-4o 调到 40–50（按题型，但最小是 40，统一取 40 用不着题型），作者的 README
    也说要调 k 才能复现论文的数字；deepseek-flash、qwen3.8-flash 与它们同档，所以 k=40 才是作者
@@ -148,7 +153,8 @@ MAX_TOKENS = 4096  # A-MEM 的 OpenAIController 是 1000，A-mem-sys 不设上�
 # 写入格式的版本：笔记、向量化的文本或演化的替换方法改了就加一，旧写入作废重建
 # 2：笔记记下发言下标；回复上限 4096；调用失败时中止写入
 # 3：回复不合 schema（解析不了、被截断、回显 schema、不是对象）时重新采样
-BUILD_VERSION = 3
+# 4：整理时照论文代码整理的格式重新向量化（不带字段名，关键词与标签以空格分隔）
+BUILD_VERSION = 4
 JSON_SYSTEM = "You must respond with a JSON object."  # A-MEM 的 OpenAIController 的系统提示
 NOTES = "notes.json"  # 写完后的全部笔记（含演化后的上下文、标签与链接），按写入顺序
 CHROMA = "chroma"  # 持久化的 Chroma 目录
@@ -289,6 +295,16 @@ def note_document(content: str, context: Any, keywords: Any, tags: Any) -> str:
     return (
         f"content:{content} context:{context or 'General'} "
         f"keywords: {', '.join(strings(keywords))} tags: {', '.join(strings(tags))}"
+    )
+
+
+def consolidated_document(content: str, context: Any, keywords: Any, tags: Any) -> str:
+    """整理时重新向量化的文本：论文代码 consolidate_memories 的格式（原文、" , "，再接上下文、
+    关键词、标签，不带字段名，关键词与标签以空格分隔）。与 note_document 不同（见模块说明
+    第 5 条）。"""
+    return (
+        f"{content} , {context or 'General'} "
+        f"{' '.join(strings(keywords))} {' '.join(strings(tags))}"
     )
 
 
@@ -616,15 +632,17 @@ class _Store:
         return self._embed(texts)
 
     def add_document(self, document: str, metadata: Mapping[str, Any], doc_id: str) -> None:
-        self.upsert([(doc_id, document, metadata)])
+        """A-MEM 的 add_note 交来笔记原文与元数据：照论文代码写入时的格式向量化。"""
+        text = note_document(
+            document, metadata.get("context"), metadata.get("keywords"), metadata.get("tags")
+        )
+        self.upsert([(doc_id, text, metadata)])
 
     def upsert(self, rows: Sequence[tuple[str, str, Mapping[str, Any]]]) -> None:
+        """（ID，要向量化的文本，元数据）：文本已按写入或整理的格式拼好，元数据只存时间。"""
         for start in range(0, len(rows), EMBED_BATCH):
             batch = rows[start : start + EMBED_BATCH]
-            texts = [
-                note_document(content, meta.get("context"), meta.get("keywords"), meta.get("tags"))
-                for _, content, meta in batch
-            ]
+            texts = [text for _, text, _ in batch]
             self.collection.upsert(
                 ids=[doc_id for doc_id, _, _ in batch],
                 embeddings=self.embed(texts),
@@ -688,19 +706,18 @@ def _find_related_memories(system: Any, query: str, k: int = 5) -> tuple[str, li
 
 
 def _consolidate_memories(system: Any) -> None:
-    """替换 A-MEM 的 consolidate_memories：按笔记当前的上下文与标签重新向量化（论文代码的做法）。"""
-    rows = [(note.id, note.content, _metadata(note)) for note in system.memories.values()]
+    """替换 A-MEM 的 consolidate_memories：全部笔记按当前的上下文、关键词与标签重新向量化，用
+    论文代码整理时的格式（consolidated_document，见模块说明第 5 条）。"""
+    rows = [
+        (
+            note.id,
+            consolidated_document(note.content, note.context, note.keywords, note.tags),
+            {"timestamp": note.timestamp},
+        )
+        for note in system.memories.values()
+    ]
     system.retriever.upsert(rows)
     system.retriever.consolidations += 1
-
-
-def _metadata(note: Any) -> dict[str, Any]:
-    return {
-        "context": note.context,
-        "keywords": note.keywords,
-        "tags": note.tags,
-        "timestamp": note.timestamp,
-    }
 
 
 @dataclass
