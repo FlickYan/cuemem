@@ -20,6 +20,9 @@ label 对 anon 只差标题里的字，是泄漏本身的效应；raw 对 label 
 - pq：只用通义（CUEMEM_PRESET=qwen，回答 qwen3.8-flash），写入在 data/eval-spaces-qwen；运行名
   pq-lme-*（raw 一臂用修复之前的代码跑，结果与 =1 相同，见 tests/test_eval_leak.py）。
 
+另外在每一臂里，照 N11 的 mem0.json 把朴素检索与 CueMem 各方法同 Mem0 逐题比较（vs_mem0），
+看 N11 "L1 对 Mem0" 的结论在修复之后是否还成立。
+
     uv run python scripts/n12_leak.py
 
 结果写到 docs/results/n12-leak/summary.json。
@@ -65,6 +68,7 @@ COMPARISONS = [  # （甲，乙，含义）
     ("raw", "label", "renaming noise only (same labels, rounds reordered)"),
     ("raw", "anon", "leak + renaming noise (pre-fix vs post-fix)"),
 ]
+VS_MEM0 = ["B2", "B4-nobm25", "B5", "B6"]  # 同一臂里与 Mem0 逐题比较的方法（N11 mem0.json 的写法）
 
 
 def load(run: str) -> dict[tuple[str, str], dict[str, Any]]:
@@ -77,6 +81,36 @@ def load(run: str) -> dict[tuple[str, str], dict[str, Any]]:
 
 def accuracy(rows: list[dict[str, Any]]) -> float | None:
     return round(sum(bool(r["correct"]) for r in rows) / len(rows), 4) if rows else None
+
+
+def paired(ra: dict[str, dict[str, Any]], rb: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """同一批题上甲对乙的逐题胜负与精确符号检验（只数一边对、另一边错的题）。"""
+    common = sorted(ra.keys() & rb.keys())
+    if not common:
+        return None
+    wins = sum(1 for s in common if ra[s]["correct"] and not rb[s]["correct"])
+    losses = sum(1 for s in common if rb[s]["correct"] and not ra[s]["correct"])
+    return {
+        "n": len(common),
+        "wins": wins,
+        "losses": losses,
+        "p": round(sign_test(wins, losses), 4),
+    }
+
+
+def vs_mem0(by_arm: dict[str, dict[tuple[str, str], dict[str, Any]]]) -> dict[str, Any]:
+    """每一臂里，朴素检索与 CueMem 各方法对 Mem0 的逐题比较（两边都有的臂才算）。"""
+    out: dict[str, Any] = {}
+    for arm, rows in by_arm.items():
+        mem0 = {s: r for (m, s), r in rows.items() if m == "M0"}
+        tests: dict[str, Any] = {}
+        for method in VS_MEM0:
+            test = paired({s: r for (m, s), r in rows.items() if m == method}, mem0)
+            if test is not None:
+                tests[f"{method}_vs_M0"] = test
+        if tests:
+            out[arm] = tests
+    return out
 
 
 def main() -> None:
@@ -103,23 +137,16 @@ def main() -> None:
                 }
             entry["paired"] = {}
             for a, b, meaning in COMPARISONS:
-                ra = {s: r for (m, s), r in by_arm[a].items() if m == method}
-                rb = {s: r for (m, s), r in by_arm[b].items() if m == method}
-                common = sorted(ra.keys() & rb.keys())
-                if not common:
+                test = paired(
+                    {s: r for (m, s), r in by_arm[a].items() if m == method},
+                    {s: r for (m, s), r in by_arm[b].items() if m == method},
+                )
+                if test is None:
                     continue
-                wins = sum(1 for s in common if ra[s]["correct"] and not rb[s]["correct"])
-                losses = sum(1 for s in common if rb[s]["correct"] and not ra[s]["correct"])
-                entry["paired"][f"{a}_vs_{b}"] = {
-                    "n": len(common),
-                    "wins": wins,
-                    "losses": losses,
-                    "p": round(sign_test(wins, losses), 4),
-                    "meaning": meaning,
-                }
+                entry["paired"][f"{a}_vs_{b}"] = {**test, "meaning": meaning}
                 if method in RETRIEVAL:
-                    pooled[f"{a}_vs_{b}"][0] += wins
-                    pooled[f"{a}_vs_{b}"][1] += losses
+                    pooled[f"{a}_vs_{b}"][0] += test["wins"]
+                    pooled[f"{a}_vs_{b}"][1] += test["losses"]
             section["methods"][method] = entry
         for key, (wins, losses) in pooled.items():
             questions = sum(
@@ -134,6 +161,7 @@ def main() -> None:
                 "p": round(sign_test(wins, losses), 4),
                 "note": "summed over retrieval methods on the same questions (not independent)",
             }
+        section["vs_mem0"] = vs_mem0(by_arm)
         summary[protocol] = section
         print(f"\n== {protocol}")
         for entry in section["methods"].values():
@@ -151,6 +179,11 @@ def main() -> None:
                 f"  pooled {key}: +{v['wins']}/-{v['losses']}"
                 f" (net {v['net_points']} pt, p={v['p']})"
             )
+        for arm, tests in section["vs_mem0"].items():
+            pairs = "  ".join(
+                f"{k}: +{v['wins']}/-{v['losses']} p={v['p']}" for k, v in tests.items()
+            )
+            print(f"  {arm} vs Mem0: {pairs}")
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     print(f"\n→ {OUT.relative_to(ROOT)}")

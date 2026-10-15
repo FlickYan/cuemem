@@ -8,7 +8,7 @@ English edition of [docs/landscape.md](../landscape.md), which remains the sourc
 
 ## 1. Summary
 
-- **The research side is rare among these projects.** CueMem makes "should we recall, and how deeply" a trainable controller that is evaluated on its own. Facts carry two timelines and are invalidated, not deleted. The original photo is looked at again at answer time. The evaluation uses test sets once, with methods frozen in advance, and runs an external baseline (Mem0) under the same models and judge. Most of the projects below have none of these, or publish no ablations for them.
+- **The research side is rare among these projects.** CueMem makes "should we recall, and how deeply" a trainable controller that is evaluated on its own. Facts carry two timelines and are invalidated, not deleted. The original photo is looked at again at answer time. The evaluation uses test sets once, with methods frozen in advance, and runs external baselines (Mem0; from N12 also Graphiti, LangMem, Cognee and A-MEM) under the same models and judge. Most of the projects below have none of these, or publish no ablations for them.
 - **Before N12, CueMem lacked the layer that makes a library usable.** Anyone who has used Mem0 expects three lines of code after `pip install`. CueMem could not do that:
   - its config lived in the repository and its data was written next to it, so a pip-installed copy did not run;
   - the only models were DeepSeek and Qwen, with embeddings through Qwen's native API: no OpenAI, no local models;
@@ -63,7 +63,7 @@ A few changes in 2025–2026 matter here:
 | Published evaluation | Test sets used once, methods frozen; three benchmarks, three readers, ablations, hand audit, a second judge | `memory-benchmarks` repo (platform models undisclosed) | Blog | Paper | Own harness | Own harness |
 | Other languages / framework integrations | Python only (plus MCP, HTTP, the proxy); OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool ([integrations](integrations.md)) | TypeScript, a dozen frameworks | TypeScript, Vercel AI SDK | A dozen frameworks | TypeScript, Rust, Claude Code plugin | TypeScript, Vercel AI SDK middleware, several frameworks |
 
-## 4. Published scores (not comparable)
+## 4. Scores: published (not comparable) and same-protocol
 
 The numbers below are **self-reported** by each project. They use different setups:
 - **Readers** range from gpt-4o-mini to GPT-5 and Gemini-3.
@@ -99,14 +99,48 @@ Against differences like these, a gap of one or two points means nothing.
 | Hindsight | 91.4 / 89.0 / 83.6 | Gemini-3 / OSS-120B / OSS-20B | hindsight-benchmarks | |
 | Mem0 open source | 91.0 | GPT-5 for extraction, answers and judging | mem0ai/memory-benchmarks | Platform 94.4, models undisclosed |
 | MemOS | 77.8 (2025-11) | gpt-4o-mini | MemOS repo | 89.2 with its own harness |
-| **CueMem** L1 / L2 / controller | 90.5 / 93.2 / 90.5 | deepseek-flash | [technical report](report.md) | Full-context baseline 73.0 |
+| **CueMem** L1 / L2 / controller | 90.5 / 93.2 / 90.5 | deepseek-flash | [technical report](report.md) | Full-context baseline 73.0; see the session-ID leak note below |
 
-**The only directly comparable pair** comes from N11: open-source Mem0 2.2, run with the same extraction model, embeddings, reader and judge (D-055).
-- LoCoMo, 200 questions: Mem0 80.5% vs CueMem L1 81.0% (a tie).
-- LongMemEval, 100 questions: 83.0% vs 92.0% (p = 0.049).
-- Mem0's writes cost 2.3–2.9 times as much. It loses on temporal reasoning, knowledge updates and details the assistant gave.
+### Same-protocol comparison (N12)
 
-The mem0ai 2.2.1 tested here already is the add-only v3 algorithm: the PyPI package is numbered 2.x, but its source labels the extraction prompt "V3 Additive Extraction Prompt (ADD-only)", and `add` no longer asks the LLM to UPDATE or DELETE.
+The scores above cannot be compared. What can be compared directly is the external systems we ran ourselves under the same protocol as CueMem (D-065). The full tables, per-type results, costs and paired tests are in the Chinese [N12 external baselines](../results/n12-baselines/README.md).
+
+- **Method**: each system uses its own write and read pipeline, following its authors' published evaluation code where it exists. The extraction model and embeddings (through the eval gateway), the reader prompt, the reader model and the judge are the same as CueMem's.
+- **Data**: LoCoMo test200r (200 questions, stratified, no adversarial questions) over 7 conversations (conv-42, 43, 44, 47, 48, 49, 50): 4,431 turns, 202 sessions. Graphiti, LangMem, Cognee and A-MEM were run on LoCoMo only (Mem0 also has LongMemEval test100r runs, from N11 and the leak ablation).
+- **Two protocols**:
+  - pds (DeepSeek only): every role is deepseek-flash, including the judge (the same model as the reader, so there is a self-preference risk); embeddings are the local BAAI/bge-small-en-v1.5; no reranker.
+  - pq (Qwen only): extraction, answering and the external systems' internal calls use qwen3.8-flash; the judge is qwen3.8-max (the same family as the reader); embeddings are qwen3.7-text-embedding, reranking is qwen3-rerank.
+- One run per configuration; pairwise comparisons are exact sign tests on the same questions.
+
+| Method | pds | pq | Nominal write cost, pds / pq |
+|---|---|---|---|
+| Full context | 84.5% | 80.0% | — |
+| Naive RAG (dense top-10) | 59.5% | 64.0% | $0 / $0.006 |
+| **CueMem L1** | 82.5% | 81.5% | $0.529 / $0.238 |
+| **CueMem L2** | **87.0%** | **85.0%** | Same (L1, L2 and the controller share one write) |
+| CueMem controller | 83.5% | 83.5% | Same |
+| Mem0 2.2.1 (open source) | 81.0% | 77.5% | $1.381 / $0.712 |
+| LangMem 0.0.30 | 78.0% | 30.0% | $0.563 / $0.225 |
+| Cognee 1.6.4 | 77.5% | 74.0% | $2.845 / $1.466 |
+| Graphiti (graphiti-core 0.30.2, Kuzu) | 59.0% | 41.5% | $9.992 / $4.515 |
+| A-MEM (agiresearch/A-mem@ceffb86) | MA-PENDING | MA-PENDING | MA-PENDING |
+
+Write costs are totals for the 7 conversations at list price, without caching (D-010); these are the figures to compare. Actual spend (after cache hits and discounts; it depends on timing and on what earlier pilot runs had cached, so it is for budgeting, not for comparing methods), pds / pq: CueMem $0.222 / $0.151, Mem0 $0.242 / $0.317, LangMem $0.239 / $0.064, Cognee $0.797 / $1.154, Graphiti $1.508 / $3.908, A-MEM MA-PENDING.
+
+- **CueMem L2 is ahead of Mem0, LangMem, Cognee and Graphiti under both protocols, and every difference is significant**:
+  - pds: against Mem0 +17 / −5 (p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002), Graphiti +62 / −6 (p < 0.001);
+  - pq: against Mem0 +24 / −9 (p = 0.014), Cognee +30 / −8 (p < 0.001), LangMem and Graphiti both p < 0.001;
+  - against A-MEM: MA-PENDING;
+  - it is above full context, but not significantly (pds +12 / −7, p = 0.36; pq +19 / −9, p = 0.087).
+- **L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under pds**: against Mem0 +14 / −11 (p = 0.69), LangMem +24 / −15 (p = 0.20), Cognee +20 / −10 (p = 0.10); against Graphiti +55 / −8 (p < 0.001). Under pq it is significantly ahead of Cognee, +25 / −10 (p = 0.017), and not significantly different from Mem0, +19 / −11 (p = 0.20). Against A-MEM: MA-PENDING.
+- **Model sensitivity**: CueMem, Mem0 and Cognee move by 0–3.5 points from pds to pq; Graphiti and LangMem drop sharply; A-MEM MA-PENDING.
+  - Graphiti: with its own prompts, qwen3.8-flash extracts far fewer entities (1,253 → 462 over the 7 conversations; facts 3,426 → 1,774). Under pq each conversation logged roughly 120–270 "Target entity not found" warnings, and those facts were dropped. Turn recall under pq is 0.545 (naive RAG 0.845, CueMem L1 0.95).
+  - LangMem: qwen3.8-flash uses PatchDoc to merge new information into a few long memories (705 → 123), and the sessions that lost their writes go from 2 / 202 to 23 / 202.
+  - Neither system's prompts or thresholds were re-tuned for Qwen. Conversely, CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), so pq is its home ground. pds is the protocol where no system's prompts were tuned for the model, and L2's lead holds there too.
+
+In N11, under the original protocol (Qwen for extraction and embeddings, deepseek-flash as reader, qwen3.8-max as judge), open-source Mem0 2.2 was compared with CueMem (D-055): on 200 LoCoMo questions, 80.5% against L1's 81.0% (a tie); on 100 LongMemEval questions, 83.0% against 92.0% (p = 0.049). Mem0's writes cost 2.3–2.9 times as much, and it lost on temporal reasoning, knowledge updates and details the assistant gave. Every retrieval-based LongMemEval number published in N2–N11 (this pair and CueMem's L1 / L2 / controller in the LongMemEval table above included; full context is unaffected) carried a session-ID leak, now fixed and measured (D-067, Chinese [leak ablation](../results/n12-leak/README.md)): CueMem's numbers show no measurable inflation; after the fix the same setup gives L1 90% against Mem0 79%, so Mem0's published 83% may be a few points high.
+
+The mem0ai 2.2.1 tested here is the add-only v3 algorithm: the PyPI package is numbered 2.x, but its source labels the extraction prompt "V3 Additive Extraction Prompt (ADD-only)", and `add` no longer asks the LLM to UPDATE or DELETE.
 
 ## 5. What N12 borrowed
 
@@ -134,7 +168,7 @@ In the order a user would run into them:
 
 1. **More framework integrations**: the OpenAI Agents SDK, LangGraph / LangChain and Claude's memory tool are done ([integrations](integrations.md)). Still missing: TypeScript and Vercel AI SDK middleware, a LangGraph `BaseStore`, CrewAI, AutoGen. The Claude memory tool backend has not been run against the real Claude API.
 2. **Multi-tenancy**: there is one shared access token. Memory spaces are isolated by user_id, but there is no per-user authentication. Multi-instance deployments need Postgres instead of SQLite.
-3. **More external baselines** under the same protocol: Graphiti, LangMem, Cognee, A-MEM, Letta. These need API keys and budget.
+3. **More external baselines**: Graphiti, LangMem, Cognee and A-MEM have been run under the same protocol (LoCoMo, DeepSeek-only and Qwen-only protocols; see §4). Not yet run: Letta, MemOS, Supermemory and others. Graphiti, LangMem, Cognee and A-MEM were run on LoCoMo only (Mem0 also has LongMemEval test100r runs, from N11 and the leak ablation): their LongMemEval writes would cost too much and take too long (Graphiti writes one episode per message; A-MEM takes about 15 s per turn under Qwen). Each configuration was run once.
 4. **Validating the presets**: the OpenAI and Ollama presets are covered by offline tests only and have not been evaluated on real models. The consolidation similarity thresholds were tuned for Qwen embeddings and may need re-tuning for another embedding model.
 5. **Metadata and expiry**: Mem0's `metadata` filters and `expiration_date`; Supermemory's automatically expiring temporary facts.
 6. **An English CLI**: CLI messages are in Chinese. The SDK, HTTP API, MCP, proxy and UI are in English.

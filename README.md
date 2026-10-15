@@ -73,6 +73,8 @@ Everything below comes from test sets used once, with every method, prompt and t
 
 On MemLens, L1 and L2 attach the top-3 original photos at answer time ("re-perception").
 
+In the LongMemEval column, every row except full context was measured before N12 fixed a session-ID leak (D-067): the evidence headers showed session IDs that gave away the evidence sessions. The [leak ablation](docs/results/n12-leak/README.md) (Chinese) finds no measurable inflation for L1, L2 or the controller (agentic retrieval was not ablated), and the gap to full context is unchanged. The numbers are left as published.
+
 1. **Memory beats a long context window.** On LongMemEval, L1 is 17.5 points more accurate than the full-context baseline at about 1/20 of the cost. On MemLens, full context loses 5.6 points going from 32K to 128K tokens of history, while L2 with photos stays flat.
 2. **The write path is the biggest single win.** The same naive retriever goes from 82.0% to 91.0% on LongMemEval (+53 / −17 questions, p < 0.001) once it can use the write path's output: facts with validity periods, fact-augmented index keys, and a profile.
 3. **The controller pays off by deciding *whether* to recall, not *how deeply*.**
@@ -86,7 +88,7 @@ On MemLens, L1 and L2 attach the top-3 original photos at answer time ("re-perce
 
 - **Controller v2.** In spaces with photos it looks up an image-space accuracy table instead of adding and clipping a photo gain, and questions about visual detail no longer go to L0. Post-hoc replay: 81.6% → 81.9% on memory questions (+10 / −5), all of it on MemLens. For a new reader model, recalibrating the accuracy table made things worse; lowering λ from 30 to 15 recovered most of the gap to always-L2 at 16–24% lower cost. Later, v3 attaches photos only when a question is about one (D-058). v2 attached photos to almost every question in such spaces, and that photo is what made the demo agent answer the previous question again. Development accuracy is unchanged, and photos go to a third of the questions instead of almost all of them.
 - **The gate on real traffic.** With the first messages of real WildChat conversations as the queries that need no memory, the gate sends 10.5% of them to retrieval (17.3% on the synthetic stream) and the stream costs 46% less than always retrieving (41% before).
-- **External baseline: Mem0.** Open-source Mem0 2.2 with the same extraction model, embeddings, reader and judge: 80.5% on 200 LoCoMo questions and 83.0% on 100 LongMemEval questions. CueMem's L1 ties on LoCoMo (81.0%) and is 9 points higher on LongMemEval (92.0%, p = 0.049), and Mem0's writes cost 2.3–2.9 times as much. Mem0 finds the right sessions; it loses on temporal reasoning, knowledge updates and details the assistant gave, which its add-only extraction does not keep.
+- **External baseline: Mem0.** Open-source Mem0 2.2 with the same extraction model, embeddings, reader and judge: 80.5% on 200 LoCoMo questions and 83.0% on 100 LongMemEval questions. CueMem's L1 ties on LoCoMo (81.0%) and is 9 points higher on LongMemEval (92.0%, p = 0.049), and Mem0's writes cost 2.3–2.9 times as much. Mem0 finds the right sessions; it loses on temporal reasoning, knowledge updates and details the assistant gave, which its add-only extraction does not keep. These LongMemEval numbers predate the session-ID leak fix (D-067, [leak ablation](docs/results/n12-leak/README.md)): rerun after the fix with the same configuration, L1 scores 90.0% and Mem0 79.0% on the same 100 questions, so Mem0's published 83.0% may be a few points high.
 - **Judging and variance.** A second judge from another provider agrees on 94.7–97.9% of 12,835 judgements (κ 0.82–0.93) and keeps the method ranking (Kendall τ 0.87–1.0). A rerun with the cache off moves accuracy by at most 0.9 points, with 3–4% of questions flipping. One N9 comparison does not survive: L1 being 2.3 points below full context on LoCoMo (not significant under the second judge, 1.5 points in the rerun). A hand audit of 50 judgements, stratified by dataset, agrees with the judge on all 48 that were labelled; 2 LoCoMo items were left unlabelled, and both judges marked them wrong.
 - **Write path.** Reconciliation now tells "a different scope", "the world changed" and "it was a mistake" apart, and sees the message each new fact came from: "Mia is 31" alone cannot tell a correction from a birthday. On a small invented conversation run 5 times, all three cases are right every time (N9's prompt: 3 / 5, 5 / 5, 0 / 5).
 - **Scale.** The local work on the read path grows linearly with local Qdrant (about 1.08 s at 46k retrieval units) and is 91 ms with a Qdrant server; one process serves 55 reads per second with the server (8.7 in local mode).
@@ -142,7 +144,21 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 | When a fact changes | Invalidated, not deleted; two timelines; `history()` | v3 is add-only | The LLM rewrites a block | Invalidated, not deleted; two timelines | Newest wins, history kept |
 | Images | Originals kept and looked at again at answer time | Turned into text | Not seen | Text and JSON only | OCR |
 | Forgetting | Deletes the source conversation, follows citations, finds uncited restatements; dry run | `delete` | Edit memory | `remove_episode` | `forget_matching`, dry run |
-| Evaluation | Frozen methods, test sets used once, external baseline under the same judge | Own benchmark repo | Blog | Paper | Own |
+| Evaluation | Frozen methods, test sets used once, external baselines under the same models and judge | Own benchmark repo | Blog | Paper | Own |
+
+**Same protocol, same models (N12).** We ran five open-source memory systems ourselves on 200 LoCoMo questions. Each uses its own write and read pipeline; the extraction model, embeddings, reader and judge are the same as CueMem's. There are two protocols, DeepSeek only and Qwen only, with one run per configuration.
+
+| LoCoMo test200r | DeepSeek only | Qwen only |
+|---|---|---|
+| CueMem L1 / L2 | 82.5% / **87.0%** | 81.5% / **85.0%** |
+| Mem0 2.2.1 | 81.0% | 77.5% |
+| LangMem 0.0.30 | 78.0% | 30.0% |
+| Cognee 1.6.4 | 77.5% | 74.0% |
+| Graphiti (graphiti-core 0.30.2) | 59.0% | 41.5% |
+| A-MEM | MA-PENDING | MA-PENDING |
+| Full context | 84.5% | 80.0% |
+
+L2 is significantly ahead of Mem0, LangMem, Cognee and Graphiti under both protocols (paired sign tests, p ≤ 0.017); against A-MEM: MA-PENDING. L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under DeepSeek (against A-MEM: MA-PENDING). Graphiti and LangMem drop sharply under Qwen: with their own prompts, qwen3.8-flash extracts far fewer entities and memories. CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), so the Qwen-only protocol is its home ground; DeepSeek-only is the protocol where no system was tuned for the model, and L2's lead holds there too. Details in the Chinese [N12 external baselines](docs/results/n12-baselines/README.md) and the [comparison](docs/en/landscape.md#same-protocol-comparison-n12).
 
 CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, three framework integrations so far ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
 
@@ -227,7 +243,8 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
 | Comparison with open-source peers: capabilities, published scores, what N12 borrowed, what is missing | [English](docs/en/landscape.md) · [中文](docs/landscape.md) |
 | Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | [English](docs/en/integrations.md) · [中文](docs/integrations.md) |
-| Decision records (64 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| Decision records (67 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| N12 results: same-protocol external baselines on LoCoMo; the LongMemEval session-ID leak, its fix and ablation | 中文: [external baselines](docs/results/n12-baselines/README.md), [session-ID leak](docs/results/n12-leak/README.md) |
 | Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 
 The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
