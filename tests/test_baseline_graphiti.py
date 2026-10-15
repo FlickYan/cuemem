@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fakes import FakeAPI
+from fakes import REJECT, FakeAPI
 from pydantic import BaseModel
 
 from cuemem.config import Settings
@@ -33,6 +33,7 @@ from cuemem.evals.baselines.graphiti import (
     SchemaMismatch,
     WarningCounter,
     _resampling_client_type,
+    check_episodes,
     check_reply,
     entity_hit,
     episode_body,
@@ -216,6 +217,18 @@ def test_replies_that_do_not_match_the_schema_are_resampled() -> None:
         assert isinstance(caught.value, json.JSONDecodeError)  # Graphiti 只对这类错误重试
 
 
+def test_refused_episodes_have_their_own_allowance() -> None:
+    """通义的内容审核会误拒平常的发言：跳过并计数，超过 max(2, 5%) 才作废；其他失败仍是 1%。"""
+    check_episodes(629, ["s1#1: x"] * 6, ["s2#3: refused"] * 31)
+    with pytest.raises(RuntimeError, match="写入失败"):
+        check_episodes(629, ["s1#1: x"] * 7, [])
+    with pytest.raises(RuntimeError, match="最多容许 31 条"):
+        check_episodes(629, [], ["s2#3: refused"] * 32)
+    check_episodes(3, [], ["s2#3: refused"] * 2)  # 很短的历史也容许两条
+    with pytest.raises(RuntimeError, match="内容审核"):
+        check_episodes(3, [], ["s2#3: refused"] * 3)
+
+
 def test_cross_encoder_ranking_follows_graphiti_convention() -> None:
     assert ranked(["a", "b", "c"], [0.1, 0.9, 0.1]) == [("b", 0.9), ("a", 0.1), ("c", 0.1)]
     assert ranked([], []) == []
@@ -298,6 +311,8 @@ def _fake_model(body: dict[str, Any]) -> str:
     schema = json.loads(found.group(1)) if found else {}
     last = str(messages[-1]["content"])
     current = last.split("<CURRENT MESSAGE>")[-1].split("</CURRENT MESSAGE>")[0]
+    if "passport" in current:  # 内容审核误拒（主模型与备用模型都拒）
+        return REJECT
     names = [name for name in ("Ana", "Berlin") if name in current]
     if schema.get("title") == "ExtractedEntities":
         entities = [{"name": name, "entity_type_id": 0} for name in names]
@@ -358,6 +373,11 @@ def test_graphiti_end_to_end_through_the_gateway(
             ],
         ),
         EvalSession("session_2", MAY9, [EvalTurn(role="user", text="Hi again", speaker="Ana")]),
+        EvalSession(
+            "session_3",
+            datetime(2023, 5, 9, 20, 0),
+            [EvalTurn(role="user", text="My passport expires soon.", speaker="Ana")],
+        ),
     ]
     sample = Sample(
         dataset="locomo",
@@ -377,6 +397,9 @@ def test_graphiti_end_to_end_through_the_gateway(
             first = method.answer(ctx)
         build = first.details["graphiti_build"]
         assert build["episodes"] == 3 and build["failed_episodes"] == []
+        # 被内容审核拒绝的发言跳过并计数，不算失败（通义预设没有备用模型）
+        (refused,) = build["refused_episodes"]
+        assert refused.startswith("session_3#0: BadRequestError") and build["refusals"] >= 1
         assert build["entities"] == 2 and build["facts"] >= 1 and build["chat_calls"] > 0
         assert build["embedder"] == f"{method.embedder.name}:{method.embedder.dim}"
         assert build["graphiti_protocol"] == BUILD_PROTOCOL and isinstance(build["warnings"], dict)
@@ -394,7 +417,9 @@ def test_graphiti_end_to_end_through_the_gateway(
         assert candidates["fact_bm25"] >= 1 and candidates["entity_bm25"] >= 1
         # 脚本化的模型有一次给的实体名对不上，Graphiti 丢掉那条事实并告警：计进写入记录
         unmatched = "WARNING: Target entity not found in nodes for edge relation: %s"
-        assert build["warnings"] == {unmatched: 1}
+        assert build["warnings"][unmatched] == 1
+        (logged,) = [k for k in build["warnings"] if k != unmatched]  # 被拒那次的错误日志
+        assert logged.startswith("ERROR: Error in generating LLM response")
         kinds = {event["kind"] for event in trace.events}
         if rerank:
             assert first.details["edge_reranker"] == "cross_encoder:qwen3-rerank"
