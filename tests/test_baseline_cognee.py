@@ -35,7 +35,7 @@ from cuemem.evals.baselines.cognee import (
     worker_env,
 )
 from cuemem.evals.datasets import EvalSession, EvalTurn
-from cuemem.evals.methods import build_methods
+from cuemem.evals.methods import MethodContext, build_methods
 
 MAY8 = datetime(2023, 5, 8, 13, 56)
 MAY25 = datetime(2023, 5, 25, 13, 14)
@@ -152,7 +152,8 @@ def test_distill_session_id_carries_no_question_id() -> None:
 
 
 def test_distilled_builds_with_old_lesson_ids_are_rebuilt(tmp_path: Path) -> None:
-    """做了会话蒸馏、蒸馏 ID 还带着题号的旧写入不复用；没做蒸馏的（LoCoMo）照常复用。"""
+    """做了会话蒸馏、蒸馏 ID 还带着题号的旧写入不复用；没做蒸馏的（LoCoMo）照常复用。
+    写入标记早先接在 protocol 后面（现存的写入都是这样），与记在 build_tag 里的一样认得。"""
     from cuemem.evals.baselines.cognee import LESSON_TAG
 
     calls: list[str] = []
@@ -163,14 +164,17 @@ def test_distilled_builds_with_old_lesson_ids_are_rebuilt(tmp_path: Path) -> Non
             return {}
 
     baseline = Recording()
-    baseline.protocol = "p"
+    baseline.protocol = "m|e:8"
+    legacy = f"m|e:8|{baseline.build_tag}"
     baseline.gateway = SimpleNamespace(usage=lambda bucket: {})
     for key, record, rebuilt in (
-        ("locomo_conv-1", {"protocol": "p", "distill": False}, False),
-        ("longmemeval_s-anon_q1", {"protocol": "p", "distill": True}, True),
+        ("locomo_conv-1", {"protocol": legacy, "distill": False}, False),
+        ("locomo_conv-2", {"protocol": "m|e:8", "build_tag": baseline.build_tag}, False),
+        ("locomo_conv-3", {"protocol": "m|e:8|cognee==1.5.0|beam-turn-pair"}, True),
+        ("longmemeval_s-anon_q1", {"protocol": legacy, "distill": True}, True),
         (
             "longmemeval_s-anon_q2",
-            {"protocol": "p", "distill": True, "lesson_ids": LESSON_TAG, "session_ids": "anon"},
+            {"protocol": legacy, "distill": True, "lesson_ids": LESSON_TAG, "session_ids": "anon"},
             False,
         ),
     ):
@@ -180,7 +184,7 @@ def test_distilled_builds_with_old_lesson_ids_are_rebuilt(tmp_path: Path) -> Non
         baseline._schemes[key] = "native" if key.startswith("locomo") else "anon"
         built = baseline._ensure_built(key, directory, [])
         assert (built is not None) == rebuilt, key
-    assert calls == ["longmemeval_s-anon_q1"]
+    assert calls == ["locomo_conv-3", "longmemeval_s-anon_q1"]
 
 
 def _rows() -> list[dict[str, Any]]:
@@ -377,8 +381,9 @@ def test_setup_pins_the_cognee_version(monkeypatch: pytest.MonkeyPatch) -> None:
         baseline.setup()
     monkeypatch.setattr(importlib.metadata, "version", lambda name: COGNEE_VERSION)
     baseline.setup()
-    # 协议里带上版本与写入格式：换了就重建
-    assert baseline.protocol.startswith(f"model|embedder:8|cognee=={COGNEE_VERSION}|")
+    # 写入标记是版本与写入格式（换了就重建）；协议只是抽取模型与向量模型
+    assert baseline.protocol == "model|embedder:8"
+    assert baseline.build_tag.startswith(f"cognee=={COGNEE_VERSION}|")
 
 
 # ---------- 需要 cognee ----------
@@ -577,12 +582,16 @@ def test_build_and_retrieve_through_the_gateway(
     try:
         built = baseline._ensure_built(key, directory, sessions)
         assert built is not None and built["failed_sessions"] == []
-        assert built["protocol"].endswith(f"|cognee=={COGNEE_VERSION}|beam-turn-pair")
+        assert built["protocol"] == baseline.protocol and "cognee" not in built["protocol"]
+        assert built["build_tag"] == f"cognee=={COGNEE_VERSION}|beam-turn-pair"
         assert built["chunks_written"] == 3 and built["chat_calls"] >= 6  # 每块一次抽取一次摘要
         assert built["node_types"]["DocumentChunk"] == 3 and built["embedded_texts"] > 0
         assert built["distill"] is False and built["sessions_without_chunks"] == []
         assert built["effective_chunk_size"] > 0
-        hits, details = baseline.retrieve(key, directory, sample, sessions)
+        ctx = MethodContext(sample, sessions, None, None, "locomo:conv-1")  # type: ignore[arg-type]
+        hits, details, searched = baseline._retrieve(key, directory, ctx)
+        # 子进程经网关（search 桶）向量化问题：这道题的那一份记在它名下（并转记进它的 trace）
+        assert searched["embedding_calls"] >= 1
         assert details["cognee_chunks"] == 3 and details["cognee_entities"] >= 1
         rounds = {h.unit.session_id: h for h in hits if h.route == "cognee_round"}
         assert rounds["session_1"].unit.ts == MAY8 and rounds["session_2"].unit.ts == MAY25

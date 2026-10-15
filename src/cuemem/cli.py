@@ -58,7 +58,13 @@ from cuemem.evals.datasets import (
 )
 from cuemem.evals.datasets import download as download_dataset
 from cuemem.evals.datasets import load as load_dataset
-from cuemem.evals.report import build_report, load_rows, method_stats
+from cuemem.evals.report import (
+    build_report,
+    error_groups,
+    load_rows,
+    method_stats,
+    pending_errors,
+)
 from cuemem.evals.runner import EvalRunner, RunConfig
 from cuemem.evals.splits import load_split, save_split, stratified_ids
 from cuemem.llm.client import LLMClient
@@ -1016,6 +1022,8 @@ def eval_run(
             f"出错 {summary.errors} 份；耗时 {summary.elapsed_s:.0f} 秒；"
             f"本次实际花费 ${summary.spent:.4f}"
         )
+        if summary.errors:
+            _print_errors(summary.run_dir)
         return
     report_path = build_report(summary.run_dir, eval_spaces=settings.paths.eval_spaces)
     note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
@@ -1024,6 +1032,8 @@ def eval_run(
         f"耗时 {summary.elapsed_s:.0f} 秒；本次实际花费 ${summary.spent:.4f}"
         f"（名义成本 ${summary.nominal_cost:.4f}）"
     )
+    if summary.errors:
+        _print_errors(summary.run_dir)
     _print_method_stats(summary.run_dir)
     console.print(f"报告：{report_path}")
 
@@ -1131,6 +1141,16 @@ def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSe
             "原始 ID（泄漏的干净消融，只用于测量泄漏的影响）[/yellow]"
         )
     return evalset
+
+
+def _print_errors(run_dir: Path, limit: int = 3) -> None:
+    """出错的组合按报错归并后列出（errors.jsonl 里每道题各记一次）：配置问题（如外部基线的写入
+    目录里是另一个协议的写入）一眼看得到报错与解决办法。"""
+    groups = error_groups(pending_errors(run_dir))
+    for method, error, n in groups[:limit]:
+        console.print(f"[red]{escape(method)} × {n}[/red]：{escape(error)}", highlight=False)
+    if len(groups) > limit:
+        console.print(f"另有 {len(groups) - limit} 种报错，详见 {run_dir / 'errors.jsonl'}")
 
 
 def _print_method_stats(run_dir: Path) -> None:

@@ -28,6 +28,7 @@ from fakes import ABORT_JSON, REJECT, FakeAPI
 
 from cuemem.config import Settings
 from cuemem.core.models import Hit
+from cuemem.errors import ConfigMismatchError
 from cuemem.evals.baselines import langmem as ml
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.methods import MethodContext, build_methods
@@ -140,7 +141,7 @@ def test_store_written_by_other_models_is_refused(tmp_path: Path) -> None:
     path = tmp_path / ml.STORE_FILE
     path.write_text(json.dumps({"identity": IDENTITY, "items": []}), "utf-8")
     other = {**IDENTITY, "extractor": "qwen3.8-flash"}
-    with pytest.raises(RuntimeError, match="换了模型"):
+    with pytest.raises(ConfigMismatchError, match="换了模型"):
         ml.load_store(path, None, other)
 
 
@@ -254,17 +255,6 @@ def test_patchdoc_patches_that_cannot_be_read_are_skipped_edits() -> None:
     assert ensure({"patches": {}}) == []  # 不在写入中：照常返回，不记
 
 
-def test_same_identity(tmp_path: Path) -> None:
-    record = tmp_path / "build.json"
-    record.write_text(json.dumps({**IDENTITY, "memories": 3}), "utf-8")
-    assert ml.same_identity(record, IDENTITY)
-    assert not ml.same_identity(record, {**IDENTITY, "extractor": "qwen3.8-flash"})
-    record.write_text(json.dumps({"memories": 3}), "utf-8")  # 没记模型的旧记录：重建
-    assert not ml.same_identity(record, IDENTITY)
-    record.write_text("{broken", "utf-8")
-    assert not ml.same_identity(record, IDENTITY)
-
-
 def test_package_versions_are_recorded() -> None:
     versions = ml.package_versions()
     assert set(versions) == set(ml.PACKAGES)
@@ -317,11 +307,12 @@ def _llm(settings: Settings, fake_api: FakeAPI) -> LLMClient:
     )
 
 
-def test_store_written_by_other_models_is_rebuilt(
+def test_store_written_by_other_models_is_kept(
     offline_settings: Settings, fake_api: FakeAPI
 ) -> None:
-    """评测空间的目录不分预设：build.json 里的模型与当前不同（或是没记模型的旧记录）就重建，
-    而不是每道题都报错。"""
+    """评测空间的目录不分协议：build.json 里的模型与当前不同就报错，不删也不复用；记协议之前的
+    写入（只有 extractor、embedder 与 dim，如 pds 的 locomo_conv-42）照样核对；什么都没记的
+    旧记录按当前协议处理。"""
     fake_api.chat_replies = ['{"answer": "unknown", "evidence_sufficient": false, "citations": []}']
     ctx = MethodContext(
         _sample(), _two_people(), Reader(_llm(offline_settings, fake_api)), None, "locomo:conv-1"
@@ -332,10 +323,22 @@ def test_store_written_by_other_models_is_rebuilt(
         assert "langmem_build" not in method.answer(ctx).details and method.builds == 1
         record = method.root / "locomo_conv-1" / "build.json"
         built = json.loads(record.read_text("utf-8"))
-        assert built["extractor"] == "qwen3.8-flash"
-        record.write_text(json.dumps({**built, "extractor": "deepseek-flash"}), "utf-8")
-        assert "langmem_build" in method.answer(ctx).details and method.builds == 2
-        assert json.loads(record.read_text("utf-8"))["extractor"] == "qwen3.8-flash"
+        assert built["extractor"] == "qwen3.8-flash" and built["protocol"] == method.protocol
+        legacy = {k: v for k, v in built.items() if k not in ("protocol", "build_tag")}
+        record.write_text(json.dumps(legacy), "utf-8")
+        assert "langmem_build" not in method.answer(ctx).details  # 记协议之前：同一协议
+        name = method.embedder.name
+        for other in (
+            {**built, "protocol": f"deepseek-flash|{name}:{method.embedder.dim}"},
+            {**legacy, "extractor": "deepseek-flash"},
+            {**legacy, "dim": 384},
+        ):
+            record.write_text(json.dumps(other), "utf-8")
+            with pytest.raises(ConfigMismatchError, match="CUEMEM_PATHS__EVAL_SPACES"):
+                method.answer(ctx)
+            assert json.loads(record.read_text("utf-8")) == other
+        record.write_text(json.dumps({"memories": 0}), "utf-8")  # 什么都没记：按当前协议
+        assert "langmem_build" not in method.answer(ctx).details and method.builds == 1
     finally:
         method.gateway.stop()
 
@@ -461,6 +464,9 @@ def test_build_and_retrieve_through_the_gateway(
         again = method.answer(ctx)
         assert "langmem_build" not in again.details
         assert [h.unit.text for h in again.hits] == [hit.unit.text]
+        # 问题经网关的 search 桶向量化（用量由网关转记进这道题，见 evals/external.py）
+        searched = again.details["search_usage"]
+        assert searched["embedding_calls"] == 1 and searched["chat_calls"] == 0
 
         # 重建：记忆 ID 由（对话, 会话）定种子，与第一次相同
         method.close("locomo_conv-1")

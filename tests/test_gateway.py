@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,12 +15,15 @@ from fastapi.testclient import TestClient
 from openai import OpenAI, RateLimitError
 
 from cuemem.config import Settings
+from cuemem.core.trace import Trace, start_trace
 from cuemem.embed import build_embedder
 from cuemem.embed.dashscope import DashScopeTextEmbedder
+from cuemem.errors import ConfigMismatchError
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
-from cuemem.evals.external import ExternalBaseline, memory_hit, space_key
+from cuemem.evals.external import ExternalBaseline, memory_hit, recorded_protocol, space_key
 from cuemem.evals.gateway import Gateway, _retry_after, embed_kind
 from cuemem.evals.methods import MethodContext, build_methods
+from cuemem.evals.runner import usage_from_trace
 from cuemem.llm import Ledger, LLMClient, ResponseCache
 from cuemem.llm.types import ChatResult
 from cuemem.read.reader import Reader
@@ -381,6 +385,12 @@ class _Toy(ExternalBaseline):
     def retrieve(
         self, key: str, directory: Path, sample: Sample, sessions: Sequence[EvalSession]
     ) -> tuple[list[Any], dict[str, Any]]:
+        # 像 LangMem、Cognee 那样检索时经网关（search 桶）向量化问题，再像 A-MEM 那样改写一次查询
+        url = self.gateway.url(self.bucket(key, "search"))
+        sdk = OpenAI(base_url=url, api_key="unused", max_retries=0)
+        sdk.embeddings.create(model="toy", input=[sample.question])
+        rewrite = [{"role": "user", "content": f"Rewrite as a search query: {sample.question}"}]
+        sdk.chat.completions.create(model="toy", messages=rewrite)  # type: ignore[arg-type]
         lines = json.loads((directory / "memories.json").read_text("utf-8"))
         hits = [
             memory_hit(key, f"m{i}", line["text"], datetime.fromisoformat(line["ts"]), i)
@@ -429,12 +439,181 @@ def test_external_baseline_builds_once_and_records_usage(
         second = toy.answer(ctx)  # 已写入：不再重建
         assert "toy_build" not in second.details and toy.builds == 1
         assert stored["protocol"] == f"qwen3.8-flash|{toy.embedder.name}:{toy.embedder.dim}"
-        toy.protocol = "deepseek-flash|other:384"  # 换了协议：重建
-        third = toy.answer(ctx)
-        assert "toy_build" in third.details and toy.builds == 2
+        assert stored["build_tag"] == ""
     finally:
         toy.gateway.stop()
     assert space_key("locomo:conv-42") == "locomo_conv-42"
+
+
+ANSWER = '{"answer": "Berlin", "evidence_sufficient": true, "citations": ["m1"]}'
+
+
+def _answer_or_ok(body: dict[str, Any]) -> str:
+    return ANSWER if "Question:" in json.dumps(body) else "ok"
+
+
+def _toy_context(llm: LLMClient, question: str = "Where do I live?") -> MethodContext:
+    when = datetime(2026, 8, 1, 10)
+    session = EvalSession(
+        session_id="s1", started_at=when, turns=[EvalTurn(role="user", text="I live in Berlin")]
+    )
+    sample = Sample(
+        "locomo", question, "conv-1", question, "Berlin", "single-hop", "single-hop", False, when
+    )
+    return MethodContext(sample, [session], Reader(llm), None, "locomo:conv-1")
+
+
+def test_external_builds_of_another_protocol_are_kept(llm: LLMClient, fake_api: FakeAPI) -> None:
+    """评测空间的目录不分协议：另一个协议（抽取模型或向量模型）的写入报错，目录与文件原样不动；
+    同一协议、写入标记（build_tag）变了才重建；没记协议的旧记录按当前协议复用。"""
+    fake_api.chat_replies = [_answer_or_ok]
+    ctx = _toy_context(llm)
+    toy = _Toy()
+    try:
+        toy.answer(ctx)
+        directory = toy.root / "locomo_conv-1"
+        files = {p.name: p.read_bytes() for p in directory.iterdir()}
+        current = toy.protocol
+        pds = "deepseek-flash|BAAI/bge-small-en-v1.5:384"
+        toy.protocol = pds
+        with pytest.raises(ConfigMismatchError) as caught:
+            toy.answer(ctx)
+        message = str(caught.value)
+        assert str(directory) in message and current in message and pds in message
+        assert "CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen" in message
+        assert {p.name: p.read_bytes() for p in directory.iterdir()} == files  # 一个字节都没动
+        assert toy.builds == 1
+
+        toy.protocol = current  # 记协议之前的旧记录：按当前协议复用
+        record = directory / "build.json"
+        legacy = json.loads(record.read_text("utf-8"))
+        del legacy["protocol"], legacy["build_tag"]
+        record.write_text(json.dumps(legacy), "utf-8")
+        assert "toy_build" not in toy.answer(ctx).details and toy.builds == 1
+
+        toy.build_tag = "toy@2"  # 写法变了（同一协议）：作废重建，记下换掉的是哪一版
+        rebuilt = toy.answer(ctx).details["toy_build"]
+        assert toy.builds == 2 and rebuilt["build_tag"] == "toy@2"
+        assert rebuilt["replaced"] == {"build_tag": ""}
+        assert "toy_build" not in toy.answer(ctx).details and toy.builds == 2
+        # 早先写入标记接在 protocol 后面（A-MEM、Cognee 现存的写入）：照样认得
+        record.write_text(json.dumps({"protocol": f"{current}|toy@2"}), "utf-8")
+        assert "toy_build" not in toy.answer(ctx).details and toy.builds == 2
+        record.write_text(json.dumps({"protocol": f"{pds}|toy@2"}), "utf-8")
+        with pytest.raises(ConfigMismatchError):
+            toy.answer(ctx)
+        assert json.loads(record.read_text("utf-8")) == {"protocol": f"{pds}|toy@2"}
+
+        # 半成品（有目录、没有 build.json）：照旧清掉重建
+        record.unlink()
+        (directory / "partial.tmp").write_text("x", "utf-8")
+        assert "toy_build" in toy.answer(ctx).details and toy.builds == 3
+        assert not (directory / "partial.tmp").exists()
+    finally:
+        toy.gateway.stop()
+
+
+def test_search_usage_reaches_the_question(llm: LLMClient, fake_api: FakeAPI) -> None:
+    """检索时经网关的请求（search 桶）在网关的服务线程里执行：用量事件转记进这道题的 trace，
+    算进 results.jsonl 的 usage；details 的 search_usage 记下这道题经网关的部分。写入不算。"""
+    fake_api.chat_replies = [_answer_or_ok]
+    toy = _Toy()
+    bucket = "toy.search.locomo_conv-1"
+    try:
+        with start_trace("answer") as trace:
+            out = toy.answer(_toy_context(llm))
+        assert toy.bucket("locomo_conv-1", "search") == bucket
+        searched = out.details["search_usage"]
+        assert searched["chat_calls"] == 1 and searched["embedding_calls"] == 1
+        assert searched["cost"] == toy.gateway.usage(bucket)["cost"] > 0
+        relayed = [e for e in trace.events if e.get("bucket") == bucket]
+        assert [e["kind"] for e in relayed] == ["llm"]  # 哈希向量器不记事件
+        answered = [e for e in trace.events if e["kind"] == "llm" and "bucket" not in e]
+        assert len(answered) == 1  # 回答模型；写入那次 LLM 调用在别的线程，不在这里
+        usage = usage_from_trace(trace)
+        assert usage["llm_calls"] == 2 and usage["input_tokens"] == 240
+        assert usage["cost"] == pytest.approx(searched["cost"] + answered[0]["cost"])
+        assert toy.gateway.usage("toy.build.locomo_conv-1")["chat_calls"] == 1
+    finally:
+        toy.gateway.stop()
+
+
+def test_search_usage_is_exact_under_parallel_questions(llm: LLMClient, fake_api: FakeAPI) -> None:
+    """同一份对话历史的题并行回答（评测的 inner workers）：检索在空间锁里串行，每题只记到
+    自己经网关的那一次调用，合起来等于桶里的总数。"""
+    fake_api.chat_replies = [_answer_or_ok]
+    toy = _Toy()
+    questions = [f"Where do I live, take {i}?" for i in range(6)]
+
+    def ask(question: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        with start_trace("answer") as trace:
+            out = toy.answer(_toy_context(llm, question))
+        return out.details["search_usage"], usage_from_trace(trace)
+
+    bucket = "toy.search.locomo_conv-1"
+    try:
+        toy.answer(_toy_context(llm))  # 先写入
+        before = toy.gateway.usage(bucket)
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(ask, questions))
+        after = toy.gateway.usage(bucket)
+        for searched, usage in results:
+            assert searched["chat_calls"] == 1 and searched["embedding_calls"] == 1
+            assert usage["llm_calls"] == 2  # 自己的检索一次、回答一次
+        assert after["chat_calls"] - before["chat_calls"] == len(questions)
+        spent = sum(s["cost"] for s, _ in results)
+        assert spent == pytest.approx(after["cost"] - before["cost"]) and spent > 0
+    finally:
+        toy.gateway.stop()
+
+
+def test_recorded_protocol_reads_every_existing_record_shape() -> None:
+    """现存的写入记录（data/eval-spaces 与 data/eval-spaces-qwen）的几种写法都认得出协议。"""
+    pds = "deepseek-flash|BAAI/bge-small-en-v1.5:384"
+    assert recorded_protocol({"protocol": f"{pds}|amem@ceffb86|max_tokens=4096|v4"}) == pds
+    assert recorded_protocol({"protocol": f"{pds}|cognee==1.6.4|beam-turn-pair"}) == pds
+    assert recorded_protocol({"protocol": pds, "build_tag": "x"}) == pds
+    # 记协议之前的 Graphiti（embedder 带维度）与 LangMem（维度另记在 dim）；extractor 是别名
+    graphiti = {"graphiti_protocol": 2, "extractor": "deepseek-flash"}
+    assert recorded_protocol({**graphiti, "embedder": "BAAI/bge-small-en-v1.5:384"}) == pds
+    langmem = {"extractor": "flash", "embedder": "BAAI/bge-small-en-v1.5", "dim": 384}
+    assert recorded_protocol(langmem, {"flash": "deepseek-flash"}) == pds
+    assert recorded_protocol({"memories": 3, "perspectives": ["Ana"]}) is None  # Mem0 早先的
+
+
+def test_gateway_forward_relays_one_bucket(
+    settings: Settings, llm: LLMClient, fake_api: FakeAPI
+) -> None:
+    """forward 期间这个桶的 LLM 与向量事件另外记进给定的 trace（标上桶名）；别的桶、forward
+    之外的请求不记；桶里照常累计。"""
+    fake_api.embed_dim = settings.embedding.dim
+    embedder = DashScopeTextEmbedder(
+        settings.embedding, "sk-test", http_client=fake_api.client(), sleep=lambda _: None
+    )
+    gateway = Gateway(llm, embedder)
+    fake_api.chat_replies = ["ok"]
+    target = Trace("answer")
+
+    def chat(test_client: TestClient, bucket: str, text: str) -> None:
+        body = {"messages": [{"role": "user", "content": text}]}
+        assert test_client.post(f"/b/{bucket}/v1/chat/completions", json=body).status_code == 200
+
+    with TestClient(gateway.app()) as test_client:
+        with gateway.forward("x.search.k", target):
+            chat(test_client, "x.search.k", "one")
+            chat(test_client, "other", "two")
+            assert test_client.post("/b/x.search.k/v1/embeddings", json={"input": "q"}).is_success
+        chat(test_client, "x.search.k", "three")
+        with gateway.forward("x.search.k", None):  # 不在 trace 里：什么也不做
+            chat(test_client, "x.search.k", "four")
+    assert [(e["kind"], e["bucket"]) for e in target.events] == [
+        ("llm", "x.search.k"),
+        ("embedding", "x.search.k"),
+    ]
+    usage = usage_from_trace(target)
+    assert usage["llm_calls"] == 1 and usage["input_tokens"] == 120
+    assert usage["embedding_tokens"] == gateway.usage("x.search.k")["embedding_tokens"] > 0
+    assert gateway.usage("x.search.k")["chat_calls"] == 3
 
 
 def test_external_builds_keep_session_id_schemes_apart(llm: LLMClient, fake_api: FakeAPI) -> None:

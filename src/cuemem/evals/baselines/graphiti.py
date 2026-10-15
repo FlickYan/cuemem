@@ -76,10 +76,13 @@ kg_architecture_agent_memory：locomo_eval/ 与 zep_longmem_eval.ipynb）写入�
     都很平常，如会话 19、23 里聊散步、读书、看电影），其中会话 29 开头曾连续 10 条被拒，按
     旧规则整份作废。
 
-写入记录（build.json）记下写入协议、抽取模型与向量模型，任何一项变了就自动重建；Graphiti 自己
+写入记录（build.json）记下协议（抽取模型与向量模型，基类核对：换了就报错，不删另一个协议的
+图，见 evals/external.py）与写入标记（build_tag，Graphiti 的写入协议 BUILD_PROTOCOL：变了就
+重建；早先的记录只有 graphiti_protocol 字段，照样认得）；Graphiti 自己
 的告警（抽取的实体名对不上而丢掉的事实、消歧编号越界、JSON 解析失败……）按类型计数记在
 warnings 里。每题的 details 记下各路召回的候选数（candidates：BM25 与向量各找到几条），哪一路
-整个失效（比如向量相似度都低于 Graphiti 的阈值 0.6）一眼看得出。检索指标按"轮"计：每条事实
+整个失效（比如向量相似度都低于 Graphiti 的阈值 0.6）一眼看得出；检索时不该再经网关调用模型，
+基类记下的 search_usage 应当都是 0。检索指标按"轮"计：每条事实
 标上它来源发言所在的轮，排在前面的事实已覆盖的轮不重复计；实体证据不计入指标。
 
 试点实测（deepseek 预设，全部 deepseek-flash、本机 bge-small 向量，错峰时段）：LoCoMo conv-42
@@ -118,7 +121,7 @@ import re
 import threading
 import warnings
 from collections import Counter, OrderedDict
-from collections.abc import Coroutine, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -161,12 +164,12 @@ class GraphitiBaseline(ExternalBaseline):
     # 逐条发言写入，LLM 调用比 Mem0 多得多：LoCoMo test200r 的 7 段对话按试点估算标价约 $10
     # （错峰实际约 $4），留出余量；LongMemEval 要调高（见模块说明）
     build_budget = 40.0
+    build_tag = f"graphiti_protocol={BUILD_PROTOCOL}"
 
     def __init__(self) -> None:
         super().__init__()
         self._graphs: OrderedDict[str, _Graph] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._replaced: dict[str, dict[str, Any]] = {}
         self.reranker: Reranker | None = None
 
     # ---------- 钩子 ----------
@@ -210,8 +213,7 @@ class GraphitiBaseline(ExternalBaseline):
             stats = self._run(self._ingest(key, directory, builder, graph, sessions))
         finally:
             self._run(client.close())
-        replaced = self._replaced.pop(key, None)
-        return {**self._build_id(), **stats, **({"replaced": replaced} if replaced else {})}
+        return stats
 
     def retrieve(
         self, key: str, directory: Path, sample: Sample, sessions: Sequence[EvalSession]
@@ -221,10 +223,7 @@ class GraphitiBaseline(ExternalBaseline):
         question = sample.question.replace("\n", " ")
         vector = self.embedder.embed([question], "query").dense[0].tolist()
         encoder = _cross_encoder_type()(self.reranker, question) if self.reranker else None
-        bucket = self.bucket(key, "search")
-        before = self.gateway.usage(bucket)
         found, candidates = self._run(self._search(graph, question, vector, group_id(key), encoder))
-        after = self.gateway.usage(bucket)
         facts = [
             fact_hit(key, edge, score, rank, graph.ledger)
             for rank, (edge, score) in enumerate(
@@ -247,11 +246,6 @@ class GraphitiBaseline(ExternalBaseline):
                 f"cross_encoder:{self.reranker.cfg.model}" if self.reranker else "rrf"
             ),
             "candidates": candidates,
-            # 检索时 Graphiti 不该再经网关调用模型：记下来核对（应当都是 0）
-            "search_usage": {
-                field: round(after[field] - before[field], 6)
-                for field in ("embedding_calls", "chat_calls", "spent")
-            },
         }
         return facts + entities, details
 
@@ -259,29 +253,12 @@ class GraphitiBaseline(ExternalBaseline):
         with self._lock:
             self._close_locked(key)
 
-    def _ensure_built(
-        self, key: str, directory: Path, sessions: Sequence[EvalSession]
-    ) -> dict[str, Any] | None:
-        """换了写入协议、抽取模型或向量模型的图不能复用：删掉写入记录，交给基类重建。"""
-        record = directory / "build.json"
-        if record.exists():
-            built = json.loads(record.read_text("utf-8"))
-            stale = {
-                field: built.get(field)
-                for field, value in self._build_id().items()
-                if built.get(field) != value
-            }
-            if stale:
-                self._replaced[key] = stale
-                record.unlink()
-        return super()._ensure_built(key, directory, sessions)
-
-    def _build_id(self) -> dict[str, Any]:
-        return {
-            "graphiti_protocol": BUILD_PROTOCOL,
-            "extractor": self.llm.settings.roles["extractor"].model,
-            "embedder": f"{self.embedder.name}:{self.embedder.dim}",
-        }
+    def recorded_tag(self, record: Mapping[str, Any]) -> str:
+        """有 build_tag 之前的写入记录只记了 graphiti_protocol（与 extractor、embedder，基类据此
+        核对协议）：照样换成写入标记，同一写入协议的图照常复用。"""
+        if "build_tag" not in record and "graphiti_protocol" in record:
+            return f"graphiti_protocol={record['graphiti_protocol']}"
+        return super().recorded_tag(record)
 
     # ---------- 写入 ----------
 

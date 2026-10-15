@@ -83,10 +83,12 @@ REPORT.md、preprocessing/preprocess.py、local_ingest.py、report_artifacts/100
 9. 检索时问题应按查询向量化（与 CueMem 的检索、M0 相同；通义的向量模型区分 query 与
    document）：检索子进程只向量化问题，请求都记在 `cognee.search.<空间>` 桶里，并带上
    input_type=query（EMBEDDING_INPUT_TYPE）。网关要按检索阶段的桶（或 input_type）选查询向量；
-   网关没有这条规则时按文档向量化。deepseek 预设的 bge-small 没有检索指令，两者相同。
+   网关没有这条规则时按文档向量化。deepseek 预设的 bge-small 没有检索指令，两者相同。这些请求
+   在子进程与网关里，不在这道题的 trace 里：网关把用量转记进这道题（见 evals/external.py）。
 
-写入记录（build.json）的协议里带上 cognee 的版本与这里的写入格式，换了就重建；装的 cognee 不是
-1.6.4 时直接报错（这里用到它的内部模块与默认值）。
+写入记录（build.json）记下协议（抽取模型与向量模型，换了就报错、不删，见 evals/external.py）与
+写入标记（build_tag：cognee 的版本与这里的写入格式，换了就重建；早先接在 protocol 后面，照样
+认得）；装的 cognee 不是 1.6.4 时直接报错（这里用到它的内部模块与默认值）。
 
 cognee 不是 CueMem 的依赖，评测时用 uv 临时装上（--extra local 只在用本机向量时需要，
 如 deepseek 预设）：
@@ -944,6 +946,8 @@ class Worker:
 
 class CogneeBaseline(ExternalBaseline):
     name, label, system = "MC", "外部基线：Cognee（1.6.4，混合检索）", "cognee"
+    # 换了 cognee 版本或写入格式的写入不能复用（setup 保证装的就是 COGNEE_VERSION）
+    build_tag = f"cognee=={COGNEE_VERSION}|{INGEST_FORMAT}"
 
     def __init__(self) -> None:
         super().__init__()
@@ -963,8 +967,6 @@ class CogneeBaseline(ExternalBaseline):
                 f"MC 按 cognee {COGNEE_VERSION} 写的（用到它的内部模块与默认值），装的是 "
                 f"{installed}：用 uv run --with cognee=={COGNEE_VERSION} ... 运行"
             )
-        # 换了 cognee 版本或写入格式的写入记录不能复用
-        self.protocol = f"{self.protocol}|cognee=={installed}|{INGEST_FORMAT}"
 
     def _env(self, directory: Path, url: str, mode: str, distill: bool = False) -> dict[str, str]:
         chat_model = self.llm.settings.roles[self.gateway.role].model
@@ -1010,17 +1012,13 @@ class CogneeBaseline(ExternalBaseline):
             **reply["stats"],
         }
 
-    def _ensure_built(
-        self, key: str, directory: Path, sessions: Sequence[EvalSession]
-    ) -> dict[str, Any] | None:
+    def recorded_tag(self, record: Mapping[str, Any]) -> str:
         """做了会话蒸馏、但蒸馏的会话 ID 还带着题号的写入（见 distill_session_id）不能复用：
-        删掉写入记录，交给基类重建。"""
-        record = directory / "build.json"
-        if record.exists():
-            built = json.loads(record.read_text("utf-8"))
-            if built.get("distill") and built.get("lesson_ids") != LESSON_TAG:
-                record.unlink()
-        return super()._ensure_built(key, directory, sessions)
+        算作另一个写入标记，基类就重建（协议不同时基类先报错，不会走到重建）。"""
+        tag = super().recorded_tag(record)
+        if record.get("distill") and record.get("lesson_ids") != LESSON_TAG:
+            return f"{tag}|lesson_ids={record.get('lesson_ids')}"
+        return tag
 
     # ---------- 检索 ----------
 

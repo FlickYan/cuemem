@@ -260,16 +260,17 @@ def test_graphiti_warnings_are_counted_per_build() -> None:
     assert warning_key(record) == "ERROR: Error executing Kuzu query: x"
 
 
-def test_graph_from_another_setup_is_rebuilt(
+def test_graph_from_another_setup_is_kept_or_rebuilt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 换了抽取模型、向量模型或写入协议：旧图不复用、也不让每道题都报错，而是重建
+    """换了写入协议（BUILD_PROTOCOL）：重建。换了抽取模型或向量模型：另一个协议的图，报错、不删
+    （评测空间的目录不分协议）。早先的写入记录只有 graphiti_protocol、extractor 与 embedder
+    （pds 的 locomo_conv-42 连 protocol 也没有），照样认得。"""
+    from cuemem.errors import ConfigMismatchError
+
     method = GraphitiBaseline()
-    roles = {"extractor": SimpleNamespace(model="qwen3.8-flash")}
-    method.llm = SimpleNamespace(settings=SimpleNamespace(roles=roles))  # type: ignore[assignment]
-    method.embedder = SimpleNamespace(name="qwen3.7-text-embedding", dim=1024)  # type: ignore[assignment]
     method.gateway = SimpleNamespace(usage=lambda bucket: {"spent": 0.0})  # type: ignore[assignment]
-    method.protocol = "qwen3.8-flash|qwen3.7-text-embedding:1024"  # 基类的指纹，setup() 里设
+    method.protocol = "qwen3.8-flash|qwen3.7-text-embedding:1024"  # 基类的指纹，_setup() 里设
     built: list[str] = []
     monkeypatch.setattr(method, "build", lambda key, directory, sessions: built.append(key) or {})
     directory = tmp_path / "locomo_conv-1"
@@ -277,13 +278,25 @@ def test_graph_from_another_setup_is_rebuilt(
     record = directory / "build.json"
     current = {"graphiti_protocol": BUILD_PROTOCOL, "extractor": "qwen3.8-flash"}
     current["embedder"] = "qwen3.7-text-embedding:1024"
-    record.write_text(json.dumps(current), "utf-8")
-    assert method._ensure_built("locomo_conv-1", directory, []) is None and built == []
-    for stale in ({"extractor": "deepseek-flash"}, {"graphiti_protocol": 1}, {"embedder": "x:384"}):
-        record.write_text(json.dumps({**current, **stale}), "utf-8")
-        assert method._ensure_built("locomo_conv-1", directory, []) is not None
-        assert method._replaced["locomo_conv-1"] == stale  # build() 把它记进新的写入记录
-    assert built == ["locomo_conv-1"] * 3
+    for legacy in (current, {**current, "protocol": method.protocol}):
+        record.write_text(json.dumps(legacy), "utf-8")
+        assert method._ensure_built("locomo_conv-1", directory, []) is None and built == []
+    for other in (
+        {"extractor": "deepseek-flash"},
+        {"embedder": "x:384"},
+        {"protocol": "deepseek-flash|BAAI/bge-small-en-v1.5:384"},
+    ):
+        record.write_text(json.dumps({**current, **other}), "utf-8")
+        with pytest.raises(ConfigMismatchError, match="不复用，也不覆盖"):
+            method._ensure_built("locomo_conv-1", directory, [])
+        assert json.loads(record.read_text("utf-8")) == {**current, **other}
+    assert built == []
+    record.write_text(json.dumps({**current, "graphiti_protocol": 1}), "utf-8")
+    stats = method._ensure_built("locomo_conv-1", directory, [])
+    assert stats is not None and built == ["locomo_conv-1"]
+    assert stats["build_tag"] == f"graphiti_protocol={BUILD_PROTOCOL}"
+    assert stats["replaced"] == {"build_tag": "graphiti_protocol=1"}  # 换掉的是哪一版
+    assert method._ensure_built("locomo_conv-1", directory, []) is None
 
 
 def test_method_is_registered_without_the_package() -> None:
@@ -401,8 +414,10 @@ def test_graphiti_end_to_end_through_the_gateway(
         (refused,) = build["refused_episodes"]
         assert refused.startswith("session_3#0: BadRequestError") and build["refusals"] >= 1
         assert build["entities"] == 2 and build["facts"] >= 1 and build["chat_calls"] > 0
-        assert build["embedder"] == f"{method.embedder.name}:{method.embedder.dim}"
-        assert build["graphiti_protocol"] == BUILD_PROTOCOL and isinstance(build["warnings"], dict)
+        assert build["protocol"] == method.protocol
+        assert build["protocol"].endswith(f"|{method.embedder.name}:{method.embedder.dim}")
+        assert build["build_tag"] == f"graphiti_protocol={BUILD_PROTOCOL}"
+        assert isinstance(build["warnings"], dict)
         assert first.response == "Berlin"
         fact = next(h for h in first.hits if h.route == "graphiti_fact")
         assert fact.unit.text == "Ana lives in Berlin (Date range: 2023-04-30 - present)"

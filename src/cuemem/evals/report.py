@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -306,7 +306,7 @@ def write_cost(
       spaces 只数巩固过的对话历史。
     - 外部基线（EXTERNAL_SYSTEMS）：每份对话历史有两处写入记录——rows 里触发写入的那道题记下的
       统计（<系统名>_build，运行自己写入时才有）与 eval_spaces 下的 build.json。给了 protocol 时
-      按协议挑（_pick_build）：先取协议对得上的（运行自己的记录优先），再取没记协议的（Mem0 从来
+      按协议挑（_pick_build）：先取协议对得上的（运行自己的记录优先），再取没记协议的（Mem0 早先
       不记；运行自己的优先）；记的协议对不上的不算（例如 pq 的运行读到了 pds 的写入目录），全都
       对不上时计入 mismatched。旧记录没有 protocol 字段，但记了 extractor 与 embedder 的照样核对。
       耗时取 build.json 的 seconds（墙钟），M0 没有这一项，取各次调用的延迟之和。
@@ -418,8 +418,9 @@ def _pick_build(found: Sequence[dict[str, Any]], protocol: str | None) -> dict[s
 
 
 def _protocol_match(build: dict[str, Any], expected: str | None) -> bool | None:
-    """写入记录的协议与这次运行的是否一致：True / False；没有记（Mem0、更早的记录）或不知道这次
-    运行的协议时为 None。外部系统可能在协议后面加上自己的版本（如 Cognee 的 |cognee==1.6.4）。
+    """写入记录的协议与这次运行的是否一致：True / False；没有记（Mem0 早先的、更早的记录）或不
+    知道这次运行的协议时为 None。早先 A-MEM 与 Cognee 把写入标记接在协议后面（如 Cognee 的
+    |cognee==1.6.4|…），现在另记在 build_tag 里（evals/external.py）。
 
     ExternalBaseline 记协议之前的记录（如 pds 的 graphiti/locomo_conv-42）没有 protocol，但记了
     extractor 与 embedder，照样核对；那时 embedder 可能不带维度（LangMem），这时只比模型名。"""
@@ -468,11 +469,7 @@ def build_report(run_dir: Path, *, eval_spaces: Path | None = None) -> Path:
     info = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     rows = load_rows(run_dir, "results.jsonl")
     ingests = load_rows(run_dir, "ingest.jsonl")
-    done = {(r["sample_id"], r["method"]) for r in rows}
-    # 出错后重跑成功的组合不再算作错误
-    errors = [
-        e for e in load_rows(run_dir, "errors.jsonl") if (e["sample_id"], e["method"]) not in done
-    ]
+    errors = pending_errors(run_dir, rows)
     stats = method_stats(rows)
     run_name = info["config"].get("name") or run_dir.name
     spaces, spaces_note = _eval_spaces(info, eval_spaces, run_name)
@@ -493,6 +490,30 @@ def build_report(run_dir: Path, *, eval_spaces: Path | None = None) -> Path:
     path = run_dir / "report.md"
     path.write_text(markdown, encoding="utf-8")
     return path
+
+
+def pending_errors(
+    run_dir: Path, rows: Sequence[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """errors.jsonl 里还算数的错误：出错后重跑成功的组合不再算作错误。rows 是 results.jsonl
+    （没给时读一遍）。"""
+    if rows is None:
+        rows = load_rows(run_dir, "results.jsonl")
+    done = {(r["sample_id"], r["method"]) for r in rows}
+    return [
+        e
+        for e in load_rows(run_dir, "errors.jsonl")
+        if (e.get("sample_id"), e.get("method")) not in done
+    ]
+
+
+def error_groups(errors: Sequence[dict[str, Any]]) -> list[tuple[str, str, int]]:
+    """出错的组合按（方法，报错）归并，次数多的在前：（方法，报错，组合数）。同一个配置问题
+    （如外部基线的写入目录里是另一个协议的写入）每道题各记一次，归并后只列一次。"""
+    counts = Counter(
+        (str(e.get("method") or e.get("stage") or "?"), str(e.get("error") or "")) for e in errors
+    )
+    return [(method, error, n) for (method, error), n in counts.most_common()]
 
 
 # ---------- Markdown ----------
@@ -711,8 +732,18 @@ def render_markdown(
     if errors:
         lines.append(
             f"- 有 {len(errors)} 个组合出错未计入结果，详见 `errors.jsonl`；重新运行会自动重试。"
+            "按报错归并（方法 × 组合数）："
         )
+        groups = error_groups(errors)
+        for method, error, n in groups[:MAX_ERROR_GROUPS]:
+            lines.append(f"  - {method} × {n}：{error[:ERROR_CHARS]}")
+        if len(groups) > MAX_ERROR_GROUPS:
+            lines.append(f"  - 另有 {len(groups) - MAX_ERROR_GROUPS} 种报错")
     return "\n".join(lines) + "\n"
+
+
+MAX_ERROR_GROUPS = 5  # report.md 里最多列几种报错
+ERROR_CHARS = 600  # 每种报错最多列多少字符（外部基线的协议报错连同解决办法约 300 字）
 
 
 WRITE_KINDS = {

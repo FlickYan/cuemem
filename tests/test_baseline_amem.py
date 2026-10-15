@@ -41,7 +41,6 @@ from cuemem.evals.baselines.amem import (
     link_targets,
     load_notes,
     merge_rounds,
-    models_of,
     note_content,
     note_document,
     note_text,
@@ -498,20 +497,39 @@ def test_query_keywords_pick_the_model_like_the_gateway(
     assert baseline.gateway.usage(baseline.bucket("c1", "search"))["chat_calls"] == 0
 
 
-def test_build_of_another_protocol_is_not_deleted(tmp_path: Path) -> None:
+def test_build_of_another_protocol_is_not_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """换了抽取模型或向量模型（pds → qwen）：不删另一个协议的写入，报错让换目录；
-    只是 A-MEM 的写入参数变了（旧版写入）才交给基类重建。"""
+    只是 A-MEM 的写入参数变了（旧版写入）才重建。早先写入标记接在 protocol 后面，照样认得。"""
     pds = "deepseek-flash|BAAI/bge-small-en-v1.5:384"
-    current = f"{pds}|amem@ceffb86|max_tokens={MAX_TOKENS}|v{BUILD_VERSION}"
-    assert models_of(current) == pds and models_of(pds) == pds
+    legacy = f"{pds}|amem@ceffb86|max_tokens={MAX_TOKENS}|v{BUILD_VERSION}"  # 现存写入的写法
     baseline = AMemBaseline()
-    baseline.root, baseline.protocol = tmp_path, current.replace(pds, "qwen3.8-flash|qwen:1024")
-    directory = tmp_path / "locomo_conv-1"
+    assert f"{pds}|{baseline.build_tag}" == legacy
+    baseline.root, baseline.protocol = tmp_path, pds
+    baseline.gateway = SimpleNamespace(usage=lambda bucket: {})  # type: ignore[assignment]
+    built: list[str] = []
+    monkeypatch.setattr(baseline, "build", lambda key, directory, sessions: built.append(key) or {})
+    key = "locomo_conv-1"
+    directory = tmp_path / key
     directory.mkdir()
-    (directory / "build.json").write_text(json.dumps({"protocol": current}), "utf-8")
+    record = directory / "build.json"
+    record.write_text(json.dumps({"protocol": legacy}), "utf-8")
+    assert baseline._ensure_built(key, directory, _locomo()) is None and built == []
+    baseline.protocol = "qwen3.8-flash|qwen:1024"
+    (directory / NOTES).write_text("[]", "utf-8")
     with pytest.raises(ConfigMismatchError, match="CUEMEM_PATHS__EVAL_SPACES"):
-        baseline._ensure_built("locomo_conv-1", directory, _locomo())
-    assert (directory / "build.json").exists()
+        baseline._ensure_built(key, directory, _locomo())
+    assert json.loads(record.read_text("utf-8")) == {"protocol": legacy}
+    assert (directory / NOTES).exists() and built == []
+    # 同一协议的旧版写入（回复上限 2000、v1）：重建，记下换掉的是哪一版
+    baseline.protocol = pds
+    record.write_text(json.dumps({"protocol": f"{pds}|amem@ceffb86|max_tokens=2000|v1"}), "utf-8")
+    stats = baseline._ensure_built(key, directory, _locomo())
+    assert stats is not None and built == [key]
+    assert stats["protocol"] == pds and stats["build_tag"] == baseline.build_tag
+    assert stats["replaced"] == {"build_tag": "amem@ceffb86|max_tokens=2000|v1"}
+    assert baseline._ensure_built(key, directory, _locomo()) is None  # 新记录照常复用
 
 
 # ---------- 装了 A-MEM 时：经网关端到端写入与检索 ----------
@@ -568,7 +586,8 @@ def test_build_and_retrieve_through_the_gateway(
 
     fake_api.chat_replies = [_fake_model]
     baseline = _baseline(offline_settings, fake_api)
-    assert baseline.protocol.endswith(f"|amem@ceffb86|max_tokens=4096|v{BUILD_VERSION}")
+    assert baseline.build_tag == f"amem@ceffb86|max_tokens=4096|v{BUILD_VERSION}"
+    assert baseline.protocol == f"qwen3.8-flash|{baseline.embedder.name}:{baseline.embedder.dim}"
     key, sessions = "locomo_conv-1", _locomo()
     directory = baseline.root / key
     question = "When did Caroline go to a support group?"

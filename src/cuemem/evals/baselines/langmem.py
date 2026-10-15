@@ -17,7 +17,8 @@ evals/external.py），只换"记忆从哪来"：
 - **检索**：`store.search(("memories",), query=问题, limit=60)`，即 LangMem 检索工具的做法；
   按名次装进约 4000 tokens（与 L1 的预算与装法相同：放不下的跳过，后面更短的还能放）。
   问题按查询向量化（网关对检索阶段的桶用 kind="query"，与 L1 相同；LangMem 参考的 OpenAI 向量
-  不分查询与文档，通义的分）。每条记忆标上写下它的会话日期，交给同一个回答模型、同一套提示。
+  不分查询与文档，通义的分），这次向量请求的用量由网关转记进这道题（见 evals/external.py）。
+  每条记忆标上写下它的会话日期，交给同一个回答模型、同一套提示。
 
 与 LangMem 自身默认（及唯一公开的 LoCoMo 跑法）不同的地方，以及原因：
 
@@ -71,8 +72,10 @@ evals/external.py），只换"记忆从哪来"：
    把新信息并进少数几条长记忆（共 20 条，最长 7461 个字符，2 条超过 max_chars），有 2 个会话
    回了空补丁（unchanged_sessions），1 个会话的补丁把路径写成列表 ["content"]、trustcall 改不了
    （skipped_edits，记作写入丢了）。
-10. store.json 与 build.json 记下写入用的抽取模型与向量器；评测空间的目录不分预设，换了模型
-    时删掉旧的写入重建，不沿用别的模型写出的记忆。
+10. store.json 与 build.json 记下写入用的抽取模型（别名）与向量器；评测空间的目录不分协议，
+    换了模型时不沿用别的模型写出的记忆，也不删掉它：基类按 build.json 的协议核对，另一个协议的
+    写入直接报错（见 evals/external.py；记协议之前的写入按 extractor、embedder 与 dim 核对），
+    装回 store.json 时再按别名核对一遍。
 11. 已知的限制：InMemoryStore 索引整个 JSON 值，CueMem 的向量器只取前 max_chars（6000）个
     字符，本机的 bge-small 还只看前 512 tokens（约 2000 个字符）；LangMem 合并出的长记忆
     （第一次试跑有两条一万多字符）尾部的内容因此检索不到，LangMem 参考的
@@ -108,6 +111,7 @@ from pathlib import Path
 from typing import Any
 
 from cuemem.core.models import Hit
+from cuemem.errors import ConfigMismatchError
 from cuemem.evals.datasets import EvalSession, Sample
 from cuemem.evals.external import ExternalBaseline, memory_hit
 from cuemem.read.l1 import estimate_tokens
@@ -237,15 +241,6 @@ class LangMemBaseline(ExternalBaseline):
 
     # ---------- 写入 ----------
 
-    def _ensure_built(
-        self, key: str, directory: Path, sessions: Sequence[EvalSession]
-    ) -> dict[str, Any] | None:
-        # 评测空间的目录不分预设：别的模型写出的记忆不能沿用。删掉 build.json，基类就整个目录重建
-        record = directory / "build.json"
-        if record.exists() and not same_identity(record, self._identity()):
-            record.unlink()
-        return super()._ensure_built(key, directory, sessions)
-
     def build(self, key: str, directory: Path, sessions: Sequence[EvalSession]) -> dict[str, Any]:
         # 整份写入放在一个事件循环里：异步路径会把写入错误抛出来（同步的 invoke 在线程池里
         # 写存储，向量请求失败时静默丢掉那条记忆）
@@ -346,7 +341,7 @@ class LangMemBaseline(ExternalBaseline):
         }
 
     def _identity(self) -> dict[str, Any]:
-        """写入用的模型：记进 store.json 与 build.json，复用前核对。评测空间的目录不分预设，
+        """写入用的模型：记进 store.json 与 build.json，装回时核对。评测空间的目录不分协议，
         换了模型（如从 deepseek 预设换到通义）不能悄悄沿用别的模型写出的记忆。"""
         return {
             "extractor": self.llm.settings.roles[self.gateway.role].model,
@@ -517,15 +512,6 @@ def check_build(
         )
 
 
-def same_identity(record: Path, identity: Mapping[str, Any]) -> bool:
-    """build.json 里记下的抽取模型与向量器是否与当前相同（旧记录缺字段时算不同）。"""
-    try:
-        built = json.loads(record.read_text("utf-8"))
-    except (OSError, ValueError):
-        return False
-    return all(built.get(field) == value for field, value in identity.items())
-
-
 def package_versions() -> dict[str, str]:
     """写入时实际用的版本（命令里钉住了，这里再记一份）。"""
     versions = {}
@@ -624,13 +610,15 @@ def load_store(
 ) -> tuple[Any, dict[str, dict[str, str]]]:
     """store.json → InMemoryStore（向量原样装回）与每条记忆的写入会话。
 
-    写入用的模型与当前不同时拒绝装回（先核对，再导入 langgraph）。正常走不到这里：
-    _ensure_built 已按 build.json 核对过，不同就重建。"""
+    写入用的模型与当前不同时拒绝装回（先核对，再导入 langgraph）。基类已按 build.json 的协议
+    （model_id 与向量模型）核对过；这里还按别名核对，model_id 相同而别名不同（如 deepseek-flash
+    与 deepseek-flash-thinking）时也报错，同样不删。"""
     payload = json.loads(path.read_text("utf-8"))
     if payload.get("identity") != dict(identity):
-        raise RuntimeError(
+        raise ConfigMismatchError(
             f"{path.parent} 是用 {payload.get('identity')} 写入的，当前是 {dict(identity)}："
-            "换了模型就删掉这个目录重建"
+            "换了模型写的记忆不能沿用。换协议要换评测空间的目录（CUEMEM_PATHS__EVAL_SPACES，"
+            "见 evals/external.py）；确实不要这份写入了，先把这个目录挪走再运行"
         )
     from langgraph.store.base import Item  # type: ignore[import-not-found, unused-ignore]
     from langgraph.store.memory import InMemoryStore  # type: ignore[import-not-found, unused-ignore]

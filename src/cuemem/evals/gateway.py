@@ -26,6 +26,10 @@
 工具调用的回复、带工具却没调用的回复、因长度上限被截断的回复：外部系统吞掉或静默丢掉的东西
 （如 trustcall 把模型调用的错误改写成提示重试）在写入记录里看得到。
 
+请求在网关的服务线程里执行，用量只进桶、不进调用方的 trace。外部系统检索时（回答一道题的中途）
+经网关的请求，用 `forward(桶, trace)` 把这段时间里这个桶的用量事件（LLM、向量）另外转记进那道题
+的 trace，于是算进它的回答用量；桶里照常累计。
+
 出错时照 OpenAI 的语义回给外部系统，由它们按自己的策略处理：
 - **限流**：上游的 429 在 LLM 客户端里已经由 SDK 退避重试过（providers.*.max_retries 次，照上游
   的 Retry-After 等），仍然限流时回 429 并带上上游的 Retry-After，由外部系统自己退避重试，网关
@@ -48,6 +52,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -56,7 +61,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import APIError, APITimeoutError, BadRequestError, RateLimitError
 
-from cuemem.core.trace import start_trace
+from cuemem.core.trace import Trace, start_trace
 from cuemem.embed.base import EmbedKind, TextEmbedder
 from cuemem.errors import ContentFilteredError, CueMemError, EmbeddingAPIError
 from cuemem.llm.client import LLMClient, Message, unparsable_json
@@ -127,6 +132,7 @@ class Gateway:
             else llm.settings.consolidation.fallback_model
         )
         self._usage: dict[str, BucketUsage] = {}
+        self._forward: dict[str, Trace] = {}  # 桶 → 另外转记用量事件的 trace（见 forward）
         self._lock = threading.Lock()
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
@@ -172,6 +178,39 @@ class Gateway:
     def usage(self, bucket: str = DEFAULT_BUCKET) -> dict[str, Any]:
         with self._lock:
             return self._bucket(bucket).as_dict()
+
+    @contextmanager
+    def forward(self, bucket: str, trace: Trace | None) -> Iterator[None]:
+        """这段时间里发到 bucket 的请求，用量事件（LLM、向量……）另外转记进 trace（桶里照常累计）。
+
+        外部系统检索时经网关的请求在网关的服务线程里执行，不在那道题的 trace 里；转记过去，它们
+        就算进那道题的用量。一个桶同一时间只转给一个 trace：调用方保证这段时间里只有这一道题在用
+        这个桶（ExternalBaseline 在空间锁里检索），否则别的题的请求也会记到它名下。请求在离开这段
+        时间之后才处理完（调用方超时放弃了）的，只进桶。trace 为 None 时什么也不做。"""
+        if trace is None:
+            yield
+            return
+        with self._lock:
+            previous = self._forward.get(bucket)
+            self._forward[bucket] = trace
+        try:
+            yield
+        finally:
+            with self._lock:
+                if previous is None:
+                    self._forward.pop(bucket, None)
+                else:
+                    self._forward[bucket] = previous
+
+    def _relay(self, bucket: str, trace: Trace) -> None:
+        """一次请求（trace 是网关为它开的）的事件转记到 forward 指定的 trace，标上桶名。"""
+        with self._lock:
+            target = self._forward.get(bucket)
+        if target is None or target is trace:  # 网关的请求本来就在那个 trace 里时不重复记
+            return
+        for event in list(trace.events):
+            data = {k: v for k, v in event.items() if k not in ("kind", "t_ms")}
+            target.add_event(event["kind"], **{**data, "bucket": bucket})
 
     # ---------- 接口 ----------
 
@@ -262,6 +301,8 @@ class Gateway:
                     rate_limited=isinstance(exc, RateLimitError),
                 )
                 raise
+            finally:  # 失败之前的调用（如被拒的主模型）也记账
+                self._relay(bucket, trace)
         self._count_chat(bucket, requested, trace, fallback_used)
         self._count_reply(bucket, result, tools is not None, json_mode)
         return result, alias
@@ -313,6 +354,7 @@ class Gateway:
                 batch = self.embedder.embed(texts, embed_kind(bucket))
             except EmbeddingAPIError as exc:  # 向量器自己已经按退避重试过：网关不再重试
                 failure = exc
+        self._relay(bucket, trace)
         from cuemem.evals.runner import usage_from_trace
 
         usage = usage_from_trace(trace)  # 失败之前已经完成的分批也花了钱

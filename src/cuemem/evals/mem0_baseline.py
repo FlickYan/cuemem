@@ -13,6 +13,11 @@
 - **检索**：`Memory.search(top_k=30)`，两人对话每位说话人各取 30 条。Mem0 2.x 的混合检索
   （语义 + BM25 + 实体加权）需要 spaCy 与 fastembed，运行命令里一并装上；每条记忆标上来源会话
   的日期（两人对话再注明是谁的记忆），交给同一个回答模型、同一套提示（与 B2 朴素检索的格式相同）。
+  检索在回答线程里调用 CueMem 的向量器，用量本来就记在这道题名下。
+- **写入记录**：每份对话历史写完留下 build.json，记下协议（"抽取模型|向量模型:维度"，与其他外部
+  基线同一写法，见 evals/external.py）。写入目录（paths.eval_spaces / mem0）不分协议：另一个
+  协议的写入不删也不复用，直接报 ConfigMismatchError（pq 协议的写入在 data/eval-spaces-qwen，
+  用 CUEMEM_PATHS__EVAL_SPACES 指过去）；没记协议的旧记录按当前协议处理。
 
 mem0ai 不是 CueMem 的依赖，评测时用 uv 临时装上（遥测在导入前关闭）：
 
@@ -50,6 +55,7 @@ from cuemem.evals.datasets import (
     build_matches_session_ids,
     storage_space_id,
 )
+from cuemem.evals.external import check_protocol, model_ids, protocol_of
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.llm.client import LLMClient, Message
 
@@ -173,6 +179,7 @@ class Mem0Baseline:
         self._ready = False
         self._build_spent = 0.0
         self._failed: dict[str, str] = {}  # 写入失败过的对话历史：不再反复重建（每次都要花钱）
+        self._model_ids: dict[str, str] = {}
 
     def _setup(self, llm: LLMClient) -> None:
         """第一次回答时初始化：沿用评测的 LLM 客户端（同一本账），向量器按同一份配置构造。"""
@@ -183,6 +190,9 @@ class Mem0Baseline:
             self.root = settings.paths.eval_spaces / "mem0"
             self.llm = llm
             self.embedder = build_embedder(settings, ledger=llm.ledger)
+            # 写入协议：记进 build.json，另一个协议的写入不复用也不删（见模块说明）
+            self.protocol = protocol_of(settings, self.embedder)
+            self._model_ids = model_ids(settings)
             self.mem0 = _import_mem0(self.root / "_home")
             self._ready = True
 
@@ -221,13 +231,17 @@ class Mem0Baseline:
 
         记忆的元数据里存着会话 ID（证据的抬头会显示它）：LongMemEval / MemLens 的写入记下
         会话 ID 的写法，对不上就重建（改写之前的写入没有这条记录，都是原始 ID）。
+
+        写入记录记下协议（抽取模型与向量模型）：另一个协议的写入报 ConfigMismatchError，不删也
+        不复用（目录不分协议，见模块说明）；没记协议的旧记录按当前协议处理。
         """
         directory = self.root / key
         record = directory / "build.json"
-        if record.exists() and (
-            session_ids == "native" or build_matches_session_ids(_read_json(record), session_ids)
-        ):
-            return None
+        if record.exists():
+            stored = _read_json(record)
+            check_protocol(stored, self.protocol, directory, "Mem0", self._model_ids)
+            if session_ids == "native" or build_matches_session_ids(stored, session_ids):
+                return None
         with self._lock:
             if key in self._failed:
                 raise RuntimeError(f"Mem0 写入这份对话历史时失败过，不再重试：{self._failed[key]}")
@@ -243,6 +257,7 @@ class Mem0Baseline:
             with self._lock:
                 self._failed[key] = f"{type(exc).__name__}: {exc}"[:300]
             raise
+        stats["protocol"] = self.protocol
         if session_ids != "native":  # LoCoMo 的写入记录不变
             stats["session_ids"] = session_ids
         record.write_text(json.dumps(stats, indent=2), "utf-8")

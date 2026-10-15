@@ -93,11 +93,11 @@ evals/external.py），只换"记忆从哪来"：
    演化，而 SDK 重发的请求与原请求相同，LLM 客户端会把它合并到还在等的那次调用上，并不会重新
    请求上游。DeepSeek 有时把请求挂起十几分钟（只发空行保活，高峰时更常见），写入就等它；
    挂起后回的空内容按第 10 条重试。
-12. 写入缓存：基类按抽取模型与向量模型区分协议，这里再加上 A-MEM 的提交、回复上限与写入格式的
-    版本，变了旧写入就作废重建。换抽取模型或向量模型（例如从 pds 换到 pq 协议）时不覆盖已有
-    的写入，直接报错：基类会把另一协议的写入删掉重建，而评测空间的目录不分协议。用通义的协议要
-    用另一个目录：CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen（与 scripts/n12_baselines.py
-    相同）。
+12. 写入缓存：基类按抽取模型与向量模型区分协议，换了（例如从 pds 换到 pq 协议）不覆盖已有的
+    写入，直接报错（评测空间的目录不分协议）；用通义的协议要用另一个目录：
+    CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen（与 scripts/n12_baselines.py 相同）。写入
+    标记（build_tag）是 A-MEM 的提交、回复上限与写入格式的版本，变了旧写入就作废重建；早先它接
+    在 build.json 的 protocol 后面（`…|amem@ceffb86|max_tokens=4096|v4`），基类照样认得。
 
 A-MEM 不是 CueMem 的依赖，评测时用 uv 临时装上（--extra local 只在用本机向量时需要，如
 deepseek 预设）。它依赖 sentence-transformers，会顺带装上 torch（约 5 GB，这里用不到，但
@@ -142,7 +142,7 @@ from typing import Any
 from openai import APIConnectionError, BadRequestError, InternalServerError, RateLimitError
 
 from cuemem.core.models import Hit
-from cuemem.errors import ConfigMismatchError, ContentFilteredError
+from cuemem.errors import ContentFilteredError
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.external import ExternalBaseline, memory_hit
 from cuemem.evals.gateway import _with_schema
@@ -249,11 +249,6 @@ def top_k() -> int:
     if not raw.isdigit() or int(raw) <= 0:
         raise ValueError(f"{K_ENV} 要是正整数，现在是 {raw!r}")
     return int(raw)
-
-
-def models_of(protocol: str) -> str:
-    """写入记录里的协议 → 其中的"抽取模型|向量模型"部分（去掉 A-MEM 自己加的后缀）。"""
-    return protocol.split("|amem@", 1)[0]
 
 
 def strings(value: Any) -> list[str]:
@@ -734,6 +729,8 @@ class _Space:
 
 class AMemBaseline(ExternalBaseline):
     name, label, system = "MA", "外部基线：A-MEM（agiresearch/A-mem，agentic memory）", "amem"
+    # A-MEM 写入的参数（见模块说明第 12 条）
+    build_tag = f"amem@{COMMIT[:7]}|max_tokens={MAX_TOKENS}|v{BUILD_VERSION}"
 
     def __init__(self) -> None:
         super().__init__()
@@ -743,8 +740,7 @@ class AMemBaseline(ExternalBaseline):
             self.label = f"{self.label}，k={self.k}"
 
     def setup(self) -> None:
-        """导入 A-MEM 前关掉 Chroma 的遥测与 LiteLLM 联网取价格表；构造时不碰共享的 Chroma。
-        协议加上 A-MEM 写入的参数（见模块说明第 12 条）。"""
+        """导入 A-MEM 前关掉 Chroma 的遥测与 LiteLLM 联网取价格表；构造时不碰共享的 Chroma。"""
         os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
         os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
         try:
@@ -757,24 +753,6 @@ class AMemBaseline(ExternalBaseline):
         amem.ChromaRetriever = _Detached
         self.amem = amem
         self.model = self.llm.settings.roles[self.gateway.role].model
-        self.protocol = (
-            f"{self.protocol}|amem@{COMMIT[:7]}|max_tokens={MAX_TOKENS}|v{BUILD_VERSION}"
-        )
-
-    def _ensure_built(
-        self, key: str, directory: Path, sessions: Sequence[EvalSession]
-    ) -> dict[str, Any] | None:
-        """另一个协议（抽取模型或向量模型不同）的写入不删：基类会删掉重建，而目录不分协议。"""
-        record = directory / "build.json"
-        if record.exists():
-            built = str(json.loads(record.read_text("utf-8")).get("protocol") or "")
-            if built and models_of(built) != models_of(self.protocol):
-                raise ConfigMismatchError(
-                    f"{directory} 是另一个协议（{models_of(built)}）的 A-MEM 写入，现在是 "
-                    f"{models_of(self.protocol)}；不覆盖。换协议时换评测空间的目录，如 "
-                    "CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen（见模块说明第 12 条）"
-                )
-        return super()._ensure_built(key, directory, sessions)
 
     # ---------- 网关客户端 ----------
 

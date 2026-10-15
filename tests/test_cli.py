@@ -234,3 +234,29 @@ def test_data_download_skips_optional_datasets(
     assert "wildchat" not in fetched and "longmemeval_s" in fetched
     assert runner.invoke(app, ["data", "download", "wildchat"]).exit_code == 0
     assert fetched[-1] == "wildchat"
+
+
+def test_eval_errors_are_listed_once_per_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """评测结束时出错的组合按报错归并列出：外部基线的协议报错每道题各记一次，这里只列一次；
+    后来重跑成功的不算；报错里的方括号原样显示（不当作终端标记）。"""
+    import json
+
+    from cuemem.cli import _print_errors
+
+    mismatch = "ConfigMismatchError: x 是另一个协议的 mem0 写入……CUEMEM_PATHS__EVAL_SPACES=y"
+    errors = [{"sample_id": f"q{i}", "method": "M0", "error": mismatch} for i in range(3)]
+    errors.append({"sample_id": "q9", "method": "B4", "error": "RuntimeError: [boom]"})
+    errors.append({"sample_id": "q8", "method": "B4", "error": "RuntimeError: fixed later"})
+    (tmp_path / "errors.jsonl").write_text(
+        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in errors), "utf-8"
+    )
+    done = {"sample_id": "q8", "method": "B4"}
+    (tmp_path / "results.jsonl").write_text(json.dumps(done) + "\n", "utf-8")
+    _print_errors(tmp_path, limit=1)
+    out = _flat(capsys.readouterr().out)
+    assert out.count("CUEMEM_PATHS__EVAL_SPACES") == 1 and "M0×3" in out
+    assert "另有1种报错" in out and "fixed" not in out
+    _print_errors(tmp_path)
+    assert "B4×1：RuntimeError:[boom]" in _flat(capsys.readouterr().out)

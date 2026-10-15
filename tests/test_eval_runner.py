@@ -11,7 +11,7 @@ import pytest
 from fakes import FakeAPI
 
 from cuemem.config import Settings
-from cuemem.errors import EmbeddingAPIError
+from cuemem.errors import ConfigMismatchError, EmbeddingAPIError
 from cuemem.evals.datasets import load_longmemeval
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.evals.report import build_report, load_rows
@@ -151,6 +151,42 @@ def test_errors_are_recorded_and_retried(eval_settings: Settings, fake_api: Fake
     assert {e["stage"] for e in errors} == {"answer"}
     assert "故意出错" in errors[0]["error"]
     assert not (summary.run_dir / "results.jsonl").exists()  # 出错的组合不算完成，下次会重试
+
+
+MISMATCH = (
+    "/data/eval-spaces/toy/longmemeval_s_q 是另一个协议（a|e:8）的 toy 写入，这次运行的协议是 "
+    "b|e:8：不复用，也不覆盖。……设 CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen"
+)
+
+
+class MismatchedMethod:
+    """像写入目录里是另一个协议的写入的外部基线：每道题都报同一个配置错误，不花钱。"""
+
+    name, label, needs_index, needs_consolidation = "MX", "协议对不上", False, False
+
+    def answer(self, ctx: MethodContext) -> MethodOutput:
+        raise ConfigMismatchError(MISMATCH)
+
+
+def test_config_mismatch_from_a_baseline_is_reported_once(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """外部基线的协议报错每道题各记一次（errors.jsonl），其余方法照常；报告与命令行按报错归并，
+    只列一次，带上解决办法。"""
+    from cuemem.evals.report import error_groups, pending_errors
+
+    fake_api.chat_replies = [fake_model]
+    config = RunConfig(name="mismatch", dataset="longmemeval_s", split=None, methods=["B0"])
+    runner = EvalRunner(eval_settings, config, http_client=fake_api.client())
+    runner.methods = [*runner.methods, MismatchedMethod()]
+    summary = runner.run(load_longmemeval(FIXTURES / "longmemeval_mini.json"))
+    assert (summary.completed, summary.errors) == (3, 3)
+    assert error_groups(pending_errors(summary.run_dir)) == [
+        ("MX", f"ConfigMismatchError: {MISMATCH}", 3)
+    ]
+    report = build_report(summary.run_dir).read_text(encoding="utf-8")
+    assert "有 3 个组合出错未计入结果" in report
+    assert f"  - MX × 3：ConfigMismatchError: {MISMATCH}" in report
 
 
 class FailingEmbedder:

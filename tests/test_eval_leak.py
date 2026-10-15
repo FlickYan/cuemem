@@ -385,6 +385,7 @@ def test_mem0_stores_are_keyed_by_id_scheme(tmp_path: Path, lme_path: Path) -> N
     class Stub(Mem0Baseline):
         def _setup(self, llm: Any) -> None:
             self.root = tmp_path / "mem0"
+            self.protocol = "qwen3.8-flash|hash-256:256"
 
         def _build(self, key: str, sessions: Any) -> dict[str, Any]:
             (self.root / key).mkdir(parents=True)  # 真的写入时由 Mem0 的存储建目录
