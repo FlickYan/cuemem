@@ -340,6 +340,10 @@ METHOD_NAMES = (
     "B5-see",
     "ORACLE",
     "M0",
+    "MG",
+    "ML",
+    "MC",
+    "MA",
 )
 
 # N12：更多外部基线（evals/baselines/），都要用 uv 临时装上对应的包，见各模块说明
