@@ -93,7 +93,21 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | 事实变了怎么办 | 失效而不删除，两条时间轴，`history()` | v3 只增不改 | LLM 改写记忆块 | 失效而不删除，两条时间轴 | 新的取代旧的，保留历史 |
 | 图片 | 保存原图，回答时取回再看 | 转成文字 | 未见 | 只支持文本与 JSON | OCR |
 | 遗忘 | 删出处的对话、沿引用扩散、找没有引用的转述；可预演 | `delete` | 编辑记忆 | `remove_episode` | `forget_matching`，可预演 |
-| 评测 | 方法事先冻结、测试集只用一次、同一判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
+| 评测 | 方法事先冻结、测试集只用一次、同样的模型与判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
+
+**同一协议下的对比（N12）**：我们自己在 LoCoMo 200 题上跑了 5 个开源记忆系统，各用自己的写入与检索流程，抽取模型、向量、回答模型与判分都和 CueMem 相同；只用 DeepSeek、只用通义两个协议，每个配置跑一次。
+
+| LoCoMo test200r | 只用 DeepSeek | 只用通义 |
+|---|---|---|
+| CueMem L1 / L2 | 82.5% / **87.0%** | 81.5% / **85.0%** |
+| Mem0 2.2.1 | 81.0% | 77.5% |
+| LangMem 0.0.30 | 78.0% | 30.0% |
+| Cognee 1.6.4 | 77.5% | 74.0% |
+| Graphiti（graphiti-core 0.30.2） | 59.0% | 41.5% |
+| A-MEM | MA-PENDING | MA-PENDING |
+| 全上下文 | 84.5% | 80.0% |
+
+L2 在两个协议下都显著高于 Mem0、LangMem、Cognee 与 Graphiti（配对符号检验 p ≤ 0.017），对 A-MEM：MA-PENDING；检索时不调用 LLM 的 L1 在只用 DeepSeek 时与 Mem0、LangMem、Cognee 没有显著差别（对 A-MEM：MA-PENDING）。Graphiti 与 LangMem 在通义下大幅掉分：用它们自己的提示词，qwen3.8-flash 抽出的实体与记忆少得多。CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调的（N3–N7），只用通义对它是主场；只用 DeepSeek 时没有哪个系统为模型调过提示词，L2 的领先同样成立。详见 [N12 外部基线](docs/results/n12-baselines/README.md)与[对比文档](docs/landscape.md#同一协议下的对比n12)。
 
 CueMem 的短板在产品层：只有 Python、只支持 SQLite + Qdrant、只有一个共享的访问令牌、框架集成目前只有三个（见[还差什么](docs/landscape.md#7-还差什么)）。
 
@@ -164,6 +178,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | [相关工作](docs/related-work.md) | 与 MemGPT、Mem0、Zep、HippoRAG、Adaptive-RAG、MemLens 等的对比与定位 |
 | [开源同类项目](docs/landscape.md)（[English](docs/en/landscape.md)） | 与 Mem0、Letta、Graphiti / Zep、Cognee、Supermemory 等 12 个项目逐项对比；各家公开的分数；N12 借鉴了什么、还差什么 |
 | [框架集成](docs/integrations.md)（[English](docs/en/integrations.md)） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool 的用法与局限 |
+| [N12 外部基线](docs/results/n12-baselines/README.md) | 同一协议下（只用 DeepSeek / 只用通义）与 Mem0、Graphiti、LangMem、Cognee、A-MEM 在 LoCoMo 上的对比：准确率、写入成本、配对检验、换模型的影响 |
+| [会话 ID 泄漏](docs/results/n12-leak/README.md) | LongMemEval 证据会话的 ID 泄漏：修复、三臂对照与对已发布数字的影响 |
 | [设计决策记录](docs/decisions.md)（[English](docs/en/decisions.md)） | 每个重要取舍的背景、备选方案与理由 |
 | [演示指南](demo/README.md)（[English](demo/README.en.md)） | 3 分钟演示：准备、步骤、讲什么 |
 
@@ -204,7 +220,7 @@ N10 之后自查出 11 处不足，逐项处理。控制器的改动在开发集
 1. **控制器 v2**：有图的空间直接查图片空间的准确率表（看图增益不再相加截断），问画面细节时不放到 L0。开发集 81.2% → 81.7%，测试集事后重放 81.6% → 81.9%（+10 / −5，收益全在 MemLens）。N9 归因于饱和的 6 道题确实救回来了，但新表在别处也改了选择，净值为零；净收益来自保底规则。之后的 v3 只在问到图时才看图（D-058）：v2 在有图的空间里几乎每题都附原图，演示里 Agent 把上一题又答一遍就是被这张图带偏的；开发集准确率不变，看图比例从几乎全部降到三分之一。
 2. **换回答模型**：重新标定准确率表反而更差；按回答模型调 λ 有效（λ = 15 补回与总是 L2 的大部分差距，成本仍低 16–24%）。
    **门控在真实流量上**：无关查询换成 WildChat 里真实用户消息的第一句，门控误送去检索 10.5%（构造的混合流 17.3%），比总是检索省 46%（原来 41%）。
-3. **外部基线 Mem0**：开源版 2.2，用同样的抽取模型、向量、回答模型与判分，LoCoMo 200 题 80.5%、LongMemEval 100 题 83.0%。CueMem 的 L1 在 LoCoMo 上与它打平（81.0%），在 LongMemEval 上高 9 个点（92.0%，p = 0.049）；Mem0 的写入成本是 2.3–2.9 倍。它找得到证据会话，丢分在时间推理、知识更新与助手说过的细节：只增不改的抽取留不住这些。
+3. **外部基线 Mem0**：开源版 2.2，用同样的抽取模型、向量、回答模型与判分，LoCoMo 200 题 80.5%、LongMemEval 100 题 83.0%。CueMem 的 L1 在 LoCoMo 上与它打平（81.0%），在 LongMemEval 上高 9 个点（92.0%，p = 0.049）；Mem0 的写入成本是 2.3–2.9 倍。它找得到证据会话，丢分在时间推理、知识更新与助手说过的细节：只增不改的抽取留不住这些。这两个 LongMemEval 数字是在会话 ID 泄漏修复之前测的（D-067，[泄漏对照](docs/results/n12-leak/README.md)）：修复后同样配置重跑，同样 100 题 L1 90.0%、Mem0 79.0%，Mem0 发布的 83.0% 可能高了几个点。
 4. **判分与随机性**：换一家的判分模型重判 12,835 条回答，一致率 94.7–97.9%（κ 0.82–0.93），方法排序基本不变；关掉缓存重跑，准确率变化不超过 0.9 个点，3–4% 的题翻转。N9 的结论里只有一条不稳：LoCoMo 上 L1 比全上下文低 2.3 个点（换判分后不显著，重跑后 1.5 个点）。人工抽检 50 条判分（按数据集分层）：勾选的 48 条全部同意；另有 2 条 LoCoMo 题未勾选，两个判分模型都判它们为错。
 5. **写入与遗忘**：对账提示分清"范围不同""现实变了""说错了"，并附上新事实出自的原话（只看"Mia 31 岁"分不清是更正还是过了生日）；新编的小对话重复 5 次，三类都对（N9 的提示：3 / 5、5 / 5、0 / 5）。Agent 的回答缓存按会话归属，遗忘不再清掉别的会话的缓存。
 6. **规模与部署**：读路径的本机部分在本地模式下随规模线性增长（4.6 万个检索单元约 1.08 s），换 Qdrant 服务端后 91 ms；单进程并发 8.7 → 55 次 / 秒。本地库被占用时明确报错，`cuemem migrate-vectors` 迁到服务端，可选访问令牌。
@@ -225,6 +241,8 @@ N10 之后自查出 11 处不足，逐项处理。控制器的改动在开发集
 | B6 学到的控制器 | 90.5% / $2.42 | 82.2% / $2.21 | 60.0% / $3.14 | 60.5% / $3.61 |
 | B3 模型自主检索 | 92.0% / $3.11 | **85.5%** / $3.15 | 46.7% / $4.21 | — |
 | B6a 控制器先选、模型兜底 | 90.0% / $5.35 | 84.4% / $4.21 | 61.5% / $8.10 | — |
+
+LongMemEval 一列里，除全上下文外的各行都是在 N12 修复会话 ID 泄漏（D-067）之前测的：证据抬头里的会话 ID 能认出哪些是证据会话。[泄漏对照](docs/results/n12-leak/README.md)里 L1、L2 与控制器都没有可测的虚高（模型自主检索没有做这个对照），与全上下文的差距不变；数字照原样保留。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/n9-final/pareto-dark.png">
