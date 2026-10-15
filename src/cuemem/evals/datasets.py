@@ -12,9 +12,17 @@
 sharegpt_、ultrachat_ 或一串十六进制；而回答模型看到的每条检索证据都标着会话 ID，等于告诉它哪些
 是证据。加载时按会话在这份历史里的时间顺序改写成中性的 session_<i>（与 LoCoMo 自带的写法相同），
 证据会话与证据发言随之改写，检索指标不变；原 ID 留在 EvalSession.source_id，只用于追溯，不进
-任何提示。MemLens 同样改写。环境变量 CUEMEM_EVAL_RAW_SESSION_IDS=1 恢复原始 ID（复现泄漏的
-消融）。两种写法的记忆不能混用：持久化的写入（CueMem 的评测空间、Mem0 与外部基线的写入）按
-storage_name / storage_space_id 分开存，写入记录里另记一份 session_ids 核对。
+任何提示。MemLens 同样改写。两种写法的记忆不能混用：持久化的写入（CueMem 的评测空间、Mem0 与
+外部基线的写入）按 storage_name / storage_space_id 分开存，写入记录里另记一份 session_ids 核对。
+
+消融用环境变量 CUEMEM_EVAL_RAW_SESSION_IDS（只影响 LongMemEval / MemLens）：
+- =1：恢复原始 ID，与修复之前逐字节相同（旧的空间、写入与响应缓存照常命中）。但它与默认之间
+  不只差证据抬头里的几个字：轮、事实等记录的 ID 是含会话 ID 的哈希，排序遇到并列时按 ID 定
+  先后（同一会话的几轮时间相同，回答模型看到的先后就由哈希决定；检索分数并列时也是），换了
+  会话 ID，这些先后跟着变。这部分差异与泄漏无关、没有偏向，但会算进两者的差里。
+- =label：会话 ID 照常改写（存储、排序、检索与默认完全相同，共用改写后的空间与写入），只在
+  回答模型看到的证据抬头里显示原始 ID（source_labels，经 read.reader.session_labels 生效）：
+  与默认之间只差抬头里的会话名，是泄漏本身的干净消融；提示与旧运行不同，不命中旧的缓存。
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx2
 
@@ -37,6 +45,7 @@ from cuemem.core.models import Conversation, SessionIn, TurnIn
 # 顺序改写的；raw 是 LongMemEval / MemLens 的原始 ID（会泄漏证据会话，只用于消融）
 SessionIds = Literal["native", "anon", "raw"]
 RAW_SESSION_IDS_ENV = "CUEMEM_EVAL_RAW_SESSION_IDS"
+RAW_LABELS_VALUE = "label"  # CUEMEM_EVAL_RAW_SESSION_IDS=label：只有证据抬头显示原始 ID
 ANON_SUFFIX = "-anon"  # 改写过会话 ID 的持久化写入：数据集名加这个后缀，与旧的写入分开
 _ANONYMIZED_DATASETS = ("longmemeval", "memlens_")
 
@@ -171,12 +180,14 @@ class Sample:
 
 @dataclass
 class EvalSet:
-    """一组题目及其对话历史。session_ids 是会话 ID 的写法（见模块说明）。"""
+    """一组题目及其对话历史。session_ids 是会话 ID 的写法；raw_labels 为 True 时（只在 anon 下）
+    证据抬头显示原始 ID（label 消融，见模块说明）。"""
 
     dataset: str
     samples: list[Sample]
     haystacks: dict[str, list[EvalSession]]
     session_ids: SessionIds = "native"
+    raw_labels: bool = False
 
     def sessions_of(self, sample: Sample) -> list[EvalSession]:
         return self.haystacks[sample.space_key]
@@ -185,10 +196,38 @@ class EvalSet:
 # ---------- 会话 ID ----------
 
 
+def _requested() -> str:
+    return os.environ.get(RAW_SESSION_IDS_ENV, "").strip().lower()
+
+
 def raw_session_ids_requested() -> bool:
     """环境变量 CUEMEM_EVAL_RAW_SESSION_IDS=1：LongMemEval / MemLens 保留原始会话 ID。"""
-    value = os.environ.get(RAW_SESSION_IDS_ENV, "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    return _requested() in {"1", "true", "yes", "on"}
+
+
+def raw_session_labels_requested() -> bool:
+    """环境变量 CUEMEM_EVAL_RAW_SESSION_IDS=label：会话 ID 照常改写，只有证据抬头显示原始 ID。"""
+    return _requested() == RAW_LABELS_VALUE
+
+
+def source_labels(sessions: Iterable[EvalSession]) -> dict[str, str]:
+    """改写后的会话 ID → 数据集的原始 ID（label 消融里证据抬头显示的会话名）。"""
+    return {s.session_id: s.source_id for s in sessions if s.source_id}
+
+
+def run_session_ids(info: Mapping[str, Any]) -> SessionIds:
+    """一次已有运行（run.json）的会话 ID 写法。分析已有运行的脚本要按它加载数据集、找写入，
+    不能看当前的环境变量。改写之前的运行没有记下写法：LongMemEval / MemLens 的都是原始 ID。"""
+    recorded = info.get("session_ids")
+    if recorded in ("native", "anon", "raw"):
+        return cast(SessionIds, recorded)
+    dataset = str((info.get("config") or {}).get("dataset", ""))
+    return session_id_scheme(dataset, raw=True)
+
+
+def run_raw_labels(info: Mapping[str, Any]) -> bool:
+    """一次已有运行是不是 label 消融（证据抬头显示原始 ID；run.json 的 session_labels）。"""
+    return info.get("session_labels") == "source"
 
 
 def session_id_scheme(dataset: str, raw: bool | None = None) -> SessionIds:
@@ -226,13 +265,20 @@ def build_matches_session_ids(build: Mapping[str, Any], scheme: SessionIds) -> b
     return build.get("session_ids", "raw") == scheme
 
 
+def _raw_labels(scheme: SessionIds, requested: bool | None) -> bool:
+    """label 消融只在改写过的会话 ID 上有意义（原始 ID 时抬头本来就是原始 ID）。"""
+    if scheme != "anon":
+        return False
+    return raw_session_labels_requested() if requested is None else requested
+
+
 def anonymize_sessions(sessions: Sequence[EvalSession]) -> dict[str, str]:
     """把一份对话历史的会话 ID 改写成 session_<i>：i 是会话在这份历史里的时间顺序（从 1 开始，
     同一时间的保持原顺序）。原 ID 记进 source_id。返回 原 ID → 新 ID。
 
     同一份历史里出现两次的原 ID（LongMemEval_S 有 13 份历史各有一个，内容相同、时间不同）按
-    第一次出现的位置编号、共用一个新 ID：只换名字，哪些会话算同一个与原始 ID 时完全相同，
-    消融（原始 ID）与默认（改写）之间只差会话 ID 这几个字。"""
+    最早的那次编号、共用一个新 ID：只换名字，哪些会话算同一个与原始 ID 时完全相同。写入的内容
+    相同，但含会话 ID 的哈希 ID（轮、事实）变了，并列时的先后跟着变（见模块说明）。"""
     order = sorted(range(len(sessions)), key=lambda i: sessions[i].started_at)
     mapping: dict[str, str] = {}
     for i in order:
@@ -311,15 +357,21 @@ def _fetch(url: str, target: Path, timeout_s: float) -> None:
 
 
 def load(
-    name: str, path: Path, *, ids: Collection[str] | None = None, raw_ids: bool | None = None
+    name: str,
+    path: Path,
+    *,
+    ids: Collection[str] | None = None,
+    raw_ids: bool | None = None,
+    raw_labels: bool | None = None,
 ) -> EvalSet:
-    """raw_ids：LongMemEval / MemLens 是否保留原始会话 ID（None 时看环境变量，见模块说明）。"""
+    """raw_ids：LongMemEval / MemLens 是否保留原始会话 ID；raw_labels：改写后是否只在证据抬头
+    显示原始 ID（label 消融）。都是 None 时看环境变量（见模块说明）。"""
     if name == "longmemeval_s":
-        return load_longmemeval(path, ids=ids, dataset=name, raw_ids=raw_ids)
+        return load_longmemeval(path, ids=ids, dataset=name, raw_ids=raw_ids, raw_labels=raw_labels)
     if name == "locomo":
         return load_locomo(path, ids=ids)
     if name.startswith("memlens_"):
-        return load_memlens(path, ids=ids, dataset=name, raw_ids=raw_ids)
+        return load_memlens(path, ids=ids, dataset=name, raw_ids=raw_ids, raw_labels=raw_labels)
     raise KeyError(f"未知数据集 {name}，可选：{sorted(DATASETS)}")
 
 
@@ -334,11 +386,13 @@ def load_longmemeval(
     ids: Collection[str] | None = None,
     dataset: str = "longmemeval_s",
     raw_ids: bool | None = None,
+    raw_labels: bool | None = None,
 ) -> EvalSet:
     """加载 LongMemEval。ids 不为空时只转换这些题目（完整文件约 277 MB）。
 
     会话 ID 默认按时间顺序改写成 session_<i>，证据会话随之改写（见模块说明）；
-    raw_ids=True（或环境变量 CUEMEM_EVAL_RAW_SESSION_IDS=1）保留原始 ID。"""
+    raw_ids=True（或环境变量 CUEMEM_EVAL_RAW_SESSION_IDS=1）保留原始 ID；raw_labels=True（或
+    CUEMEM_EVAL_RAW_SESSION_IDS=label）照常改写，只在证据抬头显示原始 ID。"""
     scheme = session_id_scheme(dataset, raw_ids)
     wanted = set(ids) if ids is not None else None
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -390,7 +444,13 @@ def load_longmemeval(
                 evidence_session_ids=evidence,
             )
         )
-    return EvalSet(dataset=dataset, samples=samples, haystacks=haystacks, session_ids=scheme)
+    return EvalSet(
+        dataset=dataset,
+        samples=samples,
+        haystacks=haystacks,
+        session_ids=scheme,
+        raw_labels=_raw_labels(scheme, raw_labels),
+    )
 
 
 def _parse_locomo_date(text: str) -> datetime:
@@ -474,6 +534,7 @@ def load_memlens(
     ids: Collection[str] | None = None,
     dataset: str = "memlens_32k",
     raw_ids: bool | None = None,
+    raw_labels: bool | None = None,
 ) -> EvalSet:
     """加载 MemLens。格式与 LongMemEval 相同，发言上多了图片（release_images 下的相对路径）。
 
@@ -541,7 +602,13 @@ def load_memlens(
                 meta={"question_subtype": item.get("question_subtype", "")},
             )
         )
-    return EvalSet(dataset=dataset, samples=samples, haystacks=haystacks, session_ids=scheme)
+    return EvalSet(
+        dataset=dataset,
+        samples=samples,
+        haystacks=haystacks,
+        session_ids=scheme,
+        raw_labels=_raw_labels(scheme, raw_labels),
+    )
 
 
 def _split_evidence(values: Iterable[str]) -> list[str]:

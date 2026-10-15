@@ -1,14 +1,19 @@
 """N12 修复的金标泄漏：LongMemEval_S 的证据会话 ID 都以 answer_ 开头，而回答模型看到的每条检索
 证据都标着会话 ID。加载时按时间顺序改写成 session_<i>（与 LoCoMo 相同的写法）；
-CUEMEM_EVAL_RAW_SESSION_IDS=1 恢复原始 ID（复现泄漏的消融）；两种写法的持久化写入分开存、
-不混用；LoCoMo 逐字节不变。全部离线。"""
+CUEMEM_EVAL_RAW_SESSION_IDS=1 恢复原始 ID（复现泄漏的消融），=label 只在证据抬头显示原始 ID
+（干净的消融）；两种写法的持久化写入分开存、不混用；分析已有运行的脚本按运行记下的写法加载；
+LoCoMo 逐字节不变。全部离线。"""
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import re
 import shutil
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,12 +27,16 @@ from cuemem.evals.datasets import (
     RAW_SESSION_IDS_ENV,
     EvalSet,
     build_matches_session_ids,
+    dataset_path,
     evidence_turns,
     load,
     load_locomo,
     load_longmemeval,
+    run_raw_labels,
+    run_session_ids,
     sample_evidence_turns,
     session_id_scheme,
+    source_labels,
     storage_name,
     storage_space_id,
     to_conversation,
@@ -35,11 +44,12 @@ from cuemem.evals.datasets import (
 )
 from cuemem.evals.report import load_rows
 from cuemem.evals.runner import EvalRunner, RunConfig, _check_resume_compatible, space_dir
-from cuemem.read.reader import format_memories
+from cuemem.read.reader import format_memories, session_labels
 from cuemem.store.sqlite import MemoryDB
 from cuemem.write.online import build_rounds, build_turns
 
 FIXTURES = Path(__file__).parent / "fixtures"
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 # 照 LongMemEval_S 的样子：证据会话 answer_…，其余 sharegpt_…、ultrachat_… 或十六进制；
 # 顺序与时间对不上，有两个会话同一时间，还有一个会话出现两次（内容相同、时间不同）
@@ -157,6 +167,67 @@ def test_reader_context_shows_no_raw_session_ids(lme_path: Path) -> None:
     raw = load_longmemeval(lme_path, raw_ids=True)
     leaked, _ = format_memories(_hits(raw, list(range(6))))
     assert "· session answer_280352e9_1" in leaked
+
+
+# 照 LongMemEval_S 的拒答题：30 道拒答题的证据会话都是 answer_<哈希>_abs 或 answer_<哈希>_abs_<k>，
+# 有的历史里还有同一哈希、不带 answer_ 的 _abs 干扰会话；题号本身也以 _abs 结尾
+ABS_HAYSTACK = [
+    ("733e443a_abs_3", "2023/05/10 (Wed) 09:00", "I might take up pottery.", False),
+    ("answer_733e443a_abs_2", "2023/05/12 (Fri) 09:00", "I bought a used road bike.", True),
+    ("ultrachat_99", "2023/05/11 (Thu) 09:00", "How do tides work?", False),
+    ("answer_733e443a_abs_1", "2023/05/09 (Tue) 09:00", "I started a running plan.", True),
+]
+ABS_RAW_IDS = [sid for sid, *_ in ABS_HAYSTACK]
+
+
+@pytest.fixture
+def abs_path(tmp_path: Path) -> Path:
+    item = {
+        "question_id": "88432d0a_abs",
+        "question_type": "multi-session",
+        "question": "How many marathons did I run this spring?",
+        "question_date": "2023/06/01 (Thu) 10:00",
+        "answer": "The information provided is not enough.",
+        "answer_session_ids": ["answer_733e443a_abs_1", "answer_733e443a_abs_2"],
+        "haystack_session_ids": ABS_RAW_IDS,
+        "haystack_dates": [date for _, date, _, _ in ABS_HAYSTACK],
+        "haystack_sessions": [_session(text, ev) for _, _, text, ev in ABS_HAYSTACK],
+    }
+    path = tmp_path / "longmemeval_abs.json"
+    path.write_text(json.dumps([item]), encoding="utf-8")
+    return path
+
+
+def _first_rounds(space_id: str, sessions: list[Any]) -> list[Hit]:
+    return [
+        Hit(unit=build_rounds(build_turns(space_id, s))[0], score=1.0 / k, route="dense", rank=k)
+        for k, s in enumerate(to_session_ins(sessions), start=1)
+    ]
+
+
+def test_abstention_marks_do_not_reach_the_reader(abs_path: Path) -> None:
+    """原始 ID 时拒答题的证据抬头还带着 _abs（"这就是那个无从回答的会话"）；改写后一点不剩。"""
+    anon = load_longmemeval(abs_path, raw_ids=False)
+    sessions = anon.haystacks["88432d0a_abs"]
+    assert [s.session_id for s in sessions] == ["session_2", "session_4", "session_3", "session_1"]
+    assert anon.samples[0].evidence_session_ids == ["session_1", "session_4"]
+    assert anon.samples[0].is_abstention  # 题型照常交给判分与报告
+    context, _ = format_memories(_first_rounds("longmemeval_s:88432d0a_abs", sessions))
+    assert "_abs" not in context and "answer_" not in context
+    raw = load_longmemeval(abs_path, raw_ids=True)
+    leaked, _ = format_memories(_first_rounds("s", raw.haystacks["88432d0a_abs"]))
+    assert "· session answer_733e443a_abs_1" in leaked
+
+
+def test_abstention_question_id_reaches_no_model(
+    eval_settings: Settings, fake_api: FakeAPI, abs_path: Path, anon_env: None
+) -> None:
+    """拒答题的题号（空间 ID 里的 _abs）只用于目录与缓存的作用域，不进任何请求。"""
+    methods = ["B1", "B2", "B4", "B5"]
+    _, summary = _run(eval_settings, fake_api, load_longmemeval(abs_path), "abs", methods)
+    assert (summary.completed, summary.errors) == (4, 0)
+    every = json.dumps(fake_api.chat_requests, ensure_ascii=False)
+    assert "_abs" not in every and "88432d0a" not in every and "733e443a" not in every
 
 
 # ---------- 端到端：交给模型的全部请求 ----------
@@ -306,8 +377,6 @@ def test_mem0_stores_are_keyed_by_id_scheme(tmp_path: Path, lme_path: Path) -> N
     """M0 的记忆元数据里存着会话 ID：改写过的写在 longmemeval_s-anon_<题号> 下并记下写法；
     改写之前的写入（没记写法）只给原始 ID 的运行复用；LoCoMo 的位置与记录不变。
     （不装 mem0ai：写入与检索换成替身，只测 Mem0Baseline 自己的流程。）"""
-    from types import SimpleNamespace
-
     from cuemem.evals.mem0_baseline import Mem0Baseline
     from cuemem.evals.methods import MethodContext
 
@@ -363,6 +432,156 @@ def test_build_records_are_matched_by_id_scheme() -> None:
     assert storage_space_id("longmemeval_s:q1_abs", "anon") == "longmemeval_s-anon:q1_abs"
     assert storage_space_id("longmemeval_s:q1_abs", "raw") == "longmemeval_s:q1_abs"
     assert storage_space_id("memlens_32k:q_1", "anon") == "memlens_32k-anon:q_1"
+
+
+# ---------- label 消融：只差证据抬头 ----------
+
+
+def _unlabel(prompt: str, back: dict[str, str]) -> str:
+    return re.sub(r"· session (\S+)", lambda m: f"· session {back.get(m[1], m[1])}", prompt)
+
+
+def test_label_ablation_differs_only_in_the_evidence_header(
+    eval_settings: Settings,
+    fake_api: FakeAPI,
+    lme_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUEMEM_EVAL_RAW_SESSION_IDS=label：存储、检索、排序与默认完全相同（复用同一份空间），
+    回答模型的提示里只有证据抬头的会话名换成了原始 ID。原始 ID（=1）时轮的 ID 是另一套哈希，
+    并列的先后会变，两者的差里混着这部分与泄漏无关的变化；label 没有。"""
+    monkeypatch.delenv(RAW_SESSION_IDS_ENV, raising=False)
+    methods = ["B2", "B4", "B5"]
+    anon = load_longmemeval(lme_path)
+    assert not anon.raw_labels
+    _run(eval_settings, fake_api, anon, "anon", methods)
+    anon_prompts = _reader_prompts(fake_api)
+    assert len(anon_prompts) == 3
+
+    fake_api.chat_requests.clear()
+    monkeypatch.setenv(RAW_SESSION_IDS_ENV, "label")
+    labelled = load_longmemeval(lme_path)
+    assert (labelled.session_ids, labelled.raw_labels) == ("anon", True)
+    assert [s.session_id for s in labelled.haystacks["lk-1"]] == ANON_IDS
+    assert labelled.samples[0].evidence_session_ids == anon.samples[0].evidence_session_ids
+    _, summary = _run(eval_settings, fake_api, labelled, "label", methods)
+    assert summary.errors == 0
+    prompts = _reader_prompts(fake_api)
+    assert len(prompts) == 3
+    assert all("· session answer_280352e9_1" in p for p in prompts)
+    back = dict(zip(RAW_IDS, ANON_IDS, strict=True))
+    assert [_unlabel(p, back) for p in prompts] == anon_prompts
+    # 同一份改写后的空间：直接复用，没有重建
+    assert all(r.get("reused") for r in load_rows(summary.run_dir, "ingest.jsonl"))
+    info = json.loads((summary.run_dir / "run.json").read_text("utf-8"))
+    assert (info["session_ids"], info["session_labels"]) == ("anon", "source")
+    assert run_session_ids(info) == "anon" and run_raw_labels(info)
+    # 与默认的运行不能续跑到一起
+    with pytest.raises(ConfigMismatchError, match="证据抬头"):
+        _run(eval_settings, fake_api, labelled, "anon", ["B2"])
+    # 原始 ID（=1）时不存在 label 这回事；LoCoMo 也不受影响
+    assert not load_longmemeval(lme_path, raw_ids=True).raw_labels
+    assert not load_locomo(FIXTURES / "locomo_mini.json").raw_labels
+    assert load_longmemeval(lme_path, raw_labels=False).raw_labels is False
+
+
+def test_session_labels_are_scoped() -> None:
+    """抬头的会话名只在 session_labels 的范围里替换，出了范围（以及平时）照常显示会话 ID。"""
+    sessions = load_locomo(FIXTURES / "locomo_mini.json").haystacks["conv-test"]
+    hits = _first_rounds("s", sessions[:1])
+    plain, _ = format_memories(hits)
+    with session_labels({"session_1": "orig_1"}):
+        relabelled, _ = format_memories(hits)
+    assert "· session session_1" in plain and "· session orig_1" in relabelled
+    assert format_memories(hits)[0] == plain
+    assert relabelled.replace("orig_1", "session_1") == plain
+    assert source_labels(sessions) == {}  # LoCoMo 没有原始 ID 可换
+
+
+def test_existing_runs_report_their_own_id_scheme() -> None:
+    """分析已有运行时按 run.json 记下的写法，不看当前的环境变量。"""
+    legacy = {"config": {"dataset": "longmemeval_s"}}
+    assert run_session_ids(legacy) == "raw"  # 修复之前的运行
+    assert run_session_ids({"config": {"dataset": "memlens_32k"}}) == "raw"
+    assert run_session_ids({"config": {"dataset": "locomo"}}) == "native"
+    assert run_session_ids({**legacy, "session_ids": "anon"}) == "anon"
+    assert not run_raw_labels(legacy)
+    assert run_raw_labels({**legacy, "session_ids": "anon", "session_labels": "source"})
+
+
+def _script(name: str) -> ModuleType:
+    path = SCRIPTS / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"leak_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclass 需要在 sys.modules 里找到所在模块
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_run(runs_dir: Path, name: str, info: dict[str, Any]) -> None:
+    (runs_dir / name).mkdir(parents=True, exist_ok=True)
+    (runs_dir / name / "run.json").write_text(json.dumps(info), "utf-8")
+
+
+def test_n9_errors_loads_the_dataset_like_the_run_did(
+    lme_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """错误分析按运行当时的写法加载：修复之前的运行（没记写法）用原始 ID，证据发言才对得上。"""
+    errors = _script("n9_errors")
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    shutil.copy(lme_path, dataset_path(datasets, "longmemeval_s"))
+    settings = SimpleNamespace(paths=SimpleNamespace(datasets=datasets))
+    monkeypatch.setattr(errors, "RUNS", tmp_path / "runs")
+    monkeypatch.setattr(errors, "load_settings", lambda: settings)
+    monkeypatch.delenv(RAW_SESSION_IDS_ENV, raising=False)
+    lme = {"config": {"dataset": "longmemeval_s"}}
+    _write_run(tmp_path / "runs", "old", lme)
+    _write_run(tmp_path / "runs", "new", {**lme, "session_ids": "anon"})
+    _, old = errors.load_evalset("old")
+    assert [s.session_id for s in old.haystacks["lk-1"]] == RAW_IDS
+    monkeypatch.setenv(RAW_SESSION_IDS_ENV, "1")  # 当前的环境变量不起作用
+    _, new = errors.load_evalset("new")
+    assert [s.session_id for s in new.haystacks["lk-1"]] == ANON_IDS
+
+
+def test_n12_baselines_uses_the_runs_id_scheme(tmp_path: Path) -> None:
+    """N12 对比脚本：写入记录按运行记下的写法去找（不看环境变量），写法对不上或找不到的单独
+    计数、不悄悄算成 0；写法不同的运行不放在一起比。"""
+    baselines = _script("n12_baselines")
+    runs = tmp_path / "runs"
+    lme = {"config": {"dataset": "longmemeval_s"}}
+    _write_run(runs, "pq-lme-cuemem", lme)
+    _write_run(runs, "pq-lme-mem0", lme)
+    _write_run(runs, "pq-lme-anon", {**lme, "session_ids": "anon"})
+    _write_run(runs, "pq-lme-label", {**lme, "session_ids": "anon", "session_labels": "source"})
+    assert baselines.runs_session_ids(runs, ["pq-lme-cuemem", "pq-lme-mem0"]) == "raw"
+    assert baselines.runs_session_ids(runs, ["pq-lme-anon"]) == "anon"
+    for mixed in (["pq-lme-cuemem", "pq-lme-anon"], ["pq-lme-anon", "pq-lme-label"]):
+        with pytest.raises(SystemExit, match="会话 ID 写法不同"):
+            baselines.runs_session_ids(runs, mixed)
+
+    spaces = tmp_path / "spaces"
+    for name, record in {
+        "longmemeval_s_q1": {"cost": 1.0},  # 修复之前（原始 ID）的写入
+        "longmemeval_s-anon_q1": {"cost": 0.5, "session_ids": "anon"},
+        "longmemeval_s-anon_q2": {"cost": 0.25},  # 放错了地方（没记写法 = 原始 ID）
+    }.items():
+        (spaces / "mem0" / name).mkdir(parents=True)
+        (spaces / "mem0" / name / "build.json").write_text(json.dumps(record), "utf-8")
+    settings = SimpleNamespace(paths=SimpleNamespace(eval_spaces=spaces))
+    keys = {"q1", "q2", "q3"}
+    anon = baselines.write_stats(settings, "longmemeval_s", "M0", keys, runs, [], "anon")
+    assert (anon["spaces"], anon["cost"], anon["mismatched"], anon["missing"]) == (1, 0.5, 1, 1)
+    raw = baselines.write_stats(settings, "longmemeval_s", "M0", keys, runs, [], "raw")
+    assert (raw["spaces"], raw["cost"], raw["missing"]) == (1, 1.0, 2)
+
+
+def test_reproduce_keeps_the_leak_era_ids() -> None:
+    """复现脚本复现的是文档里修复之前的数字：每一步都用原始会话 ID（LoCoMo 不受影响）。"""
+    reproduce = _script("reproduce")
+    assert all(step.environment().get(RAW_SESSION_IDS_ENV) == "1" for step in reproduce.STEPS)
 
 
 # ---------- LoCoMo 逐字节不变 ----------

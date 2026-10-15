@@ -35,7 +35,13 @@ from pathlib import Path
 from typing import Any
 
 from cuemem.config import load_settings
-from cuemem.evals.datasets import storage_name
+from cuemem.evals.datasets import (
+    SessionIds,
+    build_matches_session_ids,
+    run_raw_labels,
+    run_session_ids,
+    storage_name,
+)
 from cuemem.evals.report import load_rows
 from cuemem.evals.routing import sign_test
 
@@ -79,6 +85,22 @@ def load_cells(
     return cells, runs
 
 
+def runs_session_ids(runs_dir: Path, runs: list[str]) -> SessionIds:
+    """这些运行的会话 ID 写法（各自 run.json 里记的，不看当前的环境变量）。混用了不同写法（或
+    label 消融）的运行不能放在一起比：修复泄漏之前的结果与之后的混在一起，直接报错。"""
+    modes: dict[str, tuple[SessionIds, bool]] = {}
+    for run in runs:
+        path = runs_dir / run / "run.json"
+        info = json.loads(path.read_text("utf-8")) if path.exists() else {}
+        modes[run] = (run_session_ids(info), run_raw_labels(info))
+    if len(set(modes.values())) > 1:
+        detail = "；".join(
+            f"{run}: {ids}{'+label' if labels else ''}" for run, (ids, labels) in modes.items()
+        )
+        raise SystemExit(f"这些运行的会话 ID 写法不同，不能放在一起比（{detail}）")
+    return next(iter(modes.values()))[0] if modes else "native"
+
+
 def write_stats(
     settings: Any,
     dataset: str,
@@ -86,22 +108,28 @@ def write_stats(
     keys: set[str],
     runs_dir: Path,
     runs: list[str],
+    scheme: SessionIds = "native",
 ) -> dict[str, Any]:
     """写入的成本：外部系统取各空间的 build.json；CueMem 取运行里的写入与巩固统计。
 
     全上下文（B1）不写入；朴素检索（B2）只建索引（向量化，不调用 LLM）；L1 / L2 / 控制器用同一份
-    巩固后的记忆，写入成本相同。"""
+    巩固后的记忆，写入成本相同。scheme 是这些运行的会话 ID 写法（runs_session_ids）：改写过的
+    写入在 <数据集>-anon_<历史> 下；找不到写入记录的历史计入 missing，写法对不上的计入
+    mismatched，都不算进成本。"""
     total: dict[str, float] = defaultdict(float)
     if method in SYSTEMS:
         root = settings.paths.eval_spaces / SYSTEMS[method]
-        # 会话 ID 改写过的写入在 <数据集>-anon_<历史> 下（与评测运行时一样看环境变量）
-        stored = storage_name(dataset)
+        stored = storage_name(dataset, scheme)
         for key in keys:
             names = {re.sub(r"[^A-Za-z0-9_.-]", "_", f"{stored}:{key}"), key}
             found = [root / name / "build.json" for name in names if (root / name).is_dir()]
             if not found or not found[0].exists():
+                total["missing"] += 1
                 continue
             build = json.loads(found[0].read_text("utf-8"))
+            if not build_matches_session_ids(build, scheme):
+                total["mismatched"] += 1
+                continue
             total["spaces"] += 1
             total["cost"] += float(build.get("cost", 0) or 0)
             total["spent"] += float(build.get("spent", 0) or 0)
@@ -140,6 +168,7 @@ def main() -> None:
     if not cells:
         print(f"没有 {prefix}* 的运行")
         return
+    scheme = runs_session_ids(runs_dir, runs)
     methods_present = sorted(
         {m for _, m in cells}, key=lambda m: list(LABELS).index(m) if m in LABELS else 99
     )
@@ -152,6 +181,7 @@ def main() -> None:
         "protocol": args.protocol,
         "dataset": args.dataset,
         "runs": runs,
+        **({"session_ids": scheme} if scheme != "native" else {}),
         "questions": len(common),
         "dropped": {
             m: len(ids) - len(common) for m, ids in by_method.items() if len(ids) > len(common)
@@ -181,7 +211,7 @@ def main() -> None:
                 t: {"n": len(v), "accuracy": round(sum(v) / len(v), 3)}
                 for t, v in sorted(by_type.items())
             },
-            "write": write_stats(settings, args.dataset, method, keys, runs_dir, runs),
+            "write": write_stats(settings, args.dataset, method, keys, runs_dir, runs, scheme),
         }
     for ref in REFERENCES:
         if ref not in methods_present:
@@ -207,6 +237,9 @@ def main() -> None:
     for method, row in out["methods"].items():
         lo, hi = row["ci95"]
         write = row["write"]
+        for problem, what in (("missing", "找不到写入记录"), ("mismatched", "会话 ID 写法不符")):
+            if write.get(problem):
+                print(f"  ! {method}：{write[problem]:.0f} 份对话历史{what}，没有计入写入成本")
         print(
             f"  {LABELS.get(method, method):<26} {row['accuracy']:.1%} [{lo:.1%}, {hi:.1%}]"
             f"  回答 ${row['answer_cost_per_1k']:.2f}/1k q"

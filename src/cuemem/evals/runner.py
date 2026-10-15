@@ -38,8 +38,11 @@ from cuemem.evals.datasets import (
     EvalSet,
     Sample,
     SessionIds,
+    run_raw_labels,
+    run_session_ids,
     sample_evidence_turns,
     session_id_scheme,
+    source_labels,
     storage_name,
     to_conversation,
     to_session_ins,
@@ -51,7 +54,7 @@ from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
 from cuemem.memory import MemorySystem, build_reranker
-from cuemem.read.reader import Reader
+from cuemem.read.reader import Reader, session_labels
 from cuemem.read.rerank import Reranker
 from cuemem.write.extract import PIPELINE_VERSION
 from cuemem.write.online import build_rounds, build_turns
@@ -345,6 +348,8 @@ class EvalRunner:
             return
         sessions = evalset.haystacks[space_key]
         space_id = f"{evalset.dataset}:{space_key}"
+        # label 消融：证据抬头显示原始 ID（存储与检索照常用改写后的 ID，见 datasets 的模块说明）
+        labels = source_labels(sessions) if evalset.raw_labels else None
         system: MemorySystem | None = None
         turns = sum(len(s.turns) for s in sessions)
         build: dict[str, Any] = {}
@@ -406,7 +411,7 @@ class EvalRunner:
                 return
             try:
                 row = self._evaluate(
-                    sample, method, sessions, system, space_id, evalset.session_ids
+                    sample, method, sessions, system, space_id, evalset.session_ids, labels
                 )
             except Exception as exc:
                 self._record_error(sample, method, exc, stage="answer")
@@ -437,9 +442,13 @@ class EvalRunner:
         system: MemorySystem | None,
         space_id: str,
         session_ids: SessionIds = "native",
+        labels: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         ctx = MethodContext(sample, sessions, self.reader, system, space_id, session_ids)
-        with start_trace("answer", method=method.name, sample=sample.sample_id) as trace:
+        with (
+            start_trace("answer", method=method.name, sample=sample.sample_id) as trace,
+            session_labels(labels),
+        ):
             output = method.answer(ctx)
         usage = usage_from_trace(trace)
         with start_trace("judge") as judge_trace:
@@ -543,8 +552,10 @@ class EvalRunner:
             return
         self._append("ingest.jsonl", {**build[stage], "reused": True})
 
-    def _check_resume(self, info: dict[str, Any], session_ids: SessionIds = "native") -> None:
-        _check_resume_compatible(info, self.settings, self.config, session_ids)
+    def _check_resume(
+        self, info: dict[str, Any], session_ids: SessionIds = "native", raw_labels: bool = False
+    ) -> None:
+        _check_resume_compatible(info, self.settings, self.config, session_ids, raw_labels)
 
     def _drop_failed(
         self,
@@ -639,8 +650,10 @@ class EvalRunner:
             }
             if evalset.session_ids != "native":  # LoCoMo 的 run.json 不变
                 info["session_ids"] = evalset.session_ids
+            if evalset.raw_labels:  # label 消融：证据抬头显示数据集的原始 ID
+                info["session_labels"] = "source"
         else:
-            self._check_resume(info, evalset.session_ids)
+            self._check_resume(info, evalset.session_ids, evalset.raw_labels)
             info["resumed"].append(now)
             info["config"]["methods"] = sorted(
                 set(info["config"]["methods"]) | set(self.config.methods)
@@ -653,16 +666,19 @@ def _check_resume_compatible(
     settings: Settings,
     config: RunConfig,
     session_ids: SessionIds = "native",
+    raw_labels: bool = False,
 ) -> None:
     """续跑同名运行时，关键配置必须一致；否则新旧结果会混在一个目录里（N4 差点发生过）。
 
-    会话 ID 的写法也要一致：改写之前的运行没有记下写法，LongMemEval / MemLens 的都是原始 ID。"""
+    会话 ID 的写法也要一致：改写之前的运行没有记下写法，LongMemEval / MemLens 的都是原始 ID
+    （run_session_ids）；证据抬头显示的会话名（label 消融）同样要一致。"""
     previous = info.get("config", {})
-    before_ids = info.get("session_ids") or session_id_scheme(str(previous.get("dataset")), True)
+    label = {False: "会话 ID", True: "原始 ID"}
     checks = {
         "数据集": (previous.get("dataset"), config.dataset),
         "划分": (previous.get("split"), config.split),
-        "会话 ID": (before_ids, session_ids),
+        "会话 ID": (run_session_ids(info), session_ids),
+        "证据抬头的会话名": (label[run_raw_labels(info)], label[raw_labels]),
         "向量模型": (info.get("embedding", {}).get("model"), settings.embedding.model),
         "回答模型": (
             info.get("roles", {}).get("reader", {}).get("model"),
