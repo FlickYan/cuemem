@@ -15,6 +15,16 @@
   通义的 JSON 模式不保证支持 json_schema）；
 - `stream=true` 时先拿到完整结果，再按 SSE 一次发出（外部系统只是读完整个流）；
 - `n` 只支持 1；`seed`、`logprobs` 之类的参数忽略。
+
+为了让外部系统得到它们假定的 OpenAI 语义：
+- 带工具的请求没写 `parallel_tool_calls` 时按 OpenAI 的默认（true）发出：通义不设为 true 时
+  一次只回一个工具调用，而 LangMem 等要求"一次并行调用多个工具"；写了就照原样转发；
+- 检索阶段的桶（`<系统>.search.<空间>`，见 ExternalBaseline.bucket）里的向量请求按查询
+  向量化（kind="query"），与 CueMem 自己的检索相同；其余按文档。
+
+每个桶另外统计失败的请求与其中被内容审核拒绝的、带工具的请求、返回的工具调用、一次回多个
+工具调用的回复、带工具却没调用的回复、因长度上限被截断的回复：外部系统吞掉或静默丢掉的东西
+（如 trustcall 把模型调用的错误改写成提示重试）在写入记录里看得到。
 """
 
 from __future__ import annotations
@@ -34,12 +44,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from openai import APITimeoutError, BadRequestError
 
 from cuemem.core.trace import start_trace
-from cuemem.embed.base import TextEmbedder
+from cuemem.embed.base import EmbedKind, TextEmbedder
 from cuemem.errors import ContentFilteredError, CueMemError
 from cuemem.llm.client import LLMClient, Message
 from cuemem.llm.types import ChatResult
 
 DEFAULT_BUCKET = "default"
+SEARCH_STAGE = "search"  # ExternalBaseline.bucket(key, "search")：检索时的请求
 
 
 @dataclass
@@ -49,7 +60,13 @@ class BucketUsage:
     chat_calls: int = 0
     cache_hits: int = 0
     fallbacks: int = 0
-    errors: int = 0
+    errors: int = 0  # 最终失败的请求（换了备用模型也失败的算一次）
+    refusals: int = 0  # 其中被内容审核拒绝的（重试也没用）
+    tool_requests: int = 0  # 带工具的请求
+    tool_calls: int = 0  # 返回的工具调用
+    multi_tool_replies: int = 0  # 一次回了多个工具调用的回复（并行工具调用生效）
+    no_tool_replies: int = 0  # 带工具却没有调用的回复（例如通义没照 tool_choice=required 做）
+    truncated_replies: int = 0  # finish_reason 为 length：输出被长度上限截断
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
@@ -198,30 +215,42 @@ class Gateway:
             response_format = {"type": "json_object"}
         max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
         primary = self.llm.settings.roles[self.role].model
+        tools = body.get("tools") or None
+        # 没写时按 OpenAI 的默认（true）：外部系统都按它写；通义不设为 true 时一次只回一个工具调用
+        parallel = body.get("parallel_tool_calls")
         kwargs: dict[str, Any] = {
             "temperature": body.get("temperature"),
             "max_tokens": int(max_tokens) if max_tokens else None,
             "response_format": response_format,
-            "tools": body.get("tools") or None,
-            "tool_choice": body.get("tool_choice") if body.get("tools") else None,
+            "tools": tools,
+            "tool_choice": body.get("tool_choice") if tools else None,
+            "parallel_tool_calls": (parallel is None or bool(parallel)) if tools else None,
             "cache_scope": f"gateway|{bucket}",
         }
         requested = str(body.get("model") or "")
         with start_trace("gateway", bucket=bucket) as trace:
-            fallback_used = False
             try:
-                result = self.llm.chat(self.role, messages, **kwargs)
-                alias = primary
-            except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
-                aborted = "Model output became abnormal" in str(exc)
-                usable = self.fallback is not None and self.fallback != primary
-                if not usable or (isinstance(exc, BadRequestError) and not aborted):
-                    self._count_error(bucket, requested)
-                    raise
-                result = self.llm.chat(self.role, messages, model=self.fallback, **kwargs)
-                alias, fallback_used = str(self.fallback), True
+                result, alias, fallback_used = self._call(messages, kwargs, primary)
+            except Exception as exc:  # 包括备用模型也失败的情况
+                self._count_error(bucket, requested, refused=isinstance(exc, ContentFilteredError))
+                raise
         self._count_chat(bucket, requested, trace, fallback_used)
+        self._count_reply(bucket, result, tools is not None)
         return result, alias
+
+    def _call(
+        self, messages: list[Message], kwargs: dict[str, Any], primary: str
+    ) -> tuple[ChatResult, str, bool]:
+        """先用主模型；内容审核误拒、超时或 JSON 生成被中止时换备用模型。"""
+        try:
+            return self.llm.chat(self.role, messages, **kwargs), primary, False
+        except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
+            aborted = "Model output became abnormal" in str(exc)
+            usable = self.fallback is not None and self.fallback != primary
+            if not usable or (isinstance(exc, BadRequestError) and not aborted):
+                raise
+        result = self.llm.chat(self.role, messages, model=self.fallback, **kwargs)
+        return result, str(self.fallback), True
 
     def _chat_response(self, bucket: str, body: dict[str, Any]) -> JSONResponse | StreamingResponse:
         try:
@@ -245,7 +274,7 @@ class Gateway:
         if not all(isinstance(t, str) for t in texts):
             raise HTTPException(400, "input must be a string or a list of strings (no token ids).")
         with start_trace("gateway", bucket=bucket) as trace:
-            batch = self.embedder.embed(texts, "document")
+            batch = self.embedder.embed(texts, embed_kind(bucket))
         from cuemem.evals.runner import usage_from_trace
 
         usage = usage_from_trace(trace)
@@ -295,10 +324,22 @@ class Gateway:
             entry.latency_ms += float(usage["latency_ms"] or 0.0)
             entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
 
-    def _count_error(self, bucket: str, requested: str) -> None:
+    def _count_reply(self, bucket: str, result: ChatResult, with_tools: bool) -> None:
+        calls = len(result.tool_calls)
+        with self._lock:
+            entry = self._bucket(bucket)
+            entry.truncated_replies += int(result.finish_reason == "length")
+            if with_tools:
+                entry.tool_requests += 1
+                entry.tool_calls += calls
+                entry.multi_tool_replies += int(calls > 1)
+                entry.no_tool_replies += int(calls == 0)
+
+    def _count_error(self, bucket: str, requested: str, *, refused: bool) -> None:
         with self._lock:
             entry = self._bucket(bucket)
             entry.errors += 1
+            entry.refusals += int(refused)
             entry.models_requested[requested] = entry.models_requested.get(requested, 0) + 1
 
 
@@ -317,6 +358,15 @@ async def _in_thread(function: Any, *args: Any) -> Any:
     from starlette.concurrency import run_in_threadpool
 
     return await run_in_threadpool(function, *args)
+
+
+def embed_kind(bucket: str) -> EmbedKind:
+    """桶里的向量请求按查询还是文档向量化：检索阶段的桶（<系统>.search.<空间>）是查询。
+
+    通义的向量模型分 text_type=query / document（本机的 bge 没有检索指令时两者相同）；外部系统
+    检索时只向量化问题，与 CueMem 的检索、M0 的做法一致。写入阶段（包括写入时查已有记忆）按文档。"""
+    parts = bucket.split(".")
+    return "query" if len(parts) > 2 and parts[1] == SEARCH_STAGE else "document"
 
 
 def _with_schema(messages: list[Message], json_schema: dict[str, Any]) -> list[Message]:

@@ -94,15 +94,24 @@ class LLMClient:
         response_format: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         use_cache: bool = True,
         cache_scope: str | None = None,
     ) -> ChatResult:
         """调用一次聊天补全。role 决定默认模型与参数，model 可显式指定模型别名。
 
+        parallel_tool_calls 只在带工具时发出（通义不设为 true 时一次只回一个工具调用，N12）。
         cache_scope 标记缓存条目所属的记忆空间，遗忘时据此清理。
         """
         alias, spec, params = self._prepare(
-            role, model, temperature, max_tokens, response_format, tools, tool_choice
+            role,
+            model,
+            temperature,
+            max_tokens,
+            response_format,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
         )
         caching = use_cache and self.cache is not None and self.settings.llm_cache_mode != "off"
         key = ""
@@ -322,6 +331,7 @@ class LLMClient:
         response_format: dict[str, Any] | None,
         tools: list[dict[str, Any]] | None,
         tool_choice: str | dict[str, Any] | None,
+        parallel_tool_calls: bool | None = None,
     ) -> tuple[str, ModelSpec, dict[str, Any]]:
         role_cfg = self.settings.roles.get(role)
         alias = model or (role_cfg.model if role_cfg else None)
@@ -346,6 +356,8 @@ class LLMClient:
             params["tools"] = tools
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
+        if tools and parallel_tool_calls is not None:
+            params["parallel_tool_calls"] = parallel_tool_calls
         return alias, spec, params
 
     def _client(self, provider: str) -> OpenAI:
