@@ -48,7 +48,11 @@ kg_architecture_agent_memory：locomo_eval/ 与 zep_longmem_eval.ipynb）写入�
    3 条因此整条写入失败）；网关的写法 30 条全部成功。
 5. 解析失败时重新采样：回复解析不了时，Graphiti 原样重发（最多 4 次，温度 1，本意是重新采样），
    网关的响应缓存却只会还回同一个坏回复。这里重试时把 max_tokens 减 1，请求落到新的缓存键上，
-   真正重新采样（回复都很短，上限差一个 token 不影响结果）；第一次请求不变。
+   真正重新采样（回复都很短，上限差一个 token 不影响结果）；第一次请求不变。回复是 JSON 却
+   不合 schema 时 Graphiti 不重试（`Model(**回复)` 报错，整条 episode 失败），而通义的 JSON 模式
+   不保证 schema：通义预设试点的 conv-42 前 125 条发言里 4 条因此失败（回了裸列表 `[]`、
+   `[{...}]`，或在整数列表里放 null），超过第 11 条的 1% 上限、整份作废。这里按 Graphiti 自己
+   解析的规则校验（check_reply），不合就当作解析失败、同样重新采样；合 schema 的回复照旧。
 6. 发言时间：同一会话里每条发言的时间都是会话时间，而 Graphiti 取"前 10 条消息"时只按时间
    排序，同一时刻的发言先后不定。这里给会话里第 i 条发言加 i 秒，并让整份历史的时间严格递增
    （LongMemEval 约五分之一的历史里有开始时间相同的会话，不然两段会话的发言会交错进上下文），
@@ -630,9 +634,12 @@ def _resampling_client_type() -> type[Any]:
         ) -> dict[str, Any]:
             attempt = self.attempts.get(id(messages), 0)
             self.attempts[id(messages)] = attempt + 1
-            return await super()._generate_response(
+            reply: dict[str, Any] = await super()._generate_response(
                 messages, response_model, max_tokens - attempt, *args, **kwargs
             )
+            if response_model is not None:  # 不合 schema 也重新采样（见模块说明第 5 条）
+                check_reply(reply, response_model)
+            return reply
 
     return ResamplingClient
 
@@ -736,6 +743,28 @@ def entity_hit(key: str, node: Any, score: float, rank: int, ledger: EpisodeLedg
         route="graphiti_entity",
         kind="entity",
     )
+
+
+class SchemaMismatch(json.JSONDecodeError):
+    """回复是合法的 JSON，却不是要的结构。继承 JSONDecodeError：Graphiti 的重试只认它这类错误。"""
+
+
+def check_reply(reply: Any, model: type[Any]) -> None:
+    """回复不合 response_model 时报 SchemaMismatch，让 Graphiti 重试（重新采样）。
+
+    Graphiti 拿到回复后用 `Model(**reply)` 解析，不合就让整条 episode 失败；通义的 JSON 模式
+    不保证 schema（试点里约 3% 的 episode 因此失败：回了裸列表 `[]`、`[{...}]`，或在整数列表
+    里放 null）。校验与 Graphiti 自己的解析相同，合 schema 的回复照常返回。"""
+    if not isinstance(reply, dict):
+        name = getattr(model, "__name__", "the schema")
+        logging.getLogger("graphiti_core").warning(f"Reply is not a JSON object for {name}")
+        raise SchemaMismatch(f"Expected a JSON object for {name}", json.dumps(reply)[:200], 0)
+    try:
+        model.model_validate(reply)
+    except ValueError as exc:  # pydantic 的 ValidationError 是 ValueError
+        name = getattr(model, "__name__", "the schema")
+        logging.getLogger("graphiti_core").warning(f"Reply does not match {name}")
+        raise SchemaMismatch(f"Reply does not match {name}: {exc}"[:500], "", 0) from exc
 
 
 def ranked(passages: Sequence[str], scores: Sequence[float]) -> list[tuple[str, float]]:

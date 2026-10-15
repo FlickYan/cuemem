@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from fakes import FakeAPI
+from pydantic import BaseModel
 
 from cuemem.config import Settings
 from cuemem.core.trace import start_trace
@@ -29,8 +30,10 @@ from cuemem.evals.baselines.graphiti import (
     MAX_MESSAGE_CHARS,
     EpisodeLedger,
     GraphitiBaseline,
+    SchemaMismatch,
     WarningCounter,
     _resampling_client_type,
+    check_reply,
     entity_hit,
     episode_body,
     fact_hit,
@@ -190,6 +193,27 @@ def test_metrics_count_each_round_once() -> None:
         hits, evidence_sessions=["s1"], evidence_turns={("s1", 2)}, relevant_units=1
     )
     assert metrics["turn_recall_all"] == 1.0 and metrics["turn_ndcg"] == 1.0
+
+
+class _Edge(BaseModel):
+    fact: str
+    episode_indices: list[int] = []
+
+
+class _Edges(BaseModel):
+    """ExtractedEdges 的缩影：一个必填的列表字段，元素里有整数列表。"""
+
+    edges: list[_Edge]
+
+
+def test_replies_that_do_not_match_the_schema_are_resampled() -> None:
+    """通义的 JSON 模式不保证 schema：裸列表、整数列表里的 null 当作解析失败（Graphiti 会重试）。"""
+    check_reply({"edges": [{"fact": "Ana lives in Berlin", "episode_indices": [0]}]}, _Edges)
+    check_reply({"edges": [], "note": "extra keys are ignored"}, _Edges)
+    for bad in ([], [{"fact": "x"}], {"edges": [{"fact": "x", "episode_indices": [None]}]}, {}):
+        with pytest.raises(SchemaMismatch) as caught:
+            check_reply(bad, _Edges)
+        assert isinstance(caught.value, json.JSONDecodeError)  # Graphiti 只对这类错误重试
 
 
 def test_cross_encoder_ranking_follows_graphiti_convention() -> None:
@@ -414,4 +438,14 @@ def test_retries_resample_instead_of_replaying_the_cache(monkeypatch: pytest.Mon
     client = _resampling_client_type()(LLMConfig(api_key="x", model="m"), client=fake)
     messages = [Message(role="system", content="Extract."), Message(role="user", content="Hi")]
     assert asyncio.run(client.generate_response(messages)) == {"ok": True}
+    assert sent == [client.max_tokens, client.max_tokens - 1] and client.attempts == {}
+
+    # 回复是 JSON 却不合 schema（通义回了裸列表）：同样换个缓存键重新采样，而不是整条 episode 失败
+    from graphiti_core.prompts.extract_edges import ExtractedEdges
+
+    sent.clear()
+    replies = iter(["[]", '{"edges": []}'])
+    messages = [Message(role="system", content="Extract."), Message(role="user", content="Hi")]
+    reply = asyncio.run(client.generate_response(messages, response_model=ExtractedEdges))
+    assert reply == {"edges": []}
     assert sent == [client.max_tokens, client.max_tokens - 1] and client.attempts == {}
