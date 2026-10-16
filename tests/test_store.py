@@ -33,6 +33,33 @@ def test_db_writes_are_idempotent(tmp_path: Path) -> None:
     assert db.list_spaces()[0]["turns"] == len(turns)
 
 
+def test_scrub_leaves_no_deleted_text_without_vacuum(tmp_path: Path) -> None:
+    """遗忘之后的 scrub 只把 WAL 写回并截断，不 VACUUM：删除时 secure_delete 已经覆写了
+    被删的内容，长到溢出页里的发言也一样。"""
+    path = tmp_path / "memory.sqlite"
+    db = MemoryDB(path)
+    session = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8")).sessions[0]
+    turns = build_turns("demo", session)
+    secret = "".join(f"ZQX{i:05d} " for i in range(3000))  # 约 27 KB，跨好几个溢出页
+    turns[0] = turns[0].model_copy(update={"text": secret})
+    db.ensure_space("demo")
+    db.add_session("demo", session.session_id, session.started_at)
+    db.add_turns(turns)
+    db.scrub()  # 先写回数据库文件本身
+
+    def on_disk() -> bytes:
+        wal = path.with_name(path.name + "-wal")
+        return path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
+
+    assert b"ZQX02999" in on_disk()
+    db.delete_turns("demo", [turns[0].id])
+    db.scrub()
+    raw = on_disk()
+    assert b"ZQX" not in raw
+    assert turns[1].text.encode() in raw  # 对照：没删的发言还在
+    db.close()
+
+
 def test_meta_guard_detects_embedder_change(tmp_path: Path) -> None:
     db = MemoryDB(tmp_path / "memory.sqlite")
     db.check_or_set_meta("embedder", "model-a:8")

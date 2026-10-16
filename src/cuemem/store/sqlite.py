@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
@@ -22,6 +23,8 @@ from typing import Any
 
 from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
 from cuemem.errors import ConfigMismatchError
+
+logger = logging.getLogger(__name__)
 
 # v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）
@@ -839,12 +842,17 @@ class MemoryDB:
             for r in fetched
         ]
 
-    def vacuum(self) -> None:
-        """整理数据库文件（遗忘之后调用，进一步确保被删内容不留在文件里）。"""
+    def scrub(self) -> None:
+        """遗忘之后调用：提交，把 WAL 写回数据库文件并截断，被删内容不留在 WAL 里。
+
+        删除时已经覆写（secure_delete，溢出页也一样），写回之后文件里就没有被删的内容了，
+        不用 VACUUM。VACUUM 要重写整个文件，库大时一次要几秒，期间这个库的读写全部停下；
+        代价是文件不会因为遗忘变小。别的进程正在读这个库时可能截断不了：记一条警告。"""
         with self._lock:
             self._conn.commit()
-            self._conn.execute("VACUUM")
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            busy = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            logger.warning("记忆库的 WAL 没能截断（别的进程正在使用），被删的内容暂时还在 WAL 里")
 
     def close(self) -> None:
         with self._lock:

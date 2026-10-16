@@ -61,7 +61,7 @@ class DashScopeMultimodalEmbedder:
         self._api_key = api_key
         self._http = http_client or httpx2.Client(timeout=cfg.timeout_s)
         self._ledger = ledger
-        self._cache = cache
+        self.cache = cache
         self._sleep = sleep
         self._slots = threading.BoundedSemaphore(max(1, cfg.max_concurrency))
 
@@ -75,8 +75,8 @@ class DashScopeMultimodalEmbedder:
 
     def _embed(self, keys: list[str], contents: list[dict[str, str]]) -> FloatArray:
         found: dict[str, FloatArray] = {}
-        if self._cache is not None:
-            found = {k: v[0] for k, v in self._cache.get_many(keys).items()}
+        if self.cache is not None:
+            found = {k: v[0] for k, v in self.cache.get_many(keys).items()}
         todo: list[int] = []  # 需要真正请求的下标（同一批里的重复内容只请求一次）
         seen: set[str] = set()
         for i, key in enumerate(keys):
@@ -95,8 +95,8 @@ class DashScopeMultimodalEmbedder:
             for row, i in enumerate(batch):
                 found[keys[i]] = vectors[row]
                 items.append((keys[i], vectors[row], None))
-            if self._cache is not None:
-                self._cache.put_many(items)
+            if self.cache is not None:
+                self.cache.put_many(items)
             self._account(tokens, latency_ms, len(batch))
         if not keys:
             return np.zeros((0, self.dim), dtype=np.float32)

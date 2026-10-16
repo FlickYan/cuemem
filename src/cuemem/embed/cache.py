@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -16,6 +17,8 @@ from cuemem.core.ids import content_hash
 from cuemem.embed.base import EmbeddingBatch, EmbedKind, FloatArray, SparseVector, TextEmbedder
 
 CachedVector = tuple[FloatArray, SparseVector | None]
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingCache:
@@ -77,7 +80,10 @@ class EmbeddingCache:
             self._conn.commit()
 
     def delete_many(self, keys: Sequence[str]) -> int:
-        """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。"""
+        """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。
+
+        删除时覆写（secure_delete），删了东西就把 WAL 写回并截断：否则被删的键与向量留在
+        WAL 里，直到进程退出。同一个文件的另一个连接（图片向量器的）不用再截断一次。"""
         deleted = 0
         unique = list(dict.fromkeys(keys))
         with self._lock:
@@ -89,11 +95,20 @@ class EmbeddingCache:
                 )
                 deleted += max(cursor.rowcount, 0)
             self._conn.commit()
+            if deleted:
+                self._checkpoint()
         return deleted
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _checkpoint(self) -> None:
+        """把 WAL 写回数据库并截断（调用方持有 self._lock）。别的进程（评测）正在读写这份缓存时
+        可能做不完，被删的条目暂时还在 WAL 里：记一条警告。"""
+        busy = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            logger.warning("向量缓存的 WAL 没能截断（别的进程正在使用），被删的条目暂时还在 WAL 里")
 
 
 class CachedEmbedder:

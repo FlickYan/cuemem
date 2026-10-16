@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def request_key(request: dict[str, Any]) -> str:
@@ -67,11 +70,17 @@ class ResponseCache:
             self._conn.commit()
 
     def delete_scope(self, scope: str) -> int:
-        """删除某个记忆空间产生的全部缓存条目：回复里可能含有被遗忘的个人信息。"""
+        """删除某个记忆空间产生的全部缓存条目：回复里可能含有被遗忘的个人信息。
+
+        删除时覆写（secure_delete），删了东西就把 WAL 写回并截断：否则被删的回复留在 WAL
+        里，直到进程退出。"""
         with self._lock:
             cursor = self._conn.execute("DELETE FROM llm_cache WHERE scope = ?", (scope,))
             self._conn.commit()
-            return max(cursor.rowcount, 0)
+            deleted = max(cursor.rowcount, 0)
+            if deleted:
+                self._checkpoint()
+            return deleted
 
     def responses(self, scope: str | None = None) -> list[str]:
         """返回缓存中的原始回复文本（测试与遗忘检查用）。"""
@@ -90,3 +99,10 @@ class ResponseCache:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _checkpoint(self) -> None:
+        """把 WAL 写回数据库并截断（调用方持有 self._lock）。别的进程（评测）正在读写这份缓存时
+        可能做不完，被删的条目暂时还在 WAL 里：记一条警告。"""
+        busy = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            logger.warning("LLM 缓存的 WAL 没能截断（别的进程正在使用），被删的条目暂时还在 WAL 里")

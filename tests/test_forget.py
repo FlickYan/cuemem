@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from collections.abc import Iterator
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -39,17 +41,30 @@ def system(n3_settings: Settings, fake_api: FakeAPI) -> Iterator[MemorySystem]:
     memory.close()
 
 
+def _on_disk(path: Path) -> bytes:
+    """SQLite 数据库文件连同它的 WAL 的全部字节（取证用）。"""
+    wal = path.with_name(path.name + "-wal")
+    return path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
+
+
 def test_forget_session_cascades_and_restores(system: MemorySystem, fake_api: FakeAPI) -> None:
     assert any(SECRET in f.statement for f in system.facts("demo"))
     s4_rounds = [u.id for u in system.db.list_units("demo", kinds=["round"], session_ids=["s4"])]
     s4_texts = [u.text for u in system.db.list_units("demo") if SECRET in u.text]
     assert isinstance(system.embedder, CachedEmbedder)
     assert system.embedder.cached(s4_texts, "document")
+    # 向量缓存里没有原文，取证时找被删文本的缓存键与向量本身
+    keys = [system.embedder._key(t, "document") for t in s4_texts]
+    embedded = [v.tobytes()[:64] for v, _ in system.embedder.cache.get_many(keys).values()]
+    assert len(embedded) == len(keys)
     extraction_requests = sum(
         1 for r in fake_api.chat_requests if "long-term memory of a personal" in str(r)
     )
+    statements: list[str] = []
+    system.db._conn.set_trace_callback(statements.append)
 
     report = system.forget("demo", session_ids=["s4"])
+    system.db._conn.set_trace_callback(None)
 
     assert report.turns_deleted == 4 and report.sessions_affected == ["s4"]
     # 原始层：轮次与会话都没了
@@ -78,13 +93,20 @@ def test_forget_session_cascades_and_restores(system: MemorySystem, fake_api: Fa
     )
     assert extraction_after == extraction_requests  # 重放时其余 4 段会话全部命中缓存
 
-    # 取证：数据库文件里也找不到被删的内容（secure_delete + VACUUM）
-    db_path = system.settings.paths.db
-    raw = db_path.read_bytes()
-    wal = db_path.with_name(db_path.name + "-wal")
-    raw += wal.read_bytes() if wal.exists() else b""
+    # 取证：数据库与两种缓存的文件（连同 WAL）里也找不到被删的内容。删除时覆写
+    # （secure_delete），删完把 WAL 写回并截断就够了，不用 VACUUM 重写整个库
+    assert not any(s.lstrip().upper().startswith("VACUUM") for s in statements)
+    paths = system.settings.paths
+    raw = _on_disk(paths.db)
     assert SECRET.encode("utf-8") not in raw
     assert "北京".encode() in raw  # 对照：没被删的内容还在
+    cached = _on_disk(paths.llm_cache)
+    assert SECRET.encode("utf-8") not in cached and "北京".encode() in cached
+    vectors = _on_disk(paths.embed_cache)
+    assert not any(k.encode() in vectors for k in keys)
+    assert not any(v in vectors for v in embedded)
+    kept = next(u.text for u in system.db.list_units("demo") if "北京" in u.text)
+    assert system.embedder._key(kept, "document").encode() in vectors
 
 
 def test_forget_single_turn_rebuilds_its_round(system: MemorySystem) -> None:
@@ -104,6 +126,29 @@ def test_forget_unknown_target_is_noop(system: MemorySystem) -> None:
     report = system.forget("demo", session_ids=["nope"])
     assert report.turns_deleted == 0
     assert len(system.facts("demo")) == before
+
+
+def test_close_closes_its_own_caches(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """from_settings 建的系统关闭时连同两种缓存一起关（关掉最后一个连接时 SQLite 把 WAL 写回
+    并删掉）；评测的系统（ephemeral / on_disk）共用传入的缓存，关闭时不能把它们关掉。"""
+    fake_api.chat_replies = [ScriptedModel(TOY_EXTRACTIONS)]
+    conv = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8"))
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    system.ingest(conv, consolidate=True)
+    llm, embedder = system.llm, system.embedder
+    assert llm.cache is not None and isinstance(embedder, CachedEmbedder)
+    texts = [u.text for u in system.db.list_units("demo")]
+    MemorySystem.ephemeral(n3_settings, embedder=embedder, llm=llm, ledger=system.ledger).close()
+    assert len(llm.cache) > 0 and embedder.cached(texts, "document")  # 共用的缓存还开着
+
+    system.close()
+    paths = n3_settings.paths
+    for path in (paths.llm_cache, paths.embed_cache):
+        assert not path.with_name(path.name + "-wal").exists()
+    with pytest.raises(sqlite3.ProgrammingError):
+        len(llm.cache)
+    with pytest.raises(sqlite3.ProgrammingError):
+        embedder.cached(texts, "document")
 
 
 def _in_thread(target: Any, *args: Any, **kwargs: Any) -> tuple[threading.Thread, list[Any]]:

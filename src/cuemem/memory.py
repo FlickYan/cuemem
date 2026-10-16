@@ -32,7 +32,7 @@ from cuemem.core.models import (
 from cuemem.core.trace import TraceSink, start_trace
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
-from cuemem.embed.multimodal import ImageEmbedder
+from cuemem.embed.multimodal import DashScopeMultimodalEmbedder, ImageEmbedder
 from cuemem.errors import ConsolidationError
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
@@ -205,6 +205,7 @@ class MemorySystem:
         ledger: Ledger,
         tracer: TraceSink | None = None,
         owns_ledger: bool = True,
+        owns_caches: bool = False,
         reranker: Reranker | None = None,
         media: MediaStore | None = None,
         image_embedder: ImageEmbedder | None = None,
@@ -217,6 +218,8 @@ class MemorySystem:
         self.ledger = ledger
         self.tracer = tracer
         self._owns_ledger = owns_ledger  # 评测时账本由多个线程共享，不能由单个系统关闭
+        # LLM 缓存与向量缓存只在自己建的时候（from_settings）随系统关闭：评测时多个系统共用
+        self._owns_caches = owns_caches
         self.media = media
         self.image_embedder = image_embedder
         self.writer = OnlineWriter(
@@ -265,6 +268,7 @@ class MemorySystem:
             llm=llm,
             ledger=ledger,
             tracer=TraceSink(paths.traces),
+            owns_caches=True,
             reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
             media=MediaStore(paths.media),
             image_embedder=build_image_embedder(settings, ledger=ledger, http_client=http_client),
@@ -492,7 +496,7 @@ class MemorySystem:
             embed_purged = (
                 self.embedder.purge(gone) if isinstance(self.embedder, CachedEmbedder) else 0
             )
-            self.db.vacuum()
+            self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
             report = ForgetReport(
                 space_id=space_id,
                 turns_deleted=deleted,
@@ -776,7 +780,7 @@ class MemorySystem:
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.db.delete_space(space_id)
             self.vectors.delete_space(space_id)
-            self.db.vacuum()
+            self.db.scrub()
         return report
 
     # ---------- 读取 ----------
@@ -1093,6 +1097,14 @@ class MemorySystem:
             self.worker.stop()
         self.vectors.close()
         self.db.close()
+        if self._owns_caches:  # 关掉最后一个连接时，SQLite 把 WAL 写回并删掉
+            if self.llm.cache is not None:
+                self.llm.cache.close()
+            if isinstance(self.embedder, CachedEmbedder):
+                self.embedder.cache.close()
+            image = self.image_embedder
+            if isinstance(image, DashScopeMultimodalEmbedder) and image.cache is not None:
+                image.cache.close()  # 与文本向量同一个文件的另一个连接
         if self._owns_ledger:
             self.ledger.close()
 
