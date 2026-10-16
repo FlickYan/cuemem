@@ -421,6 +421,174 @@ def test_resume_with_different_embedding_is_refused(
         run(other, fake_api, name="same", methods=["B0"])
 
 
+def _with_role(settings: Settings, role: str, model: str) -> Settings:
+    roles = dict(settings.roles)
+    roles[role] = roles[role].model_copy(update={"model": model})
+    return settings.model_copy(update={"roles": roles})
+
+
+def _with_controller(settings: Settings, name: str) -> Settings:
+    retrieval = settings.retrieval.model_copy(update={"controller": name})
+    return settings.model_copy(update={"retrieval": retrieval})
+
+
+def test_resume_refuses_other_settings_while_questions_remain(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """还有没答完的题时，判分模型、--k、--limit、要回答的题（--types）与控制器也要与首次一致；
+    全部答完的运行不追加结果，配置变了也照常（复现脚本只是重新生成报告）。每次续跑都记下代码
+    版本、命令行与环境变量。"""
+    from cuemem.errors import ConfigMismatchError
+
+    _, first = run(eval_settings, fake_api, name="r", methods=["B0"], limit=2)
+    assert (first.planned, first.completed) == (2, 2)
+    path = first.run_dir / "run.json"
+    info = json.loads(path.read_text("utf-8"))
+    assert info["retrieval"]["controller_version"] == "n11-two-stage-v3"
+    assert len(info["retrieval"]["controller_sha256"]) == 64
+    assert len(info["sample_ids_sha256"]) == 64 and info["samples"] == 3
+    assert info["argv"] and isinstance(info["env"], dict) and info["resumes"] == []
+
+    judged = _with_role(eval_settings, "judge", "deepseek-flash")
+    _, again = run(judged, fake_api, name="r", methods=["B0"], limit=2)  # 全部答完：照常
+    assert again.planned == 0 and len(load_rows(first.run_dir, "results.jsonl")) == 2
+    info = json.loads(path.read_text("utf-8"))
+    assert len(info["resumed"]) == 1 and isinstance(info["resumed"][0], str)
+    [resume] = info["resumes"]
+    assert resume["at"] == info["resumed"][0] and resume["git"] and "argv" in resume
+    assert "env" in resume
+
+    judge = re.escape("判分模型：qwen3.8-max → deepseek-flash")
+    with pytest.raises(ConfigMismatchError, match=judge):
+        run(judged, fake_api, name="r", methods=["B0", "B1"], limit=2)
+    with pytest.raises(ConfigMismatchError, match="只跑前 N 题（--limit）：2 → None"):
+        run(eval_settings, fake_api, name="r", methods=["B0"])
+    with pytest.raises(ConfigMismatchError, match="检索条数（--k）：10 → 5"):
+        run(eval_settings, fake_api, name="r", methods=["B0", "B2"], limit=2, k=5)
+    with pytest.raises(ConfigMismatchError, match="控制器：n11-two-stage-v3 → n7-two-stage-v1"):
+        run(_with_controller(eval_settings, "controller_model_v1.json"), fake_api, name="r",
+            methods=["B6"], limit=2)  # fmt: skip
+    evalset = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    evalset.samples = evalset.samples[1:]  # 像 --types 筛掉了一种题型
+    config = RunConfig(name="r", dataset="longmemeval_s", split=None, methods=["B0", "B1"], limit=2)
+    with pytest.raises(ConfigMismatchError, match="要回答的题"):
+        EvalRunner(eval_settings, config, http_client=fake_api.client()).run(evalset)
+    assert len(json.loads(path.read_text("utf-8"))["resumes"]) == 1  # 拒绝的续跑什么都不写
+
+    _, more = run(eval_settings, fake_api, name="r", methods=["B0", "B1"], limit=2)
+    assert (more.planned, more.completed, more.errors) == (2, 2, 0)
+    assert len(json.loads(path.read_text("utf-8"))["resumes"]) == 2
+
+
+def test_resume_infers_what_old_runs_did_not_record(
+    eval_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧的 run.json 没记题号的哈希时比题数；没记控制器（3d4e3ad 之前，只有 v1）时按 v1 比，记的是
+    带版本号的文件名时读那个文件，记的是 controller_model.json（先后指过 v2、v3）时提醒、不比；
+    没有用控制器的方法时不比控制器。"""
+    from cuemem.errors import ConfigMismatchError
+    from cuemem.evals.runner import _check_resume_extended
+
+    _, first = run(eval_settings, fake_api, name="old", methods=["B0"])
+    info = json.loads((first.run_dir / "run.json").read_text("utf-8"))
+    evalset = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    retrieval = {k: v for k, v in info["retrieval"].items() if not k.startswith("controller")}
+    legacy = {
+        k: v for k, v in info.items() if k not in ("sample_ids_sha256", "env", "argv", "resumes")
+    }
+    legacy["retrieval"] = retrieval
+    b6 = RunConfig(name="old", dataset="longmemeval_s", split=None, methods=["B6"])
+    v1 = _with_controller(eval_settings, "controller_model_v1.json")
+    v2 = _with_controller(eval_settings, "controller_model_v2.json")
+    _check_resume_extended(info, eval_settings, b6, evalset)
+    retrained = {**info, "retrieval": {**info["retrieval"], "controller_sha256": "0" * 64}}
+    with pytest.raises(ConfigMismatchError, match="n11-two-stage-v3 的模型文件内容变了"):
+        _check_resume_extended(retrained, eval_settings, b6, evalset)
+
+    with pytest.raises(ConfigMismatchError, match="控制器：n7-two-stage-v1 → n11-two-stage-v3"):
+        _check_resume_extended(legacy, eval_settings, b6, evalset)
+    _check_resume_extended(legacy, v1, b6, evalset)
+    named = {**legacy, "retrieval": {**retrieval, "controller": "controller_model_v2.json"}}
+    with pytest.raises(ConfigMismatchError, match="n11-two-stage-v2 → n7-two-stage-v1"):
+        _check_resume_extended(named, v1, b6, evalset)
+    _check_resume_extended(named, v2, b6, evalset)
+    ambiguous = {**legacy, "retrieval": {**retrieval, "controller": "controller_model.json"}}
+    with pytest.warns(UserWarning, match="看不出是哪一版"):
+        _check_resume_extended(ambiguous, v1, b6, evalset)
+    b4 = RunConfig(name="old", dataset="longmemeval_s", split=None, methods=["B4"])
+    _check_resume_extended(legacy, v1, b4, evalset)
+
+    fewer = load_longmemeval(FIXTURES / "longmemeval_mini.json")
+    fewer.samples = fewer.samples[1:]
+    with pytest.raises(ConfigMismatchError, match="题数（划分与 --types 筛出的）：3 → 2"):
+        _check_resume_extended(legacy, eval_settings, b4, fewer)
+    # 巩固配置只影响用 CueMem 事实记忆的方法：外部基线与 B1 不比它
+    other = eval_settings.model_copy(
+        update={
+            "consolidation": eval_settings.consolidation.model_copy(
+                update={"fallback_model": "qwen3.7-plus"}
+            )
+        }
+    )
+    with pytest.raises(ConfigMismatchError, match=re.escape("consolidation.fallback_model")):
+        _check_resume_extended(legacy, other, b4, evalset)
+    external = {**legacy, "config": {**legacy["config"], "methods": ["MG"]}}
+    b1 = RunConfig(name="old", dataset="longmemeval_s", split=None, methods=["B1"])
+    _check_resume_extended(external, other, b1, evalset)
+    # A-MEM 的检索条数只在环境变量里：记了环境变量的运行才比
+    ma = RunConfig(name="old", dataset="longmemeval_s", split=None, methods=["MA"])
+    _check_resume_extended(info, eval_settings, ma, evalset)
+    monkeypatch.setenv("CUEMEM_AMEM_K", "40")
+    with pytest.raises(ConfigMismatchError, match="CUEMEM_AMEM_K）：默认 → 40"):
+        _check_resume_extended(info, eval_settings, ma, evalset)
+    _check_resume_extended(legacy, eval_settings, ma, evalset)
+
+
+def test_published_runs_pass_the_resume_checks(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """docs/results 里的每个 run.json，在复现脚本给那一步的环境变量下（N2、N3 换回
+    text-embedding-v4）都通过续跑的核对：复现脚本续跑这些运行不会被拦下（题数要数据集，
+    这里按记下的题数，只核对配置）。"""
+    import importlib.util
+    import sys
+    from types import SimpleNamespace
+
+    from cuemem.config import load_settings
+    from cuemem.evals.datasets import session_id_scheme
+    from cuemem.evals.runner import _check_resume_compatible, _check_resume_extended
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("reproduce", root / "scripts" / "reproduce.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["reproduce"] = module
+    spec.loader.exec_module(module)
+    steps = {step.copy[1]: step for step in module.STEPS if step.copy}
+    paths = sorted((root / "docs" / "results").glob("**/run.json"))
+    assert len(paths) >= 10
+    for path in paths:
+        step = steps[str(path.parent.relative_to(root / "docs" / "results"))]
+        with monkeypatch.context() as patch:
+            for name, value in step.environment().items():
+                patch.setenv(name, value)
+            settings = load_settings()
+            info = json.loads(path.read_text("utf-8"))
+            command = step.command
+            config = RunConfig(
+                name=info["config"]["name"],
+                dataset=info["config"]["dataset"],
+                split=info["config"]["split"],
+                methods=command[command.index("--methods") + 1].split(","),
+                limit=int(command[command.index("--limit") + 1]) if "--limit" in command else None,
+            )
+            scheme = session_id_scheme(config.dataset)
+            samples = [SimpleNamespace(sample_id=str(i)) for i in range(info["samples"])]
+            evalset: Any = SimpleNamespace(samples=samples, session_ids=scheme, raw_labels=False)
+            _check_resume_compatible(info, settings, config, scheme)
+            _check_resume_extended(info, settings, config, evalset)
+
+
 def test_build_only_builds_spaces_without_answering(
     eval_settings: Settings, fake_api: FakeAPI
 ) -> None:

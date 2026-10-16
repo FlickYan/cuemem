@@ -148,11 +148,15 @@ class RegrownOutput(BaseModel):
     same: list[int] = Field(default_factory=list)
 
 
+def controller_path(name: str) -> Path:
+    """检索控制器模型文件（retrieval.controller）的位置：相对路径相对 src/cuemem/read/。"""
+    path = Path(name)
+    return path if path.is_absolute() else DEFAULT_MODEL.parent / path
+
+
 def load_controller(settings: Settings) -> LearnedController | None:
     """按配置（retrieval.controller）加载检索控制器的模型文件；没有时返回 None（退回规则版）。"""
-    path = Path(settings.retrieval.controller)
-    if not path.is_absolute():
-        path = DEFAULT_MODEL.parent / path
+    path = controller_path(settings.retrieval.controller)
     return LearnedController.load(path) if path.exists() else None
 
 

@@ -9,13 +9,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
+import warnings
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,12 +52,12 @@ from cuemem.evals.datasets import (
     to_session_ins,
 )
 from cuemem.evals.judge import Judge, token_f1
-from cuemem.evals.methods import Method, MethodContext, build_methods
+from cuemem.evals.methods import EXTERNAL, METHOD_NAMES, Method, MethodContext, build_methods
 from cuemem.evals.metrics import retrieval_metrics
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
-from cuemem.memory import MemorySystem, build_reranker
+from cuemem.memory import MemorySystem, build_reranker, controller_path
 from cuemem.read.reader import Reader, session_labels
 from cuemem.read.rerank import Reranker
 from cuemem.write.extract import PIPELINE_VERSION
@@ -182,7 +186,6 @@ class EvalRunner:
     def run(self, evalset: EvalSet) -> RunSummary:
         started = time.perf_counter()
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self._write_run_info(evalset)
         done = self._load_done()
         samples = evalset.samples[: self.config.limit] if self.config.limit else evalset.samples
         groups: dict[str, list[tuple[Sample, list[Method]]]] = {}
@@ -196,6 +199,7 @@ class EvalRunner:
                 planned += len(pending)
         if self.config.build_only:
             planned = len(groups)
+        self._write_run_info(evalset, has_pending=bool(groups) or self.config.build_only)
         self._on_start(planned)
         # 对话历史比线程少时（LoCoMo 一共 3 段对话），同一段历史里的题也并行回答
         self._inner_workers = max(1, self.config.workers // max(1, len(groups)))
@@ -642,8 +646,13 @@ class EvalRunner:
             done.add((row["sample_id"], row["method"]))
         return done
 
-    def _write_run_info(self, evalset: EvalSet) -> None:
-        """记录本次运行的配置与环境，保证结果可追溯；续跑时保留首次的信息并追加续跑时间。"""
+    def _write_run_info(self, evalset: EvalSet, *, has_pending: bool = True) -> None:
+        """记录本次运行的配置与环境，保证结果可追溯；续跑时保留首次的信息，追加这次续跑的时间、
+        代码版本、命令行与 CUEMEM_* 环境变量（resumes）。
+
+        续跑时先核对关键配置（_check_resume_compatible）；还有没答完的组合时（has_pending）再核对
+        其余影响结果的配置（_check_resume_extended）。全部答完的运行不追加结果，配置变了也混不进
+        来：复现脚本照常重新生成报告，即使当时记下的默认值后来改了。"""
         path = self.run_dir / "run.json"
         info: dict[str, Any] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         now = datetime.now().isoformat(timespec="seconds")
@@ -659,13 +668,20 @@ class EvalRunner:
             info = {
                 "config": asdict(self.config),
                 "samples": len(evalset.samples),
+                # 这次要回答的题（划分、--types 与 --limit 选出的）：续跑时核对是同一批题
+                "sample_ids_sha256": _sample_ids_sha256(evalset, self.config),
                 "roles": roles,
                 "embedding": {
                     "model": self.settings.embedding.model,
                     "dim": self.settings.embedding.dim,
                     "backend": self.settings.embedding.backend,
                 },
-                "retrieval": self.settings.retrieval.model_dump(),
+                # 只记文件名分不出控制器是哪一版（controller_model.json 先后是 v1、v2、v3）：
+                # 另记文件里的版本与内容哈希
+                "retrieval": {
+                    **self.settings.retrieval.model_dump(),
+                    **controller_identity(self.settings.retrieval.controller),
+                },
                 "consolidation": {
                     "pipeline_version": PIPELINE_VERSION,
                     **self.settings.consolidation.model_dump(),
@@ -673,9 +689,10 @@ class EvalRunner:
                 # 记忆空间与外部基线写入记录的目录：报告据此读外部基线的写入成本（N12；
                 # 同一个数据目录下 pds 与 pq 协议的写入分放两处）
                 "eval_spaces": str(self.settings.paths.eval_spaces),
-                "git": _git_version(),
+                **_provenance(),
                 "created": now,
                 "resumed": [],
+                "resumes": [],  # 每次续跑的时间、代码版本、命令行与环境变量
             }
             if evalset.session_ids != "native":  # LoCoMo 的 run.json 不变
                 info["session_ids"] = evalset.session_ids
@@ -683,7 +700,10 @@ class EvalRunner:
                 info["session_labels"] = "source"
         else:
             self._check_resume(info, evalset.session_ids, evalset.raw_labels)
+            if has_pending:
+                _check_resume_extended(info, self.settings, self.config, evalset)
             info["resumed"].append(now)
+            info.setdefault("resumes", []).append({"at": now, **_provenance()})
             info["config"]["methods"] = sorted(
                 set(info["config"]["methods"]) | set(self.config.methods)
             )
@@ -720,6 +740,162 @@ def _check_resume_compatible(
             f"运行 {config.name} 已存在，但关键配置变了（{'；'.join(changed)}）。"
             "续跑会把新旧结果混在一起：请换一个运行名（--name）。"
         )
+
+
+ROLE_LABELS = {
+    "extractor": "抽取模型",
+    "planner": "规划模型",
+    "reader": "回答模型",
+    "vlm": "看图模型",
+    "captioner": "图片描述模型",
+    "judge": "判分模型",
+    "agent": "Agent 模型",
+}
+CONTROLLER_METHODS = {"B6", "B6h", "B6a"}  # 用学到的控制器（retrieval.controller）选档的方法
+# 3d4e3ad（N11）之前 run.json 不记控制器的文件名，那时只有 N7 导出的 v1 这一个文件
+LEGACY_CONTROLLER = "n7-two-stage-v1"
+AMEM_K_ENV = "CUEMEM_AMEM_K"  # A-MEM（MA）的检索条数（evals/baselines/amem.py）
+# 写进 run.json 的环境变量去掉密钥类的（与 evals/baselines/cognee.py 的 SECRET_ENV 相同）
+SECRET_ENV = re.compile(r"^AWS_|KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+
+def _check_resume_extended(
+    info: dict[str, Any], settings: Settings, config: RunConfig, evalset: EvalSet
+) -> None:
+    """续跑还有没答完的组合时，其余影响结果的配置也要一致（只比 run.json 里记下的项）：
+
+    - 各角色的模型（记下的角色；后来才加的角色旧运行里没有，不比）；
+    - 检索条数（--k）、只跑前 N 题（--limit）与这次要回答的题（新运行比题号的哈希，旧运行比
+      数据集按划分与 --types 筛完的题数）；
+    - 巩固与检索的配置：记下的每一项（并发数与控制器的文件名除外），以及抽取流水线的版本；只在
+      有用到 CueMem 自己的事实记忆（或检索）的方法时比，外部基线与 B0、B1 不受它们影响；
+    - 控制器（只在记下的或这次的方法里有 B6、B6h、B6a 时）：比模型文件里的版本，记了内容的
+      sha256 时也比（同一个版本号的文件可能被重新导出过）。旧运行没记版本：
+      没有控制器这一项的是 3d4e3ad 之前建的，那时只有 v1；记的是带版本号的文件名就读那个文件；
+      记的是 controller_model.json（N11 之后先后指过 v2、v3）的无从判断，提醒一声、不比；
+    - A-MEM（MA）的检索条数 CUEMEM_AMEM_K（只在 run.json 记了环境变量时）。
+    """
+    previous = info.get("config", {})
+    changed: list[str] = []
+
+    def compare(name: str, old: Any, new: Any) -> None:
+        if old != new:
+            changed.append(f"{name}：{old} → {new}")
+
+    for role, record in info.get("roles", {}).items():
+        current = settings.roles.get(role)
+        compare(
+            ROLE_LABELS.get(role, f"{role} 角色的模型"),
+            record.get("model"),
+            current.model if current else None,
+        )
+    for key, label in (("k", "检索条数（--k）"), ("limit", "只跑前 N 题（--limit）")):
+        if key in previous:
+            compare(label, previous[key], getattr(config, key))
+    if "sample_ids_sha256" in info:
+        if info["sample_ids_sha256"] != _sample_ids_sha256(evalset, config):
+            changed.append("要回答的题（划分、--types 或 --limit 选出的）不同")
+    elif "samples" in info:
+        compare("题数（划分与 --types 筛出的）", info["samples"], len(evalset.samples))
+    methods = set(previous.get("methods", [])) | set(config.methods)
+    indexed, consolidated = _uses_own_memory(methods)
+    sections = {
+        "consolidation": (
+            consolidated,
+            {"pipeline_version": PIPELINE_VERSION, **settings.consolidation.model_dump()},
+        ),
+        "retrieval": (indexed, settings.retrieval.model_dump()),
+    }
+    for section, (relevant, current_values) in sections.items():
+        for key, old in info.get(section, {}).items() if relevant else ():
+            if key not in ("workers", "controller") and key in current_values:
+                compare(f"{section}.{key}", old, current_values[key])
+    if methods & CONTROLLER_METHODS:
+        stored = _stored_controller(info)
+        identity = controller_identity(settings.retrieval.controller)
+        current_version = identity["controller_version"]
+        stored_sha256 = info.get("retrieval", {}).get("controller_sha256")
+        if stored is None:
+            warnings.warn(
+                f"运行 {config.name} 记下的控制器文件"
+                f"（{info.get('retrieval', {}).get('controller')}）看不出是哪一版"
+                f"（controller_model.json 在 N11 之后先后是 v2、v3），没有核对；"
+                f"这次用的是 {current_version}。",
+                stacklevel=2,
+            )
+        elif stored != current_version:
+            changed.append(
+                f"控制器：{stored} → {current_version}（复现 N7 / N9 设 "
+                "CUEMEM_RETRIEVAL__CONTROLLER=controller_model_v1.json，N11 设 "
+                "controller_model_v2.json）"
+            )
+        elif stored_sha256 and stored_sha256 != identity["controller_sha256"]:
+            # 版本号相同，文件却被重新导出过（比如重跑了训练脚本）
+            changed.append(f"控制器 {stored} 的模型文件内容变了（sha256 不同）")
+    if "env" in info and "MA" in methods:
+        compare(
+            f"A-MEM 的检索条数（{AMEM_K_ENV}）",
+            info["env"].get(AMEM_K_ENV, "").strip() or "默认",
+            os.environ.get(AMEM_K_ENV, "").strip() or "默认",
+        )
+    if changed:
+        raise ConfigMismatchError(
+            f"运行 {config.name} 已存在，还有没答完的题，但配置变了（{'；'.join(changed)}）。"
+            "续跑会把新旧结果混在一起：请换一个运行名（--name），或换回当时的配置。"
+        )
+
+
+def _uses_own_memory(names: set[str]) -> tuple[bool, bool]:
+    """这些方法里有没有用 CueMem 自己的检索（要索引）与事实记忆（要巩固）的。外部基线自己写入、
+    自己检索，巩固与检索的配置影响不到它们（也不必为此导入它们的包）。"""
+    own = [n for n in METHOD_NAMES if n in names and n != "M0" and n not in EXTERNAL]
+    methods = build_methods(own)
+    return any(m.needs_index for m in methods), any(m.needs_consolidation for m in methods)
+
+
+def _stored_controller(info: dict[str, Any]) -> str | None:
+    """运行建立时用的控制器版本（见 _check_resume_extended）；看不出来（记的是
+    controller_model.json，或记下的文件已经不在）时为 None。"""
+    retrieval = info.get("retrieval", {})
+    if retrieval.get("controller_version"):
+        return str(retrieval["controller_version"])
+    if "controller" not in retrieval:
+        return LEGACY_CONTROLLER
+    if retrieval["controller"] == "controller_model.json":
+        return None
+    return controller_identity(retrieval["controller"])["controller_version"]
+
+
+def controller_identity(name: str) -> dict[str, str | None]:
+    """检索控制器模型文件（retrieval.controller）里的版本与内容的 sha256；文件不在时都是 None
+    （这时 B6 等退回规则版，见 memory.load_controller）。"""
+    path = controller_path(name)
+    if not path.exists():
+        return {"controller_version": None, "controller_sha256": None}
+    raw = path.read_bytes()
+    version = json.loads(raw).get("version")
+    return {
+        "controller_version": str(version) if version is not None else None,
+        "controller_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _sample_ids_sha256(evalset: EvalSet, config: RunConfig) -> str:
+    """这次要回答的题（--limit 之后）的题号，排序后的哈希。"""
+    samples = evalset.samples[: config.limit] if config.limit else evalset.samples
+    ids = sorted(s.sample_id for s in samples)
+    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+
+
+def _provenance() -> dict[str, Any]:
+    """这次运行（或续跑）的代码版本、命令行与 CUEMEM_* 环境变量（去掉密钥类的）。"""
+    argv = [Path(sys.argv[0]).name, *sys.argv[1:]] if sys.argv else []
+    env = {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name.startswith("CUEMEM_") and not SECRET_ENV.search(name)
+    }
+    return {"git": _git_version(), "argv": argv, "env": env}
 
 
 def _safe_name(key: str) -> str:
