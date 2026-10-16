@@ -418,6 +418,35 @@ def test_http_api_token(service: ChatService, tmp_path: Path) -> None:
     assert forget.status_code == 401  # 删除记忆同样要令牌
 
 
+def test_http_api_agent_scoped_space(service: ChatService, tmp_path: Path) -> None:
+    """带 Agent 的空间 ID 里有 "/"（SDK 的 agent_id、代理的 X-CueMem-Agent：bot/alice、
+    agent/shop）：以前每个空间接口都 404，浏览、检索、导出、遗忘都做不到；"/" 写成 %2F 也一样。"""
+    from cuemem.core.models import SessionIn, TurnIn
+    from cuemem.sdk import space_for
+
+    client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=False))
+    spaces = [space_for("alice", "bot"), space_for(agent_id="shop")]
+    assert spaces == ["bot/alice", "agent/shop"]
+    for space in spaces:
+        turns = [TurnIn(role="user", text="I live in Berlin"), TurnIn(role="assistant", text="Ok")]
+        service.system.append(space, SessionIn(session_id="s1", started_at=DAY, turns=turns), 0)
+        service.system.consolidate(space)
+    for space in spaces:
+        for path in (space, space.replace("/", "%2F")):
+            base = f"/api/spaces/{path}"
+            assert client.get(f"{base}/sessions").json()[0]["turns"] == 2
+            assert client.get(f"{base}/facts").json()
+            assert client.get(f"{base}/status").status_code == 200
+            assert client.get(f"{base}/export").json()["space_id"] == space
+            recalled = client.post(f"{base}/recall", json={"query": "Berlin", "mode": "l1"})
+            assert recalled.status_code == 200 and recalled.json()["excerpts"]
+            preview = client.post(f"{base}/forget", json={"session_ids": ["s1"], "dry_run": True})
+            assert preview.status_code == 200 and len(preview.json()["turns"]) == 2
+        forgot = client.post(f"/api/spaces/{space}/forget", json={"session_ids": ["s1"]})
+        assert forgot.status_code == 200 and forgot.json()["turns_deleted"] == 2
+        assert service.system.db.get_turns(space) == []
+
+
 def test_http_api_refuses_cross_origin_requests(service: ChatService, tmp_path: Path) -> None:
     """别的网站发来的浏览器请求一律 403。预检请求（OPTIONS）匹配不到接口，以前会落到根路径上的
     Gradio，它对非本机的 Host（Docker、局域网）放行任何来源，之后跨站的 JSON POST 就能遗忘、导入。

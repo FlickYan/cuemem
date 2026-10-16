@@ -229,7 +229,9 @@ def create_app(
         with _errors():
             return service.end(session_id, wait=wait)
 
-    @api.post("/api/spaces/{space}/recall")
+    # 空间 ID 里可以有 "/"（sdk.space_for：bot/alice、agent/shop），所以用 {space:path}。
+    # media 列表排在 media/{media_id} 前面：…/x/media/media 是空间 x/media 的列表（图片 ID 是哈希）
+    @api.post("/api/spaces/{space:path}/recall")
     def recall(space: str, request: RecallRequest) -> dict[str, Any]:
         with _errors():
             return service.recall(
@@ -241,34 +243,34 @@ def create_app(
                 at=request.at,
             )
 
-    @api.get("/api/spaces/{space}/profile")
+    @api.get("/api/spaces/{space:path}/profile")
     def profile(space: str) -> dict[str, str]:
         return {"text": service.profile(space)}
 
-    @api.get("/api/spaces/{space}/facts")
+    @api.get("/api/spaces/{space:path}/facts")
     def facts(space: str, current_only: bool = False) -> list[dict[str, Any]]:
         return service.facts(space, current_only=current_only)
 
-    @api.get("/api/spaces/{space}/entities")
+    @api.get("/api/spaces/{space:path}/entities")
     def entities(space: str) -> list[dict[str, Any]]:
         return service.entities(space)
 
-    @api.get("/api/spaces/{space}/graph")
+    @api.get("/api/spaces/{space:path}/graph")
     def graph(space: str) -> dict[str, Any]:
         return service.graph(space)
 
-    @api.get("/api/spaces/{space}/media")
+    @api.get("/api/spaces/{space:path}/media")
     def media(space: str) -> list[dict[str, Any]]:
         return service.media(space)
 
-    @api.get("/api/spaces/{space}/media/{media_id}")
+    @api.get("/api/spaces/{space:path}/media/{media_id}")
     def media_file(space: str, media_id: str) -> FileResponse:
         items = service.system.db.get_media(space, ids=[media_id])
         if not items or not Path(items[0].path).exists():
             raise HTTPException(404, "没有这张图片")
         return FileResponse(items[0].path)
 
-    @api.get("/api/spaces/{space}/sessions")
+    @api.get("/api/spaces/{space:path}/sessions")
     def sessions(space: str) -> list[dict[str, Any]]:
         return [
             {
@@ -280,11 +282,11 @@ def create_app(
             for s in service.session_list(space)
         ]
 
-    @api.get("/api/spaces/{space}/status")
+    @api.get("/api/spaces/{space:path}/status")
     def status(space: str) -> dict[str, Any]:
         return service.status(space)
 
-    @api.post("/api/spaces/{space}/forget")
+    @api.post("/api/spaces/{space:path}/forget")
     def forget(space: str, request: ForgetRequest) -> dict[str, Any]:
         if request.dry_run:
             with _errors():
@@ -311,7 +313,7 @@ def create_app(
             "images_deleted": report.images_deleted,
         }
 
-    @api.get("/api/spaces/{space}/export")
+    @api.get("/api/spaces/{space:path}/export")
     def export(space: str, derived: bool = True) -> dict[str, Any]:
         """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。"""
         with _errors():
@@ -326,7 +328,7 @@ def create_app(
             service.system.worker.submit(report["space_id"])
         return report
 
-    @api.post("/api/spaces/{space}/consolidate")
+    @api.post("/api/spaces/{space:path}/consolidate")
     def consolidate(space: str) -> dict[str, Any]:
         with _errors():
             return service.consolidate(space)

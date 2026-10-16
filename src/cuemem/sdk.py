@@ -11,7 +11,8 @@
 与 Mem0 对应的方法名与参数（add / search / get_all / get / history / delete / delete_all）保持
 一致，返回值也是 {"results": [...]}、每条带 "memory" 文本；不同的地方是 CueMem 自己的设计：
 
-- 记忆空间：user_id 与 agent_id 合起来定一个空间（各空间完全隔离）；run_id 是空间里的一个会话；
+- 记忆空间：user_id 与 agent_id 合起来定一个空间（各空间完全隔离）；run_id 是空间里的一个会话，
+  search / get_all / delete_all 给了 run_id 时只看、只删这个会话的记忆；
 - 写入分两步：add 先在线写入原始日志（不调用 LLM，立即可检索），抽取事实在后台完成；
   wait=True 时同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件；一段对话分多次写入时用
   run() 包起来，结束时整段只抽取一次；
@@ -303,6 +304,7 @@ class Memory:
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
+        run_id: str | None = None,
         limit: int | None = None,
         mode: SearchMode = "auto",
         at: datetime | None = None,
@@ -314,9 +316,11 @@ class Memory:
         """检索（不回答）。mode="auto" 由检索控制器选 L0 / L1 / L2，结果里的 level 与 reasons
         说明它为什么这么选；L0 表示这句话不需要回忆，只返回画像。limit 截断结果条数。
 
-        filters={"user_id": …, "agent_id": …} 与 top_k 是 Mem0 v3 的写法，与 user_id、limit 等价。
+        filters={"user_id": …, "agent_id": …, "run_id": …} 与 top_k 是 Mem0 v3 的写法，与
+        user_id、limit 等价。run_id：只要这个会话里的事实、对话片段与图片。检索照常在整个空间里
+        做（控制器与 L1 / L2 不变），再按会话筛，所以结果可能少于 limit；画像是整个空间的。
         """
-        user_id, agent_id = _scope(user_id, agent_id, filters)
+        user_id, agent_id, run_id = _scope(user_id, agent_id, run_id, filters)
         limit = limit or top_k
         space = space_for(user_id, agent_id)
         if not self.system.db.get_sessions(space):
@@ -324,7 +328,7 @@ class Memory:
         recall = self.system.retrieve(
             space, query, question_time=at, mode=mode, router=router, lam=lam
         )
-        return _recall_out(recall, user_id, agent_id, limit)
+        return _recall_out(recall, user_id, agent_id, limit, run_id=run_id)
 
     def answer(
         self,
@@ -349,6 +353,7 @@ class Memory:
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
+        run_id: str | None = None,
         include_superseded: bool = False,
         valid_at: str | None = None,
         known_at: datetime | None = None,
@@ -357,12 +362,14 @@ class Memory:
         top_k: int | None = None,
     ) -> dict[str, Any]:
         """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at="2025-06" 是那时
-        现实中成立的事实，known_at 是系统在那一刻相信的事实。"""
-        user_id, agent_id = _scope(user_id, agent_id, filters)
+        现实中成立的事实，known_at 是系统在那一刻相信的事实。run_id：只要这个会话里记下的事实。"""
+        user_id, agent_id, run_id = _scope(user_id, agent_id, run_id, filters)
         limit = limit or top_k
         space = space_for(user_id, agent_id)
         current = not include_superseded and valid_at is None and known_at is None
         facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
+        if run_id is not None:
+            facts = [f for f in facts if f.session_id == run_id]
         items = [_fact_item(f, None, user_id, agent_id) for f in facts]
         return {"results": items[:limit] if limit else items}
 
@@ -422,10 +429,15 @@ class Memory:
         return {"message": "Memory deleted", **_forget_out(report)}
 
     def delete_all(
-        self, *, user_id: str | None = None, agent_id: str | None = None
+        self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
     ) -> dict[str, Any]:
-        """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图。"""
-        report = self.system.delete_space(space_for(user_id, agent_id))
+        """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图。
+        run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。"""
+        space = space_for(user_id, agent_id)
+        if run_id is not None:
+            report = self.system.forget_memories(space, session_ids=[run_id])
+            return {"message": "Memories of this run deleted", **_forget_out(report)}
+        report = self.system.delete_space(space)
         return {"message": "All memories deleted", **_forget_out(report)}
 
     # ---------- 导出与导入 ----------
@@ -623,17 +635,25 @@ def _image_file(url: str) -> tuple[Path, bool]:
 
 
 def _scope(
-    user_id: str | None, agent_id: str | None, filters: Mapping[str, Any] | None
-) -> tuple[str | None, str | None]:
-    """Mem0 v3 把 user_id、agent_id 放在 filters 里；两种写法都认。"""
+    user_id: str | None,
+    agent_id: str | None,
+    run_id: str | None,
+    filters: Mapping[str, Any] | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Mem0 v3 把 user_id、agent_id、run_id 放在 filters 里；两种写法都认。"""
     if not filters:
-        return user_id, agent_id
+        return user_id, agent_id, run_id
     unknown = set(filters) - {"user_id", "agent_id", "run_id"}
     if unknown:
         raise ValueError(
-            f"Unsupported filters: {sorted(unknown)}. Memories are scoped by user_id and agent_id."
+            f"Unsupported filters: {sorted(unknown)}. "
+            "Memories are scoped by user_id, agent_id and run_id."
         )
-    return filters.get("user_id", user_id), filters.get("agent_id", agent_id)
+    return (
+        filters.get("user_id", user_id),
+        filters.get("agent_id", agent_id),
+        filters.get("run_id", run_id),
+    )
 
 
 def _as_datetime(value: datetime | str | float | None) -> datetime | None:
@@ -716,16 +736,27 @@ def _image_item(item: MediaItem, attached: bool) -> dict[str, Any]:
 
 
 def _recall_out(
-    recall: Recall, user_id: str | None, agent_id: str | None, limit: int | None
+    recall: Recall,
+    user_id: str | None,
+    agent_id: str | None,
+    limit: int | None,
+    *,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     view = recall.view
     facts: list[FactHit] = view.facts
+    rounds, media = view.rounds, list(view.media.values())
+    if run_id is not None:  # 只要这个会话的：检索本身不分会话，在这里事后筛
+        facts = [fh for fh in facts if fh.fact.session_id == run_id]
+        rounds = [h for h in rounds if h.unit.session_id == run_id]
+        kept = {m for h in rounds for m in h.unit.meta.get("media_ids", [])}
+        media = [m for m in media if m.id in kept]  # 图片来自装入的轮（l1.collect_media）
     items = [_fact_item(fh.fact, fh.score, user_id, agent_id) for fh in facts]
-    items += [_excerpt_item(h) for h in sorted(view.rounds, key=lambda h: -h.score)]
+    items += [_excerpt_item(h) for h in sorted(rounds, key=lambda h: -h.score)]
     decision = recall.decision
     return {
         "results": items[:limit] if limit else items,
-        "images": [_image_item(m, m.id in view.attach) for m in view.media.values()],
+        "images": [_image_item(m, m.id in view.attach) for m in media],
         "profile": view.core.text if view.core is not None else "",
         "level": recall.level.upper(),
         "see": bool(decision and decision.see),

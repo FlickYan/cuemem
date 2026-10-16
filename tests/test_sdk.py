@@ -419,6 +419,50 @@ def test_aware_timestamp_does_not_stall_background_extraction(
         assert [f["object"] for f in memory.get_all(user_id="alice")["results"]] == ["Munich"]
 
 
+def test_run_id_scopes_search_get_all_and_delete_all(memory: Memory) -> None:
+    """run_id（filters 里的写法与关键字参数）只取、只删这个会话的记忆。以前 filters 里的 run_id
+    被悄悄忽略：照 Mem0 写的代码拿到同一个用户别的会话的记忆。"""
+    memory.add("I like jazz", user_id="dan", run_id="r1", wait=True)
+    memory.add("I like chess", user_id="dan", run_id="r2", wait=True)
+    scoped = {"user_id": "dan", "run_id": "r1"}
+    facts = memory.get_all(filters=scoped)["results"]
+    assert [(f["memory"], f["session_id"]) for f in facts] == [("I like jazz", "r1")]
+    assert memory.get_all(user_id="dan", run_id="r2")["results"][0]["memory"] == "I like chess"
+    assert len(memory.get_all(user_id="dan")["results"]) == 2
+    for found in (
+        memory.search("chess", filters=scoped, mode="l1"),
+        memory.search("chess", user_id="dan", run_id="r1", mode="l1"),
+    ):
+        assert found["results"] and {r["session_id"] for r in found["results"]} == {"r1"}
+        assert all("chess" not in r["memory"] for r in found["results"])
+    everywhere = memory.search("chess", user_id="dan", mode="l1")["results"]
+    assert {r["session_id"] for r in everywhere} == {"r1", "r2"}
+    assert memory.search("chess", user_id="dan", run_id="r9", mode="l1")["results"] == []
+
+    report = memory.delete_all(user_id="dan", run_id="r1")
+    assert report["sessions_affected"] == ["r1"]
+    assert [f["memory"] for f in memory.get_all(user_id="dan")["results"]] == ["I like chess"]
+    assert [s["space_id"] for s in memory.spaces()] == ["dan"]  # 空间还在，只删了这个会话
+
+
+def test_run_scoped_search_keeps_only_that_runs_images(memory: Memory, tmp_path: Path) -> None:
+    for run, color in (("r1", "red"), ("r2", "blue")):
+        path = tmp_path / f"{color}.png"
+        Image.new("RGB", (16, 16), color).save(path)
+        content = [
+            {"type": "text", "text": f"My {color} running shoes"},
+            {"type": "image_url", "image_url": {"url": str(path)}},
+        ]
+        memory.add({"role": "user", "content": content}, user_id="eve", run_id=run, infer=False)
+    assert len(memory.search("running shoes", user_id="eve", mode="l1")["images"]) == 2
+    scoped = memory.search("running shoes", user_id="eve", run_id="r1", mode="l1")
+    assert {r["session_id"] for r in scoped["results"]} == {"r1"}
+    (image,) = scoped["images"]
+    r1_turns = [t.id for t in memory.system.db.get_turns("eve", "r1")]
+    (r1_image,) = memory.system.db.get_media("eve", turn_ids=r1_turns)
+    assert image["id"] == r1_image.id
+
+
 def test_delete_restores_the_older_version_and_delete_all_wipes(memory: Memory) -> None:
     memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
     munich = memory.add("I moved to Munich", user_id="alice", timestamp=SEP, wait=True)
