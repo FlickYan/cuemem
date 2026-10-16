@@ -149,6 +149,53 @@ def test_session_lifecycle_and_memory_views(service: ChatService, model: Scripte
     assert "svg" in render_graph(graph) or "No entities" in render_graph(graph)
 
 
+def test_graph_links_entities_named_in_statements(
+    service: ChatService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """实体图里，陈述中出现了名字或别名（按词边界）的实体连一条边。先按子串筛再跑正则：
+    名字多过 re 的缓存时，以前每条事实都把每个名字的正则重新编译一遍。"""
+    from cuemem.core.models import Entity, Fact
+
+    def entity(eid: str, name: str, *aliases: str) -> Entity:
+        return Entity(
+            id=eid, space_id="g", name=name, type="other", aliases=list(aliases),
+            first_seen=DAY, last_seen=DAY,
+        )  # fmt: skip
+
+    def fact(fid: str, subject: str, statement: str, obj: str) -> Fact:
+        return Fact(
+            id=fid, space_id="g", subject_id=subject, subject=subject, predicate="p",
+            object=obj, statement=statement, recorded_at=DAY, session_id="s",
+            source_turn_ids=[],
+        )  # fmt: skip
+
+    entities = [
+        entity("u", "User"),
+        entity("max", "Max", "Maxie"),
+        entity("lis", "Lisbon"),
+        *(entity(f"p{i}", f"Person {i:03d}", f"nick{i}") for i in range(600)),
+    ]
+    facts = [
+        fact("f1", "u", "The user walks Max in Lisbon.", "a dog"),
+        fact("f2", "u", "The user likes maximalism.", "art"),  # "max" 只是子串
+        fact("f3", "max", "Maxie sleeps a lot.", "sleep"),
+        fact("f4", "u", "The user met nick12 and Person 007.", "friends"),
+    ]
+    service.system.db.apply_consolidation(facts=facts, entities=entities, episodes=[], units=[])
+    searches: list[str] = []
+    search = re.search
+
+    def counting(pattern: str, text: str, *args: Any) -> Any:
+        searches.append(pattern)
+        return search(pattern, text, *args)
+
+    monkeypatch.setattr(re, "search", counting)
+    graph = service.graph("g")
+    edges = {(e["source"], e["target"]) for e in graph["edges"]}
+    assert edges == {("u", "max"), ("u", "lis"), ("u", "p12"), ("u", "p7")}
+    assert len(searches) <= 12  # 以前 4 条事实 × 1,200 多个名字
+
+
 def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedModel) -> None:
     model.agent = lambda body: "Happy early birthday to Ana on October 3!"
     session = service.start("shop", at=DAY)

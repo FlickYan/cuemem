@@ -267,11 +267,9 @@ class L1Retriever:
         for unit in self.db.list_units(space_id, kinds=["round"], session_ids=sessions):
             round_units.setdefault(unit.id, unit)
         if visual_media:  # 以文搜图命中的图片可能在任何会话里：按发言找到所在的轮
-            turn_sessions = {
-                t.id: t.session_id
-                for t in self.db.get_turns(space_id)
-                if t.id in {m.source_turn_id for m in visual_media.values()}
-            }
+            wanted = sorted({m.source_turn_id for m in visual_media.values()})
+            # 只取这几句发言（以前载入整个空间的原始日志，1.6 万轮时约 250 毫秒）
+            turn_sessions = {t.id: t.session_id for t in self.db.get_turns(space_id, ids=wanted)}
             extra = sorted(set(turn_sessions.values()) - set(sessions))
             for unit in self.db.list_units(space_id, kinds=["round"], session_ids=extra):
                 round_units.setdefault(unit.id, unit)

@@ -260,16 +260,19 @@ class Probe:
         return features
 
     def _entity_hits(self, space_id: str, question: str) -> int:
-        """问题里点名了多少个记忆中的实体（名字或别名，按词边界匹配；不算用户本人）。"""
+        """问题里点名了多少个记忆中的实体（名字或别名，按词边界匹配；不算用户本人）。
+
+        先按子串筛掉不出现的名字（词边界匹配一定是子串，计数不变）：每个名字一个正则，名字与
+        别名超过 re 的缓存（512 个）之后每次读取都要全部重新编译，1.2k 个实体约 100 毫秒。
+        """
         lowered = question.lower()
         count = 0
-        for entity in self.db.get_entities(space_id):
-            names = [entity.name, *entity.aliases]
-            for name in names:
-                name = name.strip().lower()
-                if len(name) < 3 or name in ("user", "the user", "用户"):
+        for name, aliases in self.db.entity_names(space_id):
+            for raw in [name, *aliases]:
+                key = raw.strip().lower()
+                if len(key) < 3 or key in ("user", "the user", "用户"):
                     continue
-                if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", lowered):
+                if key in lowered and re.search(rf"(?<!\w){re.escape(key)}(?!\w)", lowered):
                     count += 1
                     break
         return count

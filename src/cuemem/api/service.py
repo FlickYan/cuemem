@@ -248,10 +248,13 @@ class ChatService:
                 continue
             degree[fact.subject_id] = degree.get(fact.subject_id, 0) + 1
             text = f"{fact.statement} {fact.object}".lower()
+            # 先按子串筛：每个名字一个正则，名字多过 re 的缓存后每条事实都要全部重新编译
             linked = set(fact.entity_ids) | {
                 eid
                 for eid, aliases in names.items()
-                if any(re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text) for a in aliases)
+                if any(
+                    a in text and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text) for a in aliases
+                )
             }
             for other in sorted(linked - {fact.subject_id}):
                 pair = (min(fact.subject_id, other), max(fact.subject_id, other))

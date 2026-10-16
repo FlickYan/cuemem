@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）
 SCHEMA_VERSION = 5
 
+# 新增的索引不用升版本：每次打开都执行 _SCHEMA，已有的库自动补上。facts 的
+# (space_id, superseded_by) 与 (space_id, invalidated_at) 每次读取都用得到：沿版本链找被取代的
+# 旧版本（choose_facts）、数当前有效的事实（space_stats）
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -154,6 +157,8 @@ CREATE INDEX IF NOT EXISTS idx_provenance_target ON provenance (space_id, target
 CREATE INDEX IF NOT EXISTS idx_turns_space ON turns (space_id, session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id);
 CREATE INDEX IF NOT EXISTS idx_facts_space ON facts (space_id, subject_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts (space_id, superseded_by);
+CREATE INDEX IF NOT EXISTS idx_facts_current ON facts (space_id, invalidated_at);
 CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
 CREATE INDEX IF NOT EXISTS idx_media_space ON media (space_id, source_turn_id);
@@ -681,6 +686,15 @@ class MemoryDB:
         with self._lock:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_entity(r) for r in fetched]
+
+    def entity_names(self, space_id: str) -> list[tuple[str, list[str]]]:
+        """各实体的名字与别名（顺序同 get_entities）：只要名字时不用逐行构造 Entity。"""
+        with self._lock:
+            fetched = self._conn.execute(
+                "SELECT name, aliases FROM entities WHERE space_id = ? ORDER BY first_seen, id",
+                (space_id,),
+            ).fetchall()
+        return [(r[0], json.loads(r[1])) for r in fetched]
 
     def get_episodes(self, space_id: str) -> list[Episode]:
         with self._lock:

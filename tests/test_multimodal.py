@@ -175,6 +175,36 @@ def test_visual_route_finds_images(mm: tuple[MemorySystem, ScriptedModel]) -> No
     assert result.media and len(result.attach) >= 1
 
 
+def test_visual_route_reads_only_the_hit_turns(
+    mm: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """以文搜图命中的图片按发言找所在的轮：只取命中图片的那几句发言。以前每次检索都载入并解析
+    整个空间的原始日志（1.6 万轮时约 250 毫秒）。"""
+    system, _ = mm
+    cfg = L1Config(image_kind=None, visual_weight=1.0, attach_images=2)
+    media = system.db.get_media("pics")
+    rounds = system.db.list_units("pics", kinds=["round"])
+    owner = {
+        m.id: next(r.id for r in rounds if m.source_turn_id in r.source_turn_ids) for m in media
+    }
+    real = system.db.get_turns
+    asked: list[list[str] | None] = []
+
+    def get_turns(space_id: str, session_id: str | None = None, **kwargs: Any) -> Any:
+        assert session_id is not None or kwargs.get("ids") is not None, "载入了整个原始日志"
+        asked.append(kwargs.get("ids"))
+        return real(space_id, session_id, **kwargs)
+
+    monkeypatch.setattr(system.db, "get_turns", get_turns)
+    cands = system.l1.candidates("pics", "car", ASKED, cfg)
+    visual = cands.routes[("media", "visual")]
+    assert {mid for mid, _ in visual} == set(owner)
+    assert sorted(m.source_turn_id for m in media) in asked
+    ranked = dict(cands.ranked)
+    assert all(owner[mid] in ranked for mid in owner)  # 每张命中的图片都映射回了所在的轮
+    assert set(cands.media_score) == set(owner)
+
+
 def test_history_blocks_interleave_images(images: dict[str, Path]) -> None:
     session = SessionIn(
         session_id="s",

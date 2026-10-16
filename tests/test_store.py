@@ -188,6 +188,65 @@ def test_v1_database_is_migrated(tmp_path: Path) -> None:
     assert db.get_turns("s")[0].speaker == "Alice"
 
 
+def test_fact_indexes_are_added_to_existing_databases(tmp_path: Path) -> None:
+    """每次读取都要沿版本链找被取代的旧版本、数当前有效的事实：以前只有 (space_id, subject_id,
+    predicate) 一个索引，两个查询都扫整个空间。打开已有的库时自动补上两个索引，查询结果不变。"""
+    import sqlite3
+
+    from cuemem.core.models import Fact
+
+    path = tmp_path / "memory.sqlite"
+    db = MemoryDB(path)
+    when = datetime(2025, 1, 1)
+    facts = [
+        Fact(
+            id=f"f{i:03d}",
+            space_id="s" if i % 3 else "other",
+            subject_id="user",
+            subject="User",
+            predicate="likes",
+            object=f"thing {i}",
+            statement=f"The user likes thing {i}.",
+            recorded_at=when.replace(day=1 + i % 28),
+            invalidated_at=when if i % 4 == 0 else None,
+            superseded_by=f"f{i + 1:03d}" if i % 4 == 0 else None,
+            session_id="x",
+            source_turn_ids=[],
+        )
+        for i in range(60)
+    ]
+    db.apply_consolidation(facts=facts, entities=[], episodes=[], units=[])
+
+    def read() -> tuple[list[str], dict[str, int]]:
+        old = db.get_facts("s", superseded_by=["f005", "f009", "f033", "nope"])
+        return [f.id for f in old], db.space_stats("s")
+
+    db.close()
+    conn = sqlite3.connect(path)  # 模拟升级前的库：没有这两个索引
+    conn.executescript(
+        "DROP INDEX IF EXISTS idx_facts_superseded; DROP INDEX IF EXISTS idx_facts_current;"
+    )
+    conn.close()
+    db = MemoryDB(path)
+    with_indexes = read()
+    names = {row[1] for row in db._conn.execute("PRAGMA index_list(facts)")}
+    assert {"idx_facts_superseded", "idx_facts_current"} <= names
+    plan = " ".join(
+        str(row[-1])
+        for row in db._conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM facts"
+            " WHERE space_id = ? AND invalidated_at IS NULL",
+            ("s",),
+        )
+    )
+    assert "idx_facts_current" in plan
+    for name in ("idx_facts_superseded", "idx_facts_current"):
+        db._conn.execute(f"DROP INDEX {name}")
+    assert read() == with_indexes  # 没有索引时（全表扫描）结果相同
+    assert with_indexes[0] == ["f004", "f032", "f008"]  # 按 recorded_at、id 排序
+    db.close()
+
+
 def test_llm_cache_gains_scope_column(tmp_path: Path) -> None:
     """N3 之前建的响应缓存没有 scope 列：打开时自动补上，旧条目照常可读。"""
     import sqlite3
