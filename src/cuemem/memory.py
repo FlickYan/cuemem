@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -272,9 +272,14 @@ class MemorySystem:
 
     @classmethod
     def from_settings(
-        cls, settings: Settings, *, http_client: httpx2.Client | None = None
+        cls,
+        settings: Settings,
+        *,
+        http_client: httpx2.Client | None = None,
+        on_peak_wait: Callable[[str, datetime], None] | None = None,
     ) -> MemorySystem:
-        """按配置组装各组件。http_client 用于测试时注入模拟的网络层。"""
+        """按配置组装各组件。http_client 用于测试时注入模拟的网络层；on_peak_wait：wait 策略下
+        遇到高峰、开始暂停时通知调用方（每段高峰每个供应商一次）。"""
         paths = settings.paths
         ledger = Ledger(paths.ledger)
         embedder = build_embedder(settings, ledger=ledger, http_client=http_client)
@@ -286,6 +291,7 @@ class MemorySystem:
             cache=ResponseCache(paths.llm_cache),
             ledger=ledger,
             http_client=http_client,
+            on_peak_wait=on_peak_wait,
         )
         return cls(
             settings,

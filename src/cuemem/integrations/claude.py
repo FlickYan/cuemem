@@ -4,7 +4,8 @@
     from cuemem import Memory
     from cuemem.integrations.claude import CueMemMemoryTool, with_recall
 
-    memory = Memory()  # 默认配置用通义千问；只有 DeepSeek 的 Key 时 Memory(preset="deepseek")
+    # 默认配置：通义千问抽取与检索、DeepSeek 回答；只有 DeepSeek 的 Key 时 Memory(preset="deepseek")
+    memory = Memory()
     tool = CueMemMemoryTool(memory, user_id="alice")
     history, evidence = with_recall(
         [{"role": "user", "content": "I moved to Lisbon last month."}], memory, user_id="alice"

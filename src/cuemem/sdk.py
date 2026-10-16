@@ -29,6 +29,7 @@ import asyncio
 import base64
 import binascii
 import functools
+import logging
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
@@ -45,10 +46,13 @@ from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
 from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConcurrentWriteError
+from cuemem.llm.client import PeakPolicy
 from cuemem.memory import ForgetReport, MemorySystem, Recall
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router, english_reason
 from cuemem.read.facts import fact_status
+
+logger = logging.getLogger(__name__)
 
 SearchMode = Literal["auto", "l0", "l1", "l2"]
 AnswerMode = Literal["auto", "l0", "l1", "l2", "agent", "hatch"]
@@ -81,6 +85,16 @@ def _part(value: str) -> str:
     return value.replace("%", "%25").replace("/", "%2F")
 
 
+def _log_peak_wait(provider: str, until: datetime) -> None:
+    """peak_policy="wait" 时开始暂停：记一条警告，不让调用方以为卡死了。"""
+    logger.warning(
+        "%s peak hours: pausing model calls until %s (peak_policy='wait'; "
+        "pass peak_policy='warn' to call now at peak price).",
+        provider,
+        until.isoformat(timespec="minutes"),
+    )
+
+
 class Memory:
     """CueMem 的 Python SDK。线程安全；用完调用 close()，或用 with 语句。
 
@@ -88,6 +102,13 @@ class Memory:
     {"roles": {"reader": {"model": "qwen3.8-flash"}}}；home：数据目录（默认 CUEMEM_HOME，
     源码仓库里是仓库根目录，否则 ~/.cuemem）；instructions：给抽取的补充说明（记什么、不记什么）；
     background：后台线程抽取事实（默认开）。
+
+    peak_policy：DeepSeek 分时价格的高峰时段里需要真实调用时怎么办（默认配置的回答模型就是
+    DeepSeek）。SDK 是交互式的，缺省 "warn"：照常按高峰价调用，trace 里记一条 peak_call，与
+    cuemem ask / serve / mcp / proxy 一致（D-024）。批量写入想等高峰结束、拿错峰折扣时传 "wait"
+    （开始等待时记一条警告日志），"allow" 不提醒。这个参数与 config 里的 peak_policy 优先于环境
+    变量 CUEMEM_PEAK_POLICY 与 YAML 配置（与 CLI 相同）；config 是 Settings 对象时保留它自己的
+    值，除非显式传了这个参数。
     """
 
     def __init__(
@@ -98,17 +119,27 @@ class Memory:
         home: str | Path | None = None,
         instructions: str | None = None,
         background: bool = True,
+        peak_policy: PeakPolicy | None = None,
         http_client: httpx2.Client | None = None,
     ) -> None:
         if isinstance(config, Settings):
             settings = config
+            if peak_policy is not None:
+                settings = settings.model_copy(update={"peak_policy": peak_policy})
         else:
-            settings = load_settings(preset=preset, home=home, **dict(config or {}))
+            overrides = dict(config or {})
+            if peak_policy is not None:
+                overrides["peak_policy"] = peak_policy
+            # 交互式调用不继承配置里批量任务用的 wait：高峰最长 4 小时，调用方看起来像卡死（D-024）
+            overrides.setdefault("peak_policy", "warn")
+            settings = load_settings(preset=preset, home=home, **overrides)
         if instructions is not None:  # 抽取的补充说明（Mem0 叫 custom_instructions）
             consolidation = settings.consolidation.model_copy(update={"instructions": instructions})
             settings = settings.model_copy(update={"consolidation": consolidation})
         self.settings = settings
-        self.system = MemorySystem.from_settings(settings, http_client=http_client)
+        self.system = MemorySystem.from_settings(
+            settings, http_client=http_client, on_peak_wait=_log_peak_wait
+        )
         self._runs: set[tuple[str, str]] = set()  # open_run 开始、还没结束的（空间，run_id）
         self._runs_lock = threading.Lock()
         if background:

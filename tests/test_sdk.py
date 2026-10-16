@@ -557,6 +557,88 @@ def test_config_dict_and_home(
         memory.close()
 
 
+HASH = {"embedding": {"backend": "hash", "dim": 64}}
+
+
+def test_sdk_does_not_inherit_the_batch_peak_policy(
+    settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """SDK 是交互式的：配置字典（或不给配置）时缺省 peak_policy="warn"，不继承默认配置里批量任务
+    用的 wait；显式给的值（字典里的或参数）照用；Settings 对象保留它自己的值。"""
+
+    def policy(config: Any = None, **kwargs: Any) -> str:
+        home = tmp_path / "home"  # 配置字典的数据目录；Settings 对象用它自己的 paths
+        with Memory(
+            config, home=home, http_client=fake_api.client(), background=False, **kwargs
+        ) as m:
+            assert m.system.llm.peak_policy == m.settings.peak_policy
+            return m.settings.peak_policy
+
+    assert policy(HASH) == "warn"
+    assert policy({**HASH, "peak_policy": "wait"}) == "wait"
+    assert policy(HASH, peak_policy="wait") == "wait"
+    assert policy({**HASH, "peak_policy": "allow"}, peak_policy="wait") == "wait"
+    assert policy(settings) == "allow"  # conftest 的 Settings：保留它自己的值
+    assert policy(settings.model_copy(update={"peak_policy": "wait"})) == "wait"
+    assert policy(settings, peak_policy="warn") == "warn"
+
+    async def run() -> str:
+        async with AsyncMemory(
+            HASH,
+            home=tmp_path / "home",
+            http_client=fake_api.client(),
+            background=False,
+            peak_policy="allow",
+        ) as m:
+            return str(m.settings.peak_policy)
+
+    assert asyncio.run(run()) == "allow"
+
+
+def test_sdk_calls_are_not_paused_in_peak_hours(
+    settings: Settings, fake_api: FakeAPI, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """DeepSeek 的高峰时段（周三 10:00，北京时间）：以前 SDK 继承 wait，answer() 与 L2 的
+    search() 各自暂停到 12:00，看起来像卡死。现在照常调用；选了 wait 时开始暂停记一条警告。"""
+    from zoneinfo import ZoneInfo
+
+    fake_api.chat_replies = [ScriptedModel(where_i_live)]
+    clock = [datetime(2026, 10, 14, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))]
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+
+    def at_peak(m: Memory) -> Memory:
+        m.system.llm._clock = lambda: clock[0]
+        m.system.llm._sleep = sleep
+        return m
+
+    def deepseek(**kwargs: Any) -> Memory:
+        return Memory(
+            HASH,
+            preset="deepseek",
+            home=tmp_path,
+            http_client=fake_api.client(),
+            background=False,
+            **kwargs,
+        )
+
+    with at_peak(deepseek()) as m:
+        m.add("I live in Berlin", user_id="alice", infer=False)
+        m.answer("Where do I live?", user_id="alice", mode="l1")
+        m.search("Where do I live?", user_id="alice", mode="l2")
+        m.add("I moved to Munich", user_id="alice", wait=True)
+    models = [r["model"] for r in fake_api.chat_requests]
+    assert slept == [] and len(models) >= 3 and set(models) == {"deepseek-flash"}
+
+    with at_peak(deepseek(peak_policy="wait")) as m, caplog.at_level("WARNING", "cuemem.sdk"):
+        m.answer("Where else did I live?", user_id="alice", mode="l1")
+    assert sum(slept) == 2 * 3600  # 选了 wait：暂停到 12:00
+    assert "deepseek peak hours: pausing model calls until 2026-10-14T12:00" in caplog.text
+
+
 def test_async_memory(n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel) -> None:
     fake_api.chat_replies = [model]
 

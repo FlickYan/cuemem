@@ -21,7 +21,8 @@ paths:
 llm_cache_mode: read_write
 
 # 分时价格的高峰时段遇到需要真实调用的请求时怎么办：wait 暂停到高峰结束（评测等批量任务的默认）；
-# warn 照常调用但提醒；allow 照常调用。交互式提问（cuemem ask）总是 allow。
+# warn 照常调用但提醒；allow 照常调用。交互式的入口（cuemem ask / serve / mcp / proxy 与 Python SDK
+# 的 Memory）缺省用 warn，不用这里的值；SDK 要等高峰结束时传 Memory(peak_policy="wait")。
 peak_policy: wait
 
 providers:

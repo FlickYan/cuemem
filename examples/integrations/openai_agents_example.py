@@ -68,7 +68,9 @@ async def say(
 
 async def main() -> None:
     set_tracing_disabled(True)  # trace 默认发往 OpenAI（包括注入的记忆）；这里没有 OpenAI 的 Key
-    memory = Memory()  # CUEMEM_PRESET 选预设；不设时用默认配置（QwenCloud）
+    # CUEMEM_PRESET 选预设；不设时用默认配置：抽取、检索与 agent 角色用 QwenCloud（默认的回答模型是
+    # DeepSeek，这里用不到）
+    memory = Memory()
     memory.delete_all(user_id=USER)  # 演示用户从空白开始
 
     model, settings = agent_model(memory)

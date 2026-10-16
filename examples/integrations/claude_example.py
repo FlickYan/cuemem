@@ -82,7 +82,8 @@ class Conversation:
 
 
 def main() -> None:
-    memory = Memory()  # 不设 CUEMEM_PRESET 时是默认配置（通义千问）
+    # 不设 CUEMEM_PRESET 时是默认配置：抽取、向量与检索用通义千问；回答模型是 DeepSeek，这里用不到
+    memory = Memory()
     delete_all(memory, user_id=USER)  # 演示用户从空白开始：记忆与 Claude 的文件一起删
     client = anthropic.Anthropic()
     with CueMemMemoryTool(memory, user_id=USER) as tool:
