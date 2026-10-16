@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import anyio
+import httpx2
 import pytest
 from fakes import REJECT, FakeAPI
 from fastapi.testclient import TestClient
@@ -228,6 +231,138 @@ def test_streaming_is_relayed_and_written_back(
     assert text == "Berlin has great coffee"
     turns = system.db.get_turns("alice", "s1")
     assert [t.text for t in turns] == ["I live in Berlin", "Berlin has great coffee"]
+
+
+def _sse(text: str) -> bytes:
+    chunk = {"choices": [{"index": 0, "delta": {"content": text}}]}
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+class Answer(httpx2.SyncByteStream):
+    """上游的流式回答：先说 texts，然后断掉（error）、一直说下去（endless）或以 last 收尾。"""
+
+    def __init__(
+        self,
+        texts: list[str],
+        *,
+        error: Exception | None = None,
+        endless: bool = False,
+        last: bytes = b"data: [DONE]\n\n",
+    ) -> None:
+        self.texts, self.error, self.endless, self.last = texts, error, endless, last
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from map(_sse, self.texts)
+        if self.error is not None:
+            raise self.error
+        while self.endless:
+            yield _sse(" and")
+        yield self.last
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def streaming(system: MemorySystem, answer: Answer) -> MemoryProxy:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, stream=answer, headers={"content-type": "text/event-stream"})
+
+    return MemoryProxy(system, http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
+
+
+ASK_PIN = {
+    "model": "qwen3.8-flash",
+    "stream": True,
+    "user": "alice",
+    "messages": [{"role": "user", "content": "What is my PIN?"}],
+}
+
+
+def test_a_broken_upstream_stream_is_not_remembered(system: MemorySystem) -> None:
+    """上游说到一半断了（连接被重置）：调用方拿到错误，记忆里什么也不写（D-062，与非流式
+    相同）。以前把半截的 "Your PIN is 12" 当成完整的回答写进了原始日志。"""
+    reset = httpx2.ReadError("connection reset by peer")
+    answer = Answer(["Your PIN is", " 12"], error=reset)
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    with pytest.raises(httpx2.ReadError):
+        list(chunks)
+    assert answer.closed and system.db.get_turns("alice") == []
+
+
+def test_an_error_inside_the_stream_is_not_remembered(system: MemorySystem) -> None:
+    """有的上游出错时在流里发 {"error": ...} 再正常关流：同样不写记忆。"""
+    error = {"error": {"message": "overloaded", "type": "server_error"}}
+    answer = Answer(["Your PIN is"], last=f"data: {json.dumps(error)}\n\n".encode())
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    assert b"overloaded" in b"".join(chunks)  # 原样转发给调用方
+    assert answer.closed and system.db.get_turns("alice") == []
+
+
+def test_a_stopped_stream_keeps_only_the_user_message(system: MemorySystem) -> None:
+    """调用方中途不要了（用户停下）：关掉上游，只写回用户的话，半截的回答不算回答。"""
+    answer = Answer(["Your PIN is"], endless=True)
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    for _ in range(4):  # 读过几块回答再停：以前会把读到的半截写成回答
+        next(chunks)
+    chunks.close()
+    assert answer.closed
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_client_disconnect_closes_the_relay_at_once(
+    system: MemorySystem, spec_version: str
+) -> None:
+    """客户端中途断开：路由立即关掉转发，上游的连接马上释放，用户的话按顺序写回。以前
+    Starlette 不关同步迭代器，要等垃圾回收才收尾（写回排到下一轮之后，还可能在同一线程上
+    等自己持有的会话锁）。2.4 起服务器在 send 时报 OSError，更早的版本由 receive 告知断开。"""
+    answer = Answer(["Your PIN is"], endless=True)
+    app_ = create_proxy_app(streaming(system, answer))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": spec_version},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8787),
+    }
+    bodies = 0
+
+    async def main() -> None:
+        gone = anyio.Event()
+        received = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal received
+            if not received:
+                received = True
+                return {"type": "http.request", "body": json.dumps(ASK_PIN).encode()}
+            await gone.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            nonlocal bodies
+            if message["type"] == "http.response.body":
+                bodies += 1
+                if bodies >= 3:
+                    gone.set()
+                    if spec_version == "2.4":
+                        raise OSError("client went away")
+
+        with contextlib.suppress(Exception):
+            await app_(scope, receive, send)
+
+    anyio.run(main)
+    assert bodies >= 3
+    assert answer.closed  # 不等垃圾回收
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
 
 
 def test_model_mapping_and_agent_scope(

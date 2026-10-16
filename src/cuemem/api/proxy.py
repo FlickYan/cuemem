@@ -14,7 +14,8 @@
 3. **转发**：按配置里的模型目录转发给上游（model 是配置里的别名或模型 ID，
    否则用 agent 角色的模型），流式与非流式都支持，响应原样返回；
    控制器的决定放在响应头 X-CueMem-* 里；
-4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）。会话进行中不抽取事实，
+4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）；上游出错时不写，流式
+   回答中途断开（客户端停下）只写用户的话。会话进行中不抽取事实，
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-045）。
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent）；会话：请求头
@@ -38,9 +39,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated, Any
 
+import anyio
+import anyio.to_thread
 import httpx2
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.config import ModelSpec
@@ -128,7 +132,10 @@ class MemoryProxy:
     def stream(
         self, body: dict[str, Any], headers: Mapping[str, str]
     ) -> tuple[int, Iterator[bytes], dict[str, str]]:
-        """流式：先拿到上游的状态码，再把 SSE 原样转发；流结束后写回回答。"""
+        """流式：先拿到上游的状态码，再把 SSE 原样转发；流读完后写回回答。
+
+        状态码是 200 时返回的迭代器（_Relay）要么读完，要么调用 close()：它占着上游的连接，
+        中途不要的（客户端断开、用户停下）只写回用户的话；上游中途出错时什么也不写。"""
         turn, upstream, url, auth = self._prepare(body, headers)
         request = self._http.build_request("POST", url, json=upstream, headers=auth)
         response = self._http.send(request, stream=True)
@@ -136,19 +143,7 @@ class MemoryProxy:
             content = response.read()
             response.close()
             return response.status_code, iter([content]), _headers(turn)
-
-        def relay() -> Iterator[bytes]:
-            pieces: list[str] = []
-            try:
-                for line in response.iter_lines():
-                    yield (line + "\n").encode()
-                    if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
-                        pieces.append(_delta_text(line[5:]))
-            finally:
-                response.close()
-                self._write_back(turn, "".join(pieces))
-
-        return 200, relay(), _headers(turn)
+        return 200, _Relay(self, turn, response), _headers(turn)
 
     # ---------- 会话 ----------
 
@@ -306,6 +301,84 @@ class MemoryProxy:
             record_event("proxy_write_failed", error=f"{type(exc).__name__}: {exc}")
 
 
+class _Relay(Iterator[bytes]):
+    """把上游的 SSE 一行行原样转发；流怎么结束决定写回什么（D-062：上游出错不写记忆）。
+
+    - 读完（done）：写回用户的话与回答。不要求 [DONE] 或 finish_reason：有的上游不发
+      [DONE] 就关流，finish_reason 为 length 的回答也是完整的；
+    - 上游中途出错（failed，含流里的 {"error": ...}）：什么也不写，与非流式的出错相同；
+    - 调用方中途 close()（stopped，客户端断开、用户停下）：只写回用户的话。半截的回答不算
+      回答（调用方下一次请求的历史里有它）；用户的话却要写：之后的请求只写各自最后一句
+      用户消息，这句不写就永远丢了。
+
+    写成类而不是生成器：还没开始读就 close() 的生成器不执行收尾，上游的连接一直占着。"""
+
+    def __init__(self, proxy: MemoryProxy, turn: Turn, response: httpx2.Response) -> None:
+        self._proxy = proxy
+        self._turn = turn
+        self._response = response
+        self._lines = response.iter_lines()
+        self._pieces: list[str] = []
+        self._error = False
+        self._ended: str | None = None
+
+    def __next__(self) -> bytes:
+        if self._ended is not None:
+            raise StopIteration
+        try:
+            line = next(self._lines)
+        except StopIteration:
+            self._end("failed" if self._error else "done")
+            raise
+        except BaseException:
+            self._end("failed")
+            raise
+        payload = line[5:].strip() if line.startswith("data:") else ""
+        if payload and payload != "[DONE]":
+            chunk = _sse_json(payload)
+            self._error = self._error or bool(chunk.get("error"))
+            self._pieces.append(_delta_text(chunk))
+        return (line + "\n").encode()
+
+    def close(self) -> None:
+        self._end("stopped")
+
+    def _end(self, ended: str) -> None:
+        if self._ended is not None:
+            return
+        self._ended = ended
+        self._response.close()
+        answer = "".join(self._pieces)
+        if ended == "done":
+            self._proxy._write_back(self._turn, answer)
+            return
+        record_event(
+            "proxy_stream_incomplete", space=self._turn.space, ended=ended, chars=len(answer)
+        )
+        if ended == "stopped":
+            self._proxy._write_back(self._turn, None)
+
+
+class _RelayResponse(StreamingResponse):
+    """流式响应一结束（读完、出错、客户端断开）就关掉 _Relay。
+
+    Starlette 在客户端断开时不关同步迭代器，收尾要等垃圾回收：期间占着上游的连接，写回落在
+    任意线程上、排在下一轮之后，在同一线程上还会等自己持有的会话锁，死锁。"""
+
+    def __init__(self, chunks: Iterator[bytes], **kwargs: Any) -> None:
+        super().__init__(chunks, **kwargs)
+        self._chunks = chunks
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close = getattr(self._chunks, "close", None)
+            if close is not None:  # 写回要访问数据库与嵌入：放到工作线程，取消时也做完
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(close)
+
+
 def _adapt(upstream: dict[str, Any], spec: ModelSpec) -> None:
     """按模型目录补上供应商特有的参数（例如关掉思考模式），并处理推理模型的参数差异。"""
     for key, value in spec.extra_body.items():
@@ -338,11 +411,15 @@ def _image_url(block: dict[str, Any]) -> str:
     return str(value.get("url", "") if isinstance(value, dict) else value or "")
 
 
-def _delta_text(payload: str) -> str:
+def _sse_json(payload: str) -> dict[str, Any]:
     try:
         chunk = json.loads(payload)
     except json.JSONDecodeError:
-        return ""
+        return {}
+    return chunk if isinstance(chunk, dict) else {}
+
+
+def _delta_text(chunk: dict[str, Any]) -> str:
     choices = chunk.get("choices") or []
     delta = choices[0].get("delta") if choices else None
     return (delta or {}).get("content") or ""
@@ -385,7 +462,7 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
             status, chunks, extra = proxy.stream(body, headers)
             if status != 200:
                 return Response(b"".join(chunks), status, extra, media_type="application/json")
-            return StreamingResponse(chunks, headers=extra, media_type="text/event-stream")
+            return _RelayResponse(chunks, headers=extra, media_type="text/event-stream")
         status, data, extra = proxy.complete(body, headers)
         return JSONResponse(data, status, extra)
 
