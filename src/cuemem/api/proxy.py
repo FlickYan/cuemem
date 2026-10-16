@@ -21,6 +21,9 @@
 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）或者空闲
 超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。
+
+请求体必须是 Content-Type: application/json，别的网站发来的浏览器请求（Origin 与 Host 不同）一律
+403（api.app.SameOriginOnly）：否则任何网页都能借访问者的浏览器往本机的代理写记忆、花上游的额度。
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -390,6 +393,12 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
 
 
 async def _body(request: Request) -> dict[str, Any]:
+    # 只收 JSON：text/plain、表单与不带 Content-Type 的 POST 是浏览器不经预检就能跨站发的请求
+    media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media != "application/json" and not (
+        media.startswith("application/") and media.endswith("+json")
+    ):
+        raise HTTPException(415, "Content-Type must be application/json.")
     try:
         body = await request.json()
     except ValueError as exc:
@@ -399,10 +408,18 @@ async def _body(request: Request) -> dict[str, Any]:
     return body
 
 
-def create_proxy_app(proxy: MemoryProxy, *, token: str | None = None) -> FastAPI:
+def create_proxy_app(
+    proxy: MemoryProxy,
+    *,
+    token: str | None = None,
+    allowed_hosts: Sequence[str] | None = None,
+    origin_hosts: Sequence[str] = (),
+) -> FastAPI:
     """单独运行的记忆代理（cuemem proxy）。token 非空时要求 Authorization: Bearer <token>：
-    OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。"""
-    from cuemem.api.app import _token_check
+    OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。
+
+    不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。"""
+    from cuemem.api.app import _guard, _token_check
 
     stop = threading.Event()
 
@@ -432,4 +449,5 @@ def create_proxy_app(proxy: MemoryProxy, *, token: str | None = None) -> FastAPI
 
     deps = [Depends(_token_check(token))] if token else []
     app.include_router(proxy_router(proxy, dependencies=deps))
+    _guard(app, allowed_hosts, origin_hosts)
     return app

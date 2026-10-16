@@ -418,6 +418,46 @@ def test_http_api_token(service: ChatService, tmp_path: Path) -> None:
     assert forget.status_code == 401  # 删除记忆同样要令牌
 
 
+def test_http_api_refuses_cross_origin_requests(service: ChatService, tmp_path: Path) -> None:
+    """别的网站发来的浏览器请求一律 403。预检请求（OPTIONS）匹配不到接口，以前会落到根路径上的
+    Gradio，它对非本机的 Host（Docker、局域网）放行任何来源，之后跨站的 JSON POST 就能遗忘、导入。
+    同源（/docs 的 Try it out）、不带 Origin 的请求与界面照常。"""
+    client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=True))
+    lan, evil = "192.168.1.10:7860", "https://evil.example"
+    for path in ("/api/spaces/shop/forget", "/api/spaces/import", "/api/sessions"):
+        preflight = client.options(
+            path,
+            headers={
+                "Host": lan,
+                "Origin": evil,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        assert preflight.status_code == 403, path
+        assert "access-control-allow-origin" not in preflight.headers
+    started = client.post("/api/sessions", json={}, headers={"Host": lan, "Origin": evil})
+    assert started.status_code == 403 and service.sessions == {}
+    assert client.get("/api/spaces", headers={"Host": lan, "Origin": "null"}).status_code == 403
+    same = client.post("/api/sessions", json={}, headers={"Host": lan, "Origin": f"http://{lan}"})
+    assert same.status_code == 200
+    assert client.get("/api/spaces").status_code == 200
+    assert client.get("/", headers={"Host": lan, "Origin": evil}).status_code == 200  # 界面
+
+
+def test_http_api_trusted_hosts(service: ChatService, tmp_path: Path) -> None:
+    """allowed_hosts（cuemem serve 监听本机地址时）：接口与界面都只接受这些 Host，
+    防 DNS 重绑定。"""
+    app_ = create_app(
+        service, upload_dir=tmp_path / "uploads", ui=True, allowed_hosts=["127.0.0.1"]
+    )
+    client = TestClient(app_, base_url="http://127.0.0.1:7860")
+    assert client.get("/api/spaces").status_code == 200
+    assert client.get("/").status_code == 200
+    for path in ("/api/spaces", "/api/spaces/shop/export", "/"):
+        assert client.get(path, headers={"Host": "attacker.example:7860"}).status_code == 400
+
+
 def test_http_import_rejects_bad_attachments(service: ChatService, tmp_path: Path) -> None:
     """导入的附件不是图片、或 sha256 是一条路径：409（不是 500），什么都不写。"""
     client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=False))

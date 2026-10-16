@@ -505,6 +505,20 @@ def _require_token(host: str, token: str | None, insecure: bool) -> None:
     raise typer.Exit(2)
 
 
+def _host_policy(host: str) -> tuple[list[str] | None, list[str]]:
+    """（Host 白名单，除同源外放行的 Origin 主机名）。监听本机地址时只接受 Host 为本机的请求
+    （防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，它的网页就算同源）；监听别的地址时不查 Host
+    （Docker、局域网用什么地址访问都行，靠访问令牌）。CUEMEM_ALLOWED_HOSTS 列出的主机名两边都放行，
+    含 "*" 时不查 Host、不限 Origin。"""
+    from cuemem.api.app import HOSTS_ENV, LOOPBACK_HOSTS
+
+    extra = [h.strip().lower() for h in os.environ.get(HOSTS_ENV, "").split(",") if h.strip()]
+    if "*" in extra or not _is_loopback(host):
+        return None, extra
+    bind = f"[{host}]" if ":" in host else host.lower()  # 例如 127.0.0.2
+    return list(dict.fromkeys([*LOOPBACK_HOSTS, bind, *extra])), extra
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
@@ -531,6 +545,7 @@ def serve(
     except typer.Exit:
         service.close()
         raise
+    allowed_hosts, origin_hosts = _host_policy(host)
     proxy = MemoryProxy(service.system)  # 同一个记忆系统：经代理写入的对话在界面里也能看到
     try:
         app_ = create_app(
@@ -539,6 +554,8 @@ def serve(
             ui=not no_ui,
             token=token,
             proxy=proxy,
+            allowed_hosts=allowed_hosts,
+            origin_hosts=origin_hosts,
         )
         console.print(
             f"界面：[bold]http://{host}:{port}/[/bold] · 接口文档：http://{host}:{port}/docs"
@@ -585,6 +602,7 @@ def proxy(
     settings = load_settings(peak_policy="warn")
     token = os.environ.get(TOKEN_ENV) or None  # load_settings 已读入 .env
     _require_token(host, token, insecure_no_auth)
+    allowed_hosts, origin_hosts = _host_policy(host)
     system = MemorySystem.from_settings(settings)
     memory_proxy = MemoryProxy(
         system, default_user=user, mode=cast(RecallMode, mode), idle_minutes=idle_minutes
@@ -605,7 +623,10 @@ def proxy(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
                 "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
             )
-        uvicorn.run(create_proxy_app(memory_proxy, token=token), host=host, port=port)
+        app_ = create_proxy_app(
+            memory_proxy, token=token, allowed_hosts=allowed_hosts, origin_hosts=origin_hosts
+        )
+        uvicorn.run(app_, host=host, port=port)
     finally:
         memory_proxy.close_all()
         system.close()

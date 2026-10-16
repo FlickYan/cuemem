@@ -7,6 +7,10 @@
 Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密码填令牌）。不设置时不鉴权，
 只适合在本机演示：cuemem serve 默认只监听 127.0.0.1，监听别的地址又没有令牌时拒绝启动
 （加 --insecure-no-auth 才照常启动）。
+
+浏览器（N12）：/api 与 /v1 不接受别的网站发来的请求（SameOriginOnly），否则任何网页都能借访问者
+的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受这些 Host（cuemem serve /
+proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，它的网页就算同源）。
 """
 
 from __future__ import annotations
@@ -14,16 +18,20 @@ from __future__ import annotations
 import secrets
 import shutil
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, get_args
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
@@ -38,8 +46,54 @@ if TYPE_CHECKING:
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TOKEN_ENV = "CUEMEM_API_TOKEN"
+# 额外接受的主机名（逗号分隔，"*" 表示不限）：监听本机地址时追加进 Host 白名单，也作为 Origin 放行
+HOSTS_ENV = "CUEMEM_ALLOWED_HOSTS"
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")  # Host 头里的 IPv6 地址带方括号
 # 放在模块级：注解是字符串（from __future__ import annotations），FastAPI 解析不到函数里的局部变量
 _BEARER = HTTPBearer(auto_error=False)
+
+
+class SameOriginOnly:
+    """/api 与 /v1 不接受别的网站发来的浏览器请求：带 Origin 头时，Origin 的主机与端口要与 Host
+    头相同（同源，例如 /docs 的 Try it out），或者 Origin 的主机名在 hosts 里（反向代理改写了 Host
+    时）；Origin: null 一律拒绝。不带 Origin 的请求（SDK、curl）不受影响。
+
+    是整个应用的中间件，不是接口的依赖：预检请求（OPTIONS）匹配不到接口，会落到根路径上的
+    Gradio，它对非本机的 Host 放行任何来源。"""
+
+    def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
+        self.app = app
+        self.hosts = {h.lower() for h in hosts}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["path"].startswith(("/api/", "/v1/")):
+            headers = Headers(scope=scope)
+            origin = headers.get("origin")
+            if origin is not None and not self._allowed(origin, headers.get("host", "")):
+                response = JSONResponse({"detail": "不接受别的网站发来的浏览器请求"}, 403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    def _allowed(self, origin: str, host: str) -> bool:
+        if "*" in self.hosts:
+            return True
+        try:
+            parts = urlsplit(origin)
+            name = parts.hostname or ""
+        except ValueError:
+            return False
+        if parts.scheme not in ("http", "https") or not name:
+            return False
+        name = f"[{name}]" if ":" in name else name
+        return parts.netloc.lower() == host.lower() or name in self.hosts
+
+
+def _guard(app: FastAPI, allowed_hosts: Sequence[str] | None, origin_hosts: Sequence[str]) -> None:
+    """浏览器侧的防护（create_app 与 create_proxy_app 共用）；Host 检查在最外层，先于 Origin。"""
+    app.add_middleware(SameOriginOnly, hosts=origin_hosts)
+    if allowed_hosts is not None:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
 
 
 class StartRequest(BaseModel):
@@ -122,11 +176,16 @@ def create_app(
     ui: bool = True,
     token: str | None = None,
     proxy: MemoryProxy | None = None,
+    allowed_hosts: Sequence[str] | None = None,
+    origin_hosts: Sequence[str] = (),
 ) -> FastAPI:
     """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。
 
     proxy：同时提供 OpenAI 兼容的记忆代理（/v1/chat/completions，N12），与界面共用一个记忆系统，
     经代理写入的对话可以在界面里浏览。
+
+    allowed_hosts：只接受这些 Host（接口与界面；None 不检查）。origin_hosts：除同源外放行的
+    Origin 主机名（"*" 不限）。见模块说明。
     """
     app = FastAPI(
         title="CueMem",
@@ -295,6 +354,7 @@ def create_app(
             auth=_ui_login(token),
             auth_message="Sign in with any username and the access token as the password.",
         )
+    _guard(app, allowed_hosts, origin_hosts)  # 中间件：落到界面的预检请求也先过这里
     return app
 
 

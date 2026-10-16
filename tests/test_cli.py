@@ -273,6 +273,30 @@ def test_non_loopback_bind_needs_a_token(
     assert len(served) == 3
 
 
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_loopback_bind_checks_the_host(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """监听本机地址时只接受 Host 为本机的请求（DNS 重绑定）；监听别的地址时不查 Host（Docker、
+    局域网）。CUEMEM_ALLOWED_HOSTS 追加的主机名作为 Host 与 Origin 都放行。"""
+    from fastapi.testclient import TestClient
+
+    assert runner.invoke(app, command).exit_code == 0
+    assert runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"]).exit_code == 0
+    monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", "mem.example, cuemem.lan")
+    assert runner.invoke(app, command).exit_code == 0
+    local, lan, extended = (TestClient(app_) for app_ in served)
+    for host in ("127.0.0.1:7860", "localhost:7860", "[::1]:7860"):
+        assert local.get("/v1/models", headers={"Host": host}).status_code == 200
+    rebound = {"Host": "attacker.example:7860", "Origin": "http://attacker.example:7860"}
+    assert local.get("/v1/models", headers=rebound).status_code == 400
+    assert lan.get("/v1/models", headers={"Host": "192.168.1.10:7860"}).status_code == 200
+    assert extended.get("/v1/models", headers={"Host": "cuemem.lan"}).status_code == 200
+    proxied = {"Host": "127.0.0.1:7860", "Origin": "https://mem.example"}
+    assert extended.get("/v1/models", headers=proxied).status_code == 200
+    assert local.get("/v1/models", headers=proxied).status_code == 403
+
+
 def test_data_download_skips_optional_datasets(
     isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
