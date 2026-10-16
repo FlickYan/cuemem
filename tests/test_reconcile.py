@@ -244,6 +244,22 @@ def test_user_name_becomes_alias(settings: Settings, fake_api: FakeAPI) -> None:
     assert report.created == 1  # 只有用户本人这一个实体
 
 
+def test_speakers_in_other_scripts_are_separate_people(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """说话人名字是西里尔文或只有 emoji：以前名字键都是 ''，所有这样的说话人是同一个实体，
+    别名索引里还有 '' 这个键（任何规范化成 '' 的宾语都会指向这个人）。"""
+    state = EntityState("s")
+    res = resolver(settings, fake_api, {"matches": []})
+    report = ResolutionReport()
+    res.ensure_people(state, ["Анна", "Иван", "🙂", "🙃"], datetime(2026, 1, 10), report)
+    assert report.created == 4 and len(state.entities) == 4
+    assert "" not in state.alias_index
+    assert state.lookup("Анна") != state.lookup("Иван")
+    assert state.lookup("анна") == state.lookup("Анна") is not None
+    assert state.lookup("—") is None
+
+
 def test_plans_do_not_trigger_single_valued_rule(settings: Settings, fake_api: FakeAPI) -> None:
     """ "旅行期间住在某酒店"被标成 lives_in 时，不能按规则把用户的住址取代掉。"""
     state = FactState()

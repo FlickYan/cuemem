@@ -58,7 +58,12 @@ from cuemem.write.extract import (
     participants,
     session_content_hash,
 )
-from cuemem.write.predicates import normalize_predicate, normalize_value, registered_cardinality
+from cuemem.write.predicates import (
+    legacy_value_key,
+    normalize_predicate,
+    normalize_value,
+    registered_cardinality,
+)
 from cuemem.write.profile import build_core_memory
 from cuemem.write.reconcile import FactState, Reconciler
 
@@ -525,6 +530,7 @@ class Consolidator:
 
         new_facts: list[tuple[Fact, FloatArray]] = []
         said_on = {t.id: t.ts for t in turns}
+        keys: dict[str, str] = {}  # 本次抽取里用过的事实 ID → 陈述的规范形式
         for candidate in ext.facts:
             raw = candidate.raw
             subject_id = self.resolver.subject_id(entity_state, raw.subject, ts, ents)
@@ -532,8 +538,14 @@ class Consolidator:
                 continue
             predicate = normalize_predicate(raw.predicate)
             object_id = entity_state.lookup(raw.object) if raw.object else None
+            # 事实 ID 照旧按原来的规范形式派生（已有的 ID 不变）；只有原来的形式撞上、陈述其实
+            # 不同时（"...named 초코." 与 "...named 보리." 原来都成了 "...named"）才另派一个
+            key = normalize_value(raw.statement)
+            fact_id = stable_id(space_id, "fact", ext.session_id, legacy_value_key(raw.statement))
+            if keys.setdefault(fact_id, key) != key:
+                fact_id = stable_id(space_id, "fact", ext.session_id, key, "u")
             fact = Fact(
-                id=stable_id(space_id, "fact", ext.session_id, normalize_value(raw.statement)),
+                id=fact_id,
                 space_id=space_id,
                 subject_id=subject_id,
                 subject=entity_state.entities[subject_id].name,

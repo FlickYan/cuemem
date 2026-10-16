@@ -21,7 +21,7 @@ from test_sdk import where_i_live
 
 from cuemem import Memory
 from cuemem.config import Settings
-from cuemem.core.models import Conversation, Fact
+from cuemem.core.models import Conversation, Fact, SessionIn, TurnIn
 from cuemem.memory import MemorySystem
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
@@ -433,3 +433,89 @@ def test_a_grown_session_is_not_replayed_without_a_writable_cache(
             memory.add(ALPS, user_id="u", run_id="chat", wait=True)
         assert "不从原始日志重放" in caplog.text
         assert "The user likes hiking." in statements(memory)
+
+
+def said(
+    statement: str, subject: str, predicate: str, obj: str, turn: int, cardinality: str = "single"
+) -> dict[str, Any]:
+    return {
+        "statement": statement,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
+        "category": "attribute",
+        "cardinality": cardinality,
+        "importance": 4,
+        "turns": [turn],
+    }
+
+
+# 抽取提示要求用英文写记忆，名字与专名保留原来的文字
+NATIVE_NAMES: dict[str, Any] = {
+    "2026-01-10": {
+        "summary": "",
+        "facts": [
+            said("Анна lives in Moscow.", "Анна", "lives_in", "Moscow", 0),
+            said("Иван works as a doctor.", "Иван", "job_title", "doctor", 1),
+        ],
+        "entities": [],
+    },
+    "2026-02-01": {
+        "summary": "",
+        "facts": [
+            said("The user has a dog named 초코.", "User", "has_pet", "초코", 0, "multi"),
+            said("The user has a dog named 보리.", "User", "has_pet", "보리", 0, "multi"),
+            said("The user lives in 서울.", "User", "lives_in", "서울", 0),
+        ],
+        "entities": [],
+    },
+    "2026-03-01": {
+        "summary": "",
+        "facts": [said("The user moved to 부산.", "User", "lives_in", "부산", 0)],
+        "entities": [],
+    },
+}
+
+
+def test_names_and_values_in_other_scripts(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """名字与宾语是西里尔、韩文等文字时（以前规范化成 ''）：两位俄文名字的说话人是两个实体，
+    关于他们的事实都留着；同一会话里两只韩文名字的狗都留着；从 서울 搬到 부산 经过对账，
+    서울 不再是当前的（以前当成同一个值，부산 被当作重复丢掉）。"""
+    model = ScriptedModel(
+        NATIVE_NAMES,
+        reconcile=lambda prompt: {"decisions": [{"new": 1, "action": "update", "target": "e1"}]},
+    )
+    fake_api.chat_replies = [model]
+    speakers = SessionIn(
+        session_id="g",
+        started_at=datetime(2026, 1, 10),
+        turns=[
+            TurnIn(role="user", speaker="Анна", text="Я живу в Москве."),
+            TurnIn(role="user", speaker="Иван", text="А я работаю врачом."),
+        ],
+    )
+    pets = SessionIn(
+        session_id="a",
+        started_at=datetime(2026, 2, 1),
+        turns=[TurnIn(role="user", text="강아지 초코랑 보리를 키워요. 서울에 살아요.")],
+    )
+    moved = SessionIn(
+        session_id="b",
+        started_at=datetime(2026, 3, 1),
+        turns=[TurnIn(role="user", text="부산으로 이사했어요.")],
+    )
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
+        memory.ingest(Conversation(space_id="ru", sessions=[speakers]), consolidate=True)
+        people = {e.name: e.id for e in memory.entities("ru")}
+        assert set(people) == {"Анна", "Иван"}
+        facts = memory.facts("ru")
+        assert by_statement(facts, "Moscow").subject_id == people["Анна"]
+        assert by_statement(facts, "doctor").subject_id == people["Иван"]
+
+        memory.ingest(Conversation(space_id="ko", sessions=[pets, moved]), consolidate=True)
+        facts = memory.facts("ko")
+        assert {f.object for f in facts if f.predicate == "has_pet"} == {"초코", "보리"}
+        seoul, busan = by_statement(facts, "서울"), by_statement(facts, "부산")
+        assert busan.is_current and not seoul.is_current
+        assert seoul.superseded_by == busan.id
+        assert model.calls["reconcile"] == 1 and "서울" in model.prompts["reconcile"][0]
