@@ -14,6 +14,7 @@ from PIL import Image
 from scripted import ScriptedModel
 from test_sdk import where_i_live
 
+from cuemem import Memory
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
@@ -153,6 +154,37 @@ def test_a_new_conversation_starts_a_new_session(
     assert system.worker is not None
     system.worker.wait()
     assert "The user lives in Berlin." in {f.statement for f in system.facts("alice")}
+
+
+def test_sessions_left_open_by_a_crash_are_adopted(
+    n3_settings: Settings, fake_api: FakeAPI, upstream: Upstream
+) -> None:
+    """代理崩溃时还在进行中的会话（没来得及 close_all）：下一个进程第一次碰到这个用户时交给抽取。
+    只认进行中的标记：infer=False 写入的会话照样不抽取；调用方指定、马上要接着写的会话不动。"""
+
+    def body(text: str) -> dict[str, Any]:
+        return {"model": "qwen3.8-flash", "messages": [SYSTEM, user(text)], "user": "alice"}
+
+    def user(text: str) -> dict[str, str]:
+        return {"role": "user", "content": text}
+
+    crashed = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    proxy = MemoryProxy(crashed, http_client=fake_api.client(), mode="l1")
+    left = proxy.complete(body("I live in Berlin"), {})[2]["X-CueMem-Session"]
+    proxy.complete(body("I like jazz"), {"x-cuemem-session": "kept"})
+    Memory.from_system(crashed).add("I like tea", user_id="alice", infer=False)
+    assert crashed.open_sessions("alice") == {left, "kept"}
+    crashed.close()  # 没有 close_all：进行中的两个会话没人交出去
+
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+        proxy.complete(body("Where do I live?"), {"x-cuemem-session": "kept"})
+        assert system.worker is not None
+        system.worker.wait()
+        assert {j["session_id"]: j["status"] for j in system.db.get_jobs("alice")} == {left: "done"}
+        assert {f.statement for f in system.facts("alice")} == {"The user lives in Berlin."}
+        assert system.open_sessions("alice") == {"kept"}
+        assert system.adopt_open("alice") == 0  # 接手过的会话不再有标记
 
 
 def test_forget_purges_the_query_vector_of_a_deleted_message(

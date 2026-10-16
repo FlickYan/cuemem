@@ -96,6 +96,7 @@ class MemoryProxy:
         self._http = http_client or httpx2.Client(timeout=300.0)
         self._clock = clock
         self._runs: dict[tuple[str, str | None], Run] = {}
+        self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的抽取在后台完成
 
@@ -174,6 +175,7 @@ class MemoryProxy:
         没指定会话时结束上一段、开新的一段——会话的边界跟着调用方的对话走。"""
         now = self._clock()
         self.close_idle()
+        self._adopt(space, explicit)
         key = (space, explicit)
         with self._lock:
             run = self._runs.get(key)
@@ -193,6 +195,15 @@ class MemoryProxy:
         if ended is not None:
             self.system.close_session(ended.space, ended.session_id)
         return run
+
+    def _adopt(self, space: str, explicit: str | None) -> None:
+        """这个进程第一次碰到这个空间：之前的进程崩溃时还在进行中的会话（正常退出时 close_all
+        已经交出去了）交给后台抽取。调用方指定的会话除外：它马上要接着写。"""
+        with self._lock:
+            if space in self._adopted:
+                return
+            self._adopted.add(space)
+        self.system.adopt_open(space, keep=[explicit] if explicit else [])
 
     # ---------- 内部 ----------
 

@@ -235,6 +235,19 @@ class MemoryDB:
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
+    def delete_meta(self, key: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+    def meta_keys(self, prefix: str) -> list[str]:
+        """以 prefix 开头的键。按区间查询而不用 LIKE：键里的空间 ID 可能有 % 与 _。"""
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key FROM meta WHERE key >= ? AND key < ? ORDER BY key", (prefix, upper)
+            ).fetchall()
+        return [r[0] for r in rows]
+
     # ---------- 原始层 ----------
 
     def ensure_space(self, space_id: str) -> None:
@@ -806,6 +819,29 @@ class MemoryDB:
                 (space_id,),
             )
             return max(cursor.rowcount, 0)
+
+    def reset_jobs(self, job_ids: Sequence[str]) -> int:
+        """把这些失败的任务改回待处理（后台按退避时间重试）。期间被新任务取代的不动。"""
+        if not job_ids:
+            return 0
+        marks = ",".join("?" * len(job_ids))
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE jobs SET status = 'pending' WHERE id IN ({marks}) AND status = 'failed'",
+                list(job_ids),
+            )
+            return max(cursor.rowcount, 0)
+
+    def spaces_with_work(self, version: str, max_attempts: int) -> list[str]:
+        """有待处理的任务、或失败次数还没到上限的任务的空间（后台线程启动时接着做）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT space_id FROM jobs WHERE version = ?"
+                " AND (status = 'pending' OR (status = 'failed' AND attempts < ?))"
+                " ORDER BY space_id",
+                (version, max_attempts),
+            ).fetchall()
+        return [r[0] for r in rows]
 
     # ---------- 空间级操作 ----------
 

@@ -3,15 +3,22 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+import threading
+from datetime import datetime, timedelta
+from typing import Any
 
 import pytest
-from fakes import TOY_CONVERSATION, FakeAPI
+from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
 from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
+from test_sdk import where_i_live
 
+from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.models import Conversation, Fact
 from cuemem.memory import MemorySystem
+
+EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
 
 
 def toy() -> Conversation:
@@ -187,6 +194,127 @@ def test_background_worker(n3_settings: Settings, fake_api: FakeAPI, model: Scri
         assert not worker.errors
         assert worker.reports and worker.reports[0].sessions == 5
         assert memory.facts("demo", current_only=True)
+
+
+def outage(model: ScriptedModel) -> tuple[dict[str, int], Any]:
+    """供应商故障的替身：left 还剩几次时，抽取请求返回余额不足（HTTP 402，SDK 不重试）。"""
+    left = {"left": 0}
+
+    def reply(body: dict[str, Any]) -> Any:
+        if left["left"] and body["messages"][0]["content"].startswith(EXTRACT):
+            left["left"] -= 1
+            return NO_BALANCE
+        return model(body)
+
+    return left, reply
+
+
+def statuses(memory: Memory, space: str) -> list[tuple[str, int]]:
+    return sorted((j["status"], j["attempts"]) for j in memory.system.db.get_jobs(space))
+
+
+def test_worker_retries_failed_job_after_outage(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """后台抽取遇上供应商故障：不用等显式的巩固，后台线程按退避时间自动重试；失败 3 次之后
+    不再自动重试（之后的会话照常抽取），显式的 consolidate 仍能补上。"""
+    down, reply = outage(ScriptedModel(where_i_live))
+    fake_api.chat_replies = [reply]
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        worker = memory.system.worker
+        assert worker is not None
+        worker.retry_base_s = 0.0  # 不等退避时间：失败之后马上重试
+        down["left"] = 2  # 前两次失败，第三次成功
+        memory.add("I live in Berlin", user_id="alice")
+        memory.wait()
+        assert statuses(memory, "alice") == [("done", 2)]
+        assert [f["memory"] for f in memory.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
+        assert len(worker.errors) == 2 and "1 个会话抽取失败" in worker.errors[0]
+        assert "Insufficient Balance" in worker.errors[0]
+
+        down["left"] = 99  # 一直失败
+        memory.add("I live in Paris", user_id="bob", timestamp=datetime(2026, 8, 1))
+        memory.wait()
+        assert statuses(memory, "bob") == [("failed", 3)]
+        down["left"] = 0
+        memory.add("I like jazz", user_id="bob", timestamp=datetime(2026, 9, 1))
+        memory.wait()
+        assert statuses(memory, "bob") == [("done", 0), ("failed", 3)]
+        memory.consolidate(user_id="bob")  # 显式的巩固重试全部失败的任务
+        assert [s for s, _ in statuses(memory, "bob")] == ["done", "done"]
+        assert len(memory.get_all(user_id="bob")["results"]) == 2
+
+
+def test_failed_jobs_back_off(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """自动重试的退避：第一次失败之后等 1 分钟，第二次之后等 4 分钟，失败 3 次就不再自动重试。"""
+    down, reply = outage(ScriptedModel(where_i_live))
+    fake_api.chat_replies = [reply]
+    down["left"] = 99
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("I live in Berlin", user_id="alice")
+        consolidator = memory.system.consolidator
+        for attempts, wait in ((1, 60), (2, 240)):
+            assert consolidator.run("alice").failed
+            assert statuses(memory, "alice") == [("failed", attempts)]
+            left = consolidator.next_retry("alice")
+            assert left is not None and wait - 5 < left <= wait
+            now = datetime.now()
+            assert consolidator.retry_due("alice", now=now + timedelta(seconds=wait - 5)) == 0
+            assert consolidator.retry_due("alice", now=now + timedelta(seconds=wait + 1)) == 1
+            assert statuses(memory, "alice") == [("pending", attempts)]
+        assert consolidator.run("alice").failed
+        assert consolidator.next_retry("alice") is None
+        assert consolidator.retry_due("alice", now=datetime.now() + timedelta(days=1)) == 0
+
+
+def test_worker_resumes_pending_jobs_on_start(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """进程退出时还没做完的抽取：下次启动后台线程时接着做，不用等这个用户再写入。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        assert memory.add("I live in Berlin", user_id="alice")["status"] == "queued"
+        assert statuses(memory, "alice") == [("pending", 0)]
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        memory.wait()
+        assert statuses(memory, "alice") == [("done", 0)]
+        assert [f["memory"] for f in memory.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
+
+
+def test_close_timeout_does_not_record_closed_db_error(
+    n3_settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """关闭时后台线程还在抽取、等不到它做完：照常关闭，线程随后碰到已关闭的数据库时不记报错；
+    任务留在待处理，下次启动时接着做。"""
+    model = ScriptedModel(where_i_live)
+    entered, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if body["messages"][0]["content"].startswith(EXTRACT) and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    memory = Memory(n3_settings, http_client=fake_api.client())
+    worker = memory.system.worker
+    assert worker is not None
+    memory.add("I live in Berlin", user_id="alice")
+    assert entered.wait(10)
+    worker.stop_timeout_s = 0.2
+    with caplog.at_level(logging.WARNING, logger="cuemem.write.consolidate"):
+        memory.close()
+    assert worker.closing and "下次启动时接着做" in caplog.text
+    release.set()
+    worker._thread.join(10)
+    assert not worker._thread.is_alive() and not worker.errors
+
+    with Memory(n3_settings, http_client=fake_api.client()) as again:
+        again.wait()
+        assert statuses(again, "alice") == [("done", 0)]
+        assert [f["memory"] for f in again.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
 
 
 def test_content_filter_skips_session_or_falls_back_to_rules(

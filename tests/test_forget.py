@@ -251,7 +251,7 @@ def test_forget_waits_for_background_consolidation(
         thread.join(10)
         worker.wait()
 
-        assert worker.errors == []
+        assert not worker.errors
         [report] = out
         assert not isinstance(report, Exception) and report.turns_deleted == 1
         assert system.db.get_facts("alice") == []
@@ -286,7 +286,7 @@ def test_forget_other_session_during_background_reconciliation(
         thread.join(10)
         worker.wait()
 
-        assert worker.errors == []
+        assert not worker.errors
         [report] = out
         assert not isinstance(report, Exception) and report.turns_deleted > 0
         assert all(f.session_id != "s1" for f in system.facts("demo"))

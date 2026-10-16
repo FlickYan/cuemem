@@ -299,7 +299,7 @@ class ChatService:
             "pending": sum(1 for j in jobs if j["status"] == "pending"),
             "failed": sum(1 for j in jobs if j["status"] == "failed"),
             "done": sum(1 for j in jobs if j["status"] == "done"),
-            "errors": list(worker.errors[-3:]) if worker is not None else [],
+            "errors": list(worker.errors)[-3:] if worker is not None else [],
         }
 
     # ---------- 遗忘与巩固 ----------

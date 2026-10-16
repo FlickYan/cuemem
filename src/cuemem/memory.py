@@ -60,11 +60,13 @@ from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 from cuemem.write.consolidate import (
+    MAX_ATTEMPTS,
     ConsolidationReport,
     ConsolidationWorker,
     Consolidator,
     scope,
 )
+from cuemem.write.extract import PIPELINE_VERSION
 from cuemem.write.online import IngestReport, OnlineWriter
 
 AskMode = Literal["l0", "l1", "l2", "auto", "agent", "hatch", "facts", "naive"]
@@ -205,6 +207,12 @@ def _strings(value: Any) -> Iterator[str]:
             yield from _strings(item)
 
 
+def _open_mark(space_id: str, session_id: str = "") -> str:
+    """进行中的会话在数据库里的标记（元信息的键）；session_id 为空时是这个空间全部标记的
+    共同前缀。空间 ID 带上长度：一个空间的前缀不会同时是另一个空间的前缀。"""
+    return f"open-session:{len(space_id)}:{space_id}:{session_id}"
+
+
 class MemorySystem:
     def __init__(
         self,
@@ -251,6 +259,7 @@ class MemorySystem:
         self.reader = Reader(llm)
         self.agent = ToolReader(llm)
         self.worker: ConsolidationWorker | None = None
+        self._worker_lock = threading.Lock()
         # 进行中的会话（Agent 正在对话，N8）：暂不巩固，会话结束后再整体抽取一次
         self._open: set[tuple[str, str]] = set()
         self._open_lock = threading.Lock()
@@ -387,9 +396,13 @@ class MemorySystem:
 
     def open_session(self, space_id: str, session_id: str) -> None:
         """标记会话进行中：每轮照常在线写入（可检索），但不登记巩固任务——
-        否则半个会话会被抽取一遍，会话结束后整个会话又抽取一遍。"""
+        否则半个会话会被抽取一遍，会话结束后整个会话又抽取一遍。
+
+        数据库里另外留一个标记：进程崩溃时没人再结束这个会话，下一个进程据此接手（adopt_open）。"""
         with self._open_lock:
-            self._open.add((space_id, session_id))
+            if (space_id, session_id) not in self._open:
+                self._open.add((space_id, session_id))
+                self.db.set_meta(_open_mark(space_id, session_id), datetime.now().isoformat())
 
     def close_session(
         self, space_id: str, session_id: str, *, wait: bool = False
@@ -397,6 +410,7 @@ class MemorySystem:
         """会话结束：登记巩固任务；wait=True 时同步巩固并返回报告，否则交给后台线程。"""
         with self._open_lock:
             self._open.discard((space_id, session_id))
+            self.db.delete_meta(_open_mark(space_id, session_id))
         self.consolidator.enqueue(space_id, [session_id])
         if wait:
             return self.consolidate(space_id)
@@ -406,6 +420,25 @@ class MemorySystem:
     def open_sessions(self, space_id: str) -> set[str]:
         with self._open_lock:
             return {sid for space, sid in self._open if space == space_id}
+
+    def adopt_open(self, space_id: str, keep: Collection[str] = ()) -> int:
+        """接手之前的进程留下的进行中的会话：进程崩溃（没来得及 close_session）时，它们没有
+        登记巩固任务，也没人再结束它们。数据库里有标记、本进程里却不在进行中的会话（keep 除外：
+        调用方马上要接着写），登记任务、交给后台线程，去掉标记。返回接手的会话数。
+
+        只认标记，不碰没有任务的其他会话：SDK 的 infer=False 写入的会话本来就不该抽取。"""
+        prefix = _open_mark(space_id)
+        with self._open_lock:
+            live = {sid for space, sid in self._open if space == space_id} | set(keep)
+            marked = [key.removeprefix(prefix) for key in self.db.meta_keys(prefix)]
+            leftover = [sid for sid in marked if sid not in live]
+            if not leftover:
+                return 0
+            self.consolidator.enqueue(space_id, leftover)
+            for sid in leftover:
+                self.db.delete_meta(_open_mark(space_id, sid))
+        self.start_worker().submit(space_id)
+        return len(leftover)
 
     def consolidate(
         self, space_id: str, *, rebuild: bool = False, strict: bool = False
@@ -430,10 +463,16 @@ class MemorySystem:
         return report
 
     def start_worker(self) -> ConsolidationWorker:
-        """启动后台巩固线程：此后 ingest 只登记任务，巩固在后台完成。"""
-        if self.worker is None:
-            self.worker = ConsolidationWorker(self.consolidator)
-        return self.worker
+        """启动后台巩固线程：此后 ingest 只登记任务，巩固在后台完成。
+
+        第一次启动时接着做上次没做完的：进程退出、崩溃或关闭超时时还待处理的任务，以及失败
+        次数还没到上限的任务，所在的空间都提交一遍。"""
+        with self._worker_lock:
+            if self.worker is None:
+                self.worker = ConsolidationWorker(self.consolidator, tracer=self.tracer)
+                for space_id in self.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS):
+                    self.worker.submit(space_id)
+            return self.worker
 
     def forget(
         self,
