@@ -92,7 +92,14 @@ from pydantic import BaseModel
 
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
-from cuemem.evidence import format_listing, recall_evidence, recall_listing, resolve_ids
+from cuemem.evidence import (
+    format_listing,
+    in_context_rounds,
+    recall_evidence,
+    recall_listing,
+    resolve_ids,
+    stored_text,
+)
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.sdk import AsyncMemory, Memory, space_for
 
@@ -449,8 +456,9 @@ class ThreadMemory:
         system = self.memory.system
         if not query.strip() or not system.db.get_sessions(space):
             return
-        present = {_stored_text(m).strip() for m in earlier if _is_turn(m)}
-        exclude = _in_context(system, space, session_for(thread), present) if thread else []
+        # 按写进记忆后的样子比对（_openai 之后：只有 data URL 的图片记作 <image>）
+        present = {stored_text(_openai(m)).strip() for m in earlier if _is_turn(m)}
+        exclude = in_context_rounds(system, space, [session_for(thread)], present) if thread else []
         found = recall_evidence(system, space, query, mode=self.mode, exclude=exclude)
         evidence.level, evidence.reasons = found.level, found.reasons
         evidence.recalled, evidence.block = found.recalled, found.block
@@ -1032,15 +1040,6 @@ def _part(block: str | dict[Any, Any]) -> dict[str, Any] | None:
     return {"type": "image_url", "image_url": {"url": url}} if url.startswith("data:") else None
 
 
-def _stored_text(message: BaseMessage) -> str:
-    """写进记忆后的发言文本（与 SDK 的 parse_messages 相同：图片在文本里记作 <image>）。"""
-    content = _openai(message)["content"]
-    if not isinstance(content, list):
-        return str(content or "")
-    parts = [str(b.get("text", "")) if b["type"] == "text" else "<image>" for b in content]
-    return " ".join(p for p in parts if p)
-
-
 def _render(value: Any) -> str:
     """结构化输出 → 写进记忆的回答（JSON）。"""
     if isinstance(value, BaseModel):
@@ -1051,21 +1050,6 @@ def _render(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return str(value)
-
-
-def _in_context(system: MemorySystem, space: str, session_id: str, present: set[str]) -> list[str]:
-    """当前线程的会话里，原样还在消息里的轮（检索时排除）。按内容比对：线程的消息可能被
-    裁剪或总结过，不能假定写进去的都还在（与记忆代理相同）。"""
-    if not present:
-        return []
-    db = system.db
-    rounds = db.list_units(space, kinds=["round"], session_ids=[session_id])
-    turns = {t.id: t for t in db.get_turns(space, session_id)}
-    return [
-        u.id
-        for u in rounds
-        if all(t in turns and turns[t].text.strip() in present for t in u.source_turn_ids)
-    ]
 
 
 def _remember[V](cache: OrderedDict[str, V], key: str, value: V) -> None:

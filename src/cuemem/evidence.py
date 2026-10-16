@@ -8,12 +8,13 @@
 - **清单**（recall_listing / format_listing）：给另一个 Agent 自己推理用的结构化结果，每条带 ID，
   可以按 ID 遗忘（resolve_ids）。MCP 的 recall 工具与 HTTP 的 /recall 都用它。
 
-以前这几段在记忆代理、服务层与三个集成里各写了一份（集成评审时查出），这里收拢成一份。
+以前这几段在记忆代理、服务层与三个集成里各写了一份（集成评审时查出），这里收拢成一份；
+检索前认出"已经原样在上下文里的轮"（stored_text / in_context_rounds）也一样。
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -107,6 +108,48 @@ def message_text(content: Any) -> str:
     if isinstance(content, list):
         return " ".join(b.get("text", "") for b in content if b.get("type") == "text")
     return ""
+
+
+# ---------- 已经在上下文里的轮 ----------
+
+
+def stored_text(message: Mapping[str, Any]) -> str:
+    """OpenAI 格式的消息 → 写进记忆后的发言文本，与 sdk.parse_messages 相同：图片在文本里记作
+    "<image>"。用来认出上下文里哪些轮原样已经写进了记忆。
+
+    调用方传入经过自己写入筛选之后的消息（记忆代理的 _storable、Agents 会话的 _mirrorable）：
+    只有真正存下的图片才有标记，没存的网络图片也算一个 "<image>" 就对不上了。"""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return content if isinstance(content, str) else ""
+    parts: list[str] = []
+    for block in content:
+        if block.get("type") == "text":
+            parts.append(block.get("text") or "")
+        elif block.get("type") == "image_url":
+            parts.append("<image>")
+    return " ".join(p for p in parts if p)
+
+
+def in_context_rounds(
+    system: MemorySystem, space: str, session_ids: Sequence[str], present: Collection[str]
+) -> list[str]:
+    """这些会话里、原样还在上下文中的轮的 ID（检索时排除，名额留给上下文里没有的）。
+
+    present：上下文里每条用户与助手消息的 stored_text（去掉首尾空白）。一轮的每句发言都在
+    present 里才算。按内容比对，不假定写进去的都还在：调用方可能删减、裁剪或总结了历史，或者
+    在同一会话里开了别的对话。记忆代理与各框架集成共用（以前各写一份，只有 LangGraph 认得
+    "<image>"，另两份让发过照片的轮回到它自己的对话里）。"""
+    if not session_ids or not present:
+        return []
+    db = system.db
+    turns = {t.id: t for sid in session_ids for t in db.get_turns(space, sid)}
+    rounds = db.list_units(space, kinds=["round"], session_ids=list(session_ids))
+    return [
+        u.id
+        for u in rounds
+        if all(t in turns and turns[t].text.strip() in present for t in u.source_turn_ids)
+    ]
 
 
 # ---------- 清单：给另一个 Agent 自己推理 ----------

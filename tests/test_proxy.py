@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import io
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -491,6 +493,34 @@ def test_trusted_hosts(proxy: MemoryProxy, upstream: Upstream) -> None:
         assert chat(client, "hi", user="alice", headers=proxied).status_code == 200
         other = {"Origin": "http://localhost:3000"}  # 本机别的端口上的网页也是别的来源
         assert chat(client, "hi", user="alice", headers=other).status_code == 403
+
+
+def test_an_image_round_still_in_the_request_is_not_recalled(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """发过照片的一轮原样还在请求里：不再被想起、重复注入（以前按纯文字比对，写进记忆的
+    "… <image>" 永远对不上）。只算真正存下的图片：网络图片不存，也就没有 <image> 标记。"""
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(buffer, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    content = [
+        {"type": "text", "text": "Here is my red jacket"},
+        {"type": "image_url", "image_url": {"url": data_url}},
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+    ]
+    shown = {"role": "user", "content": content}
+    first = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen3.8-flash", "user": "alice", "messages": [SYSTEM, shown]},
+    )
+    session = first.headers["x-cuemem-session"]
+    assert system.db.get_turns("alice", session)[0].text == "Here is my red jacket <image>"
+    history = [shown, {"role": "assistant", "content": "Happy to help, Alice!"}]
+    second = chat(client, "What colour was the jacket?", history, user="alice")
+    assert second.headers["x-cuemem-session"] == session
+    assert second.headers["x-cuemem-level"] == "L1"
+    assert second.headers["x-cuemem-recalled"] == "0"
+    assert "<memory>" not in upstream.proxied[-1]["messages"][-1]["content"]
 
 
 def test_server_side_image_paths_are_not_stored(

@@ -92,7 +92,14 @@ from agents.run_config import (  # type: ignore[import-not-found, unused-ignore]
 
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
-from cuemem.evidence import format_listing, recall_evidence, recall_listing, resolve_ids
+from cuemem.evidence import (
+    format_listing,
+    in_context_rounds,
+    recall_evidence,
+    recall_listing,
+    resolve_ids,
+    stored_text,
+)
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
 from cuemem.read.controller import Router
 from cuemem.sdk import AsyncMemory, Memory, space_for
@@ -419,7 +426,9 @@ class MemoryInputFilter:
         key = (space, _shared(system).generation(space), index, query, _history(items, index))
         evidence = self._get(self._cache, key) if follow_up else None
         if evidence is None:  # 每一轮的第一次调用都重新检索
-            present = {_text(m.get("content")).strip() for m in _messages(items)}
+            # 按写进记忆后的样子比对（_mirrorable 之后：只有 data URL 的图片记作 <image>）
+            pending = [p for p in map(_mirrorable, items) if p is not None]
+            present = {stored_text(p.message).strip() for p in pending}
             try:
                 evidence = await asyncio.to_thread(self._recall, space, query, present)
             except Exception as exc:  # 记忆出错不挡住对话：这一次不带记忆
@@ -475,7 +484,7 @@ class MemoryInputFilter:
             mode=self.mode,
             router=self.router,
             lam=self.lam,
-            exclude=_in_context(system, space, present),
+            exclude=in_context_rounds(system, space, sorted(system.open_sessions(space)), present),
         )
         record_event("agents_recall", space=space, level=found.level, recalled=found.recalled)
         return Evidence(query, found.level, found.reasons, found.recalled, found.block)
@@ -532,21 +541,6 @@ def memory_input_filter(
         lam=lam,
         placement=placement,
     )
-
-
-def _in_context(system: MemorySystem, space: str, present: Collection[str]) -> list[str]:
-    """进行中的会话里、原样已在输入中的轮（检索时排除，名额留给输入里没有的）。按内容比对，
-    与记忆代理相同：调用方可能删减了历史，不能假定写进去的都还在。"""
-    sessions = sorted(system.open_sessions(space))
-    if not sessions or not present:
-        return []
-    turns = {t.id: t for sid in sessions for t in system.db.get_turns(space, sid)}
-    rounds = system.db.list_units(space, kinds=["round"], session_ids=sessions)
-    return [
-        u.id
-        for u in rounds
-        if all(t in turns and turns[t].text.strip() in present for t in u.source_turn_ids)
-    ]
 
 
 def _with_note(message: Mapping[str, Any], note: str) -> dict[str, Any]:
@@ -1004,10 +998,6 @@ def _message(item: Any) -> Mapping[str, Any] | None:
     if not isinstance(item, Mapping) or item.get("role") not in ("user", "assistant"):
         return None
     return item if item.get("type", "message") == "message" else None
-
-
-def _messages(items: Sequence[Any]) -> list[Mapping[str, Any]]:
-    return [m for m in (_message(item) for item in items) if m is not None]
 
 
 def _is_output(item: Any) -> bool:

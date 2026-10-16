@@ -50,7 +50,13 @@ from cuemem import __version__
 from cuemem.config import ModelSpec
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
-from cuemem.evidence import inject_evidence, message_text, recall_evidence
+from cuemem.evidence import (
+    in_context_rounds,
+    inject_evidence,
+    message_text,
+    recall_evidence,
+    stored_text,
+)
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.sdk import Memory, space_for
 
@@ -251,16 +257,10 @@ class MemoryProxy:
         return turn
 
     def _in_context(self, space: str, session_id: str, earlier: list[dict[str, Any]]) -> list[str]:
-        """当前会话里已经原样在请求中的轮（检索时排除，名额留给请求里没有的）。按内容比对：
-        调用方可能删减了历史，或者在同一会话里开了别的对话，不能假定写进去的都还在。"""
-        present = {message_text(m.get("content")).strip() for m in earlier}
-        rounds = self.system.db.list_units(space, kinds=["round"], session_ids=[session_id])
-        turns = {t.id: t for t in self.system.db.get_turns(space, session_id)}
-        return [
-            u.id
-            for u in rounds
-            if all(t in turns and turns[t].text.strip() in present for t in u.source_turn_ids)
-        ]
+        """当前会话里已经原样在请求中的轮（检索时排除，名额留给请求里没有的）。之前的每条消息
+        按写回时的样子比对：先过 _storable（只有 data URL 的图片会存下、记作 <image>）。"""
+        present = {stored_text(_storable(m)).strip() for m in earlier}
+        return in_context_rounds(self.system, space, [session_id], present)
 
     def _upstream(self, body: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, str]]:
         """请求体 → 上游的请求体、地址与鉴权头。model 是配置里的别名或模型 ID，否则用默认模型。"""

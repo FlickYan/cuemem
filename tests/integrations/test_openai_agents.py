@@ -83,7 +83,7 @@ def tool_outputs(model_call: ModelCall) -> list[str]:
 
 def run(
     agent: Agent[Any],
-    text: str,
+    text: str | list[TResponseInputItem],
     *,
     session: Session | None = None,
     config: RunConfig | None = None,
@@ -487,6 +487,37 @@ def test_rounds_already_in_context_are_not_recalled(memory: Memory) -> None:
     run(agent, "Where do I live?", session=session, config=config)
     # 唯一的记忆就是这段对话本身，已经原样在历史里：什么都不加
     assert last_user_text(script.calls[1]) == "Where do I live?"
+    assert recall.last is not None and recall.last.level == "L1" and recall.last.block == ""
+
+
+def test_photo_rounds_already_in_context_are_not_recalled(memory: Memory) -> None:
+    """发过照片的一轮也一样：写进记忆的是 "… <image>"（只有 data URL 的图片），比对时按写进去的
+    样子算，而不是只看文字。以前这一轮被想起来，重复注入到它自己的对话里。"""
+    buffer = io.BytesIO()
+    Image.new("RGB", (16, 16), "red").save(buffer, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    shown = cast(
+        list[TResponseInputItem],
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Here is my red jacket"},
+                    {"type": "input_image", "image_url": data_url, "detail": "auto"},
+                    {"type": "input_image", "image_url": "https://x.test/a.png", "detail": "auto"},
+                ],
+            }
+        ],
+    )
+    script = AgentScript([reply("Noted!"), reply("Red.")])
+    agent = Agent(name="a", model=script)
+    recall = memory_input_filter(memory, user_id="alice", mode="l1")
+    config = RunConfig(call_model_input_filter=recall)
+    session = CueMemSession("monday", memory, user_id="alice")
+    run(agent, shown, session=session, config=config)
+    assert turns(memory, "oa-monday")[0] == ("user", "Here is my red jacket <image>")
+    run(agent, "What colour was my jacket?", session=session, config=config)
+    assert last_user_text(script.calls[1]) == "What colour was my jacket?"
     assert recall.last is not None and recall.last.level == "L1" and recall.last.block == ""
 
 

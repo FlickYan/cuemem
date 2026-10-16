@@ -24,7 +24,8 @@ from cuemem import AsyncMemory, Memory
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError
-from cuemem.sdk import space_for
+from cuemem.evidence import stored_text
+from cuemem.sdk import parse_messages, space_for
 
 AUG = datetime(2026, 8, 1, 10, 0)
 SEP = datetime(2026, 9, 1, 10, 0)
@@ -235,6 +236,28 @@ def test_openai_messages_with_images(
             },
             user_id="alice",
         )
+
+
+def test_stored_text_matches_what_parse_messages_stores() -> None:
+    """evidence.stored_text（记忆代理与各框架集成判断哪些轮已经在上下文里）与 SDK 写进记忆的
+    文本一致：两份写法一旦走样，已经在请求里的轮又会被想起来。"""
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(buffer, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    image = {"type": "image_url", "image_url": {"url": data_url}}
+    cases: list[Any] = [
+        "Plain words",
+        None,
+        [{"type": "text", "text": "My shoes"}, image],
+        [{"type": "image_url", "image_url": data_url}, {"type": "text", "text": " then words "}],
+        [{"type": "text", "text": ""}, {"type": "text"}, image, {"type": "text", "text": "a"}],
+    ]
+    for content in cases:
+        message = {"role": "user", "content": content}
+        turns, temporary = parse_messages([message], AUG)
+        for path in temporary:
+            path.unlink()
+        assert stored_text(message) == (turns[0].text if turns else ""), content
 
 
 def test_run_id_appends_and_infer_false_defers_extraction(memory: Memory) -> None:
