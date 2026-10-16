@@ -138,7 +138,8 @@ class Consolidator:
             if config.caption_images
             else None
         )
-        self._space_locks: dict[str, threading.Lock] = {}
+        # 可重入：遗忘、重建持有这把锁时，内部再调用 run() 不会自己等自己（见 exclusive）
+        self._space_locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
 
     # ---------- 任务 ----------
@@ -591,9 +592,18 @@ class Consolidator:
             for i, text in enumerate(unique)
         }
 
-    def _lock_for(self, space_id: str) -> threading.Lock:
+    def exclusive(self, space_id: str) -> threading.RLock:
+        """这个空间的派生记忆的独占锁（可重入），与 run() 是同一把。
+
+        凡是要改动派生记忆的操作（遗忘、重建、删除空间）都在这把锁里做：后台线程正在巩固
+        这个空间时，它在开头就读好了会话的轮次，事后会把由它们抽出的事实、向量与缓存写回去；
+        在锁外删除原始日志、清空派生层，被删的内容就又回来了。持有这把锁时可以直接调用 run()。
+        """
+        return self._lock_for(space_id)
+
+    def _lock_for(self, space_id: str) -> threading.RLock:
         with self._locks_guard:
-            return self._space_locks.setdefault(space_id, threading.Lock())
+            return self._space_locks.setdefault(space_id, threading.RLock())
 
 
 class ConsolidationWorker:

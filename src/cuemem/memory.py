@@ -399,7 +399,10 @@ class MemorySystem:
         strict=True 时有会话抽取失败就抛出异常（评测用：宁可整题重试，也不要残缺的记忆）。
         """
         skip = self.open_sessions(space_id)
-        with start_trace("consolidate", self.tracer, space=space_id) as trace:
+        with (
+            self.consolidator.exclusive(space_id),  # 清空重建不能和后台线程的巩固交错
+            start_trace("consolidate", self.tracer, space=space_id) as trace,
+        ):
             if rebuild or self.consolidator.stale(space_id):
                 self.consolidator.rebuild(space_id, skip=skip)
             self.db.retry_failed_jobs(space_id)
@@ -437,9 +440,15 @@ class MemorySystem:
         restated_turn_ids（D-051）：按内容找到的转述，一起删，但不从它们出发沿引用扩散。
         它们只是顺带透露了被删的信息，所在那一轮里别的内容（用户在同一轮说的另一件事、
         由此抽出的事实、后来引用这些事实的回复）不是要删的。
+
+        整个过程持有这个空间的巩固锁（Consolidator.exclusive）：后台线程正在巩固时先等它做完，
+        否则它会把由被删轮次抽出的事实、向量与缓存写回来。
         """
         started = time.perf_counter()
-        with start_trace("forget", self.tracer, space=space_id) as trace:
+        with (
+            self.consolidator.exclusive(space_id),
+            start_trace("forget", self.tracer, space=space_id) as trace,
+        ):
             targets, cascaded = self._forget_targets(
                 space_id, session_ids, turn_ids, follow_citations, restated_turn_ids
             )
@@ -760,11 +769,14 @@ class MemorySystem:
 
     def delete_space(self, space_id: str) -> ForgetReport:
         """删除整个记忆空间（SDK 的 delete_all，N12）：先按会话遗忘全部日志（连带清理缓存、
-        trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合。"""
-        report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
-        self.db.delete_space(space_id)
-        self.vectors.delete_space(space_id)
-        self.db.vacuum()
+        trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合。
+
+        两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。"""
+        with self.consolidator.exclusive(space_id):
+            report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
+            self.db.delete_space(space_id)
+            self.vectors.delete_space(space_id)
+            self.db.vacuum()
         return report
 
     # ---------- 读取 ----------

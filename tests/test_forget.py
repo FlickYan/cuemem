@@ -3,18 +3,28 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
+from datetime import datetime
+from typing import Any
 
 import pytest
 from fakes import TOY_CONVERSATION, FakeAPI
-from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
+from scripted import (
+    EMPTY_EXTRACTION,
+    TOY_EXTRACTIONS,
+    TOY_UPDATE_KEYWORDS,
+    ScriptedModel,
+    reconcile_by_keyword,
+)
 
 from cuemem.config import Settings
-from cuemem.core.models import Conversation
+from cuemem.core.models import Conversation, SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
 from cuemem.memory import MemorySystem
 
 SECRET = "电商"  # 只出现在第 4 段会话（s4）里的词
+PIN = "SECRET-1234"
 
 
 @pytest.fixture
@@ -94,3 +104,103 @@ def test_forget_unknown_target_is_noop(system: MemorySystem) -> None:
     report = system.forget("demo", session_ids=["nope"])
     assert report.turns_deleted == 0
     assert len(system.facts("demo")) == before
+
+
+def _in_thread(target: Any, *args: Any, **kwargs: Any) -> tuple[threading.Thread, list[Any]]:
+    """在另一个线程里调用（模拟另一个请求），返回线程与它的结果（或异常）。"""
+    out: list[Any] = []
+
+    def run() -> None:
+        try:
+            out.append(target(*args, **kwargs))
+        except Exception as exc:
+            out.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, out
+
+
+@pytest.mark.parametrize("how", ["forget", "delete_space"])
+def test_forget_waits_for_background_consolidation(
+    n3_settings: Settings, fake_api: FakeAPI, how: str
+) -> None:
+    """后台线程正在抽取这段会话时遗忘它：抽取结果不能在遗忘之后写回事实、向量与缓存。"""
+    entered, release = threading.Event(), threading.Event()
+
+    def extract(prompt: str) -> dict[str, Any]:
+        if PIN not in prompt:
+            return EMPTY_EXTRACTION
+        entered.set()
+        release.wait(10)  # 抽取请求还在路上（慢的供应商）
+        fact = {
+            "statement": f"The user's PIN is {PIN}.",
+            "subject": "User",
+            "predicate": "pin",
+            "object": PIN,
+            "importance": 5,
+            "turns": [0],
+        }
+        return {"summary": "", "facts": [fact], "entities": []}
+
+    fake_api.chat_replies = [ScriptedModel(extract)]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        session = SessionIn(
+            session_id="s1",
+            started_at=datetime(2026, 9, 1, 10),
+            turns=[TurnIn(role="user", text=f"My PIN is {PIN}, keep it safe")],
+        )
+        system.append("alice", session, 0)  # 登记任务并交给后台线程
+        assert entered.wait(5)
+        if how == "forget":
+            thread, out = _in_thread(system.forget, "alice", session_ids=["s1"])
+        else:
+            thread, out = _in_thread(system.delete_space, "alice")
+        thread.join(0.3)  # 不持锁时遗忘在这期间就删完了原始日志、清空了派生层
+        release.set()
+        thread.join(10)
+        worker.wait()
+
+        assert worker.errors == []
+        [report] = out
+        assert not isinstance(report, Exception) and report.turns_deleted == 1
+        assert system.db.get_facts("alice") == []
+        assert system.vectors.unit_ids("alice") == []
+        assert system.llm.cache is not None
+        assert not any(PIN in r for r in system.llm.cache.responses())
+
+
+def test_forget_other_session_during_background_reconciliation(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """后台线程正在对账时遗忘另一段会话：巩固不能因为它读过的记录被删了而半途崩掉。"""
+    model = ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
+    entered, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        system_prompt = body["messages"][0]["content"]
+        if system_prompt.startswith("You maintain a long-term memory") and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    conv = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8"))
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        system.ingest(conv)  # 交给后台巩固
+        assert entered.wait(10)
+        thread, out = _in_thread(system.forget, "demo", session_ids=["s1"])
+        thread.join(0.3)
+        release.set()
+        thread.join(10)
+        worker.wait()
+
+        assert worker.errors == []
+        [report] = out
+        assert not isinstance(report, Exception) and report.turns_deleted > 0
+        assert all(f.session_id != "s1" for f in system.facts("demo"))
+        assert all(j["status"] == "done" for j in system.db.get_jobs("demo"))
+        core = system.core_memory("demo")
+        assert core is not None and "林晓" not in core.text and "新加坡" in core.text
