@@ -18,9 +18,13 @@ N9 在测试集上查出的两个控制器问题，在这里修：
 - **换回答模型**：qwen3.8-flash 用 N7 在开发集上的标注标定、在测试子集上评；qwen3.6-35b-a3b
   没有开发集标注，在测试子集上按对话历史 2 折交叉标定（事后）。
 
+v2 是 N11 冻结评测用的那一版，复现脚本只核对、不覆盖它（--no-export --check，见
+scripts/n7_controller.py）。
+
 用法：
     uv run python scripts/n11_controller_v2.py            # 评测 + 导出 controller_model_v2.json
     uv run python scripts/n11_controller_v2.py --no-export
+    uv run python scripts/n11_controller_v2.py --no-export --check  # 核对 v2 没有变
 """
 
 from __future__ import annotations
@@ -171,7 +175,10 @@ def dev_section(
     return out, lams["v2"]
 
 
-def export_v2(items: list[R.Item], names: list[str], lam: float, memory: list[R.Item]) -> None:
+def fit_v2(
+    items: list[R.Item], names: list[str], lam: float, memory: list[R.Item]
+) -> dict[str, Any]:
+    """用全部开发数据训练 v2，返回要导出的 JSON。"""
     final = R.fit_two_stage(items, names, by_images=True)
     meta = {
         "trained_on": {
@@ -187,15 +194,14 @@ def export_v2(items: list[R.Item], names: list[str], lam: float, memory: list[R.
         ),
         "created": datetime.now().strftime("%Y-%m-%d"),
     }
-    V2_MODEL.write_text(
-        json.dumps(final.to_json(lam=lam, meta=meta), ensure_ascii=False, indent=1) + "\n",
-        encoding="utf-8",
-    )
+    return final.to_json(lam=lam, meta=meta)
+
+
+def export_v2(model: dict[str, Any]) -> None:
+    V2_MODEL.write_text(json.dumps(model, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     v1 = json.loads(V1_MODEL.read_text(encoding="utf-8"))
-    same = np.allclose(
-        np.asarray(v1["coef"]), np.asarray([[float(x) for x in r] for r in final.coef]), atol=1e-5
-    )
-    print(f"导出 v2：{V2_MODEL}（λ = {lam:g}；类型模型与 v1 一致：{same}）")
+    same = np.allclose(np.asarray(v1["coef"]), np.asarray(model["coef"]), atol=1e-5)
+    print(f"导出 v2：{V2_MODEL}（λ = {model['lambda']:g}；类型模型与 v1 一致：{same}）")
 
 
 # ---------- 2. 测试集：事后重放 ----------
@@ -378,9 +384,7 @@ def readers_section(ctrl: LearnedController) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument(
-        "--no-export", action="store_true", help="只评测，不覆盖 controller_model_v2.json"
-    )
+    N7.add_export_flags(parser, V2_MODEL.name)
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     memory = [it for name in N7.RUNS for it in R.load_items(RUNS / name)]
@@ -391,8 +395,12 @@ def main() -> None:
     print(f"开发集：记忆题 {len(memory)}，无关查询 {len(mixed)}")
     dev, lam_v2 = dev_section(items, names, args.repeats)
     print(f"开发集 λ：{dev['lambda']}；AUC：{dev['auc']}")
-    if not args.no_export:
-        export_v2(items, names, lam_v2, memory)
+    if args.check or not args.no_export:
+        model = fit_v2(items, names, lam_v2, memory)
+        if args.check:  # 在写任何结果之前：对不上时 docs/results 也不动
+            N7.check_export(V2_MODEL, model)
+        if not args.no_export:
+            export_v2(model)
     ctrl_v1 = LearnedController.load(V1_MODEL)
     ctrl_v2 = LearnedController.load(V2_MODEL)
     results = {

@@ -493,6 +493,46 @@ class TwoStageModel:
         return out
 
 
+def controller_drift(
+    fresh: dict[str, Any], committed: dict[str, Any], *, atol: float = 1e-5
+) -> list[str]:
+    """重新训练出的控制器（to_json 的输出）与仓库里冻结的那份对不上的字段（训练脚本的 --check）。
+
+    导出日期（created）不比；数值差在 atol 以内不算变化（系数导出时保留 6 位小数，浮点运算的
+    噪声不该让核对失败）；特征名、推理类型等字符串、列表长度与字段逐一比较。"""
+    drift: list[str] = []
+
+    def walk(path: str, a: Any, b: Any) -> None:
+        if isinstance(a, dict) and isinstance(b, dict):
+            for key in sorted(set(a) | set(b)):
+                if not path and key == "created":
+                    continue
+                sub = f"{path}.{key}" if path else key
+                if key in a and key in b:
+                    walk(sub, a[key], b[key])
+                else:
+                    drift.append(sub)
+        elif isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                drift.append(path)
+                return
+            for i, (x, y) in enumerate(zip(a, b, strict=True)):
+                walk(f"{path}[{i}]", x, y)
+        elif _number(a) and _number(b):
+            if not math.isclose(a, b, rel_tol=0.0, abs_tol=atol):
+                drift.append(path)
+        elif a != b:
+            drift.append(path)
+
+    # 先过一遍 JSON：元组、numpy 的数值与写进文件后的样子一致
+    walk("", json.loads(json.dumps(fresh, ensure_ascii=False)), committed)
+    return drift
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
 def _standardize(x: FloatArray) -> tuple[FloatArray, FloatArray]:
     mean = x.mean(axis=0)
     scale = x.std(axis=0)

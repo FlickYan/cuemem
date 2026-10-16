@@ -316,6 +316,59 @@ def test_data_download_skips_optional_datasets(
     assert fetched[-1] == "wildchat"
 
 
+@pytest.mark.parametrize(
+    ("errors", "stopped", "code"), [(0, False, 0), (2, False, 3), (0, True, 4), (1, True, 4)]
+)
+def test_eval_run_fail_on_error(
+    isolated_paths: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    errors: int,
+    stopped: bool,
+    code: int,
+) -> None:
+    """eval run --fail-on-error（复现脚本用）：有组合出错时退出码 3、达到花费上限提前停止时 4，
+    报告照常生成；不加这个参数时退出码照旧是 0。"""
+    from types import SimpleNamespace
+
+    from cuemem import cli
+    from cuemem.evals.runner import RunSummary
+
+    class FakeRunner:
+        def __init__(self, settings: Any, config: Any, **kwargs: Any) -> None:
+            pass
+
+        def run(self, evalset: Any) -> RunSummary:
+            return RunSummary(
+                run_dir=tmp_path,
+                planned=3,
+                completed=3 - errors,
+                errors=errors,
+                spent=0.0,
+                nominal_cost=0.0,
+                elapsed_s=0.0,
+                stopped_by_budget=stopped,
+            )
+
+    reports: list[Path] = []
+
+    def fake_report(run_dir: Path, **kwargs: Any) -> Path:
+        reports.append(run_dir)
+        return run_dir / "report.md"
+
+    monkeypatch.setattr(cli, "EvalRunner", FakeRunner)
+    monkeypatch.setattr(cli, "_load_evalset", lambda *args: SimpleNamespace(samples=[]))
+    monkeypatch.setattr(cli, "build_report", fake_report)
+    args = ["eval", "run", "--name", "x", "--methods", "B1"]
+    assert runner.invoke(app, args).exit_code == 0
+    result = runner.invoke(app, [*args, "--fail-on-error"])
+    assert result.exit_code == code, result.output
+    assert len(reports) == 2  # 报告照常生成
+    assert ("--fail-on-error" in result.output) == bool(code)
+    assert runner.invoke(app, [*args, "--build-only"]).exit_code == 0
+    assert runner.invoke(app, [*args, "--build-only", "--fail-on-error"]).exit_code == code
+
+
 def test_eval_errors_are_listed_once_per_message(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

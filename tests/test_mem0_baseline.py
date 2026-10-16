@@ -2,7 +2,7 @@
 
 mem0ai 不是 CueMem 的依赖，平时只跑写入记录（协议、会话 ID 的写法）的测试，其余跳过；要跑全部
 时临时装上：
-    uv run --with mem0ai --with spacy --with fastembed pytest tests/test_mem0_baseline.py
+    uv run --with mem0ai==2.2.1 --with spacy --with fastembed pytest tests/test_mem0_baseline.py
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.methods import MethodContext
 
 needs_mem0 = pytest.mark.skipif(
-    importlib.util.find_spec("mem0") is None, reason="需要 mem0ai（uv run --with mem0ai ...）"
+    importlib.util.find_spec("mem0") is None,
+    reason="需要 mem0ai（uv run --with mem0ai==2.2.1 ...）",
 )
 
 

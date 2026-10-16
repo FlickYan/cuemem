@@ -18,11 +18,25 @@
   （LEAK_ERA）：提示与当时逐字相同、缓存照常命中，续跑旧运行时会话 ID 的写法也对得上（LoCoMo
   不受影响）。修复后的数字要另起运行名重跑，不在这里。
 
+不会悄悄改动发表的结果：
+- 控制器的三个模型文件（v1、v2 与默认的 v3）是冻结评测用的：训练脚本只重新评测、核对
+  （--no-export --check），重新训练的结果与仓库里的文件对不上时整个脚本停下，不覆盖；
+- 评测运行都加了 --fail-on-error：达到花费上限提前停止、或者有组合出错时退出码非零，脚本停下，
+  不把不完整的报告复制到 docs/results/。不复制报告的步骤里，出错的组合与这一步之前完全相同时
+  照常继续：那是发表时就有、每次重跑都一样的出错（例如被内容审核拒绝的题）；
+- 续跑没有新答的题时不复制 run.json（续跑只在里面追加时间与环境）；
+- --cache-only 让每一步的 LLM 请求都只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：未命中
+  即报错、不调用 API，要重新算的请求有一个字节变了，也会在复制报告之前停下（向量请求照常，
+  未命中时花费很小）。关掉缓存的步骤（按定义不能从缓存复现）跳过；N8 的演示回放未命中时只跳过
+  N8（Agent 的请求随产品改动，不是发表的评测数字）。跑完用 git diff docs/results src/cuemem/read
+  核对结果。
+
 用法：
     uv run python scripts/reproduce.py --dry-run          # 只列出要执行的命令
     uv run python scripts/reproduce.py --only N9          # 只复现某个节点
     uv run python scripts/reproduce.py                    # 全部（跳过可选步骤）
     uv run python scripts/reproduce.py --only N9 --with-optional
+    uv run python scripts/reproduce.py --cache-only       # LLM 只读本地缓存，不调用 API
 """
 
 from __future__ import annotations
@@ -34,6 +48,8 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from cuemem.evals.report import pending_errors
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs" / "eval"
@@ -48,15 +64,24 @@ V1 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v1.json"}
 V2 = {"CUEMEM_RETRIEVAL__CONTROLLER": "controller_model_v2.json"}
 NODE_ENV = {"N7": V1, "N8": V1, "N9": V1, "N11": V2}
 NO_CACHE = {"CUEMEM_LLM_CACHE_MODE": "off"}
+CACHE_ONLY = {"CUEMEM_LLM_CACHE_MODE": "read_only"}  # --cache-only
 # 文档里的数字都是修复会话 ID 泄漏之前的（见模块说明）：每一步都用原始会话 ID
 LEAK_ERA = {"CUEMEM_EVAL_RAW_SESSION_IDS": "1"}
-# 外部基线 Mem0（N11）：mem0ai 不是依赖，临时装上；spaCy 与 fastembed 让它的混合检索完整生效
+# 外部基线 Mem0（N11）：mem0ai 不是依赖，临时装上（N11、N12 用的都是 2.2.1，各版本的算法不同）；
+# spaCy 与 fastembed 让它的混合检索完整生效
 SPACY_SM = (
     "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/"
     "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
 )
-MEM0 = ["uv", "run", "--with", "mem0ai", "--with", "spacy", "--with", "fastembed",
+MEM0 = ["uv", "run", "--with", "mem0ai==2.2.1", "--with", "spacy", "--with", "fastembed",
         "--with", SPACY_SM]  # fmt: skip
+# 评测运行有组合出错（退出码 3）或达到花费上限提前停止（4）时退出码非零：脚本停下，不复制
+# 不完整的报告（cuemem eval run --fail-on-error）
+FAIL_ON_ERROR = "--fail-on-error"
+ERRORS_EXIT, BUDGET_EXIT = 3, 4
+# 控制器的训练脚本只评测、核对冻结的模型文件，不覆盖（见模块说明）
+VERIFY_ONLY = ("--no-export", "--check")
+REPORT_FILES = ("report.md", "run.json", "pareto-light.png", "pareto-dark.png")
 
 
 @dataclass
@@ -66,10 +91,22 @@ class Step:
     env: dict[str, str] = field(default_factory=dict)
     copy: tuple[str, str] | None = None  # （运行名，docs/results 下的目录）：复制报告与图
     optional: bool = False  # 没有缓存、要真花钱的步骤：默认跳过
+    # --cache-only 时失败（未命中缓存）只跳过这个节点余下的步骤，不让整个脚本停下
+    best_effort: bool = False
 
     def environment(self) -> dict[str, str]:
         """这一步在当前环境之上另外设的环境变量（LEAK_ERA、节点的、这一步自己的）。"""
         return {**LEAK_ERA, **NODE_ENV.get(self.node, {}), **self.env}
+
+    def uncached(self) -> bool:
+        """关掉了缓存的步骤：按定义不能从缓存复现。"""
+        return self.environment().get("CUEMEM_LLM_CACHE_MODE") == "off"
+
+    def run_name(self) -> str | None:
+        """评测运行的运行名（其他步骤为 None）。"""
+        if FAIL_ON_ERROR not in self.command:
+            return None
+        return self.command[self.command.index("--name") + 1]
 
     def describe(self) -> str:
         env = " ".join(f"{k}={v}" for k, v in self.environment().items() if k not in LEAK_ERA)
@@ -92,7 +129,7 @@ def run(
     command = [
         "uv", "run", "cuemem", "eval", "run",
         "--dataset", dataset, "--split", split, "--methods", methods,
-        "--name", name, "--workers", str(workers), "--max-cost", "60",
+        "--name", name, "--workers", str(workers), "--max-cost", "60", FAIL_ON_ERROR,
     ]  # fmt: skip
     if limit is not None:
         command += ["--limit", str(limit)]
@@ -164,14 +201,14 @@ STEPS: list[Step] = [
     probe("N7", "locomo-3conv-n7", "locomo", "all", limit=385),
     probe("N7", "memlens32-dev100-n7", "memlens_32k", "dev100"),
     script("N7", "scripts/n7_mixed.py"),
-    script("N7", "scripts/n7_controller.py"),
+    script("N7", "scripts/n7_controller.py", *VERIFY_ONLY),  # 核对 v1，不覆盖
     run("N7", "dev100-n7-qflash", "longmemeval_s", "dev100", "B3,B4-nobm25,B5,L0", env=QFLASH),
     run("N7", "locomo-3conv-n7-qflash", "locomo", "all", "B3,B4-nobm25,B5,L0", limit=385,
         env=QFLASH),
     script("N7", "scripts/n7_h3.py"),
     # N8 Agent 与演示：剧本回放与核对（只用通义）
     Step("N8", ["uv", "run", "cuemem", "demo", "demo/shop/script.json", "--fresh", "--report",
-                "runs/demo/final-full.json"]),
+                "runs/demo/final-full.json"], best_effort=True),
     script("N8", "scripts/n8_summary.py", "runs/demo/final-full.json"),
     # N9 测试集上的最终评测
     run("N9", "test400-n9", "longmemeval_s", "test400", N9_LME),
@@ -198,15 +235,16 @@ STEPS: list[Step] = [
     script("N9", "scripts/n9_errors.py", "summarize"),  # 人工错误标注（已提交）的汇总
     script("N9", "scripts/n9_report.py"),  # results.json、图与 tables.md
     # N11：测试集之后的补做（控制器 v2 只在开发集上选，测试集只作事后重放）
-    script("N11", "scripts/n11_controller_v2.py"),  # 导出 v2 并写 controller_v2.json
-    script("N11", "scripts/n11_see_gate.py"),  # 导出 v3（再感知的门槛，D-058）并写 see_gate.json
+    # 核对 v2 并写 controller_v2.json；核对 v3（再感知的门槛，D-058）并写 see_gate.json
+    script("N11", "scripts/n11_controller_v2.py", *VERIFY_ONLY),
+    script("N11", "scripts/n11_see_gate.py", *VERIFY_ONLY),
     script("N11", "scripts/n11_latency.py"),  # 离线；服务端那一组要先起 Qdrant（见脚本说明）
     Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "locomo", "--split", "test200r",
                  "--methods", "M0", "--name", "locomo-test200r-mem0", "--workers", "12",
-                 "--max-cost", "5"]),
+                 "--max-cost", "5", FAIL_ON_ERROR]),
     Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "longmemeval_s", "--split",
                  "test100r", "--methods", "M0", "--name", "test100r-mem0", "--workers", "16",
-                 "--max-cost", "5"]),
+                 "--max-cost", "5", FAIL_ON_ERROR]),
     script("N11", "scripts/n11_mem0.py"),
     script("N11", "scripts/n11_second_judge.py", "run"),
     Step("N11", ["uv", "run", "cuemem", "data", "download", "wildchat"]),
@@ -223,37 +261,86 @@ STEPS: list[Step] = [
 ]  # fmt: skip
 
 
-def copy_report(name: str, target: str) -> None:
+def answered(name: str) -> int:
+    """运行目录里 results.jsonl 的大小：一步前后不变，说明这次续跑没有新答的题。"""
+    path = RUNS / name / "results.jsonl"
+    return path.stat().st_size if path.exists() else -1
+
+
+def failed(name: str) -> set[tuple[str, str]]:
+    """运行里出错、还没重跑成功的（题目，方法）组合。"""
+    return {(e.get("sample_id"), e.get("method")) for e in pending_errors(RUNS / name)}
+
+
+def copy_report(name: str, target: str, *, run_info: bool = True) -> None:
+    """把报告与图复制到 docs/results/。run_info=False（续跑没有新答的题）时留着那里的 run.json：
+    续跑只在里面追加了时间与环境。"""
     source = RUNS / name
     dest = RESULTS / target
     dest.mkdir(parents=True, exist_ok=True)
-    for file in ("report.md", "run.json", "pareto-light.png", "pareto-dark.png"):
+    for file in REPORT_FILES:
+        if file == "run.json" and not run_info and (dest / file).exists():
+            continue
         if (source / file).exists():
             shutil.copy2(source / file, dest / file)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", help="只复现某个节点，如 N9")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--with-optional", action="store_true", help="也执行标了可选的步骤")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：未命中即报错、不调用 API",
+    )
+    args = parser.parse_args(argv)
     steps = [s for s in STEPS if args.only is None or s.node == args.only]
     leak_era = " ".join(f"{k}={v}" for k, v in LEAK_ERA.items())
     print(f"（每一步都设了 {leak_era}：复现修复会话 ID 泄漏之前的数字）", flush=True)
+    extra = CACHE_ONLY if args.cache_only else {}
+    if args.cache_only:
+        cache_only = " ".join(f"{k}={v}" for k, v in CACHE_ONLY.items())
+        print(f"（--cache-only：每一步都设了 {cache_only}，未命中缓存即报错）", flush=True)
+    skipped: set[str] = set()  # --cache-only 时演示回放未命中、余下步骤跳过的节点
     for step in steps:
         if step.optional and not args.with_optional:
             print(f"（跳过可选步骤）{step.describe()}", flush=True)
             continue
+        if args.cache_only and step.uncached():
+            print(f"（关掉缓存的步骤，--cache-only 时跳过）{step.describe()}", flush=True)
+            continue
+        if step.node in skipped:
+            print(f"（{step.node} 的演示回放没有复现，跳过）{step.describe()}", flush=True)
+            continue
         print(step.describe(), flush=True)
         if args.dry_run:
             continue
-        env = {**os.environ, **step.environment()}
-        done = subprocess.run(step.command, cwd=ROOT, env=env, check=False)
-        if done.returncode != 0:
-            sys.exit(f"失败：{step.describe()}")
+        name = step.run_name()
+        before = (answered(name), failed(name)) if name else None
+        env = {**os.environ, **step.environment(), **extra}
+        code = subprocess.run(step.command, cwd=ROOT, env=env, check=False).returncode
+        reported_errors = code == ERRORS_EXIT and name is not None and step.copy is None
+        if reported_errors and before and before[1] and failed(str(name)) <= before[1]:
+            # 出错的组合与这一步之前完全相同：发表时就有、每次重跑都一样的出错（例如 N9 里被
+            # qwen3.8-flash 的内容审核拒绝的那道题，报告按三个回答模型都答了的 99 题比较）
+            print("（出错的组合与这一步之前相同：发表时就有的出错，继续）", flush=True)
+            code = 0
+        if code != 0 and args.cache_only and step.best_effort:
+            print(f"（只读缓存下没有复现，跳过 {step.node} 余下的步骤）", flush=True)
+            skipped.add(step.node)
+            continue
+        if code != 0 and reported_errors:
+            sys.exit(
+                f"失败：{step.describe()} 有组合出错（报错见上，明细在 errors.jsonl）。确认是每次"
+                "重跑都一样的出错（如内容审核拒绝）后再运行一次：出错与之前相同的步骤会照常继续"
+            )
+        if code != 0:
+            sys.exit(f"失败（退出码 {code}）：{step.describe()}")
         if step.copy is not None:
-            copy_report(*step.copy)
+            assert before is not None
+            copy_report(*step.copy, run_info=answered(step.copy[0]) != before[0])
 
 
 if __name__ == "__main__":

@@ -66,7 +66,7 @@ from cuemem.evals.report import (
     method_stats,
     pending_errors,
 )
-from cuemem.evals.runner import EvalRunner, RunConfig
+from cuemem.evals.runner import EvalRunner, RunConfig, RunSummary
 from cuemem.evals.splits import load_split, save_split, stratified_ids
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
@@ -992,6 +992,12 @@ def eval_split(
     console.print(table)
 
 
+# eval run --fail-on-error 的退出码（与配置错误的 1、参数错误的 2 区分开）：有组合出错时是 3，
+# 达到花费上限提前停止时是 4（复现脚本据此区分发表时就有的出错与没跑完）
+ERRORS_EXIT = 3
+BUDGET_EXIT = 4
+
+
 @eval_app.command("run")
 def eval_run(
     dataset: Annotated[str, typer.Option(help="数据集")] = "longmemeval_s",
@@ -1025,6 +1031,14 @@ def eval_run(
             "--rebuild-spaces",
             help="磁盘上的记忆空间是按另一套巩固配置（或旧版流水线）建的时，按这次的配置重建；"
             "默认报错、不动它",
+        ),
+    ] = False,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-error",
+            help=f"照常生成报告，但有组合出错时以退出码 {ERRORS_EXIT}、达到花费上限提前停止时以 "
+            f"{BUDGET_EXIT} 结束（复现脚本据此不复制不完整的报告）；默认这两种情况退出码都是 0",
         ),
     ] = False,
 ) -> None:
@@ -1096,6 +1110,7 @@ def eval_run(
         )
         if summary.errors:
             _print_errors(summary.run_dir)
+        _exit_if_partial(summary, fail_on_error)
         return
     report_path = build_report(summary.run_dir, eval_spaces=settings.paths.eval_spaces)
     note = "（已达到花费上限，提前停止）" if summary.stopped_by_budget else ""
@@ -1108,6 +1123,17 @@ def eval_run(
         _print_errors(summary.run_dir)
     _print_method_stats(summary.run_dir)
     console.print(f"报告：{report_path}")
+    _exit_if_partial(summary, fail_on_error)
+
+
+def _exit_if_partial(summary: RunSummary, fail_on_error: bool) -> None:
+    """--fail-on-error：这次运行不完整时以非零退出码结束（报告照常生成）。"""
+    if not fail_on_error or not (summary.errors or summary.stopped_by_budget):
+        return
+    code = BUDGET_EXIT if summary.stopped_by_budget else ERRORS_EXIT
+    reason = "达到花费上限提前停止" if summary.stopped_by_budget else "有组合出错"
+    console.print(f"[red]这次运行不完整（{reason}），按 --fail-on-error 以退出码 {code} 结束[/red]")
+    raise typer.Exit(code)
 
 
 @eval_app.command("probe")

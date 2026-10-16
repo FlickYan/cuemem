@@ -658,3 +658,163 @@ def test_reproduce_steps_use_known_methods() -> None:
     for step in runs:
         methods = step.command[step.command.index("--methods") + 1].split(",")
         assert [m.name for m in build_methods(methods)] == methods
+
+
+def _reproduce() -> Any:
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "reproduce.py"
+    spec = importlib.util.spec_from_file_location("reproduce", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["reproduce"] = module  # dataclass 需要在 sys.modules 里找到所在模块
+    spec.loader.exec_module(module)
+    return module
+
+
+def _is_eval_run(command: list[str]) -> bool:
+    i = command.index("cuemem") if "cuemem" in command else -1
+    return i >= 0 and command[i + 1 : i + 3] == ["eval", "run"]
+
+
+TRAINING_SCRIPTS = (
+    "scripts/n7_controller.py",
+    "scripts/n11_controller_v2.py",
+    "scripts/n11_see_gate.py",
+)
+
+
+def test_reproduce_does_not_overwrite_frozen_artifacts() -> None:
+    """复现脚本只核对、不覆盖控制器的三个模型文件（v1、v2 是 N9、N11 冻结评测用的，v3 是默认
+    的）；每次评测运行都加 --fail-on-error（出错或提前停止时不复制报告）；Mem0 固定在 N11、N12
+    用的 2.2.1。"""
+    module = _reproduce()
+    trainers = [s for s in module.STEPS if any(p in s.command for p in TRAINING_SCRIPTS)]
+    assert len(trainers) == len(TRAINING_SCRIPTS)
+    assert all("--no-export" in s.command and "--check" in s.command for s in trainers)
+    runs = [s for s in module.STEPS if _is_eval_run(s.command)]
+    assert len(runs) >= 25 and all("--fail-on-error" in s.command for s in runs)
+    assert all(s.run_name() for s in runs)
+    mem0 = [s for s in runs if "M0" in s.command]
+    assert len(mem0) == 2 and all("mem0ai==2.2.1" in s.command for s in mem0)
+
+
+@pytest.mark.parametrize("script", TRAINING_SCRIPTS)
+def test_training_scripts_accept_the_verify_flags(script: str) -> None:
+    """复现脚本传给训练脚本的 --no-export 与 --check，三个脚本都认。"""
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, script, "--help"], cwd=root, capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    assert "--no-export" in done.stdout and "--check" in done.stdout
+
+
+class _FakeSteps:
+    """替身的 subprocess.run：评测运行按 plan 依次往运行目录里追加结果与报错，返回给定的退出码。"""
+
+    def __init__(self, runs: Path) -> None:
+        self.runs = runs
+        self.plan: dict[str, list[tuple[int, list[str], list[str]]]] = {}
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def __call__(self, command: list[str], **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        self.calls.append((command, kwargs["env"]))
+        if "--name" not in command:
+            return SimpleNamespace(returncode=int("fail" in command[-1]))
+        name = command[command.index("--name") + 1]
+        code, answered, failed = self.plan[name].pop(0)
+        run_dir = self.runs / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "results.jsonl").open("a", encoding="utf-8") as f:
+            f.writelines(json.dumps({"sample_id": q, "method": "B1"}) + "\n" for q in answered)
+        with (run_dir / "errors.jsonl").open("a", encoding="utf-8") as f:
+            for q in failed:
+                f.write(json.dumps({"sample_id": q, "method": "B1", "error": "X: boom"}) + "\n")
+        (run_dir / "report.md").write_text(f"report {len(self.calls)}", encoding="utf-8")
+        (run_dir / "run.json").write_text(f"run {len(self.calls)}", encoding="utf-8")
+        return SimpleNamespace(returncode=code)
+
+
+@pytest.fixture
+def reproduce(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, _FakeSteps]:
+    module = _reproduce()
+    monkeypatch.setattr(module, "RUNS", tmp_path / "runs")
+    monkeypatch.setattr(module, "RESULTS", tmp_path / "results")
+    fake = _FakeSteps(tmp_path / "runs")
+    monkeypatch.setattr(module.subprocess, "run", fake)
+    monkeypatch.delenv("CUEMEM_LLM_CACHE_MODE", raising=False)
+    return module, fake
+
+
+def test_reproduce_copies_only_complete_runs(
+    reproduce: tuple[Any, _FakeSteps], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """复制报告的步骤：出错（退出码 3）或提前停止（4）时脚本停下，docs/results 不动；续跑没有
+    新答的题时报告照常复制，run.json 留着原来的（续跑只在里面追加时间与环境）。"""
+    module, fake = reproduce
+    monkeypatch.setattr(
+        module, "STEPS", [module.run("N2", "n2-run", "longmemeval_s", "dev100", "B1", copy="n2")]
+    )
+    dest = tmp_path / "results" / "n2"
+    fake.plan["n2-run"] = [(3, ["q1"], ["q2"]), (4, ["q2"], []), (0, ["q3"], [])]
+    for _ in range(2):
+        with pytest.raises(SystemExit):
+            module.main([])
+        assert not dest.exists()
+    module.main([])
+    assert (dest / "run.json").read_text("utf-8") == "run 3"
+    assert (dest / "report.md").read_text("utf-8") == "report 3"
+    fake.plan["n2-run"] = [(0, [], [])]  # 全部答完：续跑没有新答的题
+    module.main([])
+    assert (dest / "report.md").read_text("utf-8") == "report 4"
+    assert (dest / "run.json").read_text("utf-8") == "run 3"
+    assert "--fail-on-error" in fake.calls[0][0]
+    assert fake.calls[0][1].get("CUEMEM_LLM_CACHE_MODE") is None  # 默认照常读写缓存
+
+
+def test_reproduce_tolerates_only_the_errors_it_already_had(
+    reproduce: tuple[Any, _FakeSteps], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不复制报告的评测运行：出错的组合与这一步之前完全相同（发表时就有、每次重跑都一样的出错，
+    如内容审核拒绝的题）时继续往下走；第一次出错、多了新的出错或提前停止时停下。"""
+    module, fake = reproduce
+    after = module.script("N9", "scripts/after.py")
+    steps = [module.run("N9", "n9-run", "longmemeval_s", "test400", "B1"), after]
+    monkeypatch.setattr(module, "STEPS", steps)
+    fake.plan["n9-run"] = [(3, ["q1"], ["q2"]), (3, [], ["q2"]), (3, [], ["q2", "q3"]), (4, [], [])]
+    with pytest.raises(SystemExit, match="再运行一次"):
+        module.main([])
+    module.main([])  # 与上次相同的出错：照常继续
+    assert fake.calls[-1][0] == after.command
+    for _ in range(2):  # 多了 q3；提前停止
+        with pytest.raises(SystemExit):
+            module.main([])
+        assert fake.calls[-1][0] != after.command
+
+
+def test_reproduce_cache_only(
+    reproduce: tuple[Any, _FakeSteps], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--cache-only：每一步都只读缓存；关掉缓存的步骤跳过；演示回放没有复现时只跳过它所在的
+    节点，不加 --cache-only 时照旧停下。"""
+    module, fake = reproduce
+    steps = [
+        module.run("N8", "nocache", "locomo", "test7", "B1", env=module.NO_CACHE, optional=True),
+        module.Step("N8", ["uv", "run", "cuemem", "demo", "fail"], best_effort=True),
+        module.script("N8", "scripts/n8_summary.py"),
+        module.script("N9", "scripts/n9_report.py"),
+    ]
+    monkeypatch.setattr(module, "STEPS", steps)
+    module.main(["--cache-only", "--with-optional"])
+    commands = [command for command, _ in fake.calls]
+    assert commands == [steps[1].command, steps[3].command]
+    assert all(env["CUEMEM_LLM_CACHE_MODE"] == "read_only" for _, env in fake.calls)
+    with pytest.raises(SystemExit):
+        module.main([])

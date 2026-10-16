@@ -459,12 +459,44 @@ def test_ask_auto_with_learned_and_hybrid_controllers(
     }
 
 
-def test_controller_model_file_matches_its_schema() -> None:
-    """仓库里导出的控制器（scripts/n7_controller.py）能被运行时读进来，且维度一致。"""
-    model = ControllerModel.load(
-        Path(__file__).parents[1] / "src/cuemem/read/controller_model.json"
-    )
+CONTROLLER_FILES = ("controller_model.json", "controller_model_v1.json", "controller_model_v2.json")
+
+
+@pytest.mark.parametrize("name", CONTROLLER_FILES)
+def test_controller_model_file_matches_its_schema(name: str) -> None:
+    """仓库里导出的控制器（默认的 v3 与冻结评测用的 v1、v2）能被运行时读进来，且维度一致。
+    （文件内容的哈希钉在 tests/test_frozen_config.py。）"""
+    model = ControllerModel.load(Path(__file__).parents[1] / "src/cuemem/read" / name)
     assert model.coef.shape == (len(model.memory_types), len(model.features))
     assert model.gate_coef is not None and model.types[-1] == "none"
+    assert model.gate_coef.shape == (len(model.features),)
     assert set(model.accuracy) == set(model.types)
     assert model.lam > 0
+
+
+def test_controller_drift_ignores_the_date_and_float_noise() -> None:
+    """训练脚本的 --check（复现脚本用）：重新训练的控制器与冻结的文件比，导出日期与浮点噪声
+    不算变化；系数、特征、门槛或字段变了都报出来。"""
+    path = Path(__file__).parents[1] / "src/cuemem/read/controller_model.json"
+    committed = json.loads(path.read_text(encoding="utf-8"))
+    fresh = json.loads(json.dumps(committed))
+    fresh["created"] = "2099-01-01"
+    fresh["coef"][0][0] += 4e-6
+    fresh["mean"] = tuple(np.asarray(fresh["mean"]) + 1e-7)  # 训练时是数组：过一遍 JSON 再比
+    assert R.controller_drift(fresh, committed) == []
+    fresh["coef"][2][3] += 1e-3
+    fresh["features"] = [*fresh["features"][:-1], "q_new"]
+    fresh["see_gate"]["caption_min"] = 0.62
+    del fresh["image_floor"]
+    fresh["extra"] = 1
+    assert R.controller_drift(fresh, committed) == [
+        "coef[2][3]",
+        "extra",
+        f"features[{len(committed['features']) - 1}]",
+        "image_floor",
+        "see_gate.caption_min",
+    ]
+    assert R.controller_drift({**committed, "types": committed["types"][:-1]}, committed) == [
+        "types"
+    ]
+    assert R.controller_drift({**committed, "lambda": True}, committed) == ["lambda"]

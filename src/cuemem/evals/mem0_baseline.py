@@ -21,7 +21,7 @@
 
 mem0ai 不是 CueMem 的依赖，评测时用 uv 临时装上（遥测在导入前关闭）：
 
-    uv run --with mem0ai --with spacy --with fastembed --with "en_core_web_sm @ $SPACY_SM" \\
+    uv run --with mem0ai==2.2.1 --with spacy --with fastembed --with "en_core_web_sm @ $SPACY_SM" \\
         cuemem eval run --dataset locomo --split test200r --methods M0 --name locomo-test200r-mem0
 
 其中 SPACY_SM 是 spaCy 英文小模型的地址（与 spaCy 3.8 配套）：
@@ -152,7 +152,7 @@ def _import_mem0(home: Path) -> Any:
         import mem0.memory.notices as mem0_notices  # type: ignore[import-not-found, unused-ignore]
     except ImportError as exc:  # pragma: no cover - 取决于运行环境
         raise RuntimeError(
-            "M0 需要 mem0ai：用 uv run --with mem0ai ... 运行（见模块说明）"
+            "M0 需要 mem0ai：用 uv run --with mem0ai==2.2.1 ... 运行（见模块说明）"
         ) from exc
     mem0_notices._fetch_remote_config = lambda: None
     original = mem0_main.generate_additive_extraction_prompt
