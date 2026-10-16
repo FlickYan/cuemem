@@ -72,6 +72,9 @@ class RunConfig:
     limit: int | None = None  # 只跑前 N 道题（调试用）
     reuse_spaces: bool = True  # 记忆空间存在磁盘上跨运行复用（paths.eval_spaces）
     build_only: bool = False  # 只构建记忆空间（写入与巩固），不回答、不判分
+    # 磁盘上的空间是按另一套巩固配置（指纹）或旧版流水线建的：默认报错、不动它（见
+    # _run_group）；True 时照旧清空它的派生记忆，按这次的配置重建
+    rebuild_spaces: bool = False
 
 
 @dataclass(frozen=True)
@@ -375,6 +378,7 @@ class EvalRunner:
             m.needs_consolidation for _, methods in items for m in methods
         ):
             try:
+                self._check_space_config(system, space_id)
                 with start_trace("consolidate", space=space_id) as trace:
                     consolidation = system.consolidate(space_id, strict=True)
                 row = {
@@ -540,6 +544,28 @@ class EvalRunner:
         build = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         build["_path"] = str(path)
         return system, build
+
+    def _check_space_config(self, system: MemorySystem, space_id: str) -> None:
+        """复用的空间是按另一套巩固配置（指纹）或旧版抽取流水线建的：报 ConfigMismatchError。
+
+        巩固遇到这样的空间会清空派生记忆、按这次的配置重建，build.json 也跟着改写；评测空间的
+        目录却不分巩固配置（原协议与 pq 协议只差备用模型，指纹就不同，D-067），设错一次目录就把
+        另一个协议的空间悄悄重建了。报错只落在需要事实记忆的方法上（_drop_failed），其余方法照常；
+        每个空间的报错一字不差，报告里归并成一条。不放在 _open_space：那里的 ConfigMismatchError
+        会删掉整个空间重建。--rebuild-spaces（rebuild_spaces）时照旧重建。"""
+        if not self.config.reuse_spaces or self.config.rebuild_spaces:
+            return
+        if not system.consolidator.stale(space_id):
+            return
+        recorded = system.db.get_meta(f"consolidation:{space_id}") or "无"
+        raise ConfigMismatchError(
+            f"{self.settings.paths.eval_spaces} 里的记忆空间是按另一套巩固配置建的（指纹 "
+            f"{recorded}，这次是 {system.consolidator.fingerprint()}；或是旧版抽取流水线建的）："
+            "不重建，也不用它的事实。评测空间的目录不分巩固配置，换配置要换目录（D-067）：原协议"
+            "（默认配置）设 CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-default，pq 协议（通义预设）"
+            "设 CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen；确实要按这次的配置重建这些空间，"
+            "加 --rebuild-spaces。"
+        )
 
     def _record_stage(self, row: dict[str, Any], build: dict[str, Any], *, did_work: bool) -> None:
         """记录写入或巩固的统计：这次真的做了就记实测值；复用已有空间时记首次构建的统计。"""

@@ -333,6 +333,80 @@ def test_spaces_are_reused_across_runs(eval_settings: Settings, fake_api: FakeAP
     assert (second.completed, second.errors) == (3, 0)
 
 
+def _consolidation_variant(settings: Settings, fake_api: FakeAPI, name: str, **config: Any) -> Any:
+    """LoCoMo 迷你数据上跑 B1 与 B4（B4 要巩固；Alice 说的每句话记成一条事实）。"""
+    from scripted import ScriptedModel, echo_extraction
+
+    from cuemem.evals.datasets import load_locomo
+
+    def extract(prompt: str) -> Any:
+        return echo_extraction(prompt.replace("] Alice: ", "] User: "))
+
+    fake_api.chat_replies = [with_extraction(ScriptedModel(extract))]
+    run_config = RunConfig(
+        name=name, dataset="locomo", split=None, methods=["B1", "B4"], workers=1, **config
+    )
+    runner = EvalRunner(settings, run_config, http_client=fake_api.client())
+    return runner, runner.run(load_locomo(FIXTURES / "locomo_mini.json"))
+
+
+def test_spaces_built_with_another_consolidation_config_are_not_rebuilt(
+    eval_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """评测空间的目录不分巩固配置：指纹对不上的空间（如另一个协议的）不悄悄重建，需要事实记忆的
+    方法报一条归并后的配置错误，其余方法照常；指纹相同的照常复用；--rebuild-spaces 时照旧重建。"""
+    from cuemem.evals.report import error_groups, pending_errors
+    from cuemem.evals.runner import space_dir
+    from cuemem.store.sqlite import MemoryDB
+
+    runner, first = _consolidation_variant(eval_settings, fake_api, "first")
+    assert first.errors == 0
+    directory = space_dir(eval_settings, "locomo", runner.embedder, "conv-test")
+    build = (directory / "build.json").read_text("utf-8")
+
+    def facts() -> int:
+        db = MemoryDB(directory / "memory.sqlite")
+        try:
+            return len(db.get_facts("locomo:conv-test"))
+        finally:
+            db.close()
+
+    built = facts()
+    assert built > 0
+
+    # 同一套配置：复用，不报错
+    _, same = _consolidation_variant(eval_settings, fake_api, "same")
+    assert same.errors == 0 and same.completed == first.completed
+    assert all(r.get("reused") for r in load_rows(same.run_dir, "ingest.jsonl"))
+
+    # 只换了备用模型（原协议与 pq 协议的差别）：指纹不同，不重建
+    other = eval_settings.model_copy(
+        update={
+            "consolidation": eval_settings.consolidation.model_copy(
+                update={"fallback_model": "qwen3.7-plus"}
+            )
+        }
+    )
+    _, mismatched = _consolidation_variant(other, fake_api, "mismatched")
+    errors = load_rows(mismatched.run_dir, "errors.jsonl")
+    assert {(e["method"], e["stage"]) for e in errors} == {("B4", "consolidate")}
+    assert mismatched.errors == len(errors) > 1
+    assert {r["method"] for r in load_rows(mismatched.run_dir, "results.jsonl")} == {"B1"}
+    [(method, error, n)] = error_groups(pending_errors(mismatched.run_dir))
+    assert (method, n) == ("B4", len(errors))
+    assert error.startswith("ConfigMismatchError: ")
+    assert "CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen" in error
+    assert "--rebuild-spaces" in error
+    assert (directory / "build.json").read_text("utf-8") == build
+    assert facts() == built
+
+    # 明确要求重建：照旧清空派生记忆，按这次的配置重新巩固
+    _, rebuilt = _consolidation_variant(other, fake_api, "rebuilt", rebuild_spaces=True)
+    assert rebuilt.errors == 0
+    [row] = [r for r in load_rows(rebuilt.run_dir, "ingest.jsonl") if r["stage"] == "consolidate"]
+    assert row["sessions"] > 0 and not row.get("reused")
+
+
 def test_resume_with_different_embedding_is_refused(
     eval_settings: Settings, fake_api: FakeAPI
 ) -> None:

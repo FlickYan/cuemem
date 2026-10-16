@@ -1019,6 +1019,14 @@ def eval_run(
             "构建只用通义的模型，可以在 DeepSeek 高峰时段做",
         ),
     ] = False,
+    rebuild_spaces: Annotated[
+        bool,
+        typer.Option(
+            "--rebuild-spaces",
+            help="磁盘上的记忆空间是按另一套巩固配置（或旧版流水线）建的时，按这次的配置重建；"
+            "默认报错、不动它",
+        ),
+    ] = False,
 ) -> None:
     """运行评测：写入 → 回答 → 判分；结果写入 runs/eval/<运行名>/，最后生成报告。"""
     if peak is not None and peak not in ("wait", "warn", "allow"):
@@ -1047,6 +1055,7 @@ def eval_run(
         max_cost=max_cost,
         limit=limit,
         build_only=build_only,
+        rebuild_spaces=rebuild_spaces,
     )
     count = min(limit, len(evalset.samples)) if limit else len(evalset.samples)
     console.print(f"运行 [bold]{run_name}[/bold]：{count} 题 × {config.methods}")
