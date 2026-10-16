@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Iterator, Sequence
@@ -25,6 +26,7 @@ from cuemem.api.service import ChatService
 from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
 from cuemem.config import Settings
 from cuemem.memory import MemorySystem
+from cuemem.store.media import image_data_url
 
 DAY = datetime(2026, 8, 28, 19, 30)
 
@@ -368,8 +370,21 @@ def test_forget_restatement_does_not_take_its_round_along(
 # ---------- HTTP 接口 ----------
 
 
+def _holding(root: Path, data: bytes, *, skip: Path) -> list[Path]:
+    """root 下（skip 之外）内容与 data 相同的文件。"""
+    digest = hashlib.sha256(data).hexdigest()
+    return [
+        p
+        for p in root.rglob("*")
+        if p.is_file()
+        and skip not in p.parents
+        and hashlib.sha256(p.read_bytes()).hexdigest() == digest
+    ]
+
+
 def test_http_api(service: ChatService, tmp_path: Path, catalog_root: Path) -> None:
-    client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=False))
+    uploads = tmp_path / "uploads"
+    client = TestClient(create_app(service, upload_dir=uploads, ui=False))
     assert client.get("/api/health").json()["ok"]
     started = client.post("/api/sessions", json={"space": "shop", "at": "2026-08-28T19:30"})
     sid = started.json()["session_id"]
@@ -382,6 +397,9 @@ def test_http_api(service: ChatService, tmp_path: Path, catalog_root: Path) -> N
     assert reply.status_code == 200, reply.text
     body = reply.json()
     assert body["trace"]["level"] == "L0" and body["text"] == "OK"
+    # 上传的文件只用这一轮：图片存进了记忆，会话改读那份
+    assert list(uploads.iterdir()) == []
+    assert len(_holding(tmp_path, photo, skip=catalog_root)) == 1
     media = client.get("/api/spaces/shop/media").json()
     assert len(media) == 1
     assert client.get(f"/api/spaces/shop/media/{media[0]['id']}").status_code == 200
@@ -395,12 +413,47 @@ def test_http_api(service: ChatService, tmp_path: Path, catalog_root: Path) -> N
     assert bad.status_code == 422
     forgot = client.post("/api/spaces/shop/forget", json={"session_ids": [sid]}).json()
     assert forgot["turns_deleted"] == 2 and forgot["images_deleted"] == 1
+    # 遗忘之后数据目录里没有这张照片的任何副本（以前上传目录里留着原样的一份）
+    assert _holding(tmp_path, photo, skip=catalog_root) == []
     rejected = client.post(
         f"/api/sessions/{client.post('/api/sessions', json={}).json()['session_id']}/messages",
         data={"text": "hi"},
-        files=[("images", ("x.txt", b"not an image", "text/plain"))],
+        files=[
+            ("images", ("ok.jpg", photo, "image/jpeg")),
+            ("images", ("x.txt", b"not an image", "text/plain")),
+        ],
     )
     assert rejected.status_code == 415
+    assert list(uploads.iterdir()) == []  # 第二个文件被拒，先存下的第一个也删掉
+
+
+def test_http_photo_stays_in_the_conversation(
+    service: ChatService, fake_api: FakeAPI, tmp_path: Path, catalog_root: Path
+) -> None:
+    """上传的文件删掉之后，同一会话的下一轮照常（200），工作记忆里的那张图逐字不变。"""
+    client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=False))
+    sid = client.post("/api/sessions", json={"space": "shop", "at": "2026-08-28T19:30"}).json()[
+        "session_id"
+    ]
+    picture = catalog_root / "images" / "P03.jpg"
+    first = client.post(
+        f"/api/sessions/{sid}/messages",
+        data={"text": "Look at my new backpack", "mode": "l0"},
+        files=[("images", ("pack.jpg", picture.read_bytes(), "image/jpeg"))],
+    )
+    assert first.status_code == 200
+    seen = len(fake_api.chat_requests)
+    second = client.post(f"/api/sessions/{sid}/messages", data={"text": "Colour?", "mode": "l0"})
+    assert second.status_code == 200, second.text
+    (request,) = fake_api.chat_requests[seen:]
+    urls = [
+        b["image_url"]["url"]
+        for m in request["messages"]
+        if isinstance(m["content"], list)
+        for b in m["content"]
+        if b.get("type") == "image_url"
+    ]
+    assert urls == [image_data_url(picture)]
 
 
 def test_http_api_token(service: ChatService, tmp_path: Path) -> None:
@@ -527,7 +580,8 @@ def test_mcp_tools(service: ChatService) -> None:
 
 
 def test_ui_builds_and_renders(service: ChatService, model: ScriptedModel) -> None:
-    assert build_ui(service) is not None
+    # 界面的临时文件（上传、对话与图库里的副本）一小时后清掉：Gradio 没法在遗忘时删它们
+    assert build_ui(service).delete_cache == (3600, 3600)
     model.agent = lambda body: "You wear EU 39 [m1]."
     session = service.start("shop", at=DAY)
     service.chat(session.session_id, "I wear EU 39.", mode="l0")

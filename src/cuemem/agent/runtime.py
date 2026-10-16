@@ -141,7 +141,7 @@ class ChatSession:
     simulated: bool = False
     next_idx: int = 0  # 下一句发言的序号（只增不减：遗忘删掉的序号不再复用）
     window: list[Exchange] = field(default_factory=list)
-    uploads: dict[str, str] = field(default_factory=dict)  # u1 → 本地路径
+    uploads: dict[str, str] = field(default_factory=dict)  # u1 → 本地路径（存进记忆后是那份）
     upload_turns: dict[str, int] = field(default_factory=dict)  # u1 → 所在发言的序号
     closed: bool = False
     _clock: float = field(default_factory=time.monotonic)
@@ -354,6 +354,9 @@ class Agent:
                 first_idx=user_idx,
             )
             session.next_idx += 2
+            # 之后各轮（工作记忆里的图、找同款的 u1）改读记忆里存的那份，字节相同、请求不变：
+            # 调用方的文件（HTTP 的上传、界面的临时文件）用完就能删，遗忘删掉原图后不留副本
+            uploads = self._stored_uploads(space, session.session_id, user_idx, uploads)
             # 溯源：这次回复引用了哪些记忆（遗忘时沿引用扩散，见 MemorySystem.forget）
             self.system.db.add_provenance(
                 space,
@@ -394,6 +397,19 @@ class Agent:
                 prefix_messages=ctx.prefix,
             ),
         )
+
+    def _stored_uploads(
+        self, space: str, session_id: str, user_idx: int, uploads: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """这一轮的图片 → 媒体库里存的路径（没有媒体库、没存下的保留原路径）。"""
+        if not uploads:
+            return uploads
+        turn_id = stable_id(space, session_id, user_idx)
+        ids = [media_id(space, turn_id, i) for i in range(len(uploads))]
+        stored = {m.id: m.path for m in self.system.db.get_media(space, ids=ids)}
+        return [
+            (label, stored.get(mid, path)) for (label, path), mid in zip(uploads, ids, strict=True)
+        ]
 
     def _loop(
         self,

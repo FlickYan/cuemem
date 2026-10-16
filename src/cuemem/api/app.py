@@ -218,11 +218,21 @@ def create_app(
         router: Annotated[str | None, Form()] = None,
         lam: Annotated[float | None, Form()] = None,
     ) -> Reply:
-        paths = [_save_upload(upload, upload_dir) for upload in images or []]
-        with _errors():
-            return service.chat(
-                session_id, text, images=paths, mode=_mode(mode), router=_router(router), lam=lam
-            )
+        paths: list[str] = []
+        try:
+            for upload in images or []:
+                paths.append(_save_upload(upload, upload_dir))
+            with _errors():
+                return service.chat(
+                    session_id,
+                    text,
+                    images=paths,
+                    mode=_mode(mode),
+                    router=_router(router),
+                    lam=lam,
+                )
+        finally:  # 上传的文件只用这一轮：图片已经存进记忆，会话改读那份；不留副本（遗忘删不到）
+            _discard(paths, service, session_id)
 
     @api.post("/api/sessions/{session_id}/end")
     def end(session_id: str, wait: bool = False) -> dict[str, Any]:
@@ -351,7 +361,7 @@ def create_app(
             path="/",
             theme=THEME,
             css=CSS,
-            allowed_paths=[str(upload_dir), str(service.system.settings.paths.media)],
+            allowed_paths=[str(service.system.settings.paths.media)],  # 界面不读上传目录
             footer_links=[],  # 接口文档在 /docs
             auth=_ui_login(token),
             auth_message="Sign in with any username and the access token as the password.",
@@ -369,3 +379,14 @@ def _save_upload(upload: UploadFile, directory: Path) -> str:
     with target.open("wb") as out:
         shutil.copyfileobj(upload.file, out)
     return str(target)
+
+
+def _discard(paths: Sequence[str], service: ChatService, session_id: str) -> None:
+    """删掉这一轮上传的文件。会话还在读的不删：记忆系统没有媒体库时只能读原文件。"""
+    try:
+        kept = set(service.get(session_id).uploads.values())
+    except KeyError:
+        kept = set()
+    for path in paths:
+        if path not in kept:
+            Path(path).unlink(missing_ok=True)

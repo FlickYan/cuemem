@@ -20,6 +20,7 @@ from cuemem.agent.context import Exchange, citations, evict, strip_citations
 from cuemem.config import Settings
 from cuemem.core.models import Conversation
 from cuemem.memory import MemorySystem
+from cuemem.store.media import image_data_url
 
 DAY = datetime(2025, 10, 10, 19, 0)
 
@@ -193,6 +194,27 @@ def test_images_in_chat(system: MemorySystem, model: ScriptedModel, tmp_path: Pa
     media = system.db.get_media("demo")
     assert len(media) == 1 and Path(media[0].path).exists()
     assert media[0].id in agent._window_ids(session)  # 检索时排除工作记忆里的图
+
+
+def test_pictures_are_read_from_memory_once_written(
+    system: MemorySystem, model: ScriptedModel, tmp_path: Path
+) -> None:
+    """用户发的图写进记忆之后，会话（工作记忆、找同款用的 u1）改读媒体库里的那份：调用方的
+    文件（HTTP 的上传、界面的临时文件）用完就能删，遗忘删掉原图后不留副本；之后的请求不变。"""
+    picture = tmp_path / "shoes.png"
+    Image.new("RGB", (64, 48), "white").save(picture)
+    sent = image_data_url(picture)
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "我朋友穿的这双鞋好看吗？", images=[picture], mode="l0")
+    (stored,) = system.db.get_media("demo")
+    assert Path(stored.path).is_relative_to(system.settings.paths.media)
+    assert session.uploads == {"u1": stored.path}
+    assert session.window[-1].images == [("u1", stored.path)]
+    picture.unlink()  # 调用方删掉自己的文件：下一轮照常，请求里的图逐字不变
+    agent.chat(session, "那双鞋是什么颜色？", mode="l0")
+    history = model.agent_requests[-1]["messages"][1]["content"]
+    assert [b["image_url"]["url"] for b in history if b.get("type") == "image_url"] == [sent]
 
 
 def test_eviction_in_chunks() -> None:

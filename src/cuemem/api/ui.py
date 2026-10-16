@@ -139,7 +139,9 @@ The store and products are made up for the demo; product photos are AI-generated
 
 def build_ui(service: ChatService) -> gr.Blocks:
     lam_default = _lam_default(service)
-    with gr.Blocks(title="CueMem demo") as demo:
+    # Gradio 把上传的照片、对话与图库里显示的图都复制进自己的临时目录，遗忘时没法删到：每小时清掉
+    # 一小时以前的副本（会话读的是记忆里存的那份，不受影响；更早的对话里的图不再显示）
+    with gr.Blocks(title="CueMem demo", delete_cache=(3600, 3600)) as demo:
         session_id = gr.State(None)
         gr.HTML(
             '<div class="cm-header"><h1>CueMem</h1><p>A shopping assistant with long-term '
