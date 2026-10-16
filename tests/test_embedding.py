@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -7,7 +8,8 @@ import numpy as np
 import pytest
 from fakes import FakeAPI
 
-from cuemem.config import Settings
+from cuemem.config import MultimodalEmbeddingConfig, Settings
+from cuemem.core.ids import content_hash
 from cuemem.embed import (
     CachedEmbedder,
     DashScopeTextEmbedder,
@@ -17,6 +19,7 @@ from cuemem.embed import (
     HashEmbedder,
     SparseVector,
 )
+from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.errors import EmbeddingAPIError
 from cuemem.llm import Ledger
 
@@ -107,6 +110,37 @@ def test_cached_embedder_only_embeds_misses(tmp_path: Path) -> None:
     reopened = CachedEmbedder(inner, EmbeddingCache(tmp_path / "embed.sqlite"))
     reopened.embed(["橙子"], "document")  # 持久化：新实例直接命中
     assert len(inner.calls) == 3
+
+
+class NamedEmbedder:
+    """只用来算缓存键：名字、维度与稀疏开关取默认配置的向量模型。"""
+
+    name, dim, supports_sparse = "qwen3.7-text-embedding", 1024, False
+
+    def embed(self, texts: Sequence[str], kind: EmbedKind) -> EmbeddingBatch:
+        raise AssertionError("算缓存键不需要向量化")
+
+
+def test_embedding_cache_keys_are_frozen(tmp_path: Path) -> None:
+    """文本与图片向量的缓存键钉死（与基线提交 e7064ef 上相同）：键变了，data/cache 里已有的
+    向量全部失效，重放发表的数字时要重新向量化。"""
+    cached = CachedEmbedder(
+        NamedEmbedder(),
+        EmbeddingCache(tmp_path / "embed.sqlite"),
+        instruct="Find memories that answer the question",
+    )
+    text = "我领养了一只金毛，叫 Max。"
+    query_key = "d59f46a006fe056ace094ecb5400655cde3237cf456b97f8dd0bbb913d000685"
+    document_key = "a7b11e3bc09380393d665e3b8bfec7489e4dd4fb60dd16de99ee8d05a9bafc56"
+    assert cached._key(text, "query") == query_key  # 查询带指令
+    assert cached._key(text, "document") == document_key
+
+    images = DashScopeMultimodalEmbedder(MultimodalEmbeddingConfig(), "sk-test")
+    text_key = "45dc995a9495b881a515e65d263dfbc7bb8daaf18552c4b3f11cc0646019cb81"
+    image_key = "e0287fb67548371dae3846ce385b95fe64978b4c9dfc7828dfe61fb7fafe3d34"
+    assert images._key("text", content_hash("a red sign that says CUE 42")) == text_key
+    image = hashlib.sha256(b"\x89PNG not really an image").hexdigest()
+    assert images._key("image", image) == image_key
 
 
 def test_hash_embedder_reflects_lexical_overlap() -> None:

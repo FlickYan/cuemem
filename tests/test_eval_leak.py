@@ -18,6 +18,8 @@ from typing import Any
 
 import pytest
 from fakes import FakeAPI
+from frozen_requests import method_keys
+from frozen_requests import reply as _reply
 from scripted import ScriptedModel, echo_extraction
 
 from cuemem.config import Settings
@@ -231,25 +233,7 @@ def test_abstention_question_id_reaches_no_model(
 
 
 # ---------- 端到端：交给模型的全部请求 ----------
-
-
-def _reply(model: ScriptedModel) -> Any:
-    """reader 固定回答、judge 判对，其余（抽取、对账、规划……）交给脚本化的模型。"""
-
-    def reply(body: dict[str, Any]) -> str:
-        first = body["messages"][0]
-        content = body["messages"][-1]["content"]
-        if isinstance(content, str) and content.startswith("I will give you"):
-            return "yes"
-        if first["role"] == "system" and first["content"].startswith(
-            "You are a personal assistant"
-        ):
-            return json.dumps(
-                {"answer": "golden retriever", "citations": [], "evidence_sufficient": True}
-            )
-        return str(model(body))
-
-    return reply
+# （_reply：reader 固定回答、judge 判对，其余交给脚本化的模型，见 tests/frozen_requests.py）
 
 
 @pytest.fixture
@@ -646,3 +630,79 @@ def test_locomo_is_byte_for_byte_unchanged(
     assert len(digests) == 18
     assert hashlib.sha256("\n".join(digests).encode()).hexdigest() == LOCOMO_REQUESTS
     assert LOCOMO_B2_PROMPT in _reader_prompts(fake_api)
+
+
+# ---------- 冻结的方法：全部请求逐字节不变 ----------
+
+# 冻结的方法在迷你数据上单独跑一遍（单线程、响应缓存是空的）的全部请求，按写进响应缓存的键记成
+# 快照：（请求数，键排序后的 sha256）。缓存键包括供应商、模型、消息、参数（温度、max_tokens、
+# response_format、工具与 tool_choice）与 extra_body，正是已有缓存能否命中、发表的数字能否从
+# data/cache 重放的依据：抽取、对账、规划与充分性检查、控制器、Agent 的工具调用（检索、算日期、
+# 交卷，以及一道题一直不交卷、步数用完后由 reader 兜底）、回答与判分都在里面。LongMemEval 用
+# 原始会话 ID（=1），与修复泄漏之前逐字节相同（D-067）。基线提交 e7064ef 上用同一份代码
+# （tests/frozen_requests.py）跑出的值与这里完全相同。
+# L1（B4-nobm25）与 B6r 在这么小的数据上与 B4 的请求相同（整段历史都在预算里），它们的检索配置
+# 在 test_frozen_config.py 里钉住。有意修改提示词或参数时（在 decisions 里写明），跑
+# uv run pytest tests/test_eval_leak.py -k frozen，按失败信息里的新值更新这张表。
+FROZEN_REQUESTS: dict[tuple[str, str], tuple[int, str]] = {
+    ("locomo", "B1"): (8, "61f057a23f8c0d6d9a0ca11ffb2f34bd3e084fdba54f2b42fec5c8609ccbaa4c"),
+    ("locomo", "B2"): (8, "6a49c5b18c9375a88cd8adaa0f7cca9305ae7657b50b2a3f538d0787941fcdc0"),
+    ("locomo", "B2F"): (10, "2fe1ce09e8c9384427787e0f40ab0c3b30a3d0b92276be51da5f4438d3e41909"),
+    ("locomo", "B4"): (10, "1d8ee9e2c7a2b81b97013a42148d41afc66f80a2ff3349349e06ca5a03c84e49"),
+    ("locomo", "B5"): (18, "e4531efb85b92c58df93e46973e311c123952a1839f0a0226d1f76ef1627c1f2"),
+    ("locomo", "B6"): (10, "686c2937b730841631d4b6094daacfec140975abdeede3b1c514c193176a96c5"),
+    ("locomo", "B3"): (19, "29bbfc98a70211d82a5cfa2666fa3b654f089c211a6e706e6b6434e5770b8292"),
+    ("locomo", "B6a"): (19, "cf1d923f4fea3fb0499bb85bd46b19060d1b7328cb5dba05cc9ee2ded8571433"),
+    ("longmemeval_s-raw", "B1"): (
+        2,
+        "a991aa7211abc18c02a1c496a7affd4c01cec99c650f34633a86bfefe5440054",
+    ),
+    ("longmemeval_s-raw", "B2"): (
+        2,
+        "7f51a5338c799041f308bc9d8b1a950c761eba0be05a56d1f16a21ab376e3a17",
+    ),
+    ("longmemeval_s-raw", "B4"): (
+        7,
+        "8aacc1962c5b1458dbff4223aec8e6dc4a44197870359170f3f5b651ca349fe5",
+    ),
+    ("longmemeval_s-raw", "B5"): (
+        9,
+        "b025bb3b92bd7c50f5422b0e7392a64ff9c8ee7f9c59df0576478c762694c222",
+    ),
+    ("longmemeval_s-raw", "B6"): (
+        7,
+        "aea13cd0f1bbe0f909a9ad1f1c20d6d3a623e4a14684cc183ea7e360818cf337",
+    ),
+    ("longmemeval_s-raw", "B3"): (
+        8,
+        "080ab14dcaecd0ab29f635ac521bf89897f4a4d029b502c63e90636fa74cea30",
+    ),
+    ("longmemeval_s-raw", "B6a"): (
+        8,
+        "d35cdcc2486c834044bed89404e2b854cafdd69fd10c01e5946c7d0af3a81002",
+    ),
+}
+
+
+@pytest.mark.parametrize(("dataset", "method"), list(FROZEN_REQUESTS))
+def test_frozen_requests_are_unchanged(
+    eval_settings: Settings,
+    fake_api: FakeAPI,
+    lme_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dataset: str,
+    method: str,
+) -> None:
+    if dataset == "locomo":
+        monkeypatch.delenv(RAW_SESSION_IDS_ENV, raising=False)
+        evalset = load_locomo(FIXTURES / "locomo_mini.json")
+    else:
+        monkeypatch.setenv(RAW_SESSION_IDS_ENV, "1")
+        evalset = load_longmemeval(lme_path)
+    expected = FROZEN_REQUESTS[(dataset, method)]
+    assert method_keys(eval_settings, fake_api, evalset, method) == expected
+    if method in ("B3", "B6a"):  # Agent 真的调用了工具；LoCoMo 上有一道题走了兜底回答
+        assert any(body.get("tools") for body in fake_api.chat_requests)
+        rows = load_rows(eval_settings.paths.eval_runs / method, "results.jsonl")
+        forced = [r for r in rows if (r["details"] or {}).get("forced_answer")]
+        assert len(forced) == (1 if dataset == "locomo" else 0)
