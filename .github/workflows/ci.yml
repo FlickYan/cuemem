@@ -22,3 +22,64 @@ jobs:
         run: uv run mypy
       - name: 单元测试（离线，不需要 API Key）
         run: uv run pytest
+
+  package:
+    # pip 安装的路径：在仓库外装上构建出的 wheel，跑命令行、SDK 与 HTTP 接口（离线，不需要 API Key）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: 构建 wheel
+        run: uv build --wheel
+      - name: wheel 里有配置、预设与控制器
+        run: |
+          python3 - <<'EOF'
+          import glob
+          import zipfile
+
+          [wheel] = glob.glob("dist/*.whl")
+          names = set(zipfile.ZipFile(wheel).namelist())
+          need = {"cuemem/configs/default.yaml"}
+          need |= {f"cuemem/configs/presets/{p}.yaml" for p in ("openai", "ollama", "deepseek", "qwen")}
+          need |= {f"cuemem/read/controller_model{v}.json" for v in ("", "_v1", "_v2")}
+          missing = sorted(need - names)
+          assert not missing, f"wheel 里缺少 {missing}"
+          EOF
+      - name: 在仓库外安装 wheel
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv" dist/*.whl
+      - name: 冒烟测试（哈希向量，数据写在临时目录）
+        working-directory: ${{ runner.temp }}
+        env:
+          CUEMEM_HOME: ${{ runner.temp }}/home
+          CUEMEM_EMBEDDING__BACKEND: hash
+        run: |
+          export PATH="$RUNNER_TEMP/venv/bin:$PATH"
+          cuemem --help
+          cuemem doctor
+          python "$GITHUB_WORKSPACE/scripts/smoke_wheel.py"
+          # 默认场景：包里没有导购演示的商品目录，cuemem serve 改用通用助手照常起来
+          cuemem serve --no-ui --port 7860 > serve.log 2>&1 &
+          pid=$!
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:7860/api/health || { cat serve.log; exit 1; }
+          kill "$pid"
+
+  docker:
+    # 镜像能构建、带着本机向量的可选依赖（预设 deepseek 要用），启动后 /api/health 正常
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建镜像
+        run: docker build -t cuemem:ci .
+      - name: 本机向量的可选依赖在镜像里
+        run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed"
+      - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设访问令牌）
+        run: |
+          docker run -d --name cuemem -p 127.0.0.1:7860:7860 \
+            -e CUEMEM_API_TOKEN=ci-token -e CUEMEM_EMBEDDING__BACKEND=hash cuemem:ci
+          for _ in $(seq 90); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:7860/api/health || { docker logs cuemem; exit 1; }

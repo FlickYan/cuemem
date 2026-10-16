@@ -307,6 +307,22 @@ def env_file_path(root: Path | None = None) -> Path:
     return Path(os.environ.get("CUEMEM_ENV_FILE") or (root or home_dir()) / ".env")
 
 
+def cli_command(args: str) -> str:
+    """提示里让用户运行的命令：源码仓库里是 uv run cuemem …，pip 安装后直接是 cuemem …。"""
+    return f"{'uv run ' if source_checkout() else ''}cuemem {args}"
+
+
+def missing_key_remedy(provider: str) -> str:
+    """缺 Key 时的解决办法。只设了 OPENAI_API_KEY、缺的却是别家的 Key 时，多半是没换预设。"""
+    remedy = f"请运行 {cli_command('configure')}"
+    if provider != "openai" and os.environ.get("OPENAI_API_KEY"):
+        remedy += (
+            f"；只有 OpenAI 的 Key 时用 openai 预设：{cli_command('--preset openai …')}、"
+            'Memory(preset="openai")，或设 CUEMEM_PRESET=openai'
+        )
+    return remedy
+
+
 def presets() -> list[str]:
     """可用的预设名（presets/*.yaml）。"""
     return sorted(p.stem for p in PRESETS_DIR.glob("*.yaml"))

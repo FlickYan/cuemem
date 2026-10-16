@@ -21,13 +21,14 @@ from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import SessionIn, TurnIn
+from cuemem.errors import CueMemError
 from cuemem.evidence import fact_state, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
 from cuemem.read.controller import Router
 
 Scenario = Literal["shop", "plain"]
 
-SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"
+SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
 
 
 @dataclass
@@ -68,15 +69,20 @@ class ChatService:
         lam: float | None = None,
         http_client: httpx2.Client | None = None,
     ) -> ChatService:
+        catalog_path = catalog_path or SHOP_CATALOG
+        if scenario == "shop" and not catalog_path.is_file():  # 在打开记忆系统之前检查
+            raise CueMemError(
+                f"找不到导购演示的商品目录 {catalog_path}：它只在源码仓库里（demo/shop/），"
+                "pip 安装的包里没有。改用通用助手（cuemem serve --scenario plain，"
+                '代码里 scenario="plain"），或用 catalog_path 指定商品目录'
+            )
         system = MemorySystem.from_settings(settings, http_client=http_client)
         catalog = None
         persona: Persona | None = None
         tools = []
         if scenario == "shop":
             catalog = Catalog.load(
-                catalog_path or SHOP_CATALOG,
-                embedder=system.embedder,
-                image_embedder=system.image_embedder,
+                catalog_path, embedder=system.embedder, image_embedder=system.image_embedder
             )
             persona = SHOP_PERSONA
             tools = shop_tools(catalog)

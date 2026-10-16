@@ -297,6 +297,71 @@ def test_loopback_bind_checks_the_host(
     assert local.get("/v1/models", headers=proxied).status_code == 403
 
 
+def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """导购演示的商品目录只在源码仓库里：pip 安装后 cuemem serve 默认改用通用助手照常起来（以前
+    直接崩在 FileNotFoundError 上）；明说 --scenario shop 时给出可读的报错。仓库里默认仍是导购。"""
+    from cuemem import cli
+
+    assert cli._default_scenario() == "shop"
+    missing = tmp_path / "site-packages" / "demo" / "shop" / "catalog.json"
+    monkeypatch.setattr(cli, "SHOP_CATALOG", missing)
+    monkeypatch.setattr("cuemem.api.service.SHOP_CATALOG", missing)
+    result = runner.invoke(app, ["serve", "--no-ui"])
+    assert result.exit_code == 0, result.output
+    assert len(served) == 1 and "通用助手" in result.output
+    result = runner.invoke(app, ["serve", "--no-ui", "--scenario", "shop"])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+    assert "错误" in result.output and "--scenarioplain" in _flat(result.output)
+    assert len(served) == 1
+
+
+@pytest.mark.parametrize(
+    "command", [["serve", "--no-ui", "--scenario", "plain"], ["chat", "--space", "s"], ["proxy"]]
+)
+def test_missing_key_is_a_friendly_error_for_servers(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]
+) -> None:
+    """缺 Key 时 serve、chat 与 proxy 只打印原因并以 1 退出，不再抛出调用栈（Docker 里会反复
+    重启）；pip 安装后的提示是 cuemem configure。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("cuemem.config.source_checkout", lambda: False)
+    calls: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
+    result = runner.invoke(app, command, input="/quit\n")
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    flat = _flat(result.output)
+    assert "错误" in flat and "DASHSCOPE_API_KEY" in flat and "请运行cuememconfigure" in flat
+    assert calls == []
+
+
+def test_demo_uses_the_catalog_next_to_its_script(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """cuemem demo 用剧本旁边的商品目录（demo/shop/ 里就是这样）：不在源码仓库里也能回放；
+    旁边没有时才用仓库里的。"""
+    from cuemem import cli
+    from cuemem.errors import CueMemError
+
+    seen: list[Path | None] = []
+
+    def fake_create(settings: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["catalog_path"])
+        raise CueMemError("stop")
+
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.ChatService, "create", fake_create)
+    script = tmp_path / "shop" / "script.json"
+    script.parent.mkdir()
+    script.write_text('{"space": "demo", "sessions": []}', encoding="utf-8")
+    result = runner.invoke(app, ["demo", str(script)])
+    assert result.exit_code == 1 and "stop" in result.output
+    (script.parent / "catalog.json").write_text("{}", encoding="utf-8")
+    assert runner.invoke(app, ["demo", str(script)]).exit_code == 1
+    assert seen == [None, script.parent / "catalog.json"]
+
+
 def test_data_download_skips_optional_datasets(
     isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

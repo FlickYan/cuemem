@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx2
 
-from cuemem.config import Settings
+from cuemem.config import Settings, missing_key_remedy
 from cuemem.embed.base import EmbeddingBatch, EmbedKind, SparseVector, TextEmbedder
 from cuemem.embed.cache import CachedEmbedder, EmbeddingCache
 from cuemem.embed.dashscope import DashScopeTextEmbedder
@@ -55,7 +55,7 @@ def build_embedder(
         api_key = provider.api_key()
         if api_key is None:
             raise MissingAPIKeyError(
-                f"向量化需要环境变量 {provider.api_key_env}，请运行 uv run cuemem configure；"
+                f"向量化需要环境变量 {provider.api_key_env}，{missing_key_remedy(cfg.provider)}；"
                 "离线试用可设置 CUEMEM_EMBEDDING__BACKEND=hash"
             )
         if cfg.backend == "openai":

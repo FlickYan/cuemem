@@ -43,8 +43,8 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, T
 from rich.table import Table
 
 from cuemem.agent import Reply
-from cuemem.api.service import ChatService, Scenario
-from cuemem.config import Settings, env_file_path, load_settings
+from cuemem.api.service import SHOP_CATALOG, ChatService, Scenario
+from cuemem.config import Settings, cli_command, env_file_path, load_settings
 from cuemem.core.models import Answer, Conversation, Fact
 from cuemem.embed import build_embedder
 from cuemem.envfile import mask, read_env, update_env
@@ -170,7 +170,7 @@ def configure() -> None:
             provider.base_url,
         )
     console.print(summary)
-    console.print("下一步：[bold]uv run cuemem doctor --live[/bold]")
+    console.print(f"下一步：[bold]{cli_command('doctor --live')}[/bold]")
 
 
 @app.command()
@@ -456,7 +456,12 @@ SCENARIO_HELP = "shop：电商导购演示（商品目录与按图找同款）�
 
 
 def _service(
-    space: str, scenario: str, router: str, lam: float | None
+    space: str,
+    scenario: str,
+    router: str,
+    lam: float | None,
+    *,
+    catalog_path: Path | None = None,
 ) -> tuple[Settings, ChatService]:
     if scenario not in get_args(Scenario):
         console.print(f"[red]--scenario 只能是 {'、'.join(get_args(Scenario))}[/red]")
@@ -464,16 +469,30 @@ def _service(
     if router not in get_args(Router):
         console.print(f"[red]--router 只能是 {'、'.join(get_args(Router))}[/red]")
         raise typer.Exit(1)
-    settings = load_settings(peak_policy="warn")
-    _peak_note(settings)
-    service = ChatService.create(
-        settings,
-        scenario=cast(Scenario, scenario),
-        default_space=space,
-        router=cast(Router, router),
-        lam=lam,
-    )
+    try:  # 缺 Key、换了向量模型、没有商品目录等：提示原因，不打印调用栈（Docker 里会反复重启）
+        settings = load_settings(peak_policy="warn")
+        _peak_note(settings)
+        service = ChatService.create(
+            settings,
+            scenario=cast(Scenario, scenario),
+            catalog_path=catalog_path,
+            default_space=space,
+            router=cast(Router, router),
+            lam=lam,
+        )
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     return settings, service
+
+
+def _default_scenario() -> str:
+    """serve 不指定 --scenario 时：源码仓库里有导购演示的商品目录，用 shop；pip 安装后没有，
+    用通用助手。"""
+    if SHOP_CATALOG.is_file():
+        return "shop"
+    console.print("[dim]导购演示的商品目录只在源码仓库里：这里用通用助手（--scenario plain）[/dim]")
+    return "plain"
 
 
 INSECURE_HELP = (
@@ -524,7 +543,10 @@ def serve(
     host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
     port: Annotated[int, typer.Option(help="端口")] = 7860,
     space: Annotated[str, typer.Option(help="界面默认的记忆空间")] = "shop-demo",
-    scenario: Annotated[str, typer.Option(help=SCENARIO_HELP)] = "shop",
+    scenario: Annotated[
+        str | None,
+        typer.Option(help=SCENARIO_HELP + "；默认在源码仓库里是 shop，pip 安装后是 plain"),
+    ] = None,
     router: Annotated[str, typer.Option(help="默认的检索控制器")] = "learned",
     lam: Annotated[float | None, typer.Option(help="成本旋钮 λ；默认取控制器模型里的值")] = None,
     no_ui: Annotated[bool, typer.Option("--no-ui", help="只启动 HTTP 接口")] = False,
@@ -538,7 +560,7 @@ def serve(
     from cuemem.api.app import TOKEN_ENV, create_app
     from cuemem.api.proxy import MemoryProxy
 
-    settings, service = _service(space, scenario, router, lam)
+    settings, service = _service(space, scenario or _default_scenario(), router, lam)
     token = os.environ.get(TOKEN_ENV) or None  # _service 加载配置时已读入 .env
     try:
         _require_token(host, token, insecure_no_auth)
@@ -603,7 +625,11 @@ def proxy(
     token = os.environ.get(TOKEN_ENV) or None  # load_settings 已读入 .env
     _require_token(host, token, insecure_no_auth)
     allowed_hosts, origin_hosts = _host_policy(host)
-    system = MemorySystem.from_settings(settings)
+    try:
+        system = MemorySystem.from_settings(settings)
+    except CueMemError as exc:  # 缺 Key、换了向量模型等：提示原因，不打印调用栈
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     memory_proxy = MemoryProxy(
         system, default_user=user, mode=cast(RecallMode, mode), idle_minutes=idle_minutes
     )
@@ -696,7 +722,11 @@ def demo(
 
     plan = DemoScript.load(script)
     space_id = space or plan.space
-    settings, service = _service(space_id, "shop", router, lam)
+    # 剧本旁边有商品目录就用它（demo/shop/ 里就是这样）：不在源码仓库里也能回放
+    catalog = script.parent / "catalog.json"
+    settings, service = _service(
+        space_id, "shop", router, lam, catalog_path=catalog if catalog.is_file() else None
+    )
     try:
         if fresh:
             service.system.db.delete_space(space_id)
@@ -1223,7 +1253,7 @@ def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSe
     path = dataset_path(settings.paths.datasets, dataset)
     if not path.exists():
         console.print(
-            f"[red]缺少数据文件 {path}[/red]，请先运行：uv run cuemem data download {dataset}"
+            f"[red]缺少数据文件 {path}[/red]，请先运行：{cli_command('data download ' + dataset)}"
         )
         raise typer.Exit(1)
     ids = load_split(dataset, split) if split else None

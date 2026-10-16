@@ -91,8 +91,13 @@ def test_meta_guard_detects_embedder_change(tmp_path: Path) -> None:
     db = MemoryDB(tmp_path / "memory.sqlite")
     db.check_or_set_meta("embedder", "model-a:8")
     db.check_or_set_meta("embedder", "model-a:8")
-    with pytest.raises(ConfigMismatchError):
+    with pytest.raises(ConfigMismatchError) as caught:
         db.check_or_set_meta("embedder", "model-b:16")
+    # 报错指向新的数据目录（pip 安装后没有仓库里的 data/ 目录可删）
+    message = str(caught.value)
+    assert str(tmp_path / "memory.sqlite") in message and "model-a:8" in message
+    assert "CUEMEM_HOME" in message and "Memory(home=...)" in message
+    assert "data/ 目录" not in message
 
 
 def test_vector_store_search_and_filters(tmp_path: Path) -> None:

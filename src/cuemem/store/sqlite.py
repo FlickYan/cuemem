@@ -228,8 +228,9 @@ class MemoryDB:
         if row[0] != value:
             raise ConfigMismatchError(
                 f"数据库 {self.path} 建立时的 {key} 是 {row[0]}，当前配置是 {value}。"
-                "混用会导致向量不可比：请删除 data/ 目录后重新导入，"
-                "或通过 CUEMEM_PATHS__* 指定新的存储位置。"
+                "混用会导致向量不可比：换一个新的数据目录（环境变量 CUEMEM_HOME，SDK 用 "
+                "Memory(home=...)），或用 CUEMEM_PATHS__DB 与 CUEMEM_PATHS__QDRANT 指定新的存储"
+                "位置；确定不要这里的记忆时，删掉这个数据库与向量库后重新导入。"
             )
 
     def get_meta(self, key: str) -> str | None:

@@ -78,6 +78,25 @@ def _call(name: str, **arguments: Any) -> dict[str, Any]:
     return {"tool_calls": [{"id": "c1", "name": name, "arguments": json.dumps(arguments)}]}
 
 
+def test_shop_scenario_needs_its_catalog(
+    n3_settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """导购演示的商品目录只在源码仓库里（不进 wheel）：找不到时报 CueMemError、指向
+    --scenario plain 与 catalog_path，而且不先打开记忆系统。"""
+    from cuemem.errors import CueMemError
+
+    missing = tmp_path / "site-packages" / "demo" / "shop" / "catalog.json"
+    opened: list[Settings] = []
+    monkeypatch.setattr(MemorySystem, "from_settings", lambda s, **kw: opened.append(s))
+    with pytest.raises(CueMemError, match="--scenario plain") as caught:
+        ChatService.create(n3_settings, scenario="shop", catalog_path=missing)
+    assert str(missing) in str(caught.value) and "catalog_path" in str(caught.value)
+    monkeypatch.setattr("cuemem.api.service.SHOP_CATALOG", missing)
+    with pytest.raises(CueMemError, match="--scenario plain"):
+        ChatService.create(n3_settings)  # 默认就是导购演示
+    assert opened == []
+
+
 # ---------- 商品工具 ----------
 
 

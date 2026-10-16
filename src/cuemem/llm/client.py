@@ -25,7 +25,7 @@ from openai import APITimeoutError, BadRequestError, OpenAI
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ValidationError
 
-from cuemem.config import ModelSpec, Settings
+from cuemem.config import ModelSpec, Settings, missing_key_remedy
 from cuemem.core.trace import record_event
 from cuemem.errors import (
     CacheMissError,
@@ -408,7 +408,7 @@ class LLMClient:
                 if api_key is None:
                     raise MissingAPIKeyError(
                         f"缺少环境变量 {cfg.api_key_env}（{provider}），"
-                        "请运行 uv run cuemem configure"
+                        f"{missing_key_remedy(provider)}"
                     )
                 self._clients[provider] = OpenAI(
                     api_key=api_key,

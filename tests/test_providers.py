@@ -78,6 +78,30 @@ def test_unknown_preset_is_rejected(clean_env: None) -> None:
         load_settings(preset="no-such-preset")
 
 
+def test_missing_key_errors_name_the_right_remedy(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缺 Key 的报错（命令行提示照旧是中文）：pip 安装后要运行的是 cuemem configure（源码仓库里
+    才加 uv run）；只设了 OPENAI_API_KEY、缺的却是别家的 Key 时，提示换成 openai 预设。"""
+    from cuemem import config
+    from cuemem.errors import MissingAPIKeyError
+
+    settings = load_settings(home=tmp_path, peak_policy="allow")
+    monkeypatch.setattr(config, "source_checkout", lambda: False)
+    with pytest.raises(MissingAPIKeyError) as caught:
+        build_embedder(settings)
+    assert "DASHSCOPE_API_KEY，请运行 cuemem configure" in str(caught.value)
+    assert "openai" not in str(caught.value)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    with pytest.raises(MissingAPIKeyError, match=r'Memory\(preset="openai"\)'):
+        build_embedder(settings)
+    with pytest.raises(MissingAPIKeyError, match="--preset openai"):
+        LLMClient(settings).chat("reader", HELLO)
+    monkeypatch.setattr(config, "source_checkout", lambda: True)
+    with pytest.raises(MissingAPIKeyError, match="请运行 uv run cuemem configure"):
+        build_embedder(settings)
+
+
 @pytest.fixture
 def openai_settings(clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
