@@ -13,7 +13,8 @@
 
 - 记忆空间：user_id 与 agent_id 合起来定一个空间（各空间完全隔离）；run_id 是空间里的一个会话；
 - 写入分两步：add 先在线写入原始日志（不调用 LLM，立即可检索），抽取事实在后台完成；
-  wait=True 时同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件；
+  wait=True 时同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件；一段对话分多次写入时用
+  run() 包起来，结束时整段只抽取一次；
 - 事实不就地改写、也不删除旧版本：被取代的事实留在版本链里（history），get_all 默认只给当前的；
 - search 先过检索控制器：与记忆无关的问题返回 L0（只有画像，不检索），mode="l1" 可以强制检索；
 - delete 是"被遗忘权"：删掉事实出自的对话，再用剩下的日志重建，连带清理转述、缓存与原图。
@@ -29,8 +30,10 @@ import base64
 import binascii
 import functools
 import tempfile
+import threading
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -105,6 +108,8 @@ class Memory:
             settings = settings.model_copy(update={"consolidation": consolidation})
         self.settings = settings
         self.system = MemorySystem.from_settings(settings, http_client=http_client)
+        self._runs: set[tuple[str, str]] = set()  # open_run 开始、还没结束的（空间，run_id）
+        self._runs_lock = threading.Lock()
         if background:
             self.system.start_worker()
 
@@ -120,6 +125,8 @@ class Memory:
         memory = cls.__new__(cls)
         memory.settings = system.settings
         memory.system = system
+        memory._runs = set()
+        memory._runs_lock = threading.Lock()
         return memory
 
     # ---------- 写入 ----------
@@ -138,11 +145,19 @@ class Memory:
         """写入对话。messages 可以是一句话、一条消息或 OpenAI 格式的消息列表（内容块里的
         image_url 可以是 data URL 或本地路径，图片会存进记忆）；system / tool 消息不写入。
 
-        run_id：写进同一个会话（一次对话），不填时这次 add 自成一个会话。
+        run_id：写进同一个会话（一次对话），不填时这次 add 自成一个会话。每轮 add 一次同一个
+        run_id 时，每次都把整段对话重新抽取一遍（巩固过的会话又长了还要重放派生记忆）：一段
+        对话分多次写入时用 run()（或 open_run / end_run）包起来，结束时只抽取一次。
         infer=False：只写原始日志、不抽取事实（之后调用 consolidate）。
-        wait=True：同步抽取，返回新增与取代的事实（Mem0 的 ADD / UPDATE 事件）。
+        wait=True：同步抽取，返回新增与取代的事实（Mem0 的 ADD / UPDATE 事件）；run 进行中时
+        不能用（这段对话结束时才抽取），会报 ValueError。
         """
         space = space_for(user_id, agent_id)
+        if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
+            raise ValueError(
+                f"Run {run_id!r} is still open: its memories are extracted when it ends. "
+                "Add without wait=True, then call end_run(..., wait=True)."
+            )
         when = _as_datetime(timestamp) or datetime.now().replace(microsecond=0)
         turns, temporary = parse_messages(messages, when)
         try:
@@ -174,6 +189,60 @@ class Memory:
         else:
             out["status"] = "queued"
         return out
+
+    def open_run(
+        self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
+    ) -> str:
+        """开始一段对话（run）：之后 add(run_id=...) 照常在线写入、立即可检索，但不抽取事实，
+        end_run 时整段只抽取一次。返回 run_id（不给时生成一个）。"""
+        space = space_for(user_id, agent_id)
+        rid = run_id or f"run-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+        self.system.open_session(space, rid)
+        with self._runs_lock:
+            self._runs.add((space, rid))
+        return rid
+
+    def end_run(
+        self,
+        run_id: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        """结束一段对话：整段交给抽取。wait=True 时同步抽取并返回报告；否则交给后台线程
+        （没开后台线程时只登记，下次 consolidate 时完成），consolidation 是 "queued"。"""
+        space = space_for(user_id, agent_id)
+        with self._runs_lock:
+            self._runs.discard((space, run_id))
+        turns = len(self.system.db.get_turns(space, run_id))
+        if not turns:  # 什么都没写：只结束，不抽取
+            self.system.close_session(space, run_id, submit=False)
+            return {"session_id": run_id, "turns": 0, "consolidation": None}
+        background = self.system.worker is not None
+        report = self.system.close_session(space, run_id, wait=wait, submit=background)
+        return {
+            "session_id": run_id,
+            "turns": turns,
+            "consolidation": report.as_dict() if report is not None else "queued",
+        }
+
+    @contextmanager
+    def run(
+        self,
+        run_id: str | None = None,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        wait: bool = False,
+    ) -> Iterator[str]:
+        """with m.run(user_id="alice") as run_id: ...：进入时 open_run，退出时 end_run（出错时
+        也结束）。wait=True 时退出前同步抽取。"""
+        rid = self.open_run(run_id, user_id=user_id, agent_id=agent_id)
+        try:
+            yield rid
+        finally:
+            self.end_run(rid, user_id=user_id, agent_id=agent_id, wait=wait)
 
     def consolidate(
         self, *, user_id: str | None = None, agent_id: str | None = None, rebuild: bool = False
@@ -350,6 +419,13 @@ class Memory:
         return self.system.db.list_spaces()
 
     def close(self) -> None:
+        """关闭。还没结束的 run 先结束：只登记抽取任务（存在数据库里），下次巩固或后台线程
+        启动时完成。"""
+        with self._runs_lock:
+            runs = sorted(self._runs)
+            self._runs.clear()
+        for space, rid in runs:
+            self.system.close_session(space, rid, submit=False)
         self.system.close()
 
     def __enter__(self) -> Memory:
@@ -393,6 +469,25 @@ class AsyncMemory:
         if not callable(method) or name.startswith("_"):
             return method
         return _threaded(method)
+
+    @asynccontextmanager
+    async def run(
+        self,
+        run_id: str | None = None,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        wait: bool = False,
+    ) -> AsyncIterator[str]:
+        """async with m.run(user_id="alice") as run_id: ...（见 Memory.run）。"""
+        sync = self.sync
+        rid = await asyncio.to_thread(sync.open_run, run_id, user_id=user_id, agent_id=agent_id)
+        try:
+            yield rid
+        finally:
+            await asyncio.to_thread(
+                sync.end_run, rid, user_id=user_id, agent_id=agent_id, wait=wait
+            )
 
     async def __aenter__(self) -> AsyncMemory:
         return self

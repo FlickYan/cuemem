@@ -10,7 +10,13 @@ from typing import Any
 
 import pytest
 from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
-from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
+from scripted import (
+    TOY_EXTRACTIONS,
+    TOY_UPDATE_KEYWORDS,
+    ScriptedModel,
+    growing_extraction,
+    reconcile_by_keyword,
+)
 from test_sdk import where_i_live
 
 from cuemem import Memory
@@ -110,7 +116,7 @@ def test_consolidation_is_idempotent_and_replayable(
     assert again.sessions == 0
     assert len(fake_api.chat_requests) == requests
 
-    system.ingest(toy())  # 重复导入同一份对话不会登记新任务
+    system.ingest(toy())  # 重复导入同一份对话不会登记新任务，也不会重放（会话没长）
     assert system.consolidate("demo").sessions == 0
 
     rebuilt = system.consolidate("demo", rebuild=True)  # 清空派生记忆后从原始日志重放
@@ -368,3 +374,62 @@ def test_config_change_triggers_rebuild(
         assert memory.consolidator.stale("demo")
         report = memory.consolidate("demo")  # 自动重建：5 个会话全部重放（命中缓存）
         assert report.sessions == 5 and not memory.consolidator.stale("demo")
+
+
+HIKING = [{"role": "user", "content": "I like hiking"}, {"role": "assistant", "content": "Nice!"}]
+ALPS = [
+    {"role": "user", "content": "Mostly in the Alps"},
+    {"role": "assistant", "content": "Cool."},
+]
+
+
+def statements(memory: Memory, space: str = "u") -> list[str]:
+    return sorted(f.statement for f in memory.system.facts(space))
+
+
+def test_a_session_that_grows_is_replayed_from_the_log(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """巩固过的会话又追加了发言（SDK 每轮 add 同一个 run_id）：整段重新抽取之后，之前那次抽取的
+    说法（"The user likes hiking."）不再留着，派生记忆与从原始日志重建的一样。重放只重新抽取
+    长了的会话，其余会话命中缓存。"""
+    model = ScriptedModel(growing_extraction)
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        add = memory.add
+        add("I live in Berlin", user_id="u", run_id="before", timestamp=datetime(2026, 7, 1))
+        add(HIKING, user_id="u", run_id="chat", timestamp=datetime(2026, 8, 1), wait=True)
+        add("I like jazz", user_id="u", run_id="after", timestamp=datetime(2026, 9, 1), wait=True)
+        assert "The user likes hiking." in statements(memory)
+        requests = len(fake_api.chat_requests)
+
+        add(ALPS, user_id="u", run_id="chat", timestamp=datetime(2026, 8, 1, 0, 5), wait=True)
+        assert len(fake_api.chat_requests) == requests + 1  # 只有长了的会话重新抽取
+        assert "Mostly in the Alps" in model.prompts["extract"][-1]
+        grown = statements(memory)
+        assert grown == [
+            "The user enjoys hiking in the Alps.",
+            "The user said: I like jazz",
+            "The user said: I live in Berlin",
+            "The user said: Mostly in the Alps",
+        ]
+        assert [j["status"] for j in memory.system.db.get_jobs("u")] == ["done"] * 3
+        traces = memory.system.settings.paths.traces.glob("*.jsonl")
+        assert any("consolidate_regrown_replay" in p.read_text("utf-8") for p in traces)
+
+        memory.consolidate(user_id="u", rebuild=True)
+        assert statements(memory) == grown
+
+
+def test_a_grown_session_is_not_replayed_without_a_writable_cache(
+    n3_settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """LLM 缓存不可写时重放会把所有会话重新抽取一遍：照旧增量巩固，并给出警告。"""
+    fake_api.chat_replies = [ScriptedModel(growing_extraction)]
+    settings = n3_settings.model_copy(update={"llm_cache_mode": "off"})
+    with Memory(settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add(HIKING, user_id="u", run_id="chat", wait=True)
+        with caplog.at_level(logging.WARNING, logger="cuemem.write.consolidate"):
+            memory.add(ALPS, user_id="u", run_id="chat", wait=True)
+        assert "不从原始日志重放" in caplog.text
+        assert "The user likes hiking." in statements(memory)

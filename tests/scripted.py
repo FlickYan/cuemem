@@ -208,6 +208,22 @@ def echo_extraction(prompt: str) -> Reply:
     return {"summary": first, "facts": facts, "entities": []}
 
 
+def growing_extraction(prompt: str) -> Reply:
+    """抽取替身：会话越长说得越具体（真实的抽取模型常这样换说法）。"I like hiking" 在两句的会话
+    里抽成 "The user likes hiking."，会话长了抽成 "The user enjoys hiking in the Alps."；
+    其余用户发言记成 "The user said: ..."。"""
+    hiking = (
+        "The user enjoys hiking in the Alps."
+        if len(re.findall(r"\[t\d+\]", prompt)) > 2
+        else "The user likes hiking."
+    )
+    facts = []
+    for n, text in re.findall(r"\[t(\d+)\] User: (.*)", prompt):
+        statement = hiking if "hiking" in text else f"The user said: {text}"
+        facts.append(_fact(statement, "said", statement[:40], turns=[int(n)], cardinality="multi"))
+    return {"summary": "", "facts": facts, "entities": []}
+
+
 class ScriptedModel:
     def __init__(
         self,

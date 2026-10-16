@@ -304,6 +304,59 @@ def test_delete_leaves_no_vectors_or_traces_of_the_fact(
         assert not any("October 3" in p.read_text("utf-8") for p in traces.glob("*.jsonl"))
 
 
+def test_a_run_is_extracted_once_when_it_ends(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """一段对话每轮 add 一次：放在 run() 里，结束时整段只抽取一次（原始日志照样立即可检索）；
+    进行中不能 add(wait=True)。不放在 run 里的 add 照旧每次都抽取。"""
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        likes = ["jazz", "tea", "rain", "chess", "sushi", "Paris", "running", "cats"]
+        with memory.run(user_id="alice") as rid:
+            for like in likes:
+                turn = [
+                    {"role": "user", "content": f"I like {like}"},
+                    {"role": "assistant", "content": "Nice."},
+                ]
+                assert memory.add(turn, user_id="alice", run_id=rid)["status"] == "queued"
+            memory.wait()
+            assert model.calls["extract"] == 0 and memory.get_all(user_id="alice")["results"] == []
+            hits = memory.search("chess", user_id="alice", mode="l1")["results"]
+            assert any("chess" in h["memory"] for h in hits)
+            with pytest.raises(ValueError, match="still open"):
+                memory.add("I live in Berlin", user_id="alice", run_id=rid, wait=True)
+        memory.wait()
+        assert model.calls["extract"] == 1
+        assert model.prompts["extract"][0].count("User: I like") == 8
+        assert len(memory.get_all(user_id="alice")["results"]) == 8
+
+        for text in ("I like tea", "I like rain"):
+            memory.add(text, user_id="bob", run_id="chat")
+            memory.wait()
+        assert model.calls["extract"] == 3
+        assert "I like tea" in model.prompts["extract"][-1]
+        assert "I like rain" in model.prompts["extract"][-1]
+
+
+def test_close_ends_open_runs(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """close() 结束还没结束的 run：登记抽取任务，下次启动后台线程时完成。"""
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        assert memory.open_run("chat-1", user_id="alice") == "chat-1"
+        memory.add("I live in Berlin", user_id="alice", run_id="chat-1")
+        assert memory.system.db.get_jobs("alice") == []
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        memory.wait()
+        assert [f["memory"] for f in memory.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
+        assert memory.system.adopt_open("alice") == 0  # 正常结束：没有留下进行中的标记
+        ended = memory.end_run("chat-1", user_id="alice", wait=True)
+        assert ended["turns"] == 1 and ended["consolidation"]["sessions"] == 0
+
+
 def test_background_extraction(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:
@@ -345,3 +398,17 @@ def test_async_memory(n3_settings: Settings, fake_api: FakeAPI, model: ScriptedM
             return [f["memory"] for f in found["results"]]
 
     assert asyncio.run(run()) == ["The user lives in Berlin."]
+
+
+def test_async_run(n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel) -> None:
+    fake_api.chat_replies = [model]
+
+    async def run() -> tuple[list[Any], list[str]]:
+        async with AsyncMemory(n3_settings, http_client=fake_api.client(), background=False) as m:
+            async with m.run(user_id="alice", wait=True) as rid:
+                await m.add("I live in Berlin", user_id="alice", run_id=rid)
+                during = (await m.get_all(user_id="alice"))["results"]
+            found = await m.get_all(user_id="alice")
+            return during, [f["memory"] for f in found["results"]]
+
+    assert asyncio.run(run()) == ([], ["The user lives in Berlin."])

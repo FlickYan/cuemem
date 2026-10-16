@@ -32,7 +32,7 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from PIL import Image
 from pydantic import BaseModel, Field
-from scripted import ScriptedModel
+from scripted import ScriptedModel, growing_extraction
 from test_sdk import moved, where_i_live
 
 import cuemem.integrations.langgraph as lg
@@ -645,6 +645,25 @@ def test_a_thread_can_go_on_after_it_ended(memory: Memory, fake_api: FakeAPI) ->
         "The user lives in Berlin.",
         "The user lives in Munich.",
     ]
+
+
+def test_a_resumed_thread_ends_like_a_replay(memory: Memory, fake_api: FakeAPI) -> None:
+    """线程结束之后又接着聊：再次结束时整段重新抽取，之前那次抽取的说法不再留着，事实与从原始
+    日志重建的一样（D-045）。"""
+    fake_api.chat_replies = [ScriptedModel(growing_extraction)]
+    model = Recorder(responses=[AIMessage("Nice!"), AIMessage("Cool.")])
+    cuemem = CueMemMiddleware(memory, user_id="alice", mode="l1")
+    agent = create_agent(model, middleware=[cuemem], checkpointer=InMemorySaver())
+    config = thread("t1")
+    agent.invoke(ask("I like hiking"), config)
+    cuemem.end_thread(config, wait=True)
+    assert facts(memory) == ["The user likes hiking."]
+    agent.invoke(ask("Mostly in the Alps"), config)
+    cuemem.end_thread(config, wait=True)
+    grown = sorted(facts(memory))
+    assert grown == ["The user enjoys hiking in the Alps.", "The user said: Mostly in the Alps"]
+    memory.consolidate(user_id="alice", rebuild=True)
+    assert sorted(facts(memory)) == grown
 
 
 def test_async_memory_and_async_ending(lives_in_berlin: Memory) -> None:

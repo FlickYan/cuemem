@@ -245,7 +245,9 @@ class MemorySystem:
         self.writer = OnlineWriter(
             db, vectors, embedder, media=media, image_embedder=image_embedder
         )
-        self.consolidator = Consolidator(db, vectors, embedder, llm, settings.consolidation)
+        self.consolidator = Consolidator(
+            db, vectors, embedder, llm, settings.consolidation, open_sessions=self.open_sessions
+        )
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
         self.l1 = L1Retriever(db, vectors, embedder, image_embedder=image_embedder)
@@ -405,16 +407,18 @@ class MemorySystem:
                 self.db.set_meta(_open_mark(space_id, session_id), datetime.now().isoformat())
 
     def close_session(
-        self, space_id: str, session_id: str, *, wait: bool = False
+        self, space_id: str, session_id: str, *, wait: bool = False, submit: bool = True
     ) -> ConsolidationReport | None:
-        """会话结束：登记巩固任务；wait=True 时同步巩固并返回报告，否则交给后台线程。"""
+        """会话结束：登记巩固任务；wait=True 时同步巩固并返回报告，否则交给后台线程
+        （submit=False 时只登记，下次巩固或后台线程启动时完成）。"""
         with self._open_lock:
             self._open.discard((space_id, session_id))
             self.db.delete_meta(_open_mark(space_id, session_id))
         self.consolidator.enqueue(space_id, [session_id])
         if wait:
             return self.consolidate(space_id)
-        self.start_worker().submit(space_id)
+        if submit:
+            self.start_worker().submit(space_id)
         return None
 
     def open_sessions(self, space_id: str) -> set[str]:

@@ -12,7 +12,8 @@
   会话内容或抽取逻辑变了，任务键随之改变。
 - 每个会话的结果在一个数据库事务里写入并把任务标记为完成；中途失败时任务保持待处理，
   重跑即可，已完成的会话不会重复处理。
-- 派生数据都可以从原始日志重建：清空后全部任务重放一遍（LLM 与向量都命中缓存）。
+- 派生数据都可以从原始日志重建：清空后全部任务重放一遍（LLM 与向量都命中缓存）。巩固过的会话
+  又追加了发言时也这样重放，派生记忆始终是原始日志的函数（D-021，见 Consolidator.run）。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import queue
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -116,11 +117,14 @@ class Consolidator:
         config: ConsolidationConfig,
         *,
         extractor_model: str | None = None,
+        open_sessions: Callable[[str], Collection[str]] | None = None,
     ) -> None:
         self.db = db
         self.vectors = vectors
         self.embedder = embedder
         self.config = config
+        # 进行中的会话（MemorySystem.open_sessions）：重放时跳过，结束后再整体登记
+        self.open_sessions: Callable[[str], Collection[str]] = open_sessions or (lambda _: ())
         self.extractor = Extractor(
             llm,
             model=extractor_model,
@@ -163,7 +167,8 @@ class Consolidator:
         """为会话登记巩固任务（幂等），返回新登记的任务数。
 
         skip：暂不巩固的会话（Agent 正在进行的会话，结束后再登记）。同一会话的内容变了
-        （又追加了发言）时，新任务取代还没执行的旧任务（见 MemoryDB.enqueue_job）。
+        （又追加了发言）时，新任务取代还没执行的旧任务（见 MemoryDB.enqueue_job）；这个会话
+        已经巩固过时，执行前先从原始日志重放（见 run）。
         """
         sessions = self.db.get_sessions(space_id)
         added = 0
@@ -240,9 +245,37 @@ class Consolidator:
     # ---------- 执行 ----------
 
     def run(self, space_id: str) -> ConsolidationReport:
-        """执行该空间所有待处理的任务。同一空间同一时间只有一个巩固在跑。"""
+        """执行该空间所有待处理的任务。同一空间同一时间只有一个巩固在跑。
+
+        巩固过的会话又追加了发言时，先清空派生记忆、从原始日志重放（见 _replay_regrown）。"""
         with self._lock_for(space_id):
+            self._replay_regrown(space_id)
             return self._run(space_id, scope(space_id, "consolidate"))
+
+    def _replay_regrown(self, space_id: str) -> None:
+        """会话巩固过之后又长了（SDK 每轮 add 同一个 run_id、线程结束后又接着聊、代理复用指定的
+        会话）：新任务把整个会话重新抽取一遍，增量巩固却只增不减，之前那次抽取的事实还留着（换了
+        说法的复述成了另一条事实）。派生记忆就不再是原始日志的函数，之后的遗忘、导入会改动无关的
+        事实。所以先清空派生记忆、为全部会话重新登记（进行中的除外），不清 LLM 缓存：其余会话的
+        抽取与时间在它之前的对账都命中缓存，只有长了的会话要重新抽取，时间在它之后的会话的对账
+        可能要再问模型；本地的重放与空间大小成正比（D-045）。
+
+        LLM 缓存关闭或只读（llm_cache_mode 不是 read_write）时不重放：关闭时要把所有会话重新抽取
+        一遍，只读时重放的结果进不了缓存。照旧增量巩固，记一条警告。"""
+        regrown = self.db.regrown_sessions(space_id, PIPELINE_VERSION)
+        if not regrown:
+            return
+        llm = self.extractor.llm
+        if llm.cache is None or llm.settings.llm_cache_mode != "read_write":
+            logger.warning(
+                "%s 的会话 %s 巩固过之后又追加了发言，LLM 缓存不可写，不从原始日志重放："
+                "之前那次抽取的事实还留着",
+                space_id,
+                sorted(regrown),
+            )
+            return
+        record_event("consolidate_regrown_replay", sessions=sorted(regrown))
+        self.rebuild(space_id, skip=self.open_sessions(space_id))
 
     def _run(self, space_id: str, cache_scope: str) -> ConsolidationReport:
         started = time.perf_counter()

@@ -832,6 +832,19 @@ class MemoryDB:
             )
             return max(cursor.rowcount, 0)
 
+    def regrown_sessions(self, space_id: str, version: str) -> set[str]:
+        """巩固过之后又长了的会话：有待处理的任务，同一版本又有内容指纹不同的已完成任务。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT p.session_id FROM jobs p JOIN jobs d"
+                " ON d.space_id = p.space_id AND d.session_id = p.session_id"
+                " AND d.version = p.version"
+                " WHERE p.space_id = ? AND p.version = ? AND p.status = 'pending'"
+                " AND d.status = 'done' AND d.content_hash != p.content_hash",
+                (space_id, version),
+            ).fetchall()
+        return {r[0] for r in rows}
+
     def spaces_with_work(self, version: str, max_attempts: int) -> list[str]:
         """有待处理的任务、或失败次数还没到上限的任务的空间（后台线程启动时接着做）。"""
         with self._lock:
