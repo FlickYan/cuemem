@@ -44,6 +44,7 @@ import httpx2
 from cuemem.config import Settings, load_settings
 from cuemem.core.ids import stable_id
 from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
+from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConcurrentWriteError
 from cuemem.memory import ForgetReport, MemorySystem, Recall
 from cuemem.portable import export_space, import_space
@@ -605,10 +606,14 @@ def _scope(
 
 
 def _as_datetime(value: datetime | str | float | None) -> datetime | None:
-    if value is None or isinstance(value, datetime):
-        return value
+    """timestamp 参数 → 本机时间（不带时区）。带时区的（'...Z'）先换算：生成的会话 ID 里的
+    时间与存下来的开始时间一致。数字是 Unix 时间戳。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return naive_local(value)
     if isinstance(value, str):
-        return datetime.fromisoformat(value)
+        return naive_local(datetime.fromisoformat(value))
     return datetime.fromtimestamp(value)
 
 

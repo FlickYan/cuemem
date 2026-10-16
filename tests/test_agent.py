@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +119,22 @@ def test_session_end_consolidates(system: MemorySystem, model: ScriptedModel) ->
     assert any("新加坡" in f.statement for f in facts)
     with pytest.raises(ValueError, match="已经结束"):
         agent.chat(session, "还在吗？")
+
+
+def test_aware_and_naive_times_in_one_session(system: MemorySystem, model: ScriptedModel) -> None:
+    """HTTP 接口传来的 at 可能带时区（'Z'）：换算成本机时间。以前带时区开始的会话再用不带时区的
+    时间聊（或者反过来），比较"时间不倒流"时就报 TypeError。"""
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY.astimezone(UTC))
+    assert session.started_at == DAY and session.started_at.tzinfo is None
+    agent.chat(session, "你好", at=DAY + timedelta(minutes=1))
+    later = (DAY + timedelta(minutes=2)).astimezone(UTC)
+    reply = agent.chat(session, "我下个月要去新加坡出差。", at=later)
+    assert reply.at == DAY + timedelta(minutes=2)
+    turns = system.db.get_turns("demo", session.session_id)
+    assert all(t.ts.tzinfo is None for t in turns) and len(turns) == 4
+    report = agent.end(session, wait=True)
+    assert report is not None and report.sessions == 1
 
 
 def test_memory_search_escape_hatch(system: MemorySystem, model: ScriptedModel) -> None:

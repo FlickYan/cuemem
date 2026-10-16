@@ -41,6 +41,7 @@ from cuemem.agent.context import (
 from cuemem.agent.tools import Tool, ToolContext, ToolResult, memory_tools
 from cuemem.core.ids import stable_id
 from cuemem.core.models import SessionIn, TurnIn
+from cuemem.core.timeutil import naive_local
 from cuemem.core.trace import Trace, span, start_trace
 from cuemem.llm.client import Message
 from cuemem.memory import MemorySystem, Recall, RecallMode
@@ -187,8 +188,9 @@ class Agent:
     def start(
         self, space_id: str, *, at: datetime | None = None, session_id: str | None = None
     ) -> ChatSession:
-        """开始一个会话：标记为进行中（暂不巩固），取一次核心记忆快照。"""
-        started = (at or datetime.now()).replace(microsecond=0)
+        """开始一个会话：标记为进行中（暂不巩固），取一次核心记忆快照。
+        at（模拟的开始时间）带时区时换算成本机时间。"""
+        started = (naive_local(at) if at is not None else datetime.now()).replace(microsecond=0)
         sid = session_id or f"chat-{started:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
         self.system.open_session(space_id, sid)
         return ChatSession(
@@ -272,7 +274,7 @@ class Agent:
         lam: float | None,
     ) -> Reply:
         space = session.space_id
-        when = at or session.now()
+        when = naive_local(at) if at is not None else session.now()
         if session.last_at is not None and when < session.last_at:
             when = session.last_at  # 时间不倒流
         # 回答缓存按会话归属（N11）：遗忘只清受影响会话的缓存。整个空间共用一个归属时，删一条事实

@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any
 
 from cuemem.core.models import Fact
+from cuemem.core.timeutil import naive_local
 from cuemem.memory import MemorySystem, Recall, RecallMode
 from cuemem.read.controller import Router, english_reason
 from cuemem.read.reader import memory_blocks
@@ -56,7 +57,7 @@ def recall_evidence(
     exclude: Collection[str] = (),
 ) -> Evidence:
     """控制器选档、取回记忆、排成证据块。exclude：已经原样在上下文里的轮与图片的 ID。"""
-    now = at or datetime.now()
+    now = naive_local(at) if at is not None else datetime.now()  # 证据块里的"几天前"也按本机时间
     recall = system.retrieve(
         space, query, question_time=now, mode=mode, router=router, lam=lam, exclude=exclude
     )

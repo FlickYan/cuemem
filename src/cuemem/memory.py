@@ -29,6 +29,7 @@ from cuemem.core.models import (
     SessionIn,
     Turn,
 )
+from cuemem.core.timeutil import naive_local
 from cuemem.core.trace import TraceSink, start_trace
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
@@ -945,8 +946,9 @@ class MemorySystem:
         - mode="naive"：B2 基线，只在"轮"上做 dense 检索。
         notes：reader 先记笔记再回答（并按检索计划给阅读提示）；默认 L2 开、L1 关。
         还没巩固过的空间，l1 与 facts 模式也能用（只是没有事实可用）。
+        question_time 带时区时换算成本机时间（与存下来的时间一致，见 core/timeutil.py）。
         """
-        when = question_time or datetime.now()
+        when = naive_local(question_time) if question_time is not None else datetime.now()
         cache_scope = scope(space_id, "ask")
         with start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace:
             recall: Recall | None = None
@@ -1077,7 +1079,7 @@ class MemorySystem:
         ask() 与 Agent（N8）共用这一步。exclude 是已经在上下文里的轮与图片的 ID
         （Agent 的工作记忆），不参与探针与检索。
         """
-        when = question_time or datetime.now()
+        when = naive_local(question_time) if question_time is not None else datetime.now()
         cache_scope = cache_scope or scope(space_id, "ask")
         level: str = mode
         decision: RouteDecision | None = None
@@ -1182,6 +1184,8 @@ class MemorySystem:
         valid_at: str | None = None,
         known_at: datetime | None = None,
     ) -> list[Fact]:
+        if known_at is not None:  # 数据库里按字符串比较：带时区的先换算成本机时间
+            known_at = naive_local(known_at)
         return self.db.get_facts(
             space_id, current_only=current_only, valid_at=valid_at, known_at=known_at
         )

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
+from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConfigMismatchError
 
 logger = logging.getLogger(__name__)
@@ -270,7 +271,7 @@ class MemoryDB:
             rows = self._conn.execute(
                 "SELECT id, started_at FROM sessions WHERE space_id = ?", (space_id,)
             ).fetchall()
-        return {r[0]: datetime.fromisoformat(r[1]) for r in rows}
+        return {r[0]: _dt(r[1]) for r in rows}
 
     def speakers(self, space_id: str) -> list[str]:
         """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。"""
@@ -693,8 +694,8 @@ class MemoryDB:
                 id=r[0],
                 space_id=r[1],
                 session_id=r[2],
-                start_ts=datetime.fromisoformat(r[3]),
-                end_ts=datetime.fromisoformat(r[4]),
+                start_ts=_dt(r[3]),
+                end_ts=_dt(r[4]),
                 summary=r[5],
                 turn_ids=json.loads(r[6]),
             )
@@ -726,7 +727,7 @@ class MemoryDB:
             space_id=row[0],
             text=row[1],
             fact_ids=json.loads(row[2]),
-            updated_at=datetime.fromisoformat(row[3]),
+            updated_at=_dt(row[3]),
         )
 
     def clear_derived(self, space_id: str) -> list[str]:
@@ -932,6 +933,12 @@ def _insert_units(conn: sqlite3.Connection, units: Sequence[MemoryUnit], *, repl
     return max(cursor.rowcount, 0)
 
 
+def _dt(value: str) -> datetime:
+    """读出的时间一律是本机时间、不带时区。写入时已经换算（见 core/models.py），这里照顾之前
+    用带时区的时间写进去的行（'...+00:00'）：否则与新写入的行混在一起无法比较。"""
+    return naive_local(datetime.fromisoformat(value))
+
+
 def _row_to_turn(r: Sequence[Any]) -> Turn:
     return Turn(
         id=r[0],
@@ -940,7 +947,7 @@ def _row_to_turn(r: Sequence[Any]) -> Turn:
         idx=r[3],
         role=r[4],
         text=r[5],
-        ts=datetime.fromisoformat(r[6]),
+        ts=_dt(r[6]),
         media_ids=json.loads(r[7]),
         speaker=r[8],
     )
@@ -953,7 +960,7 @@ def _row_to_unit(row: Sequence[Any]) -> MemoryUnit:
         kind=row[2],
         session_id=row[3],
         text=row[4],
-        ts=datetime.fromisoformat(row[5]),
+        ts=_dt(row[5]),
         source_turn_ids=json.loads(row[6]),
         meta=json.loads(row[7]),
     )
@@ -998,8 +1005,8 @@ def _row_to_fact(r: Sequence[Any]) -> Fact:
         negated=bool(r[9]),
         valid_from=r[10],
         valid_to=r[11],
-        recorded_at=datetime.fromisoformat(r[12]),
-        invalidated_at=datetime.fromisoformat(r[13]) if r[13] else None,
+        recorded_at=_dt(r[12]),
+        invalidated_at=_dt(r[13]) if r[13] else None,
         superseded_by=r[14],
         supersede_reason=r[15],
         importance=r[16],
@@ -1031,8 +1038,8 @@ def _row_to_entity(r: Sequence[Any]) -> Entity:
         type=r[3],
         aliases=json.loads(r[4]),
         description=r[5],
-        first_seen=datetime.fromisoformat(r[6]),
-        last_seen=datetime.fromisoformat(r[7]),
+        first_seen=_dt(r[6]),
+        last_seen=_dt(r[7]),
         mentions=r[8],
     )
 
@@ -1048,7 +1055,7 @@ def _row_to_media(r: Sequence[Any]) -> MediaItem:
         tags=json.loads(r[6]),
         entity_ids=json.loads(r[7]),
         source_turn_id=r[8],
-        ts=datetime.fromisoformat(r[9]),
+        ts=_dt(r[9]),
         caption_iso=r[10],
         width=r[11],
         height=r[12],

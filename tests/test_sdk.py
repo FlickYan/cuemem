@@ -9,7 +9,7 @@ import re
 import tempfile
 import threading
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -308,6 +308,45 @@ def test_add_raises_when_a_turn_was_not_written(
     with pytest.raises(ConcurrentWriteError, match="chat"):
         memory.add("I like jazz", user_id="alice", run_id="chat", infer=False)
     assert [t.text for t in memory.system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
+
+
+def _utc_z(local: datetime) -> str:
+    """本机时间 → 同一时刻的 UTC ISO 字符串，带 'Z'（JS 客户端与 pydantic 的常见写法）。"""
+    return f"{local.astimezone(UTC):%Y-%m-%dT%H:%M:%S}Z"
+
+
+def test_aware_and_naive_timestamps_mix(memory: Memory) -> None:
+    """带时区的时间换算成本机时间。以前带时区与不带时区的发言混在一个空间里，巩固报 TypeError、
+    任务一直卡在待处理，带时间的检索也报 TypeError。"""
+    memory.add("I live in Berlin", user_id="alice", timestamp=_utc_z(AUG), wait=True)
+    assert [t.ts for t in memory.system.db.get_turns("alice")] == [AUG]
+    assert memory.search("What did I do last week?", user_id="alice", mode="l1")["level"] == "L1"
+    memory.add("I moved to Munich", user_id="alice", timestamp=SEP, wait=True)
+    assert [j["status"] for j in memory.system.db.get_jobs("alice")] == ["done", "done"]
+    assert [f["object"] for f in memory.get_all(user_id="alice")["results"]] == ["Munich"]
+
+    later = (SEP + timedelta(days=3)).astimezone(timezone(timedelta(hours=-12)))
+    found = memory.search("Where did I live last month?", user_id="alice", mode="l1", at=later)
+    assert any("Berlin" in r["memory"] for r in found["results"])
+    assert memory.answer("Where do I live?", user_id="alice", mode="l1", at=later)["answer"]
+    # 那一刻系统相信什么：同一时刻换个时区表示，结果相同
+    known = (SEP + timedelta(hours=1)).astimezone(timezone(timedelta(hours=-12)))
+    believed = memory.get_all(user_id="alice", known_at=known)["results"]
+    assert [f["object"] for f in believed] == ["Munich"]
+
+
+def test_aware_timestamp_does_not_stall_background_extraction(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        memory.add("I live in Berlin", user_id="alice", timestamp=AUG)
+        memory.wait()
+        memory.add("I moved to Munich", user_id="alice", timestamp=_utc_z(SEP))
+        memory.wait()
+        assert memory.system.worker is not None and list(memory.system.worker.errors) == []
+        assert [j["status"] for j in memory.system.db.get_jobs("alice")] == ["done", "done"]
+        assert [f["object"] for f in memory.get_all(user_id="alice")["results"]] == ["Munich"]
 
 
 def test_delete_restores_the_older_version_and_delete_all_wipes(memory: Memory) -> None:

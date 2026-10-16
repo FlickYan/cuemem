@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import pytest
 from fakes import TOY_CONVERSATION
 
-from cuemem.core.models import Conversation
+from cuemem.core.models import Conversation, SessionIn, Turn, TurnIn
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
 from cuemem.errors import ConfigMismatchError, StorageLockedError
@@ -57,6 +58,32 @@ def test_scrub_leaves_no_deleted_text_without_vacuum(tmp_path: Path) -> None:
     raw = on_disk()
     assert b"ZQX" not in raw
     assert turns[1].text.encode() in raw  # 对照：没删的发言还在
+    db.close()
+
+
+def test_aware_times_are_stored_and_read_as_local_time(tmp_path: Path) -> None:
+    """带时区的时间在入口换算成本机时间、去掉时区，不带时区的原样保留（评测数据都不带时区）。
+    之前用带时区的时间写进去的行（'+00:00'），读出来也换算：否则与新写入的行混在一起无法比较。"""
+    naive = datetime(2026, 8, 1, 10, 0)
+    aware = naive.astimezone(UTC)  # 同一时刻，UTC 表示
+    plain = SessionIn(session_id="s", started_at=naive, turns=[TurnIn(role="user", text="hi")])
+    assert plain.started_at is naive
+    assert TurnIn(role="user", text="hi", ts=naive).ts is naive
+    converted = SessionIn(
+        session_id="s", started_at=aware, turns=[TurnIn(role="user", text="hi", ts=aware)]
+    )
+    assert converted.started_at == naive and converted.started_at.tzinfo is None
+    assert converted.turns[0].ts == naive and converted.turns[0].ts.tzinfo is None
+
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    db.ensure_space("demo")
+    db.add_session("demo", "old", aware)
+    old = Turn(id="t", space_id="demo", session_id="old", idx=0, role="user", text="hi", ts=aware)
+    db.add_turns([old])
+    db.add_units(build_rounds([old]))
+    assert db.get_sessions("demo") == {"old": naive}
+    assert [(t.ts, t.ts.tzinfo) for t in db.get_turns("demo")] == [(naive, None)]
+    assert [(u.ts, u.ts.tzinfo) for u in db.list_units("demo")] == [(naive, None)]
     db.close()
 
 

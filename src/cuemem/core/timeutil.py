@@ -1,6 +1,10 @@
 """时间工具。
 
-基准数据里的时间大多不带时区，统一视为"对话时间"：无时区即按 UTC 处理。
+不带时区的时间一律是本机的墙上时间，也就是"对话时间"：基准数据里的时间不带时区，
+datetime.now() 与 datetime.fromtimestamp() 的缺省值也是本机时间。带时区的时间（ISO 字符串
+里的 'Z'、'+02:00'）在写入与查询的入口换算成本机时间、去掉时区（naive_local）：两种时间
+混在一起无法比较大小。to_epoch 把不带时区的时间按 UTC 换算，只是给向量库的载荷算一个数值，
+没有按它过滤的地方。
 事实的事件时间用"部分日期"字符串表示（YYYY / YYYY-MM / YYYY-MM-DD）：对话里常常只说
 "五月""去年"，硬补成某一天会制造虚假的精度。同一格式的 ISO 字符串可以直接按字典序比较。
 """
@@ -11,6 +15,11 @@ import re
 from datetime import UTC, datetime
 
 _PARTIAL_DATE = re.compile(r"^(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2}))?)?")
+
+
+def naive_local(dt: datetime) -> datetime:
+    """带时区的时间 → 本机的墙上时间（不带时区）；不带时区的原样返回。"""
+    return dt if dt.tzinfo is None else dt.astimezone().replace(tzinfo=None)
 
 
 def to_epoch(dt: datetime) -> float:
