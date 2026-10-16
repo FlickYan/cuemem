@@ -18,11 +18,17 @@ CueMem 的派生记忆（事实、实体、摘要、画像）是原始日志的�
 derived 只是给别的系统读的快照（带版本链的事实与画像），导入时不用它。没有导出的：回复引用了
 哪些记忆的溯源表（导入后事实 ID 会重新生成，对不上）；遗忘时沿引用扩散因此对导入的空间不起作用，
 按内容找转述（D-051）照常工作。
+
+导入的文件不可信（可能是别人发来的，HTTP 接口也收）：图片的 sha256 与 mime 不拿来拼文件名，
+临时文件按重新算出的内容哈希命名、后缀按 PIL 认出的格式取；不是图片、哈希对不上时整个导入报错，
+一条发言也不写。
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import mimetypes
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
@@ -31,11 +37,23 @@ from itertools import groupby
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from cuemem.core.models import SessionIn, Turn, TurnIn
 from cuemem.memory import MemorySystem
 
 FORMAT = "cuemem.space"
 VERSION = 1
+# PIL 认出的格式 → 临时文件的后缀（媒体库按后缀存放）；没列出的格式用 .img（同 SDK 的 data URL）
+_FORMAT_SUFFIX = {
+    "JPEG": ".jpg",
+    "MPO": ".jpg",  # 手机拍的 JPEG 常被认成 MPO
+    "PNG": ".png",
+    "WEBP": ".webp",
+    "GIF": ".gif",
+    "BMP": ".bmp",
+    "TIFF": ".tif",
+}
 
 
 def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -> dict[str, Any]:
@@ -92,6 +110,8 @@ def import_space(
     target = space_id or str(data["space_id"])
     turns_added = images_added = 0
     with tempfile.TemporaryDirectory(prefix="cuemem-import-") as scratch:
+        # 先读完、校验完整个文件再写：有一张坏图时一条发言也不写，不留下导入了一半的空间
+        chunks: list[tuple[SessionIn, int]] = []
         for session in data.get("sessions", []):
             started = datetime.fromisoformat(session["started_at"])
             # 遗忘留下的序号空缺照原样保留（重新抽取时要标出来，D-059）：按连续的序号分段写入
@@ -99,13 +119,12 @@ def import_space(
             for _, run in groupby(enumerate(ordered), key=lambda p: int(p[1]["idx"]) - p[0]):
                 chunk = [turn for _, turn in run]
                 turns = [_turn_in(t, Path(scratch)) for t in chunk]
-                report = system.append(
-                    target,
-                    SessionIn(session_id=session["session_id"], started_at=started, turns=turns),
-                    int(chunk[0]["idx"]),
-                )
-                turns_added += report.turns_added
-                images_added += report.images_added
+                piece = SessionIn(session_id=session["session_id"], started_at=started, turns=turns)
+                chunks.append((piece, int(chunk[0]["idx"])))
+        for session_in, first_idx in chunks:
+            report = system.append(target, session_in, first_idx)
+            turns_added += report.turns_added
+            images_added += report.images_added
     out: dict[str, Any] = {
         "space_id": target,
         "sessions": len(data.get("sessions", [])),
@@ -148,8 +167,20 @@ def _turn_in(turn: Mapping[str, Any], scratch: Path) -> TurnIn:
 
 
 def _image_files(images: Sequence[Mapping[str, Any]], scratch: Path) -> Iterator[Path]:
+    """导出文件里的图片 → 临时目录里的文件。文件名不用文件里的任何字段（sha256 写成 "../x" 或
+    绝对路径就能写到临时目录外面）；先认出是图片再落盘，声明的 mime 不可靠（未知后缀导出成
+    image/jpeg），后缀按 PIL 认出的格式取。"""
     for image in images:
-        suffix = mimetypes.guess_extension(image.get("mime") or "") or ".jpg"
-        path = scratch / f"{image.get('sha256') or len(list(scratch.iterdir()))}{suffix}"
-        path.write_bytes(base64.b64decode(image["data"]))
+        try:
+            data = base64.b64decode(image["data"], validate=True)
+            with Image.open(io.BytesIO(data)) as probe:
+                fmt = probe.format or ""
+                probe.verify()
+        except Exception as exc:  # 坏图时 PIL 抛的异常五花八门：OSError、SyntaxError、struct.error…
+            raise ValueError("Export contains an attachment that is not a valid image") from exc
+        sha = hashlib.sha256(data).hexdigest()
+        if image.get("sha256") and image["sha256"] != sha:
+            raise ValueError("Image sha256 does not match its data")
+        path = scratch / f"{sha}{_FORMAT_SUFFIX.get(fmt, '.img')}"
+        path.write_bytes(data)
         yield path

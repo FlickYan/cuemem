@@ -418,6 +418,19 @@ def test_http_api_token(service: ChatService, tmp_path: Path) -> None:
     assert forget.status_code == 401  # 删除记忆同样要令牌
 
 
+def test_http_import_rejects_bad_attachments(service: ChatService, tmp_path: Path) -> None:
+    """导入的附件不是图片、或 sha256 是一条路径：409（不是 500），什么都不写。"""
+    client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=False))
+    image = {"sha256": str(tmp_path / "planted"), "mime": "text/x-python", "data": "cHJpbnQoMSk="}
+    turn = {"idx": 0, "role": "user", "text": "<image>", "ts": None, "images": [image]}
+    session = {"session_id": "s1", "started_at": "2026-08-28T19:30:00", "turns": [turn]}
+    data = {"format": "cuemem.space", "version": 1, "space_id": "x", "sessions": [session]}
+    response = client.post("/api/spaces/import", json=data)
+    assert response.status_code == 409 and "not a valid image" in response.json()["detail"]
+    assert list(tmp_path.glob("planted*")) == []
+    assert service.system.db.list_spaces() == []
+
+
 # ---------- MCP ----------
 
 

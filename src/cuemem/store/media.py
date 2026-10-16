@@ -35,6 +35,8 @@ class MediaStore:
     def put(self, source: Path) -> StoredImage:
         """把图片存进媒体库（已存在则跳过），返回内容哈希、存放路径与尺寸。"""
         data = source.read_bytes()
+        with Image.open(io.BytesIO(data)) as image:  # 先认图：不是图片的文件不进媒体库
+            width, height = image.size
         sha = hashlib.sha256(data).hexdigest()
         suffix = source.suffix.lower() or ".jpg"
         target = self.root / sha[:2] / f"{sha}{suffix}"
@@ -43,8 +45,6 @@ class MediaStore:
             partial = target.with_suffix(target.suffix + ".part")
             shutil.copyfile(source, partial)
             partial.replace(target)
-        with Image.open(io.BytesIO(data)) as image:
-            width, height = image.size
         return StoredImage(sha256=sha, path=target, width=width, height=height)
 
     def delete(self, path: Path) -> bool:

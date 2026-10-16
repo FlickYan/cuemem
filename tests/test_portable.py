@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
+import tempfile
+import uuid
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fakes import TOY_CONVERSATION, FakeAPI
@@ -127,6 +132,83 @@ def test_export_and_import_round_trip(
         memory.load({"format": "something-else"})
     with pytest.raises(KeyError):
         memory.export(user_id="nobody")
+
+
+def _png(color: str = "red") -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _export(*images: dict[str, Any]) -> dict[str, Any]:
+    """一个会话的导出文件：先一句纯文本，再一句带图片的发言。"""
+    turns = [
+        {"idx": 0, "role": "user", "text": "hi", "ts": DAY.isoformat(), "images": []},
+        {"idx": 1, "role": "user", "text": "look <image>", "ts": DAY.isoformat(), "images": images},
+    ]
+    session = {"session_id": "s1", "started_at": DAY.isoformat(), "turns": turns}
+    return {"format": FORMAT, "version": 1, "space_id": "evil", "sessions": [session]}
+
+
+def _image(data: bytes, mime: str = "image/png", sha256: str | None = None) -> dict[str, Any]:
+    return {"sha256": sha256, "mime": mime, "data": base64.b64encode(data).decode("ascii")}
+
+
+def test_import_never_writes_outside_its_scratch_dir(memory: Memory, tmp_path: Path) -> None:
+    """图片的 sha256 与 mime 来自导入的文件：不能拿来拼文件名（绝对路径、"../" 都能逃出临时目录，
+    mime 决定后缀，能写出 .py、.sqlite）。"""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    planted = _image(_png(), "text/x-python", sha256=str(victim / "sitecustomize"))
+    with pytest.raises(ValueError, match="sha256 does not match"):
+        memory.load(_export(planted))
+    assert list(victim.iterdir()) == []
+
+    escape = f"cuemem-escape-{uuid.uuid4().hex}"
+    with pytest.raises(ValueError, match="sha256 does not match"):
+        memory.load(_export(_image(_png(), sha256=f"../{escape}")))
+    assert not (Path(tempfile.gettempdir()) / f"{escape}.png").exists()
+    assert memory.system.db.list_spaces() == []
+
+
+def test_import_rejects_non_images_before_writing_anything(memory: Memory) -> None:
+    """不是图片的附件：整个导入报 ValueError（HTTP 是 409），一条发言也不写，也不进媒体库。"""
+    media_root = memory.system.settings.paths.media
+    png = _png()
+    for bad in (
+        _image(b"<script>alert(1)</script>", "text/html"),
+        _image(b"not a png at all", "image/png"),
+        _image(png[:-20] + bytes([png[-20] ^ 0xFF]) + png[-19:]),  # 校验和不对（SyntaxError）
+        _image(png[: len(png) // 2]),  # 截断（OSError）
+        {"mime": "image/png", "data": "@@not base64@@"},
+        {"mime": "image/png"},
+    ):
+        with pytest.raises(ValueError, match="not a valid image"):
+            memory.load(_export(bad))
+    assert memory.system.db.get_turns("evil") == []
+    assert not media_root.exists() or not any(p.is_file() for p in media_root.rglob("*"))
+
+
+def test_import_keeps_formats_the_export_mislabels(memory: Memory, tmp_path: Path) -> None:
+    """后缀按 PIL 认出的格式取，不按声明的 mime：SDK 收下的 BMP、未知后缀（导出成 image/jpeg）
+    照样能导回来；PNG、JPEG 的后缀与以前相同。"""
+    bmp = tmp_path / "scan.bmp"
+    Image.new("RGB", (6, 6), "blue").save(bmp)
+    photo = tmp_path / "shot.jpg"
+    Image.new("RGB", (6, 6), "white").save(photo)
+    content = [
+        {"type": "text", "text": "My scans"},
+        {"type": "image_url", "image_url": {"url": str(bmp)}},
+        {"type": "image_url", "image_url": {"url": str(photo)}},
+    ]
+    memory.add([{"role": "user", "content": content}], user_id="alice", run_id="s1", infer=False)
+    data = memory.export(user_id="alice", derived=False)
+    data["sessions"][0]["turns"][0]["images"][0]["mime"] = "image/jpeg"  # 声明错了也没关系
+    report = memory.load(data, user_id="bob")
+    assert report["images_added"] == 2
+    stored = sorted(Path(m.path) for m in memory.system.db.get_media("bob"))
+    assert sorted(p.suffix for p in stored) == [".bmp", ".jpg"]
+    assert {p.read_bytes() for p in stored} == {bmp.read_bytes(), photo.read_bytes()}
 
 
 def test_forget_dry_run_deletes_nothing(memory: Memory) -> None:
