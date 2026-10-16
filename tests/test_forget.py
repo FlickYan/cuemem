@@ -10,8 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import openai
 import pytest
-from fakes import TOY_CONVERSATION, FakeAPI
+from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
 from scripted import (
     EMPTY_EXTRACTION,
     TOY_EXTRACTIONS,
@@ -126,6 +127,49 @@ def test_forget_unknown_target_is_noop(system: MemorySystem) -> None:
     report = system.forget("demo", session_ids=["nope"])
     assert report.turns_deleted == 0
     assert len(system.facts("demo")) == before
+
+
+def _traces(system: MemorySystem) -> str:
+    return "".join(p.read_text("utf-8") for p in system.settings.paths.traces.glob("*.jsonl"))
+
+
+def test_forget_cleans_up_even_when_replay_fails(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """重放半途失败（对账时余额不足）：原始日志已经删了，重试时找不到要删的发言，所以 trace 与
+    向量缓存当场就要清理，异常照常抛出；没做完的巩固任务留着，下次巩固时补齐。"""
+    model = ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
+    broke = threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        reconciling = body["messages"][0]["content"].startswith("You maintain a long-term memory")
+        return NO_BALANCE if broke.is_set() and reconciling else model(body)
+
+    fake_api.chat_replies = [reply]
+    conv = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8"))
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        system.ingest(conv, consolidate=True)
+        [turn] = [t for t in system.db.get_turns("demo", "s5") if t.role == "user"]
+        question = f"{turn.text} 我现在在哪工作？"  # 提问里带着要删的原话
+        system.ask("demo", question, mode="l1")
+        system.search("demo", turn.text)  # 原话本身做过检索查询（代理与 Agent 都这样）
+        assert turn.text in _traces(system)
+        assert isinstance(system.embedder, CachedEmbedder)
+        assert system.embedder.cached([turn.text, question], "query")
+        old_round = next(u.text for u in system.db.list_units("demo") if turn.text in u.text)
+
+        broke.set()
+        with pytest.raises(openai.APIStatusError, match="Insufficient Balance"):
+            system.forget("demo", turn_ids=[turn.id])
+        assert all(t.id != turn.id for t in system.db.get_turns("demo"))
+        assert turn.text not in _traces(system)
+        assert not system.embedder.cached([old_round], "document")
+        assert not system.embedder.cached([turn.text, question], "query")
+        assert any(j["status"] == "pending" for j in system.db.get_jobs("demo"))
+
+        broke.clear()
+        system.consolidate("demo")
+        assert all(j["status"] == "done" for j in system.db.get_jobs("demo"))
+        core = system.core_memory("demo")
+        assert core is not None and "新加坡" in core.text
 
 
 def test_close_closes_its_own_caches(n3_settings: Settings, fake_api: FakeAPI) -> None:

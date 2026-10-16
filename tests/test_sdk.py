@@ -19,6 +19,7 @@ from scripted import ScriptedModel
 
 from cuemem import AsyncMemory, Memory
 from cuemem.config import Settings
+from cuemem.embed import CachedEmbedder
 from cuemem.sdk import space_for
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -267,6 +268,40 @@ def test_delete_restores_the_older_version_and_delete_all_wipes(memory: Memory) 
     # 删掉后重建的空间：会话从第 0 句开始
     memory.add("I live in Oslo", user_id="alice", run_id="r", infer=False)
     assert [t.idx for t in memory.system.db.get_turns("alice", "r")] == [0]
+
+
+def test_delete_leaves_no_vectors_or_traces_of_the_fact(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """删一条事实之后，它的陈述不在向量缓存里（找转述时算的查询向量、兜底时重新算的文档向量），
+    看过它的回答的 trace 与那次提问的查询向量也都删了（回答复述了它，trace 里没有用户的原话）。"""
+
+    def reworded(prompt: str) -> dict[str, Any]:  # 陈述与原话不同：分得清是谁的向量
+        out = where_i_live(prompt)
+        for fact in out["facts"]:
+            fact["statement"] = f"The user said: {fact['statement']}"
+        return out
+
+    answer = "Ana's birthday is on October 3."
+    reader = {"answer": answer, "citations": ["f1"], "evidence_sufficient": True}
+    fake_api.chat_replies = [ScriptedModel(reworded, reader=lambda prompt: reader)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("My sister Ana's birthday is October 3", user_id="u", timestamp=AUG, wait=True)
+        memory.add("I like hiking", user_id="u", timestamp=SEP, wait=True)
+        question = "When is Ana's birthday?"
+        assert memory.answer(question, user_id="u", mode="l1")["answer"] == answer
+        traces = memory.system.settings.paths.traces
+        assert any("October 3" in p.read_text("utf-8") for p in traces.glob("*.jsonl"))
+        [fact] = [f for f in memory.system.facts("u") if "Ana" in f.statement]
+
+        memory.delete(fact.id)
+        statements = [f.statement for f in memory.system.facts("u")]
+        assert statements == ["The user said: I like hiking"]
+        embedder = memory.system.embedder
+        assert isinstance(embedder, CachedEmbedder)
+        assert not embedder.cached([fact.statement], "document")
+        assert not embedder.cached([fact.statement, question], "query")
+        assert not any("October 3" in p.read_text("utf-8") for p in traces.glob("*.jsonl"))
 
 
 def test_background_extraction(

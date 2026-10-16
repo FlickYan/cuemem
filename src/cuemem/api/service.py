@@ -314,16 +314,17 @@ class ChatService:
         media_ids: Sequence[str] = (),
     ) -> ForgetReport:
         """遗忘（逻辑见 MemorySystem.forget_memories）；进行中的会话同步去掉被删的内容。"""
-        report = self.system.forget_memories(
-            space_id,
-            session_ids=session_ids,
-            turn_ids=turn_ids,
-            fact_ids=fact_ids,
-            media_ids=media_ids,
-        )
-        for session in self.open_sessions(space_id):
-            self.agent.prune(session)
-        return report
+        try:
+            return self.system.forget_memories(
+                space_id,
+                session_ids=session_ids,
+                turn_ids=turn_ids,
+                fact_ids=fact_ids,
+                media_ids=media_ids,
+            )
+        finally:  # 重建失败时原始日志也已经删了：进行中的会话照样去掉被删的轮
+            for session in self.open_sessions(space_id):
+                self.agent.prune(session)
 
     def consolidate(self, space_id: str) -> dict[str, Any]:
         return self.system.consolidate(space_id).as_dict()

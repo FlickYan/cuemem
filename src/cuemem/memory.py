@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -191,6 +191,18 @@ def build_reranker(
     return Reranker(
         settings.rerank, api_key, http_client=http_client, cache=llm.cache, ledger=ledger
     )
+
+
+def _strings(value: Any) -> Iterator[str]:
+    """JSON 结构里的全部字符串（trace 的 spans、events 里按 ID 记着检索到的记忆）。"""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
 
 
 class MemorySystem:
@@ -436,7 +448,8 @@ class MemorySystem:
 
         派生记忆是原始日志的函数，所以遗忘 = 从日志里删除 + 用剩下的日志重放派生记忆：
         事实、实体、摘要、核心记忆都重新生成；被删内容取代过的旧事实会自动恢复为当前有效。
-        随后清理缓存：被删会话的抽取结果、该空间的对账与回答缓存、不再出现的文本的向量。
+        随后清理缓存与 trace：被删会话的抽取结果、该空间的对账与回答缓存、不再出现的文本的向量、
+        被删发言的查询向量，以及含有被删原话或看过被删记忆的 trace（连同其提问的查询向量）。
 
         follow_citations（N8）：助手后来的回复如果引用过要删的记忆，它就复述了被删的信息，
         那一轮也一起删，并继续往下追（溯源表记录了每次回复引用了什么）。
@@ -447,6 +460,9 @@ class MemorySystem:
 
         整个过程持有这个空间的巩固锁（Consolidator.exclusive）：后台线程正在巩固时先等它做完，
         否则它会把由被删轮次抽出的事实、向量与缓存写回来。
+
+        重放失败（例如对账时余额不足）时照样清理 trace 与向量缓存，再把异常抛出去：原始日志
+        已经删了，重试时找不到要删的发言。没做完的巩固任务留着，下次巩固时补齐。
         """
         started = time.perf_counter()
         with (
@@ -460,8 +476,9 @@ class MemorySystem:
             if not targets:
                 return ForgetReport(space_id, 0, [], 0, 0, 0, 0, 0.0)
             consolidated = bool(self.db.get_jobs(space_id))
-            facts_before = len(self.db.get_facts(space_id))
+            facts = self.db.get_facts(space_id)
             texts_before = {u.text for u in self.db.list_units(space_id)}
+            doomed = {t.id for t in targets}
 
             # 1. 原始层：删除轮次与其中的图片（记录、图片向量；没有别处引用的原图文件），
             #    再按剩下的轮次重建受影响会话的"轮"
@@ -469,6 +486,11 @@ class MemorySystem:
             self.vectors.delete(space_id, [u.id for u in old_rounds])
             self.db.delete_units(space_id, [u.id for u in old_rounds])
             doomed_media = self.db.get_media(space_id, turn_ids=[t.id for t in targets])
+            # 被删内容的记忆 ID：含有被删发言的轮、由它们抽出的事实、其中的图片（trace 按 ID
+            # 记着回答模型看过哪些记忆）
+            refs = {u.id for u in old_rounds if doomed & set(u.source_turn_ids)}
+            refs |= {f.id for f in facts if doomed & set(f.source_turn_ids)}
+            refs |= {m.id for m in doomed_media}
             deleted = self.db.delete_turns(space_id, [t.id for t in targets])
             self.vectors.delete_images(space_id, [m.id for m in doomed_media])
             images_deleted = 0
@@ -484,24 +506,30 @@ class MemorySystem:
             if self.llm.cache is not None:
                 parts = [f"session:{sid}" for sid in affected] + ["consolidate", "ask"]
                 llm_purged = sum(self.llm.cache.delete_scope(scope(space_id, p)) for p in parts)
-            if consolidated:
-                self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
-                self.consolidator.run(space_id)
+            try:
+                if consolidated:
+                    self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
+                    self.consolidator.run(space_id)
+            finally:
+                # 3. trace：属性里有被删原话的条目（提问、回答原文），以及检索时给回答模型看过
+                #    被删记忆的条目（回答可能复述了它，trace 里却没有原话）
+                texts = [t.text for t in targets]
+                traces_removed, questions = self._remove_traces(space_id, texts, refs)
 
-            # 3. trace：属性里有被删原话的条目（提问、回答原文）一并删除
-            traces_removed = self._remove_traces(space_id, [t.text for t in targets])
-
-            # 4. 向量缓存：删除已不在记忆里的文本（向量本身也可能泄露原文）
-            gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
-            embed_purged = (
-                self.embedder.purge(gone) if isinstance(self.embedder, CachedEmbedder) else 0
-            )
-            self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
+                # 4. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面那些
+                #    提问的查询向量（代理与 Agent 拿用户的原话做检索查询）。重放失败时派生记忆
+                #    只重建了一部分，多删的向量下次巩固时重新算
+                gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
+                embed_purged = 0
+                if isinstance(self.embedder, CachedEmbedder):
+                    embed_purged = self.embedder.purge(gone)
+                    embed_purged += self.embedder.purge([*texts, *questions], "query")
+                self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
             report = ForgetReport(
                 space_id=space_id,
                 turns_deleted=deleted,
                 sessions_affected=affected,
-                facts_before=facts_before,
+                facts_before=len(facts),
                 facts_after=len(self.db.get_facts(space_id)),
                 embed_cache_purged=embed_purged,
                 llm_cache_purged=llm_purged,
@@ -534,20 +562,34 @@ class MemorySystem:
         wanted_turns |= {t.id for t in all_turns if t.id in restated}
         return [t for t in all_turns if t.id in wanted_turns], cascaded
 
-    def _remove_traces(self, space_id: str, texts: Sequence[str]) -> int:
-        """删除这个空间里、属性中含有被删原话的 trace（太短的话不作依据，免得误删）。"""
+    def _remove_traces(
+        self, space_id: str, texts: Sequence[str], refs: Collection[str] = ()
+    ) -> tuple[int, list[str]]:
+        """删除这个空间里的 trace：属性中含有被删原话的（太短的话不作依据，免得误删），以及
+        检索记录（spans、events）里有被删记忆 ID 的——回答模型看过它，回答可能复述了它。
+        返回删除的条数与这些 trace 的提问（提问的查询向量也要清掉）。
+
+        按 ID 宁多勿漏（D-046、D-051）：检索总会带上前几名候选，空间小的时候，遗忘一段会话
+        可能删掉大部分回答的 trace。trace 只是排查用的 JSONL，产品里没有地方读它。"""
         wanted = [t for t in texts if len(t.strip()) >= 12]
-        if self.tracer is None or not wanted:
-            return 0
+        ids = set(refs)
+        if self.tracer is None or not (wanted or ids):
+            return 0, []
+        questions: list[str] = []
 
         def doomed(record: dict[str, Any]) -> bool:
             attrs = record.get("attrs") or {}
             if attrs.get("space") != space_id:
                 return False
             blob = " ".join(str(v) for v in attrs.values())
-            return any(text in blob for text in wanted)
+            hit = any(text in blob for text in wanted)
+            if not hit and ids:
+                hit = not ids.isdisjoint(_strings([record.get("spans"), record.get("events")]))
+            if hit:
+                questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
+            return hit
 
-        return self.tracer.remove(doomed)
+        return self.tracer.remove(doomed), questions
 
     def _follow_citations(self, space_id: str, turns: set[str]) -> set[str]:
         """沿引用扩散：要删的发言所在的轮、由它们抽取的事实、其中的图片，凡是被后来的回复
@@ -695,22 +737,29 @@ class MemorySystem:
         只删那条发言、不沿引用扩散：同一轮里用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。
         """
         turns, restated, statements = self._forget_plan(space_id, turn_ids, fact_ids, media_ids)
-        report = self.forget(
-            space_id,
-            session_ids=list(session_ids),
-            turn_ids=list(dict.fromkeys(turns)),
-            restated_turn_ids=restated,
-        )
-        report = replace(report, restated=len(restated))
-        for _ in range(REGROW_ROUNDS if statements else 0):
-            regrown = self.regrown_facts(space_id, statements)
-            if not regrown:
-                break
-            more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
-            report = report.merged(
-                replace(self.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
+        try:
+            report = self.forget(
+                space_id,
+                session_ids=list(session_ids),
+                turn_ids=list(dict.fromkeys(turns)),
+                restated_turn_ids=restated,
             )
-        return report
+            report = replace(report, restated=len(restated))
+            for _ in range(REGROW_ROUNDS if statements else 0):
+                regrown = self.regrown_facts(space_id, statements)
+                if not regrown:
+                    break
+                more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
+                report = report.merged(
+                    replace(self.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
+                )
+        finally:
+            # 找转述与兜底时为被删的陈述算过查询与文档两种向量，兜底那次还在 forget 清理之后：
+            # 一并删掉（中途失败时也删）
+            purged = 0
+            if statements and isinstance(self.embedder, CachedEmbedder):
+                purged = self.embedder.purge(statements, "query") + self.embedder.purge(statements)
+        return replace(report, embed_cache_purged=report.embed_cache_purged + purged)
 
     def _forget_plan(
         self,

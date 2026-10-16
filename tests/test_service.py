@@ -163,6 +163,28 @@ def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedMo
     assert live.window == []
 
 
+def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
+    service: ChatService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """重建派生记忆失败（例如余额不足）时，原始日志已经删了：进行中的会话照样把被删的轮从
+    工作记忆里去掉，异常照常抛给调用方。"""
+    first = service.start("shop", at=DAY)
+    service.chat(first.session_id, "I'm vegan, so no leather please.", mode="l0")
+    service.end(first.session_id, wait=True)  # 有巩固过的会话：遗忘时要重建
+    live = service.start("shop", at=datetime(2026, 9, 1))
+    service.chat(live.session_id, "My sister Ana turns 30 on October 3.", mode="l0")
+    assert len(live.window) == 1
+    said = service.system.db.get_turns("shop", live.session_id)[0]
+
+    def broken(space_id: str) -> Any:
+        raise RuntimeError("Insufficient Balance")
+
+    monkeypatch.setattr(service.system.consolidator, "run", broken)
+    with pytest.raises(RuntimeError, match="Insufficient Balance"):
+        service.forget("shop", turn_ids=[said.id])
+    assert live.window == []
+
+
 def test_forget_keeps_other_sessions_reply_cache(
     service: ChatService, model: ScriptedModel
 ) -> None:

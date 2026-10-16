@@ -16,6 +16,7 @@ from test_sdk import where_i_live
 
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.config import Settings
+from cuemem.embed import CachedEmbedder
 from cuemem.memory import MemorySystem
 
 SYSTEM = {"role": "system", "content": "You are a helpful shopping assistant."}
@@ -152,6 +153,21 @@ def test_a_new_conversation_starts_a_new_session(
     assert system.worker is not None
     system.worker.wait()
     assert "The user lives in Berlin." in {f.statement for f in system.facts("alice")}
+
+
+def test_forget_purges_the_query_vector_of_a_deleted_message(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """代理拿用户的原话做检索查询（查询向量进了缓存），再把原话写进原始日志：遗忘这条发言时，
+    它的查询向量也要从缓存里删掉（向量本身也可能泄露原文）。"""
+    chat(client, "I live in Berlin", user="alice")
+    secret = "My sister Ana's birthday is October 3"
+    assert chat(client, secret, user="alice").headers["x-cuemem-level"] != "none"
+    embedder = system.embedder
+    assert isinstance(embedder, CachedEmbedder) and embedder.cached([secret], "query")
+    [turn] = [t for t in system.db.get_turns("alice") if t.text == secret]
+    assert system.forget("alice", turn_ids=[turn.id]).turns_deleted == 1
+    assert not embedder.cached([secret], "query")
 
 
 def test_streaming_is_relayed_and_written_back(
