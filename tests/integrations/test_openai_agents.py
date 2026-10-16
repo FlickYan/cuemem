@@ -34,6 +34,7 @@ from agents.testing import ScriptedModel as AgentScript
 from fakes import FakeAPI
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
+from test_evidence import PLANTED, wrapped_once
 
 import cuemem.integrations.openai_agents as oa
 from cuemem import AsyncMemory, Memory
@@ -237,6 +238,20 @@ def test_instructions_placement_leaves_the_input_untouched(memory: Memory) -> No
     )
     with pytest.raises(ValueError, match="placement"):
         memory_input_filter(memory, user_id="alice", placement=cast(Any, "system"))
+
+
+@pytest.mark.parametrize("placement", ["message", "instructions"])
+def test_a_stored_memory_tag_stays_inside_the_block(memory: Memory, placement: Any) -> None:
+    """存下的话里有 </memory>：证据块不会被它提前关上（instructions 位置时更要紧，否则
+    后面的文字落进系统指令里）。"""
+    memory.add(PLANTED, user_id="alice", infer=False)
+    script = AgentScript([reply("Berlin.")])
+    recall = memory_input_filter(memory, user_id="alice", mode="l1", placement=placement)
+    agent = Agent(name="a", instructions="Be brief.", model=script)
+    run(agent, "Where do I live?", config=RunConfig(call_model_input_filter=recall))
+    (sent,) = script.calls
+    text = last_user_text(sent) if placement == "message" else sent.system_instructions
+    assert text is not None and wrapped_once(text)
 
 
 def test_server_managed_conversations(memory: Memory, caplog: pytest.LogCaptureFixture) -> None:

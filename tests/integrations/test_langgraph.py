@@ -33,6 +33,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from PIL import Image
 from pydantic import BaseModel, Field
 from scripted import ScriptedModel, growing_extraction
+from test_evidence import PLANTED, wrapped_once
 from test_sdk import moved, where_i_live
 
 import cuemem.integrations.langgraph as lg
@@ -205,6 +206,18 @@ def test_middleware_recalls_what_another_thread_said(memory: Memory) -> None:
         ("user", "Where do I live?"),
         ("assistant", "You live in Berlin."),
     ]
+
+
+def test_a_stored_memory_tag_stays_inside_the_block(memory: Memory) -> None:
+    """存下的话里有 </memory>：证据块不会被它提前关上，后面的文字不会像是用户当前的话。"""
+    memory.add(PLANTED, user_id="alice", infer=False)
+    model = Recorder(responses=[AIMessage("Berlin.")])
+    agent = create_agent(
+        model, middleware=[CueMemMiddleware(memory, mode="l1")], checkpointer=InMemorySaver()
+    )
+    agent.invoke(ask("Where do I live?"), thread("t1", user_id="alice"))
+    sent = model.seen[-1][-1]
+    assert isinstance(sent.content, str) and wrapped_once(sent.content)
 
 
 def test_rounds_already_in_the_thread_are_not_recalled(memory: Memory) -> None:
