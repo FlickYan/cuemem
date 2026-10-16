@@ -7,6 +7,7 @@ import base64
 import io
 import re
 import tempfile
+import threading
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from scripted import ScriptedModel
 from cuemem import AsyncMemory, Memory
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
+from cuemem.errors import ConcurrentWriteError
 from cuemem.sdk import space_for
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -248,6 +250,64 @@ def test_run_id_appends_and_infer_false_defers_extraction(memory: Memory) -> Non
         "The user lives in Berlin.",
         "I like jazz",
     }
+
+
+def test_concurrent_adds_to_one_run_keep_every_turn(memory: Memory) -> None:
+    """同一个 run_id 并发 add：每句都写进去，序号连续，返回的 turn_id 指向自己写的那句。以前序号
+    在锁外分配，撞号的发言被 INSERT OR IGNORE 悄悄丢掉，返回的 ID 却指向别人的话。"""
+    memory.add("seed", user_id="u", run_id="s", timestamp=AUG, infer=False)
+    barrier = threading.Barrier(16)
+    returned: dict[int, list[str]] = {}
+
+    def add(i: int) -> None:
+        barrier.wait()
+        out = memory.add(f"msg {i}", user_id="u", run_id="s", timestamp=AUG, infer=False)
+        returned[i] = out["turn_ids"]
+
+    threads = [threading.Thread(target=add, args=(i,)) for i in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    turns = memory.system.db.get_turns("u", "s")
+    assert sorted(t.idx for t in turns) == list(range(17))
+    text = {t.id: t.text for t in turns}
+    assert {i: [text.get(tid) for tid in ids] for i, ids in returned.items()} == {
+        i: [f"msg {i}"] for i in range(16)
+    }
+
+
+def test_concurrent_async_adds_keep_every_turn(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    fake_api.chat_replies = [model]
+
+    async def run() -> tuple[list[dict[str, Any]], dict[str, str]]:
+        async with AsyncMemory(n3_settings, http_client=fake_api.client(), background=False) as m:
+            await m.add("seed", user_id="u", run_id="s", timestamp=AUG, infer=False)
+            outs = await asyncio.gather(
+                *(
+                    m.add(f"msg {i}", user_id="u", run_id="s", timestamp=AUG, infer=False)
+                    for i in range(8)
+                )
+            )
+            turns = m.sync.system.db.get_turns("u", "s")
+            return outs, {t.id: t.text for t in turns}
+
+    outs, text = asyncio.run(run())
+    assert len(text) == 9
+    assert [text.get(out["turn_ids"][0]) for out in outs] == [f"msg {i}" for i in range(8)]
+
+
+def test_add_raises_when_a_turn_was_not_written(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """序号撞上已有的发言（INSERT OR IGNORE 没写进去）：报错，而不是返回没写进去的 turn_id。"""
+    memory.add("I live in Berlin", user_id="alice", run_id="chat", infer=False)
+    monkeypatch.setattr(Memory, "_next_idx", lambda self, space, session_id: 0)
+    with pytest.raises(ConcurrentWriteError, match="chat"):
+        memory.add("I like jazz", user_id="alice", run_id="chat", infer=False)
+    assert [t.text for t in memory.system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
 
 
 def test_delete_restores_the_older_version_and_delete_all_wipes(memory: Memory) -> None:

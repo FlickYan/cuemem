@@ -265,6 +265,9 @@ class MemorySystem:
         # 进行中的会话（Agent 正在对话，N8）：暂不巩固，会话结束后再整体抽取一次
         self._open: set[tuple[str, str]] = set()
         self._open_lock = threading.Lock()
+        # 同一会话的写入按顺序进行（SDK 的 add 在锁里分配发言序号）。按（空间，会话）分到固定的
+        # 几十把锁上，不为每个会话建一把：不给 run_id 的 add 每次都是一个新会话
+        self._session_locks = [threading.Lock() for _ in range(64)]
 
     @classmethod
     def from_settings(
@@ -424,6 +427,11 @@ class MemorySystem:
     def open_sessions(self, space_id: str) -> set[str]:
         with self._open_lock:
             return {sid for space, sid in self._open if space == space_id}
+
+    def session_lock(self, space_id: str, session_id: str) -> threading.Lock:
+        """往这个会话里写入时持有的锁：从分配发言序号到写完为止。放在系统上而不是 SDK 的
+        Memory 上：HTTP 服务、记忆代理与各个集成用 Memory.from_system 包住的是同一个系统。"""
+        return self._session_locks[hash((space_id, session_id)) % len(self._session_locks)]
 
     def adopt_open(self, space_id: str, keep: Collection[str] = ()) -> int:
         """接手之前的进程留下的进行中的会话：进程崩溃（没来得及 close_session）时，它们没有

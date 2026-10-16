@@ -44,6 +44,7 @@ import httpx2
 from cuemem.config import Settings, load_settings
 from cuemem.core.ids import stable_id
 from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
+from cuemem.errors import ConcurrentWriteError
 from cuemem.memory import ForgetReport, MemorySystem, Recall
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router, english_reason
@@ -164,16 +165,23 @@ class Memory:
             if not turns:
                 return {"results": [], "session_id": None, "turn_ids": [], "status": "empty"}
             sid = run_id or f"add-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
-            first = self._next_idx(space, sid)
-            started = self.system.db.get_sessions(space).get(sid, when)
             before = {f.id: f for f in self.system.db.get_facts(space)} if wait else {}
-            self.system.append(
-                space,
-                SessionIn(session_id=sid, started_at=started, turns=turns),
-                first,
-                enqueue=infer,
-            )
-            self.system.db.set_meta(_idx_key(space, sid), str(first + len(turns)))
+            # 发言序号在会话锁里分配、写完再放：同一个 run_id 的并发 add 不会撞号
+            with self.system.session_lock(space, sid):
+                first = self._next_idx(space, sid)
+                started = self.system.db.get_sessions(space).get(sid, when)
+                written = self.system.append(
+                    space,
+                    SessionIn(session_id=sid, started_at=started, turns=turns),
+                    first,
+                    enqueue=infer,
+                )
+                self.system.db.set_meta(_idx_key(space, sid), str(first + len(turns)))
+            if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
+                raise ConcurrentWriteError(
+                    f"Only {written.turns_added} of {len(turns)} messages were written to session "
+                    f"{sid!r}: their turn numbers were already taken by another write."
+                )
         finally:
             for path in temporary:
                 path.unlink(missing_ok=True)
