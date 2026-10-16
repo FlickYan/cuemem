@@ -20,7 +20,6 @@ import json
 import re
 import threading
 import time
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -39,7 +38,7 @@ from cuemem.agent.context import (
     strip_citations,
 )
 from cuemem.agent.tools import Tool, ToolContext, ToolResult, memory_tools
-from cuemem.core.ids import stable_id
+from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import SessionIn, TurnIn
 from cuemem.core.timeutil import naive_local
 from cuemem.core.trace import Trace, span, start_trace
@@ -150,8 +149,8 @@ class ChatSession:
 
     def now(self) -> datetime:
         """当前时间：真实会话就是现在；模拟的会话从给定的开始时间起，按真实流逝往前走。"""
-        if not self.simulated:
-            return datetime.now().replace(microsecond=0)
+        if not self.simulated:  # 不截到秒：与 SDK、各个集成的写入在同一秒里也分得出先后
+            return datetime.now()
         return self.started_at + timedelta(seconds=round(time.monotonic() - self._clock))
 
     @property
@@ -190,8 +189,8 @@ class Agent:
     ) -> ChatSession:
         """开始一个会话：标记为进行中（暂不巩固），取一次核心记忆快照。
         at（模拟的开始时间）带时区时换算成本机时间。"""
-        started = (naive_local(at) if at is not None else datetime.now()).replace(microsecond=0)
-        sid = session_id or f"chat-{started:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+        started = naive_local(at).replace(microsecond=0) if at is not None else datetime.now()
+        sid = session_id or sortable_session_id("chat", started)
         self.system.open_session(space_id, sid)
         return ChatSession(
             space_id=space_id,

@@ -67,7 +67,6 @@ import logging
 import re
 import threading
 import time
-import uuid
 import weakref
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -91,6 +90,7 @@ from agents.run_config import (  # type: ignore[import-not-found, unused-ignore]
     ModelInputData,
 )
 
+from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
 from cuemem.evidence import format_listing, recall_evidence, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
@@ -321,8 +321,8 @@ def memory_tools(
     @function_tool(name_override="remember", description_override=REMEMBER_DESCRIPTION)
     def remember(ctx: RunContextWrapper[Any], text: str) -> str:
         user, agent = who.ids(ctx.context)
-        when = datetime.now().replace(microsecond=0)
-        note = f"note-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+        when = datetime.now()  # 不截到秒：同一秒里的几条笔记也分得出先后
+        note = sortable_session_id("note", when)
         out = sync.add(text, user_id=user, agent_id=agent, run_id=note, timestamp=when)
         if not out["turn_ids"]:
             return "Nothing was saved: the text is empty."

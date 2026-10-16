@@ -29,7 +29,6 @@ import json
 import re
 import threading
 import time
-import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -42,6 +41,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from cuemem import __version__
 from cuemem.config import ModelSpec
+from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
 from cuemem.evidence import inject_evidence, message_text, recall_evidence
 from cuemem.memory import MemorySystem, RecallMode
@@ -187,7 +187,7 @@ class MemoryProxy:
                 ended = None
             if run is None:
                 when = datetime.now()
-                sid = explicit or f"proxy-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+                sid = explicit or sortable_session_id("proxy", when)
                 run = Run(space, sid, now)
                 self._runs[key] = run
                 self.system.open_session(space, sid)  # 进行中：每轮照常写入，但不抽取

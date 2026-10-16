@@ -738,8 +738,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         存不进去（包括文件刚被别的进程改过）时撤销刚写的笔记，文件与记忆保持一致。
         note_text 为 None（只是空白之类，没有新信息）时只存原文。
 
-        会话 ID 带上微秒：同一秒里的几次改动（一轮里并行的工具调用）按 ID 排序就是先后顺序，
-        后台一起巩固时对账才不会把新版本当成旧的。"""
+        开始时间不截到秒、会话 ID 也带上微秒：同一秒里的几次改动（一轮里并行的工具调用）按开始
+        时间排序就是先后顺序，与 SDK 等其他地方的写入之间也是，后台一起巩固时对账才不会把新版本
+        当成旧的。"""
         self._ensure_epoch()
         note = None
         if note_text is not None and note_text.strip():
@@ -751,7 +752,7 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
                     user_id=self.user_id,
                     agent_id=self.agent_id,
                     run_id=session,
-                    timestamp=now.replace(microsecond=0),
+                    timestamp=now,
                     wait=self.wait,
                 )
             except Exception as exc:

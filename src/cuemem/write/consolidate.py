@@ -25,7 +25,7 @@ import queue
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -524,6 +524,7 @@ class Consolidator:
         )
 
         new_facts: list[tuple[Fact, FloatArray]] = []
+        said_on = {t.id: t.ts for t in turns}
         for candidate in ext.facts:
             raw = candidate.raw
             subject_id = self.resolver.subject_id(entity_state, raw.subject, ts, ents)
@@ -543,7 +544,7 @@ class Consolidator:
                 cardinality=registered_cardinality(predicate) or raw.cardinality,
                 negated=raw.negated,
                 valid_from=raw.date,
-                recorded_at=ts,
+                recorded_at=_said_at(candidate.source_turn_ids, said_on, ts),
                 importance=raw.importance,
                 entity_ids=list(dict.fromkeys([subject_id, *([object_id] if object_id else [])])),
                 session_id=ext.session_id,
@@ -789,6 +790,18 @@ def scope(space_id: str, part: str) -> str:
     """LLM 缓存条目的归属标签：抽取按会话标记，对账与消歧按空间标记，回答按空间标记。
     遗忘时据此只清理受影响的条目，其余会话的抽取结果仍可复用（D-021）。"""
     return f"{space_id}|{part}"
+
+
+def _said_at(
+    turn_ids: Sequence[str], said_on: Mapping[str, datetime], started: datetime
+) -> datetime:
+    """事实的记录时间（被说出的时间）：出处里最晚的一句发言不在会话开始的那天说的（复用的
+    run_id、LangGraph 的线程跨了好几天），取那句发言的时间；否则取会话开始的时间。
+
+    只按天区分，与抽取提示一致（换了日期的发言前才标出日期，见 render_session）：同一天里的
+    会话（评测的会话、Agent 的一次对话）事实的记录时间与之前相同，派生记忆与之后的请求不变。"""
+    latest = max((said_on[t] for t in turn_ids if t in said_on), default=started)
+    return latest if latest.date() != started.date() else started
 
 
 # ---------- 检索单元 ----------

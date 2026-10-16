@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 import threading
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +19,7 @@ import httpx2
 from cuemem.agent import Agent, ChatSession, Persona, Reply
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
 from cuemem.config import PROJECT_ROOT, Settings
-from cuemem.core.ids import stable_id
+from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import SessionIn, TurnIn
 from cuemem.evidence import fact_state, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
@@ -163,8 +162,9 @@ class ChatService:
 
     def remember(self, space_id: str, text: str, *, at: datetime | None = None) -> dict[str, str]:
         """记一条笔记（MCP 的 remember）：写成只有一句话的会话，在线写入、后台巩固。"""
-        when = (at or datetime.now()).replace(microsecond=0)
-        sid = f"note-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+        # 现在的时间不截到秒：与 SDK、各个集成写入的会话在同一秒里也分得出先后
+        when = at.replace(microsecond=0) if at is not None else datetime.now()
+        sid = sortable_session_id("note", when)
         self.system.append(
             space_id,
             SessionIn(

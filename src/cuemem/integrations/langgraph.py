@@ -60,7 +60,6 @@ import json
 import re
 import threading
 import time
-import uuid
 import warnings
 import weakref
 from collections import Counter, OrderedDict
@@ -91,6 +90,7 @@ from langgraph.runtime import Runtime, get_runtime  # type: ignore[import-not-fo
 from langgraph.types import Command  # type: ignore[import-not-found, unused-ignore]
 from pydantic import BaseModel
 
+from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
 from cuemem.evidence import format_listing, recall_evidence, recall_listing, resolve_ids
 from cuemem.memory import MemorySystem, RecallMode
@@ -564,8 +564,8 @@ def memory_tools(
         def run() -> str:
             user, agent = who(config)
             # 一句话一个会话，与 MCP 的 remember 相同：在线写入、后台抽取
-            when = datetime.now().replace(microsecond=0)
-            note = f"note-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+            when = datetime.now()  # 不截到秒：同一秒里的几条笔记也分得出先后
+            note = sortable_session_id("note", when)
             out = sync.add(text, user_id=user, agent_id=agent, run_id=note, timestamp=when)
             return f"Saved as {out['turn_ids'][0]}." if out["turn_ids"] else "Nothing to save."
 

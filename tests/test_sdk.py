@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import itertools
 import re
 import tempfile
 import threading
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -308,6 +310,74 @@ def test_add_raises_when_a_turn_was_not_written(
     with pytest.raises(ConcurrentWriteError, match="chat"):
         memory.add("I like jazz", user_id="alice", run_id="chat", infer=False)
     assert [t.text for t in memory.system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
+
+
+def _descending_uuids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """uuid4 依次变小：以前生成的会话 ID 以随机数结尾，开始时间相同时按 ID 排序，后写的排到前面。"""
+    count = itertools.count()
+    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=(0xFFFFFF - next(count)) << 104))
+
+
+def test_adds_with_the_same_timestamp_are_reconciled_in_order(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """显式给了同样的时间（只精确到天或秒的导入、Mem0 式的批量写入）：后写的才是当前的。巩固按
+    （开始时间，会话 ID）排序，以前会话 ID 以随机数结尾，对账的先后是随机的，旧住址可能成了
+    当前的。"""
+    _descending_uuids(monkeypatch)
+    first = memory.add("I live in Berlin", user_id="alice", timestamp=AUG, infer=False)
+    second = memory.add("I moved to Munich", user_id="alice", timestamp=AUG, infer=False)
+    assert first["session_id"] < second["session_id"]
+    memory.consolidate(user_id="alice")
+    assert [f["object"] for f in memory.get_all(user_id="alice")["results"]] == ["Munich"]
+
+
+def test_adds_in_the_same_second_are_reconciled_in_order(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不给时间、后台抽取，连着几次 add（同一秒里）：后说的才是当前的。以前缺省时间截到秒，
+    开始时间相同，排序落到随机的会话 ID 上。"""
+    gate = threading.Event()
+
+    def held(body: dict[str, Any]) -> Any:  # 第一次抽取等到三次 add 都写完：后两段一起巩固
+        gate.wait(5)
+        return model(body)
+
+    fake_api.chat_replies = [held]
+    _descending_uuids(monkeypatch)
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        memory.add("Hi there", user_id="alice")
+        memory.add("I live in Berlin", user_id="alice")
+        memory.add("I moved to Munich", user_id="alice")
+        gate.set()
+        memory.wait()
+        current = memory.get_all(user_id="alice")["results"]
+        assert [f["object"] for f in current if f["predicate"] == "lives_in"] == ["Munich"]
+
+
+def test_a_run_spanning_days_dates_facts_by_the_day_they_were_said(
+    memory: Memory, model: ScriptedModel
+) -> None:
+    """一个 run_id 跨了好几天（复用的会话、LangGraph 的线程）：后来某天说的事实按那天记录，抽取
+    提示里标出那天的日期。以前一律记成会话开始的那天：8 月 10 日说的"搬到慕尼黑"比 8 月 5 日另一段
+    对话里的"住在柏林"还早，存成已被取代，画像里还是柏林。同一天里说的仍按会话开始时间记录。"""
+    for text, run_id, at in [
+        ("Hi, I'm planning a trip", "main", AUG),
+        ("I like jazz", "main", AUG + timedelta(hours=2)),
+        ("I live in Berlin", "side", AUG + timedelta(days=4)),
+        ("I moved to Munich", "main", AUG + timedelta(days=9)),
+    ]:
+        memory.add(text, user_id="u", run_id=run_id, timestamp=at, infer=False)
+    memory.consolidate(user_id="u")
+    [prompt] = [p for p in model.prompts["extract"] if "Munich" in p]
+    assert "[t1] User: I like jazz\n[Date: 2026-08-10 (Monday)]\n[t2] User: I moved" in prompt
+    everything = memory.get_all(user_id="u", include_superseded=True)["results"]
+    facts = {f["object"]: f for f in everything}
+    assert facts["Munich"]["status"] == "current"
+    assert facts["Munich"]["created_at"] == (AUG + timedelta(days=9)).isoformat()
+    assert facts["Berlin"]["valid_to"] == "2026-08-10"
+    assert facts["I like jazz"]["created_at"] == AUG.isoformat()  # 同一天：会话开始的时间
+    assert "Munich" in memory.profile(user_id="u") and "Berlin" not in memory.profile(user_id="u")
 
 
 def _utc_z(local: datetime) -> str:

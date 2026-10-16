@@ -31,7 +31,6 @@ import binascii
 import functools
 import tempfile
 import threading
-import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
@@ -42,7 +41,7 @@ from typing import Any, Literal
 import httpx2
 
 from cuemem.config import Settings, load_settings
-from cuemem.core.ids import stable_id
+from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
 from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConcurrentWriteError
@@ -160,12 +159,13 @@ class Memory:
                 f"Run {run_id!r} is still open: its memories are extracted when it ends. "
                 "Add without wait=True, then call end_run(..., wait=True)."
             )
-        when = _as_datetime(timestamp) or datetime.now().replace(microsecond=0)
+        # 缺省时间不截到秒：同一秒里的几次 add 也分得出先后（巩固按开始时间排序对账）
+        when = _as_datetime(timestamp) or datetime.now()
         turns, temporary = parse_messages(messages, when)
         try:
             if not turns:
                 return {"results": [], "session_id": None, "turn_ids": [], "status": "empty"}
-            sid = run_id or f"add-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+            sid = run_id or sortable_session_id("add", when)
             before = {f.id: f for f in self.system.db.get_facts(space)} if wait else {}
             # 发言序号在会话锁里分配、写完再放：同一个 run_id 的并发 add 不会撞号
             with self.system.session_lock(space, sid):
@@ -205,7 +205,7 @@ class Memory:
         """开始一段对话（run）：之后 add(run_id=...) 照常在线写入、立即可检索，但不抽取事实，
         end_run 时整段只抽取一次。返回 run_id（不给时生成一个）。"""
         space = space_for(user_id, agent_id)
-        rid = run_id or f"run-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+        rid = run_id or sortable_session_id("run", datetime.now())
         self.system.open_session(space, rid)
         with self._runs_lock:
             self._runs.add((space, rid))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fakes import FakeAPI
 
@@ -12,7 +12,7 @@ from cuemem.core.models import SessionIn, TurnIn
 from cuemem.core.timeutil import normalize_partial_date
 from cuemem.llm import LLMClient
 from cuemem.write import build_turns
-from cuemem.write.extract import ExtractionOutput, Extractor, render_session
+from cuemem.write.extract import DATED_NOTE, ExtractionOutput, Extractor, render_session
 from cuemem.write.predicates import normalize_predicate, registered_cardinality
 
 WHEN = datetime(2023, 5, 20, 9, 0)
@@ -131,6 +131,37 @@ def test_deleted_gaps_are_marked_only_where_messages_were_deleted(
     assert not any("[deleted]" in p for p in prompts[:first])
     marked = [p for p in prompts[first:] if "[deleted]" in p]
     assert len(marked) == 1 and "[deleted]\n[t5]" in marked[0]
+
+
+def test_turns_said_on_another_day_get_a_date_line() -> None:
+    """一段会话跨了几天（复用的 run_id、LangGraph 的线程）：换了日期的发言前标出日期，加一行
+    说明。同一天里的会话（评测的会话、Agent 的一次对话）渲染结果与之前逐字相同。"""
+    turns = session(
+        ("user", "I adopted a dog."), ("assistant", "Nice."), ("user", "I moved yesterday.")
+    )
+    expected = (
+        "Conversation date: 2023-05-20 (Saturday)\n"
+        "Participants: User, Assistant (AI)\n"
+        "Language: English\n"
+        "\n"
+        "[t0] User: I adopted a dog.\n"
+        "[t1] Assistant: Nice.\n"
+        "[t2] User: I moved yesterday."
+    )
+    assert render_session(turns, WHEN, assistant_chars=None) == expected
+    same_day = [*turns[:2], turns[2].model_copy(update={"ts": WHEN + timedelta(hours=14)})]
+    assert render_session(same_day, WHEN, assistant_chars=None) == expected
+
+    later = [*turns[:2], turns[2].model_copy(update={"ts": datetime(2023, 5, 28, 18, 0)})]
+    text = render_session(later, WHEN, assistant_chars=None)
+    header, body = text.split("\n\n")
+    assert header == expected.split("\n\n")[0] + "\n" + DATED_NOTE
+    assert body == (
+        "[t0] User: I adopted a dog.\n"
+        "[t1] Assistant: Nice.\n"
+        "[Date: 2023-05-28 (Sunday)]\n"
+        "[t2] User: I moved yesterday."
+    )
 
 
 def test_predicate_normalization() -> None:

@@ -72,6 +72,14 @@ DELETED_NOTE = (
     "rule to use names instead of pronouns."
 )
 
+# 会话跨了几天（复用的 run_id、LangGraph 的线程）才加的说明：换了日期的发言前标出 [Date: …]，
+# 否则模型按会话开始的日期换算"昨天""上周"。同一天里的会话渲染结果不变，抽取缓存照常命中
+DATED_NOTE = (
+    "Some turns were said on a different day from the conversation date. A line such as "
+    "[Date: YYYY-MM-DD (Weekday)] gives the date of the turns after it: for those turns, use "
+    "that date instead of the conversation date, including when converting relative times."
+)
+
 _ENTITY_TYPES = set(get_args(EntityType))
 _CATEGORIES = set(get_args(FactCategory))
 _TURN_NUMBER = re.compile(r"\d+")
@@ -210,6 +218,9 @@ def render_session(
 
     deleted_from：会话里有发言被遗忘删掉时，这一段（超长会话切成的窗口）第一句应有的编号；
     空缺标成 [deleted]，并加一行说明（DELETED_NOTE）。为 None（没删过）时渲染结果不变。
+
+    发言的日期与会话日期（或上一句标出的日期）不同时，在它前面标出新的日期并加一行说明
+    （DATED_NOTE）。所有发言都在会话开始的那天时渲染结果不变。
     """
     names = participants(turns)
     who = ", ".join(names) if names != ["User", "Assistant"] else "User, Assistant (AI)"
@@ -226,11 +237,17 @@ def render_session(
         )
     body: list[str] = []
     expected = deleted_from
+    shown = started_at.date()  # 正文里当前标着的日期
+    dated = False
     for turn in turns:
         if expected is not None:
             if turn.idx > expected:
                 body.append("[deleted]")
             expected = turn.idx + 1
+        if turn.ts.date() != shown:
+            shown = turn.ts.date()
+            body.append(f"[Date: {turn.ts:%Y-%m-%d (%A)}]")
+            dated = True
         label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
         text = turn.text.strip()
         if turn.role == "assistant" and assistant_chars is not None and len(text) > assistant_chars:
@@ -238,6 +255,8 @@ def render_session(
         if notes.get(turn.id):
             text = inline_images(text, notes[turn.id])
         body.append(f"[t{turn.idx}] {label}: {text}")
+    if dated:
+        lines.append(DATED_NOTE)
     if "[deleted]" in body:
         lines.append(DELETED_NOTE)
     return "\n".join([*lines, "", *body])
