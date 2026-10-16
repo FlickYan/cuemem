@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 from dotenv import dotenv_values
@@ -215,6 +216,61 @@ def test_demo_and_chat_commands(
     assert result.exit_code == 0, result.output
     flat = _flat(result.output)
     assert "HiMaya,noted." in flat and "会话结束" in flat
+
+
+@pytest.mark.parametrize(
+    ("host", "token", "insecure", "starts"),
+    [
+        ("0.0.0.0", None, False, False),
+        ("192.168.1.10", None, False, False),
+        ("::", None, False, False),
+        ("", None, False, False),
+        ("127.0.0.1", None, False, True),
+        ("127.0.0.2", None, False, True),
+        ("::1", None, False, True),
+        ("localhost", None, False, True),
+        ("0.0.0.0", "fake-token", False, True),
+        ("0.0.0.0", None, True, True),
+    ],
+)
+def test_require_token(host: str, token: str | None, insecure: bool, starts: bool) -> None:
+    import typer
+
+    from cuemem.cli import _require_token
+
+    if starts:
+        _require_token(host, token, insecure)
+    else:
+        with pytest.raises(typer.Exit):
+            _require_token(host, token, insecure)
+
+
+@pytest.fixture
+def served(isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+    """cuemem serve / proxy 不真的监听：记下交给 uvicorn.run 的应用。"""
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("CUEMEM_PATHS__MEDIA", str(tmp_path / "media"))
+    calls: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
+    return calls
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_non_loopback_bind_needs_a_token(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """监听非本机地址又没有访问令牌：拒绝启动（Docker 镜像监听 0.0.0.0），
+    除非加 --insecure-no-auth。"""
+    result = runner.invoke(app, [*command, "--host", "0.0.0.0"])
+    assert result.exit_code == 2 and served == []
+    assert "CUEMEM_API_TOKEN" in result.output and "--insecure-no-auth" in _flat(result.output)
+    result = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"])
+    assert result.exit_code == 0, result.output
+    assert runner.invoke(app, [*command, "--host", "127.0.0.1"]).exit_code == 0
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "fake-token")
+    assert runner.invoke(app, [*command, "--host", "0.0.0.0"]).exit_code == 0
+    assert len(served) == 3
 
 
 def test_data_download_skips_optional_datasets(

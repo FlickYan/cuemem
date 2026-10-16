@@ -1,6 +1,7 @@
 # CueMem 的容器镜像（N12）：HTTP 接口 + 记忆浏览界面 + OpenAI 兼容的记忆代理（/v1），一个进程。
 #   docker build -t cuemem .
-#   docker run -p 7860:7860 -v cuemem-data:/data --env-file .env cuemem
+#   docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem
+# .env 里要有 CUEMEM_API_TOKEN：容器里监听 0.0.0.0，没有访问令牌时拒绝启动。
 # 多进程 / 大规模部署见 docker-compose.yml（Qdrant 服务端）。
 FROM python:3.12-slim AS build
 COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /bin/uv
@@ -25,5 +26,6 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/health')"
 ENTRYPOINT ["cuemem"]
-# 演示的导购场景要用仓库里的商品目录，镜像里用通用助手；访问令牌用 CUEMEM_API_TOKEN 设置
+# 演示的导购场景要用仓库里的商品目录，镜像里用通用助手；访问令牌 CUEMEM_API_TOKEN 必须设置
+# （不鉴权在可信网络里跑：命令后面加 --insecure-no-auth）
 CMD ["serve", "--host", "0.0.0.0", "--port", "7860", "--scenario", "plain", "--space", "default"]

@@ -1,7 +1,7 @@
 # CueMem + Qdrant 服务端（N12）。本地模式的向量库同一时间只能被一个进程打开、规模大了会变慢（D-005、
 # D-056）；这里改用 Qdrant 服务端。
-#   cp .env.example .env    # 填 Key（或者 CUEMEM_PRESET=ollama，不要 Key）
-#   docker compose up -d
+#   cp .env.example .env    # 填 Key（或者 CUEMEM_PRESET=ollama，不要 Key），并设置 CUEMEM_API_TOKEN
+#   docker compose up -d    # 没有 CUEMEM_API_TOKEN 时拒绝启动
 #   界面 http://localhost:7860/ · 接口文档 /docs · OpenAI 兼容的记忆代理 http://localhost:7860/v1
 services:
   qdrant:
@@ -17,14 +17,16 @@ services:
     depends_on:
       - qdrant
     ports:
-      - "7860:7860"
+      # 只映射到宿主机的本机地址；要让局域网或公网访问，改成 "7860:7860"（或放在反向代理后面）
+      - "127.0.0.1:7860:7860"
     env_file:
       - path: .env
         required: false
     environment:
       CUEMEM_VECTOR_STORE__URL: http://qdrant:6333
       CUEMEM_PRESET: ${CUEMEM_PRESET:-}
-      CUEMEM_API_TOKEN: ${CUEMEM_API_TOKEN:-}
+      # 必填：接口、界面与记忆代理的访问令牌（容器里监听 0.0.0.0，没有令牌时 cuemem 拒绝启动）
+      CUEMEM_API_TOKEN: ${CUEMEM_API_TOKEN:?在 .env 里设置 CUEMEM_API_TOKEN（openssl rand -hex 32）}
       # 用宿主机上的 Ollama 时：
       # CUEMEM_PROVIDERS__OLLAMA__BASE_URL: http://host.docker.internal:11434/v1
     extra_hosts:

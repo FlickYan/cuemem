@@ -3,9 +3,10 @@
 界面（Gradio）挂在同一个应用的根路径上，与接口共用一个服务对象（api/ui.py）。
 接口文档：启动后打开 /docs。
 
-访问令牌（可选，N11）：设置环境变量 CUEMEM_API_TOKEN 后，/api 下除健康检查外的接口都要带
+访问令牌（N11）：设置环境变量 CUEMEM_API_TOKEN 后，/api 下除健康检查外的接口都要带
 Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密码填令牌）。不设置时不鉴权，
-只适合在本机演示（cuemem serve 默认只监听 127.0.0.1）。
+只适合在本机演示：cuemem serve 默认只监听 127.0.0.1，监听别的地址又没有令牌时拒绝启动
+（加 --insecure-no-auth 才照常启动）。
 """
 
 from __future__ import annotations

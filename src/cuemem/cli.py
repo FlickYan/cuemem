@@ -25,6 +25,7 @@ cuemem migrate-vectors --to URL       把本地向量库复制到 Qdrant 服务�
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import time
@@ -475,6 +476,35 @@ def _service(
     return settings, service
 
 
+INSECURE_HELP = (
+    "监听非本机地址又没有设置 CUEMEM_API_TOKEN 时也照常启动（不鉴权：能连到这台机器的人都能"
+    "读写、删除记忆，用你的上游 Key）。只在可信的网络里用"
+)
+
+
+def _is_loopback(host: str) -> bool:
+    """监听地址是不是只有本机能连（127.0.0.0/8、::1、localhost）。"""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _require_token(host: str, token: str | None, insecure: bool) -> None:
+    """监听非本机地址时必须设访问令牌：没有令牌时拒绝启动，除非显式加 --insecure-no-auth。
+    容器里总是监听 0.0.0.0（看不出宿主机只映射到了本机），所以镜像也要设令牌。"""
+    from cuemem.api.app import TOKEN_ENV
+
+    if token or insecure or _is_loopback(host):
+        return
+    console.print(
+        f"[red]监听 {escape(host)} 但没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
+        f"读写、删除记忆，用你的上游 Key。[/red]\n在 .env 里设置 {TOKEN_ENV}（例如用 openssl rand"
+        " -hex 32 生成）；只在可信的网络里使用时也可以加 --insecure-no-auth。"
+    )
+    raise typer.Exit(2)
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
@@ -484,6 +514,9 @@ def serve(
     router: Annotated[str, typer.Option(help="默认的检索控制器")] = "learned",
     lam: Annotated[float | None, typer.Option(help="成本旋钮 λ；默认取控制器模型里的值")] = None,
     no_ui: Annotated[bool, typer.Option("--no-ui", help="只启动 HTTP 接口")] = False,
+    insecure_no_auth: Annotated[
+        bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
+    ] = False,
 ) -> None:
     """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。"""
     import uvicorn
@@ -493,6 +526,11 @@ def serve(
 
     settings, service = _service(space, scenario, router, lam)
     token = os.environ.get(TOKEN_ENV) or None  # _service 加载配置时已读入 .env
+    try:
+        _require_token(host, token, insecure_no_auth)
+    except typer.Exit:
+        service.close()
+        raise
     proxy = MemoryProxy(service.system)  # 同一个记忆系统：经代理写入的对话在界面里也能看到
     try:
         app_ = create_app(
@@ -508,10 +546,10 @@ def serve(
         )
         if token:
             console.print(f"已启用访问令牌（{TOKEN_ENV}）：接口要带 Bearer 令牌，界面要先登录")
-        elif host not in ("127.0.0.1", "localhost", "::1"):
+        elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(
-                f"[yellow]注意：[/yellow]监听 {host} 但没有设置 {TOKEN_ENV}，"
-                "能连到这台机器的人都能读写、删除记忆"
+                f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
+                "（--insecure-no-auth），能连到这台机器的人都能读写、删除记忆"
             )
         uvicorn.run(app_, host=host, port=port, log_level="warning")
     finally:
@@ -531,6 +569,9 @@ def proxy(
     ] = None,
     mode: Annotated[str, typer.Option(help="检索档位：auto（控制器选）、l0、l1、l2")] = "auto",
     idle_minutes: Annotated[float, typer.Option(help="会话空闲多少分钟后结束并抽取事实")] = 30.0,
+    insecure_no_auth: Annotated[
+        bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
+    ] = False,
 ) -> None:
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
@@ -542,8 +583,9 @@ def proxy(
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(RecallMode))}[/red]")
         raise typer.Exit(1)
     settings = load_settings(peak_policy="warn")
+    token = os.environ.get(TOKEN_ENV) or None  # load_settings 已读入 .env
+    _require_token(host, token, insecure_no_auth)
     system = MemorySystem.from_settings(settings)
-    token = os.environ.get(TOKEN_ENV) or None
     memory_proxy = MemoryProxy(
         system, default_user=user, mode=cast(RecallMode, mode), idle_minutes=idle_minutes
     )
@@ -558,10 +600,10 @@ def proxy(
         )
         if token:
             console.print(f"已启用访问令牌（{TOKEN_ENV}）：OpenAI SDK 的 api_key 填这个令牌")
-        elif host not in ("127.0.0.1", "localhost", "::1"):
+        elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(
-                f"[yellow]注意：[/yellow]监听 {host} 但没有设置 {TOKEN_ENV}，"
-                "能连到这台机器的人都能用你的上游 Key、读写记忆"
+                f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
+                "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
             )
         uvicorn.run(create_proxy_app(memory_proxy, token=token), host=host, port=port)
     finally:
