@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Any
 
 import n9_report as N9
-from n7_controller import add_export_flags, check_export
+from n7_controller import add_export_flags, finish_export
 from n11_controller_v2 import IMAGE_FLOOR, OUT, RUNS, add_scene, frozen, pct, versus
 
 from cuemem.evals import routing as R
@@ -112,8 +112,8 @@ def main() -> None:
     v2 = LearnedController.load(V2_MODEL)
     tau, dev = choose_tau(v2)
     model = v3_model(json.loads(V2_MODEL.read_text(encoding="utf-8")), tau)
-    if args.check:  # 在写任何结果之前：对不上时 docs/results 也不动
-        check_export(DEFAULT_MODEL, model)
+    if finish_export(args, DEFAULT_MODEL, model):  # 在写任何结果之前：对不上时都不动
+        print(f"导出 v3：{DEFAULT_MODEL}")
     v3 = gated(v2, tau)
     result = {"rule": "开发集准确率不低于 v2 的最大 τ", "tau": tau, "dev": dev}
     result["test_post_hoc"] = test_replay(v2, v3)
@@ -122,11 +122,6 @@ def main() -> None:
         json.dumps(result, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
     )
     print(f"结果：{OUT / 'see_gate.json'}")
-    if not args.no_export:
-        DEFAULT_MODEL.write_text(
-            json.dumps(model, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
-        )
-        print(f"导出 v3：{DEFAULT_MODEL}")
 
 
 if __name__ == "__main__":

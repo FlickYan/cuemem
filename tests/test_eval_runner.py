@@ -714,6 +714,45 @@ def test_training_scripts_accept_the_verify_flags(script: str) -> None:
     assert "--no-export" in done.stdout and "--check" in done.stdout
 
 
+def test_training_scripts_check_before_they_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """三个训练脚本共用的 finish_export：--no-export --check 从不写；对不上时在写任何东西之前以
+    非零退出码结束；不带参数时写入。三个脚本都只经它写控制器文件，并且在写结果之前调用。"""
+    import argparse
+    import importlib
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root / "scripts"))
+    n7 = importlib.import_module("n7_controller")
+    parser = argparse.ArgumentParser()
+    n7.add_export_flags(parser, "controller_model.json")
+    frozen = {"lambda": 0.1, "coef": [[1.0, 2.0]], "created": "2026-01-01"}
+    path = tmp_path / "controller_model.json"
+    path.write_text(json.dumps(frozen), encoding="utf-8")
+    committed = path.read_bytes()
+
+    same = {**frozen, "coef": [[1.0, 2.000001]], "created": "2026-10-21"}  # 浮点噪声、导出日期
+    assert not n7.finish_export(parser.parse_args(["--no-export", "--check"]), path, same)
+    drifted = {**frozen, "coef": [[1.0, 2.5]]}
+    for argv in (["--no-export", "--check"], ["--check"]):
+        with pytest.raises(SystemExit, match="对不上"):
+            n7.finish_export(parser.parse_args(argv), path, drifted)
+    assert path.read_bytes() == committed
+    missing = tmp_path / "missing.json"
+    assert not n7.finish_export(parser.parse_args(["--no-export"]), missing, drifted)
+    assert not missing.exists()
+    assert n7.finish_export(parser.parse_args([]), path, drifted)  # 有意更新：直接运行时照旧导出
+    assert path.read_text("utf-8") == json.dumps(drifted, ensure_ascii=False, indent=1) + "\n"
+
+    for script in TRAINING_SCRIPTS:
+        source = (root / script).read_text("utf-8")
+        assert not re.search(r"\b(V1_MODEL|V2_MODEL|DEFAULT_MODEL)\.write_text", source), script
+        main = source[source.index("\ndef main(") :]  # docs/results 下的结果在 OUT 里
+        assert 0 <= main.index("finish_export(") < main.index("(OUT / "), script
+
+
 class _FakeSteps:
     """替身的 subprocess.run：评测运行按 plan 依次往运行目录里追加结果与报错，返回给定的退出码。"""
 

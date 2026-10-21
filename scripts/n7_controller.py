@@ -316,6 +316,17 @@ def check_export(path: Path, fresh: dict[str, Any]) -> None:
     print(f"核对通过：重新训练的控制器与 {path.name} 一致（导出日期除外）")
 
 
+def finish_export(args: argparse.Namespace, path: Path, model: dict[str, Any]) -> bool:
+    """三个训练脚本在写任何结果（docs/results）之前调用：--check 时先与仓库里的 path 比对，对不上
+    时以非零退出码结束、什么都不写；不带 --no-export 时再写入 path。返回是否写了。"""
+    if args.check:
+        check_export(path, model)
+    if args.no_export:
+        return False
+    path.write_text(json.dumps(model, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return True
+
+
 def add_export_flags(parser: argparse.ArgumentParser, filename: str) -> None:
     """三个训练脚本（N7 的 v1、N11 的 v2 与 v3）共用的导出开关。"""
     parser.add_argument("--no-export", action="store_true", help=f"只评测，不覆盖 {filename}")
@@ -539,12 +550,7 @@ def main() -> None:
         "created": datetime.now().strftime("%Y-%m-%d"),
     }
     model = final.to_json(lam=lam, meta=meta)
-    if args.check:  # 在写任何结果之前：对不上时 docs/results 也不动
-        check_export(V1_MODEL, model)
-    if not args.no_export:
-        V1_MODEL.write_text(
-            json.dumps(model, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
-        )
+    finish_export(args, V1_MODEL, model)  # 在写任何结果之前：对不上时 docs/results 也不动
     (OUT / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )

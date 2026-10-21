@@ -197,8 +197,8 @@ def fit_v2(
     return final.to_json(lam=lam, meta=meta)
 
 
-def export_v2(model: dict[str, Any]) -> None:
-    V2_MODEL.write_text(json.dumps(model, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+def exported_v2(model: dict[str, Any]) -> None:
+    """导出 v2 之后：与 v1 比一比类型模型。"""
     v1 = json.loads(V1_MODEL.read_text(encoding="utf-8"))
     same = np.allclose(np.asarray(v1["coef"]), np.asarray(model["coef"]), atol=1e-5)
     print(f"导出 v2：{V2_MODEL}（λ = {model['lambda']:g}；类型模型与 v1 一致：{same}）")
@@ -397,10 +397,8 @@ def main() -> None:
     print(f"开发集 λ：{dev['lambda']}；AUC：{dev['auc']}")
     if args.check or not args.no_export:
         model = fit_v2(items, names, lam_v2, memory)
-        if args.check:  # 在写任何结果之前：对不上时 docs/results 也不动
-            N7.check_export(V2_MODEL, model)
-        if not args.no_export:
-            export_v2(model)
+        if N7.finish_export(args, V2_MODEL, model):  # 在写任何结果之前：对不上时都不动
+            exported_v2(model)
     ctrl_v1 = LearnedController.load(V1_MODEL)
     ctrl_v2 = LearnedController.load(V2_MODEL)
     results = {
