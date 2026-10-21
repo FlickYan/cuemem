@@ -192,7 +192,12 @@ def create_app(
 
     allowed_hosts：只接受这些 Host（接口与界面；None 不检查）。origin_hosts：除同源外放行的
     Origin 主机名（"*" 不限）。见模块说明。
+
+    upload_dir：上传的图片只在请求期间放在这里，写进记忆之后就删（媒体库里另存一份）。建应用时
+    先清掉里面留下的图片：以前的版本一直留着上传的原图，遗忘之后磁盘上还有一份（D-021）；
+    会话不跨进程，这时没有会话还在读它们。
     """
+    _clear_uploads(upload_dir)
     app = FastAPI(
         title="CueMem",
         version=__version__,
@@ -374,6 +379,15 @@ def create_app(
         )
     _guard(app, allowed_hosts, origin_hosts)  # 中间件：落到界面的预检请求也先过这里
     return app
+
+
+def _clear_uploads(directory: Path) -> None:
+    """删掉上传目录里直接放着的图片（只认 _save_upload 会写的扩展名，别的文件不动）。"""
+    if not directory.is_dir():
+        return
+    for path in directory.iterdir():
+        if path.suffix.lower() in IMAGE_TYPES and path.is_file():
+            path.unlink(missing_ok=True)
 
 
 def _save_upload(upload: UploadFile, directory: Path) -> str:

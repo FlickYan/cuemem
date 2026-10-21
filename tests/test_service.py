@@ -432,6 +432,19 @@ def _holding(root: Path, data: bytes, *, skip: Path) -> list[Path]:
     ]
 
 
+def test_uploads_left_by_earlier_versions_are_removed(service: ChatService, tmp_path: Path) -> None:
+    """以前的版本把经 HTTP 发的照片一直留在上传目录里，遗忘之后磁盘上还有一份：建应用时清掉。
+    只删上传会写的图片，别的文件不动。"""
+    uploads = tmp_path / "uploads"
+    old = _picture(uploads / "0f1e2d3c4b5a69788796a5b4c3d2e1f0.jpg", "red")
+    _picture(uploads / "older.PNG", "blue")
+    notes = uploads / "notes.txt"
+    notes.write_text("keep me", encoding="utf-8")
+    create_app(service, upload_dir=uploads, ui=False)
+    assert not old.exists() and sorted(p.name for p in uploads.iterdir()) == ["notes.txt"]
+    create_app(service, upload_dir=tmp_path / "missing", ui=False)  # 目录还不存在也行
+
+
 def test_http_api(service: ChatService, tmp_path: Path, catalog_root: Path) -> None:
     uploads = tmp_path / "uploads"
     client = TestClient(create_app(service, upload_dir=uploads, ui=False))
