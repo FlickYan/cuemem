@@ -14,6 +14,7 @@ from scripted import (
     TOY_EXTRACTIONS,
     TOY_UPDATE_KEYWORDS,
     ScriptedModel,
+    echo_extraction,
     growing_extraction,
     reconcile_by_keyword,
 )
@@ -321,6 +322,68 @@ def test_close_timeout_does_not_record_closed_db_error(
         assert [f["memory"] for f in again.get_all(user_id="alice")["results"]] == [
             "The user lives in Berlin."
         ]
+
+
+def said_once(session_id: str, text: str, day: int) -> SessionIn:
+    return SessionIn(
+        session_id=session_id,
+        started_at=datetime(2026, 9, day, 10),
+        turns=[TurnIn(role="user", text=text)],
+    )
+
+
+@pytest.mark.parametrize("rebuild", [True, False], ids=["rebuild", "plain"])
+def test_consolidate_reads_open_sessions_once_it_holds_the_lock(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch, rebuild: bool
+) -> None:
+    """显式的巩固要等后台线程做完手上这一轮才拿到巩固锁。等锁期间结束的会话照样被抽取（重建时
+    它刚登记的任务被清空，要重新登记）；等锁期间新开、已经说了几句的会话不被抽取半段。"""
+    model = ScriptedModel(echo_extraction)
+    entered, release, asked = threading.Event(), threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "SLOW" in str(body["messages"]) and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        if rebuild:
+            system.open_session("u", "x")
+            system.append("u", said_once("x", "I live in Paris", 2), 0)  # 进行中：不登记
+        system.append("u", said_once("slow", "SLOW extraction in flight", 1), 0)
+        assert entered.wait(10)  # 后台线程拿着巩固锁，卡在抽取里
+
+        exclusive = system.consolidator.exclusive
+
+        def announced(space_id: str) -> Any:
+            asked.set()
+            return exclusive(space_id)
+
+        monkeypatch.setattr(system.consolidator, "exclusive", announced)
+        waiting = threading.Thread(target=lambda: system.consolidate("u", rebuild=rebuild))
+        waiting.start()
+        assert asked.wait(10)  # 显式的巩固在等锁
+        if rebuild:
+            system.close_session("u", "x", submit=False)  # 会话结束：登记任务
+        else:
+            system.open_session("u", "y")  # 新的一段对话开始，已经说了一句
+            system.append("u", said_once("y", "I am planning a trip", 3), 0)
+        release.set()
+        waiting.join(10)
+        worker.wait()
+        assert not worker.errors
+        jobs = {j["session_id"]: j["status"] for j in system.db.get_jobs("u")}
+        facts = sorted(f.statement for f in system.facts("u"))
+        if rebuild:
+            assert jobs == {"slow": "done", "x": "done"}
+            assert facts == ["I live in Paris", "SLOW extraction in flight"]
+        else:
+            assert jobs == {"slow": "done"} and facts == ["SLOW extraction in flight"]
+            system.close_session("u", "y", wait=True)
+            assert "I am planning a trip" in [f.statement for f in system.facts("u")]
 
 
 def test_content_filter_skips_session_or_falls_back_to_rules(

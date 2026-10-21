@@ -203,11 +203,13 @@ class Consolidator:
         recorded = self.db.get_meta(f"consolidation:{space_id}")
         return bool(jobs) and recorded is not None and recorded != self.fingerprint()
 
-    def rebuild(self, space_id: str, *, skip: Collection[str] = ()) -> None:
-        """清空派生记忆（数据库与向量），再为全部会话（skip 里的除外）登记任务。"""
+    def rebuild(self, space_id: str) -> None:
+        """清空派生记忆（数据库与向量），再为全部会话登记任务，进行中的会话（open_sessions）
+        除外。进行中的会话在清空之后才读：这期间结束的会话（close_session 先把它移出进行中、
+        再登记任务），任务要么在清空之后登记、不会被删，要么在这里登记。"""
         removed = self.db.clear_derived(space_id)
         self.vectors.delete(space_id, removed)
-        self.enqueue(space_id, skip=skip)
+        self.enqueue(space_id, skip=self.open_sessions(space_id))
 
     def retry_due(
         self,
@@ -280,7 +282,7 @@ class Consolidator:
             )
             return
         record_event("consolidate_regrown_replay", sessions=sorted(regrown))
-        self.rebuild(space_id, skip=self.open_sessions(space_id))
+        self.rebuild(space_id)
 
     def _run(self, space_id: str, cache_scope: str) -> ConsolidationReport:
         started = time.perf_counter()

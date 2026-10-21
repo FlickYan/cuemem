@@ -469,16 +469,18 @@ class MemorySystem:
         """执行待处理的巩固任务。rebuild=True（或抽取逻辑版本变化）时先清空派生记忆再全部重放。
 
         strict=True 时有会话抽取失败就抛出异常（评测用：宁可整题重试，也不要残缺的记忆）。
+
+        进行中的会话拿到锁之后再读（重建时在清空之后读，见 Consolidator.rebuild）：等锁可能要等
+        后台线程做完一整轮巩固，这期间新开的会话不能被抽取半段，结束的会话也不能没有任务。
         """
-        skip = self.open_sessions(space_id)
         with (
             self.consolidator.exclusive(space_id),  # 清空重建不能和后台线程的巩固交错
             start_trace("consolidate", self.tracer, space=space_id) as trace,
         ):
             if rebuild or self.consolidator.stale(space_id):
-                self.consolidator.rebuild(space_id, skip=skip)
+                self.consolidator.rebuild(space_id)
             self.db.retry_failed_jobs(space_id)
-            self.consolidator.enqueue(space_id, skip=skip)
+            self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
             report = self.consolidator.run(space_id)
             trace.attrs.update(report.as_dict())
         if strict and report.failed:
