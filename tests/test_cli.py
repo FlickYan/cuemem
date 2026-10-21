@@ -236,13 +236,15 @@ def test_demo_and_chat_commands(
 def test_require_token(host: str, token: str | None, insecure: bool, starts: bool) -> None:
     import typer
 
+    from cuemem.api.auth import Keys
     from cuemem.cli import _require_token
 
+    keys = Keys.from_token(token)
     if starts:
-        _require_token(host, token, insecure)
+        _require_token(host, keys, insecure)
     else:
         with pytest.raises(typer.Exit):
-            _require_token(host, token, insecure)
+            _require_token(host, keys, insecure)
 
 
 @pytest.fixture
@@ -341,6 +343,50 @@ def test_unknown_models_are_rejected_on_request(
         response = client.post("/v1/chat/completions", json=body)
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "model_not_found"
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_scoped_keys_from_the_environment(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]
+) -> None:
+    """CUEMEM_API_KEYS_FILE（或 CUEMEM_API_KEYS）给出限定作用域的令牌：只有它们、没有
+    CUEMEM_API_TOKEN 也算设了令牌，可以监听非本机地址；每个令牌只能访问自己的用户。文件写错时
+    在打开记忆系统之前报错（退出码 1），不带令牌本身。"""
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+
+    keys = tmp_path / "keys.yaml"
+    keys.write_text(
+        "keys:\n  - {name: alice-app, token: alice-0123456789, scopes: [{user: alice}]}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(keys))
+    result = runner.invoke(app, [*command, "--host", "0.0.0.0"])
+    assert result.exit_code == 0, result.output
+    assert "alice-app" in result.output and "alice-0123456789" not in result.output
+    # 命令已经退出、记忆系统已关：只看在碰记忆之前就做完的检查
+    client = TestClient(served[-1])
+    alice = {"Authorization": "Bearer alice-0123456789"}
+    body = {"messages": [{"role": "user", "content": "hi"}], "user": "bob"}
+    response = client.post("/v1/chat/completions", json=body, headers=alice)
+    assert response.status_code == 403 and response.json()["error"]["code"] == "forbidden"
+    assert client.get("/v1/models", headers={"Authorization": "Bearer x"}).status_code == 401
+    if command[0] == "serve":
+        assert client.get("/api/spaces/bob/facts", headers=alice).status_code == 403
+
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0  # 留下待处理的任务
+    with sqlite3.connect(os.environ["CUEMEM_PATHS__DB"]) as conn:
+        pending = conn.execute("SELECT id, status FROM jobs ORDER BY id").fetchall()
+    keys.write_text("keys:\n  - {name: a, token: alice-0123456789, scopes: []}\n", encoding="utf-8")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1 and "错误" in result.output and "scopes" in result.output
+    assert "alice-0123456789" not in result.output and len(served) == 1
+    with sqlite3.connect(os.environ["CUEMEM_PATHS__DB"]) as conn:
+        assert conn.execute("SELECT id, status FROM jobs ORDER BY id").fetchall() == pending
+    monkeypatch.setenv("CUEMEM_API_KEYS", "keys: []")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1 and "只能设一个" in result.output
 
 
 def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(

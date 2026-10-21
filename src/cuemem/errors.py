@@ -55,6 +55,10 @@ class StorageLockedError(CueMemError):
     """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
 
 
+class AccessKeysError(CueMemError):
+    """限定作用域的访问令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）读不出来或写错了。"""
+
+
 class MemoryAPIError(CueMemError):
     """远程记忆接口（cuemem.client.MemoryClient）的出错里，没有对应的本地异常的那些：令牌不对、
     连不上服务、找不到接口等。status 是 HTTP 状态码（连不上时为 None），code 是 /api/v1 的

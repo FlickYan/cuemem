@@ -58,6 +58,7 @@ from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
 if TYPE_CHECKING:
     from cuemem.agent import Reply
+    from cuemem.api.auth import Keys
     from cuemem.api.service import ChatService
     from cuemem.core.models import Answer, Fact
     from cuemem.evals.datasets import EvalSet
@@ -515,17 +516,37 @@ def _is_loopback(host: str) -> bool:
         return host.lower() == "localhost"
 
 
-def _require_token(host: str, token: str | None, insecure: bool) -> None:
-    """监听非本机地址时必须设访问令牌：没有令牌时拒绝启动，除非显式加 --insecure-no-auth。
-    容器里总是监听 0.0.0.0（看不出宿主机只映射到了本机），所以镜像也要设令牌。"""
-    from cuemem.api.app import TOKEN_ENV
+def _access_keys() -> Keys:
+    """访问令牌：CUEMEM_API_TOKEN 与限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS，
+    见 api/auth.py）。在读完配置（数据目录的 .env 已加载）之后、打开记忆系统之前调用；写错时
+    AccessKeysError（CueMemError），由调用方打印原因。"""
+    from cuemem.api.auth import Keys
 
-    if token or insecure or _is_loopback(host):
+    return Keys.from_env()
+
+
+def _keys_note(keys: Keys) -> str:
+    from cuemem.api.auth import TOKEN_ENV
+
+    parts = [f"管理令牌（{TOKEN_ENV}）"] if keys.admin is not None else []
+    if keys.names:
+        parts.append(f"{len(keys.names)} 个限定作用域的令牌（{'、'.join(keys.names)}）")
+    return "、".join(parts)
+
+
+def _require_token(host: str, keys: Keys, insecure: bool) -> None:
+    """监听非本机地址时必须设访问令牌：没有令牌时拒绝启动，除非显式加 --insecure-no-auth。
+    容器里总是监听 0.0.0.0（看不出宿主机只映射到了本机），所以镜像也要设令牌。只有限定作用域的
+    令牌、没有管理令牌也算设了。"""
+    from cuemem.api.auth import KEYS_FILE_ENV, TOKEN_ENV
+
+    if keys.enabled or insecure or _is_loopback(host):
         return
     console.print(
         f"[red]监听 {escape(host)} 但没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
         f"读写、删除记忆，用你的上游 Key。[/red]\n在 .env 里设置 {TOKEN_ENV}（例如用 openssl rand"
-        " -hex 32 生成）；只在可信的网络里使用时也可以加 --insecure-no-auth。"
+        f" -hex 32 生成），或用 {KEYS_FILE_ENV} 给出限定作用域的令牌；只在可信的网络里使用时"
+        "也可以加 --insecure-no-auth。"
     )
     raise typer.Exit(2)
 
@@ -582,7 +603,8 @@ def serve(
     界面要用可选依赖 ui（Gradio）；没装时只启动 HTTP 接口与记忆代理，并说明怎么装。"""
     import uvicorn
 
-    from cuemem.api.app import TOKEN_ENV, create_app
+    from cuemem.api.app import create_app
+    from cuemem.api.auth import TOKEN_ENV, Keys
     from cuemem.api.proxy import MemoryProxy
 
     ui = not no_ui
@@ -593,12 +615,14 @@ def serve(
         )
         ui = False
     unknown = _unknown_model(unknown_model)
+    keys = Keys()
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
-        _require_token(host, os.environ.get(TOKEN_ENV) or None, insecure_no_auth)
+        nonlocal keys
+        keys = _access_keys()
+        _require_token(host, keys, insecure_no_auth)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
-    token = os.environ.get(TOKEN_ENV) or None
     allowed_hosts, origin_hosts = _host_policy(host)
     # 同一个记忆系统：经代理写入的对话在界面里也能看到
     proxy = MemoryProxy(service.system, unknown_model=unknown)
@@ -607,7 +631,7 @@ def serve(
             service,
             upload_dir=settings.paths.media.parent / "uploads",
             ui=ui,
-            token=token,
+            keys=keys,
             proxy=proxy,
             allowed_hosts=allowed_hosts,
             origin_hosts=origin_hosts,
@@ -617,8 +641,8 @@ def serve(
             f"{where}接口文档：http://{host}:{port}/docs"
             f" · OpenAI 兼容的记忆代理：http://{host}:{port}/v1"
         )
-        if token:
-            console.print(f"已启用访问令牌（{TOKEN_ENV}）：接口要带 Bearer 令牌，界面要先登录")
+        if keys.enabled:
+            console.print(f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录")
         elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
@@ -650,7 +674,7 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.app import TOKEN_ENV
+    from cuemem.api.auth import TOKEN_ENV
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -659,8 +683,12 @@ def proxy(
         raise typer.Exit(1)
     unknown = _unknown_model(unknown_model)
     settings = load_settings(peak_policy="warn")
-    token = os.environ.get(TOKEN_ENV) or None  # load_settings 已读入 .env
-    _require_token(host, token, insecure_no_auth)
+    try:
+        keys = _access_keys()  # load_settings 已读入 .env
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    _require_token(host, keys, insecure_no_auth)
     allowed_hosts, origin_hosts = _host_policy(host)
     try:
         system = MemorySystem.from_settings(settings)
@@ -683,15 +711,15 @@ def proxy(
             "用户：请求体的 user 字段，或请求头 X-CueMem-User"
             + (f"；默认 {user}" if user else "；没有时原样转发、不碰记忆")
         )
-        if token:
-            console.print(f"已启用访问令牌（{TOKEN_ENV}）：OpenAI SDK 的 api_key 填这个令牌")
+        if keys.enabled:
+            console.print(f"已启用访问令牌：{_keys_note(keys)}。OpenAI SDK 的 api_key 填令牌")
         elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
                 "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
             )
         app_ = create_proxy_app(
-            memory_proxy, token=token, allowed_hosts=allowed_hosts, origin_hosts=origin_hosts
+            memory_proxy, keys=keys, allowed_hosts=allowed_hosts, origin_hosts=origin_hosts
         )
         uvicorn.run(app_, host=host, port=port)
     finally:

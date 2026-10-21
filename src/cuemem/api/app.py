@@ -9,6 +9,10 @@ Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密�
 只适合在本机演示：cuemem serve 默认只监听 127.0.0.1，监听别的地址又没有令牌时拒绝启动
 （加 --insecure-no-auth 才照常启动）。
 
+多租户（N12 之后）：CUEMEM_API_KEYS_FILE 另外给出限定作用域的令牌，每个令牌只能访问列出的用户
+（与 Agent）的记忆，/api、/api/v1、界面与记忆代理都按它检查（格式与规则见 api/auth.py）。界面里
+用这种令牌登录时，用户名填令牌的名字。
+
 浏览器（N12）：/api、/v1 与界面的 /gradio_api 不接受别的网站发来的请求（SameOriginOnly），否则
 任何网页都能借访问者的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受
 这些 Host（cuemem serve / proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，
@@ -19,19 +23,17 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import secrets
 import shutil
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, get_args
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -39,6 +41,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
+from cuemem.api.auth import Keys, Principal, guard, principal_of, ui_login
 from cuemem.api.failures import provider_failure
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
@@ -55,12 +58,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-TOKEN_ENV = "CUEMEM_API_TOKEN"
 # 额外接受的主机名（逗号分隔，"*" 表示不限）：监听本机地址时追加进 Host 白名单，也作为 Origin 放行
 HOSTS_ENV = "CUEMEM_ALLOWED_HOSTS"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")  # Host 头里的 IPv6 地址带方括号
-# 放在模块级：注解是字符串（from __future__ import annotations），FastAPI 解析不到函数里的局部变量
-_BEARER = HTTPBearer(auto_error=False)
 
 
 class SameOriginOnly:
@@ -171,25 +171,24 @@ def _router(value: str | None) -> Router | None:
     return value  # type: ignore[return-value]
 
 
-def _same(given: str, token: str) -> bool:
-    return secrets.compare_digest(given.encode(), token.encode())
+def _check_space(who: Principal, space: str) -> str:
+    """令牌的作用域之外的空间：403（空间是请求自己点名的，不涉及别人有没有数据）。"""
+    if not who.allows(space):
+        raise HTTPException(403, f"这个访问令牌不能访问记忆空间 {space}")
+    return space
 
 
-def _token_check(token: str) -> Callable[..., None]:
-    def check(
-        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],
-    ) -> None:
-        if credentials is None or not _same(credentials.credentials, token):
-            raise HTTPException(401, "缺少或错误的访问令牌", headers={"WWW-Authenticate": "Bearer"})
-
-    return check
+def _import_target(data: Mapping[str, Any], space: str | None) -> str | None:
+    """导入写进哪个空间：与 import_space 的取法相同（参数优先，否则是文件里的 space_id）。"""
+    return space or (str(data["space_id"]) if "space_id" in data else None)
 
 
-def _ui_login(token: str | None) -> Callable[[str, str], bool] | None:
-    """界面的登录检查：用户名任意，密码是访问令牌。"""
-    if not token:
-        return None
-    return lambda _user, password: _same(password, token)
+def _allowed_space(space: str, http: Request) -> str:
+    """/api/spaces/{space}/… 的路径参数，先过作用域检查（路由的依赖，在 guard 之后执行）。"""
+    return _check_space(principal_of(http), space)
+
+
+AllowedSpace = Annotated[str, Depends(_allowed_space)]
 
 
 def create_app(
@@ -198,11 +197,14 @@ def create_app(
     upload_dir: Path,
     ui: bool = True,
     token: str | None = None,
+    keys: Keys | None = None,
     proxy: MemoryProxy | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
 ) -> FastAPI:
-    """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。
+    """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。keys：管理令牌之外还有限定
+    作用域的令牌（Keys.from_env，见 api/auth.py；给了时不看 token）：每个令牌只能访问自己作用域
+    里的空间，/api、/api/v1、界面与记忆代理都检查。
 
     proxy：同时提供 OpenAI 兼容的记忆代理（/v1/chat/completions，N12），与界面共用一个记忆系统，
     经代理写入的对话可以在界面里浏览。
@@ -220,19 +222,31 @@ def create_app(
         version=__version__,
         description="Long-term multimodal memory for LLM agents: chat, browse, forget, recall.",
     )
-    guarded = [Depends(_token_check(token))] if token else []
+    keys = keys if keys is not None else Keys.from_token(token)
+    guarded = guard(keys)  # 认出令牌（principal_of）；没有配令牌时不鉴权
     api = APIRouter(dependencies=guarded)
+
+    def own_session(http: Request, session_id: str) -> None:
+        """会话属于作用域之外的空间时，与不存在的会话一样 404（会话 ID 不是探测的途径）。"""
+        try:
+            space = service.get(session_id).space_id
+        except KeyError:
+            return  # 由服务层照常报 404
+        if not principal_of(http).allows(space):
+            raise HTTPException(404, f"没有进行中的会话 {session_id}")
 
     @app.get("/api/health")  # 不鉴权：给负载均衡与监控探活用
     def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__, "open_sessions": len(service.sessions)}
 
     @api.get("/api/spaces")
-    def spaces() -> list[dict[str, Any]]:
-        return service.spaces()
+    def spaces(http: Request) -> list[dict[str, Any]]:
+        who = principal_of(http)
+        return [row for row in service.spaces() if who.allows(row["space_id"])]
 
     @api.post("/api/sessions")
-    def start(request: StartRequest) -> SessionOut:
+    def start(http: Request, request: StartRequest) -> SessionOut:
+        _check_space(principal_of(http), request.space or service.default_space)
         session = service.start(request.space, at=request.at)
         return SessionOut(
             session_id=session.session_id, space=session.space_id, started_at=session.started_at
@@ -240,6 +254,7 @@ def create_app(
 
     @api.post("/api/sessions/{session_id}/messages")
     def message(
+        http: Request,
         session_id: str,
         text: Annotated[str, Form()],
         images: Annotated[list[UploadFile] | None, File()] = None,
@@ -247,6 +262,7 @@ def create_app(
         router: Annotated[str | None, Form()] = None,
         lam: Annotated[float | None, Form()] = None,
     ) -> Reply:
+        own_session(http, session_id)  # 在存下上传的图片之前
         paths: list[str] = []
         try:
             for upload in images or []:
@@ -264,14 +280,16 @@ def create_app(
             _discard(paths, service, session_id)
 
     @api.post("/api/sessions/{session_id}/end")
-    def end(session_id: str, wait: bool = False) -> dict[str, Any]:
+    def end(http: Request, session_id: str, wait: bool = False) -> dict[str, Any]:
+        own_session(http, session_id)
         with _errors():
             return service.end(session_id, wait=wait)
 
-    # 空间 ID 里可以有 "/"（sdk.space_for：bot/alice、agent/shop），所以用 {space:path}。
+    # 空间 ID 里可以有 "/"（sdk.space_for：bot/alice、agent/shop），所以用 {space:path}；路径里的
+    # %2F 在路由之前已经解成 "/"。AllowedSpace 检查令牌的作用域（之外 403）。
     # media 列表排在 media/{media_id} 前面：…/x/media/media 是空间 x/media 的列表（图片 ID 是哈希）
     @api.post("/api/spaces/{space:path}/recall")
-    def recall(space: str, request: RecallRequest) -> dict[str, Any]:
+    def recall(space: AllowedSpace, request: RecallRequest) -> dict[str, Any]:
         with _errors():
             return service.recall(
                 space,
@@ -283,34 +301,34 @@ def create_app(
             )
 
     @api.get("/api/spaces/{space:path}/profile")
-    def profile(space: str) -> dict[str, str]:
+    def profile(space: AllowedSpace) -> dict[str, str]:
         return {"text": service.profile(space)}
 
     @api.get("/api/spaces/{space:path}/facts")
-    def facts(space: str, current_only: bool = False) -> list[dict[str, Any]]:
+    def facts(space: AllowedSpace, current_only: bool = False) -> list[dict[str, Any]]:
         return service.facts(space, current_only=current_only)
 
     @api.get("/api/spaces/{space:path}/entities")
-    def entities(space: str) -> list[dict[str, Any]]:
+    def entities(space: AllowedSpace) -> list[dict[str, Any]]:
         return service.entities(space)
 
     @api.get("/api/spaces/{space:path}/graph")
-    def graph(space: str) -> dict[str, Any]:
+    def graph(space: AllowedSpace) -> dict[str, Any]:
         return service.graph(space)
 
     @api.get("/api/spaces/{space:path}/media")
-    def media(space: str) -> list[dict[str, Any]]:
+    def media(space: AllowedSpace) -> list[dict[str, Any]]:
         return service.media(space)
 
     @api.get("/api/spaces/{space:path}/media/{media_id}")
-    def media_file(space: str, media_id: str) -> FileResponse:
+    def media_file(space: AllowedSpace, media_id: str) -> FileResponse:
         items = service.system.db.get_media(space, ids=[media_id])
         if not items or not Path(items[0].path).exists():
             raise HTTPException(404, "没有这张图片")
         return FileResponse(items[0].path)
 
     @api.get("/api/spaces/{space:path}/sessions")
-    def sessions(space: str) -> list[dict[str, Any]]:
+    def sessions(space: AllowedSpace) -> list[dict[str, Any]]:
         return [
             {
                 "session_id": s.session_id,
@@ -322,11 +340,11 @@ def create_app(
         ]
 
     @api.get("/api/spaces/{space:path}/status")
-    def status(space: str) -> dict[str, Any]:
+    def status(space: AllowedSpace) -> dict[str, Any]:
         return service.status(space)
 
     @api.post("/api/spaces/{space:path}/forget")
-    def forget(space: str, request: ForgetRequest) -> dict[str, Any]:
+    def forget(space: AllowedSpace, request: ForgetRequest) -> dict[str, Any]:
         if request.dry_run:
             with _errors():
                 return service.system.preview_forget(
@@ -353,14 +371,18 @@ def create_app(
         }
 
     @api.get("/api/spaces/{space:path}/export")
-    def export(space: str, derived: bool = True) -> dict[str, Any]:
+    def export(space: AllowedSpace, derived: bool = True) -> dict[str, Any]:
         """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。"""
         with _errors():
             return export_space(service.system, space, derived=derived)
 
     @api.post("/api/spaces/import")
-    def import_(data: dict[str, Any], space: str | None = None) -> dict[str, Any]:
-        """导入 export 的结果（N12）：写回原始日志，派生记忆在后台重新抽取。"""
+    def import_(http: Request, data: dict[str, Any], space: str | None = None) -> dict[str, Any]:
+        """导入 export 的结果（N12）：写回原始日志，派生记忆在后台重新抽取。写进作用域之外的
+        空间（参数，或文件里的 space_id）时 403，什么都不写。"""
+        target = _import_target(data, space)
+        if not principal_of(http).allows(target):
+            raise HTTPException(403, f"这个访问令牌不能导入到记忆空间 {target}")
         with _errors():
             report = import_space(service.system, data, space_id=space)
         if service.system.worker is not None:
@@ -368,12 +390,12 @@ def create_app(
         return report
 
     @api.post("/api/spaces/{space:path}/consolidate")
-    def consolidate(space: str) -> dict[str, Any]:
+    def consolidate(space: AllowedSpace) -> dict[str, Any]:
         with _errors():
             return service.consolidate(space)
 
     app.include_router(api)
-    # Mem0 形状的记忆接口（/api/v1）：与界面、记忆代理共用同一个记忆系统，鉴权相同
+    # Mem0 形状的记忆接口（/api/v1）：与界面、记忆代理共用同一个记忆系统，鉴权与作用域相同
     app.include_router(memories_router(Memory.from_system(service.system), dependencies=guarded))
     install_error_format(app)
     if proxy is not None:
@@ -391,14 +413,17 @@ def create_app(
 
         app = gr.mount_gradio_app(
             app,
-            build_ui(service),
+            build_ui(service, access=keys.by_username),  # 界面里登录的是哪个令牌
             path="/",
             theme=THEME,
             css=CSS,
             allowed_paths=[str(service.system.settings.paths.media)],  # 界面不读上传目录
             footer_links=[],  # 接口文档在 /docs
-            auth=_ui_login(token),
-            auth_message="Sign in with any username and the access token as the password.",
+            auth=ui_login(keys),
+            auth_message=(
+                "Sign in with the access token as the password: any username for the admin "
+                "token, the key's name for a scoped key."
+            ),
         )
     _guard(app, allowed_hosts, origin_hosts)  # 中间件：落到界面的预检请求也先过这里
     return app

@@ -21,7 +21,9 @@
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent）；会话：请求头
 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）或者空闲
 超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
-都没有用户、又没配默认用户时，请求原样转发、不碰记忆。
+都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
+作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
+之前。
 
 另外两个 OpenAI 兼容的接口：
 - /v1/responses：Responses API 的一个子集——非流式、纯文字输入（字符串或 input_text 的消息），
@@ -59,6 +61,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
+from cuemem.api.auth import Keys, Principal, guard, principal_of
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
@@ -174,11 +177,15 @@ class MemoryProxy:
         return {"object": "list", "data": data}
 
     def complete(
-        self, body: dict[str, Any], headers: Mapping[str, str]
+        self,
+        body: dict[str, Any],
+        headers: Mapping[str, str],
+        principal: Principal | None = None,
     ) -> tuple[int, dict[str, Any], dict[str, str]]:
         """非流式：返回（状态码，响应体，附加响应头）。上游出错时原样返回（连同它的
-        Retry-After）、不写记忆；连不上或超时时回 OpenAI 格式的 502 / 504。"""
-        turn, upstream, url, auth = self._prepare(body, headers)
+        Retry-After）、不写记忆；连不上或超时时回 OpenAI 格式的 502 / 504。
+        principal：请求的令牌，用户在它的作用域之外时 ProxyError（403）；None 不限制。"""
+        turn, upstream, url, auth = self._prepare(body, headers, principal)
         extra = _headers(turn, upstream["model"])
         try:
             response = self._http.post(url, json=upstream, headers=auth)
@@ -194,14 +201,17 @@ class MemoryProxy:
         return response.status_code, data, {**extra, **_retry_headers(response)}
 
     def stream(
-        self, body: dict[str, Any], headers: Mapping[str, str]
+        self,
+        body: dict[str, Any],
+        headers: Mapping[str, str],
+        principal: Principal | None = None,
     ) -> tuple[int, Iterator[bytes], dict[str, str]]:
         """流式：先拿到上游的状态码，再把 SSE 原样转发；流读完后写回回答。
 
         状态码是 200 时返回的迭代器（_Relay）要么读完，要么调用 close()：它占着上游的连接，
         中途不要的（客户端断开、用户停下）只写回用户的话；上游中途出错时什么也不写。
         上游一开始就出错时与非流式相同。"""
-        turn, upstream, url, auth = self._prepare(body, headers)
+        turn, upstream, url, auth = self._prepare(body, headers, principal)
         request = self._http.build_request("POST", url, json=upstream, headers=auth)
         extra = _headers(turn, upstream["model"])
         try:
@@ -216,11 +226,14 @@ class MemoryProxy:
         return 200, _Relay(self, turn, response), extra
 
     def respond(
-        self, body: dict[str, Any], headers: Mapping[str, str]
+        self,
+        body: dict[str, Any],
+        headers: Mapping[str, str],
+        principal: Principal | None = None,
     ) -> tuple[int, dict[str, Any], dict[str, str]]:
         """/v1/responses 的子集（见模块说明）：换成 Chat Completions，走 complete 同样的想起、注入、
         转发与写回，再把回答写成 Responses 的格式。不支持的参数报 ProxyError（501）。"""
-        status, data, extra = self.complete(_responses_to_chat(body), headers)
+        status, data, extra = self.complete(_responses_to_chat(body), headers, principal)
         if status != 200:  # 上游的出错原样返回（OpenAI 两种接口的出错格式相同）
             return status, data, extra
         return status, _chat_to_response(body, data, extra["X-CueMem-Model"]), extra
@@ -320,17 +333,34 @@ class MemoryProxy:
     # ---------- 内部 ----------
 
     def _prepare(
-        self, body: dict[str, Any], headers: Mapping[str, str]
+        self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
     ) -> tuple[Turn, dict[str, Any], str, dict[str, str]]:
         upstream, url, auth = self._upstream(body)  # 先认模型：被拒绝的请求不开会话、不检索
-        turn = self._recall(body, headers)
+        turn = self._recall(body, headers, principal)
         if turn.write_user is not None and turn.block:
             upstream["messages"] = inject_evidence(upstream["messages"], turn.block)
         return turn, upstream, url, auth
 
-    def _recall(self, body: dict[str, Any], headers: Mapping[str, str]) -> Turn:
+    def _recall(
+        self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
+    ) -> Turn:
         user_id = headers.get("x-cuemem-user") or body.get("user") or self.default_user
         agent_id = headers.get("x-cuemem-agent") or None
+        if (  # 在开会话、检索之前；管理令牌不限制
+            user_id is not None
+            and principal is not None
+            and not principal.admin
+            and (not isinstance(user_id, str) or not principal.allows(space_for(user_id, agent_id)))
+        ):
+            raise ProxyError(
+                403,
+                f"This API key cannot access the memories of user {user_id!r}"
+                + (f" with agent {agent_id!r}" if agent_id else "")
+                + ": use a user in its scope (the user field or the X-CueMem-User header).",
+                kind="permission_error",
+                param="user",
+                code="forbidden",
+            )
         messages = body.get("messages") or []
         if user_id is None or not messages:
             return Turn(space=None)
@@ -791,7 +821,7 @@ def _headers(turn: Turn, model: str) -> dict[str, str]:
 
 def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -> APIRouter:
     """/v1/models、/v1/chat/completions、/v1/responses 与 /v1/embeddings；可以挂在 cuemem serve 的
-    应用上，也可以单独运行。"""
+    应用上，也可以单独运行。dependencies 要有 api.auth.guard（认出令牌，按它的作用域检查用户）。"""
     router = APIRouter(dependencies=dependencies or [])
 
     @router.get("/v1/models")
@@ -801,13 +831,14 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
     @router.post("/v1/chat/completions")
     def completions(body: Annotated[dict[str, Any], Depends(_body)], request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
+        who = principal_of(request)
         try:
             if body.get("stream"):
-                status, chunks, extra = proxy.stream(body, headers)
+                status, chunks, extra = proxy.stream(body, headers, who)
                 if status != 200:
                     return Response(b"".join(chunks), status, extra, media_type="application/json")
                 return _RelayResponse(chunks, headers=extra, media_type="text/event-stream")
-            status, data, extra = proxy.complete(body, headers)
+            status, data, extra = proxy.complete(body, headers, who)
         except ProxyError as exc:
             return exc.response()
         return JSONResponse(data, status, extra)
@@ -816,7 +847,7 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
     def responses(body: Annotated[dict[str, Any], Depends(_body)], request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         try:
-            status, data, extra = proxy.respond(body, headers)
+            status, data, extra = proxy.respond(body, headers, principal_of(request))
         except ProxyError as exc:
             return exc.response()
         return JSONResponse(data, status, extra)
@@ -852,14 +883,16 @@ def create_proxy_app(
     proxy: MemoryProxy,
     *,
     token: str | None = None,
+    keys: Keys | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
 ) -> FastAPI:
     """单独运行的记忆代理（cuemem proxy）。token 非空时要求 Authorization: Bearer <token>：
-    OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。
+    OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。keys：另有限定作用域
+    的令牌（Keys.from_env；给了时不看 token），每个令牌只能用作用域里的用户。
 
     不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。"""
-    from cuemem.api.app import _guard, _token_check
+    from cuemem.api.app import _guard
 
     stop = threading.Event()
 
@@ -887,7 +920,7 @@ def create_proxy_app(
     def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__, "open_runs": proxy.open_runs()}
 
-    deps = [Depends(_token_check(token))] if token else []
-    app.include_router(proxy_router(proxy, dependencies=deps))
+    keys = keys if keys is not None else Keys.from_token(token)
+    app.include_router(proxy_router(proxy, dependencies=guard(keys)))
     _guard(app, allowed_hosts, origin_hosts)
     return app

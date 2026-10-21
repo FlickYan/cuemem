@@ -61,7 +61,9 @@ class MemoryClient:
     用完调用 close()，或用 with 语句。
 
     base_url：服务的地址（默认 cuemem serve 的 http://127.0.0.1:7860）；api_key：访问令牌，不填时
-    读环境变量 CUEMEM_API_TOKEN（与服务端同名）；timeout：单次请求的秒数（wait=True 的 add、update
+    读环境变量 CUEMEM_API_TOKEN（与服务端同名）。限定作用域的令牌（服务端的 CUEMEM_API_KEYS_FILE）
+    只能访问它的用户：之外的 user_id、agent_id 报 MemoryAPIError（status 403），别人的记忆 ID 与
+    不存在的一样；timeout：单次请求的秒数（wait=True 的 add、update
     要等抽取做完）；http_client：自带的 httpx2.Client（测试里传 FastAPI 的 TestClient；超时照它
     自己的设置，timeout 不再起作用）。
     """

@@ -101,8 +101,34 @@ def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
     raise ValueError("Give user_id, agent_id, or both: memories are kept per user and per agent.")
 
 
+def space_owner(space: str) -> tuple[str | None, str | None] | None:
+    """space_for 的逆：这个空间是哪个（user_id，agent_id）的（访问令牌的作用域据此判断）。
+
+    "agent/x" 是 Agent x 自己的记忆（None，"x"）：用户 x 在名叫 agent 的 Agent 下的记忆
+    （space_for("x", "agent")）也落在这里，但不能因此算作用户 x 的，否则只能访问用户 x 的令牌
+    借 agent_id="agent" 就读到了 Agent x 的记忆。不是由 space_for 得来的空间（评测、手工起的名字
+    里有两个以上的 "/"，或者 "%" 的写法与 space_for 不同）返回 None。解出来的 ID 再过一遍
+    space_for，逐字相同才算。"""
+    left, slash, right = space.partition("/")
+    owner: tuple[str | None, str | None]
+    if not slash:
+        owner = (_unpart(space), None)
+    elif left == "agent":
+        owner = (None, _unpart(right))
+    else:
+        owner = (_unpart(right), _unpart(left))
+    try:
+        return owner if space_for(*owner) == space else None
+    except ValueError:  # 空的 ID
+        return None
+
+
 def _part(value: str) -> str:
     return value.replace("%", "%25").replace("/", "%2F")
+
+
+def _unpart(value: str) -> str:
+    return value.replace("%2F", "/").replace("%25", "%")
 
 
 def _log_peak_wait(provider: str, until: datetime) -> None:

@@ -15,7 +15,9 @@
     import（load）、spaces。
 
 作用域与 SDK 相同：user_id、agent_id 合起来定一个记忆空间，不碰原始的空间 ID（"/" 不用转义）。
-鉴权与 /api 的其他接口相同（CUEMEM_API_TOKEN）。
+鉴权与 /api 的其他接口相同（CUEMEM_API_TOKEN）；限定作用域的令牌（api/auth.py）只能访问自己的
+用户：点名了作用域之外的 user_id、agent_id（包括写在 filters 里的）时 403，按 ID 找的记忆在作用域
+之外时与不存在的一样（404；history 是空列表），spaces 只列出作用域里的，reset 只有管理令牌能用。
 
 报错是英文的 {"error": {"code", "type", "message"}}：type 是 SDK 抛出的异常类型（KeyError、
 ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此抛出同样的异常。请求体不合
@@ -43,9 +45,10 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from cuemem.api.auth import Principal, principal_of
 from cuemem.errors import ConcurrentWriteError, CueMemError
 from cuemem.read.controller import Router
-from cuemem.sdk import AnswerMode, Memory, SearchMode
+from cuemem.sdk import AnswerMode, Memory, SearchMode, _scope, space_for
 
 PREFIX = "/api/v1"
 _CODES = {
@@ -191,14 +194,43 @@ def _filters(raw: str | None) -> dict[str, Any] | None:
     return value
 
 
+def _allow(who: Principal, space: str | None) -> None:
+    """请求点名的空间在令牌的作用域之外：403。"""
+    if not who.allows(space):
+        raise V1Error(403, f"This API key cannot access the memory space {space!r}.")
+
+
 def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) -> APIRouter:
     """/api/v1 下的记忆接口，包住一个 Memory（服务里是 Memory.from_system，与界面、记忆代理共用
-    同一个记忆系统）。同步的接口：FastAPI 在线程池里执行，Memory 本身线程安全。"""
+    同一个记忆系统）。同步的接口：FastAPI 在线程池里执行，Memory 本身线程安全。
+
+    dependencies 要有 api.auth.guard（认出令牌）：每个接口按它的作用域检查，没有时报错（500），
+    不当成管理令牌放行。"""
     router = APIRouter(prefix=PREFIX, dependencies=dependencies or [], tags=["memories (v1)"])
 
+    def allow(
+        http: Request,
+        user_id: str | None,
+        agent_id: str | None,
+        filters: dict[str, Any] | None = None,
+    ) -> None:
+        """user_id、agent_id 定下的空间（filters 里的 user_id、agent_id 优先）要在作用域里。与 SDK
+        用同一个函数解析 filters：检查的空间就是 SDK 要读的空间。都没给时报 SDK 的 ValueError。"""
+        user_id, agent_id, _, _ = _scope(user_id, agent_id, None, filters)
+        _allow(principal_of(http), space_for(user_id, agent_id))
+
+    def visible(http: Request, memory_id: str) -> bool:
+        """按 ID 找的记忆：不存在的，或者在作用域里的。作用域之外的与不存在的一样处理。"""
+        space = memory.system.db.fact_space(memory_id)
+        return space is None or principal_of(http).allows(space)
+
+    def missing(memory_id: str) -> V1Error:
+        return V1Error(404, f"No memory with id {memory_id}", error_type="KeyError")
+
     @router.post("/memories")
-    def add(request: AddRequest) -> dict[str, Any]:
+    def add(http: Request, request: AddRequest) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
             _no_server_files(request.messages)
             return memory.add(
                 request.messages,
@@ -213,8 +245,9 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
             )
 
     @router.post("/memories/search")
-    def search(request: SearchRequest) -> dict[str, Any]:
+    def search(http: Request, request: SearchRequest) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, request.user_id, request.agent_id, request.filters)
             return memory.search(
                 request.query,
                 user_id=request.user_id,
@@ -232,6 +265,7 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
 
     @router.get("/memories")
     def get_all(
+        http: Request,
         user_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
@@ -244,6 +278,7 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
     ) -> dict[str, Any]:
         where = _filters(filters)
         with _sdk_errors():
+            allow(http, user_id, agent_id, where)
             return memory.get_all(
                 user_id=user_id,
                 agent_id=agent_id,
@@ -258,42 +293,57 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
 
     @router.delete("/memories")
     def delete_all(
-        user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
+        http: Request,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, user_id, agent_id)
             return memory.delete_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
     @router.get("/memories/{memory_id}")
-    def get(memory_id: str) -> dict[str, Any]:
+    def get(http: Request, memory_id: str) -> dict[str, Any]:
+        if not visible(http, memory_id):
+            raise missing(memory_id)
         with _sdk_errors(by_id=True):
             item = memory.get(memory_id)
         if item is None:
-            raise V1Error(404, f"No memory with id {memory_id}", error_type="KeyError")
+            raise missing(memory_id)
         return item
 
     @router.put("/memories/{memory_id}")
-    def update(memory_id: str, request: UpdateRequest) -> dict[str, Any]:
+    def update(http: Request, memory_id: str, request: UpdateRequest) -> dict[str, Any]:
+        if not visible(http, memory_id):
+            raise missing(memory_id)
         with _sdk_errors(by_id=True):
             return memory.update(memory_id, request.data, metadata=request.metadata)
 
     @router.get("/memories/{memory_id}/history")
-    def history(memory_id: str) -> list[dict[str, Any]]:
+    def history(http: Request, memory_id: str) -> list[dict[str, Any]]:
+        if not visible(http, memory_id):
+            return []  # 与不存在的 ID 相同
         with _sdk_errors(by_id=True):
             return memory.history(memory_id)
 
     @router.delete("/memories/{memory_id}")
-    def delete(memory_id: str, dry_run: bool = False) -> dict[str, Any]:
+    def delete(http: Request, memory_id: str, dry_run: bool = False) -> dict[str, Any]:
+        if not visible(http, memory_id):
+            raise missing(memory_id)
         with _sdk_errors(by_id=True):
             return memory.delete(memory_id, dry_run=dry_run)
 
     @router.post("/reset")
-    def reset() -> dict[str, Any]:
+    def reset(http: Request) -> dict[str, Any]:
+        if not principal_of(http).admin:  # 删的是每个用户的记忆
+            raise V1Error(403, "Only the admin token (CUEMEM_API_TOKEN) can reset all memories.")
         with _sdk_errors():
             return memory.reset()
 
     @router.post("/answer")
-    def answer(request: AnswerRequest) -> dict[str, Any]:
+    def answer(http: Request, request: AnswerRequest) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
             return memory.answer(
                 request.question,
                 user_id=request.user_id,
@@ -305,21 +355,26 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
             )
 
     @router.get("/profile")
-    def profile(user_id: str | None = None, agent_id: str | None = None) -> dict[str, str]:
+    def profile(
+        http: Request, user_id: str | None = None, agent_id: str | None = None
+    ) -> dict[str, str]:
         with _sdk_errors():
+            allow(http, user_id, agent_id)
             return {"profile": memory.profile(user_id=user_id, agent_id=agent_id)}
 
     @router.post("/runs")
-    def open_run(request: RunRequest) -> dict[str, str]:
+    def open_run(http: Request, request: RunRequest) -> dict[str, str]:
         with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
             run_id = memory.open_run(
                 request.run_id, user_id=request.user_id, agent_id=request.agent_id
             )
         return {"run_id": run_id}
 
     @router.post("/runs/end")
-    def end_run(request: EndRunRequest) -> dict[str, Any]:
+    def end_run(http: Request, request: EndRunRequest) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
             return memory.end_run(
                 request.run_id,
                 user_id=request.user_id,
@@ -328,8 +383,9 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
             )
 
     @router.post("/consolidate")
-    def consolidate(request: ConsolidateRequest) -> dict[str, Any]:
+    def consolidate(http: Request, request: ConsolidateRequest) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
             return memory.consolidate(
                 user_id=request.user_id, agent_id=request.agent_id, rebuild=request.rebuild
             )
@@ -341,13 +397,21 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
 
     @router.get("/export")
     def export(
-        user_id: str | None = None, agent_id: str | None = None, derived: bool = True
+        http: Request, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
     ) -> dict[str, Any]:
         with _sdk_errors():
+            allow(http, user_id, agent_id)
             return memory.export(user_id=user_id, agent_id=agent_id, derived=derived)
 
     @router.post("/import")
-    def load(request: ImportRequest) -> dict[str, Any]:
+    def load(http: Request, request: ImportRequest) -> dict[str, Any]:
+        # 写进哪个空间与 Memory.load 的取法相同：给了 user_id、agent_id 时是它们的空间，否则是
+        # 文件里的 space_id
+        if request.user_id or request.agent_id:
+            target: str | None = space_for(request.user_id, request.agent_id)
+        else:
+            target = str(request.data["space_id"]) if "space_id" in request.data else None
+        _allow(principal_of(http), target)
         with _sdk_errors():
             return memory.load(
                 request.data,
@@ -357,8 +421,9 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
             )
 
     @router.get("/spaces")
-    def spaces() -> list[dict[str, Any]]:
-        return memory.spaces()
+    def spaces(http: Request) -> list[dict[str, Any]]:
+        who = principal_of(http)
+        return [row for row in memory.spaces() if who.allows(row["space_id"])]
 
     return router
 

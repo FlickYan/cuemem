@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from fakes import FakeAPI
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from scripted import ScriptedModel
@@ -24,7 +24,8 @@ from test_sdk import AUG, SEP, moved, where_i_live
 
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
-from cuemem.api.app import _token_check, create_app
+from cuemem.api.app import create_app
+from cuemem.api.auth import Keys, guard
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
@@ -58,10 +59,10 @@ def system(
     opened.close()
 
 
-def v1_app(system: MemorySystem, token: str | None = None) -> FastAPI:
+def v1_app(system: MemorySystem, keys: Keys | None = None) -> FastAPI:
     """只有记忆接口的应用：不启动后台线程，与 background=False 的本地 Memory 一样确定。"""
     app = FastAPI()
-    deps = [Depends(_token_check(token))] if token else []
+    deps = guard(keys or Keys())
     app.include_router(memories_router(Memory.from_system(system), dependencies=deps))
     install_error_format(app)
     return app

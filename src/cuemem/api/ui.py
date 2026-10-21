@@ -6,6 +6,10 @@
 - 原理：一页说明。
 
 界面文字用英文；与接口共用服务对象（api/service.py）。
+
+访问令牌（api/auth.py）：用限定作用域的令牌登录时，每个事件（经界面或 /gradio_api 直接调用）都
+先检查记忆空间在不在它的作用域里，不在时报错、什么都不读不写；页面打开时，默认的记忆空间不在
+作用域里就换成作用域里的第一个。
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import html
 import io
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast, get_args
@@ -25,6 +29,7 @@ from PIL import Image
 
 from cuemem.agent import Reply
 from cuemem.agent.runtime import RecalledItem, TurnTrace
+from cuemem.api.auth import ADMIN, Principal
 from cuemem.api.service import ChatService
 from cuemem.memory import RecallMode
 from cuemem.read.controller import Router, english_reason
@@ -137,8 +142,39 @@ The store and products are made up for the demo; product photos are AI-generated
 """
 
 
-def build_ui(service: ChatService) -> gr.Blocks:
+def build_ui(
+    service: ChatService, *, access: Callable[[str | None], Principal | None] | None = None
+) -> gr.Blocks:
+    """access：登录的用户名 → 令牌（api.auth.Keys.by_username；None 是没登录）。不给时不限制
+    （没有访问令牌的本机演示）。"""
     lam_default = _lam_default(service)
+
+    def who(request: gr.Request | None) -> Principal:
+        if access is None:
+            return ADMIN
+        principal = access(request.username if request is not None else None)
+        if principal is None:
+            raise gr.Error("Sign in first.")
+        return principal
+
+    def allowed(request: gr.Request | None, space_id: str) -> str:
+        """界面里填的记忆空间（空着是默认空间），先过令牌的作用域检查。"""
+        space = space_id.strip() or service.default_space
+        if not who(request).allows(space):
+            raise gr.Error(f"Your access token cannot open the memory space {space!r}.")
+        return space
+
+    def mine(request: gr.Request | None, sid: str | None) -> str | None:
+        """这个页面的会话：属于作用域之外的空间时当作没有（会话 ID 只在服务端的页面状态里，
+        这里再查一遍）。"""
+        if not sid:
+            return None
+        try:
+            space = service.get(sid).space_id
+        except KeyError:
+            return sid  # 已经结束：照常由 _end、service.chat 处理
+        return sid if who(request).allows(space) else None
+
     # Gradio 把上传的照片、对话与图库里显示的图都复制进自己的临时目录，遗忘时没法删到：每小时清掉
     # 一小时以前的副本（会话读的是记忆里存的那份，不受影响；更早的对话里的图不再显示）
     with gr.Blocks(title="CueMem demo", delete_cache=(3600, 3600)) as demo:
@@ -241,11 +277,14 @@ def build_ui(service: ChatService) -> gr.Blocks:
 
         # ---------- 事件 ----------
 
-        def start(space_id: str, date: str, sid: str | None) -> tuple[Any, ...]:
+        def start(
+            space_id: str, date: str, sid: str | None, request: gr.Request
+        ) -> tuple[Any, ...]:
+            space = allowed(request, space_id)
             notice = ""
-            if sid:
+            if sid := mine(request, sid):
                 notice = _end(service, sid)
-            session = service.start(space_id.strip() or None, at=_parse_date(date))
+            session = service.start(space, at=_parse_date(date))
             return (
                 session.session_id,
                 [],
@@ -255,7 +294,8 @@ def build_ui(service: ChatService) -> gr.Blocks:
 
         new_button.click(start, [space, when, session_id], [session_id, chatbot, trace, status])
 
-        def end(sid: str | None) -> tuple[Any, ...]:
+        def end(sid: str | None, request: gr.Request) -> tuple[Any, ...]:
+            sid = mine(request, sid)
             if not sid:
                 return None, "No session to end."
             return None, _end(service, sid)
@@ -271,14 +311,17 @@ def build_ui(service: ChatService) -> gr.Blocks:
             recall_mode: str,
             controller: str,
             lam_value: float,
+            request: gr.Request,
         ) -> Iterator[tuple[Any, ...]]:
+            space = allowed(request, space_id)  # 还没有会话时在这里开
+            sid = mine(request, sid)
             text = str((message or {}).get("text") or "").strip()
             files = [_file_path(f) for f in (message or {}).get("files") or []]
             if not text and not files:
                 yield history, gr.MultimodalTextbox(value=None), sid, gr.skip(), gr.skip()
                 return
             if not sid:
-                sid = service.start(space_id.strip() or None, at=_parse_date(date)).session_id
+                sid = service.start(space, at=_parse_date(date)).session_id
             user: list[Any] = [text] if text else []
             user += [{"path": f} for f in files]
             history = [*history, {"role": "user", "content": user}]
@@ -328,8 +371,10 @@ def build_ui(service: ChatService) -> gr.Blocks:
             [chatbot, box, session_id, trace, status],
         )
 
-        def load_memory(space_id: str, current: bool, kind: str) -> tuple[Any, ...]:
-            sid = space_id.strip() or service.default_space
+        def load_memory(
+            space_id: str, current: bool, kind: str, request: gr.Request
+        ) -> tuple[Any, ...]:
+            sid = allowed(request, space_id)
             rows = service.facts(sid, current_only=current)
             table = [
                 [r["said_on"][:10], r["statement"], r["status"], r["replaced_by"] or ""]
@@ -359,16 +404,17 @@ def build_ui(service: ChatService) -> gr.Blocks:
         refresh.click(load_memory, memory_inputs, memory_outputs)
         memory_tab.select(load_memory, memory_inputs, memory_outputs)
         current_only.change(load_memory, memory_inputs, memory_outputs)
-        forget_kind.change(
-            lambda s, k: gr.Dropdown(choices=_forget_choices(service, s, k), value=None),
-            [space, forget_kind],
-            [forget_target],
-        )
 
-        def forget(space_id: str, kind: str, target: str | None) -> str:
+        def choices(space_id: str, kind: str, request: gr.Request) -> Any:
+            options = _forget_choices(service, allowed(request, space_id), kind)
+            return gr.Dropdown(choices=options, value=None)
+
+        forget_kind.change(choices, [space, forget_kind], [forget_target])
+
+        def forget(space_id: str, kind: str, target: str | None, request: gr.Request) -> str:
+            sid = allowed(request, space_id)
             if not target:
                 return "Pick something to forget first."
-            sid = space_id.strip() or service.default_space
             report = service.forget(
                 sid,
                 fact_ids=[target] if kind == "fact" else [],
@@ -392,6 +438,15 @@ def build_ui(service: ChatService) -> gr.Blocks:
         forget_button.click(forget, [space, forget_kind, forget_target], [forget_result]).then(
             load_memory, memory_inputs, memory_outputs
         )
+
+        def opened(request: gr.Request) -> Any:
+            """页面打开时：默认的记忆空间不在令牌的作用域里，换成作用域里的第一个。"""
+            principal = who(request)
+            if principal.allows(service.default_space):
+                return gr.skip()
+            return principal.home() or ""
+
+        demo.load(opened, None, [space])
     return demo
 
 
