@@ -15,7 +15,7 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -847,6 +847,31 @@ class MemoryDB:
                 list(job_ids),
             )
             return max(cursor.rowcount, 0)
+
+    def restore_jobs(self, jobs: Sequence[Mapping[str, Any]]) -> int:
+        """把清空之前的任务状态写回同一任务键、刚登记的待处理任务（会话内容没变）：状态、
+        失败次数、报错、统计与更新时间。返回写回的个数。"""
+        rows = [
+            (
+                j["status"],
+                j["attempts"],
+                j["error"],
+                json.dumps(j["stats"], ensure_ascii=False),
+                j["updated_at"],
+                j["id"],
+            )
+            for j in jobs
+        ]
+        restored = 0
+        with self.transaction() as conn:
+            for row in rows:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = ?, attempts = ?, error = ?, stats = ?,"
+                    " updated_at = ? WHERE id = ? AND status = 'pending'",
+                    row,
+                )
+                restored += max(cursor.rowcount, 0)
+        return restored
 
     def regrown_sessions(self, space_id: str, version: str) -> set[str]:
         """巩固过之后又长了的会话：有待处理的任务，同一版本又有内容指纹不同的已完成任务。"""

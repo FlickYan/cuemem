@@ -203,13 +203,25 @@ class Consolidator:
         recorded = self.db.get_meta(f"consolidation:{space_id}")
         return bool(jobs) and recorded is not None and recorded != self.fingerprint()
 
-    def rebuild(self, space_id: str) -> None:
+    def rebuild(self, space_id: str, *, replay: bool = False) -> None:
         """清空派生记忆（数据库与向量），再为全部会话登记任务，进行中的会话（open_sessions）
         除外。进行中的会话在清空之后才读：这期间结束的会话（close_session 先把它移出进行中、
-        再登记任务），任务要么在清空之后登记、不会被删，要么在这里登记。"""
-        removed = self.db.clear_derived(space_id)
+        再登记任务），任务要么在清空之后登记、不会被删，要么在这里登记。
+
+        replay=True（会话又长了时的重放，见 _replay_regrown）：只为原来有任务的会话登记，
+        SDK 的 infer=False 只记了日志的会话照旧等显式的 consolidate；内容没变的会话保留原来的
+        结局（_keeps_outcome）。清空前的任务与清空在同一个事务里读：期间别的线程登记的任务
+        不会被删掉而没人补上。"""
+        with self.db.transaction():
+            before = self.db.get_jobs(space_id) if replay else []
+            removed = self.db.clear_derived(space_id)
         self.vectors.delete(space_id, removed)
-        self.enqueue(space_id, skip=self.open_sessions(space_id))
+        skip = self.open_sessions(space_id)
+        if not replay:
+            self.enqueue(space_id, skip=skip)
+            return
+        self.enqueue(space_id, sorted({j["session_id"] for j in before}), skip=skip)
+        self.db.restore_jobs([j for j in before if _keeps_outcome(j)])
 
     def retry_due(
         self,
@@ -263,9 +275,10 @@ class Consolidator:
         """会话巩固过之后又长了（SDK 每轮 add 同一个 run_id、线程结束后又接着聊、代理复用指定的
         会话）：新任务把整个会话重新抽取一遍，增量巩固却只增不减，之前那次抽取的事实还留着（换了
         说法的复述成了另一条事实）。派生记忆就不再是原始日志的函数，之后的遗忘、导入会改动无关的
-        事实。所以先清空派生记忆、为全部会话重新登记（进行中的除外），不清 LLM 缓存：其余会话的
-        抽取与时间在它之前的对账都命中缓存，只有长了的会话要重新抽取，时间在它之后的会话的对账
-        可能要再问模型；本地的重放与空间大小成正比（D-045）。
+        事实。所以先清空派生记忆、为原来有任务的会话重新登记（进行中的除外），不清 LLM 缓存：
+        其余会话的抽取与时间在它之前的对账都命中缓存，只有长了的会话要重新抽取，时间在它之后的
+        会话的对账可能要再问模型；本地的重放与空间大小成正比（D-045）。没有任务的会话（infer=False）
+        不抽取；内容审核拒绝过的会话不再请求（拒绝不进缓存），失败的会话保留失败次数与退避时间。
 
         LLM 缓存关闭或只读（llm_cache_mode 不是 read_write）时不重放：关闭时要把所有会话重新抽取
         一遍，只读时重放的结果进不了缓存。照旧增量巩固，记一条警告。"""
@@ -282,7 +295,7 @@ class Consolidator:
             )
             return
         record_event("consolidate_regrown_replay", sessions=sorted(regrown))
-        self.rebuild(space_id)
+        self.rebuild(space_id, replay=True)
 
     def _run(self, space_id: str, cache_scope: str) -> ConsolidationReport:
         started = time.perf_counter()
@@ -804,6 +817,14 @@ def scope(space_id: str, part: str) -> str:
     """LLM 缓存条目的归属标签：抽取按会话标记，对账与消歧按空间标记，回答按空间标记。
     遗忘时据此只清理受影响的条目，其余会话的抽取结果仍可复用（D-021）。"""
     return f"{space_id}|{part}"
+
+
+def _keeps_outcome(job: Mapping[str, Any]) -> bool:
+    """重放时内容没变（任务键相同）的会话保留的结局：待处理与失败的任务（失败次数、退避时间不
+    清零，见 MAX_ATTEMPTS），以及被内容审核拒绝而跳过的任务（拒绝不进缓存，重放会再请求两家）。
+    正常完成的任务要重放：清空之后它的事实没了，重新执行命中缓存。"""
+    skipped = job["status"] == "done" and job["stats"].get("skipped") == "content_filter"
+    return job["status"] in ("pending", "failed") or skipped
 
 
 def _said_at(

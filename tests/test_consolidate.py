@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,7 +24,9 @@ from test_sdk import where_i_live
 from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.models import Conversation, Fact, SessionIn, TurnIn
+from cuemem.core.trace import start_trace
 from cuemem.memory import MemorySystem
+from cuemem.write.consolidate import MAX_ATTEMPTS
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
 
@@ -496,6 +499,74 @@ def test_a_grown_session_is_not_replayed_without_a_writable_cache(
             memory.add(ALPS, user_id="u", run_id="chat", wait=True)
         assert "不从原始日志重放" in caplog.text
         assert "The user likes hiking." in statements(memory)
+
+
+def test_a_replay_extracts_only_what_was_extracted_before(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """会话又长了时的重放只重新抽取原来就有任务的会话：infer=False 只记了日志的会话照旧不抽取；
+    内容审核拒绝过、内容没变的会话不再请求（拒绝不进缓存）；失败次数用完的会话不因重放清零、
+    重新开始自动重试。显式的 consolidate 照旧抽取 infer=False 的会话。"""
+    from fakes import REJECT
+
+    model = ScriptedModel(echo_extraction)
+    sent: Counter[str] = Counter()
+
+    def reply(body: dict[str, Any]) -> Any:
+        text = str(body["messages"])
+        sent.update(mark for mark in ("DIARY", "FILTERED", "BROKEN") if mark in text)
+        if "FILTERED" in text:
+            return REJECT
+        if "BROKEN" in text and body["messages"][0]["content"].startswith(EXTRACT):
+            return NO_BALANCE
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    t0 = datetime(2026, 9, 1, 10)
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("DIARY raw log only", user_id="u", infer=False, timestamp=t0)
+        memory.add("FILTERED by moderation", user_id="u", timestamp=t0 + timedelta(hours=1))
+        memory.add("BROKEN extraction", user_id="u", timestamp=t0 + timedelta(hours=2))
+        memory.add("I like tea", user_id="u", run_id="chat", timestamp=t0 + timedelta(hours=3))
+        consolidator = memory.system.consolidator
+        consolidator.run("u")  # 后台线程的做法：只执行待处理的任务
+        for _ in range(MAX_ATTEMPTS - 1):  # 退避时间到了就重试，直到用完次数
+            assert consolidator.retry_due("u", base_s=0) == 1
+            consolidator.run("u")
+
+        def outcomes() -> dict[str, tuple[str, int, str | None]]:
+            jobs = memory.system.db.get_jobs("u")
+            return {
+                memory.system.db.get_turns("u", j["session_id"])[0].text.split()[0]: (
+                    j["status"],
+                    j["attempts"],
+                    j["stats"].get("skipped"),
+                )
+                for j in jobs
+                if j["status"] != "superseded"
+            }
+
+        before = outcomes()
+        assert before == {
+            "FILTERED": ("done", 0, "content_filter"),
+            "BROKEN": ("failed", MAX_ATTEMPTS, None),
+            "I": ("done", 0, None),
+        }
+        requests = dict(sent)
+
+        memory.add("I like jazz", user_id="u", run_id="chat", timestamp=t0 + timedelta(hours=4))
+        assert consolidator.retry_due("u", base_s=0) == 0
+        with start_trace("consolidate", memory.system.tracer, space="u"):
+            report = consolidator.run("u")  # chat 又长了：从原始日志重放
+        assert report.sessions == 1 and not report.failed
+        assert outcomes() == before
+        assert dict(sent) == requests  # 没有新的抽取请求发给这三个会话
+        assert statements(memory) == ["I like jazz", "I like tea"]
+        traces = memory.system.settings.paths.traces.glob("*.jsonl")
+        assert any("consolidate_regrown_replay" in p.read_text("utf-8") for p in traces)
+
+        memory.consolidate(user_id="u")  # 显式的巩固：infer=False 的会话这时才抽取
+        assert "DIARY raw log only" in statements(memory)
 
 
 def said(
