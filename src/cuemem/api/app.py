@@ -8,9 +8,10 @@ Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密�
 只适合在本机演示：cuemem serve 默认只监听 127.0.0.1，监听别的地址又没有令牌时拒绝启动
 （加 --insecure-no-auth 才照常启动）。
 
-浏览器（N12）：/api 与 /v1 不接受别的网站发来的请求（SameOriginOnly），否则任何网页都能借访问者
-的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受这些 Host（cuemem serve /
-proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，它的网页就算同源）。
+浏览器（N12）：/api、/v1 与界面的 /gradio_api 不接受别的网站发来的请求（SameOriginOnly），否则
+任何网页都能借访问者的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受
+这些 Host（cuemem serve / proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，
+它的网页就算同源）。
 """
 
 from __future__ import annotations
@@ -54,19 +55,24 @@ _BEARER = HTTPBearer(auto_error=False)
 
 
 class SameOriginOnly:
-    """/api 与 /v1 不接受别的网站发来的浏览器请求：带 Origin 头时，Origin 的主机与端口要与 Host
-    头相同（同源，例如 /docs 的 Try it out），或者 Origin 的主机名在 hosts 里（反向代理改写了 Host
-    时）；Origin: null 一律拒绝。不带 Origin 的请求（SDK、curl）不受影响。
+    """/api、/v1 与界面自己的接口（/gradio_api）不接受别的网站发来的浏览器请求：带 Origin 头时，
+    Origin 的主机与端口要与 Host 头相同（同源，例如 /docs 的 Try it out、界面本身），或者 Origin
+    的主机名在 hosts 里（反向代理改写了 Host 时）；Origin: null 一律拒绝。不带 Origin 的请求（SDK、
+    curl、gradio_client）不受影响。
 
     是整个应用的中间件，不是接口的依赖：预检请求（OPTIONS）匹配不到接口，会落到根路径上的
-    Gradio，它对非本机的 Host 放行任何来源。"""
+    Gradio。Gradio 只在 Host 正好是 localhost、127.0.0.1、0.0.0.0 时限制来源，别的 Host（监听
+    ::1、127.0.0.2 等本机地址，Docker、局域网）放行任何来源并允许带凭据：它的 /gradio_api 能读出
+    任何空间的记忆、遗忘、对话，上传接口不经预检就会写文件。"""
+
+    PATHS = ("/api/", "/v1/", "/gradio_api/")
 
     def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
         self.app = app
         self.hosts = {h.lower() for h in hosts}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"].startswith(("/api/", "/v1/")):
+        if scope["type"] == "http" and scope["path"].startswith(self.PATHS):
             headers = Headers(scope=scope)
             origin = headers.get("origin")
             if origin is not None and not self._allowed(origin, headers.get("host", "")):

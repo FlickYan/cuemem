@@ -577,6 +577,56 @@ def test_http_api_refuses_cross_origin_requests(service: ChatService, tmp_path: 
     assert client.get("/", headers={"Host": lan, "Origin": evil}).status_code == 200  # 界面
 
 
+@pytest.mark.parametrize("bind", ["::1", "127.0.0.2", "127.0.0.1"])
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")  # Gradio 的队列里调用 pandas
+def test_ui_api_refuses_cross_origin_requests(
+    service: ChatService, tmp_path: Path, bind: str
+) -> None:
+    """界面自己的接口（/gradio_api）同样只接受同源的浏览器请求。Gradio 只在 Host 正好是
+    localhost、127.0.0.1、0.0.0.0 时限制来源：监听 ::1、127.0.0.2（不要令牌的本机地址）时它放行
+    任何来源，别的网页就能读出、遗忘任何空间的记忆；上传不经预检，监听 127.0.0.1 时也照样写文件。"""
+    from cuemem.cli import _host_policy
+
+    service.remember("alice", "My PIN is 4321")
+    service.consolidate("alice")
+    allowed, origins = _host_policy(bind)
+    app_ = create_app(
+        service,
+        upload_dir=tmp_path / "uploads",
+        ui=True,
+        allowed_hosts=allowed,
+        origin_hosts=origins,
+    )
+    host = f"[{bind}]:7860" if ":" in bind else f"{bind}:7860"
+    evil = {"Host": host, "Origin": "https://evil.example"}
+    call = "/gradio_api/call/load_memory"
+    with TestClient(app_) as client:
+        preflight = client.options(
+            call,
+            headers={
+                **evil,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        assert preflight.status_code == 403
+        assert "access-control-allow-origin" not in preflight.headers
+        posted = client.post(call, json={"data": ["alice", False, "fact"]}, headers=evil)
+        assert posted.status_code == 403
+        assert "access-control-allow-origin" not in posted.headers
+        upload = client.post(
+            "/gradio_api/upload", files={"files": ("x.txt", b"A", "text/plain")}, headers=evil
+        )
+        assert upload.status_code == 403
+
+        same = {"Host": host, "Origin": f"http://{host}"}  # 界面本身
+        posted = client.post(call, json={"data": ["alice", False, "fact"]}, headers=same)
+        assert posted.status_code == 200
+        event = posted.json()["event_id"]
+        assert "4321" in client.get(f"{call}/{event}", headers=same).text
+        assert client.get("/", headers={"Host": host}).status_code == 200
+
+
 def test_http_api_trusted_hosts(service: ChatService, tmp_path: Path) -> None:
     """allowed_hosts（cuemem serve 监听本机地址时）：接口与界面都只接受这些 Host，
     防 DNS 重绑定。"""
