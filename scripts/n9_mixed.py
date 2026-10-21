@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 from cuemem.config import PROJECT_ROOT, load_settings
-from cuemem.evals.datasets import Sample, dataset_path
+from cuemem.evals.datasets import Sample, dataset_path, protocol_samples
 from cuemem.evals.datasets import load as load_dataset
 from cuemem.evals.runner import EvalRunner, ProbeQuery, RunConfig
 from cuemem.evals.splits import load_split
@@ -48,7 +48,7 @@ def test_samples(datasets: Path) -> list[Sample]:
         evalset = load_dataset(
             dataset, dataset_path(datasets, dataset), ids=load_split(dataset, split)
         )
-        samples.extend(s for s in evalset.samples if s.question_type != "adversarial")
+        samples.extend(protocol_samples(evalset))  # 与评测一致：LoCoMo 不含对抗题
     return samples
 
 

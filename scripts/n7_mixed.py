@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from cuemem.config import PROJECT_ROOT, load_settings
 from cuemem.errors import ContentFilteredError, StructuredOutputError
-from cuemem.evals.datasets import Sample, dataset_path
+from cuemem.evals.datasets import Sample, dataset_path, protocol_samples
 from cuemem.evals.datasets import load as load_dataset
 from cuemem.evals.runner import EvalRunner, ProbeQuery, RunConfig
 from cuemem.evals.splits import load_split
@@ -64,7 +64,7 @@ def dev_samples(settings_datasets: Path) -> list[Sample]:
     for dataset, split, limit in DEV_SETS:
         ids = load_split(dataset, split) if split else None
         evalset = load_dataset(dataset, dataset_path(settings_datasets, dataset), ids=ids)
-        chosen = [s for s in evalset.samples if s.question_type != "adversarial"]
+        chosen = protocol_samples(evalset)  # 与评测一致：LoCoMo 不含对抗题
         samples.extend(chosen[:limit] if limit else chosen)
     return samples
 

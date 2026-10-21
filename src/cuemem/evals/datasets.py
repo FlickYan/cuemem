@@ -375,6 +375,20 @@ def load(
     raise KeyError(f"未知数据集 {name}，可选：{sorted(DATASETS)}")
 
 
+def protocol_samples(evalset: EvalSet, types: Collection[str] | None = None) -> list[Sample]:
+    """评测协议选出的题（保持原来的顺序）：给了题型时只留这些题型（LoCoMo 的对抗题也可以点名）；
+    没给时 LoCoMo 去掉对抗题（与文献一致：Mem0 等工作只报前四类），其余数据集全留。
+
+    eval run、eval probe 与两个混合流脚本（n7_mixed、n9_mixed）都经这里选题，规则只写这一处：
+    改它就改了发表的题目集合（LoCoMo dev3 的 497 题里评 385 题，test7 的 1489 题里评 1155 题）。"""
+    if types:
+        wanted = set(types)
+        return [s for s in evalset.samples if s.question_type in wanted]
+    if evalset.dataset == "locomo":
+        return [s for s in evalset.samples if s.question_type != "adversarial"]
+    return list(evalset.samples)
+
+
 def _parse_longmemeval_date(text: str) -> datetime:
     # 形如 "2023/05/20 (Sat) 02:21"；去掉星期，避免依赖系统语言环境
     return datetime.strptime(re.sub(r"\s*\([A-Za-z]+\)", "", text).strip(), "%Y/%m/%d %H:%M")

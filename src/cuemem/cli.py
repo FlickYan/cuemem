@@ -1098,6 +1098,7 @@ def eval_run(
         raise typer.Exit(1)
     if not build_only:  # 最后的报告要画图：先说明要装什么，不白跑一遍
         _require_plotting()
+    from cuemem.evals.datasets import protocol_samples
     from cuemem.evals.report import build_report
     from cuemem.evals.runner import EvalRunner, RunConfig
 
@@ -1108,11 +1109,9 @@ def eval_run(
         console.print(line)
     split_name = None if split == "all" else split
     evalset = _load_evalset(settings, dataset, split_name)
-    if types:
-        wanted = {t.strip() for t in types.split(",")}
-        evalset.samples = [s for s in evalset.samples if s.question_type in wanted]
-    elif dataset == "locomo":  # 与文献一致：默认不评对抗题
-        evalset.samples = [s for s in evalset.samples if s.question_type != "adversarial"]
+    # 给了 --types 就只评这些题型；没给时 LoCoMo 默认不评对抗题（与文献一致）
+    wanted = {t.strip() for t in types.split(",")} if types else None
+    evalset.samples = protocol_samples(evalset, wanted)
     run_name = name or f"{dataset}-{split}-{datetime.now():%Y%m%d-%H%M}"
     config = RunConfig(
         name=run_name,
@@ -1205,13 +1204,13 @@ def eval_probe(
     if not name:
         console.print("[red]请用 --name 指定运行名（与评测运行同名，特征与结果放在一起）[/red]")
         raise typer.Exit(1)
+    from cuemem.evals.datasets import protocol_samples
     from cuemem.evals.runner import EvalRunner, RunConfig
 
     settings = load_settings()
     split_name = None if split == "all" else split
     evalset = _load_evalset(settings, dataset, split_name)
-    if dataset == "locomo":  # 与评测一致：不含对抗题
-        evalset.samples = [s for s in evalset.samples if s.question_type != "adversarial"]
+    evalset.samples = protocol_samples(evalset)  # 与评测一致：LoCoMo 不含对抗题
     config = RunConfig(
         name=name, dataset=dataset, split=split_name, methods=[], workers=workers, limit=limit
     )

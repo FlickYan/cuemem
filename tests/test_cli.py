@@ -551,7 +551,8 @@ def test_eval_run_fail_on_error(
         return run_dir / "report.md"
 
     monkeypatch.setattr("cuemem.evals.runner.EvalRunner", FakeRunner)
-    monkeypatch.setattr(cli, "_load_evalset", lambda *args: SimpleNamespace(samples=[]))
+    evalset = SimpleNamespace(dataset="longmemeval_s", samples=[])
+    monkeypatch.setattr(cli, "_load_evalset", lambda *args: evalset)
     monkeypatch.setattr("cuemem.evals.report.build_report", fake_report)
     args = ["eval", "run", "--name", "x", "--methods", "B1"]
     assert runner.invoke(app, args).exit_code == 0
@@ -561,6 +562,158 @@ def test_eval_run_fail_on_error(
     assert ("--fail-on-error" in result.output) == bool(code)
     assert runner.invoke(app, [*args, "--build-only"]).exit_code == 0
     assert runner.invoke(app, [*args, "--build-only", "--fail-on-error"]).exit_code == code
+
+
+def _reader_and_judge(rejected: set[str]) -> Any:
+    """模拟模型，同时扮演回答与判分：回答时上下文里有 golden retriever 就答出来、否则说不知道；
+    问题在 rejected 里时像内容审核拒绝（这个组合记为出错）。判分时回答里有 golden retriever
+    就判对。"""
+    import json
+
+    from fakes import REJECT
+
+    def reply(body: dict[str, Any]) -> str:
+        prompt = body["messages"][-1]["content"]
+        if prompt.startswith("I will give you"):
+            return "yes" if "golden retriever" in prompt.split("Model Response:")[-1] else "no"
+        context, _, question = prompt.rpartition("Question: ")
+        if question.strip() in rejected:
+            return REJECT
+        found = "golden retriever" in context
+        answer = "golden retriever" if found else "I don't know."
+        return json.dumps({"answer": answer, "citations": [], "evidence_sufficient": found})
+
+    return reply
+
+
+@pytest.fixture
+def locomo_eval(clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> set[str]:
+    """离线的 cuemem eval run：迷你 LoCoMo（4 道题，第 3 道 conv-test-q2 是对抗题）放进数据目录，
+    评测运行器照旧，只把模型请求发给模拟接口（离线哈希向量器，不访问网络）。
+    返回要模拟内容审核拒绝的问题（集合，测试里随时增删）。"""
+    import shutil
+
+    from fakes import FakeAPI
+
+    from cuemem.evals.runner import EvalRunner
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope")
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "256")
+    datasets = load_settings().paths.datasets
+    datasets.mkdir(parents=True)
+    shutil.copy(Path(__file__).parent / "fixtures" / "locomo_mini.json", datasets / "locomo10.json")
+    rejected: set[str] = set()
+    fake_api = FakeAPI()
+    fake_api.chat_replies = [_reader_and_judge(rejected)]
+
+    class OfflineRunner(EvalRunner):
+        def __init__(self, settings: Any, config: Any, **kwargs: Any) -> None:
+            super().__init__(settings, config, http_client=fake_api.client(), **kwargs)
+
+    monkeypatch.setattr("cuemem.evals.runner.EvalRunner", OfflineRunner)
+    return rejected
+
+
+def _eval_rows(name: str, filename: str = "results.jsonl") -> list[dict[str, Any]]:
+    from cuemem.evals.report import load_rows
+
+    return load_rows(load_settings().paths.eval_runs / name, filename)
+
+
+def _answered(name: str) -> set[tuple[str, str]]:
+    return {(r["sample_id"].removeprefix("conv-test-"), r["method"]) for r in _eval_rows(name)}
+
+
+LOCOMO_RUN = ["eval", "run", "--dataset", "locomo", "--split", "all", "--peak", "allow"]
+
+
+def test_eval_run_selects_the_protocol_questions(locomo_eval: set[str]) -> None:
+    """cuemem eval run 走真实的评测运行器（迷你 LoCoMo、模拟模型）：只评点名的方法；LoCoMo 默认
+    不评对抗题，--types 点名时照评；--limit 只取前 N 题；eval probe 与评测选同一批题；run.json、
+    结果与报告都写出来。规则在 datasets.protocol_samples，四处入口共用。"""
+    import json
+
+    result = runner.invoke(app, [*LOCOMO_RUN, "--name", "r", "--methods", "B0, B1,B2,"])
+    assert result.exit_code == 0, result.output
+    assert "3题×['B0','B1','B2']" in _flat(result.output)
+    assert _answered("r") == {(q, m) for q in ("q0", "q1", "q3") for m in ("B0", "B1", "B2")}
+    run_dir = load_settings().paths.eval_runs / "r"
+    info = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert info["samples"] == 3 and info["config"]["methods"] == ["B0", "B1", "B2"]
+    assert (run_dir / "report.md").exists() and f"报告：{run_dir / 'report.md'}" in _flat(
+        result.output
+    )
+    correct = {(r["sample_id"], r["method"]): r["correct"] for r in _eval_rows("r")}
+    assert correct[("conv-test-q0", "B1")] and not correct[("conv-test-q0", "B0")]
+
+    result = runner.invoke(
+        app, [*LOCOMO_RUN, "--name", "adv", "--methods", "B1", "--types", "adversarial"]
+    )
+    assert result.exit_code == 0, result.output
+    assert _answered("adv") == {("q2", "B1")}
+    args = ["--name", "two", "--methods", "B1", "--types", "single-hop, adversarial"]
+    assert runner.invoke(app, [*LOCOMO_RUN, *args]).exit_code == 0
+    assert _answered("two") == {("q0", "B1"), ("q2", "B1")}
+    args = ["--name", "lim", "--methods", "B0", "--limit", "2"]
+    assert runner.invoke(app, [*LOCOMO_RUN, *args]).exit_code == 0
+    assert _answered("lim") == {("q0", "B0"), ("q1", "B0")}  # 对抗题筛掉之后的前 2 题
+
+    # 探针：r 的 B2 已经建好了空间，探针与评测选同一批题（不含对抗题）
+    probe = ["eval", "probe", "--dataset", "locomo", "--split", "all", "--name", "r"]
+    result = runner.invoke(app, probe)
+    assert result.exit_code == 0 and "完成3题，出错0题" in _flat(result.output), result.output
+    probed = {row["sample_id"] for row in _eval_rows("r", "probe.jsonl")}
+    assert probed == {"conv-test-q0", "conv-test-q1", "conv-test-q3"}
+
+
+def test_eval_run_resumes_and_reports_incomplete_runs(locomo_eval: set[str]) -> None:
+    """出错的组合不算完成，--fail-on-error 时退出码 3；同名再跑只补出错的那一个，答完之后再跑什么
+    都不做。达到花费上限提前停止时退出码 4。配置错误（未知的数据集、方法、--peak，缺数据文件）
+    退出码 1，什么都不写。"""
+    import json
+
+    locomo_eval.add("When did Bob run a marathon?")
+    args = [*LOCOMO_RUN, "--name", "r", "--methods", "B1", "--fail-on-error"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 3, result.output
+    assert "完成2/3个组合，出错1个" in _flat(result.output)
+    assert _answered("r") == {("q0", "B1"), ("q3", "B1")}
+    assert [e["sample_id"] for e in _eval_rows("r", "errors.jsonl")] == ["conv-test-q1"]
+
+    locomo_eval.clear()
+    result = runner.invoke(app, args)  # 续跑：只补上次出错的组合
+    assert result.exit_code == 0, result.output
+    assert "完成1/1个组合，出错0个" in _flat(result.output)
+    assert _answered("r") == {(q, "B1") for q in ("q0", "q1", "q3")}
+    assert len(_eval_rows("r")) == 3
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0 and "完成0/0个组合" in _flat(result.output), result.output
+    info = json.loads((load_settings().paths.eval_runs / "r" / "run.json").read_text("utf-8"))
+    assert len(info["resumed"]) == 2
+
+    # 花费上限：第一个组合（B0 还没有缓存，真的调用了模拟接口）花掉预算之后不再开始新题
+    args = [*LOCOMO_RUN, "--name", "b", "--methods", "B0", "--workers", "1", "--max-cost", "1e-9"]
+    result = runner.invoke(app, [*args, "--fail-on-error"])
+    assert result.exit_code == 4, result.output
+    assert "已达到花费上限，提前停止" in _flat(result.output) and len(_eval_rows("b")) == 1
+    args[args.index("b")] = "b2"
+    assert runner.invoke(app, args).exit_code == 0  # 不加 --fail-on-error 时退出码照旧是 0
+
+    runs = load_settings().paths.eval_runs
+    before = sorted(p.name for p in runs.iterdir())
+    for bad, message in (
+        (["--dataset", "nope"], "未知数据集nope"),
+        (["--peak", "sometimes"], "--peak只能是wait、warn或allow"),
+        (["--dataset", "longmemeval_s"], "缺少数据文件"),
+    ):
+        result = runner.invoke(app, ["eval", "run", "--split", "all", "--name", "x", *bad])
+        assert result.exit_code == 1 and message in _flat(result.output), result.output
+    result = runner.invoke(app, [*LOCOMO_RUN, "--name", "x", "--methods", "B1,B99"])
+    assert result.exit_code == 1 and "未知方法" in str(result.exception)
+    assert sorted(p.name for p in runs.iterdir()) == before  # 都没有建运行目录
 
 
 def test_eval_probe_fail_on_error(
