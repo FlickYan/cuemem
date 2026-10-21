@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from fakes import TOY_CONVERSATION
 
-from cuemem.core.models import Conversation, SessionIn, Turn, TurnIn
+from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
 from cuemem.errors import ConfigMismatchError, StorageLockedError
@@ -57,6 +57,95 @@ def test_nested_transactions_commit_only_at_the_outermost(tmp_path: Path) -> Non
     other = MemoryDB(path)
     assert [s["space_id"] for s in other.list_spaces()] == ["demo"]
     assert other.get_sessions("demo") == {} and other.get_meta("k") == "v"
+
+
+def test_versions_change_with_every_write_that_matters(tmp_path: Path) -> None:
+    """巩固跨运行复用载入的状态、不重算内容指纹，靠这两个版本发现库变了：派生记忆的版本在写
+    事实、实体、实体检索单元，清空派生记忆，删除空间，事务回滚，以及别的连接（别的进程）提交时
+    变；在线写入的发言与"轮"不动它。发言的版本只在这个会话写了发言、空间删过发言、回滚与别的
+    连接提交时变。"""
+    path = tmp_path / "memory.sqlite"
+    db = MemoryDB(path)
+    session = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8")).sessions[0]
+    turns = build_turns("demo", session)
+    rounds = build_rounds(turns)
+    when = datetime(2026, 1, 1)
+    fact = Fact(
+        id="f1",
+        space_id="demo",
+        subject_id="u",
+        subject="User",
+        predicate="likes",
+        object="tea",
+        statement="The user likes tea.",
+        recorded_at=when,
+        session_id=session.session_id,
+        source_turn_ids=[turns[0].id],
+    )
+    entity = MemoryUnit(
+        id="e1",
+        space_id="demo",
+        kind="entity",
+        session_id=session.session_id,
+        text="Max (pet): a dog",
+        ts=when,
+        source_turn_ids=[],
+    )
+    derived, sid = db.derived_version("demo"), session.session_id
+    changes: list[str] = []
+
+    def check(step: str) -> None:
+        nonlocal derived
+        now = db.derived_version("demo")
+        if now != derived:
+            changes.append(step)
+        derived = now
+
+    db.add_turns(turns[:2])
+    check("add_turns")
+    db.add_units(rounds)
+    check("add_units(round)")
+    db.delete_units("demo", [rounds[0].id])
+    check("delete_units(round)")
+    db.apply_consolidation(facts=[fact], entities=[], episodes=[], units=[])
+    check("apply_consolidation")
+    db.apply_consolidation(facts=[], entities=[], episodes=[], units=[])
+    check("apply_consolidation(nothing)")
+    db.add_units([entity])
+    check("add_units(entity)")
+    db.delete_units("demo", [entity.id])
+    check("delete_units(entity)")
+    db.clear_derived("demo")
+    check("clear_derived")
+    with pytest.raises(RuntimeError), db.transaction():
+        raise RuntimeError("rolled back")
+    check("rollback")
+    MemoryDB(path).apply_consolidation(facts=[fact], entities=[], episodes=[], units=[])
+    check("other connection")
+    db.delete_space("demo")
+    check("delete_space")
+    assert changes == [
+        "apply_consolidation",
+        "add_units(entity)",
+        "delete_units(entity)",
+        "clear_derived",
+        "rollback",
+        "other connection",
+        "delete_space",
+    ]
+
+    turns_of = {s: db.turns_version("demo", s) for s in (sid, "other")}
+    db.add_turns(turns[2:])
+    assert db.turns_version("demo", sid) != turns_of[sid]
+    assert db.turns_version("demo", "other") == turns_of["other"]  # 别的会话不受影响
+    for step in (
+        lambda: db.delete_turns("demo", [turns[0].id]),
+        lambda: MemoryDB(path).add_turns(turns[:1]),
+        lambda: db.delete_space("demo"),
+    ):
+        before = db.turns_version("demo", "other")
+        step()
+        assert db.turns_version("demo", "other") != before
 
 
 def test_scrub_leaves_no_deleted_text_without_vacuum(tmp_path: Path) -> None:

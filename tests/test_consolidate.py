@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import itertools
+import json
 import logging
+import re
 import threading
 import time
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,10 +28,15 @@ from scripted import (
 from test_sdk import where_i_live
 
 from cuemem import Memory
-from cuemem.config import Settings
-from cuemem.core.models import Conversation, Fact, SessionIn, TurnIn
+from cuemem.config import PathsConfig, Settings
+from cuemem.core.models import Conversation, Entity, Fact, SessionIn, TurnIn
 from cuemem.core.trace import start_trace
+from cuemem.embed import CachedEmbedder
+from cuemem.embed.base import EmbeddingBatch, EmbedKind
 from cuemem.memory import MemorySystem
+from cuemem.sdk import space_for
+from cuemem.store import MemoryDB
+from cuemem.write import consolidate as consolidate_module
 from cuemem.write.consolidate import MAX_ATTEMPTS
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
@@ -700,3 +710,257 @@ def test_names_and_values_in_other_scripts(n3_settings: Settings, fake_api: Fake
         assert busan.is_current and not seoul.is_current
         assert seoul.superseded_by == busan.id
         assert model.calls["reconcile"] == 1 and "서울" in model.prompts["reconcile"][0]
+
+
+# ---------- 跨巩固复用载入的状态（R6） ----------
+
+
+def life_story(prompt: str) -> dict[str, Any]:
+    """抽取替身：住址、喜好、最喜欢的颜色、家人与宠物各抽成一条事实；提到的宠物与人记成实体，
+    宠物的描述后来才说（实体的描述变了，描述向量要重新查）；喜好的陈述两边带空白（库里存的是
+    去掉空白的，载入时查的是另一段文本）。"""
+    facts: list[dict[str, Any]] = []
+    entities: list[dict[str, Any]] = []
+
+    def fact(statement: str, predicate: str, obj: str, cardinality: str, turn: str) -> None:
+        subject = statement.split()[0] if predicate == "is_a" else "User"
+        facts.append(
+            {
+                "statement": statement,
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+                "cardinality": cardinality,
+                "importance": 4,
+                "turns": [int(turn)],
+            }
+        )
+
+    for n, text in re.findall(r"\[t(\d+)\] User: (.*)", prompt):
+        if m := re.search(r"(?:live in|moved to) (\w+)", text):
+            fact(f"The user lives in {m[1]}.", "lives_in", m[1], "single", n)
+        elif m := re.search(r"like (\w+)", text):
+            fact(f" The user likes {m[1]}. ", "likes", m[1], "multi", n)
+        elif m := re.search(r"favorite color is (\w+)", text):
+            fact(f"The user's favorite color is {m[1]}.", "favorite_color", m[1], "single", n)
+        elif m := re.search(r"(\w+) is my (dog|sister)", text):
+            pet = m[2] == "dog"
+            fact(
+                f"{m[1]} is the user's {m[2]}.",
+                "has_pet" if pet else "has_family_member",
+                m[1],
+                "multi",
+                n,
+            )
+            kind = "pet" if pet else "person"
+            entities.append({"name": m[1], "type": kind, "aliases": [], "description": ""})
+        elif m := re.search(r"(\w+) is an? (.*)", text):
+            fact(f"{m[1]} is a {m[2]}", "is_a", m[2], "single", n)
+            # 只说了是什么，没说是宠物：类型记成 other，链接到已有的宠物时补上描述
+            entities.append({"name": m[1], "type": "other", "aliases": [], "description": m[2]})
+    return {"summary": "", "facts": facts, "entities": entities}
+
+
+@pytest.fixture
+def story_settings(offline_settings: Settings) -> Settings:
+    """哈希向量有字面相似度：阈值放低，让对账与消歧的灰区真的要问模型；抽取逐个会话做，
+    请求的先后确定。"""
+    consolidation = offline_settings.consolidation.model_copy(
+        update={
+            "duplicate_threshold": 0.95,
+            "conflict_threshold": 0.4,
+            "multi_conflict_threshold": 0.8,
+            "entity_merge_threshold": 0.95,
+            "entity_gray_threshold": 0.3,
+            "workers": 1,
+        }
+    )
+    return offline_settings.model_copy(update={"consolidation": consolidation})
+
+
+def story(settings: Settings, fake_api: FakeAPI, root: Path) -> dict[str, Any]:
+    """SDK 的一串写入、遗忘、导入、重建与删除空间，返回发给模型的请求、交给向量器的文本
+    （缓存未命中）、add 返回的事件、最后的事实与实体，以及从库里整个载入状态的次数。"""
+    fake_api.chat_replies = [
+        ScriptedModel(
+            life_story,
+            reconcile=reconcile_by_keyword("lives in", "favorite color"),
+            entity=lambda prompt: {"matches": [{"new": 1, "same_as": "c1"}]},
+        )
+    ]
+    fake_api.chat_requests.clear()
+    paths = PathsConfig().resolve_against(root)
+    settings = settings.model_copy(update={"paths": paths})
+    out: dict[str, Any] = {"events": [], "misses": [], "loads": 0}
+    with Memory(settings, http_client=fake_api.client(), background=False) as m:
+        db = m.system.db
+        assert isinstance(m.system.embedder, CachedEmbedder)
+        inner = m.system.embedder.inner
+        embed, get_entities = inner.embed, db.get_entities
+
+        def recording(texts: Sequence[str], kind: EmbedKind) -> EmbeddingBatch:
+            out["misses"].extend(f"{kind}:{t}" for t in texts)
+            return embed(texts, kind)
+
+        def counting(space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
+            out["loads"] += ids is None
+            return get_entities(space_id, ids)
+
+        inner.embed = recording  # type: ignore[method-assign]
+        db.get_entities = counting  # type: ignore[method-assign]
+        day = itertools.count()
+
+        def add(text: str, run: str, user: str = "u", **kw: Any) -> dict[str, Any]:
+            when = datetime(2026, 1, 1) + timedelta(days=next(day))
+            result = m.add(text, user_id=user, run_id=run, timestamp=when, **kw)
+            out["events"].append(result["results"])
+            return result
+
+        add("I live in Berlin", "s1", wait=True)
+        add("I like hiking", "s2", wait=True)
+        add("Max is my dog", "s3", wait=True)
+        add("My favorite color is blue", "s4", wait=True)
+        add("Max is a golden retriever", "s5", wait=True)  # 描述填上了：描述向量要重新查
+        add("Rex is my dog", "s5b", wait=True)  # 实体的灰区：与 Max 的描述有几分像
+        add("I moved to Munich", "s6", wait=True)  # 灰区：取代柏林
+        add("I like chess", "s7", wait=True)
+        add("My favorite color is green", "s7", wait=True)  # 会话又长了：清空重放
+        add("I like painting", "s8", infer=False)
+        out["events"].append(m.consolidate(user_id="u"))
+        chess = next(f for f in m.get_all(user_id="u")["results"] if "chess" in f["memory"])
+        m.delete(chess["id"])  # 遗忘：清空重放
+        add("I like swimming", "s9", wait=True)
+        add("Mia is my sister", "s10", wait=True)
+        m.load(m.export(user_id="u"), user_id="v", wait=True)  # 导入到另一个空间
+        add("I moved to Paris", "s11", wait=True)
+        add("I live in Rome", "v1", user="v", wait=True)
+        m.delete_all(user_id="u", run_id="s2")  # 按会话遗忘
+        out["events"].append(m.consolidate(user_id="u", rebuild=True))
+        add("I like rowing", "s12", wait=True)
+        m.delete_all(user_id="v")  # 删除空间之后同一个空间重新写入
+        add("I live in Oslo", "v2", user="v", wait=True)
+        add("Bella is my dog", "v3", user="v", wait=True)
+        for user in ("u", "v"):
+            space = space_for(user)
+            out[f"facts:{user}"] = [f.model_dump() for f in db.get_facts(space)]
+            out[f"entities:{user}"] = [e.model_dump() for e in get_entities(space)]
+        out["units"] = sorted((u.id, u.kind, u.text) for u in db.list_units(space_for("u")))
+    for report in out["events"]:
+        if isinstance(report, dict):
+            report.pop("elapsed_ms", None)
+    out["requests"] = [json.dumps(r, sort_keys=True) for r in fake_api.chat_requests]
+    return out
+
+
+def test_reused_state_matches_loading_from_the_database(
+    story_settings: Settings,
+    fake_api: FakeAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """以前每次巩固都从库里读全部事实与实体、逐条查向量缓存；现在上一次巩固之后留下镜像，
+    派生记忆没变过就直接用。经过遗忘、会话又长了的重放、导入、重建与删除空间，发给模型的请求、
+    向量缓存的未命中、add 的事件与最后的事实和实体，与每次都从库里读完全相同。"""
+    monkeypatch.setattr(consolidate_module, "MIRRORED_SPACES", 0)  # 不留镜像：每次都从库里读
+    cold = story(story_settings, fake_api, tmp_path / "cold")
+    monkeypatch.undo()
+    warm = story(story_settings, fake_api, tmp_path / "warm")
+    assert warm["requests"] == cold["requests"]
+    assert warm["misses"] == cold["misses"]
+    assert warm["events"] == cold["events"]
+    for key in ("facts:u", "entities:u", "facts:v", "entities:v", "units"):
+        assert warm[key] == cold[key], key
+    # 场景确实走到了要问模型的灰区与要重新查的向量，镜像也确实用上了
+    assert sum(RECONCILE in r for r in cold["requests"]) >= 2
+    assert any("You link entity mentions" in r for r in cold["requests"])
+    assert "document:Max (pet): golden retriever" in cold["misses"]  # 载入时才查的描述
+    assert any(f["supersede_reason"] == "changed" for f in cold["facts:u"])
+    assert warm["loads"] < cold["loads"] // 2
+
+
+def test_add_with_wait_does_not_reload_the_whole_space(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SDK 的 add(wait=True)：以前前后各读一遍全部事实、巩固时再从库里读一遍全部事实与实体、
+    逐条查向量缓存，还把每个会话的发言读出来重算内容指纹（9,600 条事实、800 个会话时每次
+    1–1.5 秒）。现在只读新会话的发言、新的与被取代的事实。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=lambda p: {"decisions": []})]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as m:
+        for i in range(12):
+            m.add(f"I like topic {i}", user_id="u", run_id=f"s{i}", wait=True)
+        db, embedder = m.system.db, m.system.embedder
+        assert isinstance(embedder, CachedEmbedder)
+        calls: Counter[str] = Counter()
+
+        def spy(name: str, target: Any) -> None:
+            real = getattr(target, name)
+
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                calls[name] += 1
+                if name == "get_facts" and kwargs.get("ids") is None:
+                    calls["get_facts(all)"] += 1
+                if name == "get_turns":
+                    calls[f"get_turns:{args[1] if len(args) > 1 else 'all'}"] += 1
+                if name == "get_many":
+                    calls["cached texts"] += len(args[0])
+                return real(*args, **kwargs)
+
+            monkeypatch.setattr(target, name, wrapper)
+
+        for name in ("get_facts", "get_entities", "get_turns"):
+            spy(name, db)
+        spy("get_many", embedder.cache)
+        out = m.add("I moved to Munich", user_id="u", run_id="s12", wait=True)
+    assert [e["memory"] for e in out["results"]] == ["The user lives in Munich."]
+    assert calls["get_facts(all)"] == 0 and calls["get_entities"] == 0
+    # 只读新会话的发言（分配序号、登记任务、抽取），其余 12 个会话的内容指纹不重算
+    assert calls["get_turns"] == calls["get_turns:s12"] == 3
+    assert calls["cached texts"] <= 3  # 只查这次新抽取的陈述
+
+
+def test_reused_state_notices_writes_from_another_connection(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """别的进程（库的另一个连接）改了事实时不用留下的镜像，照样从库里读：这里另一个连接把
+    "住在柏林"标成了不再有效，搬到慕尼黑就没有可以取代的旧住址，不该再问模型。"""
+    model = ScriptedModel(where_i_live)
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as m:
+        m.add("I live in Berlin", user_id="u", run_id="s1", wait=True)
+        [berlin] = m.system.db.get_facts(space_for("u"))
+        assert m.system.db.path is not None
+        other = MemoryDB(m.system.db.path)
+        retired = berlin.model_copy(update={"invalidated_at": berlin.recorded_at})
+        other.apply_consolidation(facts=[retired], entities=[], episodes=[], units=[])
+        other.close()
+        m.add("I moved to Munich", user_id="u", run_id="s2", wait=True)
+    assert model.calls["reconcile"] == 0
+
+
+def test_state_is_not_reused_after_another_connection_wrote_during_the_run(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """巩固进行中别的连接改了库（这里在对账问模型时把"住在柏林"标成不再有效）：这次巩固的
+    状态是改动之前载入的，做完之后不能留给下一次，下一次照样从库里读。"""
+    path: list[Path] = []
+    prompts: list[str] = []
+
+    def decide(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        if len(prompts) == 1:  # 搬到慕尼黑的对账进行中：另一个连接改了柏林那条
+            other = MemoryDB(path[0])
+            [berlin] = [f for f in other.get_facts(space_for("u")) if "Berlin" in f.statement]
+            retired = berlin.model_copy(update={"invalidated_at": berlin.recorded_at})
+            other.apply_consolidation(facts=[retired], entities=[], episodes=[], units=[])
+            other.close()
+        return {"decisions": []}  # 都按新增处理：这次巩固不会改写柏林那条
+
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=decide)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as m:
+        assert m.system.db.path is not None
+        path.append(m.system.db.path)
+        m.add("I live in Berlin", user_id="u", run_id="s1", wait=True)
+        m.add("I moved to Munich", user_id="u", run_id="s2", wait=True)
+        m.add("I moved to Paris", user_id="u", run_id="s3", wait=True)
+    assert len(prompts) == 2
+    assert "Munich" in prompts[1] and "Berlin" not in prompts[1]

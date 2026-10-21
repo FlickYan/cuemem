@@ -15,7 +15,7 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -187,6 +187,11 @@ class MemoryDB:
         self._conn = sqlite3.connect(str(path) if path else ":memory:", check_same_thread=False)
         self._lock = threading.RLock()
         self._depth = 0  # 嵌套的 transaction() 层数（只在持有 _lock 时读写）
+        # 本连接的写入计数（只在持有 _lock 时读写），见 derived_version 与 turns_version
+        self._derived: dict[str, int] = {}  # 空间 → 事实、实体与实体检索单元改过几次
+        self._turn_epochs: dict[str, int] = {}  # 空间 → 删过几次发言（遗忘、删除空间）
+        self._turn_writes: dict[tuple[str, str], int] = {}  # （空间，会话）→ 写过几次发言
+        self._rollbacks = 0  # 回滚过的事务与保存点
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
@@ -220,6 +225,7 @@ class MemoryDB:
                 try:
                     yield self._conn
                 except BaseException:
+                    self._rollbacks += 1
                     if self._conn.in_transaction:  # 有的错误（磁盘满等）SQLite 已经整个回滚了
                         self._conn.execute(f"ROLLBACK TO {name}")
                         self._conn.execute(f"RELEASE {name}")
@@ -235,10 +241,42 @@ class MemoryDB:
                 yield self._conn
                 self._conn.commit()
             except BaseException:
+                self._rollbacks += 1
                 self._conn.rollback()
                 raise
             finally:
                 self._depth = 0
+
+    def derived_version(self, space_id: str) -> tuple[int, ...]:
+        """这个空间的事实、实体与实体检索单元的版本：两次读到的相同，期间就没有改过（巩固据此
+        跨运行复用载入的状态，见 Consolidator._load_states）。
+
+        本连接的写入由改动它们的方法计数（apply_consolidation、clear_derived、delete_space，
+        以及写到或删掉实体检索单元的 add_units、delete_units；以后加的写入方法也要计数）；
+        事务回滚过、别的连接（别的进程）提交过写入，也都算改过。"""
+        with self._lock:
+            return (self._derived.get(space_id, 0), self._rollbacks, self._data_version())
+
+    def turns_version(self, space_id: str, session_id: str) -> tuple[int, ...]:
+        """这个会话的发言的版本：两次读到的相同，期间这个会话的发言就没有变过（巩固据此不用
+        每次都重算全部会话的内容指纹，见 Consolidator.enqueue）。发言只会追加（add_turns）或
+        删除（delete_turns、delete_space），这几个方法计数（以后加的改动发言的方法也要计数）；
+        回滚与别的连接的提交同样算变过。"""
+        with self._lock:
+            return (
+                self._turn_epochs.get(space_id, 0),
+                self._turn_writes.get((space_id, session_id), 0),
+                self._rollbacks,
+                self._data_version(),
+            )
+
+    def _data_version(self) -> int:
+        """别的连接每提交一次写入就变一次（本连接自己的提交不算）。"""
+        return int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+
+    def _bump(self, space_ids: Iterable[str]) -> None:
+        for space_id in set(space_ids):
+            self._derived[space_id] = self._derived.get(space_id, 0) + 1
 
     # ---------- 元信息 ----------
 
@@ -337,6 +375,8 @@ class MemoryDB:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            for key in {(t.space_id, t.session_id) for t in turns}:
+                self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
             return max(cursor.rowcount, 0)
 
     def get_turns(
@@ -367,6 +407,7 @@ class MemoryDB:
         if not turn_ids:
             return 0
         with self.transaction() as conn:
+            self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
             deleted = 0
             for start in range(0, len(turn_ids), 500):
                 chunk = list(turn_ids[start : start + 500])
@@ -432,6 +473,7 @@ class MemoryDB:
 
     def add_units(self, units: Sequence[MemoryUnit]) -> int:
         with self.transaction() as conn:
+            self._bump(u.space_id for u in units if u.kind == "entity")
             return _insert_units(conn, units, replace=False)
 
     def missing_unit_ids(self, space_id: str, ids: Sequence[str]) -> list[str]:
@@ -487,6 +529,13 @@ class MemoryDB:
             for start in range(0, len(ids), 500):
                 chunk = list(ids[start : start + 500])
                 marks = ", ".join("?" * len(chunk))
+                entity = conn.execute(  # 删到实体的检索单元时，巩固载入的状态就变了
+                    "SELECT 1 FROM units WHERE space_id = ? AND kind = 'entity'"
+                    f" AND id IN ({marks}) LIMIT 1",
+                    [space_id, *chunk],
+                ).fetchone()
+                if entity is not None:
+                    self._bump([space_id])
                 cursor = conn.execute(
                     f"DELETE FROM units WHERE space_id = ? AND id IN ({marks})",
                     [space_id, *chunk],
@@ -604,6 +653,13 @@ class MemoryDB:
         检索单元，并把任务标记为完成。中途失败则整体回滚，任务保持待处理，重跑即可。"""
         now = datetime.now().isoformat()
         with self.transaction() as conn:
+            self._bump(
+                [
+                    *(f.space_id for f in facts),
+                    *(e.space_id for e in entities),
+                    *(u.space_id for u in units if u.kind == "entity"),
+                ]
+            )
             conn.executemany(
                 f"INSERT OR REPLACE INTO facts ({_FACT_COLUMNS}) VALUES ({', '.join('?' * 20)})",
                 [_fact_row(f) for f in facts],
@@ -692,6 +748,24 @@ class MemoryDB:
             facts.sort(key=lambda f: order.get(f.id, len(order)))
         return facts
 
+    def fact_ids(self, space_id: str) -> list[str]:
+        """全部事实的 ID，顺序同 get_facts（不构造 Fact）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM facts WHERE space_id = ? ORDER BY recorded_at, id", (space_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def fact_links(self, space_id: str) -> dict[str, tuple[bool, str | None]]:
+        """事实 ID →（是否当前有效，被谁取代），顺序同 get_facts（不构造 Fact）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, invalidated_at IS NULL, superseded_by FROM facts WHERE space_id = ?"
+                " ORDER BY recorded_at, id",
+                (space_id,),
+            ).fetchall()
+        return {r[0]: (bool(r[1]), r[2]) for r in rows}
+
     def fact_space(self, fact_id: str) -> str | None:
         """事实所在的记忆空间（事实 ID 由空间派生，全局唯一；SDK 按 ID 取事实用，N12）。"""
         with self._lock:
@@ -712,6 +786,14 @@ class MemoryDB:
         with self._lock:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_entity(r) for r in fetched]
+
+    def entity_ids(self, space_id: str) -> list[str]:
+        """全部实体的 ID，顺序同 get_entities。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM entities WHERE space_id = ? ORDER BY first_seen, id", (space_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def entity_names(self, space_id: str) -> list[tuple[str, list[str]]]:
         """各实体的名字与别名（顺序同 get_entities）：只要名字时不用逐行构造 Entity。"""
@@ -774,6 +856,7 @@ class MemoryDB:
         """清空某个空间的全部派生数据（事实、实体、片段、核心记忆、任务，以及除"轮"以外的
         检索单元），返回被删除的检索单元 ID，供调用方同步删除向量。"""
         with self.transaction() as conn:
+            self._bump([space_id])
             ids = [
                 r[0]
                 for r in conn.execute(
@@ -926,6 +1009,8 @@ class MemoryDB:
 
     def delete_space(self, space_id: str) -> None:
         with self.transaction() as conn:
+            self._bump([space_id])
+            self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
             for table in ("units", "turns", "sessions", "media", "provenance", *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))
@@ -996,6 +1081,16 @@ def _insert_units(conn: sqlite3.Connection, units: Sequence[MemoryUnit], *, repl
         f"{verb} INTO units ({_UNIT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
     )
     return max(cursor.rowcount, 0)
+
+
+def stored_fact(fact: Fact) -> Fact:
+    """这条事实写进库之后再读出来的样子（与 get_facts 读到的逐字段相同）。"""
+    return _row_to_fact(_fact_row(fact))
+
+
+def stored_entity(entity: Entity) -> Entity:
+    """这个实体写进库之后再读出来的样子（与 get_entities 读到的逐字段相同）。"""
+    return _row_to_entity(_entity_row(entity))
 
 
 def _dt(value: str) -> datetime:

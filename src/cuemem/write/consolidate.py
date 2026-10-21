@@ -24,7 +24,7 @@ import logging
 import queue
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -39,9 +39,10 @@ from cuemem.core.models import Entity, Episode, Fact, MediaItem, MemoryUnit, Tur
 from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import TraceSink, record_event, span, start_trace
 from cuemem.embed.base import FloatArray, SparseVector, TextEmbedder
+from cuemem.embed.cache import CachedEmbedder
 from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient
-from cuemem.store.sqlite import MemoryDB
+from cuemem.store.sqlite import MemoryDB, stored_entity, stored_fact
 from cuemem.store.vector import VectorStore
 from cuemem.write.caption import Captioner, CaptionMode, image_note, with_text
 from cuemem.write.entities import (
@@ -75,6 +76,10 @@ logger = logging.getLogger(__name__)
 # 失败 MAX_ATTEMPTS 次就不再自动重试（显式的 consolidate 仍会重试全部失败的任务）
 MAX_ATTEMPTS = 3
 RETRY_BASE_S = 60.0
+# 跨巩固留着载入状态（_Mirror）的空间数，最近巩固过的优先；一个空间约是全部事实与实体，
+# 再加当前事实的陈述向量（1 万条、1024 维时约 40 MB）
+MIRRORED_SPACES = 4
+DIGESTS_KEPT = 100_000  # 记着内容指纹的会话数（见 enqueue），超过时清空重算
 
 
 @dataclass
@@ -110,6 +115,19 @@ class ConsolidationReport:
             "skipped": self.skipped,
             "elapsed_ms": round(self.elapsed_ms, 1),
         }
+
+
+@dataclass
+class _Mirror:
+    """一个空间的事实、实体与建了检索单元的实体在库里的样子（与从库里读到的逐字段相同），以及
+    向量化过的文本的向量（都来自向量缓存）。见 Consolidator._load_states。"""
+
+    version: tuple[int, ...]  # 记下它时的 MemoryDB.derived_version
+    embed_version: tuple[int, ...]  # 记下它时的 CachedEmbedder.version
+    facts: dict[str, Fact]
+    entities: dict[str, Entity]
+    indexed: set[str]
+    vectors: dict[str, Vector] = field(default_factory=dict)
 
 
 class Consolidator:
@@ -159,6 +177,11 @@ class Consolidator:
         # 可重入：遗忘、重建持有这把锁时，内部再调用 run() 不会自己等自己（见 exclusive）
         self._space_locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
+        self._mirrors: OrderedDict[str, _Mirror] = OrderedDict()  # 见 _load_states
+        self._mirrors_guard = threading.Lock()
+        # （空间，会话）→（发言的版本，开始时间，内容指纹；没有发言时为 None），见 enqueue
+        self._digests: dict[tuple[str, str], tuple[tuple[int, ...], datetime, str | None]] = {}
+        self._digests_guard = threading.Lock()
 
     # ---------- 任务 ----------
 
@@ -176,15 +199,37 @@ class Consolidator:
         已经巩固过时，执行前先从原始日志重放（见 run）。
         """
         sessions = self.db.get_sessions(space_id)
-        added = 0
+        todo: list[tuple[str, str]] = []
         for session_id in session_ids if session_ids is not None else sorted(sessions):
-            turns = self.db.get_turns(space_id, session_id)
-            if not turns or session_id not in sessions or session_id in skip:
+            if session_id not in sessions or session_id in skip:
                 continue
-            digest = session_content_hash(turns, sessions[session_id])
-            job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
-            added += self.db.enqueue_job(job_id, space_id, session_id, PIPELINE_VERSION, digest)
+            digest = self._digest(space_id, session_id, sessions[session_id])
+            if digest is not None:
+                todo.append((session_id, digest))
+        added = 0
+        with self.db.transaction():  # 一次提交（以前每个会话各提交一次）
+            for session_id, digest in todo:
+                job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
+                added += self.db.enqueue_job(job_id, space_id, session_id, PIPELINE_VERSION, digest)
         return added
+
+    def _digest(self, space_id: str, session_id: str, started_at: datetime) -> str | None:
+        """会话的内容指纹（session_content_hash；没有发言时为 None）。发言没变过（MemoryDB 的
+        turns_version）时用上次算的：显式的巩固与遗忘每次都为全部会话登记任务，以前每次都把每个
+        会话的发言读出来重算一遍（800 个会话约 0.18 秒）。"""
+        version = self.db.turns_version(space_id, session_id)
+        key = (space_id, session_id)
+        with self._digests_guard:
+            known = self._digests.get(key)
+        if known is not None and known[:2] == (version, started_at):
+            return known[2]
+        turns = self.db.get_turns(space_id, session_id)
+        digest = session_content_hash(turns, started_at) if turns else None
+        with self._digests_guard:
+            if len(self._digests) >= DIGESTS_KEPT:
+                self._digests.clear()
+            self._digests[key] = (version, started_at, digest)
+        return digest
 
     def fingerprint(self) -> str:
         """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。"""
@@ -364,8 +409,10 @@ class Consolidator:
         embedded = self._embed(texts)
 
         # C. 按会话时间顺序串行：消歧 → 对账 → 写入
-        entity_state = self._load_entities(space_id)
-        fact_state = self._load_facts(space_id)
+        loaded = self.db.derived_version(space_id)
+        mirror, entity_state, fact_state = self._load_states(space_id, loaded)
+        if mirror is not None:
+            mirror.vectors.update(embedded)
         for job in jobs:
             extraction = extractions.get(job["id"])
             if extraction is None:
@@ -380,6 +427,7 @@ class Consolidator:
                 embedded,
                 report,
                 cache_scope,
+                mirror,
             )
             record_event("consolidate_session", session=extraction.session_id, **stats)
 
@@ -396,6 +444,7 @@ class Consolidator:
         )
         self.db.set_core_memory(core)
         self.db.set_meta(f"consolidation:{space_id}", self.fingerprint())
+        self._keep_mirror(space_id, mirror, loaded)
         report.sessions = len(extractions)
         report.elapsed_ms = (time.perf_counter() - started) * 1000
         return report
@@ -531,6 +580,7 @@ class Consolidator:
         embedded: dict[str, Vector],
         report: ConsolidationReport,
         cache_scope: str,
+        mirror: _Mirror | None,
     ) -> dict[str, Any]:
         ts = ext.started_at
         ents = ResolutionReport()
@@ -658,6 +708,10 @@ class Consolidator:
             job_id=job_id,
             job_stats=stats,
         )
+        if mirror is not None:  # 镜像跟着库走：记下写进去的样子
+            mirror.facts.update((f.id, stored_fact(f)) for f in rec.changed.values())
+            mirror.entities.update((e.id, stored_entity(e)) for e in ents.changed.values())
+            mirror.indexed.update(u.id for u in units if u.kind == "entity")
         report.added += stats["added"]
         report.superseded += stats["superseded"]
         report.merged += stats["merged"]
@@ -670,24 +724,86 @@ class Consolidator:
 
     # ---------- 状态加载 ----------
 
-    def _load_entities(self, space_id: str) -> EntityState:
-        state = EntityState(space_id)
-        entities = self.db.get_entities(space_id)
-        indexed = {u.id for u in self.db.list_units(space_id, kinds=["entity"])}
-        vectors = self._embed([e.descriptor for e in entities if e.id in indexed])
+    def _load_states(
+        self, space_id: str, version: tuple[int, ...]
+    ) -> tuple[_Mirror | None, EntityState, FactState]:
+        """载入这个空间的实体与事实状态：库里的全部实体（按 first_seen、ID）与建了检索单元的
+        实体的描述向量，库里的全部事实（按 recorded_at、ID）与当前事实的陈述向量。
+
+        以前每次巩固都从库里读一遍全部事实与实体、逐条查向量缓存（9,600 条事实时约 0.75 秒，
+        SDK 每次 add 都有一次巩固）。现在上一次巩固之后留下这个空间的镜像（_Mirror：库里的样子
+        与查过的向量），派生记忆与向量缓存都没变过（version 是 MemoryDB.derived_version，见
+        _keep_mirror）时只按库里的顺序取一遍 ID，状态、先后与向量都与从库里读的逐字段、逐位
+        相同；还没查过的文本照旧交给向量器，请求也相同。向量器不带缓存时照旧每次从库里读。"""
+        embed_version = self._embed_version()
+        with self._mirrors_guard:
+            mirror = self._mirrors.pop(space_id, None)  # 巩固出错时不放回去：下次从库里读
+        entities: list[Entity] | None = None
+        facts: list[Fact] = []
+        if mirror is not None and (mirror.version, mirror.embed_version) == (
+            version,
+            embed_version,
+        ):
+            fact_ids, entity_ids = self.db.fact_ids(space_id), self.db.entity_ids(space_id)
+            if mirror.facts.keys() == set(fact_ids) and mirror.entities.keys() == set(entity_ids):
+                entities = [mirror.entities[i] for i in entity_ids]
+                facts = [mirror.facts[i] for i in fact_ids]
+        if mirror is None or entities is None:
+            entities = self.db.get_entities(space_id)
+            indexed = {u.id for u in self.db.list_units(space_id, kinds=["entity"])}
+            facts = self.db.get_facts(space_id)
+            mirror = None
+            if embed_version is not None:
+                mirror = _Mirror(
+                    version,
+                    embed_version,
+                    {f.id: f for f in facts},
+                    {e.id: e for e in entities},
+                    indexed,
+                )
+        else:
+            indexed = mirror.indexed
+        entity_state = EntityState(space_id)
+        vectors = self._vectors([e.descriptor for e in entities if e.id in indexed], mirror)
         for entity in entities:
             vec = vectors.get(entity.descriptor) if entity.id in indexed else None
-            state.add(entity, vec[0] if vec else None)
-        return state
-
-    def _load_facts(self, space_id: str) -> FactState:
-        state = FactState()
-        facts = self.db.get_facts(space_id)
-        vectors = self._embed([f.statement for f in facts if f.is_current])
+            entity_state.add(entity, vec[0] if vec else None)
+        fact_state = FactState()
+        vectors = self._vectors([f.statement for f in facts if f.is_current], mirror)
         for fact in facts:
             vec = vectors.get(fact.statement) if fact.is_current else None
-            state.put(fact, vec[0] if vec else None)
-        return state
+            fact_state.put(fact, vec[0] if vec else None)
+        return mirror, entity_state, fact_state
+
+    def _vectors(self, texts: Sequence[str], mirror: _Mirror | None) -> Mapping[str, Vector]:
+        """同 _embed；有镜像时先用镜像里记下的向量（都是向量缓存里的，逐位相同），只把其余的交给
+        向量器：记下的文本本来就都在缓存里，未命中、要发出的请求与全部交给向量器时相同。"""
+        if mirror is None:
+            return self._embed(texts)
+        known = mirror.vectors
+        known.update(self._embed([t for t in texts if t not in known]))
+        return known
+
+    def _keep_mirror(self, space_id: str, mirror: _Mirror | None, loaded: tuple[int, ...]) -> None:
+        """巩固做完，留下镜像给下一次用。这期间这个空间的派生记忆只有本次巩固改过（改动派生记忆
+        的操作都持有这个空间的锁，见 exclusive），所以镜像与库相同；有事务回滚过、别的连接写过
+        这个库，或向量缓存删过条目、被别的连接改过时不留。"""
+        if mirror is None:
+            return
+        version = self.db.derived_version(space_id)
+        if version[1:] != loaded[1:] or self._embed_version() != mirror.embed_version:
+            return
+        mirror.version = version
+        needed = {f.statement for f in mirror.facts.values() if f.is_current}
+        needed |= {mirror.entities[i].descriptor for i in mirror.indexed if i in mirror.entities}
+        mirror.vectors = {t: v for t, v in mirror.vectors.items() if t in needed}
+        with self._mirrors_guard:
+            self._mirrors[space_id] = mirror
+            while len(self._mirrors) > MIRRORED_SPACES:
+                self._mirrors.popitem(last=False)
+
+    def _embed_version(self) -> tuple[int, ...] | None:
+        return self.embedder.version() if isinstance(self.embedder, CachedEmbedder) else None
 
     def _embed(self, texts: Sequence[str]) -> dict[str, Vector]:
         unique = [t for t in dict.fromkeys(texts) if t]

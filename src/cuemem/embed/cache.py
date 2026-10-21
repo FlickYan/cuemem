@@ -30,6 +30,7 @@ class EmbeddingCache:
             str(path) if path else ":memory:", check_same_thread=False, timeout=60.0
         )
         self._lock = threading.Lock()
+        self._deletes = 0  # 删过几次条目（见 version）
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
@@ -96,8 +97,16 @@ class EmbeddingCache:
                 deleted += max(cursor.rowcount, 0)
             self._conn.commit()
             if deleted:
+                self._deletes += 1
                 self._checkpoint()
         return deleted
+
+    def version(self) -> tuple[int, int]:
+        """缓存的版本：两次读到的相同，期间就没有删过条目（本连接删的，或别的连接写过、
+        删过），之前读到的向量与现在再查一遍逐位相同（巩固据此跨运行复用向量）。"""
+        with self._lock:
+            changed = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+            return self._deletes, changed
 
     def close(self) -> None:
         with self._lock:
@@ -168,6 +177,11 @@ class CachedEmbedder:
             else None
         )
         return EmbeddingBatch(dense=dense, sparse=sparse_out, tokens=tokens)
+
+    def version(self) -> tuple[int, int]:
+        """见 EmbeddingCache.version：版本没变时，同一段文本再向量化一次得到逐位相同的结果、
+        也不会发出请求（之前得到过的向量都在缓存里）。"""
+        return self.cache.version()
 
     def cached(self, texts: Sequence[str], kind: EmbedKind) -> set[str]:
         """返回 texts 中已经在缓存里的那些（测试与遗忘检查用）。"""

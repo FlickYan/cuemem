@@ -52,6 +52,7 @@ from cuemem.memory import ForgetReport, MemorySystem, Recall
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router, english_reason
 from cuemem.read.facts import fact_status
+from cuemem.store.sqlite import MemoryDB
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,8 @@ class Memory:
                 return {"results": [], "session_id": None, "turn_ids": [], "status": "empty"}
             self._adopt(space)  # 没有重新 open_run 的 run_id 就是一个普通的会话，一起接手
             sid = run_id or sortable_session_id("add", when)
-            before = {f.id: f for f in self.system.db.get_facts(space)} if wait else {}
+            # 只取 ID 与是否当前有效：以前前后各读一遍全部事实（9,600 条时每次约 0.29 秒）
+            before = self.system.db.fact_links(space) if wait else {}
             # 发言序号在会话锁里分配、写完再放：同一个 run_id 的并发 add 不会撞号
             with self.system.session_lock(space, sid):
                 first = self._next_idx(space, sid)
@@ -238,7 +240,7 @@ class Memory:
             out["status"] = "logged"
         elif wait:
             report = self.system.consolidate(space)
-            out["results"] = _events(before, self.system.db.get_facts(space), user_id, agent_id)
+            out["results"] = _events(self.system.db, space, before, user_id, agent_id)
             out["status"] = "consolidated"
             out["consolidation"] = report.as_dict()
         else:
@@ -816,14 +818,27 @@ def _answer_out(answer: Answer) -> dict[str, Any]:
 
 
 def _events(
-    before: Mapping[str, Fact], after: Sequence[Fact], user_id: str | None, agent_id: str | None
+    db: MemoryDB,
+    space: str,
+    before: Mapping[str, tuple[bool, str | None]],
+    user_id: str | None,
+    agent_id: str | None,
 ) -> list[dict[str, Any]]:
     """抽取前后的事实对比 → Mem0 风格的事件：新事实 ADD；取代了旧事实的新事实 UPDATE，
-    附上被取代的旧版本（旧版本仍留在版本链里，不会被删除）。"""
+    附上被取代的旧版本（旧版本仍留在版本链里，不会被删除）。before 是抽取前的
+    MemoryDB.fact_links：只读出新的事实与这次被取代的事实（顺序同 get_facts）。"""
+    wanted = [
+        fid
+        for fid, (_, superseded_by) in db.fact_links(space).items()
+        if fid not in before or (before[fid][0] and superseded_by)
+    ]
+    after = [
+        f for i in range(0, len(wanted), 500) for f in db.get_facts(space, ids=wanted[i : i + 500])
+    ]
     replaced: dict[str, list[Fact]] = {}
     for fact in after:
         old = before.get(fact.id)
-        if old is not None and old.is_current and fact.superseded_by:
+        if old is not None and old[0] and fact.superseded_by:
             replaced.setdefault(fact.superseded_by, []).append(fact)
     events = []
     for fact in after:
