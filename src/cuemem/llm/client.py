@@ -2,7 +2,8 @@
 
 职责：
 - 按角色选模型（roles → models），拼请求参数，处理供应商差异（例如关闭思考模式）；
-- 按供应商限制并发；
+- 按供应商限制并发；限流、5xx、连不上时退避重试（照 OpenAI SDK 的规则，见 _retry_delay）；
+  超时只在调用方没有备用模型时重试；
 - 分时价格：高峰时段需要真实调用时，按策略暂停到高峰结束（见 llm/peak.py）；
 - 本地响应缓存：相同请求只调用一次 API，既省钱也让实验可复现；
 - 用量记账与 trace 事件；
@@ -11,17 +12,27 @@
 
 from __future__ import annotations
 
+import email.utils
 import json
+import math
+import random
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, cast
 
 import httpx2
-from openai import APITimeoutError, BadRequestError, OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    BadRequestError,
+    OpenAI,
+)
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ValidationError
 
@@ -42,6 +53,10 @@ Message = dict[str, Any]
 PeakPolicy = Literal["wait", "warn", "allow"]
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+# 重试的退避（与 OpenAI SDK 3.x 相同）：0.5 秒起翻倍、最多 8 秒；上游的 Retry-After 最多照等 2 分钟
+_RETRY_INITIAL_S = 0.5
+_RETRY_MAX_S = 8.0
+_RETRY_AFTER_MAX_S = 120.0
 
 
 @dataclass
@@ -99,11 +114,17 @@ class LLMClient:
         use_cache: bool = True,
         cache_scope: str | None = None,
         retry_bad_json: bool = False,
+        retry_timeouts: bool = True,
     ) -> ChatResult:
         """调用一次聊天补全。role 决定默认模型与参数，model 可显式指定模型别名。
 
         parallel_tool_calls 只在带工具时发出（通义不设为 true 时一次只回一个工具调用，N12）。
         cache_scope 标记缓存条目所属的记忆空间，遗忘时据此清理。
+
+        限流、5xx 与连不上时按 providers.*.max_retries 退避重试（_send）。retry_timeouts=False：
+        超时不重发，立即抛出 APITimeoutError——调用方有备用模型时传（structured、评测网关）：
+        超时多半是模型在这条输入上生成失控，重发同样的请求还会超时，以前要等 SDK 重试满
+        （约 4 × timeout_s）才换模型。
 
         retry_bad_json：给照 OpenAI 的方式重试的外部系统用（评测网关，N12）。JSON 模式的回复解析
         不了时记下这个请求；同样的请求再来（外部系统的重试）时不读缓存，重新调用并覆盖缓存里的
@@ -165,7 +186,14 @@ class LLMClient:
                 record_event("llm_cache_refresh", role=role, model=alias)
         try:
             result = self._call_api(
-                role, alias, spec, messages, params, key if caching else "", cache_scope
+                role,
+                alias,
+                spec,
+                messages,
+                params,
+                key if caching else "",
+                cache_scope,
+                retry_timeouts,
             )
         finally:
             if caching:
@@ -220,18 +248,19 @@ class LLMClient:
         params: dict[str, Any],
         key: str,
         cache_scope: str | None,
+        retry_timeouts: bool,
     ) -> ChatResult:
         self._peak_gate(spec.provider, role)
-        create = cast(Any, self._client(spec.provider).chat.completions.create)
+        request = {
+            "model": spec.model_id,
+            "messages": messages,
+            "extra_body": spec.extra_body or None,
+            **params,
+        }
         started = time.perf_counter()
         with self._semaphores[spec.provider]:
             try:
-                completion = create(
-                    model=spec.model_id,
-                    messages=messages,
-                    extra_body=spec.extra_body or None,
-                    **params,
-                )
+                completion = self._send(spec.provider, request, retry_timeouts)
             except BadRequestError as exc:
                 if _is_content_filter(exc):
                     record_event("llm_filtered", role=role, model=alias)
@@ -257,6 +286,22 @@ class LLMClient:
         self._account(role, alias, spec, result)
         return result
 
+    def _send(self, provider: str, request: dict[str, Any], retry_timeouts: bool) -> Any:
+        """发出请求；出错时按 _retry_delay 决定要不要重试、等多久，最多重试 max_retries 次，用尽时
+        抛出最后一次的异常。OpenAI SDK 自己不再重试（见 _client）：它对超时也照样重试。"""
+        create = cast(Any, self._client(provider).chat.completions.create)
+        retries = self.settings.providers[provider].max_retries
+        attempt = 0
+        while True:
+            try:
+                return create(**request)
+            except APIError as exc:
+                delay = _retry_delay(exc, attempt, retry_timeouts=retry_timeouts)
+                if attempt >= retries or delay is None:
+                    raise
+            self._sleep(delay)
+            attempt += 1
+
     def structured[T: BaseModel](
         self,
         role: str,
@@ -272,21 +317,30 @@ class LLMClient:
         """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。
 
         fallback_model：内容审核拒绝或请求超时时改用的模型（通常是另一家供应商的）。
-        超时多半不是网络问题：模型在某条输入上生成失控、迟迟不结束，重发同样的请求还会超时。
+        超时多半不是网络问题：模型在某条输入上生成失控、迟迟不结束，重发同样的请求还会超时，
+        所以有备用模型时主模型超时一次就换（约 1 × timeout_s，以前 SDK 先重试满 max_retries 次）。
         """
+        primary = model or (
+            self.settings.roles[role].model if role in self.settings.roles else None
+        )
+        fallback = fallback_model if fallback_model != primary else None
         try:
             return self._structured(
-                role, messages, schema, model, max_tokens, max_attempts, cache_scope
+                role,
+                messages,
+                schema,
+                model,
+                max_tokens,
+                max_attempts,
+                cache_scope,
+                retry_timeouts=fallback is None,
             )
         except (ContentFilteredError, APITimeoutError) as exc:
-            primary = model or (
-                self.settings.roles[role].model if role in self.settings.roles else None
-            )
-            if fallback_model is None or fallback_model == primary:
+            if fallback is None:
                 raise
-            record_event("llm_fallback", role=role, model=fallback_model, reason=type(exc).__name__)
+            record_event("llm_fallback", role=role, model=fallback, reason=type(exc).__name__)
             return self._structured(
-                role, messages, schema, fallback_model, max_tokens, max_attempts, cache_scope
+                role, messages, schema, fallback, max_tokens, max_attempts, cache_scope
             )
 
     def _structured[T: BaseModel](
@@ -298,6 +352,8 @@ class LLMClient:
         max_tokens: int | None,
         max_attempts: int,
         cache_scope: str | None,
+        *,
+        retry_timeouts: bool = True,
     ) -> Structured[T]:
         msgs = _with_schema_instruction(messages, schema)
         last_error = ""
@@ -310,6 +366,7 @@ class LLMClient:
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                     cache_scope=cache_scope,
+                    retry_timeouts=retry_timeouts,
                 )
             except BadRequestError as exc:
                 # QwenCloud 在 JSON 模式下偶尔中止生成（"Model output became abnormal ..."），
@@ -359,8 +416,10 @@ class LLMClient:
         return spec is not None and spec.vision
 
     def list_models(self, provider: str) -> list[str]:
-        """列出供应商可用的模型 ID，用于核对配置（不是所有供应商都支持）。"""
-        return sorted(m.id for m in self._client(provider).models.list())
+        """列出供应商可用的模型 ID，用于核对配置（不是所有供应商都支持）。这里照旧由 SDK 重试。"""
+        retries = self.settings.providers[provider].max_retries
+        client = self._client(provider).with_options(max_retries=retries)
+        return sorted(m.id for m in client.models.list())
 
     def _prepare(
         self,
@@ -414,7 +473,9 @@ class LLMClient:
                     api_key=api_key,
                     base_url=cfg.base_url,
                     timeout=cfg.timeout_s,
-                    max_retries=cfg.max_retries,  # SDK 自带对 429 / 5xx / 网络错误的指数退避重试
+                    # SDK 不重试：它对超时也重试，备用模型要等 max_retries + 1 次超时才用得上。
+                    # 429 / 5xx / 连不上照 SDK 的规则由 _send 重试 cfg.max_retries 次
+                    max_retries=0,
                     http_client=self._http_client,
                 )
             return self._clients[provider]
@@ -505,6 +566,55 @@ def unparsable_json(result: ChatResult) -> bool:
     except ValueError:  # 包括 json.JSONDecodeError
         return True
     return False
+
+
+def _retry_delay(exc: APIError, attempt: int, *, retry_timeouts: bool) -> float | None:
+    """第 attempt 次重试（从 0 起）之前等几秒；None 表示这个错误不重试。规则照 OpenAI SDK 3.x
+    （_should_retry、_calculate_retry_timeout），评测与网关在线上的重试行为因此与以前相同：
+
+    - 超时：retry_timeouts 时重试（调用方有备用模型时不重试，见 chat）；连不上：重试；
+    - 有响应的：上游要求等超过 2 分钟的不重试；x-should-retry 头说了算；否则 408、409、429 与
+      5xx 重试（402 余额不足、400、401 等不重试）；
+    - 等多久：上游给了 retry-after-ms / retry-after（秒数或 HTTP 日期）且在 0–120 秒之间就照它，
+      否则 0.5 秒起翻倍、最多 8 秒，再随机减掉最多 25%。"""
+    asked: float | None = None  # 上游要求等几秒
+    if isinstance(exc, APITimeoutError):
+        if not retry_timeouts:
+            return None
+    elif isinstance(exc, APIStatusError):
+        headers = exc.response.headers
+        asked = _retry_after_s(headers)
+        if asked is not None and math.isfinite(asked) and asked > _RETRY_AFTER_MAX_S:
+            return None
+        flag = headers.get("x-should-retry")
+        status = exc.status_code
+        if flag == "false" or (flag != "true" and status not in (408, 409, 429) and status < 500):
+            return None
+    elif not isinstance(exc, APIConnectionError):
+        return None
+    if asked is not None and math.isfinite(asked) and 0 < asked <= _RETRY_AFTER_MAX_S:
+        return asked
+    return min(_RETRY_INITIAL_S * 2.0**attempt, _RETRY_MAX_S) * (1 - 0.25 * random.random())
+
+
+def _retry_after_s(headers: Mapping[str, str]) -> float | None:
+    """上游要求等几秒：先看 retry-after-ms，再看 retry-after（秒数或 HTTP 日期）；没有或看不懂时
+    为 None。数字大到溢出时按"等不起"处理（与 SDK 相同）。"""
+    for name, divisor in (("retry-after-ms", 1000.0), ("retry-after", 1.0)):
+        value = headers.get(name)
+        if value is None:
+            continue
+        try:
+            seconds = float(value) / divisor
+        except ValueError:
+            continue
+        literal = value.strip().lower() in ("inf", "+inf", "infinity", "+infinity")
+        return _RETRY_AFTER_MAX_S + 1 if seconds == math.inf and not literal else seconds
+    try:
+        parsed = email.utils.parsedate_tz(headers.get("retry-after") or "")
+        return None if parsed is None else float(email.utils.mktime_tz(parsed) - time.time())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 def _is_aborted_json(exc: BadRequestError) -> bool:

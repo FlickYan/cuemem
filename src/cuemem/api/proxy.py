@@ -125,15 +125,21 @@ class MemoryProxy:
     def complete(
         self, body: dict[str, Any], headers: Mapping[str, str]
     ) -> tuple[int, dict[str, Any], dict[str, str]]:
-        """非流式：返回（状态码，响应体，附加响应头）。上游出错时原样返回、不写记忆。"""
+        """非流式：返回（状态码，响应体，附加响应头）。上游出错时原样返回（连同它的
+        Retry-After）、不写记忆；连不上或超时时回 OpenAI 格式的 502 / 504。"""
         turn, upstream, url, auth = self._prepare(body, headers)
-        response = self._http.post(url, json=upstream, headers=auth)
+        try:
+            response = self._http.post(url, json=upstream, headers=auth)
+        except httpx2.TransportError as exc:
+            status, error = _unreachable(exc)
+            return status, error, _headers(turn)
         data = _json(response)
         if response.status_code == 200:
             choices = data.get("choices") or [{}]
             message = choices[0].get("message") or {}
             self._write_back(turn, message.get("content"))
-        return response.status_code, data, _headers(turn)
+            return 200, data, _headers(turn)
+        return response.status_code, data, {**_headers(turn), **_retry_headers(response)}
 
     def stream(
         self, body: dict[str, Any], headers: Mapping[str, str]
@@ -141,14 +147,20 @@ class MemoryProxy:
         """流式：先拿到上游的状态码，再把 SSE 原样转发；流读完后写回回答。
 
         状态码是 200 时返回的迭代器（_Relay）要么读完，要么调用 close()：它占着上游的连接，
-        中途不要的（客户端断开、用户停下）只写回用户的话；上游中途出错时什么也不写。"""
+        中途不要的（客户端断开、用户停下）只写回用户的话；上游中途出错时什么也不写。
+        上游一开始就出错时与非流式相同。"""
         turn, upstream, url, auth = self._prepare(body, headers)
         request = self._http.build_request("POST", url, json=upstream, headers=auth)
-        response = self._http.send(request, stream=True)
+        try:
+            response = self._http.send(request, stream=True)
+        except httpx2.TransportError as exc:
+            status, error = _unreachable(exc)
+            return status, iter([json.dumps(error).encode()]), _headers(turn)
         if response.status_code != 200:
             content = response.read()
             response.close()
-            return response.status_code, iter([content]), _headers(turn)
+            extra = {**_headers(turn), **_retry_headers(response)}
+            return response.status_code, iter([content]), extra
         return 200, _Relay(self, turn, response), _headers(turn)
 
     # ---------- 会话 ----------
@@ -431,6 +443,22 @@ def _json(response: httpx2.Response) -> dict[str, Any]:
     except ValueError:
         return {"error": {"message": response.text[:500], "type": "upstream_error"}}
     return data if isinstance(data, dict) else {"data": data}
+
+
+def _unreachable(exc: httpx2.TransportError) -> tuple[int, dict[str, Any]]:
+    """上游连不上或超时：OpenAI 格式的 502 / 504（以前是没有说明的 500）。"""
+    if isinstance(exc, httpx2.TimeoutException):
+        message = f"The upstream model provider did not respond in time ({type(exc).__name__})."
+        return 504, {"error": {"message": message, "type": "timeout", "code": "upstream_timeout"}}
+    message = f"Could not reach the upstream model provider ({type(exc).__name__}: {exc})."
+    return 502, {"error": {"message": message, "type": "upstream_error", "code": "upstream_error"}}
+
+
+def _retry_headers(response: httpx2.Response) -> dict[str, str]:
+    """上游出错时转给调用方的重试提示：OpenAI SDK 照 retry-after(-ms) 等待、照 x-should-retry
+    决定重不重试。以前只转发了响应体，限流时调用方不知道该等多久。"""
+    names = ("retry-after", "retry-after-ms", "x-should-retry")
+    return {name: response.headers[name] for name in names if name in response.headers}
 
 
 def _headers(turn: Turn) -> dict[str, str]:

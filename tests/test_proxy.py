@@ -13,7 +13,7 @@ from typing import Any
 import anyio
 import httpx2
 import pytest
-from fakes import REJECT, FakeAPI
+from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from scripted import ScriptedModel
@@ -412,6 +412,28 @@ def test_upstream_errors_are_returned_and_not_remembered(
     response = chat(client, "I live in Berlin", user="alice")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "data_inspection_failed"
+    assert system.db.get_turns("alice") == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_upstream_rate_limits_and_timeouts_reach_the_caller(
+    client: TestClient,
+    system: MemorySystem,
+    upstream: Upstream,
+    fake_api: FakeAPI,
+    stream: bool,
+) -> None:
+    """上游限流：429 连同上游的 Retry-After 转给调用方（OpenAI SDK 照它退避；以前只转发了
+    响应体）。上游超时：OpenAI 格式的 504（以前是没有说明的 500）。都不写记忆。"""
+    upstream.reply = RATE_LIMIT
+    fake_api.chat_rate_limit_headers = {"retry-after": "7", "retry-after-ms": "7000"}
+    limited = chat(client, "I live in Berlin", user="alice", stream=stream)
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "7" and limited.headers["retry-after-ms"] == "7000"
+
+    upstream.reply = TIMEOUT
+    late = chat(client, "I live in Berlin", user="alice", stream=stream)
+    assert late.status_code == 504 and late.json()["error"]["type"] == "timeout"
     assert system.db.get_turns("alice") == []
 
 

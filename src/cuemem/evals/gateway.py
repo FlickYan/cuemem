@@ -31,8 +31,8 @@
 转记进那道题的 trace，于是算进它的回答用量，这段时间的用量也另外给出；桶里照常累计。
 
 出错时照 OpenAI 的语义回给外部系统，由它们按自己的策略处理：
-- **限流**：上游的 429 在 LLM 客户端里已经由 SDK 退避重试过（providers.*.max_retries 次，照上游
-  的 Retry-After 等），仍然限流时回 429 并带上上游的 Retry-After，由外部系统自己退避重试，网关
+- **限流**：上游的 429 在 LLM 客户端里已经退避重试过（providers.*.max_retries 次，照上游的
+  Retry-After 等），仍然限流时回 429 并带上上游的 Retry-After，由外部系统自己退避重试，网关
   不再加一层重试；向量请求同样（向量器自己重试 embedding.max_attempts 次）。按桶计入
   rate_limited。以前它是一个没有说明的 500：Cognee 之类按"服务器出错"处理（它对 429 会放慢
   派发，对 500 不会），写入记录里也看不出是限流。
@@ -46,7 +46,6 @@
 from __future__ import annotations
 
 import json
-import math
 import socket
 import threading
 import time
@@ -61,6 +60,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import APIError, APITimeoutError, BadRequestError, RateLimitError
 
+from cuemem.api.failures import retry_after_header
 from cuemem.core.trace import Trace, start_trace
 from cuemem.embed.base import EmbedKind, TextEmbedder
 from cuemem.errors import ContentFilteredError, CueMemError, EmbeddingAPIError
@@ -350,12 +350,14 @@ class Gateway:
     ) -> tuple[ChatResult, str, bool]:
         """先用主模型；内容审核误拒、超时或 JSON 生成被中止时换备用模型。
 
-        限流不换模型（RateLimitError 原样抛出，由接口回 429）：换了模型就不是同一个协议了。"""
+        限流不换模型（RateLimitError 原样抛出，由接口回 429）：换了模型就不是同一个协议了。
+        有备用模型时主模型超时一次就换（retry_timeouts=False，见 LLMClient.chat）。"""
+        usable = self.fallback is not None and self.fallback != primary
         try:
-            return self.llm.chat(self.role, messages, **kwargs), primary, False
+            result = self.llm.chat(self.role, messages, retry_timeouts=not usable, **kwargs)
+            return result, primary, False
         except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
             aborted = "Model output became abnormal" in str(exc)
-            usable = self.fallback is not None and self.fallback != primary
             if not usable or (isinstance(exc, BadRequestError) and not aborted):
                 raise
         result = self.llm.chat(self.role, messages, model=self.fallback, **kwargs)
@@ -366,7 +368,7 @@ class Gateway:
             result, alias = self.chat(bucket, body)
         except HTTPException:
             raise
-        except RateLimitError as exc:  # LLM 客户端已经按 SDK 的退避重试过：网关不再重试
+        except RateLimitError as exc:  # LLM 客户端已经退避重试过：网关不再重试
             return _rate_limited(str(exc), _retry_after(exc.response.headers))
         except (ContentFilteredError, BadRequestError) as exc:
             return _error(400, str(exc), "invalid_request_error")
@@ -587,13 +589,5 @@ def _rate_limited(message: str, retry_after: str | None) -> JSONResponse:
     return JSONResponse(body, 429, headers=headers)
 
 
-def _retry_after(headers: Any) -> str | None:
-    """上游响应的 Retry-After（秒数或 HTTP 日期，原样转发）；只有 retry-after-ms 时换算成秒。"""
-    value = headers.get("retry-after")
-    if value:
-        return str(value)
-    millis = headers.get("retry-after-ms")
-    try:
-        return str(max(1, math.ceil(float(millis) / 1000))) if millis else None
-    except ValueError:
-        return None
+# 上游响应的 Retry-After（HTTP 接口报限流时也用它，见 api/failures.py）
+_retry_after = retry_after_header

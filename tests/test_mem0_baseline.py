@@ -325,3 +325,19 @@ def test_mem0_checks_the_protocol_before_the_session_id_scheme(
     stats = method._ensure_built(key, _sessions(), "anon")
     assert stats is not None and stats["session_ids"] == "anon" and built == [key]
     assert method._ensure_built(key, _sessions(), "anon") is None
+
+
+def test_mem0_llm_falls_back_after_one_timeout(settings: Settings) -> None:
+    """Mem0 的抽取经 CueMem 的 LLM 客户端：主模型超时一次就换备用模型（以前 SDK 先重发
+    max_retries 次）。不需要装 mem0。"""
+    from fakes import TIMEOUT, FakeAPI
+
+    from cuemem.evals.mem0_baseline import _LLM
+    from cuemem.llm.client import LLMClient
+
+    fake = FakeAPI()
+    fake.chat_replies = [lambda body: TIMEOUT if body["model"] == "qwen3.8-flash" else "{}"]
+    llm = LLMClient(settings, http_client=fake.client(), sleep=lambda _: None)
+    reply = _LLM(llm, "mem0|x").generate_response([{"role": "user", "content": "hi"}])
+    assert reply == "{}"
+    assert [r["model"] for r in fake.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]

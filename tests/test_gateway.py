@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import ABORT_JSON, NO_BALANCE, RATE_LIMIT, REJECT, FakeAPI
+from fakes import ABORT_JSON, NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi.testclient import TestClient
 from openai import OpenAI, RateLimitError
 
@@ -148,6 +148,17 @@ def test_aborted_json_falls_back_and_errors_become_openai_errors(
     assert gateway.usage("b1")["fallbacks"] == 1
     assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 400
     assert client.post("/v1/chat/completions", json={"messages": HELLO, "n": 2}).status_code == 400
+
+
+def test_timeout_falls_back_after_one_try(
+    client: TestClient, gateway: Gateway, fake_api: FakeAPI
+) -> None:
+    """主模型超时：一次就换备用模型（以前 SDK 先重发 max_retries 次，约 4 × timeout_s）。"""
+    fake_api.chat_replies = [lambda body: TIMEOUT if body["model"] == "qwen3.8-flash" else "fine"]
+    response = client.post("/b/t/v1/chat/completions", json={"messages": HELLO})
+    assert response.status_code == 200 and response.json()["model"] == "deepseek-flash"
+    assert [r["model"] for r in fake_api.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+    assert gateway.usage("t")["fallbacks"] == 1
 
 
 def test_embeddings(client: TestClient, gateway: Gateway, offline_settings: Settings) -> None:

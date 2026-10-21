@@ -182,6 +182,58 @@ def test_timeout_falls_back_to_other_provider(settings: Settings, fake_api: Fake
     assert result.value.ok and result.result.model_alias == "deepseek-flash"
 
 
+def test_timeout_falls_back_after_one_timeout(settings: Settings, fake_api: FakeAPI) -> None:
+    """默认配置（max_retries=3）：有备用模型时主模型超时一次就换，约 1 × timeout_s。以前 OpenAI SDK
+    先把超时的请求重发 3 次，约 4 × timeout_s（默认 8 分钟）之后才换，期间占着并发名额。没有备用
+    模型时超时照旧重试（等待照 SDK 的退避）。"""
+    from fakes import TIMEOUT
+    from openai import APITimeoutError
+
+    class Out(BaseModel):
+        ok: bool
+
+    fake_api.chat_replies = [
+        lambda body: TIMEOUT if body["model"] == "qwen3.8-flash" else '{"ok": true}'
+    ]
+    waits: list[float] = []
+    client = LLMClient(settings, http_client=fake_api.client(), sleep=waits.append)
+    messages = [{"role": "user", "content": "hello"}]
+    result = client.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert result.result.model_alias == "deepseek-flash"
+    assert [r["model"] for r in fake_api.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+    assert waits == []
+
+    fake_api.chat_requests.clear()
+    with pytest.raises(APITimeoutError):
+        client.structured("extractor", messages, Out)
+    assert [r["model"] for r in fake_api.chat_requests] == ["qwen3.8-flash"] * 4
+    assert all(0.75 * b <= w <= b for w, b in zip(waits, (0.5, 1.0, 2.0), strict=True))
+
+
+def test_rate_limits_and_server_errors_are_retried_like_the_sdk(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """OpenAI SDK 自己不再重试（它连超时也重试）：429、5xx、连不上由 LLM 客户端照 SDK 的规则重试，
+    评测与网关在线上的重试行为不变——上游的 retry-after-ms 照等，没有时 0.5 秒起翻倍、随机减掉最多
+    25%；余额不足（402）不重试；重试满 max_retries 次仍然限流时抛出 RateLimitError。"""
+    from fakes import NO_BALANCE, RATE_LIMIT, SERVER_ERROR
+    from openai import APIStatusError, RateLimitError
+
+    waits: list[float] = []
+    client = LLMClient(settings, http_client=fake_api.client(), sleep=waits.append)
+    fake_api.chat_replies = [RATE_LIMIT, SERVER_ERROR, "OK"]
+    assert client.chat("reader", HELLO).content == "OK"
+    assert len(fake_api.chat_requests) == 3
+    assert waits[0] == 0.001 and 0.75 <= waits[1] <= 1.0  # retry-after-ms: 1；第二次重试的退避
+
+    for reply, error, sent in ((NO_BALANCE, APIStatusError, 1), (RATE_LIMIT, RateLimitError, 4)):
+        fake_api.chat_requests.clear()
+        fake_api.chat_replies = [reply]
+        with pytest.raises(error):
+            client.chat("reader", [{"role": "user", "content": reply}])
+        assert len(fake_api.chat_requests) == sent
+
+
 def test_identical_concurrent_requests_are_coalesced(settings: Settings, fake_api: FakeAPI) -> None:
     """两个线程同时发出同样的请求：只调用一次 API，另一个等结果（single-flight）。"""
     import threading

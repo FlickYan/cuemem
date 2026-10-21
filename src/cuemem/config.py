@@ -71,6 +71,8 @@ class ProviderConfig(BaseModel):
     api_key_env: str | None = None  # 为空表示不需要 Key（Ollama、vLLM 等本地服务，N12）
     max_concurrency: int = 8
     timeout_s: float = 120.0
+    # 限流、5xx、连不上时重试几次（LLMClient 照 OpenAI SDK 的规则退避）；超时只在调用方没有
+    # 备用模型时重试，有备用模型时超时一次就换模型
     max_retries: int = 3
     peak_hours: PeakHours | None = None  # 没有分时价格的供应商为空
 

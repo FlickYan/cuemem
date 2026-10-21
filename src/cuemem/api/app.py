@@ -36,6 +36,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
+from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
 from cuemem.errors import CueMemError
 from cuemem.memory import RecallMode
@@ -131,15 +132,23 @@ class ForgetRequest(BaseModel):
 
 @contextmanager
 def _errors() -> Iterator[None]:
-    """把服务层的已知错误转成 HTTP 状态码。"""
+    """把服务层的已知错误转成 HTTP 状态码。模型与向量供应商的错误各有状态码与说明：限流 429、
+    余额不足 402、暂时不可用 503（这两个带上游的 Retry-After）、超时 504、内容审核拒绝 422、
+    其余 502（见 api/failures.py）。以前 OpenAI SDK 的异常是没有说明的 500。"""
     try:
         yield
     except KeyError as exc:
         raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    except CueMemError as exc:
-        raise HTTPException(502, str(exc)) from exc
+    except Exception as exc:
+        failure = provider_failure(exc)
+        if failure is not None:
+            headers = {"Retry-After": failure.retry_after} if failure.retry_after else None
+            raise HTTPException(failure.status, failure.message(), headers=headers) from exc
+        if isinstance(exc, CueMemError):
+            raise HTTPException(502, str(exc)) from exc
+        raise
 
 
 def _mode(value: str) -> RecallMode:

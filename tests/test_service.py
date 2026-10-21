@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import FakeAPI
+from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi.testclient import TestClient
+from mcp.server.mcpserver.exceptions import ToolError
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 
@@ -25,6 +26,7 @@ from cuemem.api.replay import DemoScript, check, replay
 from cuemem.api.service import ChatService
 from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
 from cuemem.config import Settings
+from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
 from cuemem.store.media import image_data_url
 
@@ -490,6 +492,40 @@ def test_http_api(service: ChatService, tmp_path: Path, catalog_root: Path) -> N
     assert list(uploads.iterdir()) == []  # 第二个文件被拒，先存下的第一个也删掉
 
 
+def test_http_api_explains_provider_errors(
+    service: ChatService,
+    model: ScriptedModel,
+    fake_api: FakeAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型供应商出错时 HTTP 接口给出状态码与说明，不是没有说明的 500：限流 429（带上游的
+    Retry-After，重试过之后）、余额不足 402、超时 504、内容审核拒绝 422；向量接口限流也是 429。"""
+    service.system.llm._sleep = lambda _: None  # LLM 客户端的重试不真等
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False)
+    client = TestClient(app, raise_server_exceptions=False)
+    sid = client.post("/api/sessions", json={"space": "alice"}).json()["session_id"]
+    fake_api.chat_rate_limit_headers = {"retry-after": "7"}
+    for reply, status, said in (
+        (RATE_LIMIT, 429, "限流"),
+        (NO_BALANCE, 402, "余额不足"),
+        (TIMEOUT, 504, "超时"),
+        (REJECT, 422, "内容审核"),
+    ):
+        model.agent = lambda body, reply=reply: reply
+        response = client.post(f"/api/sessions/{sid}/messages", data={"text": "hi", "mode": "l0"})
+        assert response.status_code == status, response.text
+        assert said in response.json()["detail"]
+        assert response.headers.get("retry-after") == ("7" if status == 429 else None)
+
+    def throttled(texts: Sequence[str], kind: str) -> Any:
+        raise EmbeddingAPIError("向量接口返回 HTTP 429：Throttling", status=429, retry_after="3")
+
+    monkeypatch.setattr(service.system.embedder, "embed", throttled)
+    response = client.post("/api/spaces/alice/recall", json={"query": "shoes", "mode": "l1"})
+    assert response.status_code == 429 and response.headers["retry-after"] == "3"
+
+
 def test_http_photo_stays_in_the_conversation(
     service: ChatService, fake_api: FakeAPI, tmp_path: Path, catalog_root: Path
 ) -> None:
@@ -687,6 +723,21 @@ def test_mcp_tools(service: ChatService) -> None:
     memory_id = excerpt[1 : excerpt.index("]")]
     assert "Deleted" in call("forget", ids=[memory_id])
     assert "aisle" not in call("recall", query="aisle seats")
+
+
+def test_mcp_tools_explain_provider_errors(
+    service: ChatService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """供应商出错时工具回一句模型看得懂的话（以前只有 "Error executing tool recall"）。"""
+    server = build_server(service, "notes")
+
+    def throttled(texts: Sequence[str], kind: str) -> Any:
+        raise EmbeddingAPIError("向量接口返回 HTTP 429：Throttling", status=429, retry_after="3")
+
+    monkeypatch.setattr(service.system.embedder, "embed", throttled)
+    for name, arguments in (("remember", {"text": "I like tea."}), ("recall", {"query": "tea"})):
+        with pytest.raises(ToolError, match=r"rate-limiting requests \(HTTP 429\).*about 3 s"):
+            asyncio.run(server.call_tool(name, arguments))
 
 
 # ---------- 界面与剧本 ----------

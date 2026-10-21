@@ -14,10 +14,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
+from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
 from cuemem.evidence import format_listing
 
@@ -33,7 +37,8 @@ def build_server(service: ChatService, space_id: str) -> MCPServer[Any]:
     def remember(text: str) -> str:
         """Save something worth remembering about the user (a preference, a fact, a plan).
         It can be recalled right away and is turned into structured facts in the background."""
-        saved = service.remember(space_id, text)
+        with _provider_errors():
+            saved = service.remember(space_id, text)
         return f"Saved as {saved['turn_id']}."
 
     @server.tool()
@@ -42,14 +47,16 @@ def build_server(service: ChatService, space_id: str) -> MCPServer[Any]:
         search is enough or a deeper one is needed; deep=true forces the deep search. Returns the
         user's profile, facts with validity, and conversation excerpts, each with an id and a
         date."""
-        found = service.recall(space_id, query, mode="l2" if deep else "auto", at_least_l1=True)
+        with _provider_errors():
+            found = service.recall(space_id, query, mode="l2" if deep else "auto", at_least_l1=True)
         return format_recall(found)
 
     @server.tool()
     def forget(ids: list[str]) -> str:
         """Forget memories by the ids that recall returned (fact ids or excerpt ids). Deletes
         the conversation they came from and rebuilds everything derived from it."""
-        report = service.forget_ids(space_id, ids)
+        with _provider_errors():
+            report = service.forget_ids(space_id, ids)
         return (
             f"Deleted {report.turns_deleted} conversation turn(s); "
             f"facts {report.facts_before} -> {report.facts_after}."
@@ -61,6 +68,19 @@ def build_server(service: ChatService, space_id: str) -> MCPServer[Any]:
         return service.profile(space_id) or "Nothing is known about the user yet."
 
     return server
+
+
+@contextmanager
+def _provider_errors() -> Iterator[None]:
+    """供应商出错（限流、余额不足、超时……）时给调用方的模型一句看得懂的话。别的异常 MCP 只回
+    "Error executing tool <name>"：模型分不清是 CueMem 坏了，还是该等一会儿再试。"""
+    try:
+        yield
+    except Exception as exc:
+        failure = provider_failure(exc)
+        if failure is None:
+            raise
+        raise ToolError(failure.for_model()) from exc
 
 
 # MCP 的 recall 与各框架集成的 recall 工具用同一份文字格式（见 evidence.py）

@@ -71,7 +71,7 @@ class _LLM:
     """Mem0 的 LLM 接口（generate_response）→ CueMem 的 LLMClient。
 
     与 CueMem 自己的抽取一样：内容审核误拒、请求超时、JSON 生成被中止时，改用备用模型
-    （另一家供应商）再试一次。
+    （另一家供应商）再试一次；有备用模型时主模型超时一次就换（retry_timeouts，见 LLMClient.chat）。
     """
 
     def __init__(self, llm: LLMClient, scope: str) -> None:
@@ -96,6 +96,7 @@ class _LLM:
                 tools=tools,
                 tool_choice=tool_choice if tools else None,
                 cache_scope=self.scope,
+                retry_timeouts=model is not None or self.fallback is None,
             )
             return _wrap_list(result.content or "") if response_format else result.content or ""
 

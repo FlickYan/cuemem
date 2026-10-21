@@ -20,7 +20,8 @@ ABORT_JSON = "__ABORT_JSON__"  # 模拟 QwenCloud 在 JSON 模式下中止生成
 TIMEOUT = "__TIMEOUT__"  # 模拟请求超时（生成失控、迟迟不结束）
 # 模拟限流（HTTP 429）：带 FakeAPI.chat_rate_limit_headers 里的头（默认让 SDK 只等 1 毫秒）
 RATE_LIMIT = "__RATE_LIMIT__"
-NO_BALANCE = "__NO_BALANCE__"  # 模拟 DeepSeek 余额不足（HTTP 402，SDK 不重试）
+NO_BALANCE = "__NO_BALANCE__"  # 模拟 DeepSeek 余额不足（HTTP 402，不重试）
+SERVER_ERROR = "__SERVER_ERROR__"  # 模拟上游出错（HTTP 500，不带 Retry-After）
 
 
 def chat_completion_body(
@@ -135,6 +136,10 @@ class FakeAPI:
                 return httpx2.Response(
                     402,
                     json={"error": {"message": "Insufficient Balance", "type": "unknown_error"}},
+                )
+            if content == SERVER_ERROR:
+                return httpx2.Response(
+                    500, json={"error": {"message": "internal error", "type": "server_error"}}
                 )
             deepseek = "deepseek" in request.url.host
             if isinstance(content, dict):  # 工具调用
