@@ -42,7 +42,14 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from cuemem.config import Settings, cli_command, env_file_path, extra_remedy, load_settings
+from cuemem.config import (
+    Settings,
+    UnknownModel,
+    cli_command,
+    env_file_path,
+    extra_remedy,
+    load_settings,
+)
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
@@ -523,6 +530,22 @@ def _require_token(host: str, token: str | None, insecure: bool) -> None:
     raise typer.Exit(2)
 
 
+UNKNOWN_MODEL_HELP = (
+    "记忆代理收到模型目录里没有的 model 时：remap 改用 agent 角色的模型（响应头 X-CueMem-Model "
+    "写明，日志里记一条警告）；reject 返回 400。默认取配置 proxy.unknown_model（remap）"
+)
+
+
+def _unknown_model(value: str | None) -> UnknownModel | None:
+    """--unknown-model 的检查：写错时提示、退出码 1（在打开记忆系统之前）。"""
+    if value is None:
+        return None
+    if value in get_args(UnknownModel):
+        return cast(UnknownModel, value)
+    console.print(f"[red]--unknown-model 只能是 {'、'.join(get_args(UnknownModel))}[/red]")
+    raise typer.Exit(1)
+
+
 def _host_policy(host: str) -> tuple[list[str] | None, list[str]]:
     """（Host 白名单，除同源外放行的 Origin 主机名）。监听本机地址时只接受 Host 为本机的请求
     （防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，它的网页就算同源）；监听别的地址时不查 Host
@@ -552,6 +575,7 @@ def serve(
     insecure_no_auth: Annotated[
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
+    unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
 ) -> None:
     """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。
 
@@ -568,6 +592,7 @@ def serve(
             f"{escape(extra_remedy('ui'))}。这次只启动 HTTP 接口与记忆代理"
         )
         ui = False
+    unknown = _unknown_model(unknown_model)
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
         _require_token(host, os.environ.get(TOKEN_ENV) or None, insecure_no_auth)
@@ -575,7 +600,8 @@ def serve(
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
     token = os.environ.get(TOKEN_ENV) or None
     allowed_hosts, origin_hosts = _host_policy(host)
-    proxy = MemoryProxy(service.system)  # 同一个记忆系统：经代理写入的对话在界面里也能看到
+    # 同一个记忆系统：经代理写入的对话在界面里也能看到
+    proxy = MemoryProxy(service.system, unknown_model=unknown)
     try:
         app_ = create_app(
             service,
@@ -619,6 +645,7 @@ def proxy(
     insecure_no_auth: Annotated[
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
+    unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
 ) -> None:
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
@@ -630,6 +657,7 @@ def proxy(
     if mode not in get_args(RecallMode):
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(RecallMode))}[/red]")
         raise typer.Exit(1)
+    unknown = _unknown_model(unknown_model)
     settings = load_settings(peak_policy="warn")
     token = os.environ.get(TOKEN_ENV) or None  # load_settings 已读入 .env
     _require_token(host, token, insecure_no_auth)
@@ -640,7 +668,11 @@ def proxy(
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
     memory_proxy = MemoryProxy(
-        system, default_user=user, mode=cast(RecallMode, mode), idle_minutes=idle_minutes
+        system,
+        default_user=user,
+        mode=cast(RecallMode, mode),
+        idle_minutes=idle_minutes,
+        unknown_model=unknown,
     )
     try:
         console.print(

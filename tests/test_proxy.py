@@ -6,21 +6,25 @@ import base64
 import contextlib
 import io
 import json
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import anyio
 import httpx2
+import numpy as np
 import pytest
 from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi.testclient import TestClient
+from openai import OpenAI
+from openai.types.responses import Response as OpenAIResponse
 from PIL import Image
 from scripted import ScriptedModel
 from test_sdk import where_i_live
 
 from cuemem import Memory
-from cuemem.api.proxy import MemoryProxy, create_proxy_app
+from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.memory import MemorySystem
@@ -595,3 +599,242 @@ def test_recall_failure_does_not_fail_the_turn(
     assert response.status_code == 200
     assert response.headers["x-cuemem-level"] == "error"
     assert response.json()["choices"][0]["message"]["content"] == "Happy to help, Alice!"
+
+
+# ---------- 模型、/v1/embeddings 与 /v1/responses（N12 之后） ----------
+
+
+def sdk_for(client: TestClient) -> OpenAI:
+    """官方 OpenAI SDK，经 TestClient 调用代理（不走网络）。"""
+    return OpenAI(
+        base_url="http://testserver/v1", api_key="unused", http_client=client, max_retries=0
+    )
+
+
+def test_the_model_actually_used_is_named_and_unknown_ones_warned(
+    client: TestClient, upstream: Upstream, caplog: pytest.LogCaptureFixture
+) -> None:
+    """不认识的模型照旧改用 agent 角色的模型（不让已有的客户端出错），但不再悄无声息：响应头
+    X-CueMem-Model 写明实际转发的模型，日志里每个模型名记一条警告。以前 model="gpt-4o" 被
+    悄悄换成 qwen3.8-flash，响应里看不出来。"""
+    hi = [SYSTEM, {"role": "user", "content": "hi"}]
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        first = chat(client, "hi", model="gpt-4o", user="bob")
+        passed = chat(client, "hi again", model="gpt-4o")  # 没有用户、原样转发的也写明
+        known = chat(client, "hi", model="deepseek-flash", user="bob")
+        streamed = {"model": "gpt-4o", "stream": True, "messages": hi}
+        with client.stream("POST", "/v1/chat/completions", json=streamed) as response:
+            assert response.headers["x-cuemem-model"] == "qwen3.8-flash"
+            list(response.iter_lines())
+    assert first.status_code == passed.status_code == known.status_code == 200
+    assert first.headers["x-cuemem-model"] == passed.headers["x-cuemem-model"] == "qwen3.8-flash"
+    assert upstream.proxied[0]["model"] == "qwen3.8-flash"
+    assert known.headers["x-cuemem-model"] == "deepseek-flash"
+    warned = [r.getMessage() for r in caplog.records if r.name == "cuemem.api.proxy"]
+    assert len(warned) == 1 and "'gpt-4o'" in warned[0] and "qwen3.8-flash" in warned[0]
+
+
+def test_unknown_models_can_be_rejected(
+    system: MemorySystem, fake_api: FakeAPI, upstream: Upstream
+) -> None:
+    """unknown_model="reject"（参数、配置 proxy.unknown_model 或 --unknown-model）：不认识的模型
+    400（OpenAI 的 model_not_found），不转发、不开会话、不检索、不写记忆；认识的模型与没给
+    model 的请求照常。"""
+    proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1", unknown_model="reject")
+    with TestClient(create_proxy_app(proxy)) as client:
+        refused = chat(client, "I live in Berlin", model="gpt-4o", user="alice")
+        assert refused.status_code == 400
+        error = refused.json()["error"]
+        assert (error["code"], error["param"]) == ("model_not_found", "model")
+        assert "'gpt-4o'" in error["message"] and "qwen3.8-flash" in error["message"]
+        streamed = {"model": "gpt-4o", "stream": True, "user": "alice", "messages": [SYSTEM]}
+        assert client.post("/v1/chat/completions", json=streamed).status_code == 400
+        answered = client.post("/v1/responses", json={"model": "gpt-4o", "input": "hi"})
+        assert answered.json()["error"]["code"] == "model_not_found"
+        embedded = client.post("/v1/embeddings", json={"model": "text-embedding-3", "input": "x"})
+        assert embedded.status_code == 400
+        assert upstream.proxied == [] and system.db.list_spaces() == []
+        assert system.open_sessions("alice") == set()
+        assert chat(client, "hi", model="qwen3.8-flash", user="alice").status_code == 200
+        unnamed = {"messages": [SYSTEM, {"role": "user", "content": "hi"}], "user": "alice"}
+        assert client.post("/v1/chat/completions", json=unnamed).status_code == 200
+
+
+def test_embeddings_pass_through_to_the_configured_embedder(
+    client: TestClient, system: MemorySystem, caplog: pytest.LogCaptureFixture
+) -> None:
+    """/v1/embeddings（以前 404）：交给配置里的向量模型，OpenAI 的格式（float 或 base64，官方
+    SDK 缺省请求 base64）。调用方的文本不是记忆：不进向量缓存（遗忘清不到）。"""
+    embedder = system.embedder
+    assert isinstance(embedder, CachedEmbedder)
+    name = embedder.name
+    texts = ["red running shoes", "a quiet cafe in Berlin"]
+    expected = embedder.inner.embed(texts, "document").dense
+    response = client.post("/v1/embeddings", json={"model": name, "input": texts})
+    assert response.status_code == 200 and response.headers["x-cuemem-model"] == name
+    body = response.json()
+    assert body["object"] == "list" and body["model"] == name
+    assert [d["index"] for d in body["data"]] == [0, 1]
+    assert np.allclose([d["embedding"] for d in body["data"]], expected)
+    assert embedder.cached(texts, "document") == set()
+    encoded = client.post(
+        "/v1/embeddings", json={"input": texts[0], "encoding_format": "base64"}
+    ).json()
+    vector = np.frombuffer(base64.b64decode(encoded["data"][0]["embedding"]), dtype="<f4")
+    assert np.allclose(vector, expected[0])
+    result = sdk_for(client).embeddings.create(model=name, input=texts)
+    assert np.allclose([d.embedding for d in result.data], expected)
+    assert name in {m["id"] for m in client.get("/v1/models").json()["data"]}
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):  # 不认识的模型：照用
+        other = client.post("/v1/embeddings", json={"model": "text-embedding-3", "input": "x"})
+    assert other.status_code == 200 and other.headers["x-cuemem-model"] == name
+    assert any("text-embedding-3" in r.getMessage() for r in caplog.records)
+    for bad in (
+        {"input": []},
+        {"input": [1, 2, 3]},
+        {"input": ["fine", ""]},
+        {"input": "x", "dimensions": embedder.dim + 1},
+        {"input": "x", "encoding_format": "int8"},
+    ):
+        refused = client.post("/v1/embeddings", json=bad)
+        assert refused.status_code == 400 and refused.json()["error"]["param"], bad
+
+
+def test_responses_api_recalls_injects_and_writes_back(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """/v1/responses（以前 404）：非流式、纯文字输入的子集，换成 Chat Completions 走同样的想起、
+    注入、转发与写回；官方 OpenAI SDK 的 responses.create 与 output_text 照常可用。"""
+    first = sdk_for(client).responses.create(
+        model="qwen3.8-flash",
+        instructions=SYSTEM["content"],
+        input="I live in Berlin",
+        user="alice",
+        max_output_tokens=200,
+    )
+    assert first.output_text == "Happy to help, Alice!" and first.status == "completed"
+    assert first.usage is not None and first.usage.input_tokens == 120
+    sent = upstream.proxied[-1]
+    assert sent["messages"] == [SYSTEM, {"role": "user", "content": "I live in Berlin"}]
+    assert sent["max_tokens"] == 200 and "user" not in sent
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "I live in Berlin"),
+        ("assistant", "Happy to help, Alice!"),
+    ]
+    clock.now += 31 * 60  # 会话结束，后台抽取
+    assert proxy.close_idle() == 1
+    assert system.worker is not None
+    system.worker.wait()
+
+    asked = {"type": "input_text", "text": "Where should I buy winter boots?"}
+    raw = client.post(
+        "/v1/responses",
+        json={
+            "model": "qwen3.8-flash",
+            "instructions": SYSTEM["content"],
+            "input": [{"type": "message", "role": "user", "content": [asked]}],
+            "user": "alice",
+            "metadata": {"app": "shop"},
+            "store": True,
+            "tools": [],
+            "stream": False,
+        },
+    )
+    assert raw.status_code == 200, raw.text
+    assert raw.headers["x-cuemem-level"] == "L1" and int(raw.headers["x-cuemem-recalled"]) >= 1
+    assert raw.headers["x-cuemem-model"] == "qwen3.8-flash"
+    content = upstream.proxied[-1]["messages"][-1]["content"]
+    assert content.startswith("<memory>\n") and "The user lives in Berlin." in content
+    response = OpenAIResponse.model_validate(raw.json())  # 严格按 OpenAI 的类型校验
+    assert response.output_text == "Happy to help, Alice!"
+    assert response.metadata == {"app": "shop"} and response.store is False
+    session = raw.headers["x-cuemem-session"]
+    assert system.db.get_turns("alice", session)[0].text == "Where should I buy winter boots?"
+
+
+def test_responses_input_becomes_chat_messages() -> None:
+    body = {
+        "model": "m",
+        "instructions": "Be brief.",
+        "input": [
+            {"role": "developer", "content": "Answer in English."},
+            {"role": "user", "content": "I live in Berlin"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Noted.", "annotations": []}],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "Boots?"}]},
+        ],
+        "temperature": 0.2,
+        "top_p": None,
+    }
+    assert _responses_to_chat(body) == {
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "system", "content": "Answer in English."},
+            {"role": "user", "content": "I live in Berlin"},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "Boots?"},
+        ],
+        "temperature": 0.2,
+    }
+
+
+def test_a_truncated_answer_is_an_incomplete_response() -> None:
+    data = {
+        "model": "deepseek-flash",
+        "created": 5,
+        "choices": [{"message": {"content": "Half"}, "finish_reason": "length"}],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14,
+            "prompt_cache_hit_tokens": 6,
+        },
+    }
+    out = OpenAIResponse.model_validate(_chat_to_response({"max_output_tokens": 4}, data, "x"))
+    assert out.status == "incomplete" and out.incomplete_details is not None
+    assert out.incomplete_details.reason == "max_output_tokens"
+    assert out.output_text == "Half" and out.model == "deepseek-flash"
+    assert out.usage is not None and out.usage.input_tokens_details.cached_tokens == 6
+
+
+@pytest.mark.parametrize(
+    ("extra", "named"),
+    [
+        ({"stream": True}, "stream"),
+        ({"tools": [{"type": "function", "name": "f", "parameters": {}}]}, "tools"),
+        ({"previous_response_id": "resp_1"}, "previous_response_id"),
+        ({"text": {"format": {"type": "json_object"}}}, "text"),
+        ({"input": [{"role": "user", "content": [{"type": "input_image"}]}]}, "input_image"),
+        ({"input": [{"type": "function_call_output", "call_id": "c"}]}, "function_call_output"),
+    ],
+)
+def test_responses_outside_the_subset_are_501(
+    client: TestClient,
+    system: MemorySystem,
+    upstream: Upstream,
+    extra: dict[str, Any],
+    named: str,
+) -> None:
+    """子集以外的（流式、工具、存下来的回答、结构化输出、图片与工具调用的输入）：501，OpenAI 格式
+    的出错写明哪一项，x-should-retry: false 让官方 SDK 不重试；不转发、不碰记忆。"""
+    body = {"model": "qwen3.8-flash", "input": "I live in Berlin", "user": "alice", **extra}
+    response = client.post("/v1/responses", json=body)
+    assert response.status_code == 501 and response.headers["x-should-retry"] == "false"
+    assert named in response.json()["error"]["message"]
+    assert upstream.proxied == [] and system.db.list_spaces() == []
+
+
+def test_responses_errors(client: TestClient, system: MemorySystem, upstream: Upstream) -> None:
+    for bad in ({"input": []}, {"input": 5}, {"input": "x", "instructions": ["x"]}):
+        refused = client.post("/v1/responses", json={"model": "qwen3.8-flash", **bad})
+        assert refused.status_code == 400, bad
+    upstream.reply = REJECT  # 上游的出错原样返回，不写记忆
+    body = {"model": "qwen3.8-flash", "instructions": SYSTEM["content"], "input": "hi"}
+    rejected = client.post("/v1/responses", json={**body, "user": "alice"})
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "data_inspection_failed"
+    assert system.db.get_turns("alice") == []

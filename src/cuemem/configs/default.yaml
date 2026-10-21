@@ -168,3 +168,9 @@ consolidation:
   entity_gray_threshold: 0.75
   profile_max_chars: 1600       # 核心记忆上限（约 400 tokens）
   profile_min_importance: 4
+
+# 记忆代理（cuemem proxy 与 cuemem serve 的 /v1，D-062）
+proxy:
+  # 请求的 model 不在上面的模型目录里（别名或模型 ID）时：remap 改用 agent 角色的模型，响应头
+  # X-CueMem-Model 写明实际用的模型；reject 返回 400（model_not_found）。也可以用 --unknown-model
+  unknown_model: remap

@@ -310,6 +310,39 @@ def test_loopback_bind_checks_the_host(
     assert local.get("/v1/models", headers=proxied).status_code == 403
 
 
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_unknown_models_are_rejected_on_request(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """--unknown-model reject 或配置 proxy.unknown_model（环境变量 CUEMEM_PROXY__UNKNOWN_MODEL）：
+    记忆代理对不认识的模型返回 400；缺省照旧改用 agent 角色的模型。写错的值在启动之前报错。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.api import proxy as proxy_module
+
+    made: list[Any] = []
+
+    class Recorded(proxy_module.MemoryProxy):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(proxy_module, "MemoryProxy", Recorded)
+    result = runner.invoke(app, [*command, "--unknown-model", "nope"])
+    assert result.exit_code == 1 and "--unknown-model" in result.output and served == []
+    assert runner.invoke(app, [*command, "--unknown-model", "reject"]).exit_code == 0
+    monkeypatch.setenv("CUEMEM_PROXY__UNKNOWN_MODEL", "reject")
+    assert runner.invoke(app, command).exit_code == 0
+    assert runner.invoke(app, [*command, "--unknown-model", "remap"]).exit_code == 0  # 参数优先
+    assert [p.unknown_model for p in made] == ["reject", "reject", "remap"]
+    body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    for app_ in served[:2]:  # 被拒绝的请求不转发（改用默认模型的那个会真的发给上游，不在这里发）
+        client = TestClient(app_, base_url="http://127.0.0.1:7860")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "model_not_found"
+
+
 def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

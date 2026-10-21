@@ -200,6 +200,17 @@ class RetrievalConfig(BaseModel):
     controller: str = "controller_model.json"
 
 
+UnknownModel = Literal["remap", "reject"]
+
+
+class ProxyConfig(BaseModel):
+    """记忆代理（cuemem proxy 与 cuemem serve 的 /v1，D-062）。"""
+
+    # 请求的 model 不是模型目录里的别名或模型 ID 时：remap 改用 agent 角色的模型（响应头
+    # X-CueMem-Model 写明实际用的模型，日志里记一条警告）；reject 返回 400（model_not_found）
+    unknown_model: UnknownModel = "remap"
+
+
 class ConsolidationConfig(BaseModel):
     """异步巩固（N3）的参数。相似度阈值针对 text-embedding-v4 的余弦相似度。"""
 
@@ -243,6 +254,7 @@ class Settings(BaseSettings):
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     consolidation: ConsolidationConfig = Field(default_factory=ConsolidationConfig)
+    proxy: ProxyConfig = Field(default_factory=ProxyConfig)
 
     @classmethod
     def settings_customise_sources(
