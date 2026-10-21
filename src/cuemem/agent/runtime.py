@@ -285,9 +285,12 @@ class Agent:
         labels = [f"u{first + i}" for i in range(len(images))]
         uploads = list(zip(labels, images, strict=True))
         timings: dict[str, float] = {}
-        with start_trace(
-            "chat", self.system.tracer, space=space, session=session.session_id, message=text
-        ) as trace:
+        with (
+            self.system.reading(space),  # 遗忘等这一轮做完：回复写进日志、溯源记下之后才清理
+            start_trace(
+                "chat", self.system.tracer, space=space, session=session.session_id, message=text
+            ) as trace,
+        ):
             exclude = self._window_ids(session)
             l1 = L1Config(budget_tokens=self.budget.recalled)
             with span("recall"):

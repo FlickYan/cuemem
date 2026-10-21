@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -219,6 +219,65 @@ def _without_images(text: str) -> str:
     return " ".join(text.replace("<image>", " ").split())
 
 
+class _ReadGate:
+    """一个空间的读写门（见 MemorySystem.reading）：读取可以同时进行，遗忘独占。遗忘先等进行中的
+    读取做完，等着的时候新来的读取排在它后面（不会一直等不到）。同一线程里读可以重入（ask 里的
+    检索、Agent 一轮对话里的检索），遗忘里的读取直接通过，删除空间里的遗忘可以重入。"""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0  # 持有读的线程数
+        self._writer: int | None = None  # 持有写的线程
+        self._writes = 0  # 写的重入深度
+        self._waiting = 0  # 等着写的线程数
+        self._local = threading.local()  # 本线程读的重入深度
+
+    @contextmanager
+    def shared(self) -> Iterator[None]:
+        if self._writer == threading.get_ident():  # 遗忘自己要读：已经独占了
+            yield
+            return
+        depth = getattr(self._local, "depth", 0)
+        if depth == 0:
+            with self._cond:
+                while self._writer is not None or self._waiting:
+                    self._cond.wait()
+                self._readers += 1
+        self._local.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._local.depth = depth
+            if depth == 0:
+                with self._cond:
+                    self._readers -= 1
+                    self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self) -> Iterator[None]:
+        me = threading.get_ident()
+        with self._cond:
+            if self._writer == me:
+                self._writes += 1
+            else:
+                own = int(getattr(self._local, "depth", 0) > 0)  # 本线程自己持有的读不用等
+                self._waiting += 1
+                try:
+                    while self._writer is not None or self._readers > own:
+                        self._cond.wait()
+                finally:
+                    self._waiting -= 1
+                self._writer, self._writes = me, 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writes -= 1
+                if self._writes == 0:
+                    self._writer = None
+                    self._cond.notify_all()
+
+
 def _open_mark(space_id: str, session_id: str = "") -> str:
     """进行中的会话在数据库里的标记（元信息的键）；session_id 为空时是这个空间全部标记的
     共同前缀。空间 ID 带上长度：一个空间的前缀不会同时是另一个空间的前缀。"""
@@ -280,6 +339,8 @@ class MemorySystem:
         # 同一会话的写入按顺序进行（SDK 的 add 在锁里分配发言序号）。按（空间，会话）分到固定的
         # 几十把锁上，不为每个会话建一把：不给 run_id 的 add 每次都是一个新会话
         self._session_locks = [threading.Lock() for _ in range(64)]
+        self._gates: dict[str, _ReadGate] = {}  # 空间 → 读写门（见 reading）
+        self._gates_guard = threading.Lock()
 
     @classmethod
     def from_settings(
@@ -451,6 +512,17 @@ class MemorySystem:
         Memory 上：HTTP 服务、记忆代理与各个集成用 Memory.from_system 包住的是同一个系统。"""
         return self._session_locks[hash((space_id, session_id)) % len(self._session_locks)]
 
+    def reading(self, space_id: str) -> AbstractContextManager[None]:
+        """读这个空间的记忆、并把结果写下来（回答写进 LLM 缓存与 trace，Agent 的回复写进日志）时
+        持有：可以同时有多个。遗忘等进行中的读取都做完才开始，期间新的读取等它做完——否则回答
+        模型还在生成时遗忘清掉了缓存与 trace，回答随后又带着被删的内容写进去。同一线程里可以
+        重入。"""
+        return self._gate(space_id).shared()
+
+    def _gate(self, space_id: str) -> _ReadGate:
+        with self._gates_guard:
+            return self._gates.setdefault(space_id, _ReadGate())
+
     def adopt_open(self, space_id: str, keep: Collection[str] = ()) -> int:
         """接手之前的进程留下的进行中的会话：进程崩溃（没来得及 close_session）时，它们没有
         登记巩固任务，也没人再结束它们。数据库里有标记、本进程里却不在进行中的会话（keep 除外：
@@ -530,13 +602,15 @@ class MemorySystem:
         由此抽出的事实、后来引用这些事实的回复）不是要删的。
 
         整个过程持有这个空间的巩固锁（Consolidator.exclusive）：后台线程正在巩固时先等它做完，
-        否则它会把由被删轮次抽出的事实、向量与缓存写回来。
+        否则它会把由被删轮次抽出的事实、向量与缓存写回来。进行中的回答、检索与 Agent 的对话
+        也先等它们做完（reading），否则它们随后把看过的被删内容写进缓存、trace 与日志。
 
         重放失败（例如对账时余额不足）时照样清理 trace 与向量缓存，再把异常抛出去：原始日志
         已经删了，重试时找不到要删的发言。没做完的巩固任务留着，下次巩固时补齐。
         """
         started = time.perf_counter()
         with (
+            self._gate(space_id).exclusive(),  # 先于巩固锁：读取不会去拿巩固锁
             self.consolidator.exclusive(space_id),
             start_trace("forget", self.tracer, space=space_id) as trace,
         ):
@@ -897,8 +971,8 @@ class MemorySystem:
         """删除整个记忆空间（SDK 的 delete_all，N12）：先按会话遗忘全部日志（连带清理缓存、
         trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合。
 
-        两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。"""
-        with self.consolidator.exclusive(space_id):
+        两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。读写门与遗忘一样先拿。"""
+        with self._gate(space_id).exclusive(), self.consolidator.exclusive(space_id):
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.db.delete_space(space_id)
             self.vectors.delete_space(space_id)
@@ -971,7 +1045,10 @@ class MemorySystem:
         """
         when = naive_local(question_time) if question_time is not None else datetime.now()
         cache_scope = scope(space_id, "ask")
-        with start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace:
+        with (
+            self.reading(space_id),  # 遗忘等这次回答写完缓存与 trace
+            start_trace("ask", self.tracer, space=space_id, question=question, mode=mode) as trace,
+        ):
             recall: Recall | None = None
             if mode in ("l0", "l1", "l2", "auto"):
                 recall = self.retrieve(
@@ -1103,13 +1180,14 @@ class MemorySystem:
         不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
         _remove_traces）。ask、Agent 与评测在自己的 trace 里调用，不另记，trace 与用量统计不变。
+        遗忘等进行中的检索写完 trace（reading）。
         """
         tracing: AbstractContextManager[object] = (
             nullcontext()
             if current_trace() is not None
             else start_trace("retrieve", self.tracer, space=space_id, question=question, mode=mode)
         )
-        with tracing:
+        with self.reading(space_id), tracing:
             when = naive_local(question_time) if question_time is not None else datetime.now()
             cache_scope = cache_scope or scope(space_id, "ask")
             level: str = mode

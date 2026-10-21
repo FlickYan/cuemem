@@ -260,6 +260,57 @@ def test_forget_waits_for_background_consolidation(
         assert not any(PIN in r for r in system.llm.cache.responses())
 
 
+def test_forget_waits_for_an_answer_in_flight(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """回答模型还在生成（它看过要删的记忆）时遗忘：遗忘等这次回答写完缓存与 trace 再清理，
+    不能先清理、再让回答带着被删的内容写进 LLM 缓存与 trace。"""
+    entered, release = threading.Event(), threading.Event()
+
+    def extract(prompt: str) -> dict[str, Any]:
+        fact = {
+            "statement": f"The user's PIN is {PIN}.",
+            "subject": "User",
+            "predicate": "pin",
+            "object": PIN,
+            "importance": 5,
+            "turns": [0],
+        }
+        return {"summary": "", "facts": [fact] if PIN in prompt else [], "entities": []}
+
+    def reader(prompt: str) -> dict[str, Any]:
+        entered.set()
+        release.wait(10)  # 回答模型还在生成
+        return {"answer": f"Your PIN is {PIN}.", "citations": [], "evidence_sufficient": True}
+
+    fake_api.chat_replies = [ScriptedModel(extract, reader=reader)]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        session = SessionIn(
+            session_id="s1",
+            started_at=datetime(2026, 9, 1, 10),
+            turns=[TurnIn(role="user", text=f"My PIN is {PIN}, keep it safe")],
+        )
+        system.append("alice", session, 0)
+        system.consolidate("alice")
+        asking, answered = _in_thread(system.ask, "alice", "What is my PIN?", mode="l1")
+        assert entered.wait(5)
+        forgetting, out = _in_thread(system.forget, "alice", session_ids=["s1"])
+        forgetting.join(0.3)
+        assert forgetting.is_alive()  # 等着这次回答
+        release.set()
+        asking.join(10)
+        forgetting.join(10)
+
+        [answer] = answered
+        assert not isinstance(answer, Exception) and PIN in answer.answer
+        [report] = out
+        assert not isinstance(report, Exception) and report.turns_deleted == 1
+        assert system.llm.cache is not None
+        assert not any(PIN in r for r in system.llm.cache.responses())
+        traces = n3_settings.paths.traces.glob("*.jsonl")
+        assert not any(PIN in p.read_text("utf-8") for p in traces)
+
+        assert system.ask("alice", "What is my PIN?", mode="l1").answer  # 之后照常回答
+
+
 def test_forget_other_session_during_background_reconciliation(
     n3_settings: Settings, fake_api: FakeAPI
 ) -> None:
