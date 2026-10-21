@@ -261,10 +261,23 @@ def test_non_loopback_bind_needs_a_token(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
     """监听非本机地址又没有访问令牌：拒绝启动（Docker 镜像监听 0.0.0.0），
-    除非加 --insecure-no-auth。"""
+    除非加 --insecure-no-auth。被拒绝时不打开记忆系统：不接着做上次没做完的抽取（缺 Key 时
+    也不白白记一次失败）。"""
+    import sqlite3
+
+    def jobs() -> list[tuple[Any, ...]]:
+        with sqlite3.connect(os.environ["CUEMEM_PATHS__DB"]) as conn:
+            return conn.execute(
+                "SELECT id, status, attempts, error FROM jobs ORDER BY id"
+            ).fetchall()
+
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0  # 留下待处理的任务
+    pending = jobs()
+    assert pending and {status for _, status, _, _ in pending} == {"pending"}
     result = runner.invoke(app, [*command, "--host", "0.0.0.0"])
     assert result.exit_code == 2 and served == []
     assert "CUEMEM_API_TOKEN" in result.output and "--insecure-no-auth" in _flat(result.output)
+    assert jobs() == pending
     result = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"])
     assert result.exit_code == 0, result.output
     assert runner.invoke(app, [*command, "--host", "127.0.0.1"]).exit_code == 0

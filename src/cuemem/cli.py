@@ -29,7 +29,7 @@ import ipaddress
 import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -462,7 +462,10 @@ def _service(
     lam: float | None,
     *,
     catalog_path: Path | None = None,
+    check: Callable[[], None] | None = None,
 ) -> tuple[Settings, ChatService]:
+    """读配置、建服务。check 在读完配置（数据目录的 .env 已经加载）、建服务之前调用：服务一建好
+    后台线程就接着做上次没做完的抽取，要拒绝启动的话得在这之前（serve 的访问令牌检查）。"""
     if scenario not in get_args(Scenario):
         console.print(f"[red]--scenario 只能是 {'、'.join(get_args(Scenario))}[/red]")
         raise typer.Exit(1)
@@ -471,6 +474,8 @@ def _service(
         raise typer.Exit(1)
     try:  # 缺 Key、换了向量模型、没有商品目录等：提示原因，不打印调用栈（Docker 里会反复重启）
         settings = load_settings(peak_policy="warn")
+        if check is not None:
+            check()
         _peak_note(settings)
         service = ChatService.create(
             settings,
@@ -560,13 +565,11 @@ def serve(
     from cuemem.api.app import TOKEN_ENV, create_app
     from cuemem.api.proxy import MemoryProxy
 
-    settings, service = _service(space, scenario or _default_scenario(), router, lam)
-    token = os.environ.get(TOKEN_ENV) or None  # _service 加载配置时已读入 .env
-    try:
-        _require_token(host, token, insecure_no_auth)
-    except typer.Exit:
-        service.close()
-        raise
+    def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
+        _require_token(host, os.environ.get(TOKEN_ENV) or None, insecure_no_auth)
+
+    settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
+    token = os.environ.get(TOKEN_ENV) or None
     allowed_hosts, origin_hosts = _host_policy(host)
     proxy = MemoryProxy(service.system)  # 同一个记忆系统：经代理写入的对话在界面里也能看到
     try:
