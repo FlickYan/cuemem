@@ -333,8 +333,9 @@ class Consolidator:
                 )
                 for j in jobs
             }
+            session_of = {j["id"]: j["session_id"] for j in jobs}
             for job_id, future in futures.items():
-                session_id = next(j["session_id"] for j in jobs if j["id"] == job_id)
+                session_id = session_of[job_id]
                 try:
                     extractions[job_id] = future.result()
                 except ContentFilteredError as exc:
@@ -684,9 +685,8 @@ class Consolidator:
         facts = self.db.get_facts(space_id)
         vectors = self._embed([f.statement for f in facts if f.is_current])
         for fact in facts:
-            state.facts[fact.id] = fact
-            if fact.is_current and fact.statement in vectors:
-                state.vectors[fact.id] = vectors[fact.statement][0]
+            vec = vectors.get(fact.statement) if fact.is_current else None
+            state.put(fact, vec[0] if vec else None)
         return state
 
     def _embed(self, texts: Sequence[str]) -> dict[str, Vector]:
