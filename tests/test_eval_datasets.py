@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+import httpx2
 import pytest
 
 from cuemem.evals.datasets import (
+    DATASETS,
     RAW_SESSION_IDS_ENV,
+    DatasetSpec,
+    download,
     evidence_turns,
     load_locomo,
     load_longmemeval,
@@ -117,3 +124,103 @@ def test_mixed_stream_scripts_use_the_protocol(
     assert [s.sample_id for s in n9.test_samples(tmp_path)] == ["conv-test-q1", "conv-test-q3"]
     for path in ("src/cuemem/cli.py", "scripts/n7_mixed.py", "scripts/n9_mixed.py"):
         assert '"adversarial"' not in (root / path).read_text(encoding="utf-8"), path
+
+
+def test_dataset_downloads_are_pinned() -> None:
+    """每个下载地址都固定在上游的一个提交上（不是 main），每个文件都有要核对的 sha256。"""
+    files = [(s.url, s.sha256) for s in DATASETS.values()]
+    files += [(url, sha) for s in DATASETS.values() for _, url, sha in s.extras]
+    for url, sha in files:
+        assert "/main/" not in url and re.search(r"/[0-9a-f]{40}/", url), url
+        assert re.fullmatch(r"[0-9a-f]{64}", sha), url
+
+
+class _Served:
+    """httpx2.stream 的替身：按 URL 返回预先放好的内容（分两块），可以中途断开。"""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.broken: set[str] = set()
+
+    def stream(self, method: str, url: str, **kwargs: Any) -> Any:
+        served = self
+
+        class Response:
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def iter_bytes(self) -> Iterator[bytes]:
+                body = served.files[url]
+                yield body[:3]
+                if url in served.broken:
+                    raise httpx2.ReadError("connection reset")
+                yield body[3:]
+
+        return Response()
+
+
+def test_download_verifies_the_pinned_sha256(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """下载后核对 sha256：一致才保存、压缩包才解压；上游内容变了（或下载被改写、截断）时报
+    DatasetChecksumError，什么都不留下（没有半个文件，压缩包不解压）。以前不核对，照样保存。"""
+    import hashlib
+    import io
+    import tarfile
+
+    from cuemem.errors import DatasetChecksumError
+    from cuemem.evals import datasets
+
+    def sha(body: bytes) -> str:
+        return hashlib.sha256(body).hexdigest()
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("toy_images/a.txt")
+        info.size = 5
+        archive.addfile(info, io.BytesIO(b"hello"))
+    tar, index, data = buffer.getvalue(), b'{"ids": ["q1"]}', b'[{"question": "q1"}]'
+    served = _Served()
+    served.files = {"u/tar": tar, "u/index": index, "u/data": data}
+    monkeypatch.setattr(datasets.httpx2, "stream", served.stream)
+    extras = (
+        ("toy/toy_images.tar.gz", "u/tar", sha(tar)),
+        ("toy/index.json", "u/index", sha(index)),
+    )
+    spec = DatasetSpec("toy", "toy/data.json", "u/data", sha(data), "测试用", extras)
+    monkeypatch.setitem(DATASETS, "toy", spec)
+
+    good = tmp_path / "good"
+    assert download("toy", good) == good / "toy" / "data.json"
+    assert (good / "toy" / "data.json").read_bytes() == data
+    assert (good / "toy" / "toy_images" / "a.txt").read_bytes() == b"hello"
+    assert sorted(p.name for p in (good / "toy").iterdir()) == [
+        "data.json",
+        "index.json",
+        "toy_images",
+    ]
+
+    served.files["u/data"] = data.replace(b"q1", b"q2")  # 上游改了题目
+    changed = tmp_path / "changed"
+    with pytest.raises(DatasetChecksumError, match=f"sha256 应为 {sha(data)}"):
+        download("toy", changed)
+    assert sorted(p.name for p in (changed / "toy").iterdir()) == ["index.json", "toy_images"]
+
+    served.files["u/tar"] = tar[:-8]  # 压缩包被截断：不解压
+    tampered = tmp_path / "tampered"
+    with pytest.raises(DatasetChecksumError, match=re.escape("toy_images.tar.gz")):
+        download("toy", tampered)
+    assert list((tampered / "toy").iterdir()) == []
+
+    served.files["u/tar"] = tar
+    served.broken.add("u/index")  # 下载到一半断开：不留下 .part
+    broken = tmp_path / "broken"
+    with pytest.raises(httpx2.ReadError):
+        download("toy", broken)
+    assert [p.name for p in (broken / "toy").iterdir()] == ["toy_images"]

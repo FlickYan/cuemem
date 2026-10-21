@@ -31,6 +31,10 @@ class EmbeddingAPIError(CueMemError):
         self.retry_after = retry_after
 
 
+class DatasetChecksumError(CueMemError):
+    """下载的评测数据集与固定的版本不同（sha256 对不上），没有保存。"""
+
+
 class ConfigMismatchError(CueMemError):
     """数据目录与当前配置不兼容，例如更换了向量模型。"""
 

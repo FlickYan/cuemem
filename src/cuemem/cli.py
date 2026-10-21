@@ -45,7 +45,7 @@ from rich.table import Table
 from cuemem.config import Settings, cli_command, env_file_path, extra_remedy, load_settings
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import mask, read_env, update_env
-from cuemem.errors import ConfigMismatchError, CueMemError
+from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
 
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
@@ -989,7 +989,8 @@ def data_download(
         list[str] | None, typer.Argument(help="数据集名，默认全部（可选的只在点名时下载）")
     ] = None,
 ) -> None:
-    """下载评测数据集到 data/datasets（已存在则跳过）。"""
+    """下载评测数据集到 data/datasets（已存在则跳过）。下载地址固定在上游的提交上，下载后核对
+    sha256，对不上就不保存、报错。"""
     from cuemem.evals.datasets import DATASETS
     from cuemem.evals.datasets import download as download_dataset
 
@@ -999,7 +1000,11 @@ def data_download(
             console.print(f"[red]未知数据集 {name}[/red]，可选：{', '.join(DATASETS)}")
             raise typer.Exit(1)
         console.print(f"{name}：{DATASETS[name].description}")
-        path = download_dataset(name, settings.paths.datasets)
+        try:
+            path = download_dataset(name, settings.paths.datasets)
+        except DatasetChecksumError as exc:
+            console.print(f"[red]错误：[/red]{escape(str(exc))}")
+            raise typer.Exit(1) from exc
         console.print(f"  → {path}（{path.stat().st_size / 1e6:.1f} MB）")
 
 

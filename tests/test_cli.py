@@ -510,6 +510,21 @@ def test_data_download_skips_optional_datasets(
     assert fetched[-1] == "wildchat"
 
 
+def test_data_download_reports_a_checksum_mismatch(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """下载的文件与固定的版本不同时，打印"错误：原因"、退出码 1，不打印调用栈。"""
+    from cuemem.errors import DatasetChecksumError
+
+    def fake_download(name: str, directory: Path) -> Path:
+        raise DatasetChecksumError("下载的 locomo10.json 与固定的版本不同：sha256 应为 [abc]")
+
+    monkeypatch.setattr("cuemem.evals.datasets.download", fake_download)
+    result = runner.invoke(app, ["data", "download", "locomo"])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    assert "错误：下载的locomo10.json与固定的版本不同：sha256应为[abc]" in _flat(result.output)
+
+
 @pytest.mark.parametrize(
     ("errors", "stopped", "code"), [(0, False, 0), (2, False, 3), (0, True, 4), (1, True, 4)]
 )

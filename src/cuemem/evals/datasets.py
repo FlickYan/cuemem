@@ -27,6 +27,7 @@ sharegpt_、ultrachat_ 或一串十六进制；而回答模型看到的每条检
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,7 @@ from typing import Any, Literal, cast
 import httpx2
 
 from cuemem.core.models import Conversation, SessionIn, TurnIn
+from cuemem.errors import DatasetChecksumError
 
 # 会话 ID 的写法：native 是数据集自带、本来就中性的（LoCoMo 的 session_<n>）；anon 是加载时按时间
 # 顺序改写的；raw 是 LongMemEval / MemLens 的原始 ID（会泄漏证据会话，只用于消融）
@@ -71,19 +73,37 @@ LOCOMO_CATEGORIES = {
 
 @dataclass(frozen=True)
 class DatasetSpec:
+    """一个评测数据集的下载方式。URL 都固定在上游的一个提交上（Hugging Face 的 resolve/<提交>/、
+    GitHub 的 <提交>/data/…），不跟着 main 变；sha256 是那个提交里这个文件的哈希，下载后核对，
+    对不上就不保存（download）。上游改了题目、标准答案或图片时，新机器上下载到的仍是发表时的那份。
+    """
+
     name: str
     filename: str
     url: str
+    sha256: str
     description: str
-    # 一同下载的附加文件：（文件名，URL）；.tar.gz 下载后解压到同一目录
-    extras: tuple[tuple[str, str], ...] = ()
+    # 一同下载的附加文件：（文件名，URL，sha256）；.tar.gz 核对之后解压到同一目录
+    extras: tuple[tuple[str, str, str], ...] = ()
     optional: bool = False  # 不随"全部下载"一起下，点名才下载
 
 
-_MEMLENS = "https://huggingface.co/datasets/xiyuRenBill/MEMLENS/resolve/main/"
+# MemLens：上游最后一次提交（2026-06-14），N6、N9 下载时的 main 就是它
+_MEMLENS = (
+    "https://huggingface.co/datasets/xiyuRenBill/MEMLENS/resolve/"
+    "afa101a1907cc37db40b50d649547964387b96b7/"
+)
 _MEMLENS_EXTRAS = (
-    ("memlens/agent_subset_195.json", _MEMLENS + "agent_subset_195.json"),
-    ("memlens/release_images.tar.gz", _MEMLENS + "release_images.tar.gz"),
+    (
+        "memlens/agent_subset_195.json",
+        _MEMLENS + "agent_subset_195.json",
+        "ae954eca5eb8478c9a1855844bee6fba7a6641f5ea14bd91c3ea49bf9f50b2aa",
+    ),
+    (
+        "memlens/release_images.tar.gz",
+        _MEMLENS + "release_images.tar.gz",
+        "8d0be814ab3ffe99ed3ea84ed04eacd9f06423c4068da2c24e4749c7ca3940f6",
+    ),
 )
 
 
@@ -91,22 +111,26 @@ DATASETS = {
     "longmemeval_s": DatasetSpec(
         "longmemeval_s",
         "longmemeval_s_cleaned.json",
-        "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/"
-        "longmemeval_s_cleaned.json",
+        "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/"
+        "98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json",
+        "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
         "LongMemEval_S 清洗版：500 题，约 277 MB，MIT 许可",
     ),
     "locomo": DatasetSpec(
         "locomo",
         "locomo10.json",
-        "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
+        "https://raw.githubusercontent.com/snap-research/locomo/"
+        "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376/data/locomo10.json",
+        "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
         "LoCoMo：10 段对话、1986 题，约 3 MB",
     ),
     # 混合流（N7）里"不需要记忆"的通用请求，只用不带参考材料的四类（mixed.py）
     "dolly": DatasetSpec(
         "dolly",
         "databricks-dolly-15k.jsonl",
-        "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/"
-        "databricks-dolly-15k.jsonl",
+        "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/"
+        "bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a/databricks-dolly-15k.jsonl",
+        "2df9083338b4abd6bceb5635764dab5d833b393b55759dffb0959b6fcbf794ec",
         "databricks-dolly-15k：15,011 条人工撰写的指令，约 13 MB，CC BY-SA 3.0",
     ),
     # N11：真实的聊天机器人用户消息（会话的第一句），检验门控在真实流量上的误召回；
@@ -116,6 +140,7 @@ DATASETS = {
         "wildchat/train-00000-of-00014.parquet",
         "https://huggingface.co/datasets/allenai/WildChat-1M/resolve/"
         "7d6490e462285cf85d91eabea0f9a954fbddcd1f/data/train-00000-of-00014.parquet",
+        "abec2a13129db8c0e6a2d3a51ff12644873c748205a6fdf6551fbcb34430e51c",
         "WildChat-1M 的第 1 个分片：约 7 万段真实的聊天机器人对话，约 231 MB，ODC-BY",
         optional=True,
     ),
@@ -123,6 +148,7 @@ DATASETS = {
         "memlens_32k",
         "memlens/dataset_32k.json",
         _MEMLENS + "dataset_32k.json",
+        "4c75acc3e0a7e1cc71bc962bff3d2a0f1f35e268bc28254ca85f1d9867b03eb9",
         "MemLens 32K 档：789 题，约 98 MB；图片 4,695 张约 225 MB（CC-BY-4.0）",
         _MEMLENS_EXTRAS,
     ),
@@ -130,6 +156,7 @@ DATASETS = {
         "memlens_128k",
         "memlens/dataset_128k.json",
         _MEMLENS + "dataset_128k.json",
+        "ad148ccc936d698db8e05a6b0df69f9342407468eb69a4ae70d8f540334bea14",
         "MemLens 128K 档：789 题，约 369 MB；图片与 32K 档共用",
         _MEMLENS_EXTRAS,
     ),
@@ -320,36 +347,50 @@ def dataset_path(directory: Path, name: str) -> Path:
 
 
 def download(name: str, directory: Path, *, timeout_s: float = 600.0) -> Path:
-    """下载数据集到 directory；已存在则跳过。先写临时文件，完成后再改名，避免留下半个文件。"""
+    """下载数据集到 directory；已存在则跳过（不重新核对）。先写临时文件，sha256 与固定的值一致
+    才改名，避免留下半个或不对的文件；压缩包核对之后才解压。对不上时报 DatasetChecksumError。"""
     spec = DATASETS[name]
-    for filename, url in spec.extras:
+    for filename, url, sha256 in spec.extras:
         extra = directory / filename
         if filename.endswith(".tar.gz"):
             unpacked = extra.parent / filename.split("/")[-1].removesuffix(".tar.gz")
             if unpacked.exists():
                 continue
-            _fetch(url, extra, timeout_s)
+            _fetch(url, extra, timeout_s, sha256)
             with tarfile.open(extra) as archive:
                 archive.extractall(extra.parent, filter="data")
             extra.unlink()
         elif not extra.exists():
-            _fetch(url, extra, timeout_s)
+            _fetch(url, extra, timeout_s, sha256)
     target = directory / spec.filename
     if not (target.exists() and target.stat().st_size > 0):
-        _fetch(spec.url, target, timeout_s)
+        _fetch(spec.url, target, timeout_s, spec.sha256)
     return target
 
 
-def _fetch(url: str, target: Path, timeout_s: float) -> None:
+def _fetch(url: str, target: Path, timeout_s: float, sha256: str) -> None:
+    """边下载边算 sha256；与 sha256 一致才把临时文件改名成 target，否则删掉它并报错。"""
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".part")
-    with (
-        httpx2.stream("GET", url, follow_redirects=True, timeout=timeout_s) as response,
-        partial.open("wb") as f,
-    ):
-        response.raise_for_status()
-        for chunk in response.iter_bytes():
-            f.write(chunk)
+    digest = hashlib.sha256()
+    try:
+        with (
+            httpx2.stream("GET", url, follow_redirects=True, timeout=timeout_s) as response,
+            partial.open("wb") as f,
+        ):
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                f.write(chunk)
+                digest.update(chunk)
+        if digest.hexdigest() != sha256:
+            raise DatasetChecksumError(
+                f"下载的 {target.name} 与固定的版本不同：sha256 应为 {sha256}，实际是 "
+                f"{digest.hexdigest()}（{url}）。没有保存。URL 固定在上游的一个提交上，内容不该变；"
+                "多半是下载被代理或镜像截断、改写了，换个网络重试"
+            )
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
     partial.rename(target)
 
 
