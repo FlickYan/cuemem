@@ -57,6 +57,21 @@ class SessionIn(BaseModel):
         return naive_local(value)
 
 
+class TurnMeta(BaseModel):
+    """SDK 写入时随发言存下的附加信息（N12 之后，Mem0 兼容）。属于原始层：与发言一起导出、一起
+    遗忘，重建派生记忆时不清空；不进抽取提示，也不进会话的内容指纹（session_content_hash），
+    抽取请求与缓存键因此不变。
+
+    - metadata：调用方给的 JSON 对象（Mem0 的 metadata）；事实与对话片段带上出处各句的并集；
+    - expires_at：过期时间（Mem0 的 expiration_date），"YYYY-MM-DD"（那天结束时过期）或本机时间；
+    - edit_of：这句是 Memory.update 写下的更正，要取代的事实 ID（对账据此取代它）。
+    """
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    expires_at: str | None = None
+    edit_of: str | None = None
+
+
 class Conversation(BaseModel):
     """导入格式：一个记忆空间下的若干会话。"""
 

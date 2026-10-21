@@ -6,14 +6,20 @@ CueMem 的派生记忆（事实、实体、摘要、画像）是原始日志的�
 原始日志：会话、发言（含时间、说话人、遗忘留下的序号空缺）与图片原文件。导入就是把日志写回去、
 再巩固一遍——换了抽取模型、换了机器也能得到一致的结构，而不是搬一份可能过期的派生结果。
 
-文件格式（JSON，format = "cuemem.space"，version = 1）：
+文件格式（JSON，format = "cuemem.space"，version = 2）：
 
-    {"format": "cuemem.space", "version": 1, "exported_at": "...", "space_id": "alice",
+    {"format": "cuemem.space", "version": 2, "exported_at": "...", "space_id": "alice",
      "sessions": [{"session_id": "...", "started_at": "...",
                    "turns": [{"idx": 0, "role": "user", "text": "... <image> ...", "ts": "...",
                               "speaker": null, "images": [{"sha256": "...", "mime": "image/jpeg",
-                                                           "data": "<base64>"}]}]}],
+                                                           "data": "<base64>"}],
+                              "metadata": {...}, "expires_at": "...", "edit_of": "..."}]}],
      "derived": {"facts": [...], "profile": "..."}}
+
+version 2（N12 之后）：发言可以带 SDK 写入时给的附加信息（core.models.TurnMeta）——metadata、
+expires_at（过期时间）与 edit_of（Memory.update 写下的更正要取代的事实）；没有时省略这几个键。
+version 1 的文件照样能导入（没有附加信息）。edit_of 指向的事实 ID 按抽取结果派生：换了抽取
+模型时可能对不上，那句更正就只是一句普通的话。
 
 derived 只是给别的系统读的快照（带版本链的事实与画像），导入时不用它。没有导出的：回复引用了
 哪些记忆的溯源表（导入后事实 ID 会重新生成，对不上）；遗忘时沿引用扩散因此对导入的空间不起作用，
@@ -39,11 +45,12 @@ from typing import Any
 
 from PIL import Image
 
-from cuemem.core.models import SessionIn, Turn, TurnIn
+from cuemem.core.models import SessionIn, Turn, TurnIn, TurnMeta
+from cuemem.core.timeutil import normalize_expiry
 from cuemem.memory import MemorySystem
 
 FORMAT = "cuemem.space"
-VERSION = 1
+VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
 # PIL 认出的格式 → 临时文件的后缀（媒体库按后缀存放）；没列出的格式用 .img（同 SDK 的 data URL）
 _FORMAT_SUFFIX = {
     "JPEG": ".jpg",
@@ -62,6 +69,7 @@ def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -
     if not sessions:
         raise KeyError(f"No memory space {space_id}")
     media = {m.id: m for m in system.db.get_media(space_id)}
+    meta = system.db.get_turn_meta(space_id)
     out_sessions = []
     for session_id, started_at in sorted(sessions.items(), key=lambda item: item[1]):
         turns = system.db.get_turns(space_id, session_id)
@@ -69,7 +77,7 @@ def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -
             {
                 "session_id": session_id,
                 "started_at": started_at.isoformat(),
-                "turns": [_turn_out(t, media) for t in turns],
+                "turns": [_turn_out(t, media, meta.get(t.id)) for t in turns],
             }
         )
     data: dict[str, Any] = {
@@ -112,6 +120,7 @@ def import_space(
     with tempfile.TemporaryDirectory(prefix="cuemem-import-") as scratch:
         # 先读完、校验完整个文件再写：有一张坏图时一条发言也不写，不留下导入了一半的空间
         chunks: list[tuple[SessionIn, int]] = []
+        meta: dict[tuple[str, int], TurnMeta | None] = {}  # （会话，序号）→ 附加信息
         for session in data.get("sessions", []):
             started = datetime.fromisoformat(session["started_at"])
             # 遗忘留下的序号空缺照原样保留（重新抽取时要标出来，D-059）：按连续的序号分段写入
@@ -121,10 +130,13 @@ def import_space(
                 turns = [_turn_in(t, Path(scratch)) for t in chunk]
                 piece = SessionIn(session_id=session["session_id"], started_at=started, turns=turns)
                 chunks.append((piece, int(chunk[0]["idx"])))
+                for t in chunk:  # 序号重复时与发言一样先写的算（INSERT OR IGNORE）
+                    meta.setdefault((piece.session_id, int(t["idx"])), _meta_in(t))
         # 整个文件在一个事务里提交：向量化中途出错时一条都不写，重试从头开始（每段各向量化一次，
         # 与以前逐段写入时的请求相同）
         if chunks:
-            with system.appending(target, chunks) as report:
+            extra = meta if any(m is not None for m in meta.values()) else None
+            with system.appending(target, chunks, meta=extra) as report:
                 turns_added, images_added = report.turns_added, report.images_added
     out: dict[str, Any] = {
         "space_id": target,
@@ -137,7 +149,7 @@ def import_space(
     return out
 
 
-def _turn_out(turn: Turn, media: Mapping[str, Any]) -> dict[str, Any]:
+def _turn_out(turn: Turn, media: Mapping[str, Any], meta: TurnMeta | None) -> dict[str, Any]:
     images = []
     for media_id in turn.media_ids:
         item = media.get(media_id)
@@ -146,7 +158,7 @@ def _turn_out(turn: Turn, media: Mapping[str, Any]) -> dict[str, Any]:
         mime = mimetypes.guess_type(item.path)[0] or "image/jpeg"
         payload = base64.b64encode(Path(item.path).read_bytes()).decode("ascii")
         images.append({"sha256": item.sha256, "mime": mime, "data": payload})
-    return {
+    out: dict[str, Any] = {
         "idx": turn.idx,
         "role": turn.role,
         "text": turn.text,
@@ -154,6 +166,9 @@ def _turn_out(turn: Turn, media: Mapping[str, Any]) -> dict[str, Any]:
         "speaker": turn.speaker,
         "images": images,
     }
+    if meta is not None:  # version 2：只写有的那几项
+        out.update(meta.model_dump(exclude_defaults=True))
+    return out
 
 
 def _turn_in(turn: Mapping[str, Any], scratch: Path) -> TurnIn:
@@ -165,6 +180,19 @@ def _turn_in(turn: Mapping[str, Any], scratch: Path) -> TurnIn:
         speaker=turn.get("speaker"),
         images=[str(p) for p in paths],
     )
+
+
+def _meta_in(turn: Mapping[str, Any]) -> TurnMeta | None:
+    """导入文件里一句发言的附加信息（version 2）；没有时是 None。文件不可信：类型不对、过期时间
+    认不出来时整个导入报错（与坏图相同，在写入任何东西之前）。"""
+    metadata, expires, edit_of = turn.get("metadata"), turn.get("expires_at"), turn.get("edit_of")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("Export contains turn metadata that is not a JSON object")
+    if edit_of is not None and not isinstance(edit_of, str):
+        raise ValueError("Export contains an edit_of that is not a memory id")
+    if not metadata and expires is None and edit_of is None:
+        return None
+    return TurnMeta(metadata=metadata or {}, expires_at=normalize_expiry(expires), edit_of=edit_of)
 
 
 def _image_files(images: Sequence[Mapping[str, Any]], scratch: Path) -> Iterator[Path]:

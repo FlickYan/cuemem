@@ -366,6 +366,46 @@ def test_fact_indexes_are_added_to_existing_databases(tmp_path: Path) -> None:
     db.close()
 
 
+def test_v5_database_gains_turn_meta(tmp_path: Path) -> None:
+    """v6 加了 turn_meta（SDK 的 metadata、过期时间与更正目标）：v5 的库打开时自动补上这张表，
+    已有的发言没有附加信息；附加信息只写给这次真正写进去的发言，随发言一起删。"""
+    import sqlite3
+
+    from cuemem.core.models import TurnMeta
+
+    def turn(turn_id: str, idx: int) -> Turn:
+        return Turn(
+            id=turn_id,
+            space_id="s",
+            session_id="x",
+            idx=idx,
+            role="user",
+            text=f"hi {idx}",
+            ts=datetime(2025, 1, 1),
+        )
+
+    path = tmp_path / "memory.sqlite"
+    db = MemoryDB(path)
+    assert db.add_turns([turn("t0", 0)]) == 1
+    db.close()
+    conn = sqlite3.connect(path)  # 模拟 v5 的库：没有 turn_meta
+    conn.executescript("DROP TABLE turn_meta; PRAGMA user_version = 5;")
+    conn.close()
+
+    db = MemoryDB(path)
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert db.get_turn_meta("s") == {} and [t.id for t in db.get_turns("s")] == ["t0"]
+    tagged = TurnMeta(metadata={"topic": "food", "n": 1}, expires_at="2030-01-01")
+    assert db.add_turns([turn("t1", 1)], {"t1": tagged}) == 1
+    assert db.add_turns([turn("t0", 0)], {"t0": tagged}) == 0  # 已有的发言：不换上附加信息
+    assert db.get_turn_meta("s") == {"t1": tagged}
+    assert db.get_turn_meta("s", ["t0", "t1", "nope"]) == {"t1": tagged}
+    assert db.get_turn_meta("s", []) == {} and db.get_turn_meta("other") == {}
+    db.delete_turns("s", ["t1"])
+    assert db.get_turn_meta("s") == {}
+    db.close()
+
+
 def test_llm_cache_gains_scope_column(tmp_path: Path) -> None:
     """N3 之前建的响应缓存没有 scope 列：打开时自动补上，旧条目照常可读。"""
     import sqlite3

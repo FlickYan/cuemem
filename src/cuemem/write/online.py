@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from cuemem.core.ids import stable_id
-from cuemem.core.models import MediaItem, MemoryUnit, SessionIn, Turn
+from cuemem.core.models import MediaItem, MemoryUnit, SessionIn, Turn, TurnMeta
 from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import span
 from cuemem.embed.base import EmbeddingBatch, TextEmbedder
@@ -109,7 +109,8 @@ class _Staged:
     """一次写入里已经写进向量库、还没写进数据库的部分（见 OnlineWriter.writing）。"""
 
     space_id: str
-    pieces: list[tuple[SessionIn, list[Turn]]] = field(default_factory=list)
+    # 会话、发言与要随发言写的附加信息（轮 ID → TurnMeta）
+    pieces: list[tuple[SessionIn, list[Turn], dict[str, TurnMeta]]] = field(default_factory=list)
     media: list[MediaItem] = field(default_factory=list)  # 新的图片记录
     units: list[MemoryUnit] = field(default_factory=list)  # 新的"轮"
     tokens: int = 0
@@ -133,7 +134,10 @@ class OnlineWriter:
 
     @contextmanager
     def writing(
-        self, space_id: str, batches: Sequence[Sequence[tuple[SessionIn, int]]]
+        self,
+        space_id: str,
+        batches: Sequence[Sequence[tuple[SessionIn, int]]],
+        meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
     ) -> Iterator[IngestReport]:
         """写入这些会话的发言，要么全部写进去，要么什么都不留。每项是会话与第一句的序号（导入
         整段对话时从 0 起；Agent 追加新的一问一答时接着往下排）。with 块里调用方的写入（登记巩固
@@ -146,12 +150,15 @@ class OnlineWriter:
 
         每批向量化一次，与以前逐次写入时的请求相同：导入整段对话是一批，导入文件时每段连续的
         发言一批。已有的发言不再处理；遗忘删掉的发言也不会被写回来。
+
+        meta：（会话，发言序号）→ 附加信息（SDK 的 metadata、过期时间与更正目标，导入的文件），
+        与发言在同一个事务里写，只写给真正写进去的发言；不影响"轮"与向量化。
         """
         started = time.perf_counter()
         staged = _Staged(space_id)
         try:
             for pieces in batches:
-                self._stage(staged, pieces)
+                self._stage(staged, pieces, meta)
             with self.db.transaction():
                 report = self._commit(staged, started)
                 yield report
@@ -159,7 +166,12 @@ class OnlineWriter:
             self._discard(staged)
             raise
 
-    def _stage(self, staged: _Staged, pieces: Sequence[tuple[SessionIn, int]]) -> None:
+    def _stage(
+        self,
+        staged: _Staged,
+        pieces: Sequence[tuple[SessionIn, int]],
+        meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+    ) -> None:
         """一批会话：建发言与"轮"、存原图，把这批里新的图片与"轮"向量化、写进向量库（不写数据库）。
         前面几批已经要写的不算新的，与以前逐批提交时相同（导入的文件里序号重复时）。"""
         space_id = staged.space_id
@@ -169,7 +181,13 @@ class OnlineWriter:
             turns = build_turns(space_id, session, first_idx)
             if self.media is not None:
                 media.extend(self._attach_images(session, turns))
-            staged.pieces.append((session, turns))
+            extra: dict[str, TurnMeta] = {}
+            if meta:
+                for t in turns:
+                    info = meta.get((t.session_id, t.idx))
+                    if info is not None:
+                        extra[t.id] = info
+            staged.pieces.append((session, turns, extra))
             units.extend(build_rounds(turns))
 
         if media:  # 新图片：先写图片向量，再登记图片记录（数据库里有就说明向量已写入）
@@ -203,9 +221,9 @@ class OnlineWriter:
         space_id = staged.space_id
         self.db.ensure_space(space_id)
         turns_added = 0
-        for session, turns in staged.pieces:
+        for session, turns, extra in staged.pieces:
             self.db.add_session(space_id, session.session_id, session.started_at)
-            turns_added += self.db.add_turns(turns)
+            turns_added += self.db.add_turns(turns, extra)
         images_added = self.db.add_media(staged.media) if staged.media else 0
         if staged.units:
             self.db.add_units(staged.units)

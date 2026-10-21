@@ -12,7 +12,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Iterator, Sequence
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,7 @@ from PIL import Image
 from scripted import ScriptedModel
 
 from cuemem import AsyncMemory, Memory
-from cuemem.config import Settings
+from cuemem.config import PathsConfig, Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
@@ -150,8 +150,11 @@ def test_search_and_answer(memory: Memory) -> None:
     v3 = memory.search("Where do I live?", filters={"user_id": "alice"}, top_k=1, mode="l1")
     assert len(v3["results"]) == 1
     assert memory.get_all(filters={"user_id": "alice"})["results"][0]["object"] == "Berlin"
-    with pytest.raises(ValueError, match="Unsupported filters"):
-        memory.search("x", filters={"user_id": "alice", "categories": ["home"]})
+    # 其余的键是 metadata 的条件（没写过 metadata：什么都不给）；写错的运算符报错
+    unknown = {"user_id": "alice", "topic": "home"}
+    assert memory.search("Where do I live?", filters=unknown, mode="l1")["results"] == []
+    with pytest.raises(ValueError, match="Unsupported filter operators"):
+        memory.search("x", filters={"user_id": "alice", "topic": {"regex": "h.*"}})
 
     auto = memory.search("Where do I live?", user_id="alice", at=SEP)
     assert auto["level"] in {"L0", "L1", "L2"} and auto["reasons"]
@@ -530,6 +533,144 @@ def test_run_scoped_search_keeps_only_that_runs_images(memory: Memory, tmp_path:
     r1_turns = [t.id for t in memory.system.db.get_turns("eve", "r1")]
     (r1_image,) = memory.system.db.get_media("eve", turn_ids=r1_turns)
     assert image["id"] == r1_image.id
+
+
+def test_metadata_is_kept_on_memories_and_filterable(memory: Memory, tmp_path: Path) -> None:
+    """add(metadata=...)（Mem0 的写法）：记在发言上，由它们抽出的事实、对话片段与图片带上它，
+    filters 里按它筛（Mem0 的运算符与 AND / OR / NOT）。以前 add 不认 metadata（TypeError），
+    filters 里别的键都报错。"""
+    tea = memory.add("I like green tea", user_id="dan", metadata={"topic": "food", "stars": 5})
+    assert tea["status"] == "queued"
+    memory.add("I like chess", user_id="dan", metadata={"topic": "games", "stars": 3})
+    memory.add("I like rain", user_id="dan")
+    memory.consolidate(user_id="dan")
+
+    def facts(**where: Any) -> list[str]:
+        found = memory.get_all(filters={"user_id": "dan", **where})["results"]
+        return sorted(f["memory"] for f in found)
+
+    every = {f["memory"]: f for f in memory.get_all(user_id="dan")["results"]}
+    assert every["I like green tea"]["metadata"] == {"topic": "food", "stars": 5}
+    assert (
+        every["I like rain"]["metadata"] == {} and every["I like rain"]["expiration_date"] is None
+    )
+    tea_and_chess = ["I like chess", "I like green tea"]
+    assert facts(topic="food") == ["I like green tea"]
+    assert facts(topic="*") == tea_and_chess
+    assert facts(topic={"ne": "food"}) == ["I like chess", "I like rain"]
+    assert facts(topic={"in": ["food", "games"]}) == tea_and_chess
+    assert facts(topic={"nin": ["food"]}) == ["I like chess", "I like rain"]
+    assert facts(topic={"icontains": "FO"}) == ["I like green tea"]
+    assert facts(stars={"gte": 4}) == ["I like green tea"]
+    assert facts(stars={"gte": 3, "lte": 4}) == ["I like chess"]
+    assert facts(stars={"gt": "x"}) == []  # 比不了大小（数字与字符串）：不算满足
+    assert facts(OR=[{"topic": "food"}, {"stars": {"lt": 4}}]) == tea_and_chess
+    assert facts(AND=[{"topic": "*"}, {"NOT": [{"topic": "food"}]}]) == ["I like chess"]
+    assert facts(AND=[{"user_id": "dan"}, {"topic": "games"}]) == ["I like chess"]
+    run = every["I like rain"]["session_id"]
+    assert facts(run_id={"in": [run, "other"]}) == ["I like rain"]
+    for bad in ({"topic": {"regex": "f.*"}}, {"OR": {"topic": "food"}}, {"topic": {"in": "food"}}):
+        with pytest.raises(ValueError, match="filter"):
+            memory.get_all(filters={"user_id": "dan", **bad})
+    with pytest.raises(ValueError, match="single id"):
+        memory.get_all(filters={"user_id": {"in": ["dan", "eve"]}})
+    for bad_meta in ({"when": datetime.now()}, {1: "x"}):
+        with pytest.raises(ValueError, match="metadata"):
+            memory.add("I like snow", user_id="dan", metadata=bad_meta)
+    assert len(memory.get_all(user_id="dan")["results"]) == 3  # 报错时什么都没写
+
+    # search：事实、对话片段与图片都按 metadata 筛，都带着 metadata
+    photo = tmp_path / "cup.png"
+    Image.new("RGB", (16, 16), "green").save(photo)
+    content = [
+        {"type": "text", "text": "My green tea cup"},
+        {"type": "image_url", "image_url": {"url": str(photo)}},
+    ]
+    memory.add({"role": "user", "content": content}, user_id="dan", metadata={"topic": "kitchen"})
+    found = memory.search("green tea", filters={"user_id": "dan", "topic": "food"}, mode="l1")
+    assert {r["type"] for r in found["results"]} == {"fact", "excerpt"}
+    assert {r["metadata"]["topic"] for r in found["results"]} == {"food"}
+    assert found["images"] == []
+    kitchen = memory.search(
+        "green tea cup", filters={"user_id": "dan", "topic": "kitchen"}, mode="l1"
+    )
+    assert [i["metadata"] for i in kitchen["images"]] == [{"topic": "kitchen"}]
+    assert {r["metadata"]["topic"] for r in kitchen["results"]} == {"kitchen"}
+
+
+def test_metadata_and_expiration_stay_out_of_extraction(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, tmp_path: Path
+) -> None:
+    """metadata 与过期时间不进抽取提示，也不进会话的内容指纹：抽取与对账的请求、任务键与不带
+    它们时逐字相同（缓存照样命中），metadata 里的内容不会发给模型。"""
+    fake_api.chat_replies = [model]
+
+    def run(home: str, **extra: Any) -> tuple[list[dict[str, Any]], list[str]]:
+        paths = PathsConfig().resolve_against(tmp_path / home)
+        fake_api.chat_requests.clear()
+        with Memory(
+            n3_settings.model_copy(update={"paths": paths}),
+            http_client=fake_api.client(),
+            background=False,
+        ) as m:
+            for text, at in (("I live in Berlin", AUG), ("I moved to Munich", SEP)):
+                m.add(text, user_id="alice", run_id=text[-6:], timestamp=at, wait=True, **extra)
+            jobs = [j["id"] for j in m.system.db.get_jobs("alice")]
+            return list(fake_api.chat_requests), jobs
+
+    plain = run("plain")
+    tagged = run("tagged", metadata={"crm": "TOP-SECRET-7"}, expiration_date="2099-01-01")
+    assert len(plain[0]) == 3  # 两次抽取、一次对账
+    assert tagged == plain
+    assert "TOP-SECRET-7" not in str(tagged[0])
+
+
+def test_expired_memories_leave_search_get_all_and_the_profile(memory: Memory) -> None:
+    """expiration_date（Mem0 的写法）：过期之后 search、get_all 与画像里不再出现，get 与 history
+    照样取得到（数据要 delete 才删）。只给日期时到那天结束为止；同一件事后来又说过一次、没给
+    过期时间，它就不过期。"""
+    today = date.today()
+    berlin = memory.add(
+        "I live in Berlin", user_id="u", expiration_date=today - timedelta(days=1), wait=True
+    )["results"][0]["id"]
+    memory.add("I like jazz", user_id="u", expiration_date=today.isoformat(), wait=True)
+    soon = datetime.now() - timedelta(seconds=1)
+    memory.add("I like chess", user_id="u", expiration_date=soon, wait=True)
+    memory.add("I like rain", user_id="u", expiration_date="2020-01-01", wait=True)
+    memory.add("I like rain", user_id="u", wait=True)  # 又说了一次，没给过期时间
+
+    current = {f["memory"]: f for f in memory.get_all(user_id="u")["results"]}
+    assert sorted(current) == ["I like jazz", "I like rain"]
+    assert current["I like jazz"]["expiration_date"] == today.isoformat()
+    assert current["I like rain"]["expiration_date"] is None
+    everything = memory.get_all(user_id="u", include_superseded=True)["results"]
+    assert "The user lives in Berlin." not in {f["memory"] for f in everything}
+
+    found = memory.search("Where do I live? Do I like chess?", user_id="u", mode="l1")
+    assert found["results"]
+    assert not any("Berlin" in r["memory"] or "chess" in r["memory"] for r in found["results"])
+    assert "Berlin" not in found["profile"] and "jazz" in found["profile"]
+    assert "Berlin" not in memory.profile(user_id="u")
+    assert "Berlin" in memory.system.core_memory("u").text  # type: ignore[union-attr]
+
+    old = memory.get(berlin)
+    assert old is not None and old["expiration_date"] == (today - timedelta(days=1)).isoformat()
+    assert [v["id"] for v in memory.history(berlin)] == [berlin]
+    with pytest.raises(ValueError, match="expiration date"):
+        memory.add("I like snow", user_id="u", expiration_date="next week")
+
+
+def test_forgetting_deletes_the_metadata_of_forgotten_turns(memory: Memory) -> None:
+    """metadata 属于原始层，可能也有个人信息：遗忘一段发言时一起删，delete_all 全删。"""
+    pin = memory.add("My PIN is 4321", user_id="u", metadata={"note": "PIN-NOTE-4321"}, wait=True)
+    memory.add("I like hiking", user_id="u", metadata={"note": "hobby"}, wait=True)
+    memory.delete(pin["results"][0]["id"])
+    left = memory.system.db.get_turn_meta("u")
+    assert [m.metadata for m in left.values()] == [{"note": "hobby"}]
+    db_path = memory.system.settings.paths.db
+    assert b"PIN-NOTE-4321" not in db_path.read_bytes()
+    memory.delete_all(user_id="u")
+    assert memory.system.db.get_turn_meta("u") == {}
 
 
 def test_delete_restores_the_older_version_and_delete_all_wipes(memory: Memory) -> None:

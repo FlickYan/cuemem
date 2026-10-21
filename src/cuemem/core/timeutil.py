@@ -12,7 +12,7 @@ datetime.now() 与 datetime.fromtimestamp() 的缺省值也是本机时间。带
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 
 _PARTIAL_DATE = re.compile(r"^(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2}))?)?")
 
@@ -59,3 +59,33 @@ def partial_date_start(value: str) -> datetime:
     while len(parts) < 3:
         parts.append(1)
     return datetime(parts[0], parts[1], parts[2])
+
+
+def normalize_expiry(value: object) -> str | None:
+    """过期时间（SDK 的 expiration_date、导入文件里的 expires_at）→ 存下的字符串：只给日期时是
+    "YYYY-MM-DD"，到那天结束为止（与 Mem0 相同）；带时间的换算成本机时间。报错是英文：
+    调用方是 SDK 与导入。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return naive_local(value).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            if len(text) == 10:
+                return date.fromisoformat(text).isoformat()
+            return naive_local(datetime.fromisoformat(text)).isoformat()
+        except ValueError:
+            pass
+    raise ValueError(
+        f"Invalid expiration date {value!r}: give an ISO date ('2026-12-31') or a datetime."
+    )
+
+
+def expiry_instant(value: str) -> datetime:
+    """存下的过期时间（normalize_expiry 的结果）→ 过期的时刻：只有日期的，第二天 0 点过期。"""
+    if len(value) == 10:
+        return datetime.combine(date.fromisoformat(value), time()) + timedelta(days=1)
+    return datetime.fromisoformat(value)

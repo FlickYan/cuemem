@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -29,6 +29,7 @@ from cuemem.core.models import (
     MediaItem,
     SessionIn,
     Turn,
+    TurnMeta,
 )
 from cuemem.core.timeutil import naive_local
 from cuemem.core.trace import TraceSink, current_trace, start_trace
@@ -464,32 +465,53 @@ class MemorySystem:
         return report
 
     def append(
-        self, space_id: str, session: SessionIn, first_idx: int, *, enqueue: bool = True
+        self,
+        space_id: str,
+        session: SessionIn,
+        first_idx: int,
+        *,
+        enqueue: bool = True,
+        meta: Sequence[TurnMeta | None] | None = None,
     ) -> IngestReport:
         """往会话里追加发言（Agent 每轮写回新的一问一答，序号从 first_idx 起），在线写入、
         不调用 LLM。会话进行中不登记巩固任务（见 open_session）；enqueue=False 时也不登记
-        （SDK 的 infer=False：只记日志，下次 consolidate 时再抽取）。
+        （SDK 的 infer=False：只记日志，下次 consolidate 时再抽取）。meta：与发言一一对应的
+        附加信息（SDK 的 metadata、过期时间与更正目标），不影响抽取。
 
         要么全部写进去，要么什么都不留：向量化或写向量出错时抛出异常、数据库里什么都没写，
         调用方可以原样重试。"""
-        with self.appending(space_id, [(session, first_idx)], enqueue=enqueue) as report:
+        extra = None
+        if meta is not None:
+            extra = {
+                (session.session_id, idx): info
+                for idx, (_, info) in enumerate(zip(session.turns, meta, strict=True), first_idx)
+                if info is not None
+            }
+        with self.appending(
+            space_id, [(session, first_idx)], enqueue=enqueue, meta=extra
+        ) as report:
             return report
 
     @contextmanager
     def appending(
-        self, space_id: str, pieces: Sequence[tuple[SessionIn, int]], *, enqueue: bool = True
+        self,
+        space_id: str,
+        pieces: Sequence[tuple[SessionIn, int]],
+        *,
+        enqueue: bool = True,
+        meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
     ) -> Iterator[IngestReport]:
         """同 append，pieces 是若干段（会话，第一句的序号），每段各向量化一次（导入文件时每段
         连续的发言一段，与以前逐段追加时的请求相同）。with 块里的写入（Agent 的溯源）与发言、
         巩固任务在同一个事务里提交，块里出错时一起撤销（块里只做数据库的写入：事务持有数据库
-        的锁）。"""
+        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。"""
         sessions = list(dict.fromkeys(s.session_id for s, _ in pieces))
         names = {"session": sessions[0]} if len(sessions) == 1 else {"sessions": sessions}
         skip = self.open_sessions(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
         queued = 0
         with (
             start_trace("append", self.tracer, space=space_id, **names),
-            self.writer.writing(space_id, [[piece] for piece in pieces]) as report,
+            self.writer.writing(space_id, [[piece] for piece in pieces], meta) as report,
         ):
             if enqueue:
                 queued = self.consolidator.enqueue(space_id, sessions, skip=skip)

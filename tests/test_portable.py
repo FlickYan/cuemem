@@ -100,7 +100,7 @@ def test_export_and_import_round_trip(
     assert len(remaining) == 2 and "I run every Sunday" in remaining
 
     data = json.loads(json.dumps(memory.export(user_id="alice")))  # 能原样写成 JSON
-    assert data["format"] == FORMAT and data["version"] == 1
+    assert data["format"] == FORMAT and data["version"] == 2
     (session,) = data["sessions"]
     assert [t["idx"] for t in session["turns"]] == [0, 1, 4]
     assert session["turns"][2]["text"] == "These are my shoes <image>"
@@ -134,6 +134,55 @@ def test_export_and_import_round_trip(
         memory.load({"format": "something-else"})
     with pytest.raises(KeyError):
         memory.export(user_id="nobody")
+
+
+def test_export_v2_carries_metadata_and_v1_files_still_import(memory: Memory) -> None:
+    """导出格式 version 2：发言带 SDK 写入时给的 metadata 与过期时间（没有时省略），导入后照样
+    能按 metadata 筛、照样过期。version 1 的文件（这个版本之前导出的）照样能导入；附加信息的
+    类型不对时整个导入报错、一条发言也不写；更新的版本拒绝导入。"""
+    memory.add(
+        "I like green tea",
+        user_id="alice",
+        run_id="s1",
+        timestamp=DAY,
+        metadata={"topic": "food", "tags": ["drink"]},
+        expiration_date="2099-12-31",
+    )
+    memory.add("I like rain", user_id="alice", run_id="s1", timestamp=DAY)
+    memory.add("I like chess", user_id="alice", run_id="s2", timestamp=DAY, expiration_date=DAY)
+    data = json.loads(json.dumps(memory.export(user_id="alice", derived=False)))
+    assert data["version"] == 2
+    turns = {t["text"]: t for s in data["sessions"] for t in s["turns"]}
+    assert turns["I like green tea"]["metadata"] == {"topic": "food", "tags": ["drink"]}
+    assert turns["I like green tea"]["expires_at"] == "2099-12-31"
+    assert turns["I like chess"]["expires_at"] == DAY.isoformat()
+    assert not {"metadata", "expires_at", "edit_of"} & set(turns["I like rain"])
+
+    memory.load(data, user_id="bob", wait=True)
+    tea = memory.get_all(filters={"user_id": "bob", "tags": {"contains": "drink"}})["results"]
+    assert [(f["memory"], f["expiration_date"]) for f in tea] == [
+        ("I like green tea", "2099-12-31")
+    ]
+    assert {f["memory"] for f in memory.get_all(user_id="bob")["results"]} == {
+        "I like green tea",
+        "I like rain",
+    }
+
+    # 这个版本之前导出的文件（version 1，发言没有附加信息）
+    report = memory.load(_export(), user_id="carol", wait=True)
+    assert report["turns_added"] == 2 and memory.system.db.get_turn_meta("carol") == {}
+    assert len(memory.get_all(user_id="carol")["results"]) == 2
+
+    for field, value in (("metadata", ["not", "an", "object"]), ("expires_at", "soon")):
+        bad = _export()
+        bad["version"] = 2
+        bad["sessions"][0]["turns"][1][field] = value
+        with pytest.raises(ValueError):
+            memory.load(bad, user_id="dave")
+        assert memory.system.db.get_turns("dave") == []
+    newer = {**_export(), "version": 3}
+    with pytest.raises(ValueError, match="newer"):
+        memory.load(newer, user_id="dave")
 
 
 def _png(color: str = "red") -> bytes:

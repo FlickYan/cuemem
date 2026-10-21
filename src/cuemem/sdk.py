@@ -13,6 +13,9 @@
 
 - 记忆空间：user_id 与 agent_id 合起来定一个空间（各空间完全隔离）；run_id 是空间里的一个会话，
   search / get_all / delete_all 给了 run_id 时只看、只删这个会话的记忆；
+- add 的 metadata 随发言存在原始层（不进抽取），事实与对话片段带上出处各句的 metadata，
+  filters 里可以按它筛（Mem0 的 eq / ne / in / gte / lte… 与 AND / OR / NOT）；expiration_date
+  过期之后 search、get_all 与画像里不再出现（get 与 history 照样取得到，数据要 delete 才删）；
 - 写入分两步：add 先在线写入原始日志（不调用 LLM，立即可检索），抽取事实在后台完成；
   wait=True 时同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件；一段对话分多次写入时用
   run() 包起来，结束时整段只抽取一次；
@@ -30,12 +33,14 @@ import asyncio
 import base64
 import binascii
 import functools
+import json
 import logging
 import tempfile
 import threading
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal
@@ -44,15 +49,24 @@ import httpx2
 
 from cuemem.config import Settings, load_settings
 from cuemem.core.ids import sortable_session_id, stable_id
-from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
-from cuemem.core.timeutil import naive_local
+from cuemem.core.models import (
+    Answer,
+    CoreMemory,
+    Fact,
+    FactHit,
+    Hit,
+    MediaItem,
+    SessionIn,
+    TurnIn,
+    TurnMeta,
+)
+from cuemem.core.timeutil import expiry_instant, naive_local, normalize_expiry
 from cuemem.core.types import PeakPolicy, Router
 from cuemem.errors import ConcurrentWriteError
 
 # 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
 if TYPE_CHECKING:
     from cuemem.memory import ForgetReport, MemorySystem, Recall
-    from cuemem.store.sqlite import MemoryDB
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +201,8 @@ class Memory:
         user_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        expiration_date: date | datetime | str | None = None,
         timestamp: datetime | str | float | None = None,
         infer: bool = True,
         wait: bool = False,
@@ -197,6 +213,11 @@ class Memory:
         run_id：写进同一个会话（一次对话），不填时这次 add 自成一个会话。每轮 add 一次同一个
         run_id 时，每次都把整段对话重新抽取一遍（巩固过的会话又长了还要重放派生记忆）：一段
         对话分多次写入时用 run()（或 open_run / end_run）包起来，结束时只抽取一次。
+        metadata：JSON 对象，记在这次写入的每句发言上（不进抽取，不改变抽取的请求）；由它们
+        抽出的事实、对话片段在结果里带上 metadata，search / get_all 的 filters 可以按它筛。
+        expiration_date：过期时间（Mem0 的写法）。只给日期时到那天结束为止；过期之后 search、
+        get_all 与画像里不再出现，get / history 照样取得到。同一件事后来又说过一次、没给过期
+        时间，它就不过期。
         infer=False：只写原始日志、不抽取事实（之后调用 consolidate）。
         wait=True：同步抽取，返回新增与取代的事实（Mem0 的 ADD / UPDATE 事件）；run 进行中时
         不能用（这段对话结束时才抽取），会报 ValueError。
@@ -207,6 +228,7 @@ class Memory:
                 f"Run {run_id!r} is still open: its memories are extracted when it ends. "
                 "Add without wait=True, then call end_run(..., wait=True)."
             )
+        info = _turn_meta(metadata, expiration_date)
         # 缺省时间不截到秒：同一秒里的几次 add 也分得出先后（巩固按开始时间排序对账）
         when = _as_datetime(timestamp) or datetime.now()
         turns, temporary = parse_messages(messages, when)
@@ -226,6 +248,7 @@ class Memory:
                     SessionIn(session_id=sid, started_at=started, turns=turns),
                     first,
                     enqueue=infer,
+                    meta=[info] * len(turns) if info is not None else None,
                 )
                 self.system.db.set_meta(_idx_key(space, sid), str(first + len(turns)))
             if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
@@ -242,7 +265,7 @@ class Memory:
             out["status"] = "logged"
         elif wait:
             report = self.system.consolidate(space)
-            out["results"] = _events(self.system.db, space, before, user_id, agent_id)
+            out["results"] = _events(self.system, space, before, user_id, agent_id)
             out["status"] = "consolidated"
             out["consolidation"] = report.as_dict()
         else:
@@ -339,10 +362,11 @@ class Memory:
         说明它为什么这么选；L0 表示这句话不需要回忆，只返回画像。limit 截断结果条数。
 
         filters={"user_id": …, "agent_id": …, "run_id": …} 与 top_k 是 Mem0 v3 的写法，与
-        user_id、limit 等价。run_id：只要这个会话里的事实、对话片段与图片。检索照常在整个空间里
-        做（控制器与 L1 / L2 不变），再按会话筛，所以结果可能少于 limit；画像是整个空间的。
+        user_id、limit 等价。run_id：只要这个会话里的事实、对话片段与图片。filters 里的其他键是
+        metadata 的条件（见 _check_where）。检索照常在整个空间里做（控制器与 L1 / L2 不变），
+        再按会话、条件与过期时间筛，所以结果可能少于 limit；画像是整个空间的（去掉过期的事实）。
         """
-        user_id, agent_id, run_id = _scope(user_id, agent_id, run_id, filters)
+        user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit or top_k
         space = space_for(user_id, agent_id)
         if not self.system.db.get_sessions(space):
@@ -350,7 +374,8 @@ class Memory:
         recall = self.system.retrieve(
             space, query, question_time=at, mode=mode, router=router, lam=lam
         )
-        return _recall_out(recall, user_id, agent_id, limit, run_id=run_id)
+        select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
+        return _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
 
     def answer(
         self,
@@ -384,21 +409,30 @@ class Memory:
         top_k: int | None = None,
     ) -> dict[str, Any]:
         """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at="2025-06" 是那时
-        现实中成立的事实，known_at 是系统在那一刻相信的事实。run_id：只要这个会话里记下的事实。"""
-        user_id, agent_id, run_id = _scope(user_id, agent_id, run_id, filters)
+        现实中成立的事实，known_at 是系统在那一刻相信的事实。run_id：只要这个会话里记下的事实；
+        filters 里的其他键是 metadata 的条件（同 search）。过期的事实不给。"""
+        user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit or top_k
         space = space_for(user_id, agent_id)
         current = not include_superseded and valid_at is None and known_at is None
         facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
-        if run_id is not None:
-            facts = [f for f in facts if f.session_id == run_id]
-        items = [_fact_item(f, None, user_id, agent_id) for f in facts]
+        sources = _Sources.load(self.system, space, [t for f in facts for t in f.source_turn_ids])
+        select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
+        items = [
+            _fact_item(f, None, user_id, agent_id, sources)
+            for f in facts
+            if select.keep(f.session_id, f.source_turn_ids, sources)
+        ]
         return {"results": items[:limit] if limit else items}
 
     def get(self, memory_id: str) -> dict[str, Any] | None:
-        """按 ID 取一条事实（不用给 user_id：ID 里已经带着空间）。"""
+        """按 ID 取一条事实（不用给 user_id：ID 里已经带着空间）。过期的也取得到。"""
         found = self._find(memory_id)
-        return _fact_item(found[1], None, None, None, space=found[0]) if found else None
+        if found is None:
+            return None
+        space, fact = found
+        sources = _Sources.load(self.system, space, fact.source_turn_ids)
+        return _fact_item(fact, None, None, None, sources, space=space)
 
     def history(self, memory_id: str) -> list[dict[str, Any]]:
         """一条事实的版本链，从最早到最新：每个版本何时记下、何时因为什么被取代。"""
@@ -418,9 +452,10 @@ class Memory:
                 break
             newer = nxt[0]
             chain.append(newer)
+        sources = _Sources.load(self.system, space, [t for f in chain for t in f.source_turn_ids])
         events = []
         for version in sorted(chain, key=lambda f: (f.recorded_at, f.id)):
-            item = _fact_item(version, None, None, None, space=space)
+            item = _fact_item(version, None, None, None, sources, space=space)
             item["event"] = (
                 "ADD" if not any(f.superseded_by == version.id for f in chain) else "UPDATE"
             )
@@ -428,9 +463,9 @@ class Memory:
         return events
 
     def profile(self, *, user_id: str | None = None, agent_id: str | None = None) -> str:
-        """用户画像（核心记忆）：重要且当前有效的事实，适合常驻在系统提示里。"""
-        core = self.system.core_memory(space_for(user_id, agent_id))
-        return core.text if core is not None else ""
+        """用户画像（核心记忆）：重要且当前有效的事实，适合常驻在系统提示里。过期的事实不给。"""
+        space = space_for(user_id, agent_id)
+        return _profile(self.system, space, self.system.core_memory(space), datetime.now())
 
     # ---------- 遗忘 ----------
 
@@ -660,25 +695,218 @@ def _image_file(url: str) -> tuple[Path, bool]:
     return path, False
 
 
+def _turn_meta(
+    metadata: Mapping[str, Any] | None, expiration_date: date | datetime | str | None
+) -> TurnMeta | None:
+    """add 的 metadata 与 expiration_date → 每句发言的附加信息；都没给时是 None（不写附加信息）。
+    metadata 要能写成 JSON（导出、HTTP 接口都要用），按 JSON 往返一遍再存。"""
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise TypeError("metadata must be a dict.")
+    if any(not isinstance(key, str) for key in (metadata or {})):
+        raise ValueError("metadata keys must be strings.")
+    try:
+        meta = json.loads(json.dumps(dict(metadata or {}), allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
+    expires = normalize_expiry(expiration_date)
+    return TurnMeta(metadata=meta, expires_at=expires) if meta or expires else None
+
+
+_SCOPE_KEYS = ("user_id", "agent_id", "run_id")
+_OPERATORS = ("eq", "ne", "gt", "gte", "lt", "lte", "in", "nin", "contains", "icontains")
+_LOGIC = ("AND", "OR", "NOT")
+
+
 def _scope(
     user_id: str | None,
     agent_id: str | None,
     run_id: str | None,
     filters: Mapping[str, Any] | None,
-) -> tuple[str | None, str | None, str | None]:
-    """Mem0 v3 把 user_id、agent_id、run_id 放在 filters 里；两种写法都认。"""
+) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
+    """Mem0 v3 把 user_id、agent_id、run_id 放在 filters 里；两种写法都认。返回（user_id，
+    agent_id，run_id，metadata 的条件）。filters 里别的键都是 metadata 的条件（见 _check_where）；
+    run_id 写成条件（{"run_id": {"in": [...]}}）时也按条件筛，user_id、agent_id 只能是一个 ID：
+    它们决定在哪个记忆空间里找。"""
     if not filters:
-        return user_id, agent_id, run_id
-    unknown = set(filters) - {"user_id", "agent_id", "run_id"}
-    if unknown:
-        raise ValueError(
-            f"Unsupported filters: {sorted(unknown)}. "
-            "Memories are scoped by user_id, agent_id and run_id."
-        )
+        return user_id, agent_id, run_id, None
+    where = {k: v for k, v in filters.items() if k not in _SCOPE_KEYS}
+    for key in ("user_id", "agent_id"):
+        if filters.get(key) is not None and not isinstance(filters[key], str):
+            raise ValueError(
+                f"filters[{key!r}] must be a single id: memories are kept per user and per agent."
+            )
+    scoped_run = filters.get("run_id")
+    if scoped_run is not None and not isinstance(scoped_run, str):
+        where["run_id"] = scoped_run
+        scoped_run = None
+    _check_where(where)
     return (
-        filters.get("user_id", user_id),
-        filters.get("agent_id", agent_id),
-        filters.get("run_id", run_id),
+        filters.get("user_id") or user_id,
+        filters.get("agent_id") or agent_id,
+        scoped_run or run_id,
+        where or None,
+    )
+
+
+def _check_where(where: Mapping[str, Any]) -> None:
+    """检查 metadata 的条件（Mem0 的 filters 写法），写错时报 ValueError，而不是悄悄什么都不给：
+
+    - {"key": value}：等于；{"key": "*"}：有这个键；几个键并列时都要满足；
+    - {"key": {"eq" | "ne" | "gt" | "gte" | "lt" | "lte": v, "in" | "nin": [...],
+      "contains" | "icontains": v}}：几个运算并列时都要满足；没有这个键时只有 ne、nin 成立；
+    - {"AND": [条件, ...]}、{"OR": [...]}、{"NOT": [...]}（NOT：一个都不满足）。
+
+    条件里的 user_id、agent_id、run_id 指记忆所在的空间与会话，其余的键指 metadata。"""
+    for key, cond in where.items():
+        if key in _LOGIC:
+            if isinstance(cond, str | bytes | Mapping) or not isinstance(cond, Sequence):
+                raise ValueError(f"filters[{key!r}] must be a list of conditions.")
+            for item in cond:
+                if not isinstance(item, Mapping):
+                    raise ValueError(f"filters[{key!r}] must be a list of conditions.")
+                _check_where(item)
+        elif isinstance(cond, Mapping):
+            unknown = sorted(set(cond) - set(_OPERATORS))
+            if unknown or not cond:
+                raise ValueError(
+                    f"Unsupported filter operators for {key!r}: {unknown}. "
+                    f"Use {', '.join(_OPERATORS)}."
+                )
+            for op in ("in", "nin"):
+                if op in cond and (
+                    isinstance(cond[op], str | bytes | Mapping)
+                    or not isinstance(cond[op], Sequence)
+                ):
+                    raise ValueError(f"filters[{key!r}][{op!r}] must be a list.")
+
+
+def _matches(where: Mapping[str, Any], record: Mapping[str, Any]) -> bool:
+    return all(_match(key, cond, record) for key, cond in where.items())
+
+
+def _match(key: str, cond: Any, record: Mapping[str, Any]) -> bool:
+    if key == "AND":
+        return all(_matches(c, record) for c in cond)
+    if key == "OR":
+        return any(_matches(c, record) for c in cond)
+    if key == "NOT":
+        return not any(_matches(c, record) for c in cond)
+    present, value = key in record, record.get(key)
+    if not isinstance(cond, Mapping):
+        return present and (cond == "*" or value == cond)
+    return all(_compare(op, present, value, arg) for op, arg in cond.items())
+
+
+def _compare(op: str, present: bool, value: Any, arg: Any) -> bool:
+    if op == "ne":
+        return not present or value != arg
+    if op == "nin":
+        return not present or value not in arg
+    if not present:
+        return False
+    if op == "eq":
+        return bool(value == arg)
+    if op == "in":
+        return value in arg
+    if op in ("contains", "icontains"):
+        fold = (lambda s: s.casefold()) if op == "icontains" else (lambda s: s)
+        if isinstance(value, str) and isinstance(arg, str):
+            return fold(arg) in fold(value)
+        if isinstance(value, list):  # 列表里有这一项
+            return any(
+                fold(v) == fold(arg) if isinstance(v, str) and isinstance(arg, str) else v == arg
+                for v in value
+            )
+        return False
+    try:
+        if op == "gt":
+            return bool(value > arg)
+        if op == "gte":
+            return bool(value >= arg)
+        if op == "lt":
+            return bool(value < arg)
+        return bool(value <= arg)
+    except TypeError:  # 类型不能比较（数字与字符串）：不算满足
+        return False
+
+
+def _scope_record(user_id: str | None, agent_id: str | None) -> dict[str, str]:
+    """条件里也可以写 user_id、agent_id（Mem0 的 AND 里常这样写）：每条记忆都带着它们。"""
+    return {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id)) if v is not None}
+
+
+@dataclass
+class _Sources:
+    """一批记忆出处各句的附加信息（turn_meta）。事实与对话片段的 metadata 是出处各句的并集
+    （同一个键取后面那句的）；过期时间取出处里最晚的，有一句没给过期时间就不过期：同一件事
+    后来又说过一次、没说什么时候过期，它就一直有效。"""
+
+    meta: Mapping[str, TurnMeta]
+
+    @classmethod
+    def load(cls, system: MemorySystem, space: str, turn_ids: Iterable[str]) -> _Sources:
+        ids = list(dict.fromkeys(turn_ids))
+        return cls(system.db.get_turn_meta(space, ids) if ids else {})
+
+    def metadata(self, turn_ids: Sequence[str]) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        for turn_id in turn_ids:
+            info = self.meta.get(turn_id)
+            if info is not None:
+                merged.update(info.metadata)
+        return merged
+
+    def expires(self, turn_ids: Sequence[str]) -> str | None:
+        stamps: list[str] = []
+        for turn_id in turn_ids:
+            info = self.meta.get(turn_id)
+            if info is None or info.expires_at is None:
+                return None
+            stamps.append(info.expires_at)
+        return max(stamps, key=expiry_instant) if stamps else None
+
+    def expired(self, turn_ids: Sequence[str], now: datetime) -> bool:
+        stamp = self.expires(turn_ids)
+        return stamp is not None and expiry_instant(stamp) <= now
+
+
+@dataclass
+class _Select:
+    """search / get_all 的事后筛选：会话（run_id）、metadata 的条件与过期时间。"""
+
+    run_id: str | None
+    where: Mapping[str, Any] | None
+    scope: Mapping[str, str]
+    now: datetime
+
+    def keep(self, session_id: str | None, turn_ids: Sequence[str], sources: _Sources) -> bool:
+        if self.run_id is not None and session_id != self.run_id:
+            return False
+        if sources.expired(turn_ids, self.now):
+            return False
+        if not self.where:
+            return True
+        record = {**sources.metadata(turn_ids), **self.scope}
+        if session_id is not None:
+            record["run_id"] = session_id
+        return _matches(self.where, record)
+
+
+def _profile(system: MemorySystem, space: str, core: CoreMemory | None, now: datetime) -> str:
+    """画像去掉已经过期的事实。画像是事实表的物化视图（write/profile.py）：每条事实一行
+    "- 陈述"，多人时前面有一行人名；某人名下的事实都过期了，人名那一行也去掉。"""
+    if core is None:
+        return ""
+    facts = system.db.get_facts(space, ids=core.fact_ids)
+    sources = _Sources.load(system, space, [t for f in facts for t in f.source_turn_ids])
+    gone = {f"- {f.statement}" for f in facts if sources.expired(f.source_turn_ids, now)}
+    if not gone:
+        return core.text
+    lines = [line for line in core.text.split("\n") if line not in gone]
+    return "\n".join(
+        line
+        for i, line in enumerate(lines)
+        if line.startswith("- ") or (i + 1 < len(lines) and lines[i + 1].startswith("- "))
     )
 
 
@@ -706,6 +934,7 @@ def _fact_item(
     score: float | None,
     user_id: str | None,
     agent_id: str | None,
+    sources: _Sources,
     *,
     space: str | None = None,
 ) -> dict[str, Any]:
@@ -728,6 +957,8 @@ def _fact_item(
         "superseded_by": fact.superseded_by,
         "session_id": fact.session_id,
         "source_turn_ids": fact.source_turn_ids,
+        "metadata": sources.metadata(fact.source_turn_ids),
+        "expiration_date": sources.expires(fact.source_turn_ids),
     }
     if score is not None:
         item["score"] = round(score, 4)
@@ -740,7 +971,7 @@ def _fact_item(
     return item
 
 
-def _excerpt_item(hit: Hit) -> dict[str, Any]:
+def _excerpt_item(hit: Hit, sources: _Sources) -> dict[str, Any]:
     return {
         "id": hit.unit.id,
         "memory": hit.unit.text,
@@ -749,10 +980,12 @@ def _excerpt_item(hit: Hit) -> dict[str, Any]:
         "created_at": hit.unit.ts.isoformat(),
         "session_id": hit.unit.session_id,
         "source_turn_ids": hit.unit.source_turn_ids,
+        "metadata": sources.metadata(hit.unit.source_turn_ids),
+        "expiration_date": sources.expires(hit.unit.source_turn_ids),
     }
 
 
-def _image_item(item: MediaItem, attached: bool) -> dict[str, Any]:
+def _image_item(item: MediaItem, attached: bool, sources: _Sources) -> dict[str, Any]:
     return {
         "id": item.id,
         "memory": item.caption,
@@ -760,34 +993,52 @@ def _image_item(item: MediaItem, attached: bool) -> dict[str, Any]:
         "path": item.path,
         "created_at": item.ts.isoformat(),
         "attached": attached,
+        "metadata": sources.metadata([item.source_turn_id]),
+        "expiration_date": sources.expires([item.source_turn_id]),
     }
 
 
 def _recall_out(
+    system: MemorySystem,
+    space: str,
     recall: Recall,
     user_id: str | None,
     agent_id: str | None,
     limit: int | None,
-    *,
-    run_id: str | None = None,
+    select: _Select,
 ) -> dict[str, Any]:
+    """检索结果 → SDK 的返回值。检索本身不分会话、不看 metadata 与过期时间，在这里事后筛。"""
     from cuemem.read.controller import english_reason
 
     view = recall.view
-    facts: list[FactHit] = view.facts
-    rounds, media = view.rounds, list(view.media.values())
-    if run_id is not None:  # 只要这个会话的：检索本身不分会话，在这里事后筛
-        facts = [fh for fh in facts if fh.fact.session_id == run_id]
-        rounds = [h for h in rounds if h.unit.session_id == run_id]
-        kept = {m for h in rounds for m in h.unit.meta.get("media_ids", [])}
-        media = [m for m in media if m.id in kept]  # 图片来自装入的轮（l1.collect_media）
-    items = [_fact_item(fh.fact, fh.score, user_id, agent_id) for fh in facts]
-    items += [_excerpt_item(h) for h in sorted(rounds, key=lambda h: -h.score)]
+    media = list(view.media.values())
+    sources = _Sources.load(
+        system,
+        space,
+        [
+            *(t for fh in view.facts for t in fh.fact.source_turn_ids),
+            *(t for h in view.rounds for t in h.unit.source_turn_ids),
+            *(m.source_turn_id for m in media),
+        ],
+    )
+    facts: list[FactHit] = [
+        fh for fh in view.facts if select.keep(fh.fact.session_id, fh.fact.source_turn_ids, sources)
+    ]
+    rounds = [
+        h for h in view.rounds if select.keep(h.unit.session_id, h.unit.source_turn_ids, sources)
+    ]
+    # 图片来自装入的轮（l1.collect_media）：会话按它所在的那一轮算
+    session_of = {
+        m: h.unit.session_id for h in view.rounds for m in h.unit.meta.get("media_ids", [])
+    }
+    media = [m for m in media if select.keep(session_of.get(m.id), [m.source_turn_id], sources)]
+    items = [_fact_item(fh.fact, fh.score, user_id, agent_id, sources) for fh in facts]
+    items += [_excerpt_item(h, sources) for h in sorted(rounds, key=lambda h: -h.score)]
     decision = recall.decision
     return {
         "results": items[:limit] if limit else items,
-        "images": [_image_item(m, m.id in view.attach) for m in media],
-        "profile": view.core.text if view.core is not None else "",
+        "images": [_image_item(m, m.id in view.attach, sources) for m in media],
+        "profile": _profile(system, space, view.core, select.now),
         "level": recall.level.upper(),
         "see": bool(decision and decision.see),
         "reasons": [english_reason(r) for r in decision.reasons] if decision else [],
@@ -830,7 +1081,7 @@ def _answer_out(answer: Answer) -> dict[str, Any]:
 
 
 def _events(
-    db: MemoryDB,
+    system: MemorySystem,
     space: str,
     before: Mapping[str, tuple[bool, str | None]],
     user_id: str | None,
@@ -839,6 +1090,7 @@ def _events(
     """抽取前后的事实对比 → Mem0 风格的事件：新事实 ADD；取代了旧事实的新事实 UPDATE，
     附上被取代的旧版本（旧版本仍留在版本链里，不会被删除）。before 是抽取前的
     MemoryDB.fact_links：只读出新的事实与这次被取代的事实（顺序同 get_facts）。"""
+    db = system.db
     wanted = [
         fid
         for fid, (_, superseded_by) in db.fact_links(space).items()
@@ -847,6 +1099,8 @@ def _events(
     after = [
         f for i in range(0, len(wanted), 500) for f in db.get_facts(space, ids=wanted[i : i + 500])
     ]
+    fresh = [t for f in after if f.id not in before for t in f.source_turn_ids]
+    sources = _Sources.load(system, space, fresh)
     replaced: dict[str, list[Fact]] = {}
     for fact in after:
         old = before.get(fact.id)
@@ -856,7 +1110,7 @@ def _events(
     for fact in after:
         if fact.id in before:
             continue
-        item = _fact_item(fact, None, user_id, agent_id)
+        item = _fact_item(fact, None, user_id, agent_id, sources)
         previous = replaced.get(fact.id, [])
         item["event"] = "UPDATE" if previous else "ADD"
         if previous:

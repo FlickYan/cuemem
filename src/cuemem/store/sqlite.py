@@ -21,15 +21,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
+from cuemem.core.models import (
+    CoreMemory,
+    Entity,
+    Episode,
+    Fact,
+    MediaItem,
+    MemoryUnit,
+    Turn,
+    TurnMeta,
+)
 from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConfigMismatchError
 
 logger = logging.getLogger(__name__)
 
 # v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
-# v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）
-SCHEMA_VERSION = 5
+# v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
+# v6：turn_meta（SDK 写入时附带的 metadata、过期时间与 update 的更正目标）。新表都用
+# CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上
+SCHEMA_VERSION = 6
 
 # 新增的索引不用升版本：每次打开都执行 _SCHEMA，已有的库自动补上。facts 的
 # (space_id, superseded_by) 与 (space_id, invalidated_at) 每次读取都用得到：沿版本链找被取代的
@@ -152,6 +163,14 @@ CREATE TABLE IF NOT EXISTS provenance (
     turn_id TEXT NOT NULL,
     target TEXT NOT NULL,
     PRIMARY KEY (space_id, turn_id, target)
+);
+CREATE TABLE IF NOT EXISTS turn_meta (
+    space_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    expires_at TEXT,
+    edit_of TEXT,
+    PRIMARY KEY (space_id, turn_id)
 );
 CREATE INDEX IF NOT EXISTS idx_provenance_target ON provenance (space_id, target);
 CREATE INDEX IF NOT EXISTS idx_turns_space ON turns (space_id, session_id, idx);
@@ -352,8 +371,13 @@ class MemoryDB:
             ).fetchall()
         return [r[0] for r in rows]
 
-    def add_turns(self, turns: Sequence[Turn]) -> int:
-        """写入原始轮次，返回实际新增的条数。"""
+    def add_turns(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta] | None = None) -> int:
+        """写入原始轮次，返回实际新增的条数。
+
+        meta：轮 ID → 附加信息（SDK 的 metadata 与过期时间），在同一个事务里写，只给这次真正
+        写进去的发言写：已有的发言（重复导入、撞号）不会被换上别人的附加信息。"""
+        if meta:
+            return self._add_turns_with_meta(turns, meta)
         rows = [
             (
                 t.id,
@@ -378,6 +402,66 @@ class MemoryDB:
             for key in {(t.space_id, t.session_id) for t in turns}:
                 self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
             return max(cursor.rowcount, 0)
+
+    def _add_turns_with_meta(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta]) -> int:
+        added = 0
+        with self.transaction() as conn:
+            for t in turns:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO turns"
+                    " (id, space_id, session_id, idx, role, text, ts, media_ids, speaker)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        t.id,
+                        t.space_id,
+                        t.session_id,
+                        t.idx,
+                        t.role,
+                        t.text,
+                        t.ts.isoformat(),
+                        json.dumps(t.media_ids),
+                        t.speaker,
+                    ),
+                )
+                if cursor.rowcount <= 0:
+                    continue
+                added += 1
+                info = meta.get(t.id)
+                if info is not None:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO turn_meta"
+                        " (space_id, turn_id, metadata, expires_at, edit_of)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            t.space_id,
+                            t.id,
+                            json.dumps(info.metadata, ensure_ascii=False),
+                            info.expires_at,
+                            info.edit_of,
+                        ),
+                    )
+        return added
+
+    def get_turn_meta(
+        self, space_id: str, turn_ids: Sequence[str] | None = None
+    ) -> dict[str, TurnMeta]:
+        """轮 ID → 附加信息；没有附加信息的发言不在结果里。turn_ids 为 None 时取整个空间的。"""
+        sql = "SELECT turn_id, metadata, expires_at, edit_of FROM turn_meta WHERE space_id = ?"
+        chunks: list[list[str] | None] = [None]
+        if turn_ids is not None:
+            unique = list(dict.fromkeys(turn_ids))
+            chunks = [unique[i : i + 500] for i in range(0, len(unique), 500)]
+        out: dict[str, TurnMeta] = {}
+        for chunk in chunks:
+            query, args = sql, [space_id]
+            if chunk is not None:
+                query += f" AND turn_id IN ({', '.join('?' * len(chunk))})"
+                args += chunk
+            with self._lock:
+                fetched = self._conn.execute(query, args).fetchall()
+            for r in fetched:
+                out[r[0]] = TurnMeta(metadata=json.loads(r[1]), expires_at=r[2], edit_of=r[3])
+        return out
 
     def get_turns(
         self,
@@ -430,6 +514,12 @@ class MemoryDB:
             )
             conn.execute(
                 "DELETE FROM provenance WHERE space_id = ? AND turn_id NOT IN"
+                " (SELECT id FROM turns WHERE space_id = ?)",
+                (space_id, space_id),
+            )
+            # 附加信息（metadata 里也可能有个人信息）随发言一起删
+            conn.execute(
+                "DELETE FROM turn_meta WHERE space_id = ? AND turn_id NOT IN"
                 " (SELECT id FROM turns WHERE space_id = ?)",
                 (space_id, space_id),
             )
@@ -1021,7 +1111,8 @@ class MemoryDB:
         with self.transaction() as conn:
             self._bump([space_id])
             self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
-            for table in ("units", "turns", "sessions", "media", "provenance", *DERIVED_TABLES):
+            raw = ("units", "turns", "sessions", "media", "provenance", "turn_meta")
+            for table in (*raw, *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))
 
