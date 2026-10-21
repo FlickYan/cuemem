@@ -523,12 +523,15 @@ class MemorySystem:
         with self._gates_guard:
             return self._gates.setdefault(space_id, _ReadGate())
 
-    def adopt_open(self, space_id: str, keep: Collection[str] = ()) -> int:
+    def adopt_open(self, space_id: str, keep: Collection[str] = (), *, start: bool = True) -> int:
         """接手之前的进程留下的进行中的会话：进程崩溃（没来得及 close_session）时，它们没有
         登记巩固任务，也没人再结束它们。数据库里有标记、本进程里却不在进行中的会话（keep 除外：
         调用方马上要接着写），登记任务、交给后台线程，去掉标记。返回接手的会话数。
+        start=False：没有后台线程时只登记、不为此启动它（SDK 的 background=False）。
 
-        只认标记，不碰没有任务的其他会话：SDK 的 infer=False 写入的会话本来就不该抽取。"""
+        只认标记，不碰没有任务的其他会话：SDK 的 infer=False 写入的会话本来就不该抽取。
+        记忆代理、SDK 与 HTTP 服务第一次碰到一个空间时各调用一次（同一个数据库同时只有一个
+        进程在写时，本进程里不在进行中的就是崩溃留下的）。"""
         prefix = _open_mark(space_id)
         with self._open_lock:
             live = {sid for space, sid in self._open if space == space_id} | set(keep)
@@ -539,7 +542,8 @@ class MemorySystem:
             self.consolidator.enqueue(space_id, leftover)
             for sid in leftover:
                 self.db.delete_meta(_open_mark(space_id, sid))
-        self.start_worker().submit(space_id)
+        if start or self.worker is not None:
+            self.start_worker().submit(space_id)
         return len(leftover)
 
     def consolidate(

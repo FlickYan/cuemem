@@ -616,6 +616,42 @@ def test_close_ends_open_runs(
         assert ended["turns"] == 1 and ended["consolidation"]["sessions"] == 0
 
 
+@pytest.mark.parametrize("first", ["add", "open_run"])
+def test_runs_left_open_by_a_crash_are_adopted(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, first: str
+) -> None:
+    """进程崩溃时还开着的 run（没有 end_run、没有 close()）：下一个进程第一次碰到这个用户时
+    交给抽取，标记随之去掉。用同一个 run_id 再 open_run 的那段接着写，不接手；infer=False
+    写入的会话照样不抽取。"""
+    fake_api.chat_replies = [model]
+    crashed = Memory(n3_settings, http_client=fake_api.client(), background=False)
+    left = crashed.open_run(user_id="alice")
+    crashed.add("I live in Berlin", user_id="alice", run_id=left)
+    crashed.open_run("again", user_id="alice")
+    crashed.add("I like jazz", user_id="alice", run_id="again")
+    crashed.add("I like tea", user_id="alice", infer=False)
+    crashed.system.close()  # 进程被杀：Memory.close() 没来得及结束这两个 run
+
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        if first == "add":
+            memory.add("I like hiking", user_id="alice", timestamp=datetime(2030, 1, 1))
+        else:
+            assert memory.open_run("again", user_id="alice") == "again"
+        memory.wait()
+        jobs = {j["session_id"]: j["status"] for j in memory.system.db.get_jobs("alice")}
+        facts = {f["memory"] for f in memory.get_all(user_id="alice")["results"]}
+        assert "The user lives in Berlin." in facts
+        if first == "add":  # 没有重新打开的 run 一起接手
+            assert set(jobs.values()) == {"done"} and len(jobs) == 3 and "again" in jobs
+        else:
+            assert jobs == {left: "done"}
+            assert memory.system.open_sessions("alice") == {"again"}
+            memory.end_run("again", user_id="alice", wait=True)
+            assert "I like jazz" in str(memory.get_all(user_id="alice")["results"])
+        assert not any("tea" in f for f in facts)
+        assert memory.system.adopt_open("alice") == 0  # 接手过的标记都去掉了
+
+
 def test_background_extraction(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:

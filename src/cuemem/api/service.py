@@ -54,6 +54,7 @@ class ChatService:
         self.catalog = catalog
         self.default_space = default_space
         self.sessions: dict[str, ChatSession] = {}
+        self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间（见 start）
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的巩固在后台完成
 
@@ -98,7 +99,13 @@ class ChatService:
         at: datetime | None = None,
         session_id: str | None = None,
     ) -> ChatSession:
-        session = self.agent.start(space_id or self.default_space, at=at, session_id=session_id)
+        space = space_id or self.default_space
+        with self._lock:
+            first = space not in self._adopted
+            self._adopted.add(space)
+        if first:  # 之前的进程崩溃时还在进行中的会话交给抽取；接着写的那个会话除外
+            self.system.adopt_open(space, keep=[session_id] if session_id else [])
+        session = self.agent.start(space, at=at, session_id=session_id)
         with self._lock:
             self.sessions[session.session_id] = session
         return session

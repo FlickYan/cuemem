@@ -142,6 +142,7 @@ class Memory:
             settings, http_client=http_client, on_peak_wait=_log_peak_wait
         )
         self._runs: set[tuple[str, str]] = set()  # open_run 开始、还没结束的（空间，run_id）
+        self._adopted: set[str] = set()  # 接手过崩溃前留下的 run 的空间（见 _adopt）
         self._runs_lock = threading.Lock()
         if background:
             self.system.start_worker()
@@ -159,8 +160,20 @@ class Memory:
         memory.settings = system.settings
         memory.system = system
         memory._runs = set()
+        memory._adopted = set()
         memory._runs_lock = threading.Lock()
         return memory
+
+    def _adopt(self, space: str, keep: Sequence[str] = ()) -> None:
+        """这个对象第一次碰到这个空间：之前的进程崩溃时还开着的 run（open_run 了、没来得及
+        end_run 或 close()），以及 Agent 与记忆代理的会话，没有抽取任务、也没人再结束它们，
+        交给抽取（MemorySystem.adopt_open；没有后台线程时只登记，下次 consolidate 时完成）。
+        keep：调用方马上要接着写的 run（open_run 重新打开它）。"""
+        with self._runs_lock:
+            if space in self._adopted:
+                return
+            self._adopted.add(space)
+        self.system.adopt_open(space, keep=keep, start=False)
 
     # ---------- 写入 ----------
 
@@ -197,6 +210,7 @@ class Memory:
         try:
             if not turns:
                 return {"results": [], "session_id": None, "turn_ids": [], "status": "empty"}
+            self._adopt(space)  # 没有重新 open_run 的 run_id 就是一个普通的会话，一起接手
             sid = run_id or sortable_session_id("add", when)
             before = {f.id: f for f in self.system.db.get_facts(space)} if wait else {}
             # 发言序号在会话锁里分配、写完再放：同一个 run_id 的并发 add 不会撞号
@@ -235,9 +249,13 @@ class Memory:
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
     ) -> str:
         """开始一段对话（run）：之后 add(run_id=...) 照常在线写入、立即可检索，但不抽取事实，
-        end_run 时整段只抽取一次。返回 run_id（不给时生成一个）。"""
+        end_run 时整段只抽取一次。返回 run_id（不给时生成一个）。
+
+        进程崩溃时还开着的 run 由下一个进程第一次碰到这个用户时交给抽取（见 _adopt）；用同一个
+        run_id 再 open_run 就是接着这段对话写，它不被接手。"""
         space = space_for(user_id, agent_id)
         rid = run_id or sortable_session_id("run", datetime.now())
+        self._adopt(space, keep=[rid])
         self.system.open_session(space, rid)
         with self._runs_lock:
             self._runs.add((space, rid))

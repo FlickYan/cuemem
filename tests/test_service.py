@@ -253,6 +253,37 @@ def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
     assert live.window == []
 
 
+def test_sessions_left_open_by_a_crash_are_adopted(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """HTTP 与界面的会话在进程崩溃时还在进行中（没有结束、没有 service.close()）：下一个进程
+    第一次在这个空间开会话时交给抽取；接着写的那个会话（指定了 session_id）不接手。"""
+    fake_api.chat_replies = [model]
+
+    def open_service() -> ChatService:
+        system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+        return ChatService(system, Agent(system, router="rule"), default_space="shop")
+
+    crashed = open_service()
+    left = crashed.start("shop", at=DAY).session_id
+    crashed.chat(left, "I live in Berlin", mode="l0")
+    kept = crashed.start("shop", at=DAY, session_id="kept").session_id
+    crashed.chat(kept, "I like jazz", mode="l0")
+    crashed.system.close()  # 进程被杀：两个会话都没人结束
+
+    service = open_service()
+    try:
+        service.start("shop", session_id="kept")
+        assert service.system.worker is not None
+        service.system.worker.wait()
+        jobs = {j["session_id"]: j["status"] for j in service.system.db.get_jobs("shop")}
+        assert jobs == {left: "done"}
+        assert "I live in Berlin" in {f.statement for f in service.system.facts("shop")}
+        assert service.system.open_sessions("shop") == {"kept"}
+    finally:
+        service.close()
+
+
 def test_forget_keeps_other_sessions_reply_cache(
     service: ChatService, model: ScriptedModel
 ) -> None:
