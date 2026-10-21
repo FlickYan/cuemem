@@ -336,6 +336,69 @@ def test_missing_key_is_a_friendly_error_for_servers(
     assert calls == []
 
 
+def test_demo_fresh_waits_for_resumed_consolidation(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """上一次演示中途退出、留下待处理的任务：后台线程一启动就接着巩固这个空间。--fresh 等它做完
+    再清空，它不会在清空之后把事实与向量写回来。"""
+    import threading
+    from datetime import datetime
+
+    from fakes import FakeAPI
+    from scripted import ScriptedModel, echo_extraction
+
+    from cuemem import cli
+    from cuemem.core.models import SessionIn, TurnIn
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("CUEMEM_PATHS__MEDIA", str(tmp_path / "media"))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake-qwen")
+    entered, release = threading.Event(), threading.Event()
+    model = ScriptedModel(echo_extraction)
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "Berlin" in str(body["messages"]) and not release.is_set():
+            entered.set()
+            release.wait(10)  # 接着做的抽取还在路上
+        return model(body)
+
+    api = FakeAPI()
+    api.chat_replies = [reply]
+    with MemorySystem.from_settings(load_settings(), http_client=api.client()) as before:
+        session = SessionIn(
+            session_id="s1",
+            started_at=datetime(2026, 9, 1, 10),
+            turns=[TurnIn(role="user", text="I live in Berlin")],
+        )
+        before.append("cli-demo", session, 0)  # 登记了任务，没来得及巩固就退出了
+    original = MemorySystem.from_settings
+    monkeypatch.setattr(
+        cli.MemorySystem,
+        "from_settings",
+        lambda settings, **kwargs: original(settings, http_client=api.client()),
+    )
+    create = cli.ChatService.create
+
+    def resumed(settings: Any, **kwargs: Any) -> Any:
+        service = create(settings, **kwargs)
+        assert entered.wait(10)  # 后台线程正在巩固 cli-demo
+        threading.Timer(0.3, release.set).start()
+        return service
+
+    monkeypatch.setattr(cli.ChatService, "create", resumed)
+    script = tmp_path / "script.json"
+    script.write_text('{"space": "cli-demo", "sessions": []}', encoding="utf-8")
+    result = runner.invoke(app, ["demo", str(script), "--fresh", "--report", str(tmp_path / "r")])
+    assert result.exit_code == 0, result.output
+    with MemorySystem.from_settings(load_settings(), http_client=api.client()) as after:
+        assert after.db.get_facts("cli-demo") == []
+        assert after.vectors.unit_ids("cli-demo") == []
+        assert after.db.get_jobs("cli-demo") == []
+
+
 def test_demo_uses_the_catalog_next_to_its_script(
     clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

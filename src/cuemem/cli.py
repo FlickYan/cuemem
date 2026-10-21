@@ -729,8 +729,13 @@ def demo(
     )
     try:
         if fresh:
-            service.system.db.delete_space(space_id)
-            service.system.vectors.delete_space(space_id)
+            # 在巩固锁里清空：后台线程一启动就接着做上次中途退出时没做完的任务，可能正在巩固
+            # 这个空间，锁外清空的话它随后又把事实与向量写回来。不用 system.delete_space：
+            # 它连 LLM 缓存一起清，回放就不可复现了
+            system = service.system
+            with system.consolidator.exclusive(space_id):
+                system.db.delete_space(space_id)
+                system.vectors.delete_space(space_id)
             console.print(f"[dim]已清空记忆空间 {space_id}[/dim]")
 
         def show(result: TurnResult) -> None:
