@@ -321,6 +321,28 @@ def test_recall_listing_raised_from_l0_packs_the_probe(
     assert raised["facts"] == plain["facts"]
 
 
+@pytest.mark.parametrize("at", [ASKED, None])
+def test_sdk_search_raised_from_l0_packs_the_probe(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch, at: datetime | None
+) -> None:
+    """SDK 的 search（缺省不低于 L1）与 recall_listing 相同：控制器选了 L0 时直接打包探针的候选
+    （两次用同一个问题时间），结果与直接走 L1 相同。以前改走 L1 时把探针做过的检索再做一遍。"""
+    from cuemem.evidence import RAISED_REASON
+    from cuemem.sdk import Memory
+
+    system, _ = toy
+    memory = Memory.from_system(system)
+    question = "Max 喜欢吃什么？"
+    kinds = count_searches(system, monkeypatch)
+    raised = memory.search(question, user_id="demo", at=at, lam=1e9)
+    assert raised["level"] == "L1" and raised["reasons"] == [RAISED_REASON]
+    assert kinds == ["round", "fact", "summary"]
+    kinds.clear()
+    plain = memory.search(question, user_id="demo", at=at, mode="l1")
+    assert kinds == ["round", "fact"]
+    assert raised["results"] and raised["results"] == plain["results"]
+
+
 def test_planner_and_checker_failures_fall_back(toy: tuple[MemorySystem, ScriptedModel]) -> None:
     system, model = toy
     model.planner = lambda prompt: {"answer_type": ["not", "a", "string"], "exhaustive": "maybe"}

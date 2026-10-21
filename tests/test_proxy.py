@@ -27,6 +27,7 @@ from cuemem import Memory
 from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
+from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
 
 SYSTEM = {"role": "system", "content": "You are a helpful shopping assistant."}
@@ -698,6 +699,32 @@ def test_embeddings_pass_through_to_the_configured_embedder(
     ):
         refused = client.post("/v1/embeddings", json=bad)
         assert refused.status_code == 400 and refused.json()["error"]["param"], bad
+
+
+def test_embedding_errors_are_explained_like_the_rest(
+    client: TestClient, proxy: MemoryProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/v1/embeddings 的向量接口出错时，状态码与 HTTP 接口、对话转发的相同（api/failures.py）：
+    限流 429 与暂时不可用 503 带上游的 Retry-After，余额不足 402，超时 504，别的 502。以前除了
+    限流都是 502（余额不足、超时也一样），503 也不带 Retry-After。"""
+    timeout = EmbeddingAPIError("向量接口网络错误：timed out")
+    timeout.__cause__ = httpx2.ReadTimeout("timed out")
+    for error, status, retry in (
+        (EmbeddingAPIError("HTTP 429", status=429, retry_after="3"), 429, "3"),
+        (EmbeddingAPIError("HTTP 503", status=503, retry_after="9"), 503, "9"),
+        (EmbeddingAPIError("HTTP 402", status=402), 402, None),
+        (timeout, 504, None),
+        (EmbeddingAPIError("HTTP 500", status=500), 502, None),
+    ):
+
+        def failing(texts: Any, kind: str, error: Exception = error) -> Any:
+            raise error
+
+        monkeypatch.setattr(proxy._embedder, "embed", failing)
+        response = client.post("/v1/embeddings", json={"input": "x"})
+        assert response.status_code == status, response.text
+        assert response.headers.get("retry-after") == retry
+        assert str(error) in response.json()["error"]["message"]
 
 
 def test_responses_api_recalls_injects_and_writes_back(

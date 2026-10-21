@@ -21,7 +21,9 @@
 
 报错是英文的 {"error": {"code", "type", "message"}}：type 是 SDK 抛出的异常类型（KeyError、
 ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此抛出同样的异常。请求体不合
-格式（422）、令牌不对（401）在 /api/v1 下也写成这个形状（install_error_format）。
+格式（422）、令牌不对（401）在 /api/v1 下也写成这个形状（install_error_format）。模型与向量供应商
+出错时的状态码与 /api 相同（api/failures.py：限流 429 带 Retry-After、余额不足 402、超时 504……），
+code 是出错的类别（rate_limited、no_balance、timeout 等）。
 
 图片只收 data URL：服务器不读自己磁盘上的文件（与记忆代理相同），MemoryClient 把本地路径先读成
 data URL 再发；网络图片照 SDK 的规矩不下载。
@@ -46,6 +48,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cuemem.api.auth import Principal, principal_of
+from cuemem.api.failures import provider_failure
 from cuemem.errors import ConcurrentWriteError, CueMemError
 from cuemem.read.controller import Router
 from cuemem.sdk import AnswerMode, Memory, SearchMode, _scope, space_for
@@ -54,22 +57,36 @@ PREFIX = "/api/v1"
 _CODES = {
     400: "invalid_request",
     401: "unauthorized",
+    402: "no_balance",
     403: "forbidden",
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
     415: "unsupported_media_type",
     422: "invalid_request",
+    429: "rate_limited",
     502: "upstream_error",
+    503: "unavailable",
+    504: "timeout",
 }
 
 
 class V1Error(HTTPException):
-    """/api/v1 的出错：状态码、错误码与 SDK 的异常类型（MemoryClient 据此抛出同样的异常）。"""
+    """/api/v1 的出错：状态码、错误码与 SDK 的异常类型（MemoryClient 据此抛出同样的异常）。
+    code 不给时按状态码取（_CODES）；headers：例如限流时上游的 Retry-After。"""
 
-    def __init__(self, status: int, message: str, *, error_type: str | None = None) -> None:
-        super().__init__(status, message)
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        error_type: str | None = None,
+        code: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(status, message, headers=dict(headers) if headers else None)
         self.error_type = error_type
+        self.code = code
 
 
 class AddRequest(BaseModel):
@@ -143,7 +160,9 @@ class ImportRequest(BaseModel):
 @contextmanager
 def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
     """SDK 的异常 → /api/v1 的出错。KeyError 只在按 ID 找记忆的接口上算"没有这条"（404），
-    别处的 KeyError 是程序错误，照常 500。"""
+    别处的 KeyError 是程序错误，照常 500。模型与向量供应商的出错与 /api 相同（api/failures.py）：
+    限流 429 与暂时不可用 503 带上游的 Retry-After，余额不足 402，超时 504，内容审核拒绝 422，
+    别的 502；以前 openai 的异常是没有说明的 500，向量接口限流、内容审核拒绝都是 502。"""
     try:
         yield
     except KeyError as exc:
@@ -154,8 +173,19 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(400, str(exc), error_type=type(exc).__name__) from exc
     except ConcurrentWriteError as exc:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
-    except CueMemError as exc:
-        raise V1Error(502, str(exc), error_type=type(exc).__name__) from exc
+    except Exception as exc:
+        failure = provider_failure(exc)
+        if failure is not None:
+            raise V1Error(
+                failure.status,
+                failure.for_model(),
+                error_type=type(exc).__name__,
+                code=failure.kind,
+                headers={"Retry-After": failure.retry_after} if failure.retry_after else None,
+            ) from exc
+        if isinstance(exc, CueMemError):
+            raise V1Error(502, str(exc), error_type=type(exc).__name__) from exc
+        raise
 
 
 def _no_server_files(messages: str | dict[str, Any] | list[dict[str, Any]]) -> None:
@@ -437,7 +467,11 @@ def install_error_format(app: FastAPI) -> None:
         if not _v1(request):
             return await http_exception_handler(request, exc)
         return _error(
-            exc.status_code, str(exc.detail), getattr(exc, "error_type", None), exc.headers
+            exc.status_code,
+            str(exc.detail),
+            getattr(exc, "error_type", None),
+            exc.headers,
+            getattr(exc, "code", None),
         )
 
     async def validation_error(request: Request, exc: Exception) -> Response:
@@ -459,7 +493,11 @@ def _v1(request: Request) -> bool:
 
 
 def _error(
-    status: int, message: str, error_type: str | None, headers: Mapping[str, str] | None = None
+    status: int,
+    message: str,
+    error_type: str | None,
+    headers: Mapping[str, str] | None = None,
+    code: str | None = None,
 ) -> JSONResponse:
-    body = {"code": _CODES.get(status, "error"), "type": error_type, "message": message}
+    body = {"code": code or _CODES.get(status, "error"), "type": error_type, "message": message}
     return JSONResponse({"error": body}, status, dict(headers or {}))

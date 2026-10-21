@@ -396,7 +396,7 @@ def test_a_write_failing_after_the_vectors_takes_them_back(
     memory: Memory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """数据库那一步出错时（向量已经写进向量库）：整个事务撤销，这次写的向量也删掉。以前发言已经
-    提交，向量库里有点、数据库里却没有"轮"。"""
+    提交，向量库里有点、数据库里却没有"轮"。发言的附加信息（metadata）在同一个事务里，一起撤销。"""
     system = memory.system
 
     def broken(units: Sequence[Any]) -> int:
@@ -404,8 +404,9 @@ def test_a_write_failing_after_the_vectors_takes_them_back(
 
     monkeypatch.setattr(system.db, "add_units", broken)
     with pytest.raises(sqlite3.OperationalError):
-        memory.add("I live in Berlin", user_id="alice", run_id="r1")
+        memory.add("I live in Berlin", user_id="alice", run_id="r1", metadata={"src": "crm"})
     assert system.db.get_turns("alice") == [] and system.vectors.count("alice") == 0
+    assert system.db.get_turn_meta("alice") == {}
 
 
 def _descending_uuids(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -647,6 +648,32 @@ def test_metadata_and_expiration_stay_out_of_extraction(
     assert len(plain[0]) == 3  # 两次抽取、一次对账
     assert tagged == plain
     assert "TOP-SECRET-7" not in str(tagged[0])
+
+
+def test_a_run_that_grows_with_metadata_is_extracted_again(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, tmp_path: Path
+) -> None:
+    """同一个 run_id 带着 metadata 再写一次：会话长了，巩固要重新抽取，与不带 metadata 时的请求
+    与结果逐字相同。巩固按发言的版本（MemoryDB.turns_version）判断会话变没变，带附加信息的写入
+    以前不让它变：第二句没有抽取，"搬到慕尼黑"一直不在记忆里。"""
+    fake_api.chat_replies = [model]
+
+    def run(home: str, **extra: Any) -> tuple[list[dict[str, Any]], list[str]]:
+        paths = PathsConfig().resolve_against(tmp_path / home)
+        fake_api.chat_requests.clear()
+        with Memory(
+            n3_settings.model_copy(update={"paths": paths}),
+            http_client=fake_api.client(),
+            background=False,
+        ) as m:
+            for text, at in (("I live in Berlin", AUG), ("I moved to Munich", SEP)):
+                m.add(text, user_id="alice", run_id="r", timestamp=at, wait=True, **extra)
+            facts = sorted(f["memory"] for f in m.get_all(user_id="alice")["results"])
+            return list(fake_api.chat_requests), facts
+
+    plain = run("plain")
+    assert plain[1] == ["The user lives in Munich."]
+    assert run("tagged", metadata={"crm": "TOP-SECRET-7"}) == plain
 
 
 def test_expired_memories_leave_search_get_all_and_the_profile(memory: Memory) -> None:

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from fakes import TOY_CONVERSATION
 
-from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn
+from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
 from cuemem.errors import ConfigMismatchError, StorageLockedError
@@ -138,6 +138,10 @@ def test_versions_change_with_every_write_that_matters(tmp_path: Path) -> None:
     db.add_turns(turns[2:])
     assert db.turns_version("demo", sid) != turns_of[sid]
     assert db.turns_version("demo", "other") == turns_of["other"]  # 别的会话不受影响
+    more = build_turns("demo", session, len(turns))[:1]  # 带附加信息（SDK 的 metadata）的发言
+    before = db.turns_version("demo", sid)
+    assert db.add_turns(more, {more[0].id: TurnMeta(metadata={"source": "crm"})}) == 1
+    assert db.turns_version("demo", sid) != before
     for step in (
         lambda: db.delete_turns("demo", [turns[0].id]),
         lambda: MemoryDB(path).add_turns(turns[:1]),

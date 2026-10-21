@@ -28,6 +28,7 @@ from scripted import (
 from test_sdk import where_i_live
 
 from cuemem import Memory
+from cuemem import sdk as sdk_module
 from cuemem.config import PathsConfig, Settings
 from cuemem.core.models import Conversation, Entity, Fact, SessionIn, TurnIn
 from cuemem.core.trace import start_trace
@@ -876,6 +877,85 @@ def test_reused_state_matches_loading_from_the_database(
     assert "document:Max (pet): golden retriever" in cold["misses"]  # 载入时才查的描述
     assert any(f["supersede_reason"] == "changed" for f in cold["facts:u"])
     assert warm["loads"] < cold["loads"] // 2
+
+
+def corrections_story(settings: Settings, fake_api: FakeAPI, root: Path) -> dict[str, Any]:
+    """SDK 的 metadata、update（记进原始日志的更正）、带 metadata 又长了的会话、导出导入到另一个
+    空间（version 2，带更正目标），最后遗忘那句更正。返回发给模型的请求、各步的结果、更正之后与
+    最后的事实和实体，以及从库里整个载入状态的次数。"""
+    fake_api.chat_replies = [
+        ScriptedModel(life_story, reconcile=reconcile_by_keyword("lives in", "favorite color"))
+    ]
+    fake_api.chat_requests.clear()
+    paths = PathsConfig().resolve_against(root)
+    out: dict[str, Any] = {"events": [], "loads": 0}
+    with Memory(
+        settings.model_copy(update={"paths": paths}),
+        http_client=fake_api.client(),
+        background=False,
+    ) as m:
+        db = m.system.db
+        get_entities = db.get_entities
+
+        def counting(space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
+            out["loads"] += ids is None
+            return get_entities(space_id, ids)
+
+        db.get_entities = counting  # type: ignore[method-assign]
+        day = itertools.count()
+
+        def add(text: str, run: str, **kw: Any) -> None:
+            # 写在将来：update 给更正的会话取的时间是原来那条之后一点，不是当前时间，两次相同
+            when = datetime(2030, 1, 1) + timedelta(days=next(day))
+            result = m.add(text, user_id="u", run_id=run, timestamp=when, wait=True, **kw)
+            out["events"].append(result["results"])
+
+        add("I live in Berlin", "s1", metadata={"source": "crm"})
+        add("I like swimming", "s2", metadata={"source": "chat"})
+        add("Max is my dog", "s3")
+        swim = next(f for f in m.get_all(user_id="u")["results"] if "swimming" in f["memory"])
+        updated = m.update(swim["id"], "I like diving", metadata={"checked": True})
+        out["events"].append(updated)
+        add("I moved to Munich", "s4")
+        add("My favorite color is blue", "s4", metadata={"source": "chat"})  # 会话又长了
+        out["events"].append(m.get_all(user_id="u", filters={"source": "chat"})["results"])
+        m.load(m.export(user_id="u"), user_id="v", wait=True)
+        (diving,) = updated["results"]
+        out["corrected:u"] = [f.model_dump() for f in db.get_facts(space_for("u"))]
+        m.delete(diving["id"])  # 遗忘那句更正：原来那条恢复
+        for user in ("u", "v"):
+            space = space_for(user)
+            out[f"facts:{user}"] = [f.model_dump() for f in db.get_facts(space)]
+            out[f"entities:{user}"] = [e.model_dump() for e in get_entities(space)]
+    for event in out["events"]:
+        if isinstance(event, dict):
+            event["consolidation"].pop("elapsed_ms", None)
+    out["requests"] = [json.dumps(r, sort_keys=True) for r in fake_api.chat_requests]
+    return out
+
+
+def test_reused_state_matches_loading_from_the_database_with_corrections(
+    story_settings: Settings,
+    fake_api: FakeAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK 的 update 与 metadata（R10）经过留下的镜像（R6）：更正以"说错了"取代原来那条、带着
+    metadata 又长了的会话、导入与遗忘更正，发给模型的请求、事件与最后的事实和实体，与每次都从
+    库里读完全相同。更正的会话 ID 带计数与随机数，这里固定住，两次的事实 ID 才相同。"""
+    monkeypatch.setattr(
+        sdk_module, "sortable_session_id", lambda prefix, when: f"{prefix}-{when:%Y%m%d-%H%M%S-%f}"
+    )
+    monkeypatch.setattr(consolidate_module, "MIRRORED_SPACES", 0)  # 不留镜像：每次都从库里读
+    cold = corrections_story(story_settings, fake_api, tmp_path / "cold")
+    monkeypatch.setattr(consolidate_module, "MIRRORED_SPACES", 4)
+    warm = corrections_story(story_settings, fake_api, tmp_path / "warm")
+    for key in ("requests", "events", "corrected:u", "facts:u", "entities:u", "facts:v"):
+        assert warm[key] == cold[key], key
+    assert any(f["supersede_reason"] == "corrected" for f in cold["corrected:u"])
+    assert not any(f["supersede_reason"] == "corrected" for f in cold["facts:u"])
+    assert {f["object"] for f in cold["facts:u"] if f["superseded_by"] is None} >= {"swimming"}
+    assert warm["loads"] < cold["loads"]
 
 
 def test_add_with_wait_does_not_reload_the_whole_space(

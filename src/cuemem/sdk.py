@@ -463,12 +463,16 @@ class Memory:
             return _empty(self.system, space)
         from cuemem.evidence import RAISED_REASON
 
+        # 两次检索用同一个问题时间：改走 L1 时打包的是探针在这个时间打过分的候选
+        when = naive_local(at) if at is not None else datetime.now()
         recall = self.system.retrieve(
-            space, query, question_time=at, mode=mode, router=router, lam=lam
+            space, query, question_time=when, mode=mode, router=router, lam=lam
         )
         raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
-        if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同
-            recall = self.system.retrieve(space, query, question_time=at, mode="l1")
+        if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同：不把探针的检索再做一遍
+            recall = self.system.retrieve(
+                space, query, question_time=when, mode="l1", candidates=recall.candidates
+            )
         select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
         out = _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
         if raised:

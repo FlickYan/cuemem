@@ -62,6 +62,7 @@ from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.api.auth import Keys, Principal, guard, principal_of
+from cuemem.api.failures import provider_failure
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
@@ -255,12 +256,16 @@ class MemoryProxy:
         try:
             batch = embedder.embed(texts, "document")
         except EmbeddingAPIError as exc:  # 向量器自己已经按退避重试过
-            limited = exc.status == 429
+            # 状态码与 HTTP 接口相同（api/failures.py）：限流 429、暂时不可用 503 带 Retry-After，
+            # 余额不足 402，超时 504，别的 502
+            failure = provider_failure(exc)
+            assert failure is not None  # 向量接口的出错都有对应的状态码
             raise ProxyError(
-                429 if limited else 502,
+                failure.status,
                 str(exc),
-                kind="rate_limit_error" if limited else "upstream_error",
-                headers={"Retry-After": exc.retry_after} if limited and exc.retry_after else None,
+                kind=_ERROR_TYPES.get(failure.kind, "upstream_error"),
+                code=failure.kind,
+                headers={"Retry-After": failure.retry_after} if failure.retry_after else None,
             ) from exc
         data = [
             {"object": "embedding", "index": i, "embedding": _vector(row, encoding)}
@@ -622,6 +627,9 @@ def _retry_headers(response: httpx2.Response) -> dict[str, str]:
 
 
 # ---------- /v1/embeddings ----------
+
+# 向量接口出错（api/failures.py 的分类）→ OpenAI 格式里的 type（与对话转发的 _unreachable 相同）
+_ERROR_TYPES = {"rate_limited": "rate_limit_error", "timeout": "timeout"}
 
 
 def _embedding_input(raw: Any) -> list[str]:

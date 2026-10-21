@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import FakeAPI
+from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -29,7 +29,7 @@ from cuemem.api.auth import Keys, guard
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
-from cuemem.errors import MemoryAPIError
+from cuemem.errors import ContentFilteredError, EmbeddingAPIError, MemoryAPIError
 from cuemem.evidence import RAISED_REASON
 from cuemem.memory import MemorySystem
 
@@ -401,3 +401,48 @@ def test_the_server_does_not_read_its_own_files(system: MemorySystem, tmp_path: 
             assert response.status_code == 400, url
             assert "data URL" in response.json()["error"]["message"]
     assert system.db.list_spaces() == [] and system.db.get_media("a") == []
+
+
+def test_v1_explains_provider_errors(
+    system: MemorySystem, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """模型供应商出错时 /api/v1 与 /api 一样给出状态码与说明（api/failures.py）：限流 429 带上游的
+    Retry-After、余额不足 402、超时 504、内容审核拒绝 422；向量接口限流也是 429。MemoryClient 抛出
+    MemoryAPIError（status、code），内容审核与向量接口的出错照本地的类型抛出。以前 openai 的异常
+    是没有说明的 500，内容审核与向量接口的限流是 502。"""
+    system.llm._sleep = lambda _: None  # LLM 客户端的重试不真等
+    Memory.from_system(system).add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    fake_api.chat_rate_limit_headers = {"retry-after": "7"}
+    question = {"question": "Where do I live?", "user_id": "alice", "mode": "l1"}
+    with TestClient(v1_app(system), raise_server_exceptions=False) as http:
+        client = MemoryClient("http://testserver", http_client=http)
+        for marker, status, code, said in (
+            (RATE_LIMIT, 429, "rate_limited", "rate-limiting"),
+            (NO_BALANCE, 402, "no_balance", "balance"),
+            (TIMEOUT, 504, "timeout", "did not respond"),
+            (REJECT, 422, "content_filtered", "content filter"),
+        ):
+            fake_api.chat_replies = [marker]
+            response = http.post("/api/v1/answer", json=question)
+            assert response.status_code == status, response.text
+            error = response.json()["error"]
+            assert error["code"] == code and said in error["message"], error
+            assert response.headers.get("retry-after") == ("7" if status == 429 else None)
+            expected = ContentFilteredError if status == 422 else MemoryAPIError
+            with pytest.raises(expected) as raised:
+                client.answer(**question)
+            if isinstance(raised.value, MemoryAPIError):
+                assert (raised.value.status, raised.value.code) == (status, code)
+
+        def throttled(texts: Any, kind: str) -> Any:
+            raise EmbeddingAPIError(
+                "向量接口返回 HTTP 429：Throttling", status=429, retry_after="3"
+            )
+
+        monkeypatch.setattr(system.embedder, "embed", throttled)
+        search = {"query": "where?", "user_id": "alice", "mode": "l1"}
+        response = http.post("/api/v1/memories/search", json=search)
+        assert response.status_code == 429 and response.headers["retry-after"] == "3"
+        assert response.json()["error"]["type"] == "EmbeddingAPIError"
+        with pytest.raises(EmbeddingAPIError):
+            client.search("where?", user_id="alice", mode="l1")

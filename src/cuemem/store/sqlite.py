@@ -440,6 +440,10 @@ class MemoryDB:
                             info.edit_of,
                         ),
                     )
+            # 与不带附加信息的写入一样计数（turns_version）：以前不计，同一个 run_id 带着 metadata
+            # 再写时巩固以为会话没变，新的发言不再抽取
+            for key in {(t.space_id, t.session_id) for t in turns}:
+                self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
         return added
 
     def get_turn_meta(
