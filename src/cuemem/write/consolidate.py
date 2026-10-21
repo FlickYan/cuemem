@@ -718,7 +718,8 @@ class ConsolidationWorker:
     """后台巩固：在线写入只负责登记任务，这个线程在空闲时把任务做完，不阻塞对话。
 
     同一时间只处理一个空间；同一空间的任务按会话时间顺序串行（对账需要）。抽取失败的会话
-    （限流、余额不足、超时）按退避时间自动重试（见 Consolidator.retry_due），不用等下一次
+    （限流、余额不足、超时）按退避时间自动重试（见 Consolidator.retry_due），巩固整个抛出了
+    异常（对账、向量化时出错）时整个空间按同样的退避再做（见 _retry_after_crash），不用等下一次
     显式的巩固。reports 与 errors 只留最近 100 条。
     """
 
@@ -738,6 +739,7 @@ class ConsolidationWorker:
         self.errors: deque[str] = deque(maxlen=100)
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._retry: dict[str, float] = {}  # 空间 → 可以重试的时刻（time.monotonic），只在线程里用
+        self._crashes: dict[str, int] = {}  # 空间 → 巩固连续抛出异常的次数，只在线程里用
         self._thread = threading.Thread(target=self._loop, name="cuemem-consolidate", daemon=True)
         self._thread.start()
 
@@ -767,14 +769,18 @@ class ConsolidationWorker:
             except queue.Empty:
                 self._resubmit_due()
                 continue
+            if space_id is None:
+                self._queue.task_done()
+                return
             try:
-                if space_id is None:
-                    return
                 self._consolidate(space_id)
+                self._crashes.pop(space_id, None)
                 self._resubmit_due()  # 到期的重试排在 task_done 之前：wait() 一并等它们
-            except Exception as exc:  # 后台线程不能崩：记录下来，任务保持待处理，下次再试
+            except Exception as exc:  # 后台线程不能崩：记录下来，任务保持待处理，按退避再试
                 if not self.closing:  # 关闭超时后数据库已经关了，这时的报错说明不了什么
                     self.errors.append(f"{space_id}: {type(exc).__name__}: {exc}")
+                    self._retry_after_crash(space_id)
+                    self._resubmit_due()
             finally:
                 self._queue.task_done()
 
@@ -798,6 +804,16 @@ class ConsolidationWorker:
             self._retry.pop(space_id, None)
         else:
             self._retry[space_id] = time.monotonic() + wait
+
+    def _retry_after_crash(self, space_id: str) -> None:
+        """巩固整个抛出了异常（对账、向量化、图片描述遇上余额不足、限流等；逐个会话的抽取失败
+        不会抛出来，见 retry_due）：任务还是待处理，按同样的退避时间再做一遍，连续 MAX_ATTEMPTS
+        次都抛出就不再自动重试，等这个空间的下一次提交或显式的巩固。"""
+        crashes = self._crashes[space_id] = self._crashes.get(space_id, 0) + 1
+        if crashes >= MAX_ATTEMPTS:
+            return
+        due = time.monotonic() + self.retry_base_s * 4 ** (crashes - 1)
+        self._retry[space_id] = min(due, self._retry.get(space_id, due))
 
     def _until_due(self) -> float | None:
         """离最早一次重试还有几秒；没有要重试的空间时为 None（一直等新提交的空间）。"""

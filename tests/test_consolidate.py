@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any
@@ -29,6 +30,7 @@ from cuemem.memory import MemorySystem
 from cuemem.write.consolidate import MAX_ATTEMPTS
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
+RECONCILE = "You maintain a long-term memory"  # 对账请求的系统提示开头
 
 
 def toy() -> Conversation:
@@ -253,6 +255,51 @@ def test_worker_retries_failed_job_after_outage(n3_settings: Settings, fake_api:
         memory.consolidate(user_id="bob")  # 显式的巩固重试全部失败的任务
         assert [s for s, _ in statuses(memory, "bob")] == ["done", "done"]
         assert len(memory.get_all(user_id="bob")["results"]) == 2
+
+
+def test_worker_retries_a_space_whose_consolidation_raised(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """后台巩固时对账（不是抽取）遇上余额不足：异常从 run() 抛出，任务保持待处理。后台线程按
+    同样的退避时间把这个空间再做一遍，供应商恢复之后不用等新的写入就补上；一直抛出时最多做
+    MAX_ATTEMPTS 次。"""
+    model = ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
+    down = {"left": 0}
+
+    def reply(body: dict[str, Any]) -> Any:
+        if down["left"] and body["messages"][0]["content"].startswith(RECONCILE):
+            down["left"] -= 1
+            return NO_BALANCE
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    conv = toy()
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        system.ingest(conv.model_copy(update={"sessions": conv.sessions[:1]}), consolidate=True)
+        worker = system.start_worker()
+        worker.retry_base_s = 0.2  # 退避缩短：第一次之后等 0.2 秒（缺省 1 分钟）
+        down["left"] = 1  # 对账失败一次，之后恢复
+        system.ingest(conv)  # 后面几个会话交给后台线程：抽取成功，对账时 402
+        worker.wait()
+        assert len(worker.errors) == 1 and "Insufficient Balance" in worker.errors[0]
+        deadline = time.monotonic() + 10  # 没有新的提交：后台线程自己到时间再做
+        while {j["status"] for j in system.db.get_jobs("demo")} != {"done"}:
+            assert time.monotonic() < deadline, system.db.get_jobs("demo")
+            time.sleep(0.05)
+        assert len(worker.errors) == 1
+        assert system.facts("demo", current_only=True)
+
+        calls: list[str] = []
+
+        def broken(space_id: str) -> None:
+            calls.append(space_id)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(system.consolidator, "run", broken)
+        worker.retry_base_s = 0.0
+        worker.submit("demo")
+        worker.wait()  # 退避时间为 0：到期的重试排在 task_done 之前，wait() 一并等
+        assert calls == ["demo"] * MAX_ATTEMPTS and worker._until_due() is None
 
 
 def test_failed_jobs_back_off(n3_settings: Settings, fake_api: FakeAPI) -> None:
