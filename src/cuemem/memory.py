@@ -615,8 +615,15 @@ class MemorySystem:
 
         派生记忆是原始日志的函数，所以遗忘 = 从日志里删除 + 用剩下的日志重放派生记忆：
         事实、实体、摘要、核心记忆都重新生成；被删内容取代过的旧事实会自动恢复为当前有效。
-        随后清理缓存与 trace：被删会话的抽取结果、该空间的对账与回答缓存、不再出现的文本的向量、
+        同时清理缓存与 trace：被删会话的抽取结果、该空间的回答缓存、不再出现的文本的向量、
         被删发言的查询向量，以及含有被删原话或看过被删记忆的 trace（连同其提问的查询向量）。
+
+        对账与实体消歧的缓存（请求里列着别的会话的事实与实体）不再整个删掉、重放时全部重新
+        请求：重放之后只留下重放时原样用到的条目，其余删掉。重放的每个请求都是从剩下的日志
+        算出来的，缓存键是请求的哈希，命中就说明条目的请求与它逐字相同，里面不会有被删的
+        内容；列过被删的事实或实体、或者剩下的日志已经算不出来的条目，重放用不到，都删掉。
+        这样只有输入真的变了的对账与消歧（被删会话之后、候选里有过它的内容的那些）要重新请求。
+        不按会话给条目打标签：实体的描述可能来自好几个会话，库里没有记它的出处。
 
         follow_citations（N8）：助手后来的回复如果引用过要删的记忆，它就复述了被删的信息，
         那一轮也一起删，并继续往下追（溯源表记录了每次回复引用了什么）。
@@ -629,8 +636,9 @@ class MemorySystem:
         否则它会把由被删轮次抽出的事实、向量与缓存写回来。进行中的回答、检索与 Agent 的对话
         也先等它们做完（reading），否则它们随后把看过的被删内容写进缓存、trace 与日志。
 
-        重放失败（例如对账时余额不足）时照样清理 trace 与向量缓存，再把异常抛出去：原始日志
-        已经删了，重试时找不到要删的发言。没做完的巩固任务留着，下次巩固时补齐。
+        重放失败（例如对账时余额不足）时照样清理 trace、向量缓存与 LLM 缓存（标记的条目只留下
+        重放已经用到的），再把异常抛出去：原始日志已经删了，重试时找不到要删的发言。没做完的
+        巩固任务留着，下次巩固时补齐。
         """
         started = time.perf_counter()
         with (
@@ -649,53 +657,65 @@ class MemorySystem:
             texts_before = {u.text for u in self.db.list_units(space_id)}
             doomed = {t.id for t in targets}
 
-            # 1. 原始层：删除轮次与其中的图片（记录、图片向量；没有别处引用的原图文件），
-            #    再按剩下的轮次重建受影响会话的"轮"
-            old_rounds = self.db.list_units(space_id, kinds=["round"], session_ids=affected)
-            self.vectors.delete(space_id, [u.id for u in old_rounds])
-            self.db.delete_units(space_id, [u.id for u in old_rounds])
-            doomed_media = self.db.get_media(space_id, turn_ids=[t.id for t in targets])
-            # 被删内容的记忆 ID：含有被删发言的轮、由它们抽出的事实、其中的图片（trace 按 ID
-            # 记着回答模型看过哪些记忆）
-            refs = {u.id for u in old_rounds if doomed & set(u.source_turn_ids)}
-            refs |= {f.id for f in facts if doomed & set(f.source_turn_ids)}
-            refs |= {m.id for m in doomed_media}
-            deleted = self.db.delete_turns(space_id, [t.id for t in targets])
-            self.vectors.delete_images(space_id, [m.id for m in doomed_media])
-            images_deleted = 0
-            for item in doomed_media:
-                if self.media is not None and not self.db.media_sha_in_use(item.sha256):
-                    images_deleted += int(self.media.delete(Path(item.path)))
-            self.writer.reindex_sessions(space_id, affected)
-
-            # 2. 派生层：清空并清理相关的 LLM 缓存，再从剩下的日志重放
-            removed = self.db.clear_derived(space_id)
-            self.vectors.delete(space_id, removed)
+            # 0. LLM 缓存，在删日志之前：受影响会话的抽取与回答、遗忘时的复述检查（见
+            #    restating_turns）直接删；对账与消歧的条目先标记，重放之后只留下重放时原样用到的
+            #    （见上面的说明）。标记写在库里，进程中途退出时下次打开缓存就全部删掉
+            cache = self.llm.cache
+            held = scope(space_id, "consolidate")
+            reused: set[str] = set()  # 重放时命中过的缓存键
             llm_purged = 0
-            if self.llm.cache is not None:
-                parts = [f"session:{sid}" for sid in affected] + ["consolidate", "ask"]
-                llm_purged = sum(self.llm.cache.delete_scope(scope(space_id, p)) for p in parts)
+            if cache is not None:
+                parts = [f"session:{sid}" for sid in affected] + ["ask", "forget"]
+                llm_purged = sum(cache.delete_scope(scope(space_id, p)) for p in parts)
+                cache.hold(held)
             try:
-                if consolidated:
-                    self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
-                    self.consolidator.run(space_id)
-            finally:
-                # 3. trace：属性里有被删原话的条目（提问、回答原文），以及检索时给回答模型看过
-                #    被删记忆的条目（回答可能复述了它，trace 里却没有原话）。带图的发言另外按
-                #    去掉图片标记的文字找：记忆代理拿消息里的文字部分做检索查询
-                texts = [t.text for t in targets]
-                texts += [_without_images(t) for t in texts if "<image>" in t]
-                traces_removed, questions = self._remove_traces(space_id, texts, refs)
+                # 1. 原始层：删除轮次与其中的图片（记录、图片向量；没有别处引用的原图文件），
+                #    再按剩下的轮次重建受影响会话的"轮"
+                old_rounds = self.db.list_units(space_id, kinds=["round"], session_ids=affected)
+                self.vectors.delete(space_id, [u.id for u in old_rounds])
+                self.db.delete_units(space_id, [u.id for u in old_rounds])
+                doomed_media = self.db.get_media(space_id, turn_ids=[t.id for t in targets])
+                # 被删内容的记忆 ID：含有被删发言的轮、由它们抽出的事实、其中的图片（trace 按 ID
+                # 记着回答模型看过哪些记忆）
+                refs = {u.id for u in old_rounds if doomed & set(u.source_turn_ids)}
+                refs |= {f.id for f in facts if doomed & set(f.source_turn_ids)}
+                refs |= {m.id for m in doomed_media}
+                deleted = self.db.delete_turns(space_id, [t.id for t in targets])
+                self.vectors.delete_images(space_id, [m.id for m in doomed_media])
+                images_deleted = 0
+                for item in doomed_media:
+                    if self.media is not None and not self.db.media_sha_in_use(item.sha256):
+                        images_deleted += int(self.media.delete(Path(item.path)))
+                self.writer.reindex_sessions(space_id, affected)
 
-                # 4. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面那些
-                #    提问的查询向量（代理与 Agent 拿用户的原话做检索查询）。重放失败时派生记忆
-                #    只重建了一部分，多删的向量下次巩固时重新算
-                gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
-                embed_purged = 0
-                if isinstance(self.embedder, CachedEmbedder):
-                    embed_purged = self.embedder.purge(gone)
-                    embed_purged += self.embedder.purge([*texts, *questions], "query")
-                self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
+                # 2. 派生层：清空，再从剩下的日志重放
+                removed = self.db.clear_derived(space_id)
+                self.vectors.delete(space_id, removed)
+                try:
+                    if consolidated:
+                        with cache.recording(reused) if cache is not None else nullcontext():
+                            self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
+                            self.consolidator.run(space_id)
+                finally:
+                    # 3. trace：属性里有被删原话的条目（提问、回答原文），以及检索时给回答模型
+                    #    看过被删记忆的条目（回答可能复述了它，trace 里却没有原话）。带图的发言
+                    #    另外按去掉图片标记的文字找：记忆代理拿消息里的文字部分做检索查询
+                    texts = [t.text for t in targets]
+                    texts += [_without_images(t) for t in texts if "<image>" in t]
+                    traces_removed, questions = self._remove_traces(space_id, texts, refs)
+
+                    # 4. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面
+                    #    那些提问的查询向量（代理与 Agent 拿用户的原话做检索查询）。重放失败时派生
+                    #    记忆只重建了一部分，多删的向量下次巩固时重新算
+                    gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
+                    embed_purged = 0
+                    if isinstance(self.embedder, CachedEmbedder):
+                        embed_purged = self.embedder.purge(gone)
+                        embed_purged += self.embedder.purge([*texts, *questions], "query")
+                    self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
+            finally:  # 中途出错时重放用到的更少，删得更多
+                if cache is not None:
+                    llm_purged += cache.settle(held, reused)
             report = ForgetReport(
                 space_id=space_id,
                 turns_deleted=deleted,
@@ -832,7 +852,7 @@ class MemorySystem:
                     {"role": "user", "content": prompt},
                 ],
                 RegrownOutput,
-                cache_scope=scope(space_id, "consolidate"),
+                cache_scope=scope(space_id, "forget"),  # 遗忘时删掉（见 forget、forget_memories）
             ).value
             for n in verdict.same:
                 if 1 <= n <= len(turns):
@@ -872,7 +892,7 @@ class MemorySystem:
                     },
                 ],
                 RegrownOutput,
-                cache_scope=scope(space_id, "consolidate"),
+                cache_scope=scope(space_id, "forget"),
             ).value
             for n in verdict.same:
                 if 1 <= n <= len(candidates):
@@ -926,11 +946,18 @@ class MemorySystem:
                 )
         finally:
             # 找转述与兜底时为被删的陈述算过查询与文档两种向量，兜底那次还在 forget 清理之后：
-            # 一并删掉（中途失败时也删）
-            purged = 0
+            # 一并删掉（中途失败时也删）。兜底的请求里有被删的陈述，最后一次没有 forget 跟在后面
+            # 替它清理，它的缓存条目（归属 forget）也在这里删
+            purged = llm_purged = 0
             if statements and isinstance(self.embedder, CachedEmbedder):
                 purged = self.embedder.purge(statements, "query") + self.embedder.purge(statements)
-        return replace(report, embed_cache_purged=report.embed_cache_purged + purged)
+            if statements and self.llm.cache is not None:
+                llm_purged = self.llm.cache.delete_scope(scope(space_id, "forget"))
+        return replace(
+            report,
+            embed_cache_purged=report.embed_cache_purged + purged,
+            llm_cache_purged=report.llm_cache_purged + llm_purged,
+        )
 
     def _forget_plan(
         self,

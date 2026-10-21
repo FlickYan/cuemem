@@ -946,8 +946,10 @@ class ConsolidationWorker:
 
 
 def scope(space_id: str, part: str) -> str:
-    """LLM 缓存条目的归属标签：抽取按会话标记，对账与消歧按空间标记，回答按空间标记。
-    遗忘时据此只清理受影响的条目，其余会话的抽取结果仍可复用（D-021）。"""
+    """LLM 缓存条目的归属标签：抽取、图片描述与 Agent 的回答按会话（session:<ID>），对账与消歧
+    按空间（consolidate），其余回答按空间（ask），遗忘时的复述检查单独一个（forget）。
+    遗忘时据此只清理受影响的条目（D-021）：受影响会话的、回答与复述检查的删掉；对账与消歧的
+    重放之后只留下重放时原样用到的（见 MemorySystem.forget）；其余会话的抽取结果仍可复用。"""
     return f"{space_id}|{part}"
 
 

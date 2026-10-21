@@ -387,3 +387,46 @@ def test_llm_cache_gains_scope_column(tmp_path: Path) -> None:
     cache.put("k2", "m", {"b": 2}, scope="space|ask")
     assert cache.delete_scope("space|ask") == 1
     assert cache.get("k2") is None and cache.get("k") == {"a": 1}
+
+
+def test_llm_cache_hold_keeps_only_what_was_reused(tmp_path: Path) -> None:
+    """遗忘时对账与消歧的缓存先标记（hold），重放之后只留下重放时命中过的（settle）。标记写在库
+    里：进程在核对之前退出时，下次打开缓存就把标记着的条目全部删掉（删除时覆写）。"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    from cuemem.llm.cache import ResponseCache
+
+    path = tmp_path / "llm.sqlite"
+
+    def on_disk() -> bytes:
+        wal = path.with_name("llm.sqlite-wal")
+        return path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
+
+    cache = ResponseCache(path)
+    for key in ("a", "b", "c"):
+        cache.put(key, "m", {"text": f"secret-{key}"}, scope="s|consolidate")
+    cache.put("x", "m", {"text": "other"}, scope="t|consolidate")
+    assert cache.hold("s|consolidate") == 3
+    with cache.recording() as hits:
+        assert cache.get("a") is not None and cache.get("missing") is None
+        with ThreadPoolExecutor(1) as pool:  # 复制了上下文的线程里的命中也记得到
+            assert pool.submit(copy_context().run, cache.get, "b").result() is not None
+        thread = threading.Thread(target=cache.get, args=("c",))  # 没复制的不算
+        thread.start()
+        thread.join()
+    assert hits == {"a", "b"}
+    assert cache.settle("s|consolidate", hits) == 1
+    assert [cache.get(k) is not None for k in ("a", "b", "c", "x")] == [True, True, False, True]
+    assert cache.settle("s|consolidate", set()) == 0  # 标记已经去掉，再核对不删东西
+
+    assert cache.hold("s|consolidate") == 2
+    cache.close()  # 没有核对：进程在遗忘重放时退出
+    assert b"secret-a" in on_disk()
+    cache = ResponseCache(path)
+    assert cache.get("a") is None and cache.get("b") is None and cache.get("x") is not None
+    assert cache._conn.execute("SELECT COUNT(*) FROM llm_cache_held").fetchone() == (0,)
+    raw = on_disk()  # 还开着：删完就截断了 WAL
+    assert b"secret-a" not in raw and b"secret-b" not in raw and b"other" in raw
+    cache.close()

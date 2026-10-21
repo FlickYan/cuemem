@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -20,7 +22,9 @@ from scripted import (
     ScriptedModel,
     reconcile_by_keyword,
 )
+from scripted import _fact as fact_reply
 
+import cuemem.llm.client as llm_client
 from cuemem.config import Settings
 from cuemem.core.models import Conversation, SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
@@ -48,7 +52,42 @@ def _on_disk(path: Path) -> bytes:
     return path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
 
 
-def test_forget_session_cascades_and_restores(system: MemorySystem, fake_api: FakeAPI) -> None:
+@pytest.fixture
+def requests_by_key(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """LLM 缓存键 → 算出它的请求（JSON）。对账与消歧的回复只有编号，被删的内容只在请求里，
+    取证时要按请求找缓存条目。"""
+    seen: dict[str, str] = {}
+    real = llm_client.request_key
+
+    def spy(request: dict[str, Any]) -> str:
+        key = real(request)
+        seen[key] = json.dumps(request, ensure_ascii=False)
+        return key
+
+    monkeypatch.setattr(llm_client, "request_key", spy)
+    return seen
+
+
+def _assert_no_cache_entry_with(
+    system: MemorySystem, requests: dict[str, str], words: list[str]
+) -> list[str]:
+    """LLM 缓存里（连同文件与 WAL 的字节）没有请求里带着这些词的条目，返回这些条目的键。"""
+    assert system.llm.cache is not None
+    doomed = [k for k, body in requests.items() if any(w in body for w in words)]
+    assert doomed
+    conn = system.llm.cache._conn
+    kept = {key for (key,) in conn.execute("SELECT key FROM llm_cache")}
+    assert not kept & set(doomed)
+    assert conn.execute("SELECT COUNT(*) FROM llm_cache_held").fetchone() == (0,)
+    raw = _on_disk(system.settings.paths.llm_cache)
+    assert not any(k.encode() in raw for k in doomed)
+    assert not any(w.encode() in raw for w in words)
+    return doomed
+
+
+def test_forget_session_cascades_and_restores(
+    requests_by_key: dict[str, str], system: MemorySystem, fake_api: FakeAPI
+) -> None:
     assert any(SECRET in f.statement for f in system.facts("demo"))
     s4_rounds = [u.id for u in system.db.list_units("demo", kinds=["round"], session_ids=["s4"])]
     s4_texts = [u.text for u in system.db.list_units("demo") if SECRET in u.text]
@@ -103,6 +142,7 @@ def test_forget_session_cascades_and_restores(system: MemorySystem, fake_api: Fa
     assert "北京".encode() in raw  # 对照：没被删的内容还在
     cached = _on_disk(paths.llm_cache)
     assert SECRET.encode("utf-8") not in cached and "北京".encode() in cached
+    _assert_no_cache_entry_with(system, requests_by_key, [SECRET])  # 连同请求里有它的条目的键
     vectors = _on_disk(paths.embed_cache)
     assert not any(k.encode() in vectors for k in keys)
     assert not any(v in vectors for v in embedded)
@@ -129,13 +169,194 @@ def test_forget_unknown_target_is_noop(system: MemorySystem) -> None:
     assert len(system.facts("demo")) == before
 
 
+def _org(name: str, description: str, kind: str = "organization") -> dict[str, Any]:
+    return {"name": name, "type": kind, "aliases": [], "description": description}
+
+
+# b 是要遗忘的（Zurich、Bluebird 只在它里面）。c 的对账列着 b 的住址与 a 的公司，消歧列着
+# b 的项目；d 的对账与消歧只列着 a 的职位与公司；e 的对账列着 c 的住址
+SECRET_WORDS = ["Zurich", "Bluebird"]
+SECRET_CHAT = [
+    ("s-a", "2026-01-05", "I work at Acme as a designer."),
+    ("s-b", "2026-02-05", "I moved to Zurich for Bluebird, a secret research project."),
+    ("s-c", "2026-03-05", "I moved to Geneva and now work at Globex on Bluejay."),
+    ("s-d", "2026-04-05", "I got promoted to lead designer; Initech hired our team."),
+    ("s-e", "2026-05-05", "I moved to Bern last week."),
+]
+SECRET_EXTRACTIONS: dict[str, dict[str, Any]] = {
+    "2026-01-05": {
+        "summary": "",
+        "facts": [
+            fact_reply("The user works at Acme.", "works_at", "Acme", turns=[0]),
+            fact_reply("The user is a designer.", "job_title", "designer", turns=[0]),
+        ],
+        "entities": [_org("Acme", "the company where the user works")],
+    },
+    "2026-02-05": {
+        "summary": "",
+        "facts": [
+            fact_reply(
+                "The user moved to Zurich for the Bluebird project.",
+                "lives_in",
+                "Zurich",
+                turns=[0],
+            )
+        ],
+        "entities": [
+            _org(
+                "Bluebird",
+                "a secret research project the user joined in Zurich",
+                kind="project",
+            )
+        ],
+    },
+    "2026-03-05": {
+        "summary": "",
+        "facts": [
+            fact_reply("The user moved to Geneva.", "lives_in", "Geneva", turns=[0]),
+            fact_reply("The user works at Globex.", "works_at", "Globex", turns=[0]),
+        ],
+        "entities": [
+            _org("Bluejay", "a research project the user joined in Geneva", kind="project")
+        ],
+    },
+    "2026-04-05": {
+        "summary": "",
+        "facts": [
+            fact_reply(
+                "The user was promoted to lead designer.", "job_title", "lead designer", turns=[0]
+            )
+        ],
+        "entities": [_org("Initech", "the company that hired the user's team")],
+    },
+    "2026-05-05": {
+        "summary": "",
+        "facts": [fact_reply("The user moved to Bern.", "lives_in", "Bern", turns=[0])],
+        "entities": [],
+    },
+}
+
+
+def _secret_system(
+    settings: Settings, fake_api: FakeAPI, **replies: Any
+) -> tuple[MemorySystem, ScriptedModel]:
+    """建好 SECRET_CHAT 的空间。实体描述相似度在 0.5–0.9 之间的交给模型消歧（哈希向量下
+    Bluejay 与 Bluebird 约 0.75、Initech 与 Acme 约 0.63）。"""
+    consolidation = settings.consolidation.model_copy(
+        update={"entity_gray_threshold": 0.5, "entity_merge_threshold": 0.9}
+    )
+    model = ScriptedModel(
+        SECRET_EXTRACTIONS, reconcile=reconcile_by_keyword("moved", "works", "designer"), **replies
+    )
+    fake_api.chat_replies = [model]
+    system = MemorySystem.from_settings(
+        settings.model_copy(update={"consolidation": consolidation}),
+        http_client=fake_api.client(),
+    )
+    sessions = [
+        SessionIn(
+            session_id=sid,
+            started_at=datetime.fromisoformat(f"{day}T10:00:00"),
+            turns=[TurnIn(role="user", text=text)],
+        )
+        for sid, day, text in SECRET_CHAT
+    ]
+    system.ingest(Conversation(space_id="alice", sessions=sessions), consolidate=True)
+    # 对账：c、d、e 各一次；消歧：c、d 各一次。列着 b 的内容的是 c 的两次
+    assert model.calls["reconcile"] == 3 and model.calls["entity"] == 2
+    prompts = [*model.prompts["reconcile"], *model.prompts["entity"]]
+    assert sum(1 for p in prompts if any(w in p for w in SECRET_WORDS)) == 2
+    return system, model
+
+
+def _sent(model: ScriptedModel, kind: str, *words: str) -> int:
+    """这类请求里带着这些词的发了几次（命中缓存的不算）。"""
+    return sum(1 for p in model.prompts[kind] if all(w in p for w in words))
+
+
+def test_forget_keeps_reconciliation_and_entity_cache_the_replay_reuses(
+    n3_settings: Settings, fake_api: FakeAPI, requests_by_key: dict[str, str]
+) -> None:
+    """遗忘之后不再把整个空间的对账与消歧重新请求一遍（D-021 修订）：输入没变的（d、e 的）命中
+    缓存，只有列过被删会话内容的（c 的）重新请求；请求里有被删内容的缓存条目一条不留，连同它的
+    键。以前遗忘清掉整个空间的对账与消歧缓存，重放时全部重新请求。"""
+    system, model = _secret_system(n3_settings, fake_api)
+    with system:
+        before = model.calls.copy()
+
+        report = system.forget("alice", session_ids=["s-b"])
+
+        assert report.sessions_affected == ["s-b"]
+        # c 的对账少了 b 的住址，重新请求；c 的项目没有候选了，不用消歧；d、e 的都命中缓存
+        assert model.calls["reconcile"] - before["reconcile"] == 1
+        assert model.calls["entity"] == before["entity"]
+        assert model.calls["extract"] == before["extract"]
+        assert not any(w in model.prompts["reconcile"][-1] for w in SECRET_WORDS)
+        assert _sent(model, "reconcile", "lead designer") == 1
+        assert _sent(model, "entity", "Initech") == 1
+        current = {f.statement for f in system.facts("alice", current_only=True)}
+        assert {"The user moved to Bern.", "The user was promoted to lead designer."} <= current
+        assert not any(w in f.statement for f in system.facts("alice") for w in SECRET_WORDS)
+        # 取证：请求里有 Zurich、Bluebird 的条目（b 的抽取，c 的对账与消歧）连同键都删了，
+        # 文件里也找不到；d 的对账与消歧（重放原样用到的）还在
+        doomed = _assert_no_cache_entry_with(system, requests_by_key, SECRET_WORDS)
+        assert len(doomed) == 3
+        assert system.llm.cache is not None
+        kept = {key for (key,) in system.llm.cache._conn.execute("SELECT key FROM llm_cache")}
+        assert {k for k, body in requests_by_key.items() if "Initech" in body} <= kept
+
+
+def _flag_once(word: str) -> Any:
+    """兜底检查的替身：第一次在剩下的事实里看到带 word 的就说它还在透露，之后都说没有。"""
+    flagged: list[int] = []
+
+    def decide(prompt: str) -> dict[str, Any]:
+        if "Remaining facts:" in prompt and not flagged:
+            for n, line in re.findall(r"^(\d+)\. (.*)$", prompt, re.MULTILINE):
+                if word in line:
+                    flagged.append(int(n))
+                    return {"same": [int(n)]}
+        return {"same": []}
+
+    return decide
+
+
+def test_forget_memories_regrow_rounds_reuse_cache_and_leave_no_check_behind(
+    n3_settings: Settings, fake_api: FakeAPI, requests_by_key: dict[str, str]
+) -> None:
+    """按事实遗忘、兜底时又追了一轮（D-051）：每一轮的重放都不再重新请求输入没变的对账与消歧
+    （以前每轮都整个再付一遍）。找转述与兜底检查的请求里写着被删的事实，最后一次兜底检查之后没有
+    forget 替它清理，以前它的缓存条目一直留着。"""
+    system, model = _secret_system(n3_settings, fake_api, regrown=_flag_once("Geneva"))
+    with system:
+        [secret] = [f for f in system.facts("alice") if "Zurich" in f.statement]
+        before = model.calls.copy()
+
+        report = system.forget_memories("alice", fact_ids=[secret.id])
+
+        # 第一轮删 b；兜底发现 c 的 "moved to Geneva" 还在透露，第二轮删 c 的出处
+        assert report.regrown == 1 and report.sessions_affected == ["s-b", "s-c"]
+        assert model.calls["regrown"] - before["regrown"] == 3  # 找转述 + 两次兜底
+        assert model.calls["reconcile"] - before["reconcile"] == 1  # 只有第一轮 c 的
+        assert model.calls["entity"] == before["entity"]
+        assert _sent(model, "reconcile", "lead designer") == 1
+        assert _sent(model, "entity", "Initech") == 1
+        current = {f.statement for f in system.facts("alice", current_only=True)}
+        assert current >= {"The user moved to Bern.", "The user works at Acme."}
+        assert not any("Geneva" in f.statement for f in system.facts("alice"))
+        _assert_no_cache_entry_with(system, requests_by_key, SECRET_WORDS)
+        _assert_no_cache_entry_with(system, requests_by_key, ["Geneva", "Globex", "Bluejay"])
+
+
 def _traces(system: MemorySystem) -> str:
     return "".join(p.read_text("utf-8") for p in system.settings.paths.traces.glob("*.jsonl"))
 
 
-def test_forget_cleans_up_even_when_replay_fails(n3_settings: Settings, fake_api: FakeAPI) -> None:
-    """重放半途失败（对账时余额不足）：原始日志已经删了，重试时找不到要删的发言，所以 trace 与
-    向量缓存当场就要清理，异常照常抛出；没做完的巩固任务留着，下次巩固时补齐。"""
+def test_forget_cleans_up_even_when_replay_fails(
+    n3_settings: Settings, fake_api: FakeAPI, requests_by_key: dict[str, str]
+) -> None:
+    """重放半途失败（对账时余额不足）：原始日志已经删了，重试时找不到要删的发言，所以 trace、
+    向量缓存与 LLM 缓存当场就要清理，异常照常抛出；没做完的巩固任务留着，下次巩固时补齐。"""
     model = ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
     broke = threading.Event()
 
@@ -147,7 +368,7 @@ def test_forget_cleans_up_even_when_replay_fails(n3_settings: Settings, fake_api
     conv = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8"))
     with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
         system.ingest(conv, consolidate=True)
-        [turn] = [t for t in system.db.get_turns("demo", "s5") if t.role == "user"]
+        turn = system.db.get_turns("demo", "s2")[0]
         question = f"{turn.text} 我现在在哪工作？"  # 提问里带着要删的原话
         system.ask("demo", question, mode="l1")
         system.search("demo", turn.text)  # 原话本身做过检索查询（代理与 Agent 都这样）
@@ -157,12 +378,15 @@ def test_forget_cleans_up_even_when_replay_fails(n3_settings: Settings, fake_api
         old_round = next(u.text for u in system.db.list_units("demo") if turn.text in u.text)
 
         broke.set()
+        # s4 的对账列过 s2 的预算：遗忘 s2 之后它的输入变了，要重新请求（输入没变的对账命中缓存）
         with pytest.raises(openai.APIStatusError, match="Insufficient Balance"):
-            system.forget("demo", turn_ids=[turn.id])
+            system.forget("demo", session_ids=["s2"])
         assert all(t.id != turn.id for t in system.db.get_turns("demo"))
         assert turn.text not in _traces(system)
         assert not system.embedder.cached([old_round], "document")
         assert not system.embedder.cached([turn.text, question], "query")
+        # s4 原来的对账列着 s2 的预算：重放没用到它就失败了，照样删掉（标记的条目都核对过）
+        _assert_no_cache_entry_with(system, requests_by_key, [turn.text, "预算约 8000 元"])
         assert any(j["status"] == "pending" for j in system.db.get_jobs("demo"))
 
         broke.clear()
