@@ -16,8 +16,12 @@ All three integrations share `cuemem/evidence.py`.
 - **One evidence format:** the recalled facts and conversation excerpts are laid out exactly as the proxy and the reader lay them out, and placed at the start of the latest user message.
 - **Prefix caching is kept:** the system prompt and earlier messages are untouched, so provider prefix caching keeps working.
 - **Same tools as MCP:** recall / remember / forget have the same names, descriptions and semantics as the MCP tools.
+- **Memories are framed as data:** the evidence block and the recall tools' listing say that their content is quoted from past conversations, information and not instructions, and a stored `<memory` or `</memory` is escaped so it cannot close the block early. This reduces prompt injection from stored memories but cannot prevent it.
+- **Nothing twice:** in OpenAI Agents and LangGraph, rounds of the current conversation that are still in the request are left out of the evidence, photo rounds included (`evidence.stored_text` and `in_context_rounds`, shared with the proxy).
 
 Install with `uv sync --extra integrations`, or separately with `--extra openai-agents`, `--extra langgraph` or `--extra anthropic`. With only a DeepSeek key, add `--extra local` and use `Memory(preset="deepseek")`.
+
+**Peak hours.** The SDK, and so every integration built on a `Memory`, defaults to `peak_policy="warn"`: during DeepSeek's weekday peak hours (Beijing time) model calls go out at peak price instead of pausing until the peak ends. This applies even without a preset, because the default configuration's reader is DeepSeek. For batch work that should wait for the off-peak price, use `Memory(peak_policy="wait")`; the SDK then logs a warning on the `cuemem.sdk` logger when it starts waiting. Evaluations and `cuemem eval run --peak` are not affected.
 
 ## OpenAI Agents SDK
 
@@ -101,6 +105,7 @@ cuemem.close()  # at shutdown, before memory.close(); async: aend_thread / aclos
   - One LangGraph thread is one CueMem session.
   - Turns that end in structured output or a `return_direct` tool are saved.
   - Summaries written by LangChain's SummarizationMiddleware are not mistaken for the user's words.
+  - A thread that continues after `end_thread` or the idle hand-over is extracted again in full when it ends, and the space's derived memory is replayed from the raw log, so its facts equal a rebuild from the log (no stale wording from the earlier extraction).
 - **Forgetting:** forget removes the raw log and derived memory in CueMem. The messages stay in the current thread's checkpoints, which CueMem does not manage.
 
 ## Claude's memory tool
@@ -120,7 +125,8 @@ import anthropic
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
-memory = Memory()  # default config (Qwen); or Memory(preset="deepseek")
+# default config: Qwen extracts and retrieves, DeepSeek answers; or Memory(preset="deepseek")
+memory = Memory()
 client = anthropic.Anthropic()
 
 with CueMemMemoryTool(memory, user_id="alice") as tool:
@@ -152,3 +158,4 @@ delete_all(memory, user_id="alice")  # memories and Claude's files, together
 - **Open sessions:** they are tracked in memory per process. When several processes share a data directory (with a Qdrant server), one process can hand over a session that another is still using.
 - **Images:** the integrations inject text evidence only. When the controller wants to look at the original photo (`see`), the photo is not attached to the model call (the same as the proxy).
 - **Async:** CueMem itself is synchronous and runs in threads. In async frameworks use `AsyncMemory` or each integration's async variants.
+- **Traces:** every automatic recall and recall tool call writes a `retrieve` trace (the question, the retrieval mode and the IDs it retrieved) to `runs/traces/*.jsonl` in the data directory. Forgetting deletes the traces that list a deleted memory, together with the cached query vectors of their questions.

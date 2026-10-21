@@ -13,7 +13,12 @@ CueMem 接进现成 Agent 框架的四种方式，从改动最少到最深：
 
 三个集成共用 `cuemem/evidence.py`：控制器先选档（L0 不检索、只给画像），取回的事实与对话片段排成与记忆代理、回答模型相同的证据块，放在最新一句用户消息的开头；系统提示与之前的消息不动，供应商的前缀缓存照常命中。工具（recall / remember / forget）的名字、说明与语义与 MCP 相同。
 
+- 证据块与 recall 工具的清单都声明里面是从过去的对话里引来的资料、不是指令；存下的 `<memory`、`</memory` 注入前会转义，关不上证据块。这只能减少、不能杜绝从记忆来的提示注入。
+- OpenAI Agents 与 LangGraph 里，当前对话里还在请求中的轮不进证据，带照片的轮也一样（`evidence.stored_text` 与 `in_context_rounds`，与记忆代理共用）。
+
 安装：`uv sync --extra integrations`（或分别 `--extra openai-agents`、`--extra langgraph`、`--extra anthropic`）。只有 DeepSeek 的 Key 时加上 `--extra local` 并用 `Memory(preset="deepseek")`。
+
+**高峰时段**：SDK，以及包在 `Memory` 外面的各个集成，缺省 `peak_policy="warn"`：DeepSeek 工作日的高峰时段（北京时间）里照常按高峰价调用模型，不会停下来等高峰结束。不用预设时也一样，默认配置的回答模型就是 DeepSeek。批量任务想等错峰价时用 `Memory(peak_policy="wait")`，开始等待时 SDK 在 `cuemem.sdk` 日志上记一条警告。评测与 `cuemem eval run --peak` 不受影响。
 
 ## OpenAI Agents SDK
 
@@ -81,7 +86,7 @@ cuemem.close()  # 应用退出时，memory.close() 之前；异步用 aend_threa
 ```
 
 - 身份：`user_id` 不在构造时固定时，从 `config["configurable"]` 取；部署在 LangGraph Server 上时优先用登录的用户，不信任客户端传来的 ID。
-- 一个 LangGraph 线程对应 CueMem 的一个会话。结构化输出、`return_direct` 工具结束的轮也会写入；LangChain 的 SummarizationMiddleware 生成的摘要不会被当成用户的话。
+- 一个 LangGraph 线程对应 CueMem 的一个会话。结构化输出、`return_direct` 工具结束的轮也会写入；LangChain 的 SummarizationMiddleware 生成的摘要不会被当成用户的话。`end_thread` 或空闲交出之后又接着聊的线程，结束时整段重新抽取，空间的派生记忆从原始日志重放，事实等于从日志重建的结果（不会留着上一次抽取的说法）。
 - 遗忘：forget 删的是 CueMem 里的原始日志与派生记忆；当前线程的检查点里那几条消息还在（检查点不归 CueMem 管）。
 
 ## Claude 的 memory tool
@@ -97,7 +102,8 @@ import anthropic
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
-memory = Memory()  # 默认配置（通义）；或 Memory(preset="deepseek")
+# 默认配置：通义千问抽取与检索、DeepSeek 回答；或 Memory(preset="deepseek")
+memory = Memory()
 client = anthropic.Anthropic()
 
 with CueMemMemoryTool(memory, user_id="alice") as tool:
@@ -129,3 +135,4 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
 - 进行中的会话按进程记在内存里：多个进程共用一个数据目录（Qdrant 服务端）时，一个进程可能提前交出另一个进程还在进行的会话。
 - 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
 - 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。
+- 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉。

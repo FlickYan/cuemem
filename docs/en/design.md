@@ -291,7 +291,7 @@ A predicate's **cardinality** decides the conflict rules:
 - **Explicit forgetting** (D-021). Derived memory is a function of the raw log, so forgetting means deleting from the log and replaying the derived memory from what remains.
   - Old facts that the deleted session had superseded become current again automatically.
   - Caches are purged too: the deleted sessions' extraction cache, the space's reconciliation and answer caches, and embeddings of text that no longer appears.
-  - SQLite runs with `secure_delete` and is vacuumed afterwards. Tests read the database file's bytes to confirm the deleted content is gone.
+  - SQLite runs with `secure_delete`; after forgetting, the memory database and both caches commit and truncate their WAL (no `VACUUM` since the audit after N12, D-068). Tests read the bytes of the database files and their WALs to confirm the deleted content is gone. If the replay fails halfway, the cleanup still runs before the exception reaches the caller.
 - **Whole rounds, following citations** (N8, D-046).
   - Deleting a fact or an image deletes the round it came from: the user's words and the assistant's reply.
   - The agent records which memories every reply cited (each profile line is citable too). A later reply that cited deleted memory is deleted as well, and the chase continues from there.

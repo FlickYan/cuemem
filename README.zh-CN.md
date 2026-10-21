@@ -5,7 +5,7 @@
 
 [English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [与 Mem0、Letta、Zep 等的对比](docs/landscape.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
-> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 <a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
 
@@ -28,7 +28,14 @@ m.search("我现在住哪？", user_id="alice")  # 检索控制器决定要不�
 m.answer("我现在住哪？", user_id="alice")  # 回答并引用用到的事实
 m.history(events[0]["id"])  # 这条事实的每个版本：何时、为什么变了
 m.delete(events[0]["id"], dry_run=True)  # 先预演遗忘会删掉什么，再真的删
+
+# 多轮对话：每次 add 立即可检索，整段对话在结束时只抽取一次
+with m.run(user_id="alice") as run_id:
+    m.add("我买跑鞋的预算是 180 美元。", user_id="alice", run_id=run_id)
+    m.add("算了，还是 150 吧。", user_id="alice", run_id=run_id)
 ```
+
+每轮 add 一次同一个 `run_id` 也可以，但每次都要把整段对话重新抽取一遍、重放派生记忆；一段对话分多次写入时用 `with m.run(...)` 包起来。SDK 缺省 `peak_policy="warn"`：DeepSeek 工作日的高峰时段里照常按高峰价调用，不会停下来等高峰结束；批量写入想拿错峰价时传 `Memory(peak_policy="wait")`。
 
 或者当作 OpenAI 兼容的记忆代理：应用只改 base_url，代码不动。
 
@@ -45,9 +52,11 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 # 响应头里写着控制器的决定：X-CueMem-Level: L0（不检索）/ L1 / L2
 ```
 
+代理只收 JSON 请求（`curl -d` 要加 `-H 'Content-Type: application/json'`），不接受别的网站发来的浏览器请求。想起的记忆放在 `<memory>` 块里，块里声明这些是从过去的对话里引来的资料、不是指令；存下的 `</memory>` 也关不上这个块。这只能减少、不能杜绝从记忆来的提示注入。
+
 也可以接进 Agent 框架：OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool，每次调用模型之前由控制器决定要不要想起（见[框架集成](docs/integrations.md)）。
 
-另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server、记忆的导出与导入（`cuemem export / import`），以及 Docker 镜像（`docker compose up`）。示例见 [examples/](examples/)。
+另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server、记忆的导出与导入（`cuemem export / import`），以及 Docker 镜像（`docker compose up`，要设访问令牌）。示例见 [examples/](examples/)。
 
 ## 它要解决什么
 
@@ -81,7 +90,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 - **读**：记忆探针（一次 L1 打分，不调用 LLM，54 个特征）→ 两段式控制器按"预计答对概率 − λ × 成本"在 L0（只给画像）、L1（快速召回，不调用 LLM）、L2（规划、补检索、先记笔记再回答）之间选，有图时再决定要不要附原图。
 - **Agent**：控制器先选档召回，模型可以用 `memory_search` 自己补查；上下文按分区预算组装、前缀稳定；另有 HTTP 接口、可解释的界面与 MCP Server。
 - N0 规划里的 L1 重排、L2 图扩散、证据不足时自动升级都实现了，但实测没有收益或收益不抵成本，默认关闭。
-- **部署**：默认用嵌入式的 SQLite 与 Qdrant 本地模式，单进程；可以切到 Qdrant 服务端（见下），HTTP 接口可选访问令牌。
+- **部署**：默认用嵌入式的 SQLite 与 Qdrant 本地模式，单进程；可以切到 Qdrant 服务端（见下）。HTTP 接口与记忆代理监听非本机地址时必须设访问令牌。
 
 ## 与同类项目的比较
 
@@ -134,6 +143,8 @@ uv run cuemem data download              # 下载评测数据集（LongMemEval_S
 uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4）；dev100 为正式开发集
 ```
 
+不克隆仓库时从 GitHub 安装：`pip install "cuemem[local] @ git+https://github.com/FlickYan/cuemem"`。之后命令是 `cuemem …`（不是 `uv run cuemem …`），数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`cuemem serve` 启动通用助手，因为导购演示的商品目录只在仓库里（`cuemem demo` 读剧本旁边的 `catalog.json`）。CI 每次推送都在仓库外装 wheel，跑命令行、SDK 与服务。
+
 没有 Key 时也可以离线体验写入与检索，向量改用哈希近似：在命令前加 `CUEMEM_EMBEDDING__BACKEND=hash`，回答仍然需要 LLM。
 
 对话 Agent 与演示（N8，只用通义）：
@@ -150,7 +161,21 @@ uv run python examples/quickstart.py --preset openai   # SDK 的完整示例
 
 演示步骤见 [demo/README.md](demo/README.md)。
 
-部署相关（N11、N12）。pip 安装后数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`docker compose up -d` 在 7860 端口同时提供界面、接口与记忆代理，并带一个 Qdrant 服务端。不用 Docker 时：
+复现：
+
+```bash
+uv run python scripts/reproduce.py --dry-run      # 列出 N2–N11 每个数字背后的步骤
+uv run python scripts/reproduce.py --only N9      # 最终评测（有本地缓存时几乎不花钱）
+uv run python scripts/reproduce.py --only N9 --cache-only   # LLM 只读本地缓存
+```
+
+复现脚本不改写冻结的控制器文件（训练那几步只与仓库里的文件核对），出错或达到花费上限时停下，不把不完整的报告复制进 `docs/results`。加 `--cache-only` 时未命中缓存就报错、不调用 API，跑完用 `git diff docs/results src/cuemem/read` 核对。N12 的数字不在脚本里，运行的命令见 `scripts/n12_baselines.py` 的说明。
+
+部署相关（N11、N12）。pip 安装后数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）。
+
+`cuemem serve` 与 `cuemem proxy` 监听非本机地址又没有 `CUEMEM_API_TOKEN` 时拒绝启动（只在可信的网络里不鉴权时加 `--insecure-no-auth`）。别的网站发来的浏览器请求一律 403；监听本机地址时只接受 Host 为 127.0.0.1、localhost、[::1] 的请求，经反向代理或别的主机名访问时把这些主机名写进 `CUEMEM_ALLOWED_HOSTS`（逗号分隔，可以写在 `.env` 里）。
+
+用 Docker 时先在 `.env` 里设好令牌（例如 `openssl rand -hex 32` 生成）。`docker compose up -d` 在宿主机的 127.0.0.1:7860 同时提供界面、接口与记忆代理，并带一个 Qdrant 服务端，没有令牌时直接报错；单个容器：`docker build -t cuemem .` 之后 `docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem`。镜像默认带本机向量（可选依赖 local），`--build-arg EXTRAS=` 构建小镜像。不用 Docker 时：
 
 ```bash
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1        # Qdrant 服务端（本地模式同一时间只允许一个进程打开数据目录）
@@ -208,6 +233,7 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 | N10 | 包装 | 已完成 |
 | N11 | 测试集之后的补做 | 已完成 |
 | N12 | 对标开源同类项目：SDK、记忆代理、预设、导出导入、Docker | 已完成 |
+| N12 后续 | 全面体检：七个视角找问题，修掉 24 处，评测请求不变 | 已完成 |
 
 ## 结果
 

@@ -36,7 +36,14 @@ m.search("Where do I live now?", user_id="alice")  # the controller decides how 
 m.answer("Where do I live now?", user_id="alice")  # an answer that cites the facts it used
 m.history(events[0]["id"])  # every version of the fact: when and why it changed
 m.delete(events[0]["id"], dry_run=True)  # what forgetting would delete, before deleting anything
+
+# A multi-turn chat: each add is searchable at once, and the chat is extracted once, when it ends
+with m.run(user_id="alice") as run_id:
+    m.add("My budget for running shoes is $180.", user_id="alice", run_id=run_id)
+    m.add("Actually, make that $150.", user_id="alice", run_id=run_id)
 ```
+
+Calling `add` once per turn with the same `run_id` also works, but it re-extracts the whole run every time and replays derived memory; wrap the chat in `with m.run(...)` instead. The SDK defaults to `peak_policy="warn"`: during DeepSeek's weekday peak hours calls go out at peak price instead of pausing until the peak ends; batch jobs that want the off-peak price pass `Memory(peak_policy="wait")`.
 
 Or as a drop-in proxy for any app that uses an OpenAI-compatible API, with no code changes beyond the base URL:
 
@@ -53,9 +60,11 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 # Response headers say what the controller did: X-CueMem-Level: L0 (no recall) / L1 / L2
 ```
 
+The proxy accepts JSON requests only (`curl -d` needs `-H 'Content-Type: application/json'`) and refuses browser requests from other origins. Recalled memories go into a `<memory>` block that tells the model they are quoted from past conversations, information and not instructions, and a stored `</memory>` cannot close the block early. This reduces prompt injection from stored memories but cannot rule it out.
+
 Or inside an agent framework: the OpenAI Agents SDK, LangGraph / LangChain, and Claude's memory tool, with the controller deciding before every model call ([integrations](docs/en/integrations.md)).
 
-Also: an HTTP API with a memory browser (`cuemem serve`), an MCP server, export and import of a user's memory (`cuemem export / import`), and a Docker image (`docker compose up`). See [Quick start](#quick-start) and the [examples](examples/).
+Also: an HTTP API with a memory browser (`cuemem serve`), an MCP server, export and import of a user's memory (`cuemem export / import`), and a Docker image (`docker compose up`, with an access token). See [Quick start](#quick-start) and the [examples](examples/).
 
 ## Results at a glance
 
@@ -183,6 +192,8 @@ uv run cuemem export --space demo-en -o demo-en.json          # raw log + photos
 uv run cuemem --preset ollama doctor                          # the same commands work with any preset
 ```
 
+Without a checkout, install from GitHub: `pip install "cuemem[local] @ git+https://github.com/FlickYan/cuemem"`. The commands are then `cuemem …` instead of `uv run cuemem …`, data goes to `~/.cuemem` (`CUEMEM_HOME` to change it), and `cuemem serve` starts the plain assistant, because the shop demo's product catalogue exists only in the repository (`cuemem demo` reads the `catalog.json` next to its script). CI installs the wheel outside the repository and runs the CLI, the SDK and the server on every push.
+
 Command-line messages are in Chinese. The agent, the web UI, the demo and the MCP tools are in English. Without API keys you can still try writing and retrieval offline with hash embeddings (`CUEMEM_EMBEDDING__BACKEND=hash`); answering still needs an LLM.
 
 The agent demo uses Qwen models only:
@@ -202,13 +213,20 @@ Evaluation and reproduction:
 ```bash
 uv run cuemem data download               # LongMemEval_S, LoCoMo, MemLens 32K / 128K
 uv run cuemem eval run --split pilot10    # 10-question smoke run of the baselines (~$0.4)
-uv run python scripts/reproduce.py --dry-run      # every step behind every number in the docs
+uv run python scripts/reproduce.py --dry-run      # every step behind the N2–N11 numbers
 uv run python scripts/reproduce.py --only N9      # the final evaluation (near-free with the local cache)
+uv run python scripts/reproduce.py --only N9 --cache-only   # LLM requests from the local cache only
 ```
+
+The script never overwrites the frozen controller files (the training steps only check them against the committed files) and stops instead of copying an errored or budget-stopped report into `docs/results`. With `--cache-only` a cache miss is an error rather than an API call; check the outcome with `git diff docs/results src/cuemem/read`. The N12 numbers are not in the script: the docstring of `scripts/n12_baselines.py` lists their runs.
 
 Development: `uv run pytest` (offline, no keys), `uv run pytest -m live` (needs keys), `uv run ruff check . && uv run mypy`.
 
-Deployment (N11, N12). By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory. Installed with pip, it keeps its data in `~/.cuemem` (`CUEMEM_HOME` to change it). `docker compose up -d` runs the UI, the HTTP API and the memory proxy on port 7860 with a Qdrant server. Without Docker, run a Qdrant server and protect the API with a token:
+Deployment (N11, N12). By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory. Installed with pip, it keeps its data in `~/.cuemem` (`CUEMEM_HOME` to change it).
+
+`cuemem serve` and `cuemem proxy` refuse to listen beyond loopback without `CUEMEM_API_TOKEN` (add `--insecure-no-auth` to run without authentication on a trusted network). Browser requests from other origins get 403, and on a loopback address only 127.0.0.1, localhost and [::1] are accepted as the Host; behind a reverse proxy or under another hostname, list those hostnames in `CUEMEM_ALLOWED_HOSTS` (comma-separated, can go in `.env`).
+
+For Docker, put a token in `.env` first (for example from `openssl rand -hex 32`). `docker compose up -d` then runs the UI, the HTTP API and the memory proxy on 127.0.0.1:7860 with a Qdrant server, and stops with an error if the token is missing; a single container is `docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem` after `docker build -t cuemem .`. The image includes local embeddings (the `local` extra); `--build-arg EXTRAS=` builds a slim one. Without Docker, run a Qdrant server and protect the API with a token:
 
 ```bash
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1
@@ -243,11 +261,11 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
 | Comparison with open-source peers: capabilities, published scores, what N12 borrowed, what is missing | [English](docs/en/landscape.md) · [中文](docs/landscape.md) |
 | Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | [English](docs/en/integrations.md) · [中文](docs/integrations.md) |
-| Decision records (67 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| Decision records (68 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
 | N12 results: same-protocol external baselines on LoCoMo; the LongMemEval session-ID leak, its fix and ablation | 中文: [external baselines](docs/results/n12-baselines/README.md), [session-ID leak](docs/results/n12-leak/README.md) |
 | Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 
-The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
+The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). After N12, a full audit fixed 24 verified problems in forgetting, concurrency, security, SDK writes, evaluation hygiene, packaging and read-path performance, without changing any evaluation request (D-068 in the decision records). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
 
 ## Licence
 

@@ -161,4 +161,4 @@ N11 在原协议下（抽取与向量用通义、回答 deepseek-flash、判分 
 3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的元数据与过期**：Mem0 的 `metadata` 过滤与 `expiration_date`、Supermemory 的临时事实自动过期。
-6. **命令行的英文界面**：CLI 的提示目前是中文；SDK、HTTP、MCP、代理与界面是英文。
+6. **面向开发者的英文文字**：命令行的提示、核心模块抛出的大部分异常（包括 HTTP 接口的报错）与 SDK 的大部分文档字符串是中文，也没有英文的 SDK、HTTP 接口与代理参考；SDK 自己的报错、MCP 工具与界面是英文（N12 之后的体检，D-068）。
