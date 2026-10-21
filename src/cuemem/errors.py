@@ -53,3 +53,14 @@ class ConcurrentWriteError(CueMemError):
 
 class StorageLockedError(CueMemError):
     """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
+
+
+class MemoryAPIError(CueMemError):
+    """远程记忆接口（cuemem.client.MemoryClient）的出错里，没有对应的本地异常的那些：令牌不对、
+    连不上服务、找不到接口等。status 是 HTTP 状态码（连不上时为 None），code 是 /api/v1 的
+    错误码。"""
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code

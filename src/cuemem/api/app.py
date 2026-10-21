@@ -1,7 +1,8 @@
 """HTTP 接口（FastAPI，N8）：会话与对话、记忆浏览、遗忘、巩固，以及"只检索不回答"的记忆服务。
 
 界面（Gradio）挂在同一个应用的根路径上，与接口共用一个服务对象（api/ui.py）。
-接口文档：启动后打开 /docs。
+接口文档：启动后打开 /docs。/api/v1 下是 Mem0 形状的记忆接口，与 Python SDK 一一对应
+（api/memories.py，远程客户端是 cuemem.client.MemoryClient）。
 
 访问令牌（N11）：设置环境变量 CUEMEM_API_TOKEN 后，/api 下除健康检查外的接口都要带
 Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密码填令牌）。不设置时不鉴权，
@@ -39,12 +40,14 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from cuemem import __version__
 from cuemem.agent import Reply
 from cuemem.api.failures import provider_failure
+from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError
 from cuemem.memory import RecallMode
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router
+from cuemem.sdk import Memory
 
 if TYPE_CHECKING:
     from cuemem.api.proxy import MemoryProxy
@@ -217,7 +220,8 @@ def create_app(
         version=__version__,
         description="Long-term multimodal memory for LLM agents: chat, browse, forget, recall.",
     )
-    api = APIRouter(dependencies=[Depends(_token_check(token))] if token else [])
+    guarded = [Depends(_token_check(token))] if token else []
+    api = APIRouter(dependencies=guarded)
 
     @app.get("/api/health")  # 不鉴权：给负载均衡与监控探活用
     def health() -> dict[str, Any]:
@@ -369,12 +373,13 @@ def create_app(
             return service.consolidate(space)
 
     app.include_router(api)
+    # Mem0 形状的记忆接口（/api/v1）：与界面、记忆代理共用同一个记忆系统，鉴权相同
+    app.include_router(memories_router(Memory.from_system(service.system), dependencies=guarded))
+    install_error_format(app)
     if proxy is not None:
         from cuemem.api.proxy import proxy_router
 
-        app.include_router(
-            proxy_router(proxy, dependencies=[Depends(_token_check(token))] if token else [])
-        )
+        app.include_router(proxy_router(proxy, dependencies=guarded))
     if ui and importlib.util.find_spec("gradio") is None:
         # 界面是可选依赖 cuemem[ui]：没装时照常提供接口与记忆代理
         logger.warning("演示界面要用可选依赖 ui（Gradio），没有安装：%s", extra_remedy("ui"))
