@@ -188,7 +188,7 @@ class Probe:
         """exclude：已经在上下文里的轮与图片（Agent 的工作记忆），不算作探针的命中。"""
         started = time.perf_counter()
         cands = self.l1.candidates(
-            space_id, question, question_time, cfg or L1Config(), exclude=exclude
+            space_id, question, question_time, cfg or L1Config(), exclude=exclude, probe=True
         )
         features = {
             **query_features(question, cands.query),

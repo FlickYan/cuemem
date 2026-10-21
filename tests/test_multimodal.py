@@ -168,6 +168,28 @@ def test_text_only_requests_stay_strings(
     assert isinstance(fake_api.chat_requests[-1]["messages"][-1]["content"], str)
 
 
+def test_caption_routes_are_searched_only_where_captions_exist(
+    mm: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """有图片描述的空间照常检索描述这一路；某种描述一条都没有时不检索（结果一定是空的）。"""
+    system, _ = mm
+    kinds: list[str] = []
+    real = system.vectors._query
+
+    def query(space_id: str, vector: Any, using: str, k: int, flt: Any) -> Any:
+        kinds.append(flt.must[0].match.any[0])
+        return real(space_id, vector, using, k, flt)
+
+    monkeypatch.setattr(system.vectors, "_query", query)
+    cands = system.l1.candidates("pics", "sign", ASKED, L1Config())
+    assert kinds == ["round", "fact", "image"] and cands.routes[("image", "dense")]
+    iso = [u.id for u in system.db.list_units("pics", kinds=["image_iso"])]
+    system.db.delete_units("pics", iso)
+    kinds.clear()
+    cands = system.l1.candidates("pics", "sign", ASKED, L1Config(image_kind="image_iso"))
+    assert kinds == ["round", "fact"] and cands.routes[("image_iso", "dense")] == []
+
+
 def test_visual_route_finds_images(mm: tuple[MemorySystem, ScriptedModel]) -> None:
     system, _ = mm
     cfg = L1Config(image_kind=None, visual_weight=1.0, attach_images=2)

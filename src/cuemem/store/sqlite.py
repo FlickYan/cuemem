@@ -521,6 +521,16 @@ class MemoryDB:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_unit(r) for r in fetched]
 
+    def has_units(self, space_id: str, kinds: Sequence[str]) -> bool:
+        """空间里有没有这几种记忆单元（走 idx_units_space，不扫表）。"""
+        marks = ", ".join("?" for _ in kinds)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM units WHERE space_id = ? AND kind IN ({marks}) LIMIT 1",
+                [space_id, *kinds],
+            ).fetchone()
+        return row is not None
+
     def delete_units(self, space_id: str, ids: Sequence[str]) -> int:
         if not ids:
             return 0

@@ -86,6 +86,8 @@ class Recall:
     router: Router | None = None  # 实际用的控制器（没有模型文件时 learned 退回 rule）
     plan: QueryPlan | None = None  # L2 的检索计划（阅读提示用）
     details: dict[str, Any] = field(default_factory=dict)  # L2 的计划、充分性检查等
+    # 学到的控制器的探针打过分的候选（mode="auto" 时）：L0 改走 L1 时直接打包（见 retrieve）
+    candidates: L1Candidates | None = None
 
 
 @dataclass
@@ -1222,11 +1224,17 @@ class MemorySystem:
         l2: L2Config | None = None,
         exclude: Collection[str] = (),
         cache_scope: str | None = None,
+        candidates: L1Candidates | None = None,
     ) -> Recall:
         """只检索、不回答：按 mode 取记忆（auto 由检索控制器选档），返回交给回答模型的材料。
 
         ask() 与 Agent（N8）共用这一步。exclude 是已经在上下文里的轮与图片的 ID
         （Agent 的工作记忆），不参与探针与检索。
+
+        探针打过分的候选不丢：控制器选 L1 时直接打包；选 L2 时原问题的召回用探针的结果（见
+        L2Retriever.search）；返回的 Recall 带着它们，调用方把 L0 改走 L1 时（recall_listing 的
+        at_least_l1）以 mode="l1" 与 candidates 传回来、直接打包，不再检索一遍。candidates 必须
+        是同一个问题、同一个问题时间、同样的 exclude 与 L1 配置下的探针结果。
 
         不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
@@ -1244,7 +1252,8 @@ class MemorySystem:
             level: str = mode
             decision: RouteDecision | None = None
             used: Router | None = None
-            candidates: L1Candidates | None = None
+            if mode != "l1":
+                candidates = None
             if mode == "auto":
                 decision, candidates, used = self._route(
                     space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
@@ -1256,7 +1265,7 @@ class MemorySystem:
                     l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
             if level == "l0":
                 view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
-                return Recall("l0", view, decision, used)
+                return Recall("l0", view, decision, used, candidates=candidates)
             if level == "l1":
                 cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
                 if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
@@ -1271,10 +1280,16 @@ class MemorySystem:
                     image_mode=image_mode(cfg),
                     attach=result.attach,
                 )
-                return Recall("l1", view, decision, used)
+                return Recall("l1", view, decision, used, candidates=candidates)
             l2_cfg = l2 or L2Config()
             deep = self.l2.search(
-                space_id, question, when, l2_cfg, cache_scope=cache_scope, exclude=exclude
+                space_id,
+                question,
+                when,
+                l2_cfg,
+                cache_scope=cache_scope,
+                exclude=exclude,
+                probe=candidates,
             )
             view = MemoryView(
                 rounds=deep.rounds,
@@ -1284,7 +1299,15 @@ class MemorySystem:
                 image_mode=image_mode(l2_cfg.l1),
                 attach=deep.attach,
             )
-            return Recall("l2", view, decision, used, plan=deep.plan, details=deep.details())
+            return Recall(
+                "l2",
+                view,
+                decision,
+                used,
+                plan=deep.plan,
+                details=deep.details(),
+                candidates=candidates,
+            )
 
     def _route(
         self,

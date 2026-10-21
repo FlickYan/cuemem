@@ -192,12 +192,16 @@ def recall_listing(
     """检索控制器选档、取回记忆，原样交给调用方（另一个 Agent）去推理，不调用回答模型。
 
     at_least_l1：调用方已经决定要查记忆（例如 MCP 的 recall），控制器选了 L0 时改走 L1，
-    控制器只决定要不要查得更深。
+    控制器只决定要不要查得更深。改走 L1 时直接打包探针已经打过分的候选（两次用同一个问题
+    时间），不再检索一遍。
     """
-    recall = system.retrieve(space, query, question_time=at, mode=mode, router=router, lam=lam)
+    when = naive_local(at) if at is not None else datetime.now()
+    recall = system.retrieve(space, query, question_time=when, mode=mode, router=router, lam=lam)
     raised = at_least_l1 and recall.level == "l0"
     if raised:
-        recall = system.retrieve(space, query, question_time=at, mode="l1")
+        recall = system.retrieve(
+            space, query, question_time=when, mode="l1", candidates=recall.candidates
+        )
     view = recall.view
     decision = recall.decision
     return {
