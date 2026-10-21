@@ -34,6 +34,31 @@ def test_db_writes_are_idempotent(tmp_path: Path) -> None:
     assert db.list_spaces()[0]["turns"] == len(turns)
 
 
+def test_nested_transactions_commit_only_at_the_outermost(tmp_path: Path) -> None:
+    """嵌套的事务：外层出错时里层的写入一起撤销（以前里层自己提交了，撤不回来）；里层出错只撤销
+    里层，外层接着写、照常提交。在线写入把发言、"轮"与巩固任务放在一个事务里（D-068 之后）。"""
+    path = tmp_path / "memory.sqlite"
+    db = MemoryDB(path)
+    session = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8")).sessions[0]
+    turns = build_turns("demo", session)
+    with pytest.raises(RuntimeError, match="boom"), db.transaction():
+        db.ensure_space("demo")
+        db.add_session("demo", session.session_id, session.started_at)
+        db.add_turns(turns)
+        raise RuntimeError("boom")
+    assert MemoryDB(path).list_spaces() == []  # 另一个连接也看不到：什么都没提交
+
+    with db.transaction():
+        db.ensure_space("demo")
+        with pytest.raises(RuntimeError, match="inner"), db.transaction():
+            db.add_session("demo", session.session_id, session.started_at)
+            raise RuntimeError("inner")
+        db.set_meta("k", "v")
+    other = MemoryDB(path)
+    assert [s["space_id"] for s in other.list_spaces()] == ["demo"]
+    assert other.get_sessions("demo") == {} and other.get_meta("k") == "v"
+
+
 def test_scrub_leaves_no_deleted_text_without_vacuum(tmp_path: Path) -> None:
     """遗忘之后的 scrub 只把 WAL 写回并截断，不 VACUUM：删除时 secure_delete 已经覆写了
     被删的内容，长到溢出页里的发言也一样。"""

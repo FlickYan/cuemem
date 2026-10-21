@@ -7,10 +7,11 @@ import base64
 import io
 import itertools
 import re
+import sqlite3
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,8 @@ from scripted import ScriptedModel
 from cuemem import AsyncMemory, Memory
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
-from cuemem.errors import ConcurrentWriteError
+from cuemem.embed.base import EmbedKind
+from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
 from cuemem.evidence import stored_text
 from cuemem.sdk import parse_messages, space_for
 
@@ -333,6 +335,50 @@ def test_add_raises_when_a_turn_was_not_written(
     with pytest.raises(ConcurrentWriteError, match="chat"):
         memory.add("I like jazz", user_id="alice", run_id="chat", infer=False)
     assert [t.text for t in memory.system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
+
+
+def test_a_failed_add_leaves_nothing_and_its_retry_writes_once(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """向量接口出错：add 抛出，日志、"轮"、巩固任务与空间都不留；调用方原样重试时只写一遍。
+    以前发言先提交了：重试之后同一句话在日志里有两遍，第一遍没有"轮"（检索不到），抽取两次。"""
+    system = memory.system
+    embed = system.embedder.embed
+    outage = iter([True])
+
+    def flaky(texts: Sequence[str], kind: EmbedKind) -> Any:
+        if next(outage, False):
+            raise EmbeddingAPIError("向量接口返回 HTTP 503", status=503)
+        return embed(texts, kind)
+
+    monkeypatch.setattr(system.embedder, "embed", flaky)
+    with pytest.raises(EmbeddingAPIError):
+        memory.add("I live in Berlin", user_id="alice", run_id="r1")
+    assert system.db.list_spaces() == [] and system.db.get_jobs("alice") == []
+
+    out = memory.add("I live in Berlin", user_id="alice", run_id="r1")
+    turns = system.db.get_turns("alice")
+    assert [(t.idx, t.text) for t in turns] == [(0, "I live in Berlin")]
+    assert out["turn_ids"] == [turns[0].id]
+    rounds = system.db.list_units("alice", kinds=["round"])
+    assert [u.meta["turn_indices"] for u in rounds] == [[0]]
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == ["r1"]
+
+
+def test_a_write_failing_after_the_vectors_takes_them_back(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """数据库那一步出错时（向量已经写进向量库）：整个事务撤销，这次写的向量也删掉。以前发言已经
+    提交，向量库里有点、数据库里却没有"轮"。"""
+    system = memory.system
+
+    def broken(units: Sequence[Any]) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(system.db, "add_units", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        memory.add("I live in Berlin", user_id="alice", run_id="r1")
+    assert system.db.get_turns("alice") == [] and system.vectors.count("alice") == 0
 
 
 def _descending_uuids(monkeypatch: pytest.MonkeyPatch) -> None:

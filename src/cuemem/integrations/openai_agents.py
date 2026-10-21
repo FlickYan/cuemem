@@ -957,8 +957,8 @@ def _number(segment: str) -> int:
 
 
 def _merge_round(system: MemorySystem, space: str, segment: str, first_id: str) -> None:
-    """同一轮里工具调用之后的回复并进这一轮：删掉上一轮与新写入的"轮"，按现存的发言重建
-    （与遗忘之后重建相同，writer.reindex_sessions）。"""
+    """同一轮里工具调用之后的回复并进这一轮：上一轮与新写入的"轮"换成按现存的发言重建的
+    （writer.replace_rounds：先向量化，出错时原来的"轮"都还在）。"""
     turns = sorted(system.db.get_turns(space, segment), key=lambda t: t.idx)
     position = next((k for k, t in enumerate(turns) if t.id == first_id), 0)
     if position == 0:
@@ -969,9 +969,7 @@ def _merge_round(system: MemorySystem, space: str, segment: str, first_id: str) 
         for u in system.db.list_units(space, kinds=["round"], session_ids=[segment])
         if touched & set(u.source_turn_ids)
     ]
-    system.vectors.delete(space, stale)
-    system.db.delete_units(space, stale)
-    system.writer.reindex_sessions(space, [segment])
+    system.writer.replace_rounds(space, segment, stale)
 
 
 def _existing(system: MemorySystem, space: str, turn_ids: Sequence[str]) -> set[str]:

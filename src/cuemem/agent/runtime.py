@@ -344,28 +344,26 @@ class Agent:
 
             write_started = time.perf_counter()
             user_idx = session.next_idx
-            self.system.append(
-                space,
-                SessionIn(
-                    session_id=session.session_id,
-                    started_at=session.started_at,
-                    turns=[
-                        TurnIn(role="user", text=text, ts=when, images=images),
-                        TurnIn(role="assistant", text=plain, ts=when),
-                    ],
-                ),
-                first_idx=user_idx,
+            exchange = SessionIn(
+                session_id=session.session_id,
+                started_at=session.started_at,
+                turns=[
+                    TurnIn(role="user", text=text, ts=when, images=images),
+                    TurnIn(role="assistant", text=plain, ts=when),
+                ],
             )
+            with self.system.appending(space, [(exchange, user_idx)]):
+                # 溯源：这次回复引用了哪些记忆（遗忘时沿引用扩散，见 MemorySystem.forget）。与这一轮
+                # 在同一个事务里提交：写入出错时都不留，这一轮重来时不会写两遍
+                self.system.db.add_provenance(
+                    space,
+                    stable_id(space, session.session_id, user_idx + 1),
+                    [memory.refs[ref] for ref in cited],
+                )
             session.next_idx += 2
             # 之后各轮（工作记忆里的图、找同款的 u1）改读记忆里存的那份，字节相同、请求不变：
             # 调用方的文件（HTTP 的上传、界面的临时文件）用完就能删，遗忘删掉原图后不留副本
             uploads = self._stored_uploads(space, session.session_id, user_idx, uploads)
-            # 溯源：这次回复引用了哪些记忆（遗忘时沿引用扩散，见 MemorySystem.forget）
-            self.system.db.add_provenance(
-                space,
-                stable_id(space, session.session_id, user_idx + 1),
-                [memory.refs[ref] for ref in cited],
-            )
             timings["write"] = _ms(write_started)
             for label, path in uploads:
                 session.uploads[label] = path

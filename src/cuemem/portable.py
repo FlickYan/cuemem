@@ -121,10 +121,11 @@ def import_space(
                 turns = [_turn_in(t, Path(scratch)) for t in chunk]
                 piece = SessionIn(session_id=session["session_id"], started_at=started, turns=turns)
                 chunks.append((piece, int(chunk[0]["idx"])))
-        for session_in, first_idx in chunks:
-            report = system.append(target, session_in, first_idx)
-            turns_added += report.turns_added
-            images_added += report.images_added
+        # 整个文件在一个事务里提交：向量化中途出错时一条都不写，重试从头开始（每段各向量化一次，
+        # 与以前逐段写入时的请求相同）
+        if chunks:
+            with system.appending(target, chunks) as report:
+                turns_added, images_added = report.turns_added, report.images_added
     out: dict[str, Any] = {
         "space_id": target,
         "sessions": len(data.get("sessions", [])),

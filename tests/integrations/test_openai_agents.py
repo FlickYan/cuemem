@@ -450,6 +450,29 @@ def test_a_question_and_its_answer_form_one_round(memory: Memory, streamed: bool
     assert turns(memory, "oa-monday") == [("user", "I live in Berlin"), ("assistant", "Noted!")]
 
 
+def test_a_failed_merge_keeps_the_rounds(memory: Memory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """工具调用之后的回复并进这一轮时向量接口出错：原来的"轮"都还在（问话照样检索得到）。以前
+    先删掉上一轮与新写入的"轮"再重建，出错时这两轮的发言一个"轮"都没有了。"""
+    embed = memory.system.embedder.embed
+
+    def merge_down(texts: Any, kind: Any) -> Any:
+        if any("Let me check.\nAssistant: Berlin." in t for t in texts):
+            raise RuntimeError("embedding service down")
+        return embed(texts, kind)
+
+    monkeypatch.setattr(memory.system.embedder, "embed", merge_down)
+    script = AgentScript(
+        [[*reply("Let me check."), *call("recall", {"query": "home"})], reply("Berlin.")]
+    )
+    agent = Agent(name="a", model=script, tools=memory_tools(memory, user_id="alice"))
+    session = CueMemSession("monday", memory, user_id="alice")
+    run(agent, "Where do I live?", session=session)  # 写不进长期记忆不影响对话
+    assert rounds(memory, "oa-monday") == [
+        "User: Where do I live?\nAssistant: Let me check.",
+        "Assistant: Berlin.",
+    ]
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_input_blocked_by_a_guardrail_is_not_stored(memory: Memory, parallel: bool) -> None:
     @input_guardrail(run_in_parallel=parallel)

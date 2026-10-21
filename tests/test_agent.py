@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,8 @@ from cuemem.agent import Agent, ContextBudget, Tool, ToolResult
 from cuemem.agent.context import Exchange, citations, evict, strip_citations
 from cuemem.config import Settings
 from cuemem.core.models import Conversation
+from cuemem.embed.base import EmbedKind
+from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
 from cuemem.store.media import image_data_url
 
@@ -106,6 +108,36 @@ def test_working_memory_is_written_and_excluded(system: MemorySystem, model: Scr
     assert session.session_id not in sessions
     # 会话进行中不登记巩固任务
     assert not [j for j in system.db.get_jobs("demo") if j["session_id"] == session.session_id]
+
+
+def test_a_failed_write_back_leaves_nothing_and_the_turn_can_be_redone(
+    system: MemorySystem, model: ScriptedModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """写回这一轮时向量接口出错：这一问一答与它的溯源都不留，会话的序号不动；同一句话重来一次
+    只写一遍，"轮"与溯源都齐。以前发言先提交了：没有"轮"、也没有溯源（遗忘时追不到这次回复），
+    重来时同样的序号又被悄悄跳过（INSERT OR IGNORE）。"""
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    embed = system.embedder.embed
+
+    def documents_down(texts: Sequence[str], kind: EmbedKind) -> Any:
+        if kind == "document":  # 检索时的查询照常向量化
+            raise EmbeddingAPIError("向量接口返回 HTTP 503", status=503)
+        return embed(texts, kind)
+
+    model.agent = lambda body: "Max 是金毛 [f2]。"
+    monkeypatch.setattr(system.embedder, "embed", documents_down)
+    with pytest.raises(EmbeddingAPIError):
+        agent.chat(session, "Max 是什么品种？")
+    assert system.db.get_turns("demo", session.session_id) == [] and session.next_idx == 0
+
+    monkeypatch.setattr(system.embedder, "embed", embed)
+    agent.chat(session, "Max 是什么品种？")  # 回答命中 LLM 缓存，与上一次相同
+    turns = system.db.get_turns("demo", session.session_id)
+    assert [(t.idx, t.text) for t in turns] == [(0, "Max 是什么品种？"), (1, "Max 是金毛。")]
+    rounds = system.db.list_units("demo", kinds=["round"], session_ids=[session.session_id])
+    assert [u.text for u in rounds] == ["User: Max 是什么品种？\nAssistant: Max 是金毛。"]
+    assert len(system.db.provenance("demo", turns[1].id)) == 1 and session.next_idx == 2
 
 
 def test_session_end_consolidates(system: MemorySystem, model: ScriptedModel) -> None:

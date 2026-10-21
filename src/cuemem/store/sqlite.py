@@ -186,6 +186,7 @@ class MemoryDB:
         self.path = path
         self._conn = sqlite3.connect(str(path) if path else ":memory:", check_same_thread=False)
         self._lock = threading.RLock()
+        self._depth = 0  # 嵌套的 transaction() 层数（只在持有 _lock 时读写）
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
@@ -206,14 +207,38 @@ class MemoryDB:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """在一个事务里执行多条写入：要么全部生效，要么全部回滚。"""
+        """在一个事务里执行多条写入：要么全部生效，要么全部回滚。
+
+        可以嵌套：只有最外层提交；里层是保存点，里层出错只撤销里层，异常照常往外抛。以前里层
+        提交时连外层已经写的一起提交了，外层随后出错也撤不回来（在线写入把发言、"轮"与巩固
+        任务放在一个事务里，见 OnlineWriter.writing）。"""
         with self._lock:
+            if self._depth:
+                name = f"nested_{self._depth}"
+                self._conn.execute(f"SAVEPOINT {name}")
+                self._depth += 1
+                try:
+                    yield self._conn
+                except BaseException:
+                    if self._conn.in_transaction:  # 有的错误（磁盘满等）SQLite 已经整个回滚了
+                        self._conn.execute(f"ROLLBACK TO {name}")
+                        self._conn.execute(f"RELEASE {name}")
+                    raise
+                finally:
+                    self._depth -= 1
+                self._conn.execute(f"RELEASE {name}")
+                return
+            if not self._conn.in_transaction:  # 显式开始：里层的保存点不会自己成为事务、提前提交
+                self._conn.execute("BEGIN")
+            self._depth = 1
             try:
                 yield self._conn
+                self._conn.commit()
             except BaseException:
                 self._conn.rollback()
                 raise
-            self._conn.commit()
+            finally:
+                self._depth = 0
 
     # ---------- 元信息 ----------
 

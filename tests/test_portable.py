@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,8 @@ from cuemem import Memory
 from cuemem.cli import app
 from cuemem.config import PathsConfig, Settings
 from cuemem.core.models import Turn
+from cuemem.embed.base import EmbedKind
+from cuemem.errors import EmbeddingAPIError
 from cuemem.portable import FORMAT, import_space
 from cuemem.write.extract import INSTRUCTIONS_HEADER, Extractor
 
@@ -152,6 +154,39 @@ def _export(*images: dict[str, Any]) -> dict[str, Any]:
 
 def _image(data: bytes, mime: str = "image/png", sha256: str | None = None) -> dict[str, Any]:
     return {"sha256": sha256, "mime": mime, "data": base64.b64encode(data).decode("ascii")}
+
+
+def test_an_import_that_fails_midway_writes_nothing(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """导入到一半向量接口出错：一条发言都不写（以前前面的会话已经提交了，只有一半的空间），
+    重试时完整导入，每个会话一个巩固任务。"""
+    sessions = [
+        {
+            "session_id": sid,
+            "started_at": DAY.isoformat(),
+            "turns": [{"idx": 0, "role": "user", "text": text, "ts": DAY.isoformat()}],
+        }
+        for sid, text in (("s1", "I run every Sunday"), ("s2", "My birthday is in May"))
+    ]
+    data = {"format": FORMAT, "version": 1, "space_id": "x", "sessions": sessions}
+    system = memory.system
+    embed = system.embedder.embed
+
+    def flaky(texts: Sequence[str], kind: EmbedKind) -> Any:
+        if any("birthday" in t for t in texts):
+            raise EmbeddingAPIError("向量接口返回 HTTP 503", status=503)
+        return embed(texts, kind)
+
+    monkeypatch.setattr(system.embedder, "embed", flaky)
+    with pytest.raises(EmbeddingAPIError):
+        memory.load(data, user_id="bob")
+    assert system.db.list_spaces() == [] and system.vectors.count("bob") == 0
+
+    monkeypatch.setattr(system.embedder, "embed", embed)
+    assert memory.load(data, user_id="bob")["turns_added"] == 2
+    assert sorted(j["session_id"] for j in system.db.get_jobs("bob")) == ["s1", "s2"]
+    assert len(system.db.list_units("bob", kinds=["round"])) == 2
 
 
 def test_import_never_writes_outside_its_scratch_dir(memory: Memory, tmp_path: Path) -> None:
