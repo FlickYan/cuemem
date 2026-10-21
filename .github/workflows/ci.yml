@@ -13,7 +13,8 @@ jobs:
         with:
           enable-cache: true
       - name: 安装依赖
-        run: uv sync --locked --extra integrations  # 框架集成的测试与类型检查也要跑（N12）
+        # 界面与评测的测试要 ui、eval（开发依赖组里也有）；框架集成的测试与类型检查也要跑（N12）
+        run: uv sync --locked --extra ui --extra eval --extra integrations
       - name: 代码风格
         run: |
           uv run ruff check .
@@ -24,7 +25,8 @@ jobs:
         run: uv run pytest
 
   package:
-    # pip 安装的路径：在仓库外装上构建出的 wheel，跑命令行、SDK 与 HTTP 接口（离线，不需要 API Key）
+    # pip 安装的路径：在仓库外装上构建出的 wheel（只有核心依赖，不带可选依赖），跑命令行、SDK、
+    # HTTP 接口与记忆代理（离线，不需要 API Key）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,25 +60,34 @@ jobs:
           CUEMEM_EMBEDDING__BACKEND: hash
         run: |
           export PATH="$RUNNER_TEMP/venv/bin:$PATH"
+          # 核心依赖不带界面与评测的包（它们在可选依赖 ui、eval 里）
+          python -c "import importlib.util as u; bad = [m for m in ('gradio', 'matplotlib', 'sklearn') if u.find_spec(m)]; assert not bad, bad"
           cuemem --help
           cuemem doctor
+          cuemem mcp --help > /dev/null
+          cuemem proxy --help > /dev/null
           python "$GITHUB_WORKSPACE/scripts/smoke_wheel.py"
-          # 默认场景：包里没有导购演示的商品目录，cuemem serve 改用通用助手照常起来
-          cuemem serve --no-ui --port 7860 > serve.log 2>&1 &
+          # 评测要画图：没装 eval 时说明要装什么
+          if cuemem eval report nothing > eval.log 2>&1; then exit 1; fi
+          grep -F 'cuemem[eval]' eval.log || { cat eval.log; exit 1; }
+          # 默认场景：包里没有导购演示的商品目录，cuemem serve 改用通用助手照常起来；
+          # 没装界面时只启动接口，并说明怎么装
+          cuemem serve --port 7860 > serve.log 2>&1 &
           pid=$!
           for _ in $(seq 60); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 1; done
           curl -fsS http://127.0.0.1:7860/api/health || { cat serve.log; exit 1; }
           kill "$pid"
+          grep -F 'cuemem[ui]' serve.log || { cat serve.log; exit 1; }
 
   docker:
-    # 镜像能构建、带着本机向量的可选依赖（预设 deepseek 要用），启动后 /api/health 正常
+    # 镜像能构建、带着界面与本机向量的可选依赖（预设 deepseek 要用），启动后 /api/health 正常
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: 构建镜像
         run: docker build -t cuemem:ci .
-      - name: 本机向量的可选依赖在镜像里
-        run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed"
+      - name: 界面与本机向量的可选依赖在镜像里
+        run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed, gradio"
       - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设访问令牌）
         run: |
           docker run -d --name cuemem -p 127.0.0.1:7860:7860 \

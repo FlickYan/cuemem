@@ -24,17 +24,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
-from matplotlib.figure import Figure
-from matplotlib.legend import Legend
-from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
-from matplotlib.transforms import Bbox
+from typing import TYPE_CHECKING, Any
 
 from cuemem.config import home_dir
 from cuemem.evals.datasets import (
@@ -48,6 +38,14 @@ from cuemem.evals.datasets import (
 )
 from cuemem.evals.metrics import bootstrap_ci, mean, percentile
 from cuemem.read.probe import DONT_KNOW
+
+# 画图才要 matplotlib（可选依赖 cuemem[eval]）：只读结果、汇总表格（判分抽检、命令行的总表）时
+# 不加载它
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from matplotlib.legend import Legend
+    from matplotlib.transforms import Bbox
 
 METHOD_LABELS = {
     "B0": ("无记忆", "B0 No memory"),
@@ -1031,6 +1029,12 @@ def plot_pareto(
     stats: Sequence[MethodStats], path: Path, *, mode: str, info: dict[str, Any]
 ) -> None:
     """准确率–每题名义成本散点图（x 为对数坐标），带 95% 置信区间竖线。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
     theme = THEMES[mode]
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
@@ -1114,6 +1118,8 @@ def _place_labels(
 ) -> None:
     """直接标签的防碰撞摆放：先试紧贴点的四个方位（右上、右下、左上、左下），都放不下时
     逐步拉远并画一条细引线连回自己的点；避开点、区间竖线、图例与已放的标签。"""
+    from matplotlib.transforms import Bbox
+
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()  # type: ignore[attr-defined]
     to_px = ax.transData.transform

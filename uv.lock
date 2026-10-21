@@ -643,9 +643,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
-    { name = "gradio" },
     { name = "httpx2" },
-    { name = "matplotlib" },
     { name = "mcp" },
     { name = "numpy" },
     { name = "openai" },
@@ -657,7 +655,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "qdrant-client" },
     { name = "rich" },
-    { name = "scikit-learn" },
     { name = "scipy" },
     { name = "typer" },
     { name = "uvicorn" },
@@ -666,6 +663,10 @@ dependencies = [
 [package.optional-dependencies]
 anthropic = [
     { name = "anthropic" },
+]
+eval = [
+    { name = "matplotlib" },
+    { name = "scikit-learn" },
 ]
 integrations = [
     { name = "anthropic" },
@@ -685,9 +686,13 @@ local = [
 openai-agents = [
     { name = "openai-agents" },
 ]
+ui = [
+    { name = "gradio" },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "cuemem", extra = ["eval", "ui"] },
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -701,7 +706,7 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'integrations'", specifier = ">=1.14" },
     { name = "fastapi", specifier = ">=0.143" },
     { name = "fastembed", marker = "extra == 'local'", specifier = ">=0.9" },
-    { name = "gradio", specifier = ">=6.30" },
+    { name = "gradio", marker = "extra == 'ui'", specifier = ">=6.30" },
     { name = "httpx2", specifier = ">=2.13.1" },
     { name = "langchain", marker = "extra == 'integrations'", specifier = ">=1.4" },
     { name = "langchain", marker = "extra == 'langgraph'", specifier = ">=1.4" },
@@ -709,7 +714,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.6" },
     { name = "langgraph", marker = "extra == 'integrations'", specifier = ">=1.2" },
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=1.2" },
-    { name = "matplotlib", specifier = ">=3.10" },
+    { name = "matplotlib", marker = "extra == 'eval'", specifier = ">=3.10" },
     { name = "mcp", specifier = ">=2.3" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "openai", specifier = ">=3.29.0" },
@@ -723,15 +728,16 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "qdrant-client", specifier = ">=1.19.1" },
     { name = "rich", specifier = ">=15.0.0" },
-    { name = "scikit-learn", specifier = ">=1.7" },
+    { name = "scikit-learn", marker = "extra == 'eval'", specifier = ">=1.7" },
     { name = "scipy", specifier = ">=1.18.1" },
     { name = "typer", specifier = ">=0.27.3" },
     { name = "uvicorn", specifier = ">=0.54" },
 ]
-provides-extras = ["local", "langgraph", "openai-agents", "anthropic", "integrations"]
+provides-extras = ["ui", "eval", "local", "langgraph", "openai-agents", "anthropic", "integrations"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cuemem", extras = ["ui", "eval"] },
     { name = "mypy", specifier = ">=2.4.0" },
     { name = "pre-commit", specifier = ">=4.6.2" },
     { name = "pytest", specifier = ">=9.1.1" },

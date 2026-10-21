@@ -6,11 +6,10 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_prompts/LICENSE"]
 requires-python = ">=3.12"
+# 核心依赖：SDK、命令行、HTTP 接口、记忆代理与 MCP。界面、评测与本机向量是可选依赖
 dependencies = [
     "fastapi>=0.143",
-    "gradio>=6.30",
     "httpx2>=2.13.1",
-    "matplotlib>=3.10",
     "mcp>=2.3",
     "numpy>=2.5.4",
     "openai>=3.29.0",
@@ -22,13 +21,16 @@ dependencies = [
     "pyyaml>=6.0.3",
     "qdrant-client>=1.19.1",
     "rich>=15.0.0",
-    "scikit-learn>=1.7",
     "scipy>=1.18.1",
     "typer>=0.27.3",
     "uvicorn>=0.54",
 ]
 
 [project.optional-dependencies]
+# 演示界面（cuemem serve 的 Gradio 界面）：不装时 serve 只启动 HTTP 接口与记忆代理
+ui = ["gradio>=6.30"]
+# 评测（cuemem eval run / report 的图）与控制器、门控的训练脚本（scripts/）
+eval = ["matplotlib>=3.10", "scikit-learn>=1.7"]
 # 本机向量（embedding.backend: fastembed，预设 deepseek 用它）：ONNX 推理，不要 Key
 local = ["fastembed>=0.9"]
 # 框架集成（N12，cuemem/integrations/）：按需安装
@@ -51,7 +53,9 @@ requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# 源码仓库里的 uv sync 照旧装上界面与评测（测试、类型检查与复现脚本要用）
 dev = [
+    "cuemem[ui,eval]",
     "mypy>=2.4.0",
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",

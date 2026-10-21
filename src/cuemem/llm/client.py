@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import httpx2
 from openai import (
@@ -38,6 +38,7 @@ from pydantic import BaseModel, ValidationError
 
 from cuemem.config import ModelSpec, Settings, missing_key_remedy
 from cuemem.core.trace import record_event
+from cuemem.core.types import PeakPolicy
 from cuemem.errors import (
     CacheMissError,
     ContentFilteredError,
@@ -50,7 +51,6 @@ from cuemem.llm.peak import in_peak, peak_end
 from cuemem.llm.types import ChatResult, ToolCall, Usage
 
 Message = dict[str, Any]
-PeakPolicy = Literal["wait", "warn", "allow"]
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 # 重试的退避（与 OpenAI SDK 3.x 相同）：0.5 秒起翻倍、最多 8 秒；上游的 Retry-After 最多照等 2 分钟

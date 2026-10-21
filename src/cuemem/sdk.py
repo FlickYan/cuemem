@@ -38,7 +38,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx2
 
@@ -46,13 +46,13 @@ from cuemem.config import Settings, load_settings
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import Answer, Fact, FactHit, Hit, MediaItem, SessionIn, TurnIn
 from cuemem.core.timeutil import naive_local
+from cuemem.core.types import PeakPolicy, Router
 from cuemem.errors import ConcurrentWriteError
-from cuemem.llm.client import PeakPolicy
-from cuemem.memory import ForgetReport, MemorySystem, Recall
-from cuemem.portable import export_space, import_space
-from cuemem.read.controller import Router, english_reason
-from cuemem.read.facts import fact_status
-from cuemem.store.sqlite import MemoryDB
+
+# 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
+if TYPE_CHECKING:
+    from cuemem.memory import ForgetReport, MemorySystem, Recall
+    from cuemem.store.sqlite import MemoryDB
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,8 @@ class Memory:
             consolidation = settings.consolidation.model_copy(update={"instructions": instructions})
             settings = settings.model_copy(update={"consolidation": consolidation})
         self.settings = settings
+        from cuemem.memory import MemorySystem
+
         self.system = MemorySystem.from_settings(
             settings, http_client=http_client, on_peak_wait=_log_peak_wait
         )
@@ -467,6 +469,8 @@ class Memory:
     ) -> dict[str, Any]:
         """导出这个用户（或 Agent）的记忆：原始日志与图片原文件，可选附上事实与画像的快照。
         格式见 cuemem/portable.py；json.dump 之后可以在别的机器上 load。"""
+        from cuemem.portable import export_space
+
         return export_space(self.system, space_for(user_id, agent_id), derived=derived)
 
     def load(
@@ -479,6 +483,8 @@ class Memory:
     ) -> dict[str, Any]:
         """导入 export 的结果：写回原始日志，派生记忆重新抽取（wait=True 时同步完成）。
         不给 user_id、agent_id 时导入到文件里原来的空间。"""
+        from cuemem.portable import import_space
+
         space = space_for(user_id, agent_id) if user_id or agent_id else None
         report = import_space(self.system, data, space_id=space, consolidate=wait)
         if not wait and self.system.worker is not None:
@@ -703,6 +709,8 @@ def _fact_item(
     *,
     space: str | None = None,
 ) -> dict[str, Any]:
+    from cuemem.read.facts import fact_status
+
     item: dict[str, Any] = {
         "id": fact.id,
         "memory": fact.statement,
@@ -763,6 +771,8 @@ def _recall_out(
     *,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    from cuemem.read.controller import english_reason
+
     view = recall.view
     facts: list[FactHit] = view.facts
     rounds, media = view.rounds, list(view.media.values())
@@ -797,6 +807,8 @@ def _empty(system: MemorySystem, space: str) -> dict[str, Any]:
 
 
 def _answer_out(answer: Answer) -> dict[str, Any]:
+    from cuemem.read.controller import english_reason
+
     facts = {fh.fact.id: fh.fact.statement for fh in answer.facts}
     units = {h.unit.id: h.unit.text for h in answer.hits}
     route = answer.details.get("route") or {}

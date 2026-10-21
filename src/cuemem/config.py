@@ -314,6 +314,11 @@ def cli_command(args: str) -> str:
     return f"{'uv run ' if source_checkout() else ''}cuemem {args}"
 
 
+def extra_remedy(extra: str) -> str:
+    """缺可选依赖时的安装命令：源码仓库里用 uv sync --extra，pip 安装后用 pip install。"""
+    return f"uv sync --extra {extra}" if source_checkout() else f'pip install "cuemem[{extra}]"'
+
+
 def missing_key_remedy(provider: str) -> str:
     """缺 Key 时的解决办法。只设了 OPENAI_API_KEY、缺的却是别家的 Key 时，多半是没换预设。"""
     remedy = f"请运行 {cli_command('configure')}"

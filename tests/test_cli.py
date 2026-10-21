@@ -113,7 +113,7 @@ def test_consolidate_inspect_and_forget(
     ]
     original = MemorySystem.from_settings
     monkeypatch.setattr(
-        cli.MemorySystem,
+        MemorySystem,
         "from_settings",
         lambda settings: original(settings, http_client=api.client()),
     )
@@ -181,7 +181,7 @@ def test_demo_and_chat_commands(
     api.chat_replies = [ScriptedModel(echo_extraction, agent=lambda body: "Hi Maya, noted.")]
     original = MemorySystem.from_settings
     monkeypatch.setattr(
-        cli.MemorySystem,
+        MemorySystem,
         "from_settings",
         lambda settings, **kwargs: original(settings, http_client=api.client()),
     )
@@ -319,7 +319,6 @@ def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
 
     assert cli._default_scenario() == "shop"
     missing = tmp_path / "site-packages" / "demo" / "shop" / "catalog.json"
-    monkeypatch.setattr(cli, "SHOP_CATALOG", missing)
     monkeypatch.setattr("cuemem.api.service.SHOP_CATALOG", missing)
     result = runner.invoke(app, ["serve", "--no-ui"])
     assert result.exit_code == 0, result.output
@@ -328,6 +327,60 @@ def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
     assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
     assert "错误" in result.output and "--scenarioplain" in _flat(result.output)
     assert len(served) == 1
+
+
+def test_serve_without_the_ui_extra_serves_the_api(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """界面是可选依赖 ui：没装 Gradio 时 cuemem serve 照常提供接口与记忆代理，并说明怎么装
+    （以前 gradio 是核心依赖，没装时 serve 崩在 ImportError 上）。"""
+    import sys
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setitem(sys.modules, "gradio", None)  # 当作没装
+    result = runner.invoke(app, ["serve", "--scenario", "plain"])
+    assert result.exit_code == 0, result.output
+    assert "uvsync--extraui" in _flat(result.output) and "界面：" not in result.output
+    (app_,) = served
+    client = TestClient(app_, headers={"Host": "127.0.0.1:7860"})
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/v1/models").status_code == 200
+    assert client.get("/").status_code == 404  # 根路径上没有界面
+
+
+def test_eval_commands_say_which_extra_to_install(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """评测报告要画图：没装可选依赖 eval（matplotlib）时，eval run 与 eval report 一开始就说明
+    要装什么，不白跑一遍评测；只构建空间、判分抽检不需要它。"""
+    import json
+    import sys
+
+    monkeypatch.setitem(sys.modules, "matplotlib", None)  # 当作没装
+    for args in (["eval", "report", "x"], ["eval", "run", "--name", "x", "--methods", "B1"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 1, result.output
+        assert "uvsync--extraeval" in _flat(result.output), result.output
+    monkeypatch.setattr("cuemem.config.source_checkout", lambda: False)
+    result = runner.invoke(app, ["eval", "report", "x"])
+    assert 'pipinstall"cuemem[eval]"' in _flat(result.output), result.output
+    result = runner.invoke(app, ["eval", "run", "--name", "x", "--build-only"])
+    assert "cuemem[eval]" not in result.output and "缺少数据文件" in result.output
+    row = {
+        "sample_id": "q1",
+        "method": "B1",
+        "question_type": "single-hop",
+        "correct": True,
+        "question": "?",
+        "answer": "a",
+        "response": "a",
+        "judge_raw": "yes",
+    }
+    (tmp_path / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (tmp_path / "run.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(app, ["eval", "audit", str(tmp_path), "--n", "1"])
+    assert result.exit_code == 0, result.output
 
 
 @pytest.mark.parametrize(
@@ -360,7 +413,7 @@ def test_demo_fresh_waits_for_resumed_consolidation(
     from fakes import FakeAPI
     from scripted import ScriptedModel, echo_extraction
 
-    from cuemem import cli
+    from cuemem.api.service import ChatService
     from cuemem.core.models import SessionIn, TurnIn
     from cuemem.memory import MemorySystem
 
@@ -389,11 +442,11 @@ def test_demo_fresh_waits_for_resumed_consolidation(
         before.append("cli-demo", session, 0)  # 登记了任务，没来得及巩固就退出了
     original = MemorySystem.from_settings
     monkeypatch.setattr(
-        cli.MemorySystem,
+        MemorySystem,
         "from_settings",
         lambda settings, **kwargs: original(settings, http_client=api.client()),
     )
-    create = cli.ChatService.create
+    create = ChatService.create
 
     def resumed(settings: Any, **kwargs: Any) -> Any:
         service = create(settings, **kwargs)
@@ -401,7 +454,7 @@ def test_demo_fresh_waits_for_resumed_consolidation(
         threading.Timer(0.3, release.set).start()
         return service
 
-    monkeypatch.setattr(cli.ChatService, "create", resumed)
+    monkeypatch.setattr(ChatService, "create", resumed)
     script = tmp_path / "script.json"
     script.write_text('{"space": "cli-demo", "sessions": []}', encoding="utf-8")
     result = runner.invoke(app, ["demo", str(script), "--fresh", "--report", str(tmp_path / "r")])
@@ -417,7 +470,7 @@ def test_demo_uses_the_catalog_next_to_its_script(
 ) -> None:
     """cuemem demo 用剧本旁边的商品目录（demo/shop/ 里就是这样）：不在源码仓库里也能回放；
     旁边没有时才用仓库里的。"""
-    from cuemem import cli
+    from cuemem.api.service import ChatService
     from cuemem.errors import CueMemError
 
     seen: list[Path | None] = []
@@ -427,7 +480,7 @@ def test_demo_uses_the_catalog_next_to_its_script(
         raise CueMemError("stop")
 
     monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(cli.ChatService, "create", fake_create)
+    monkeypatch.setattr(ChatService, "create", fake_create)
     script = tmp_path / "shop" / "script.json"
     script.parent.mkdir()
     script.write_text('{"space": "demo", "sessions": []}', encoding="utf-8")
@@ -450,7 +503,7 @@ def test_data_download_skips_optional_datasets(
         path.write_bytes(b"x")
         return path
 
-    monkeypatch.setattr("cuemem.cli.download_dataset", fake_download)
+    monkeypatch.setattr("cuemem.evals.datasets.download", fake_download)
     assert runner.invoke(app, ["data", "download"]).exit_code == 0
     assert "wildchat" not in fetched and "longmemeval_s" in fetched
     assert runner.invoke(app, ["data", "download", "wildchat"]).exit_code == 0
@@ -497,9 +550,9 @@ def test_eval_run_fail_on_error(
         reports.append(run_dir)
         return run_dir / "report.md"
 
-    monkeypatch.setattr(cli, "EvalRunner", FakeRunner)
+    monkeypatch.setattr("cuemem.evals.runner.EvalRunner", FakeRunner)
     monkeypatch.setattr(cli, "_load_evalset", lambda *args: SimpleNamespace(samples=[]))
-    monkeypatch.setattr(cli, "build_report", fake_report)
+    monkeypatch.setattr("cuemem.evals.report.build_report", fake_report)
     args = ["eval", "run", "--name", "x", "--methods", "B1"]
     assert runner.invoke(app, args).exit_code == 0
     result = runner.invoke(app, [*args, "--fail-on-error"])

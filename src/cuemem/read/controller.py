@@ -25,12 +25,12 @@ import numpy as np
 from pydantic import BaseModel
 
 from cuemem.core.trace import record_event
+from cuemem.core.types import Router as Router  # 原来定义在这里，各处照旧从这里导入
 from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient, Message
 from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyze
 
 Level = Literal["L0", "L1", "L2"]
-Router = Literal["learned", "hybrid", "rule", "llm"]
 # 默认是 v3（N11 之后：v2 + 只在问到图时看图，D-058）；v2 是 N11 导出的那一版（有图的空间直接查
 # 有图的准确率表），v1 是 N7 导出、N9 测试集上冻结评测的那一版。复现某个节点的数字时用当时的文件
 # （配置 retrieval.controller，scripts/reproduce.py 会自动指定）

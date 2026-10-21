@@ -3,10 +3,11 @@
 #   docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem
 # .env 里要有 CUEMEM_API_TOKEN：容器里监听 0.0.0.0，没有访问令牌时拒绝启动。
 # 多进程 / 大规模部署见 docker-compose.yml（Qdrant 服务端）。
-# 默认带上可选依赖 local（本机向量 fastembed，预设 deepseek 要用）；不用它时
-#   docker build --build-arg EXTRAS= -t cuemem .   # 镜像小一些（不装 fastembed 与 onnxruntime）
+# 默认带上可选依赖 ui（记忆浏览界面，Gradio）与 local（本机向量 fastembed，预设 deepseek 要用）；
+# 只要接口与记忆代理时
+#   docker build --build-arg EXTRAS= -t cuemem .   # 镜像小得多（不装 Gradio、fastembed 与 onnxruntime）
 FROM python:3.12-slim AS build
-ARG EXTRAS="--extra local"
+ARG EXTRAS="--extra ui --extra local"
 COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv UV_PYTHON_DOWNLOADS=never
 WORKDIR /src

@@ -24,14 +24,17 @@ import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy import sparse
 
 from cuemem.core.models import Entity, Fact
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 from cuemem.write.entities import is_generic, normalize_name
+
+if TYPE_CHECKING:  # 建图时才导入 scipy（图扩散默认关闭）：打开记忆系统时少约 0.2 秒
+    from scipy import sparse
 
 NodeKind = str  # "entity" / "fact" / "round"
 
@@ -112,6 +115,8 @@ class MemoryGraph:
             for a, b, weight in _similar_pairs(vectors, space_id, facts, cfg):
                 connect(a, b, weight)
             stats["fact_fact"] = len(edges) - before
+
+        from scipy import sparse
 
         n = len(ids)
         rows = [i for i, _ in edges] + [j for _, j in edges]

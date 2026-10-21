@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
@@ -55,9 +56,13 @@ def main() -> None:
         raise AssertionError("包里不该有导购演示的商品目录")
     service = ChatService.create(settings, scenario="plain")
     try:
-        app = create_app(service, upload_dir=home / "uploads", ui=False)
-        health = TestClient(app).get("/api/health")
+        # 只装了核心依赖时没有 Gradio：要界面也照常提供接口（界面在可选依赖 ui 里）
+        app = create_app(service, upload_dir=home / "uploads")
+        client = TestClient(app)
+        health = client.get("/api/health")
         assert health.status_code == 200 and health.json()["ok"], health.text
+        if importlib.util.find_spec("gradio") is None:
+            assert client.get("/").status_code == 404, "没装 Gradio 时根路径上不该有界面"
     finally:
         service.close()
     print(f"wheel 冒烟测试通过：{cuemem.__file__}")

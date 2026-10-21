@@ -32,6 +32,7 @@ from cuemem.core.models import (
 )
 from cuemem.core.timeutil import naive_local
 from cuemem.core.trace import TraceSink, current_trace, start_trace
+from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder, ImageEmbedder
@@ -71,8 +72,6 @@ from cuemem.write.consolidate import (
 from cuemem.write.extract import PIPELINE_VERSION
 from cuemem.write.online import IngestReport, OnlineWriter
 
-AskMode = Literal["l0", "l1", "l2", "auto", "agent", "hatch", "facts", "naive"]
-RecallMode = Literal["l0", "l1", "l2", "auto"]
 Level = Literal["l0", "l1", "l2"]
 
 

@@ -25,6 +25,7 @@ cuemem migrate-vectors --to URL       把本地向量库复制到 Qdrant 服务�
 
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
 import json
 import os
@@ -33,48 +34,29 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, cast, get_args
+from typing import TYPE_CHECKING, Annotated, Any, cast, get_args
 
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from cuemem.agent import Reply
-from cuemem.api.service import SHOP_CATALOG, ChatService, Scenario
-from cuemem.config import Settings, cli_command, env_file_path, load_settings
-from cuemem.core.models import Answer, Conversation, Fact
-from cuemem.embed import build_embedder
+from cuemem.config import Settings, cli_command, env_file_path, extra_remedy, load_settings
+from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError
-from cuemem.evals.audit import export_audit, score_audit
-from cuemem.evals.datasets import (
-    DATASETS,
-    RAW_LABELS_VALUE,
-    RAW_SESSION_IDS_ENV,
-    EvalSet,
-    dataset_path,
-)
-from cuemem.evals.datasets import download as download_dataset
-from cuemem.evals.datasets import load as load_dataset
-from cuemem.evals.report import (
-    build_report,
-    error_groups,
-    load_rows,
-    method_stats,
-    pending_errors,
-)
-from cuemem.evals.runner import EvalRunner, RunConfig, RunSummary
-from cuemem.evals.splits import load_split, save_split, stratified_ids
-from cuemem.llm.client import LLMClient
-from cuemem.llm.ledger import Ledger
-from cuemem.llm.peak import describe, next_peak_start, peak_end
-from cuemem.memory import AskMode, MemorySystem, RecallMode
-from cuemem.read.controller import Router
-from cuemem.store.sqlite import MemoryDB
-from cuemem.write.consolidate import ConsolidationReport
+
+# 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
+# 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
+if TYPE_CHECKING:
+    from cuemem.agent import Reply
+    from cuemem.api.service import ChatService
+    from cuemem.core.models import Answer, Fact
+    from cuemem.evals.datasets import EvalSet
+    from cuemem.evals.runner import RunSummary
+    from cuemem.memory import MemorySystem
+    from cuemem.write.consolidate import ConsolidationReport
 
 app = typer.Typer(
     help="CueMem：线索驱动的多模态 Agent 长期记忆系统",
@@ -117,6 +99,8 @@ def _open_system() -> Iterator[MemorySystem]:
 
     交互式命令只发少量请求：分时价格的高峰时段照常调用（记录提醒），不像评测那样暂停。
     """
+    from cuemem.memory import MemorySystem
+
     system: MemorySystem | None = None
     try:
         settings = load_settings(peak_policy="warn")
@@ -200,6 +184,8 @@ def ingest(
     ] = False,
 ) -> None:
     """导入一段多会话对话（可重复执行，不会产生重复数据）。"""
+    from cuemem.core.models import Conversation
+
     conversation = Conversation.model_validate_json(path.read_text(encoding="utf-8"))
     if space:
         conversation = conversation.model_copy(update={"space_id": space})
@@ -410,6 +396,8 @@ def search_image(
 @app.command()
 def spaces() -> None:
     """列出所有记忆空间。"""
+    from cuemem.store.sqlite import MemoryDB
+
     settings = load_settings()
     db = MemoryDB(settings.paths.db)
     rows = db.list_spaces()
@@ -439,6 +427,8 @@ def usage(
     run: Annotated[str | None, typer.Option(help="只统计某次运行（run_id）")] = None,
 ) -> None:
     """汇总模型调用量与成本。"""
+    from cuemem.llm.ledger import Ledger
+
     settings = load_settings()
     ledger = Ledger(settings.paths.ledger)
     since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) if today else None
@@ -472,6 +462,8 @@ def _service(
     if router not in get_args(Router):
         console.print(f"[red]--router 只能是 {'、'.join(get_args(Router))}[/red]")
         raise typer.Exit(1)
+    from cuemem.api.service import ChatService
+
     try:  # 缺 Key、换了向量模型、没有商品目录等：提示原因，不打印调用栈（Docker 里会反复重启）
         settings = load_settings(peak_policy="warn")
         if check is not None:
@@ -494,6 +486,8 @@ def _service(
 def _default_scenario() -> str:
     """serve 不指定 --scenario 时：源码仓库里有导购演示的商品目录，用 shop；pip 安装后没有，
     用通用助手。"""
+    from cuemem.api.service import SHOP_CATALOG
+
     if SHOP_CATALOG.is_file():
         return "shop"
     console.print("[dim]导购演示的商品目录只在源码仓库里：这里用通用助手（--scenario plain）[/dim]")
@@ -559,11 +553,21 @@ def serve(
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
 ) -> None:
-    """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。"""
+    """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。
+
+    界面要用可选依赖 ui（Gradio）；没装时只启动 HTTP 接口与记忆代理，并说明怎么装。"""
     import uvicorn
 
     from cuemem.api.app import TOKEN_ENV, create_app
     from cuemem.api.proxy import MemoryProxy
+
+    ui = not no_ui
+    if ui and importlib.util.find_spec("gradio") is None:
+        console.print(
+            "[yellow]注意：[/yellow]演示界面要用可选依赖 ui（Gradio），没有安装："
+            f"{escape(extra_remedy('ui'))}。这次只启动 HTTP 接口与记忆代理"
+        )
+        ui = False
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
         _require_token(host, os.environ.get(TOKEN_ENV) or None, insecure_no_auth)
@@ -576,14 +580,15 @@ def serve(
         app_ = create_app(
             service,
             upload_dir=settings.paths.media.parent / "uploads",
-            ui=not no_ui,
+            ui=ui,
             token=token,
             proxy=proxy,
             allowed_hosts=allowed_hosts,
             origin_hosts=origin_hosts,
         )
+        where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
         console.print(
-            f"界面：[bold]http://{host}:{port}/[/bold] · 接口文档：http://{host}:{port}/docs"
+            f"{where}接口文档：http://{host}:{port}/docs"
             f" · OpenAI 兼容的记忆代理：http://{host}:{port}/v1"
         )
         if token:
@@ -620,6 +625,7 @@ def proxy(
 
     from cuemem.api.app import TOKEN_ENV
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
+    from cuemem.memory import MemorySystem
 
     if mode not in get_args(RecallMode):
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(RecallMode))}[/red]")
@@ -829,6 +835,7 @@ def mcp_cmd(
 ) -> None:
     """以 MCP Server（stdio）提供记忆工具，让其他 Agent（如 Claude Code）直接使用这套记忆。"""
     from cuemem.api.mcp import build_server
+    from cuemem.api.service import ChatService
 
     settings = load_settings(peak_policy="warn")
     service = ChatService.create(
@@ -983,6 +990,9 @@ def data_download(
     ] = None,
 ) -> None:
     """下载评测数据集到 data/datasets（已存在则跳过）。"""
+    from cuemem.evals.datasets import DATASETS
+    from cuemem.evals.datasets import download as download_dataset
+
     settings = load_settings()
     for name in names or [n for n, spec in DATASETS.items() if not spec.optional]:
         if name not in DATASETS:
@@ -1007,6 +1017,8 @@ def eval_split(
     ] = None,
 ) -> None:
     """按（题型，是否拒答）分层抽样，生成划分文件（提交进仓库，保证可复现）。"""
+    from cuemem.evals.splits import save_split, stratified_ids
+
     settings = load_settings()
     evalset = _load_evalset(settings, dataset, parent)
     chosen = stratified_ids(evalset.samples, size, seed=seed)
@@ -1084,6 +1096,11 @@ def eval_run(
     if peak is not None and peak not in ("wait", "warn", "allow"):
         console.print("[red]--peak 只能是 wait、warn 或 allow[/red]")
         raise typer.Exit(1)
+    if not build_only:  # 最后的报告要画图：先说明要装什么，不白跑一遍
+        _require_plotting()
+    from cuemem.evals.report import build_report
+    from cuemem.evals.runner import EvalRunner, RunConfig
+
     settings = load_settings()
     if peak is not None:
         settings = settings.model_copy(update={"peak_policy": peak})
@@ -1111,13 +1128,7 @@ def eval_run(
     )
     count = min(limit, len(evalset.samples)) if limit else len(evalset.samples)
     console.print(f"运行 [bold]{run_name}[/bold]：{count} 题 × {config.methods}")
-    with Progress(
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
+    with _progress() as progress:
         task = progress.add_task("评测", total=None)
 
         def on_peak_wait(provider: str, until: datetime) -> None:
@@ -1194,6 +1205,8 @@ def eval_probe(
     if not name:
         console.print("[red]请用 --name 指定运行名（与评测运行同名，特征与结果放在一起）[/red]")
         raise typer.Exit(1)
+    from cuemem.evals.runner import EvalRunner, RunConfig
+
     settings = load_settings()
     split_name = None if split == "all" else split
     evalset = _load_evalset(settings, dataset, split_name)
@@ -1202,13 +1215,7 @@ def eval_probe(
     config = RunConfig(
         name=name, dataset=dataset, split=split_name, methods=[], workers=workers, limit=limit
     )
-    with Progress(
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
+    with _progress() as progress:
         task = progress.add_task("探针", total=None)
         runner = EvalRunner(
             settings,
@@ -1231,6 +1238,9 @@ def eval_report(
     run: Annotated[str, typer.Argument(help="运行名或运行目录")],
 ) -> None:
     """重新生成某次运行的报告。"""
+    _require_plotting()
+    from cuemem.evals.report import build_report
+
     settings = load_settings()
     run_dir = Path(run) if Path(run).exists() else settings.paths.eval_runs / run
     if not (run_dir / "run.json").exists():
@@ -1249,6 +1259,9 @@ def eval_audit(
     score: Annotated[bool, typer.Option("--score", help="统计已勾选的抽检结果")] = False,
 ) -> None:
     """判分抽检：导出待核对的 Markdown，或统计人工核对后的一致率。"""
+    from cuemem.evals.audit import export_audit, score_audit
+    from cuemem.evals.report import load_rows
+
     settings = load_settings()
     run_dir = Path(run) if Path(run).exists() else settings.paths.eval_runs / run
     path = run_dir / "judge-audit.md"
@@ -1268,7 +1281,42 @@ def eval_audit(
     console.print(f"已导出 {count} 条到 {path}")
 
 
+def _require_plotting() -> None:
+    """评测报告要画图：没装可选依赖 eval（matplotlib）时说明要装什么，退出码 1。"""
+    if importlib.util.find_spec("matplotlib") is None:
+        console.print(
+            "[red]错误：[/red]评测报告要画图，需要可选依赖 eval（matplotlib、scikit-learn），"
+            f"没有安装：{escape(extra_remedy('eval'))}"
+        )
+        raise typer.Exit(1)
+
+
+@contextmanager
+def _progress() -> Iterator[Any]:
+    """评测与探针的进度条。"""
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    columns = (TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn())
+    with Progress(*columns, TimeElapsedColumn(), console=console) as progress:
+        yield progress
+
+
 def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSet:
+    from cuemem.evals.datasets import (
+        DATASETS,
+        RAW_LABELS_VALUE,
+        RAW_SESSION_IDS_ENV,
+        dataset_path,
+    )
+    from cuemem.evals.datasets import load as load_dataset
+    from cuemem.evals.splits import load_split
+
     if dataset not in DATASETS:
         console.print(f"[red]未知数据集 {dataset}[/red]，可选：{', '.join(DATASETS)}")
         raise typer.Exit(1)
@@ -1296,6 +1344,8 @@ def _load_evalset(settings: Settings, dataset: str, split: str | None) -> EvalSe
 def _print_errors(run_dir: Path, limit: int = 3) -> None:
     """出错的组合按报错归并后列出（errors.jsonl 里每道题各记一次）：配置问题（如外部基线的写入
     目录里是另一个协议的写入）一眼看得到报错与解决办法。"""
+    from cuemem.evals.report import error_groups, pending_errors
+
     groups = error_groups(pending_errors(run_dir))
     for method, error, n in groups[:limit]:
         console.print(f"[red]{escape(method)} × {n}[/red]：{escape(error)}", highlight=False)
@@ -1304,6 +1354,8 @@ def _print_errors(run_dir: Path, limit: int = 3) -> None:
 
 
 def _print_method_stats(run_dir: Path) -> None:
+    from cuemem.evals.report import load_rows, method_stats
+
     stats = method_stats(load_rows(run_dir, "results.jsonl"))
     table = Table(title="总体结果")
     for column in ("方法", "题数", "准确率", "95% 置信区间", "平均输入 tokens", "名义成本 / 题"):
@@ -1334,6 +1386,8 @@ def _prompt_secret(label: str, existing: str | None) -> str | None:
 
 def _peak_note(settings: Settings) -> None:
     """当前处于某个供应商的高峰时段时提醒一句（交互式命令照常调用）。"""
+    from cuemem.llm.peak import peak_end
+
     for name, provider in settings.providers.items():
         cfg = provider.peak_hours
         if cfg is not None and (end := peak_end(cfg)) is not None:
@@ -1344,6 +1398,8 @@ def _peak_note(settings: Settings) -> None:
 
 
 def _peak_status(settings: Settings) -> list[str]:
+    from cuemem.llm.peak import describe, next_peak_start, peak_end
+
     lines = []
     for name, provider in settings.providers.items():
         cfg = provider.peak_hours
@@ -1404,6 +1460,10 @@ def _print_config(settings: Settings) -> None:
 
 
 def _live_check(settings: Settings) -> None:
+    from cuemem.embed import build_embedder
+    from cuemem.llm.client import LLMClient
+    from cuemem.llm.ledger import Ledger
+
     ledger = Ledger(settings.paths.ledger)
     llm = LLMClient(settings, ledger=ledger)  # 不挂缓存：要测的是真实连通性
     table = Table(title="连通性测试（不走缓存）")

@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import httpx2
 
@@ -21,12 +21,10 @@ from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import SessionIn, TurnIn
+from cuemem.core.types import RecallMode, Router, Scenario
 from cuemem.errors import CueMemError
 from cuemem.evidence import fact_state, recall_listing, resolve_ids
-from cuemem.memory import ForgetReport, MemorySystem, RecallMode
-from cuemem.read.controller import Router
-
-Scenario = Literal["shop", "plain"]
+from cuemem.memory import ForgetReport, MemorySystem
 
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
 

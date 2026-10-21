@@ -16,6 +16,8 @@ Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密�
 
 from __future__ import annotations
 
+import importlib.util
+import logging
 import secrets
 import shutil
 import uuid
@@ -38,6 +40,7 @@ from cuemem import __version__
 from cuemem.agent import Reply
 from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
+from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError
 from cuemem.memory import RecallMode
 from cuemem.portable import export_space, import_space
@@ -45,6 +48,8 @@ from cuemem.read.controller import Router
 
 if TYPE_CHECKING:
     from cuemem.api.proxy import MemoryProxy
+
+logger = logging.getLogger(__name__)
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TOKEN_ENV = "CUEMEM_API_TOKEN"
@@ -370,6 +375,10 @@ def create_app(
         app.include_router(
             proxy_router(proxy, dependencies=[Depends(_token_check(token))] if token else [])
         )
+    if ui and importlib.util.find_spec("gradio") is None:
+        # 界面是可选依赖 cuemem[ui]：没装时照常提供接口与记忆代理
+        logger.warning("演示界面要用可选依赖 ui（Gradio），没有安装：%s", extra_remedy("ui"))
+        ui = False
     if ui:
         import gradio as gr
 
