@@ -185,6 +185,34 @@ def test_export_v2_carries_metadata_and_v1_files_still_import(memory: Memory) ->
         memory.load(newer, user_id="dave")
 
 
+def test_updates_survive_export_to_the_same_space(
+    memory: Memory, n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """update 写下的更正（edit_of）随发言导出：导入到另一台机器上同名的空间时，更正照样取代原来
+    那条；导入到别的空间时事实 ID 对不上，那句更正按普通的话对账（这里是多值的事实：两条都在）。"""
+    jazz = memory.add("I like jazz", user_id="alice", timestamp=DAY, wait=True)["results"][0]
+    edit = memory.update(jazz["id"], "I like blues")
+    assert edit["message"] == "Memory updated"
+    data = json.loads(json.dumps(memory.export(user_id="alice", derived=False)))
+    (edit_turn,) = [t for s in data["sessions"] for t in s["turns"] if "edit_of" in t]
+    assert edit_turn["edit_of"] == jazz["id"] and edit_turn["text"] == "Correction: I like blues"
+
+    other = n3_settings.model_copy(
+        update={"paths": PathsConfig().resolve_against(tmp_path / "other")}
+    )
+    with Memory(other, http_client=fake_api.client(), background=False) as fresh:
+        fresh.load(data, wait=True)
+        assert [f["memory"] for f in fresh.get_all(user_id="alice")["results"]] == [
+            "Correction: I like blues"
+        ]
+        assert [v["memory"] for v in fresh.history(jazz["id"])] == [
+            "I like jazz",
+            "Correction: I like blues",
+        ]
+        fresh.load(data, user_id="bob", wait=True)
+        assert len(fresh.get_all(user_id="bob")["results"]) == 2
+
+
 def _png(color: str = "red") -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (4, 4), color).save(buffer, format="PNG")

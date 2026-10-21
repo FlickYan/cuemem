@@ -292,16 +292,25 @@ class Reconciler:
         *,
         cache_scope: str | None = None,
         sources: Mapping[str, str] | None = None,
+        corrections: Mapping[str, str] | None = None,
     ) -> ReconcileResult:
         """按顺序处理一个会话的新事实，原地更新 state，返回操作列表与改动过的事实。
 
         sources：轮 ID → 这一轮的原话；灰区交给 LLM 时，每条新事实附上它出自的那句话。
+        corrections：轮 ID → 这句更正要取代的事实 ID（SDK 的 Memory.update 记在原始层的
+        edit_of）。由更正那句抽出的新事实里挑一条（_pair_corrections）以"说错了"取代它，不问
+        LLM；其余的照常对账。没有更正时（评测与其他所有写入）什么都不变。
         """
         result = ReconcileResult()
         gray: list[tuple[Fact, FloatArray, list[Fact]]] = []
+        pairs = self._pair_corrections(state, new_facts, corrections) if corrections else {}
         for fact, vector in new_facts:
             if fact.id in state.facts:
                 result.operations.append(Operation("noop", fact.id, fact.id, rule="replay"))
+                continue
+            edited = state.facts.get(pairs.get(fact.id, ""))
+            if edited is not None and edited.is_current:
+                self._supersede(state, result, edited, fact, vector, "corrected", "edit")
                 continue
             # 候选都从 state 的索引里取（见 FactState）：与按 current_of 逐条比较的结果相同
             subject, value = fact.subject_id, state.norm(fact.object)
@@ -351,6 +360,42 @@ class Reconciler:
         if gray:
             self._resolve_gray(state, result, gray, cache_scope, sources or {})
         return result
+
+    @staticmethod
+    def _pair_corrections(
+        state: FactState,
+        new_facts: Sequence[tuple[Fact, FloatArray]],
+        corrections: Mapping[str, str],
+    ) -> dict[str, str]:
+        """新事实 ID → 它要取代的事实 ID。每条要取代的事实只配一条新事实：出自更正那句、谓词
+        相同的优先，其次是陈述向量与它最相近的，再次是抽取的顺序。一句更正抽出几条事实时
+        （"住在巴黎，在谷歌上班"），其余的照常对账。"""
+        pairs: dict[str, str] = {}
+        for target_id in dict.fromkeys(corrections.values()):
+            target = state.facts.get(target_id)
+            if target is None:  # 要取代的事实已经不在（被遗忘、换了抽取模型）：照常对账
+                continue
+            turns = {t for t, wanted in corrections.items() if wanted == target_id}
+            candidates = [
+                (fact, vector)
+                for fact, vector in new_facts
+                if turns & set(fact.source_turn_ids)
+                and fact.id not in pairs
+                and fact.id not in state.facts
+            ]
+            old = state.vectors.get(target_id)
+            ranked = [
+                (
+                    fact.predicate == target.predicate,
+                    float(old @ vector) if old is not None else 0.0,
+                    -order,  # 并列时取先抽出的
+                    fact.id,
+                )
+                for order, (fact, vector) in enumerate(candidates)
+            ]
+            if ranked:
+                pairs[max(ranked)[3]] = target_id
+        return pairs
 
     # ---------- 动作 ----------
 

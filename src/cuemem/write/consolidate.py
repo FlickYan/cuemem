@@ -635,8 +635,11 @@ class Consolidator:
             for t in turns
             if t.role == "user"
         }
+        # SDK 的 Memory.update 写下的更正（原始层的 edit_of）：由它抽出的事实取代指定的那条
+        edits = self.db.get_turn_meta(space_id, [t.id for t in turns])
+        corrections = {t: m.edit_of for t, m in edits.items() if m.edit_of}
         rec = self.reconciler.reconcile(
-            fact_state, new_facts, cache_scope=cache_scope, sources=said
+            fact_state, new_facts, cache_scope=cache_scope, sources=said, corrections=corrections
         )
 
         # 先写向量（新事实、摘要、新实体；被取代的事实更新 payload），再在一个事务里写数据库

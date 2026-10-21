@@ -193,6 +193,50 @@ def test_registered_multi_valued_never_calls_llm(settings: Settings, fake_api: F
     assert fake_api.chat_requests == []
 
 
+def test_logged_correction_replaces_its_target(settings: Settings, fake_api: FakeAPI) -> None:
+    """SDK 的 update 记下的更正（corrections：轮 ID → 要取代的事实）：由那句抽出的事实里，同谓词
+    的、其次陈述最相近的那条以"说错了"取代目标，不问 LLM；同一句抽出的其他事实照常对账。没有
+    更正时规则不变（多值的谓词只会新增）。"""
+    state = FactState()
+    rec = reconciler(settings, fake_api, [])
+    jazz = fact("a", "User likes jazz.", "likes", "jazz", "2025-01-01", cardinality="multi")
+    rec.reconcile(state, [(jazz, vec(1, 0, 0))])
+    edit = ["t-edit"]
+    trip = fact(
+        "b", "User visited a jazz bar.", "visited", "bar", "2025-02-01", cardinality="multi"
+    )
+    blues = fact("c", "User likes blues.", "likes", "blues", "2025-02-01", cardinality="multi")
+    soul = fact("d", "User likes soul.", "likes", "soul", "2025-02-01", cardinality="multi")
+    new = [
+        (f.model_copy(update={"source_turn_ids": edit}), v)
+        for f, v in (
+            (trip, vec(0.9, 0.1, 0)),  # 陈述最相近，但谓词不同
+            (blues, vec(0, 1, 0)),
+            (soul, vec(0.3, 0.7, 0)),  # 同谓词里与 jazz 更近的这条被选中
+        )
+    ]
+    result = rec.reconcile(state, new, corrections={"t-edit": "a"})
+    retired = state.facts["a"]
+    assert retired.superseded_by == "d" and retired.supersede_reason == "corrected"
+    assert retired.valid_to is None
+    assert [(op.action, op.fact_id, op.rule) for op in result.operations] == [
+        ("add", "b", "multi_valued"),
+        ("add", "c", "multi_valued"),
+        ("supersede", "d", "edit"),
+    ]
+    assert fake_api.chat_requests == []
+
+    # 目标已经不在（被遗忘、换了抽取模型）或不是当前的：照常对账
+    later = fact("e", "User likes funk.", "likes", "funk", "2025-03-01", cardinality="multi")
+    funk = later.model_copy(update={"source_turn_ids": ["t-edit2"]})
+    rec.reconcile(state, [(funk, vec(0, 0, 1))], corrections={"t-edit2": "a"})
+    assert state.facts["e"].is_current and state.facts["a"].superseded_by == "d"
+    ghost = fact("f", "User likes pop.", "likes", "pop", "2025-03-02", cardinality="multi")
+    ghost = ghost.model_copy(update={"source_turn_ids": ["t-edit3"]})
+    rec.reconcile(state, [(ghost, vec(0, 0, 1))], corrections={"t-edit3": "gone"})
+    assert state.facts["f"].is_current
+
+
 # ---------- 实体消歧 ----------
 
 

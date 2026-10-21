@@ -693,6 +693,95 @@ def test_delete_restores_the_older_version_and_delete_all_wipes(memory: Memory) 
     assert [t.idx for t in memory.system.db.get_turns("alice", "r")] == [0]
 
 
+def current_memories(memory: Memory, user_id: str) -> list[str]:
+    return sorted(f["memory"] for f in memory.get_all(user_id=user_id)["results"])
+
+
+def test_update_is_a_logged_correction(memory: Memory, model: ScriptedModel) -> None:
+    """update(memory_id, data)（Mem0 的写法）：不就地改写，而是记一句更正、同步巩固。新事实以
+    "说错了"取代原来那条（不问 LLM；以前多值的谓词只会新增），history 里有前后两个版本，原来的
+    metadata 与过期时间带过去；重放之后照旧；遗忘这句更正时原来那条恢复。以前没有 update。"""
+    berlin = memory.add(
+        "I live in Berlin",
+        user_id="alice",
+        timestamp=AUG,
+        metadata={"source": "crm"},
+        expiration_date="2099-01-01",
+        wait=True,
+    )["results"][0]
+    jazz = memory.add("I like jazz", user_id="alice", timestamp=AUG, wait=True)["results"][0]
+    asked = model.calls["reconcile"]
+
+    out = memory.update(berlin["id"], "I live in Paris", metadata={"checked": True})
+    assert out["message"] == "Memory updated"
+    (event,) = out["results"]
+    assert (event["event"], event["memory"]) == ("UPDATE", "The user lives in Paris.")
+    assert event["previous_memory"] == ["The user lives in Berlin."]
+    assert event["reason"] == "corrected" and event["space_id"] == "alice"
+    assert event["metadata"] == {"source": "crm", "checked": True}
+    assert event["expiration_date"] == "2099-01-01"
+    assert model.calls["reconcile"] == asked  # 不问 LLM
+    turns = memory.system.db.get_turns("alice", out["session_id"])
+    assert [t.text for t in turns] == ["Correction: I live in Paris"]
+    assert [t.id for t in turns] == out["turn_ids"]
+    chain = memory.history(berlin["id"])
+    assert [(v["event"], v["memory"]) for v in chain] == [
+        ("ADD", "The user lives in Berlin."),
+        ("UPDATE", "The user lives in Paris."),
+    ]
+    assert memory.get(berlin["id"])["superseded_by"] == event["id"]  # type: ignore[index]
+    # 说错了的从未成立：按事件时间回放时也没有柏林
+    assert "Berlin" not in str(memory.get_all(user_id="alice", valid_at="2026-08-15"))
+
+    blues = memory.update(jazz["id"], "I like blues")["results"][0]
+    assert blues["event"] == "UPDATE" and blues["previous_memory"] == ["I like jazz"]
+    paris = ["Correction: I like blues", "The user lives in Paris."]
+    assert current_memories(memory, "alice") == paris
+
+    with pytest.raises(ValueError, match="already replaced"):
+        memory.update(berlin["id"], "I live in Rome")
+    with pytest.raises(ValueError, match="empty"):
+        memory.update(event["id"], "  ")
+    with pytest.raises(KeyError):
+        memory.update("no-such-id", "I live in Rome")
+
+    memory.consolidate(user_id="alice", rebuild=True)  # 从原始日志重放：更正照样取代原来那条
+    assert current_memories(memory, "alice") == paris
+    memory.delete(blues["id"])  # 遗忘这句更正：原来那条恢复
+    assert current_memories(memory, "alice") == ["I like jazz", "The user lives in Paris."]
+
+
+def test_update_that_extracts_nothing_leaves_the_memory(
+    memory: Memory, model: ScriptedModel
+) -> None:
+    berlin = memory.add("I live in Berlin", user_id="alice", wait=True)["results"][0]
+    model.extractions = lambda prompt: (
+        {"summary": "", "facts": [], "entities": []}
+        if "Correction" in prompt
+        else where_i_live(prompt)
+    )
+    out = memory.update(berlin["id"], "hmm")
+    assert out["message"].startswith("No memory could be extracted") and out["results"] == []
+    assert current_memories(memory, "alice") == ["The user lives in Berlin."]
+
+
+def test_reset_deletes_every_space(memory: Memory) -> None:
+    """reset()（Mem0 的写法）：删除这个数据目录里的全部记忆，还开着的 run 一并结束。"""
+    memory.add("I live in Berlin", user_id="alice", metadata={"k": 1}, wait=True)
+    memory.add("I live in Rome", agent_id="bot", wait=True)
+    run = memory.open_run(user_id="carol")
+    memory.add("Hi there", user_id="carol", run_id=run)
+    out = memory.reset()
+    assert out["message"] == "All memories deleted"
+    assert sorted(out["spaces_deleted"]) == ["agent/bot", "alice", "carol"]
+    assert out["turns_deleted"] == 3
+    assert memory.spaces() == [] and memory.system.db.get_turn_meta("alice") == {}
+    assert memory.system.open_sessions("carol") == set()
+    assert memory.system.adopt_open("carol") == 0
+    memory.add("I live in Oslo", user_id="alice", wait=True)  # 之后照常可用
+    assert current_memories(memory, "alice") == ["The user lives in Oslo."]
+
+
 def test_delete_leaves_no_vectors_or_traces_of_the_fact(
     n3_settings: Settings, fake_api: FakeAPI
 ) -> None:

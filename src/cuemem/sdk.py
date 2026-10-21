@@ -8,8 +8,9 @@
     m.answer("Where do I live?", user_id="alice")     # 检索并回答（带引用）
     m.history(fact_id)                                # 一条事实的版本链：何时被取代、为什么
 
-与 Mem0 对应的方法名与参数（add / search / get_all / get / history / delete / delete_all）保持
-一致，返回值也是 {"results": [...]}、每条带 "memory" 文本；不同的地方是 CueMem 自己的设计：
+与 Mem0 对应的方法名与参数（add / search / get_all / get / history / update / delete /
+delete_all / reset）保持一致，返回值也是 {"results": [...]}、每条带 "memory" 文本；不同的地方是
+CueMem 自己的设计：
 
 - 记忆空间：user_id 与 agent_id 合起来定一个空间（各空间完全隔离）；run_id 是空间里的一个会话，
   search / get_all / delete_all 给了 run_id 时只看、只删这个会话的记忆；
@@ -20,6 +21,7 @@
   wait=True 时同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件；一段对话分多次写入时用
   run() 包起来，结束时整段只抽取一次；
 - 事实不就地改写、也不删除旧版本：被取代的事实留在版本链里（history），get_all 默认只给当前的；
+  update 是记进原始日志的一句更正，由它抽出的新事实取代原来那条；
 - search 先过检索控制器：与记忆无关的问题返回 L0（只有画像，不检索），mode="l1" 可以强制检索；
 - delete 是"被遗忘权"：删掉事实出自的对话，再用剩下的日志重建，连带清理转述、缓存与原图。
 
@@ -40,7 +42,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal
@@ -330,6 +332,63 @@ class Memory:
         finally:
             self.end_run(rid, user_id=user_id, agent_id=agent_id, wait=wait)
 
+    def update(
+        self, memory_id: str, data: str, *, metadata: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """改一条记忆（Mem0 的 update）。事实不就地改写（派生记忆是原始日志的函数，D-021、
+        D-061）：像用户那样说一句更正——"Correction: <data>" 记进一段新的会话（edit-…），原始层
+        记下它要取代的事实（edit_of）——再同步巩固：由这句抽出的新事实以"说错了"（corrected）
+        取代原来那条，不问 LLM；history() 里看得到前后两个版本，遗忘这句更正时原来那条恢复。
+
+        新事实带上原来那条的 metadata（metadata 参数里的键覆盖它）与过期时间。返回 Mem0 风格的
+        事件（UPDATE 附上被取代的旧版本）；从 data 里没有抽出事实时，原来那条不变，message 写明。
+        只能改当前有效的版本（ValueError）；ID 不存在时 KeyError。"""
+        found = self._find(memory_id)
+        if found is None:
+            raise KeyError(f"No memory with id {memory_id}")
+        space, fact = found
+        if not fact.is_current:
+            raise ValueError(
+                f"Memory {memory_id} was already replaced by {fact.superseded_by}: "
+                "update the current version (see history())."
+            )
+        if not data.strip():
+            raise ValueError("data is empty: to remove a memory, call delete().")
+        sources = _Sources.load(self.system, space, fact.source_turn_ids)
+        inherited = {**sources.metadata(fact.source_turn_ids), **dict(metadata or {})}
+        info = _turn_meta(inherited, sources.expires(fact.source_turn_ids)) or TurnMeta()
+        info = info.model_copy(update={"edit_of": memory_id})
+        self._adopt(space)
+        # 巩固按会话开始的时间排序：更正排在原来那条之后（调用方写入时可能给了将来的时间）
+        when = max(datetime.now(), fact.recorded_at + timedelta(microseconds=1))
+        sid = sortable_session_id("edit", when)
+        turn = TurnIn(role="user", text=f"Correction: {data.strip()}", ts=when)
+        before = self.system.db.fact_links(space)
+        with self.system.session_lock(space, sid):
+            self.system.append(
+                space, SessionIn(session_id=sid, started_at=when, turns=[turn]), 0, meta=[info]
+            )
+            self.system.db.set_meta(_idx_key(space, sid), "1")
+        report = self.system.consolidate(space)
+        events = _events(self.system, space, before, None, None)
+        for event in events:
+            event["space_id"] = space
+        (after,) = self.system.db.get_facts(space, ids=[memory_id]) or [fact]
+        if not after.is_current:
+            message = "Memory updated"
+        elif sid in report.failed:
+            message = "Correction logged, but extraction failed: it is retried on consolidate()"
+        else:
+            message = "No memory could be extracted from data: the memory was not changed"
+        return {
+            "message": message,
+            "id": memory_id,
+            "results": events,
+            "session_id": sid,
+            "turn_ids": [stable_id(space, sid, 0)],
+            "consolidation": report.as_dict(),
+        }
+
     def consolidate(
         self, *, user_id: str | None = None, agent_id: str | None = None, rebuild: bool = False
     ) -> dict[str, Any]:
@@ -496,6 +555,25 @@ class Memory:
             return {"message": "Memories of this run deleted", **_forget_out(report)}
         report = self.system.delete_space(space)
         return {"message": "All memories deleted", **_forget_out(report)}
+
+    def reset(self) -> dict[str, Any]:
+        """删除这个数据目录里的全部记忆（Mem0 的 reset）：每个空间都按 delete_all 删除（原始
+        日志、派生记忆、向量、缓存与原图），包括 HTTP 服务、记忆代理与演示写下的空间；还开着的
+        run 一并结束。不可恢复。"""
+        with self._runs_lock:
+            runs = sorted(self._runs)
+            self._runs.clear()
+            self._adopted.clear()
+        for space, rid in runs:
+            self.system.close_session(space, rid, submit=False)
+        spaces = [s["space_id"] for s in self.system.db.list_spaces()]
+        reports = [self.system.delete_space(space) for space in spaces]
+        return {
+            "message": "All memories deleted",
+            "spaces_deleted": spaces,
+            "turns_deleted": sum(r.turns_deleted for r in reports),
+            "images_deleted": sum(r.images_deleted for r in reports),
+        }
 
     # ---------- 导出与导入 ----------
 
