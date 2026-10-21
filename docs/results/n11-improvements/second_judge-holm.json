@@ -1,0 +1,622 @@
+{
+ "source": "second_judge.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "longmemeval_s：关键对比（主判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 5,
+   "tests": {
+    "B4-nobm25 vs B1": {
+     "wins": 84,
+     "losses": 14,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B4-nobm25": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 0.1041,
+     "nominal": true,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 9,
+     "losses": 14,
+     "p": 0.4049,
+     "p_holm": 0.8097,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 5,
+     "losses": 18,
+     "p": 0.0106,
+     "p_holm": 0.0425,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "longmemeval_s：关键对比（第二判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 5,
+   "tests": {
+    "B4-nobm25 vs B1": {
+     "wins": 84,
+     "losses": 13,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B4-nobm25": {
+     "wins": 11,
+     "losses": 9,
+     "p": 0.8238,
+     "p_holm": 0.8238,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 5,
+     "losses": 15,
+     "p": 0.0414,
+     "p_holm": 0.1242,
+     "nominal": true,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 7,
+     "losses": 12,
+     "p": 0.3593,
+     "p_holm": 0.7186,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 5,
+     "losses": 17,
+     "p": 0.0169,
+     "p_holm": 0.0676,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "locomo：关键对比（主判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 5,
+   "tests": {
+    "B4-nobm25 vs B1": {
+     "wins": 65,
+     "losses": 92,
+     "p": 0.0376,
+     "p_holm": 0.1129,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 vs B4-nobm25": {
+     "wins": 42,
+     "losses": 13,
+     "p": 0.0001,
+     "p_holm": 0.0005,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B5": {
+     "wins": 7,
+     "losses": 34,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs B5": {
+     "wins": 48,
+     "losses": 37,
+     "p": 0.278,
+     "p_holm": 0.556,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 39,
+     "losses": 40,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：关键对比（第二判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 5,
+   "tests": {
+    "B4-nobm25 vs B1": {
+     "wins": 64,
+     "losses": 77,
+     "p": 0.3122,
+     "p_holm": 0.9366,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B4-nobm25": {
+     "wins": 32,
+     "losses": 16,
+     "p": 0.0293,
+     "p_holm": 0.1172,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 5,
+     "losses": 30,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs B5": {
+     "wins": 40,
+     "losses": 31,
+     "p": 0.3425,
+     "p_holm": 0.9366,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 34,
+     "losses": 31,
+     "p": 0.8043,
+     "p_holm": 0.9366,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：关键对比（主判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 4,
+   "tests": {
+    "B4-see vs B1": {
+     "wins": 27,
+     "losses": 5,
+     "p": 0.0001,
+     "p_holm": 0.0003,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B4-see": {
+     "wins": 8,
+     "losses": 14,
+     "p": 0.2863,
+     "p_holm": 0.2863,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5-see": {
+     "wins": 2,
+     "losses": 13,
+     "p": 0.0074,
+     "p_holm": 0.0148,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs B5-see": {
+     "wins": 9,
+     "losses": 46,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_32k：关键对比（第二判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 4,
+   "tests": {
+    "B4-see vs B1": {
+     "wins": 27,
+     "losses": 4,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B4-see": {
+     "wins": 8,
+     "losses": 13,
+     "p": 0.3833,
+     "p_holm": 0.3833,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5-see": {
+     "wins": 1,
+     "losses": 15,
+     "p": 0.0005,
+     "p_holm": 0.001,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs B5-see": {
+     "wins": 8,
+     "losses": 49,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_128k：关键对比（主判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 3,
+   "tests": {
+    "B4-see vs B1": {
+     "wins": 26,
+     "losses": 8,
+     "p": 0.0029,
+     "p_holm": 0.0088,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B4-see": {
+     "wins": 19,
+     "losses": 9,
+     "p": 0.0872,
+     "p_holm": 0.0872,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5-see": {
+     "wins": 2,
+     "losses": 11,
+     "p": 0.0225,
+     "p_holm": 0.0449,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_128k：关键对比（第二判分）": {
+   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "m": 3,
+   "tests": {
+    "B4-see vs B1": {
+     "wins": 27,
+     "losses": 8,
+     "p": 0.0019,
+     "p_holm": 0.0056,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B4-see": {
+     "wins": 19,
+     "losses": 9,
+     "p": 0.0872,
+     "p_holm": 0.0872,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5-see": {
+     "wins": 1,
+     "losses": 9,
+     "p": 0.0215,
+     "p_holm": 0.043,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 34,
+   "tests": {
+    "longmemeval_s：关键对比（主判分） | B4-nobm25 vs B1": {
+     "wins": 84,
+     "losses": 14,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：关键对比（主判分） | B6 vs B4-nobm25": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（主判分） | B6 vs B5": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 0.555,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（主判分） | B3 vs B5": {
+     "wins": 9,
+     "losses": 14,
+     "p": 0.4049,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（主判分） | B6a vs B5": {
+     "wins": 5,
+     "losses": 18,
+     "p": 0.0106,
+     "p_holm": 0.2231,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（第二判分） | B4-nobm25 vs B1": {
+     "wins": 84,
+     "losses": 13,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：关键对比（第二判分） | B6 vs B4-nobm25": {
+     "wins": 11,
+     "losses": 9,
+     "p": 0.8238,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（第二判分） | B6 vs B5": {
+     "wins": 5,
+     "losses": 15,
+     "p": 0.0414,
+     "p_holm": 0.5795,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（第二判分） | B3 vs B5": {
+     "wins": 7,
+     "losses": 12,
+     "p": 0.3593,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：关键对比（第二判分） | B6a vs B5": {
+     "wins": 5,
+     "losses": 17,
+     "p": 0.0169,
+     "p_holm": 0.338,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：关键对比（主判分） | B4-nobm25 vs B1": {
+     "wins": 65,
+     "losses": 92,
+     "p": 0.0376,
+     "p_holm": 0.5647,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：关键对比（主判分） | B6 vs B4-nobm25": {
+     "wins": 42,
+     "losses": 13,
+     "p": 0.0001,
+     "p_holm": 0.0031,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：关键对比（主判分） | B6 vs B5": {
+     "wins": 7,
+     "losses": 34,
+     "p": 0.0,
+     "p_holm": 0.0007,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：关键对比（主判分） | B3 vs B5": {
+     "wins": 48,
+     "losses": 37,
+     "p": 0.278,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：关键对比（主判分） | B6a vs B5": {
+     "wins": 39,
+     "losses": 40,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：关键对比（第二判分） | B4-nobm25 vs B1": {
+     "wins": 64,
+     "losses": 77,
+     "p": 0.3122,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：关键对比（第二判分） | B6 vs B4-nobm25": {
+     "wins": 32,
+     "losses": 16,
+     "p": 0.0293,
+     "p_holm": 0.4982,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：关键对比（第二判分） | B6 vs B5": {
+     "wins": 5,
+     "losses": 30,
+     "p": 0.0,
+     "p_holm": 0.0007,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：关键对比（第二判分） | B3 vs B5": {
+     "wins": 40,
+     "losses": 31,
+     "p": 0.3425,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：关键对比（第二判分） | B6a vs B5": {
+     "wins": 34,
+     "losses": 31,
+     "p": 0.8043,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：关键对比（主判分） | B4-see vs B1": {
+     "wins": 27,
+     "losses": 5,
+     "p": 0.0001,
+     "p_holm": 0.0031,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：关键对比（主判分） | B6 vs B4-see": {
+     "wins": 8,
+     "losses": 14,
+     "p": 0.2863,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：关键对比（主判分） | B6 vs B5-see": {
+     "wins": 2,
+     "losses": 13,
+     "p": 0.0074,
+     "p_holm": 0.1625,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：关键对比（主判分） | B3 vs B5-see": {
+     "wins": 9,
+     "losses": 46,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：关键对比（第二判分） | B4-see vs B1": {
+     "wins": 27,
+     "losses": 4,
+     "p": 0.0,
+     "p_holm": 0.001,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：关键对比（第二判分） | B6 vs B4-see": {
+     "wins": 8,
+     "losses": 13,
+     "p": 0.3833,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：关键对比（第二判分） | B6 vs B5-see": {
+     "wins": 1,
+     "losses": 15,
+     "p": 0.0005,
+     "p_holm": 0.013,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：关键对比（第二判分） | B3 vs B5-see": {
+     "wins": 8,
+     "losses": 49,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_128k：关键对比（主判分） | B4-see vs B1": {
+     "wins": 26,
+     "losses": 8,
+     "p": 0.0029,
+     "p_holm": 0.0675,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：关键对比（主判分） | B6 vs B4-see": {
+     "wins": 19,
+     "losses": 9,
+     "p": 0.0872,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：关键对比（主判分） | B6 vs B5-see": {
+     "wins": 2,
+     "losses": 11,
+     "p": 0.0225,
+     "p_holm": 0.4082,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：关键对比（第二判分） | B4-see vs B1": {
+     "wins": 27,
+     "losses": 8,
+     "p": 0.0019,
+     "p_holm": 0.0451,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_128k：关键对比（第二判分） | B6 vs B4-see": {
+     "wins": 19,
+     "losses": 9,
+     "p": 0.0872,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：关键对比（第二判分） | B6 vs B5-see": {
+     "wins": 1,
+     "losses": 9,
+     "p": 0.0215,
+     "p_holm": 0.4082,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "longmemeval_s：关键对比（主判分） | B6 vs B5",
+  "longmemeval_s：关键对比（第二判分） | B6 vs B5",
+  "longmemeval_s：关键对比（第二判分） | B6a vs B5",
+  "locomo：关键对比（主判分） | B4-nobm25 vs B1",
+  "locomo：关键对比（第二判分） | B6 vs B4-nobm25",
+  "全文 | longmemeval_s：关键对比（主判分） | B6 vs B5",
+  "全文 | longmemeval_s：关键对比（主判分） | B6a vs B5",
+  "全文 | longmemeval_s：关键对比（第二判分） | B6 vs B5",
+  "全文 | longmemeval_s：关键对比（第二判分） | B6a vs B5",
+  "全文 | locomo：关键对比（主判分） | B4-nobm25 vs B1",
+  "全文 | locomo：关键对比（第二判分） | B6 vs B4-nobm25",
+  "全文 | memlens_32k：关键对比（主判分） | B6 vs B5-see",
+  "全文 | memlens_128k：关键对比（主判分） | B4-see vs B1",
+  "全文 | memlens_128k：关键对比（主判分） | B6 vs B5-see",
+  "全文 | memlens_128k：关键对比（第二判分） | B6 vs B5-see"
+ ]
+}

@@ -6,7 +6,8 @@
 
 - 两个判分的一致率与 Cohen's κ（按数据集）；
 - 每个方法在两种判分下的准确率，方法之间的排序是否改变（Kendall τ）；
-- 报告里的关键对比（L1 对全上下文、控制器对 L1 / L2、ReAct 对 L2……）胜负是否改变。
+- 报告里的关键对比（L1 对全上下文、控制器对 L1 / L2、ReAct 对 L2……）胜负是否改变；每个数据集、
+  每个判分模型下的关键对比各是一族，做 Holm 校正，写到 second_judge-holm.json。
 
 注意 deepseek-flash 也是主回答模型：判自己家族的回答可能偏宽，报告里要一并说明。
 
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +39,9 @@ from cuemem.evals.routing import sign_test
 from cuemem.evals.splits import load_split
 from cuemem.llm import Ledger, LLMClient
 from cuemem.llm.cache import ResponseCache
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs" / "results" / "n11-improvements" / "second_judge.json"
@@ -220,6 +225,7 @@ def report(settings: Settings) -> None:
         "".join(json.dumps(v, ensure_ascii=False) + "\n" for v in disagreements), "utf-8"
     )
     print(f"→ {OUT.relative_to(ROOT)}；两个判分不一致的 {len(disagreements)} 条 → {path}")
+    multiplicity.update(OUT, multiplicity.n11_second_judge)  # Holm 校正 → second_judge-holm.json
 
 
 def main() -> None:

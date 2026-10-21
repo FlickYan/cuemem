@@ -29,6 +29,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+import multiplicity
 import n9_report as N9
 from n7_controller import add_export_flags, finish_export
 from n11_controller_v2 import IMAGE_FLOOR, OUT, RUNS, add_scene, frozen, pct, versus
@@ -122,6 +123,7 @@ def main() -> None:
         json.dumps(result, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
     )
     print(f"结果：{OUT / 'see_gate.json'}")
+    multiplicity.update(OUT / "see_gate.json", multiplicity.n11_see_gate)  # → see_gate-holm.json
 
 
 if __name__ == "__main__":

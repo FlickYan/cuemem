@@ -25,17 +25,22 @@ label 对 anon 只差标题里的字，是泄漏本身的效应；raw 对 label 
 
     uv run python scripts/n12_leak.py
 
-结果写到 docs/results/n12-leak/summary.json。
+结果写到 docs/results/n12-leak/summary.json；配对检验按族做 Holm 校正，写到 summary-holm.json
+（族的定义见 scripts/multiplicity.py）。
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from cuemem.evals.routing import sign_test
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs" / "eval"
@@ -187,6 +192,7 @@ def main() -> None:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     print(f"\n→ {OUT.relative_to(ROOT)}")
+    multiplicity.update(OUT, multiplicity.n12_leak)  # Holm 校正 → summary-holm.json
 
 
 if __name__ == "__main__":

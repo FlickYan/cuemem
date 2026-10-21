@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1071,6 +1071,42 @@ def sign_test(wins: int, losses: int) -> float:
     k = min(wins, losses)
     tail = sum(math.comb(n, i) for i in range(k + 1)) / 2**n
     return min(1.0, 2 * tail)
+
+
+def holm(pvalues: Mapping[str, float]) -> dict[str, float]:
+    """Holm–Bonferroni 校正：一族检验（键 → p 值）各自校正后的 p 值，键的顺序不变。
+
+    从小到大第 i 个（从 0 数）乘以 m − i，再与比它小的那些取最大值（校正后的 p 随原 p 单调），
+    不超过 1。校正后的 p 小于 α 的才算显著时，整族里错判一次以上的概率不超过 α（FWER），不要求
+    各检验独立：同一批题上的几个配对比较也适用。"""
+    order = sorted(pvalues, key=lambda key: pvalues[key])
+    adjusted: dict[str, float] = {}
+    running = 0.0
+    for i, key in enumerate(order):
+        running = max(running, min(1.0, (len(order) - i) * pvalues[key]))
+        adjusted[key] = running
+    return {key: adjusted[key] for key in pvalues}
+
+
+def holm_family(
+    tests: Mapping[str, Mapping[str, Any]], alpha: float = 0.05
+) -> dict[str, dict[str, Any]]:
+    """一族配对检验（各带 wins、losses）→ 每个检验的胜负、精确符号检验的 p、Holm 校正后的 p，
+    以及校正前后是否小于 alpha。p 按胜负重新算（发表的 JSON 里多数四舍五入到 4 位，极小的写成 0），
+    输出时保留 4 位，比较用未舍入的值。"""
+    raw = {key: sign_test(int(t["wins"]), int(t["losses"])) for key, t in tests.items()}
+    adjusted = holm(raw)
+    return {
+        key: {
+            "wins": int(t["wins"]),
+            "losses": int(t["losses"]),
+            "p": round(raw[key], 4),
+            "p_holm": round(adjusted[key], 4),
+            "nominal": raw[key] < alpha,
+            "holm": adjusted[key] < alpha,
+        }
+        for key, t in tests.items()
+    }
 
 
 def paired(a: PolicyResult, b: PolicyResult) -> tuple[int, int, float]:

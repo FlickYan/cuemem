@@ -3,7 +3,8 @@
 同一个协议下的运行按名字归到一起：`<协议>-<数据集>-<系统>`，例如 pds-locomo-cuemem、
 pds-locomo-mem0、pds-locomo-graphiti。脚本把这些运行里同一批题的结果放在一起：准确率与
 95% 置信区间、各题型、与 CueMem L1 / L2 的配对符号检验、回答成本，以及每个系统写入的成本、
-调用次数与耗时。
+调用次数与耗时。配对检验另按族做 Holm 校正（"L1、L2 对外部系统"等，见 scripts/multiplicity.py），
+写到 <协议>-<数据集>-holm.json。
 
 协议（D-065）：
 - pds：只用 DeepSeek。抽取、规划、回答、判分与外部系统内部的调用都是 deepseek-flash；
@@ -59,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -73,6 +75,9 @@ from cuemem.evals.report import (
     write_cost,
 )
 from cuemem.evals.routing import sign_test
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs" / "results" / "n12-baselines"
@@ -352,6 +357,7 @@ def main() -> None:
         for pair, row in entry["paired"].items():
             print(f"    {pair}: +{row['wins']} / -{row['losses']}  p={row['p']:.3g}")
     print(f"→ {target.relative_to(ROOT)}")
+    multiplicity.update(target, multiplicity.n12_baselines)  # Holm 校正 → <协议>-<数据集>-holm.json
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import multiplicity
 import numpy as np
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
@@ -554,6 +555,7 @@ def main() -> None:
     (OUT / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )
+    multiplicity.update(OUT / "results.json", multiplicity.n7_controller)  # → results-holm.json
     draw(items, datasets, fixed, curves)
     print(f"结果：{OUT}" + ("" if args.no_export else f"；控制器：{V1_MODEL}"))
 

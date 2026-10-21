@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
+from pathlib import Path
 from typing import Any
 
 from cuemem.config import PROJECT_ROOT
 from cuemem.evals import routing as R
 from cuemem.read.controller import V1_MODEL, LearnedController
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 RUNS = PROJECT_ROOT / "runs" / "eval"
 OUT = PROJECT_ROOT / "docs" / "results" / "n7-controller"
@@ -116,6 +121,7 @@ def main() -> None:
         for name in ("B6", "B6r", "always-L2"):
             c = changes[dataset][f"{name}_vs_B3_qwen"]
             print(f"  qwen: {name} vs B3 +{c['wins']} / −{c['losses']} p = {c['p']:.3f}")
+    multiplicity.update(OUT / "h3.json", multiplicity.n7_h3)  # Holm 校正 → h3-holm.json
 
 
 if __name__ == "__main__":

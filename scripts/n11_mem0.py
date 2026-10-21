@@ -2,6 +2,7 @@
 
 Mem0 在 LoCoMo test200r 与 LongMemEval test100r 上各跑一次（方法 M0，见 evals/mem0_baseline.py）；
 CueMem 各方法取 N9 测试集运行里同一批题的结果（同一个回答模型、同一个判分模型、同一套提示）。
+每个运行里对 Mem0 的几个配对检验是一族，做 Holm 校正，写到 mem0-holm.json。
 
     MEM0="--with mem0ai==2.2.1 --with spacy --with fastembed --with en_core_web_sm@$SPACY_SM"
     uv run $MEM0 cuemem eval run --dataset locomo --split test200r --methods M0 \\
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,9 @@ from typing import Any
 from cuemem.config import load_settings
 from cuemem.evals.report import load_rows
 from cuemem.evals.routing import sign_test
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs" / "results" / "n11-improvements" / "mem0.json"
@@ -129,6 +134,7 @@ def main() -> None:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", "utf-8")
     print(f"→ {OUT.relative_to(ROOT)}")
+    multiplicity.update(OUT, multiplicity.n11_mem0)  # Holm 校正 → mem0-holm.json
 
 
 if __name__ == "__main__":

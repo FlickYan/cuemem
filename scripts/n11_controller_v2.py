@@ -38,6 +38,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+import multiplicity
 import n7_controller as N7
 import n9_report as N9
 import numpy as np
@@ -410,6 +411,7 @@ def main() -> None:
     (OUT / "controller_v2.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )
+    multiplicity.update(OUT / "controller_v2.json", multiplicity.n11_controller_v2)
     for name, r in results["dev"]["combined"].items():
         print(f"开发集记忆题 {name}: {r['accuracy']}% ${r['cost_per_1k']}/千题")
     for name, r in results["test_posthoc"]["combined"].items():

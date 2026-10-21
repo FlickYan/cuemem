@@ -7,7 +7,8 @@
 2. 冻结的控制器：N7 导出的模型直接在测试集上选档（与 B6 的真实运行逐题核对），λ 扫描的曲线，
    与固定档位、规则、模型自主检索、"控制器先选、模型兜底"的配对比较；
 3. 混合流（测试集版，scripts/n9_mixed.py）：20% 记忆题时的成本、记忆题准确率与误召回；
-4. L2 对 L1 的分题型配对检验；LoCoMo 上的图扩散；写入路径与有效期（H4）；
+4. L2 对 L1 的分题型配对检验；LoCoMo 上的图扩散；写入路径与有效期（H4）；全部配对检验按族做
+   Holm 校正，写到 results-holm.json（族的定义见 scripts/multiplicity.py）；
 5. 换回答模型（H3）：test100r / test200r 上各回答模型 × 各方法；
 6. 错误分析：主方法答错的题分类。
 
@@ -49,6 +50,7 @@ from cuemem.evals.splits import load_split
 from cuemem.read.controller import HYBRID_BAND, HYBRID_CONFIDENCE, V1_MODEL, LearnedController
 
 sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 import n7_controller as N7
 import n9_errors as E
 import n9_tables
@@ -678,6 +680,7 @@ def main() -> None:
     (OUT / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )
+    multiplicity.update(OUT / "results.json", multiplicity.n9)  # Holm 校正 → results-holm.json
     if results["controller"]:
         plot_pareto(results["controller"], lambda mode: OUT / f"pareto-{mode}.png")
     if results["readers"]:

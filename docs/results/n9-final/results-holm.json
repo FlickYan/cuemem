@@ -1,0 +1,3819 @@
+{
+ "source": "results.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "longmemeval_s：方法对比（总体）": {
+   "description": "comparisons 里每个对比的总体一行",
+   "m": 11,
+   "tests": {
+    "B5 vs B4-nobm25": {
+     "wins": 21,
+     "losses": 10,
+     "p": 0.0708,
+     "p_holm": 0.4953,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-note vs B4-nobm25": {
+     "wins": 17,
+     "losses": 12,
+     "p": 0.4583,
+     "p_holm": 0.9912,
+     "nominal": false,
+     "holm": false
+    },
+    "B2F vs B2": {
+     "wins": 53,
+     "losses": 17,
+     "p": 0.0,
+     "p_holm": 0.0002,
+     "nominal": true,
+     "holm": true
+    },
+    "B2F vs B2F-current": {
+     "wins": 15,
+     "losses": 6,
+     "p": 0.0784,
+     "p_holm": 0.4953,
+     "nominal": false,
+     "holm": false
+    },
+    "B2F vs B2F-plain": {
+     "wins": 13,
+     "losses": 7,
+     "p": 0.2632,
+     "p_holm": 0.9912,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 vs B5-nonote": {
+     "wins": 17,
+     "losses": 10,
+     "p": 0.2478,
+     "p_holm": 0.9912,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 vs B5-noiter": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B3": {
+     "wins": 9,
+     "losses": 17,
+     "p": 0.1686,
+     "p_holm": 0.8432,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 5,
+     "losses": 18,
+     "p": 0.0106,
+     "p_holm": 0.085,
+     "nominal": true,
+     "holm": false
+    },
+    "B4-nobm25 vs B1": {
+     "wins": 84,
+     "losses": 14,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B5 vs B1": {
+     "wins": 89,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "longmemeval_s：B5 vs B4-nobm25（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 6,
+   "tests": {
+    "single-session-user": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 9,
+     "losses": 3,
+     "p": 0.146,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-preference": {
+     "wins": 3,
+     "losses": 1,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 6,
+     "losses": 1,
+     "p": 0.125,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge-update": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B4-note vs B4-nobm25（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 6,
+   "tests": {
+    "single-session-user": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 9,
+     "losses": 5,
+     "p": 0.424,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-preference": {
+     "wins": 3,
+     "losses": 1,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge-update": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B2F vs B2（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 6,
+   "tests": {
+    "single-session-user": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 24,
+     "losses": 8,
+     "p": 0.007,
+     "p_holm": 0.035,
+     "nominal": true,
+     "holm": true
+    },
+    "single-session-preference": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 21,
+     "losses": 4,
+     "p": 0.0009,
+     "p_holm": 0.0055,
+     "nominal": true,
+     "holm": true
+    },
+    "knowledge-update": {
+     "wins": 6,
+     "losses": 0,
+     "p": 0.0312,
+     "p_holm": 0.125,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B2F vs B2F-current（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "single-session-user": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B2F vs B2F-plain（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "single-session-user": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B5 vs B5-nonote（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 6,
+   "tests": {
+    "single-session-user": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 6,
+     "losses": 3,
+     "p": 0.5078,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-preference": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 9,
+     "losses": 2,
+     "p": 0.0654,
+     "p_holm": 0.3926,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge-update": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B5 vs B5-noiter（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 3,
+   "tests": {
+    "single-session-user": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B6a vs B3（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 6,
+   "tests": {
+    "single-session-user": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 5,
+     "losses": 6,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-preference": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 1,
+     "losses": 4,
+     "p": 0.375,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge-update": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B6a vs B5（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 6,
+   "tests": {
+    "single-session-user": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-preference": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 1,
+     "losses": 8,
+     "p": 0.0391,
+     "p_holm": 0.2344,
+     "nominal": true,
+     "holm": false
+    },
+    "knowledge-update": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B4-nobm25 vs B1（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 7,
+   "tests": {
+    "single-session-user": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 0.875,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 25,
+     "losses": 6,
+     "p": 0.0009,
+     "p_holm": 0.0053,
+     "nominal": true,
+     "holm": true
+    },
+    "single-session-preference": {
+     "wins": 8,
+     "losses": 2,
+     "p": 0.1094,
+     "p_holm": 0.5469,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 41,
+     "losses": 3,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "knowledge-update": {
+     "wins": 5,
+     "losses": 1,
+     "p": 0.2188,
+     "p_holm": 0.875,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-assistant": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：B5 vs B1（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 7,
+   "tests": {
+    "single-session-user": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "multi-session": {
+     "wins": 27,
+     "losses": 2,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "single-session-preference": {
+     "wins": 9,
+     "losses": 1,
+     "p": 0.0215,
+     "p_holm": 0.1074,
+     "nominal": true,
+     "holm": false
+    },
+    "temporal-reasoning": {
+     "wins": 44,
+     "losses": 1,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "knowledge-update": {
+     "wins": 6,
+     "losses": 1,
+     "p": 0.125,
+     "p_holm": 0.5,
+     "nominal": false,
+     "holm": false
+    },
+    "single-session-assistant": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：方法对比（总体）": {
+   "description": "comparisons 里每个对比的总体一行",
+   "m": 7,
+   "tests": {
+    "B5 vs B4-nobm25": {
+     "wins": 76,
+     "losses": 20,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B5-ppr vs B5": {
+     "wins": 26,
+     "losses": 30,
+     "p": 0.6889,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-note vs B4-nobm25": {
+     "wins": 49,
+     "losses": 13,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B6a vs B3": {
+     "wins": 34,
+     "losses": 46,
+     "p": 0.2185,
+     "p_holm": 0.6556,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 39,
+     "losses": 40,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 vs B1": {
+     "wins": 65,
+     "losses": 92,
+     "p": 0.0376,
+     "p_holm": 0.1506,
+     "nominal": true,
+     "holm": false
+    },
+    "B5 vs B1": {
+     "wins": 89,
+     "losses": 60,
+     "p": 0.0215,
+     "p_holm": 0.1074,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "locomo：B5 vs B4-nobm25（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 29,
+     "losses": 7,
+     "p": 0.0003,
+     "p_holm": 0.0013,
+     "nominal": true,
+     "holm": true
+    },
+    "open-domain": {
+     "wins": 8,
+     "losses": 1,
+     "p": 0.0391,
+     "p_holm": 0.0781,
+     "nominal": true,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 15,
+     "losses": 5,
+     "p": 0.0414,
+     "p_holm": 0.0781,
+     "nominal": true,
+     "holm": false
+    },
+    "single-hop": {
+     "wins": 24,
+     "losses": 7,
+     "p": 0.0033,
+     "p_holm": 0.01,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "locomo：B5-ppr vs B5（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 11,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "open-domain": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 1,
+     "losses": 4,
+     "p": 0.375,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-hop": {
+     "wins": 11,
+     "losses": 12,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：B4-note vs B4-nobm25（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 15,
+     "losses": 1,
+     "p": 0.0005,
+     "p_holm": 0.0021,
+     "nominal": true,
+     "holm": true
+    },
+    "open-domain": {
+     "wins": 4,
+     "losses": 1,
+     "p": 0.375,
+     "p_holm": 0.3785,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 14,
+     "losses": 7,
+     "p": 0.1892,
+     "p_holm": 0.3785,
+     "nominal": false,
+     "holm": false
+    },
+    "single-hop": {
+     "wins": 16,
+     "losses": 4,
+     "p": 0.0118,
+     "p_holm": 0.0355,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "locomo：B6a vs B3（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 13,
+     "losses": 16,
+     "p": 0.7111,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "open-domain": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 6,
+     "losses": 11,
+     "p": 0.3323,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-hop": {
+     "wins": 12,
+     "losses": 15,
+     "p": 0.7011,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：B6a vs B5（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 18,
+     "losses": 16,
+     "p": 0.8642,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "open-domain": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 6,
+     "losses": 10,
+     "p": 0.4545,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "single-hop": {
+     "wins": 12,
+     "losses": 12,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：B4-nobm25 vs B1（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 15,
+     "losses": 30,
+     "p": 0.0357,
+     "p_holm": 0.1403,
+     "nominal": true,
+     "holm": false
+    },
+    "open-domain": {
+     "wins": 6,
+     "losses": 15,
+     "p": 0.0784,
+     "p_holm": 0.1403,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 23,
+     "losses": 10,
+     "p": 0.0351,
+     "p_holm": 0.1403,
+     "nominal": true,
+     "holm": false
+    },
+    "single-hop": {
+     "wins": 21,
+     "losses": 37,
+     "p": 0.0479,
+     "p_holm": 0.1403,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "locomo：B5 vs B1（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi-hop": {
+     "wins": 25,
+     "losses": 18,
+     "p": 0.3604,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "open-domain": {
+     "wins": 10,
+     "losses": 12,
+     "p": 0.8318,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal": {
+     "wins": 32,
+     "losses": 9,
+     "p": 0.0004,
+     "p_holm": 0.0017,
+     "nominal": true,
+     "holm": true
+    },
+    "single-hop": {
+     "wins": 22,
+     "losses": 21,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：方法对比（总体）": {
+   "description": "comparisons 里每个对比的总体一行",
+   "m": 5,
+   "tests": {
+    "B5-see vs B4-see": {
+     "wins": 16,
+     "losses": 11,
+     "p": 0.4421,
+     "p_holm": 0.8841,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B3": {
+     "wins": 37,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B6a vs B5": {
+     "wins": 18,
+     "losses": 13,
+     "p": 0.4731,
+     "p_holm": 0.8841,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 vs B1": {
+     "wins": 25,
+     "losses": 11,
+     "p": 0.0288,
+     "p_holm": 0.0865,
+     "nominal": true,
+     "holm": false
+    },
+    "B4-see vs B4-mm": {
+     "wins": 26,
+     "losses": 2,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_32k：B5-see vs B4-see（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 3,
+     "losses": 5,
+     "p": 0.7266,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal_reasoning": {
+     "wins": 6,
+     "losses": 2,
+     "p": 0.2891,
+     "p_holm": 0.8672,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge_update": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 7,
+     "losses": 2,
+     "p": 0.1797,
+     "p_holm": 0.7188,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：B6a vs B3（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 5,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal_reasoning": {
+     "wins": 4,
+     "losses": 2,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge_update": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 25,
+     "losses": 1,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：B6a vs B5（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 5,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal_reasoning": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge_update": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 11,
+     "losses": 4,
+     "p": 0.1185,
+     "p_holm": 0.5923,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：B5 vs B1（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 11,
+     "losses": 1,
+     "p": 0.0063,
+     "p_holm": 0.0254,
+     "nominal": true,
+     "holm": true
+    },
+    "temporal_reasoning": {
+     "wins": 7,
+     "losses": 0,
+     "p": 0.0156,
+     "p_holm": 0.0469,
+     "nominal": true,
+     "holm": true
+    },
+    "knowledge_update": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：B4-see vs B4-mm（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal_reasoning": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "knowledge_update": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 19,
+     "losses": 0,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_128k：方法对比（总体）": {
+   "description": "comparisons 里每个对比的总体一行",
+   "m": 3,
+   "tests": {
+    "B5-see vs B4-see": {
+     "wins": 25,
+     "losses": 6,
+     "p": 0.0009,
+     "p_holm": 0.0019,
+     "nominal": true,
+     "holm": true
+    },
+    "B5 vs B1": {
+     "wins": 38,
+     "losses": 13,
+     "p": 0.0006,
+     "p_holm": 0.0019,
+     "nominal": true,
+     "holm": true
+    },
+    "B4-see vs B4-mm": {
+     "wins": 18,
+     "losses": 5,
+     "p": 0.0106,
+     "p_holm": 0.0106,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_128k：B5-see vs B4-see（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 7,
+     "losses": 2,
+     "p": 0.1797,
+     "p_holm": 0.5387,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal_reasoning": {
+     "wins": 6,
+     "losses": 0,
+     "p": 0.0312,
+     "p_holm": 0.125,
+     "nominal": true,
+     "holm": false
+    },
+    "knowledge_update": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 0.5387,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 10,
+     "losses": 4,
+     "p": 0.1796,
+     "p_holm": 0.5387,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_128k：B5 vs B1（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 5,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 12,
+     "losses": 1,
+     "p": 0.0034,
+     "p_holm": 0.0137,
+     "nominal": true,
+     "holm": true
+    },
+    "temporal_reasoning": {
+     "wins": 11,
+     "losses": 0,
+     "p": 0.001,
+     "p_holm": 0.0049,
+     "nominal": true,
+     "holm": true
+    },
+    "knowledge_update": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 12,
+     "losses": 8,
+     "p": 0.5034,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "abstention": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_128k：B4-see vs B4-mm（分题型）": {
+   "description": "同一个对比在各题型上（拒答题单列）",
+   "m": 4,
+   "tests": {
+    "multi_session_reasoning": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "temporal_reasoning": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "information_extraction": {
+     "wins": 15,
+     "losses": 1,
+     "p": 0.0005,
+     "p_holm": 0.0021,
+     "nominal": true,
+     "holm": true
+    },
+    "abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：控制器": {
+   "description": "冻结的控制器、B6a、B3 与固定档位、规则版和彼此之间的配对",
+   "m": 12,
+   "tests": {
+    "B6 (frozen) vs always-L1": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 (frozen) vs always-L2": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 0.3816,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 (frozen) vs B6r": {
+     "wins": 4,
+     "losses": 12,
+     "p": 0.0768,
+     "p_holm": 0.7552,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 (frozen) vs B3": {
+     "wins": 15,
+     "losses": 21,
+     "p": 0.405,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 (frozen) vs B6a": {
+     "wins": 18,
+     "losses": 16,
+     "p": 0.8642,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs always-L1": {
+     "wins": 16,
+     "losses": 18,
+     "p": 0.8642,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs always-L2": {
+     "wins": 5,
+     "losses": 18,
+     "p": 0.0106,
+     "p_holm": 0.1275,
+     "nominal": true,
+     "holm": false
+    },
+    "B6a vs B6r": {
+     "wins": 8,
+     "losses": 18,
+     "p": 0.0755,
+     "p_holm": 0.7552,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B3": {
+     "wins": 9,
+     "losses": 17,
+     "p": 0.1686,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs always-L1": {
+     "wins": 24,
+     "losses": 18,
+     "p": 0.4408,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs always-L2": {
+     "wins": 9,
+     "losses": 14,
+     "p": 0.4049,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B6r": {
+     "wins": 13,
+     "losses": 15,
+     "p": 0.8506,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：控制器": {
+   "description": "冻结的控制器、B6a、B3 与固定档位、规则版和彼此之间的配对",
+   "m": 12,
+   "tests": {
+    "B6 (frozen) vs always-L1": {
+     "wins": 42,
+     "losses": 13,
+     "p": 0.0001,
+     "p_holm": 0.0008,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 (frozen) vs always-L2": {
+     "wins": 7,
+     "losses": 34,
+     "p": 0.0,
+     "p_holm": 0.0002,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 (frozen) vs B6r": {
+     "wins": 34,
+     "losses": 16,
+     "p": 0.0153,
+     "p_holm": 0.0614,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 (frozen) vs B3": {
+     "wins": 30,
+     "losses": 68,
+     "p": 0.0002,
+     "p_holm": 0.0009,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 (frozen) vs B6a": {
+     "wins": 26,
+     "losses": 52,
+     "p": 0.0043,
+     "p_holm": 0.0217,
+     "nominal": true,
+     "holm": true
+    },
+    "B6a vs always-L1": {
+     "wins": 77,
+     "losses": 22,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B6a vs always-L2": {
+     "wins": 39,
+     "losses": 40,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6r": {
+     "wins": 71,
+     "losses": 27,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B6a vs B3": {
+     "wins": 34,
+     "losses": 46,
+     "p": 0.2185,
+     "p_holm": 0.6556,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs always-L1": {
+     "wins": 90,
+     "losses": 23,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs always-L2": {
+     "wins": 48,
+     "losses": 37,
+     "p": 0.278,
+     "p_holm": 0.6556,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B6r": {
+     "wins": 82,
+     "losses": 26,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_32k：控制器": {
+   "description": "冻结的控制器、B6a、B3 与固定档位、规则版和彼此之间的配对",
+   "m": 12,
+   "tests": {
+    "B6 (frozen) vs always-L1": {
+     "wins": 8,
+     "losses": 14,
+     "p": 0.2863,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 (frozen) vs always-L2": {
+     "wins": 2,
+     "losses": 13,
+     "p": 0.0074,
+     "p_holm": 0.0517,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 (frozen) vs B6r": {
+     "wins": 4,
+     "losses": 11,
+     "p": 0.1185,
+     "p_holm": 0.7108,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 (frozen) vs B3": {
+     "wins": 36,
+     "losses": 10,
+     "p": 0.0002,
+     "p_holm": 0.0013,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 (frozen) vs B6a": {
+     "wins": 8,
+     "losses": 11,
+     "p": 0.6476,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs always-L1": {
+     "wins": 11,
+     "losses": 14,
+     "p": 0.69,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs always-L2": {
+     "wins": 8,
+     "losses": 16,
+     "p": 0.1516,
+     "p_holm": 0.7579,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6r": {
+     "wins": 9,
+     "losses": 13,
+     "p": 0.5235,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B3": {
+     "wins": 37,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs always-L1": {
+     "wins": 11,
+     "losses": 43,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs always-L2": {
+     "wins": 9,
+     "losses": 46,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs B6r": {
+     "wins": 11,
+     "losses": 44,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "memlens_128k：控制器": {
+   "description": "冻结的控制器、B6a、B3 与固定档位、规则版和彼此之间的配对",
+   "m": 3,
+   "tests": {
+    "B6 (frozen) vs always-L1": {
+     "wins": 19,
+     "losses": 9,
+     "p": 0.0872,
+     "p_holm": 0.1743,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 (frozen) vs always-L2": {
+     "wins": 2,
+     "losses": 11,
+     "p": 0.0225,
+     "p_holm": 0.0674,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 (frozen) vs B6r": {
+     "wins": 11,
+     "losses": 6,
+     "p": 0.3323,
+     "p_holm": 0.3323,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：换回答模型（deepseek-flash）": {
+   "description": "同一个回答模型下的几个对比",
+   "m": 5,
+   "tests": {
+    "B6a vs B3": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6": {
+     "wins": 6,
+     "losses": 4,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 1,
+     "losses": 3,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：换回答模型（qwen3.8-flash）": {
+   "description": "同一个回答模型下的几个对比",
+   "m": 5,
+   "tests": {
+    "B6a vs B3": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6": {
+     "wins": 5,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 4,
+     "losses": 2,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：换回答模型（qwen3.6-35b-a3b）": {
+   "description": "同一个回答模型下的几个对比",
+   "m": 5,
+   "tests": {
+    "B6a vs B3": {
+     "wins": 4,
+     "losses": 6,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 4,
+     "losses": 6,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6": {
+     "wins": 8,
+     "losses": 3,
+     "p": 0.2266,
+     "p_holm": 0.9062,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.0781,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "locomo：换回答模型（deepseek-flash）": {
+   "description": "同一个回答模型下的几个对比",
+   "m": 5,
+   "tests": {
+    "B6a vs B3": {
+     "wins": 5,
+     "losses": 9,
+     "p": 0.424,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 4,
+     "losses": 8,
+     "p": 0.3877,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6": {
+     "wins": 7,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 0.625,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：换回答模型（qwen3.8-flash）": {
+   "description": "同一个回答模型下的几个对比",
+   "m": 5,
+   "tests": {
+    "B6a vs B3": {
+     "wins": 11,
+     "losses": 8,
+     "p": 0.6476,
+     "p_holm": 0.6476,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 16,
+     "losses": 3,
+     "p": 0.0044,
+     "p_holm": 0.0177,
+     "nominal": true,
+     "holm": true
+    },
+    "B6a vs B6": {
+     "wins": 24,
+     "losses": 3,
+     "p": 0.0,
+     "p_holm": 0.0002,
+     "nominal": true,
+     "holm": true
+    },
+    "B3 vs B5": {
+     "wins": 15,
+     "losses": 5,
+     "p": 0.0414,
+     "p_holm": 0.1157,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 0.1157,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "locomo：换回答模型（qwen3.6-35b-a3b）": {
+   "description": "同一个回答模型下的几个对比",
+   "m": 5,
+   "tests": {
+    "B6a vs B3": {
+     "wins": 15,
+     "losses": 9,
+     "p": 0.3075,
+     "p_holm": 0.9224,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B5": {
+     "wins": 10,
+     "losses": 15,
+     "p": 0.4244,
+     "p_holm": 0.9224,
+     "nominal": false,
+     "holm": false
+    },
+    "B6a vs B6": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3 vs B5": {
+     "wins": 9,
+     "losses": 20,
+     "p": 0.0614,
+     "p_holm": 0.3071,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B5": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 0.7188,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 219,
+   "tests": {
+    "longmemeval_s：方法对比（总体） | B5 vs B4-nobm25": {
+     "wins": 21,
+     "losses": 10,
+     "p": 0.0708,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B4-note vs B4-nobm25": {
+     "wins": 17,
+     "losses": 12,
+     "p": 0.4583,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B2F vs B2": {
+     "wins": 53,
+     "losses": 17,
+     "p": 0.0,
+     "p_holm": 0.0038,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：方法对比（总体） | B2F vs B2F-current": {
+     "wins": 15,
+     "losses": 6,
+     "p": 0.0784,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B2F vs B2F-plain": {
+     "wins": 13,
+     "losses": 7,
+     "p": 0.2632,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B5 vs B5-nonote": {
+     "wins": 17,
+     "losses": 10,
+     "p": 0.2478,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B5 vs B5-noiter": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B6a vs B3": {
+     "wins": 9,
+     "losses": 17,
+     "p": 0.1686,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B6a vs B5": {
+     "wins": 5,
+     "losses": 18,
+     "p": 0.0106,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：方法对比（总体） | B4-nobm25 vs B1": {
+     "wins": 84,
+     "losses": 14,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：方法对比（总体） | B5 vs B1": {
+     "wins": 89,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：B5 vs B4-nobm25（分题型） | single-session-user": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B4-nobm25（分题型） | abstention": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B4-nobm25（分题型） | multi-session": {
+     "wins": 9,
+     "losses": 3,
+     "p": 0.146,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B4-nobm25（分题型） | single-session-preference": {
+     "wins": 3,
+     "losses": 1,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B4-nobm25（分题型） | temporal-reasoning": {
+     "wins": 6,
+     "losses": 1,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B4-nobm25（分题型） | knowledge-update": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-note vs B4-nobm25（分题型） | single-session-user": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-note vs B4-nobm25（分题型） | abstention": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-note vs B4-nobm25（分题型） | multi-session": {
+     "wins": 9,
+     "losses": 5,
+     "p": 0.424,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-note vs B4-nobm25（分题型） | single-session-preference": {
+     "wins": 3,
+     "losses": 1,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-note vs B4-nobm25（分题型） | temporal-reasoning": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-note vs B4-nobm25（分题型） | knowledge-update": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2（分题型） | single-session-user": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2（分题型） | abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2（分题型） | multi-session": {
+     "wins": 24,
+     "losses": 8,
+     "p": 0.007,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2（分题型） | single-session-preference": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2（分题型） | temporal-reasoning": {
+     "wins": 21,
+     "losses": 4,
+     "p": 0.0009,
+     "p_holm": 0.1703,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2（分题型） | knowledge-update": {
+     "wins": 6,
+     "losses": 0,
+     "p": 0.0312,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-current（分题型） | single-session-user": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-current（分题型） | abstention": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-current（分题型） | multi-session": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-current（分题型） | temporal-reasoning": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-plain（分题型） | single-session-user": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-plain（分题型） | abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-plain（分题型） | multi-session": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B2F vs B2F-plain（分题型） | temporal-reasoning": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-nonote（分题型） | single-session-user": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-nonote（分题型） | abstention": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-nonote（分题型） | multi-session": {
+     "wins": 6,
+     "losses": 3,
+     "p": 0.5078,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-nonote（分题型） | single-session-preference": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-nonote（分题型） | temporal-reasoning": {
+     "wins": 9,
+     "losses": 2,
+     "p": 0.0654,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-nonote（分题型） | knowledge-update": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-noiter（分题型） | single-session-user": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-noiter（分题型） | multi-session": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B5-noiter（分题型） | temporal-reasoning": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B3（分题型） | single-session-user": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B3（分题型） | abstention": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B3（分题型） | multi-session": {
+     "wins": 5,
+     "losses": 6,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B3（分题型） | single-session-preference": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B3（分题型） | temporal-reasoning": {
+     "wins": 1,
+     "losses": 4,
+     "p": 0.375,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B3（分题型） | knowledge-update": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B5（分题型） | single-session-user": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B5（分题型） | abstention": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B5（分题型） | multi-session": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B5（分题型） | single-session-preference": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B5（分题型） | temporal-reasoning": {
+     "wins": 1,
+     "losses": 8,
+     "p": 0.0391,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：B6a vs B5（分题型） | knowledge-update": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | single-session-user": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | abstention": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | multi-session": {
+     "wins": 25,
+     "losses": 6,
+     "p": 0.0009,
+     "p_holm": 0.1659,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | single-session-preference": {
+     "wins": 8,
+     "losses": 2,
+     "p": 0.1094,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | temporal-reasoning": {
+     "wins": 41,
+     "losses": 3,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | knowledge-update": {
+     "wins": 5,
+     "losses": 1,
+     "p": 0.2188,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B4-nobm25 vs B1（分题型） | single-session-assistant": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B1（分题型） | single-session-user": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B1（分题型） | abstention": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B1（分题型） | multi-session": {
+     "wins": 27,
+     "losses": 2,
+     "p": 0.0,
+     "p_holm": 0.0003,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：B5 vs B1（分题型） | single-session-preference": {
+     "wins": 9,
+     "losses": 1,
+     "p": 0.0215,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B1（分题型） | temporal-reasoning": {
+     "wins": 44,
+     "losses": 1,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "longmemeval_s：B5 vs B1（分题型） | knowledge-update": {
+     "wins": 6,
+     "losses": 1,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：B5 vs B1（分题型） | single-session-assistant": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：方法对比（总体） | B5 vs B4-nobm25": {
+     "wins": 76,
+     "losses": 20,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：方法对比（总体） | B5-ppr vs B5": {
+     "wins": 26,
+     "losses": 30,
+     "p": 0.6889,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：方法对比（总体） | B4-note vs B4-nobm25": {
+     "wins": 49,
+     "losses": 13,
+     "p": 0.0,
+     "p_holm": 0.001,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：方法对比（总体） | B6a vs B3": {
+     "wins": 34,
+     "losses": 46,
+     "p": 0.2185,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：方法对比（总体） | B6a vs B5": {
+     "wins": 39,
+     "losses": 40,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：方法对比（总体） | B4-nobm25 vs B1": {
+     "wins": 65,
+     "losses": 92,
+     "p": 0.0376,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：方法对比（总体） | B5 vs B1": {
+     "wins": 89,
+     "losses": 60,
+     "p": 0.0215,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5 vs B4-nobm25（分题型） | multi-hop": {
+     "wins": 29,
+     "losses": 7,
+     "p": 0.0003,
+     "p_holm": 0.0606,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5 vs B4-nobm25（分题型） | open-domain": {
+     "wins": 8,
+     "losses": 1,
+     "p": 0.0391,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5 vs B4-nobm25（分题型） | temporal": {
+     "wins": 15,
+     "losses": 5,
+     "p": 0.0414,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5 vs B4-nobm25（分题型） | single-hop": {
+     "wins": 24,
+     "losses": 7,
+     "p": 0.0033,
+     "p_holm": 0.6155,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5-ppr vs B5（分题型） | multi-hop": {
+     "wins": 11,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B5-ppr vs B5（分题型） | open-domain": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B5-ppr vs B5（分题型） | temporal": {
+     "wins": 1,
+     "losses": 4,
+     "p": 0.375,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B5-ppr vs B5（分题型） | single-hop": {
+     "wins": 11,
+     "losses": 12,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B4-note vs B4-nobm25（分题型） | multi-hop": {
+     "wins": 15,
+     "losses": 1,
+     "p": 0.0005,
+     "p_holm": 0.0996,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B4-note vs B4-nobm25（分题型） | open-domain": {
+     "wins": 4,
+     "losses": 1,
+     "p": 0.375,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B4-note vs B4-nobm25（分题型） | temporal": {
+     "wins": 14,
+     "losses": 7,
+     "p": 0.1892,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B4-note vs B4-nobm25（分题型） | single-hop": {
+     "wins": 16,
+     "losses": 4,
+     "p": 0.0118,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B6a vs B3（分题型） | multi-hop": {
+     "wins": 13,
+     "losses": 16,
+     "p": 0.7111,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B3（分题型） | open-domain": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B3（分题型） | temporal": {
+     "wins": 6,
+     "losses": 11,
+     "p": 0.3323,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B3（分题型） | single-hop": {
+     "wins": 12,
+     "losses": 15,
+     "p": 0.7011,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B5（分题型） | multi-hop": {
+     "wins": 18,
+     "losses": 16,
+     "p": 0.8642,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B5（分题型） | open-domain": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B5（分题型） | temporal": {
+     "wins": 6,
+     "losses": 10,
+     "p": 0.4545,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B6a vs B5（分题型） | single-hop": {
+     "wins": 12,
+     "losses": 12,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B4-nobm25 vs B1（分题型） | multi-hop": {
+     "wins": 15,
+     "losses": 30,
+     "p": 0.0357,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B4-nobm25 vs B1（分题型） | open-domain": {
+     "wins": 6,
+     "losses": 15,
+     "p": 0.0784,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B4-nobm25 vs B1（分题型） | temporal": {
+     "wins": 23,
+     "losses": 10,
+     "p": 0.0351,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B4-nobm25 vs B1（分题型） | single-hop": {
+     "wins": 21,
+     "losses": 37,
+     "p": 0.0479,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5 vs B1（分题型） | multi-hop": {
+     "wins": 25,
+     "losses": 18,
+     "p": 0.3604,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B5 vs B1（分题型） | open-domain": {
+     "wins": 10,
+     "losses": 12,
+     "p": 0.8318,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：B5 vs B1（分题型） | temporal": {
+     "wins": 32,
+     "losses": 9,
+     "p": 0.0004,
+     "p_holm": 0.0832,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：B5 vs B1（分题型） | single-hop": {
+     "wins": 22,
+     "losses": 21,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：方法对比（总体） | B5-see vs B4-see": {
+     "wins": 16,
+     "losses": 11,
+     "p": 0.4421,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：方法对比（总体） | B6a vs B3": {
+     "wins": 37,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0031,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：方法对比（总体） | B6a vs B5": {
+     "wins": 18,
+     "losses": 13,
+     "p": 0.4731,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：方法对比（总体） | B5 vs B1": {
+     "wins": 25,
+     "losses": 11,
+     "p": 0.0288,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：方法对比（总体） | B4-see vs B4-mm": {
+     "wins": 26,
+     "losses": 2,
+     "p": 0.0,
+     "p_holm": 0.0006,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：B5-see vs B4-see（分题型） | multi_session_reasoning": {
+     "wins": 3,
+     "losses": 5,
+     "p": 0.7266,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B5-see vs B4-see（分题型） | temporal_reasoning": {
+     "wins": 6,
+     "losses": 2,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B5-see vs B4-see（分题型） | knowledge_update": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B5-see vs B4-see（分题型） | information_extraction": {
+     "wins": 7,
+     "losses": 2,
+     "p": 0.1797,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B3（分题型） | multi_session_reasoning": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B3（分题型） | temporal_reasoning": {
+     "wins": 4,
+     "losses": 2,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B3（分题型） | knowledge_update": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B3（分题型） | information_extraction": {
+     "wins": 25,
+     "losses": 1,
+     "p": 0.0,
+     "p_holm": 0.0002,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：B6a vs B3（分题型） | abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B5（分题型） | multi_session_reasoning": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B5（分题型） | temporal_reasoning": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B5（分题型） | knowledge_update": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B5（分题型） | information_extraction": {
+     "wins": 11,
+     "losses": 4,
+     "p": 0.1185,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B6a vs B5（分题型） | abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B5 vs B1（分题型） | multi_session_reasoning": {
+     "wins": 11,
+     "losses": 1,
+     "p": 0.0063,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：B5 vs B1（分题型） | temporal_reasoning": {
+     "wins": 7,
+     "losses": 0,
+     "p": 0.0156,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：B5 vs B1（分题型） | knowledge_update": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B5 vs B1（分题型） | information_extraction": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B4-see vs B4-mm（分题型） | multi_session_reasoning": {
+     "wins": 3,
+     "losses": 0,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B4-see vs B4-mm（分题型） | temporal_reasoning": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B4-see vs B4-mm（分题型） | knowledge_update": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：B4-see vs B4-mm（分题型） | information_extraction": {
+     "wins": 19,
+     "losses": 0,
+     "p": 0.0,
+     "p_holm": 0.0008,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_128k：方法对比（总体） | B5-see vs B4-see": {
+     "wins": 25,
+     "losses": 6,
+     "p": 0.0009,
+     "p_holm": 0.1659,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：方法对比（总体） | B5 vs B1": {
+     "wins": 38,
+     "losses": 13,
+     "p": 0.0006,
+     "p_holm": 0.118,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：方法对比（总体） | B4-see vs B4-mm": {
+     "wins": 18,
+     "losses": 5,
+     "p": 0.0106,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：B5-see vs B4-see（分题型） | multi_session_reasoning": {
+     "wins": 7,
+     "losses": 2,
+     "p": 0.1797,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B5-see vs B4-see（分题型） | temporal_reasoning": {
+     "wins": 6,
+     "losses": 0,
+     "p": 0.0312,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：B5-see vs B4-see（分题型） | knowledge_update": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B5-see vs B4-see（分题型） | information_extraction": {
+     "wins": 10,
+     "losses": 4,
+     "p": 0.1796,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B5 vs B1（分题型） | multi_session_reasoning": {
+     "wins": 12,
+     "losses": 1,
+     "p": 0.0034,
+     "p_holm": 0.6289,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：B5 vs B1（分题型） | temporal_reasoning": {
+     "wins": 11,
+     "losses": 0,
+     "p": 0.001,
+     "p_holm": 0.1816,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：B5 vs B1（分题型） | knowledge_update": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B5 vs B1（分题型） | information_extraction": {
+     "wins": 12,
+     "losses": 8,
+     "p": 0.5034,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B5 vs B1（分题型） | abstention": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B4-see vs B4-mm（分题型） | multi_session_reasoning": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B4-see vs B4-mm（分题型） | temporal_reasoning": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：B4-see vs B4-mm（分题型） | information_extraction": {
+     "wins": 15,
+     "losses": 1,
+     "p": 0.0005,
+     "p_holm": 0.0996,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：B4-see vs B4-mm（分题型） | abstention": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6 (frozen) vs always-L1": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6 (frozen) vs always-L2": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6 (frozen) vs B6r": {
+     "wins": 4,
+     "losses": 12,
+     "p": 0.0768,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6 (frozen) vs B3": {
+     "wins": 15,
+     "losses": 21,
+     "p": 0.405,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6 (frozen) vs B6a": {
+     "wins": 18,
+     "losses": 16,
+     "p": 0.8642,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6a vs always-L1": {
+     "wins": 16,
+     "losses": 18,
+     "p": 0.8642,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6a vs always-L2": {
+     "wins": 5,
+     "losses": 18,
+     "p": 0.0106,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6a vs B6r": {
+     "wins": 8,
+     "losses": 18,
+     "p": 0.0755,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B6a vs B3": {
+     "wins": 9,
+     "losses": 17,
+     "p": 0.1686,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B3 vs always-L1": {
+     "wins": 24,
+     "losses": 18,
+     "p": 0.4408,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B3 vs always-L2": {
+     "wins": 9,
+     "losses": 14,
+     "p": 0.4049,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器 | B3 vs B6r": {
+     "wins": 13,
+     "losses": 15,
+     "p": 0.8506,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器 | B6 (frozen) vs always-L1": {
+     "wins": 42,
+     "losses": 13,
+     "p": 0.0001,
+     "p_holm": 0.0224,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：控制器 | B6 (frozen) vs always-L2": {
+     "wins": 7,
+     "losses": 34,
+     "p": 0.0,
+     "p_holm": 0.005,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：控制器 | B6 (frozen) vs B6r": {
+     "wins": 34,
+     "losses": 16,
+     "p": 0.0153,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：控制器 | B6 (frozen) vs B3": {
+     "wins": 30,
+     "losses": 68,
+     "p": 0.0002,
+     "p_holm": 0.0306,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：控制器 | B6 (frozen) vs B6a": {
+     "wins": 26,
+     "losses": 52,
+     "p": 0.0043,
+     "p_holm": 0.7933,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：控制器 | B6a vs always-L1": {
+     "wins": 77,
+     "losses": 22,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：控制器 | B6a vs always-L2": {
+     "wins": 39,
+     "losses": 40,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器 | B6a vs B6r": {
+     "wins": 71,
+     "losses": 27,
+     "p": 0.0,
+     "p_holm": 0.0021,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：控制器 | B6a vs B3": {
+     "wins": 34,
+     "losses": 46,
+     "p": 0.2185,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器 | B3 vs always-L1": {
+     "wins": 90,
+     "losses": 23,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：控制器 | B3 vs always-L2": {
+     "wins": 48,
+     "losses": 37,
+     "p": 0.278,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器 | B3 vs B6r": {
+     "wins": 82,
+     "losses": 26,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：控制器 | B6 (frozen) vs always-L1": {
+     "wins": 8,
+     "losses": 14,
+     "p": 0.2863,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6 (frozen) vs always-L2": {
+     "wins": 2,
+     "losses": 13,
+     "p": 0.0074,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6 (frozen) vs B6r": {
+     "wins": 4,
+     "losses": 11,
+     "p": 0.1185,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6 (frozen) vs B3": {
+     "wins": 36,
+     "losses": 10,
+     "p": 0.0002,
+     "p_holm": 0.0306,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：控制器 | B6 (frozen) vs B6a": {
+     "wins": 8,
+     "losses": 11,
+     "p": 0.6476,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6a vs always-L1": {
+     "wins": 11,
+     "losses": 14,
+     "p": 0.69,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6a vs always-L2": {
+     "wins": 8,
+     "losses": 16,
+     "p": 0.1516,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6a vs B6r": {
+     "wins": 9,
+     "losses": 13,
+     "p": 0.5235,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器 | B6a vs B3": {
+     "wins": 37,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0031,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：控制器 | B3 vs always-L1": {
+     "wins": 11,
+     "losses": 43,
+     "p": 0.0,
+     "p_holm": 0.0028,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：控制器 | B3 vs always-L2": {
+     "wins": 9,
+     "losses": 46,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：控制器 | B3 vs B6r": {
+     "wins": 11,
+     "losses": 44,
+     "p": 0.0,
+     "p_holm": 0.0018,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_128k：控制器 | B6 (frozen) vs always-L1": {
+     "wins": 19,
+     "losses": 9,
+     "p": 0.0872,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k：控制器 | B6 (frozen) vs always-L2": {
+     "wins": 2,
+     "losses": 11,
+     "p": 0.0225,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_128k：控制器 | B6 (frozen) vs B6r": {
+     "wins": 11,
+     "losses": 6,
+     "p": 0.3323,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（deepseek-flash） | B6a vs B3": {
+     "wins": 2,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（deepseek-flash） | B6a vs B5": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（deepseek-flash） | B6a vs B6": {
+     "wins": 6,
+     "losses": 4,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（deepseek-flash） | B3 vs B5": {
+     "wins": 1,
+     "losses": 3,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（deepseek-flash） | B6 vs B5": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.8-flash） | B6a vs B3": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.8-flash） | B6a vs B5": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.8-flash） | B6a vs B6": {
+     "wins": 5,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.8-flash） | B3 vs B5": {
+     "wins": 4,
+     "losses": 2,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.8-flash） | B6 vs B5": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6a vs B3": {
+     "wins": 4,
+     "losses": 6,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6a vs B5": {
+     "wins": 4,
+     "losses": 6,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6a vs B6": {
+     "wins": 8,
+     "losses": 3,
+     "p": 0.2266,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B3 vs B5": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6 vs B5": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型（deepseek-flash） | B6a vs B3": {
+     "wins": 5,
+     "losses": 9,
+     "p": 0.424,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（deepseek-flash） | B6a vs B5": {
+     "wins": 4,
+     "losses": 8,
+     "p": 0.3877,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（deepseek-flash） | B6a vs B6": {
+     "wins": 7,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（deepseek-flash） | B3 vs B5": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（deepseek-flash） | B6 vs B5": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.8-flash） | B6a vs B3": {
+     "wins": 11,
+     "losses": 8,
+     "p": 0.6476,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.8-flash） | B6a vs B5": {
+     "wins": 16,
+     "losses": 3,
+     "p": 0.0044,
+     "p_holm": 0.8054,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.8-flash） | B6a vs B6": {
+     "wins": 24,
+     "losses": 3,
+     "p": 0.0,
+     "p_holm": 0.0097,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：换回答模型（qwen3.8-flash） | B3 vs B5": {
+     "wins": 15,
+     "losses": 5,
+     "p": 0.0414,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.8-flash） | B6 vs B5": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.6-35b-a3b） | B6a vs B3": {
+     "wins": 15,
+     "losses": 9,
+     "p": 0.3075,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.6-35b-a3b） | B6a vs B5": {
+     "wins": 10,
+     "losses": 15,
+     "p": 0.4244,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.6-35b-a3b） | B6a vs B6": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.6-35b-a3b） | B3 vs B5": {
+     "wins": 9,
+     "losses": 20,
+     "p": 0.0614,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型（qwen3.6-35b-a3b） | B6 vs B5": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "longmemeval_s：方法对比（总体） | B6a vs B5",
+  "longmemeval_s：B2F vs B2（分题型） | knowledge-update",
+  "longmemeval_s：B6a vs B5（分题型） | temporal-reasoning",
+  "longmemeval_s：B5 vs B1（分题型） | single-session-preference",
+  "locomo：方法对比（总体） | B4-nobm25 vs B1",
+  "locomo：方法对比（总体） | B5 vs B1",
+  "locomo：B5 vs B4-nobm25（分题型） | open-domain",
+  "locomo：B5 vs B4-nobm25（分题型） | temporal",
+  "locomo：B4-nobm25 vs B1（分题型） | multi-hop",
+  "locomo：B4-nobm25 vs B1（分题型） | temporal",
+  "locomo：B4-nobm25 vs B1（分题型） | single-hop",
+  "memlens_32k：方法对比（总体） | B5 vs B1",
+  "memlens_128k：B5-see vs B4-see（分题型） | temporal_reasoning",
+  "longmemeval_s：控制器 | B6 (frozen) vs always-L2",
+  "longmemeval_s：控制器 | B6a vs always-L2",
+  "locomo：控制器 | B6 (frozen) vs B6r",
+  "memlens_32k：控制器 | B6 (frozen) vs always-L2",
+  "memlens_128k：控制器 | B6 (frozen) vs always-L2",
+  "longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6 vs B5",
+  "locomo：换回答模型（qwen3.8-flash） | B3 vs B5",
+  "locomo：换回答模型（qwen3.8-flash） | B6 vs B5",
+  "全文 | longmemeval_s：方法对比（总体） | B6a vs B5",
+  "全文 | longmemeval_s：B2F vs B2（分题型） | multi-session",
+  "全文 | longmemeval_s：B2F vs B2（分题型） | temporal-reasoning",
+  "全文 | longmemeval_s：B2F vs B2（分题型） | knowledge-update",
+  "全文 | longmemeval_s：B6a vs B5（分题型） | temporal-reasoning",
+  "全文 | longmemeval_s：B4-nobm25 vs B1（分题型） | multi-session",
+  "全文 | longmemeval_s：B5 vs B1（分题型） | single-session-preference",
+  "全文 | locomo：方法对比（总体） | B4-nobm25 vs B1",
+  "全文 | locomo：方法对比（总体） | B5 vs B1",
+  "全文 | locomo：B5 vs B4-nobm25（分题型） | multi-hop",
+  "全文 | locomo：B5 vs B4-nobm25（分题型） | open-domain",
+  "全文 | locomo：B5 vs B4-nobm25（分题型） | temporal",
+  "全文 | locomo：B5 vs B4-nobm25（分题型） | single-hop",
+  "全文 | locomo：B4-note vs B4-nobm25（分题型） | multi-hop",
+  "全文 | locomo：B4-note vs B4-nobm25（分题型） | single-hop",
+  "全文 | locomo：B4-nobm25 vs B1（分题型） | multi-hop",
+  "全文 | locomo：B4-nobm25 vs B1（分题型） | temporal",
+  "全文 | locomo：B4-nobm25 vs B1（分题型） | single-hop",
+  "全文 | locomo：B5 vs B1（分题型） | temporal",
+  "全文 | memlens_32k：方法对比（总体） | B5 vs B1",
+  "全文 | memlens_32k：B5 vs B1（分题型） | multi_session_reasoning",
+  "全文 | memlens_32k：B5 vs B1（分题型） | temporal_reasoning",
+  "全文 | memlens_128k：方法对比（总体） | B5-see vs B4-see",
+  "全文 | memlens_128k：方法对比（总体） | B5 vs B1",
+  "全文 | memlens_128k：方法对比（总体） | B4-see vs B4-mm",
+  "全文 | memlens_128k：B5-see vs B4-see（分题型） | temporal_reasoning",
+  "全文 | memlens_128k：B5 vs B1（分题型） | multi_session_reasoning",
+  "全文 | memlens_128k：B5 vs B1（分题型） | temporal_reasoning",
+  "全文 | memlens_128k：B4-see vs B4-mm（分题型） | information_extraction",
+  "全文 | longmemeval_s：控制器 | B6 (frozen) vs always-L2",
+  "全文 | longmemeval_s：控制器 | B6a vs always-L2",
+  "全文 | locomo：控制器 | B6 (frozen) vs B6r",
+  "全文 | locomo：控制器 | B6 (frozen) vs B6a",
+  "全文 | memlens_32k：控制器 | B6 (frozen) vs always-L2",
+  "全文 | memlens_128k：控制器 | B6 (frozen) vs always-L2",
+  "全文 | longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6 vs B5",
+  "全文 | locomo：换回答模型（qwen3.8-flash） | B6a vs B5",
+  "全文 | locomo：换回答模型（qwen3.8-flash） | B3 vs B5",
+  "全文 | locomo：换回答模型（qwen3.8-flash） | B6 vs B5"
+ ]
+}
