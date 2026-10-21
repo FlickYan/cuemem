@@ -26,7 +26,7 @@ from cuemem.config import PathsConfig, Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
-from cuemem.evidence import stored_text
+from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
 from cuemem.sdk import parse_messages, space_for
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -174,6 +174,30 @@ def test_search_and_answer(memory: Memory) -> None:
         "see": False,
         "reasons": ["no memories yet"],
     }
+
+
+def test_search_does_not_fall_below_l1_unless_asked(memory: Memory) -> None:
+    """调用 search 就是已经决定要查记忆：控制器选了 L0 时改走 L1，与 MCP、Agents SDK 与 LangGraph
+    的 recall 相同（at_least_l1），reasons 写明。以前 SDK 的 search 这时返回空列表，同一句话经
+    MCP 却查得到。min_level="l0" 照控制器的决定；mode="l0" 只要画像。"""
+    memory.add("I like green tea", user_id="u", wait=True)
+    memory.add("I like chess", user_id="u", wait=True)
+    gate = memory.search("Hi there", user_id="u", min_level="l0")
+    assert gate["level"] == "L0" and gate["results"] == []  # 控制器认为这句不需要回忆
+    found = memory.search("Hi there", user_id="u")
+    assert found["level"] == "L1" and found["reasons"] == [RAISED_REASON]
+    listing = recall_listing(memory.system, "u", "Hi there", at_least_l1=True)
+    assert listing["level"] == "L1"
+    assert {r["id"] for r in found["results"] if r["type"] == "fact"} == {
+        f["id"] for f in listing["facts"]
+    }
+    assert {r["id"] for r in found["results"] if r["type"] == "excerpt"} == {
+        e["id"] for e in listing["excerpts"]
+    }
+    assert found["results"]
+    assert memory.search("Hi there", user_id="u", mode="l0")["results"] == []
+    deep = memory.search("What do I like?", user_id="u", mode="l1")
+    assert deep["level"] == "L1" and deep["reasons"] == []  # 指定了档位：照办
 
 
 def test_spaces_are_isolated_by_user_and_agent(memory: Memory) -> None:

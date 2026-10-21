@@ -22,7 +22,9 @@ CueMem 自己的设计：
   run() 包起来，结束时整段只抽取一次；
 - 事实不就地改写、也不删除旧版本：被取代的事实留在版本链里（history），get_all 默认只给当前的；
   update 是记进原始日志的一句更正，由它抽出的新事实取代原来那条；
-- search 先过检索控制器：与记忆无关的问题返回 L0（只有画像，不检索），mode="l1" 可以强制检索；
+- search 先过检索控制器，由它决定查多深；与 MCP、各框架集成的 recall 相同，不低于 L1（控制器
+  选了 L0 时改走 L1，reasons 写明），min_level="l0" 时照控制器的决定、与记忆无关的问题只给画像；
+  answer 照旧由控制器决定要不要回忆；
 - delete 是"被遗忘权"：删掉事实出自的对话，再用剩下的日志重建，连带清理转述、缓存与原图。
 
 返回值、参数名与报错信息用英文（与 HTTP 接口、MCP、界面一致）；SDK 只组装已有的组件，
@@ -416,9 +418,12 @@ class Memory:
         lam: float | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
+        min_level: Literal["l0", "l1"] = "l1",
     ) -> dict[str, Any]:
-        """检索（不回答）。mode="auto" 由检索控制器选 L0 / L1 / L2，结果里的 level 与 reasons
-        说明它为什么这么选；L0 表示这句话不需要回忆，只返回画像。limit 截断结果条数。
+        """检索（不回答）。mode="auto" 由检索控制器选档，结果里的 level 与 reasons 说明它为什么
+        这么选；limit 截断结果条数。调用 search 就是已经决定要查记忆：与 MCP、各框架集成的
+        recall 相同，控制器选了 L0（这句话不需要回忆）时改走 L1，reasons 写明，控制器只决定要不要
+        查得更深。min_level="l0" 时照控制器的决定，L0 只返回画像；mode="l0" 直接只要画像。
 
         filters={"user_id": …, "agent_id": …, "run_id": …} 与 top_k 是 Mem0 v3 的写法，与
         user_id、limit 等价。run_id：只要这个会话里的事实、对话片段与图片。filters 里的其他键是
@@ -430,11 +435,19 @@ class Memory:
         space = space_for(user_id, agent_id)
         if not self.system.db.get_sessions(space):
             return _empty(self.system, space)
+        from cuemem.evidence import RAISED_REASON
+
         recall = self.system.retrieve(
             space, query, question_time=at, mode=mode, router=router, lam=lam
         )
+        raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
+        if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同
+            recall = self.system.retrieve(space, query, question_time=at, mode="l1")
         select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
-        return _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
+        out = _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
+        if raised:
+            out["reasons"] = [RAISED_REASON]
+        return out
 
     def answer(
         self,

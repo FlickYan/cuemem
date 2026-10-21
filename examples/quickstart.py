@@ -40,12 +40,14 @@ def main() -> None:
         )
         print("events:", json.dumps(moved["results"], indent=1, ensure_ascii=False)[:800])
 
-        # 检索：控制器先判断要不要回忆、回忆多深
+        # 检索：控制器决定回忆多深
         found = m.search("Where do I live now?", user_id="alice")
         print("level:", found["level"], found["reasons"])
         for item in found["results"][:5]:
             print(f"  [{item['type']}] {item['memory'][:80]}  ({item.get('status', '')})")
-        print("no memory needed:", m.search("What is 2 + 2?", user_id="alice")["level"])
+        # search 不低于 L1（调用它就是决定要查）；min_level="l0" 时照控制器的决定，可以不查
+        gate = m.search("What is 2 + 2?", user_id="alice", min_level="l0")
+        print("no memory needed:", gate["level"])
 
         # 回答（带引用）与版本链
         print("answer:", m.answer("Where do I live now?", user_id="alice")["answer"])
