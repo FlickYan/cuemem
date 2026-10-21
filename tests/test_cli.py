@@ -510,6 +510,29 @@ def test_eval_run_fail_on_error(
     assert runner.invoke(app, [*args, "--build-only", "--fail-on-error"]).exit_code == code
 
 
+def test_eval_probe_fail_on_error(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """eval probe --fail-on-error（复现脚本用）：有题出错（空间没建好）时退出码 3；不加时照旧 0。
+    以前探针出错照样退出码 0，复现脚本接着用少了的题重写 docs/results。"""
+    import shutil
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope")
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "256")
+    datasets = load_settings().paths.datasets
+    datasets.mkdir(parents=True)
+    fixtures = Path(__file__).parent / "fixtures"
+    shutil.copy(fixtures / "locomo_mini.json", datasets / "locomo10.json")
+    args = ["eval", "probe", "--dataset", "locomo", "--split", "all", "--name", "p"]
+    result = runner.invoke(app, args)  # 空间都没有构建：每道题都出错
+    assert result.exit_code == 0 and "出错" in result.output
+    result = runner.invoke(app, [*args, "--fail-on-error"])
+    assert result.exit_code == 3 and "--fail-on-error" in result.output
+
+
 def test_eval_errors_are_listed_once_per_message(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

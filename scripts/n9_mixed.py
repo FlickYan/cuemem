@@ -163,10 +163,13 @@ def main() -> None:
     config = RunConfig(
         name=args.name, dataset="mixed", split=None, methods=[], workers=args.workers
     )
-    done, errors = EvalRunner(settings, config).probe_queries(queries)
+    runner = EvalRunner(settings, config)
+    done, errors = runner.probe_queries(queries)
     ledger.close()
     print(f"测试记忆题 {len(samples)} 道；难负例 {len(negatives)} 条，通用请求 {len(dolly)} 条")
     print(f"探针完成 {done} 条，出错 {errors} 条")
+    if errors:  # n9_report 会悄悄略过没有探针特征的查询：停下，别让复现脚本接着往下走
+        sys.exit(f"有 {errors} 条探针出错，报错见 {runner.run_dir / 'errors.jsonl'}")
 
 
 if __name__ == "__main__":

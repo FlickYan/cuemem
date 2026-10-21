@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -208,6 +209,8 @@ def main() -> None:
     ledger.close()
     print(f"难负例 {len(negatives)} 条，通用请求 {len(dolly)} 条")
     print(f"探针完成 {done} 条，出错 {errors} 条")
+    if errors:  # 训练与分析会悄悄略过没有探针特征的查询：停下，别让复现脚本接着往下走
+        sys.exit(f"有 {errors} 条探针出错，报错见 {runner.run_dir / 'errors.jsonl'}")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,8 @@
   （--no-export --check），重新训练的结果与仓库里的文件对不上时整个脚本停下，不覆盖；
 - 评测运行都加了 --fail-on-error：达到花费上限提前停止、或者有组合出错时退出码非零，脚本停下，
   不把不完整的报告复制到 docs/results/。不复制报告的步骤里，出错的组合与这一步之前完全相同时
-  照常继续：那是发表时就有、每次重跑都一样的出错（例如被内容审核拒绝的题）；
+  照常继续：那是发表时就有、每次重跑都一样的出错（例如被内容审核拒绝的题）。探针也加了
+  --fail-on-error，有题出错就停下（混合流脚本同样）：之后的分析会悄悄略过没有探针特征的题；
 - 续跑没有新答的题时不复制 run.json（续跑只在里面追加时间与环境）；
 - --cache-only 让每一步的 LLM 请求都只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：未命中
   即报错、不调用 API，要重新算的请求有一个字节变了，也会在复制报告之前停下（向量请求照常，
@@ -103,8 +104,9 @@ class Step:
         return self.environment().get("CUEMEM_LLM_CACHE_MODE") == "off"
 
     def run_name(self) -> str | None:
-        """评测运行的运行名（其他步骤为 None）。"""
-        if FAIL_ON_ERROR not in self.command:
+        """评测运行的运行名（其他步骤为 None）。探针也不算：它出错只会是空间没建好，没有"发表时
+        就有的出错"，一律停下。"""
+        if FAIL_ON_ERROR not in self.command or "probe" in self.command:
             return None
         return self.command[self.command.index("--name") + 1]
 
@@ -137,8 +139,10 @@ def run(
 
 
 def probe(node: str, name: str, dataset: str, split: str, *, limit: int | None = None) -> Step:
+    """探针出错时退出码非零、脚本停下：之后的分析（n7_mixed、n9_report 读 routing.load_items）
+    会悄悄略过没有探针特征的题，用少了的题重写 docs/results。"""
     command = ["uv", "run", "cuemem", "eval", "probe", "--dataset", dataset, "--split", split]
-    command += ["--name", name]
+    command += ["--name", name, FAIL_ON_ERROR]
     if limit is not None:
         command += ["--limit", str(limit)]
     return Step(node, command)

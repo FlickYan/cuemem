@@ -799,6 +799,28 @@ def test_reproduce_tolerates_only_the_errors_it_already_had(
         assert fake.calls[-1][0] != after.command
 
 
+def test_reproduce_stops_when_a_probe_fails(
+    reproduce: tuple[Any, _FakeSteps], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """探针有题出错（cuemem eval probe --fail-on-error 的退出码 3）时脚本停下：之后的分析
+    （n9_mixed、n9_report 读 routing.load_items）会悄悄略过没有探针特征的题，用少了的题重写
+    docs/results。探针出错不按"与之前相同的出错"放过。"""
+    module, fake = reproduce
+    probes = [s for s in module.STEPS if s.command[3:5] == ["eval", "probe"]]
+    assert len(probes) == 7 and all("--fail-on-error" in s.command for s in probes)
+    assert all(s.run_name() is None for s in probes)
+    probe = module.probe("N9", "n9-run", "longmemeval_s", "test400")
+    after = module.script("N9", "scripts/n9_report.py")
+    monkeypatch.setattr(module, "STEPS", [probe, after])
+    fake.plan["n9-run"] = [(3, [], []), (3, [], []), (0, [], [])]
+    for _ in range(2):
+        with pytest.raises(SystemExit):
+            module.main([])
+        assert fake.calls[-1][0] == probe.command
+    module.main([])
+    assert fake.calls[-1][0] == after.command
+
+
 def test_reproduce_cache_only(
     reproduce: tuple[Any, _FakeSteps], monkeypatch: pytest.MonkeyPatch
 ) -> None:

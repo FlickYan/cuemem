@@ -1181,6 +1181,14 @@ def eval_probe(
     name: Annotated[str, typer.Option(help="运行名：特征写入 runs/eval/<运行名>/probe.jsonl")] = "",
     limit: Annotated[int | None, typer.Option(help="只跑前 N 题")] = None,
     workers: Annotated[int, typer.Option(help="并发线程数")] = 8,
+    fail_on_error: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-error",
+            help=f"有题出错（空间没建好等）时以退出码 {ERRORS_EXIT} 结束（复现脚本据此停下："
+            "控制器的分析会悄悄略过没有探针特征的题）；默认退出码是 0",
+        ),
+    ] = False,
 ) -> None:
     """跑记忆探针（一次检索，不调用 LLM）：每道题的检索控制器特征（N7）。空间要先构建好。"""
     if not name:
@@ -1210,6 +1218,12 @@ def eval_probe(
         )
         done, errors = runner.probe(evalset)
     console.print(f"完成 {done} 题，出错 {errors} 题：{runner.run_dir / 'probe.jsonl'}")
+    if fail_on_error and errors:
+        console.print(
+            f"[red]有题出错（报错见 {runner.run_dir / 'errors.jsonl'}），"
+            f"按 --fail-on-error 以退出码 {ERRORS_EXIT} 结束[/red]"
+        )
+        raise typer.Exit(ERRORS_EXIT)
 
 
 @eval_app.command("report")
