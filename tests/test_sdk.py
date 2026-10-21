@@ -540,6 +540,29 @@ def test_delete_leaves_no_vectors_or_traces_of_the_fact(
         assert not any("October 3" in p.read_text("utf-8") for p in traces.glob("*.jsonl"))
 
 
+def test_delete_purges_the_query_vectors_of_searches_that_found_it(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """search 只检索、不回答，以前不记 trace：检索到被删事实的提问（提问里常常就带着被删的
+    信息）的查询向量一直留在缓存里。现在不在 trace 里的检索记一条 retrieve trace，遗忘时按
+    检索记录找到这些提问，连同查询向量一起删掉。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("My PIN is 4321", user_id="u", timestamp=AUG, wait=True)
+        memory.add("I like hiking", user_id="u", timestamp=SEP, wait=True)
+        questions = ["Is my PIN 4321?", "What is my PIN?"]
+        for question in questions:
+            assert memory.search(question, user_id="u", mode="l1")["results"]
+        embedder = memory.system.embedder
+        assert isinstance(embedder, CachedEmbedder) and embedder.cached(questions, "query")
+        [fact] = [f for f in memory.system.facts("u") if "PIN" in f.statement]
+
+        memory.delete(fact.id)
+        assert [q for q in questions if embedder.cached([q], "query")] == []
+        traces = memory.system.settings.paths.traces.glob("*.jsonl")
+        assert not any("PIN" in p.read_text("utf-8") for p in traces)
+
+
 def test_a_run_is_extracted_once_when_it_ends(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:

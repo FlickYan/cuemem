@@ -82,9 +82,9 @@ def client(proxy: MemoryProxy) -> Iterator[TestClient]:
 
 
 def chat(
-    client: TestClient, text: str, history: list[dict[str, Any]] | None = None, **extra: Any
+    client: TestClient, text: Any, history: list[dict[str, Any]] | None = None, **extra: Any
 ) -> Any:
-    """发一句话；history 是这段对话之前的消息（不给时是一段新对话的第一句）。"""
+    """发一句话（字符串或内容块）；history 是这段对话之前的消息（不给时是一段新对话的第一句）。"""
     headers = extra.pop("headers", {})
     messages = [SYSTEM, *(history or []), {"role": "user", "content": text}]
     body = {"model": "qwen3.8-flash", "messages": messages}
@@ -192,19 +192,34 @@ def test_sessions_left_open_by_a_crash_are_adopted(
         assert system.adopt_open("alice") == 0  # 接手过的会话不再有标记
 
 
+def red_png_url() -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+@pytest.mark.parametrize("photo", [False, True], ids=["text", "photo"])
 def test_forget_purges_the_query_vector_of_a_deleted_message(
-    client: TestClient, system: MemorySystem, upstream: Upstream
+    client: TestClient, system: MemorySystem, upstream: Upstream, photo: bool
 ) -> None:
     """代理拿用户的原话做检索查询（查询向量进了缓存），再把原话写进原始日志：遗忘这条发言时，
-    它的查询向量也要从缓存里删掉（向量本身也可能泄露原文）。"""
+    它的查询向量也要从缓存里删掉（向量本身也可能泄露原文）。带照片的消息查询的是文字部分，
+    写进日志的是带 "<image>" 标记的原话：按去掉标记的文字也要清。"""
     chat(client, "I live in Berlin", user="alice")
-    secret = "My sister Ana's birthday is October 3"
-    assert chat(client, secret, user="alice").headers["x-cuemem-level"] != "none"
+    secret = "My sister Ana's birthday is October 3, here is her photo"
+    content: Any = secret
+    if photo:
+        image = {"type": "image_url", "image_url": {"url": red_png_url()}}
+        content = [{"type": "text", "text": secret}, image]
+    assert chat(client, content, user="alice").headers["x-cuemem-level"] != "none"
     embedder = system.embedder
     assert isinstance(embedder, CachedEmbedder) and embedder.cached([secret], "query")
-    [turn] = [t for t in system.db.get_turns("alice") if t.text == secret]
+    [turn] = [t for t in system.db.get_turns("alice") if t.text.startswith(secret)]
+    assert turn.text == (f"{secret} <image>" if photo else secret)
     assert system.forget("alice", turn_ids=[turn.id]).turns_deleted == 1
     assert not embedder.cached([secret], "query")
+    traces = system.settings.paths.traces.glob("*.jsonl")
+    assert not any("Ana" in p.read_text("utf-8") for p in traces)  # 代理的检索 trace 也删了
 
 
 def test_streaming_is_relayed_and_written_back(

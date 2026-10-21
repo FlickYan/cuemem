@@ -8,6 +8,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from cuemem.core.models import (
     Turn,
 )
 from cuemem.core.timeutil import naive_local
-from cuemem.core.trace import TraceSink, start_trace
+from cuemem.core.trace import TraceSink, current_trace, start_trace
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder, ImageEmbedder
@@ -210,6 +211,12 @@ def _strings(value: Any) -> Iterator[str]:
     elif isinstance(value, list):
         for item in value:
             yield from _strings(item)
+
+
+def _without_images(text: str) -> str:
+    """发言原文去掉图片标记、合并空白：记忆代理拿用户消息的文字部分（evidence.message_text）
+    做检索查询，写进日志的却是带 "<image>" 标记的原话（evidence.stored_text）。"""
+    return " ".join(text.replace("<image>", " ").split())
 
 
 def _open_mark(space_id: str, session_id: str = "") -> str:
@@ -576,8 +583,10 @@ class MemorySystem:
                     self.consolidator.run(space_id)
             finally:
                 # 3. trace：属性里有被删原话的条目（提问、回答原文），以及检索时给回答模型看过
-                #    被删记忆的条目（回答可能复述了它，trace 里却没有原话）
+                #    被删记忆的条目（回答可能复述了它，trace 里却没有原话）。带图的发言另外按
+                #    去掉图片标记的文字找：记忆代理拿消息里的文字部分做检索查询
                 texts = [t.text for t in targets]
+                texts += [_without_images(t) for t in texts if "<image>" in t]
                 traces_removed, questions = self._remove_traces(space_id, texts, refs)
 
                 # 4. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面那些
@@ -1090,53 +1099,63 @@ class MemorySystem:
 
         ask() 与 Agent（N8）共用这一步。exclude 是已经在上下文里的轮与图片的 ID
         （Agent 的工作记忆），不参与探针与检索。
+
+        不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
+        retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
+        _remove_traces）。ask、Agent 与评测在自己的 trace 里调用，不另记，trace 与用量统计不变。
         """
-        when = naive_local(question_time) if question_time is not None else datetime.now()
-        cache_scope = cache_scope or scope(space_id, "ask")
-        level: str = mode
-        decision: RouteDecision | None = None
-        used: Router | None = None
-        candidates: L1Candidates | None = None
-        if mode == "auto":
-            decision, candidates, used = self._route(
-                space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+        tracing: AbstractContextManager[object] = (
+            nullcontext()
+            if current_trace() is not None
+            else start_trace("retrieve", self.tracer, space=space_id, question=question, mode=mode)
+        )
+        with tracing:
+            when = naive_local(question_time) if question_time is not None else datetime.now()
+            cache_scope = cache_scope or scope(space_id, "ask")
+            level: str = mode
+            decision: RouteDecision | None = None
+            used: Router | None = None
+            candidates: L1Candidates | None = None
+            if mode == "auto":
+                decision, candidates, used = self._route(
+                    space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+                )
+                level = decision.level.lower()
+                if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
+                    l1 = replace(l1 or L1Config(), attach_images=3)
+                    base_l2 = l2 or L2Config()
+                    l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
+            if level == "l0":
+                view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
+                return Recall("l0", view, decision, used)
+            if level == "l1":
+                cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
+                if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
+                    result = self.l1.pack(space_id, candidates, cfg)
+                else:
+                    result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
+                view = MemoryView(
+                    rounds=result.rounds,
+                    facts=result.facts,
+                    core=result.core,
+                    media=result.media,
+                    image_mode=image_mode(cfg),
+                    attach=result.attach,
+                )
+                return Recall("l1", view, decision, used)
+            l2_cfg = l2 or L2Config()
+            deep = self.l2.search(
+                space_id, question, when, l2_cfg, cache_scope=cache_scope, exclude=exclude
             )
-            level = decision.level.lower()
-            if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
-                l1 = replace(l1 or L1Config(), attach_images=3)
-                base_l2 = l2 or L2Config()
-                l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
-        if level == "l0":
-            view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
-            return Recall("l0", view, decision, used)
-        if level == "l1":
-            cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
-            if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
-                result = self.l1.pack(space_id, candidates, cfg)
-            else:
-                result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
             view = MemoryView(
-                rounds=result.rounds,
-                facts=result.facts,
-                core=result.core,
-                media=result.media,
-                image_mode=image_mode(cfg),
-                attach=result.attach,
+                rounds=deep.rounds,
+                facts=deep.facts,
+                core=deep.core,
+                media=deep.media,
+                image_mode=image_mode(l2_cfg.l1),
+                attach=deep.attach,
             )
-            return Recall("l1", view, decision, used)
-        l2_cfg = l2 or L2Config()
-        deep = self.l2.search(
-            space_id, question, when, l2_cfg, cache_scope=cache_scope, exclude=exclude
-        )
-        view = MemoryView(
-            rounds=deep.rounds,
-            facts=deep.facts,
-            core=deep.core,
-            media=deep.media,
-            image_mode=image_mode(l2_cfg.l1),
-            attach=deep.attach,
-        )
-        return Recall("l2", view, decision, used, plan=deep.plan, details=deep.details())
+            return Recall("l2", view, decision, used, plan=deep.plan, details=deep.details())
 
     def _route(
         self,
