@@ -48,9 +48,15 @@ Calling `add` once per turn with the same `run_id` also works, but it re-extract
 The rest of Mem0's API is there too, with CueMem's semantics:
 
 ```python
-m.add("I prefer aisle seats.", user_id="alice", metadata={"source": "crm"}, expiration_date="2026-12-31")
+m.add(
+    "I prefer aisle seats.",
+    user_id="alice",
+    metadata={"source": "crm"},
+    expiration_date="2026-12-31",
+)
 m.search("Seat preference?", user_id="alice", filters={"source": {"in": ["crm", "app"]}})
-m.update(events[0]["id"], "I moved to Berlin, not Munich.")  # a logged correction; history() keeps both
+# A logged correction; history() keeps both versions
+m.update(events[0]["id"], "I moved to Berlin, not Munich.")
 m.delete_all(user_id="alice", run_id=run_id)  # forget one conversation; reset() wipes every space
 ```
 

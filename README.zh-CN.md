@@ -40,9 +40,15 @@ with m.run(user_id="alice") as run_id:
 Mem0 的其余接口也有，语义按 CueMem 的来：
 
 ```python
-m.add("我坐飞机喜欢靠过道。", user_id="alice", metadata={"source": "crm"}, expiration_date="2026-12-31")
+m.add(
+    "我坐飞机喜欢靠过道。",
+    user_id="alice",
+    metadata={"source": "crm"},
+    expiration_date="2026-12-31",
+)
 m.search("座位偏好？", user_id="alice", filters={"source": {"in": ["crm", "app"]}})
-m.update(events[0]["id"], "我搬到的是柏林，不是慕尼黑。")  # 记进日志的一句更正；history() 两个版本都在
+# 记进日志的一句更正；history() 两个版本都在
+m.update(events[0]["id"], "我搬到的是柏林，不是慕尼黑。")
 m.delete_all(user_id="alice", run_id=run_id)  # 只遗忘这段对话；reset() 清空所有空间
 ```
 

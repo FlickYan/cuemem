@@ -41,10 +41,11 @@ Extras combine: `pip install "cuemem[ui,local] @ git+https://github.com/FlickYan
 ```python
 from cuemem import Memory
 
-m = Memory(preset="openai")          # Memory() for the default config, Memory(preset="ollama") for local models
+# Memory() for the default config, Memory(preset="ollama") for local models
+m = Memory(preset="openai")
 m.add("I moved to Munich last month.", user_id="alice", wait=True)
 m.search("Where do I live now?", user_id="alice")
-m.close()                            # or: with Memory() as m: ...
+m.close()  # or: with Memory() as m: ...
 ```
 
 `Memory` is thread-safe. Its methods return plain dicts and lists, shaped like Mem0's.
@@ -172,7 +173,7 @@ Result items carry a `type`:
 ```python
 from cuemem import MemoryClient
 
-m = MemoryClient("http://127.0.0.1:7860", api_key="...")   # instead of Memory()
+m = MemoryClient("http://127.0.0.1:7860", api_key="...")  # instead of Memory()
 m.add("I moved to Berlin", user_id="alice", metadata={"source": "crm"}, wait=True)
 m.search("Where do I live?", user_id="alice", filters={"source": "crm"})
 ```
@@ -326,7 +327,10 @@ Status codes: 404 for an unknown session or image, or an export of an unknown sp
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="<CUEMEM_API_TOKEN, a scoped key, or anything without auth>")
+client = OpenAI(
+    base_url="http://127.0.0.1:8787/v1",
+    api_key="<CUEMEM_API_TOKEN, a scoped key, or anything without auth>",
+)
 client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice")
 ```
 

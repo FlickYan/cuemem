@@ -41,10 +41,11 @@
 ```python
 from cuemem import Memory
 
-m = Memory(preset="openai")          # Memory() 用默认配置，Memory(preset="ollama") 用本机模型
+# Memory() 用默认配置，Memory(preset="ollama") 用本机模型
+m = Memory(preset="openai")
 m.add("I moved to Munich last month.", user_id="alice", wait=True)
 m.search("Where do I live now?", user_id="alice")
-m.close()                            # 或者：with Memory() as m: ...
+m.close()  # 或者：with Memory() as m: ...
 ```
 
 `Memory` 线程安全。方法返回普通的字典与列表，形状照 Mem0。
@@ -172,7 +173,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 ```python
 from cuemem import MemoryClient
 
-m = MemoryClient("http://127.0.0.1:7860", api_key="...")   # 代替 Memory()
+m = MemoryClient("http://127.0.0.1:7860", api_key="...")  # 代替 Memory()
 m.add("I moved to Berlin", user_id="alice", metadata={"source": "crm"}, wait=True)
 m.search("Where do I live?", user_id="alice", filters={"source": "crm"})
 ```
@@ -326,7 +327,10 @@ curl -s -X DELETE "$CUEMEM/memories?user_id=alice" -H "Authorization: Bearer $TO
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="<CUEMEM_API_TOKEN、限定作用域的令牌；不鉴权时任意值>")
+client = OpenAI(
+    base_url="http://127.0.0.1:8787/v1",
+    api_key="<CUEMEM_API_TOKEN、限定作用域的令牌；不鉴权时任意值>",
+)
 client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice")
 ```
 
