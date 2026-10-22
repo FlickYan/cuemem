@@ -341,3 +341,37 @@ def test_mem0_llm_falls_back_after_one_timeout(settings: Settings) -> None:
     reply = _LLM(llm, "mem0|x").generate_response([{"role": "user", "content": "hi"}])
     assert reply == "{}"
     assert [r["model"] for r in fake.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+
+
+def test_mem0_llm_treats_the_extractor_itself_as_no_fallback(settings: Settings) -> None:
+    """consolidation.fallback_model 就是抽取模型时等于没有备用模型（与 LLMClient.structured、
+    评测网关相同）：超时照常重试，一共 1 + max_retries 次。以前先只发一次（以为有备用），再把
+    同样的请求当备用重发满 1 + max_retries 次。"""
+    from fakes import TIMEOUT, FakeAPI
+    from openai import APITimeoutError
+    from pydantic import BaseModel
+
+    from cuemem.evals.mem0_baseline import _LLM
+    from cuemem.llm.client import LLMClient
+
+    class Out(BaseModel):
+        a: int = 0
+
+    extractor = settings.roles["extractor"].model
+    cons = settings.consolidation.model_copy(update={"fallback_model": extractor})
+    same = settings.model_copy(update={"consolidation": cons})
+    attempts = 1 + same.providers[same.models[extractor].provider].max_retries
+    messages = [{"role": "user", "content": "hi"}]
+    sent: dict[str, list[str]] = {}
+    for name in ("mem0", "structured"):
+        fake = FakeAPI()
+        fake.chat_replies = [lambda body: TIMEOUT]
+        llm = LLMClient(same, http_client=fake.client(), sleep=lambda _: None)
+        with pytest.raises(APITimeoutError):
+            if name == "mem0":
+                _LLM(llm, "mem0|x").generate_response(messages)
+            else:
+                llm.structured("extractor", messages, Out, fallback_model=extractor)
+        sent[name] = [r["model"] for r in fake.chat_requests]
+    model_id = same.models[extractor].model_id
+    assert sent["mem0"] == sent["structured"] == [model_id] * attempts

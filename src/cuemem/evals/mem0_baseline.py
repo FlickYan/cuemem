@@ -77,7 +77,12 @@ class _LLM:
     def __init__(self, llm: LLMClient, scope: str) -> None:
         self.llm = llm
         self.scope = scope
-        self.fallback = llm.settings.consolidation.fallback_model
+        fallback = llm.settings.consolidation.fallback_model
+        roles = llm.settings.roles
+        primary = roles["extractor"].model if "extractor" in roles else None
+        # 备用模型就是抽取模型时等于没有备用（与 LLMClient.structured、评测网关相同）：超时照常
+        # 重试。以前先只发一次（以为有备用），再把同样的请求当备用重发满 1 + max_retries 次
+        self.fallback = fallback if fallback != primary else None
 
     def generate_response(
         self,
