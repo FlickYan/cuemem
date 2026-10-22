@@ -920,9 +920,16 @@ def test_update_that_extracts_nothing_leaves_the_memory(
         if "Correction" in prompt
         else where_i_live(prompt)
     )
-    out = memory.update(berlin["id"], "hmm")
+    out = memory.update(berlin["id"], "I live in Hamburg")
     assert out["message"].startswith("No memory could be extracted") and out["results"] == []
     assert current_memories(memory, "alice") == ["The user lives in Berlin."]
+    # 这句更正也不留在日志里：以前它作为对话片段与原来那条一起被检索出来、随导出带走
+    assert out["turn_ids"] == [] and "error" not in out
+    assert [t.text for t in memory.system.db.get_turns("alice")] == ["I live in Berlin"]
+    found = memory.search("Hamburg", user_id="alice", mode="l1")["results"]
+    assert not any("Hamburg" in hit["memory"] for hit in found)
+    exported = memory.export(user_id="alice")["sessions"]
+    assert [t["text"] for s in exported for t in s["turns"]] == ["I live in Berlin"]
 
 
 def test_reset_deletes_every_space(memory: Memory) -> None:

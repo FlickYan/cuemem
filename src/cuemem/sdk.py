@@ -377,7 +377,8 @@ class Memory:
         取代原来那条，不问 LLM；history() 里看得到前后两个版本，遗忘这句更正时原来那条恢复。
 
         新事实带上原来那条的 metadata（metadata 参数里的键覆盖它）与过期时间。返回 Mem0 风格的
-        事件（UPDATE 附上被取代的旧版本）；从 data 里没有抽出事实时，原来那条不变，message 写明。
+        事件（UPDATE 附上被取代的旧版本）；从 data 里没有抽出事实时，原来那条不变，message 写明，
+        这句更正也从日志里遗忘（turn_ids 是空的）。
         更正记下之后抽取出错时不抛出（与 add 的 wait=True 相同）：message 与 error 写明，下次
         巩固时补上。
         只能改当前有效的版本（ValueError）；ID 不存在时 KeyError。"""
@@ -420,16 +421,25 @@ class Memory:
                 "turn_ids": turn_ids,
                 "error": _not_extracted(exc),
             }
-        events = _events(self.system, space, before, None, None)
-        for event in events:
-            event["space_id"] = space
         (after,) = self.system.db.get_facts(space, ids=[memory_id]) or [fact]
+        extra: dict[str, Any] = {}
         if not after.is_current:
             message = "Memory updated"
         elif sid in report.failed:
             message = failed
         else:
+            # 没有抽出取代它的事实：这句更正也不留在日志里。否则它作为对话片段与原来那条一起被
+            # 检索出来、随导出带走，换了抽取模型重建时还可能取代原来那条——与"没有改"不符
             message = "No memory could be extracted from data: the memory was not changed"
+            dropped = self.system.forget_memories(
+                space, session_ids=[sid], report_rebuild_errors=True
+            )
+            turn_ids = []
+            if dropped.rebuild_error:
+                extra["error"] = _forget_out(dropped)["warning"]
+        events = _events(self.system, space, before, None, None)
+        for event in events:
+            event["space_id"] = space
         return {
             "message": message,
             "id": memory_id,
@@ -437,6 +447,7 @@ class Memory:
             "session_id": sid,
             "turn_ids": turn_ids,
             "consolidation": report.as_dict(),
+            **extra,
         }
 
     def consolidate(
