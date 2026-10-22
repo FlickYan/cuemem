@@ -706,9 +706,10 @@ class MemorySystem:
                 deleted = self.db.delete_turns(space_id, [t.id for t in targets])
                 self.vectors.delete_images(space_id, [m.id for m in doomed_media])
                 images_deleted = 0
-                for item in doomed_media:
-                    if self.media is not None and not self.db.media_sha_in_use(item.sha256):
-                        images_deleted += int(self.media.delete(Path(item.path)))
+                for item in doomed_media:  # 本进程里正在写入同一张图的，文件留给它
+                    if self.media is not None:
+                        path, in_use = Path(item.path), self.db.media_sha_in_use
+                        images_deleted += int(self.media.delete_unused(path, item.sha256, in_use))
                 self.writer.reindex_sessions(space_id, affected)
 
                 # 2. 派生层：清空，再从剩下的日志重放

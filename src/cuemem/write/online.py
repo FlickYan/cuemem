@@ -26,7 +26,7 @@ from cuemem.core.trace import span
 from cuemem.embed.base import EmbeddingBatch, TextEmbedder
 from cuemem.embed.multimodal import ImageEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
-from cuemem.store.media import MediaStore
+from cuemem.store.media import MediaStore, StoredImage
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 
@@ -137,6 +137,7 @@ class _Staged:
     pieces: list[tuple[SessionIn, list[Turn], dict[str, TurnMeta]]] = field(default_factory=list)
     media: list[MediaItem] = field(default_factory=list)  # 新的图片记录
     units: list[MemoryUnit] = field(default_factory=list)  # 新的"轮"
+    stored: list[StoredImage] = field(default_factory=list)  # 存进媒体库的原图（每次 put）
     tokens: int = 0
 
 
@@ -170,7 +171,7 @@ class OnlineWriter:
         先存原图、向量化、写向量（点的 ID 由发言的位置决定，重写是幂等的），再在一个事务里写会话、
         发言、图片记录与"轮"。以前先提交发言、再向量化：向量接口或向量库出错时日志里已经有了这些
         发言，却没有"轮"、也没有巩固任务，调用方重试又把同样的话写一遍。现在出错时数据库里什么
-        都没写，已经写进向量库的点尽量删掉（见 _discard）。
+        都没写，已经写进向量库的点尽量删掉，存进媒体库、别处没有用到的原图也删掉（见 _discard）。
 
         每批向量化一次，与以前逐次写入时的请求相同：导入整段对话是一批，导入文件时每段连续的
         发言一批。已有的发言不再处理；遗忘删掉的发言也不会被写回来。
@@ -189,6 +190,9 @@ class OnlineWriter:
         except BaseException:
             self._discard(staged)
             raise
+        if self.media is not None:  # 图片记录提交了：之后遗忘时按记录删原图
+            for image in staged.stored:
+                self.media.release(image)
 
     def _stage(
         self,
@@ -204,7 +208,7 @@ class OnlineWriter:
         for session, first_idx in pieces:
             turns = build_turns(space_id, session, first_idx)
             if self.media is not None:
-                media.extend(self._attach_images(session, turns))
+                media.extend(self._attach_images(staged, session, turns))
             extra: dict[str, TurnMeta] = {}
             if meta:
                 for t in turns:
@@ -265,7 +269,11 @@ class OnlineWriter:
         """写入失败：删掉这次写进向量库、数据库里却没有记录的点。先查数据库："数据库里有记录，
         向量就一定在"这条不变式要保住（同一会话的写入由调用方串行，例如 SDK 的会话锁）。删不掉
         （向量库连不上）时记一条警告：取不到记录的点不会被检索返回，重试时同样的 ID 覆盖它们。
-        存进媒体库的原图不删：按内容哈希存放，别的记录、别的空间可能也在用，重试时直接复用。"""
+
+        这次存进媒体库的原图，没有图片记录引用、也没有别的写入正要用时删掉（与遗忘相同的规则，
+        MediaStore.delete_unused）：原图按内容哈希存放，别的记录、别的空间可能也在用。以前一律
+        不删：没有任何记录指向它，遗忘与删除空间都找不到它，例如向量接口不可用时发来的证件照片
+        一直留在磁盘上。"""
         space_id = staged.space_id
         try:
             if staged.units:
@@ -280,14 +288,24 @@ class OnlineWriter:
             logger.warning(
                 "在线写入失败后没能删掉这次写进向量库的点（重试时会覆盖）", exc_info=True
             )
+        if self.media is not None:
+            for image in staged.stored:
+                try:
+                    self.media.release(image, in_use=self.db.media_sha_in_use)
+                except Exception:
+                    logger.warning("在线写入失败后没能删掉存进媒体库的原图", exc_info=True)
 
-    def _attach_images(self, session: SessionIn, turns: Sequence[Turn]) -> list[MediaItem]:
-        """把发言里的图片存进媒体库，生成图片记录，并把图片 ID 记在发言上。"""
+    def _attach_images(
+        self, staged: _Staged, session: SessionIn, turns: Sequence[Turn]
+    ) -> list[MediaItem]:
+        """把发言里的图片存进媒体库（记在 staged.stored 上，失败时 _discard 据此删掉），生成图片
+        记录，并把图片 ID 记在发言上。"""
         assert self.media is not None
         items: list[MediaItem] = []
         for turn, turn_in in zip(turns, session.turns, strict=True):
             for i, path in enumerate(turn_in.images):
                 stored = self.media.put(Path(path))
+                staged.stored.append(stored)
                 items.append(
                     MediaItem(
                         id=media_id(turn.space_id, turn.id, i),

@@ -53,6 +53,20 @@ def test_media_store_is_content_addressed(tmp_path: Path, images: dict[str, Path
     assert small.startswith("data:image/jpeg;base64,") and len(small) < 20_000
 
 
+def test_unused_images_are_deleted_only_once_no_write_needs_them(
+    tmp_path: Path, images: dict[str, Path]
+) -> None:
+    """同一张图有两次写入进行中：一次失败时不删（另一次马上要登记它），两次都结束、也没有记录
+    引用时才删。遗忘按同样的规则删（delete_unused）。"""
+    store = MediaStore(tmp_path / "media")
+    first, second = store.put(images["red"]), store.put(images["red"])
+    unused = lambda sha: False  # noqa: E731
+    assert not store.release(first, in_use=unused) and first.path.exists()
+    assert not store.delete_unused(first.path, first.sha256, unused)
+    assert not store.release(second, in_use=lambda sha: True) and first.path.exists()
+    assert store.delete_unused(first.path, first.sha256, unused) and not first.path.exists()
+
+
 def test_fill_images() -> None:
     assert inline_images("look <image> here", ["a dog"]) == "look [Image: a dog] here"
     assert fill_images("no marker", ["[A]"]) == "no marker [A]"

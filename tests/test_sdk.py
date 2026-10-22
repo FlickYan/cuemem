@@ -409,6 +409,48 @@ def test_a_write_failing_after_the_vectors_takes_them_back(
     assert system.db.get_turn_meta("alice") == {}
 
 
+def test_a_failed_write_leaves_no_image_behind(
+    memory: Memory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带图的写入在向量化时出错：这次存进媒体库的原图也删掉。以前留在 data/media 里，却没有任何
+    记录指向它，遗忘与 delete_all 都找不到它（例如向量接口不可用时发来的证件照片）。别的记录
+    正在用的同一张图不删。"""
+    system = memory.system
+    passport, shared = tmp_path / "passport.png", tmp_path / "shared.png"
+    Image.new("RGB", (16, 16), "red").save(passport)
+    Image.new("RGB", (16, 16), "blue").save(shared)
+    memory.add([photo("My cat", shared)], user_id="bob", infer=False)
+    (kept,) = system.db.get_media("bob")
+    embed = system.embedder.embed
+
+    def documents_down(texts: Sequence[str], kind: EmbedKind) -> Any:
+        if kind == "document":
+            raise EmbeddingAPIError("向量接口返回 HTTP 503", status=503)
+        return embed(texts, kind)
+
+    monkeypatch.setattr(system.embedder, "embed", documents_down)
+    for image in (passport, shared):
+        with pytest.raises(EmbeddingAPIError):
+            memory.add([photo("This is my passport", image)], user_id="alice", run_id="r1")
+    assert system.db.get_media("alice") == []
+    files = [p for p in system.settings.paths.media.rglob("*") if p.is_file()]
+    assert files == [Path(kept.path)]
+
+    monkeypatch.setattr(system.embedder, "embed", embed)  # 恢复之后重试：原图重新存进来
+    memory.add([photo("This is my passport", passport)], user_id="alice", run_id="r1")
+    (stored,) = system.db.get_media("alice")
+    assert Path(stored.path).exists()
+    memory.delete_all(user_id="alice")
+    assert not Path(stored.path).exists() and Path(kept.path).exists()
+
+
+def photo(text: str, image: Path) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [{"type": "text", "text": text}, {"type": "image_url", "image_url": str(image)}],
+    }
+
+
 def without_balance_for_reconciling(model: ScriptedModel, fake_api: FakeAPI) -> dict[str, bool]:
     """对账时模型供应商余额不足（HTTP 402）；把返回的开关设成 False 就恢复。"""
     broke = {"on": True}
