@@ -23,7 +23,8 @@
 ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此抛出同样的异常。请求体不合
 格式（422）、令牌不对（401）在 /api/v1 下也写成这个形状（install_error_format）。模型与向量供应商
 出错时的状态码与 /api 相同（api/failures.py：限流 429 带 Retry-After、余额不足 402、超时 504……），
-code 是出错的类别（rate_limited、no_balance、timeout 等）。
+code 是出错的类别（rate_limited、no_balance、timeout 等）；向量接口的出错另带 upstream_status
+（上游原来的状态码），MemoryClient 抛出的 EmbeddingAPIError 与本地一样带着 status 与 retry_after。
 
 图片只收 data URL：服务器不读自己磁盘上的文件（与记忆代理相同），MemoryClient 把本地路径先读成
 data URL 再发；网络图片照 SDK 的规矩不下载。
@@ -49,7 +50,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cuemem.api.auth import Principal, principal_of
 from cuemem.api.failures import provider_failure
-from cuemem.errors import ConcurrentWriteError, CueMemError
+from cuemem.errors import ConcurrentWriteError, CueMemError, EmbeddingAPIError
 from cuemem.read.controller import Router
 from cuemem.sdk import AnswerMode, Memory, SearchMode, _scope, space_for
 
@@ -73,7 +74,9 @@ _CODES = {
 
 class V1Error(HTTPException):
     """/api/v1 的出错：状态码、错误码与 SDK 的异常类型（MemoryClient 据此抛出同样的异常）。
-    code 不给时按状态码取（_CODES）；headers：例如限流时上游的 Retry-After。"""
+    code 不给时按状态码取（_CODES）；headers：例如限流时上游的 Retry-After。upstream_status：
+    向量接口的出错（EmbeddingAPIError）原来的状态码，写进出错的 upstream_status，MemoryClient
+    据此还原异常的 status（回给调用方的状态码可能不同：上游的 500 是 502）。"""
 
     def __init__(
         self,
@@ -83,10 +86,12 @@ class V1Error(HTTPException):
         error_type: str | None = None,
         code: str | None = None,
         headers: Mapping[str, str] | None = None,
+        upstream_status: int | None = None,
     ) -> None:
         super().__init__(status, message, headers=dict(headers) if headers else None)
         self.error_type = error_type
         self.code = code
+        self.upstream_status = upstream_status
 
 
 class AddRequest(BaseModel):
@@ -182,6 +187,7 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
                 error_type=type(exc).__name__,
                 code=failure.kind,
                 headers={"Retry-After": failure.retry_after} if failure.retry_after else None,
+                upstream_status=exc.status if isinstance(exc, EmbeddingAPIError) else None,
             ) from exc
         if isinstance(exc, CueMemError):
             raise V1Error(502, str(exc), error_type=type(exc).__name__) from exc
@@ -429,7 +435,7 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
     def export(
         http: Request, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
     ) -> dict[str, Any]:
-        with _sdk_errors():
+        with _sdk_errors(by_id=True):  # 没有这个空间：KeyError（404），与本地相同
             allow(http, user_id, agent_id)
             return memory.export(user_id=user_id, agent_id=agent_id, derived=derived)
 
@@ -472,6 +478,7 @@ def install_error_format(app: FastAPI) -> None:
             getattr(exc, "error_type", None),
             exc.headers,
             getattr(exc, "code", None),
+            getattr(exc, "upstream_status", None),
         )
 
     async def validation_error(request: Request, exc: Exception) -> Response:
@@ -498,6 +505,13 @@ def _error(
     error_type: str | None,
     headers: Mapping[str, str] | None = None,
     code: str | None = None,
+    upstream_status: int | None = None,
 ) -> JSONResponse:
-    body = {"code": code or _CODES.get(status, "error"), "type": error_type, "message": message}
+    body: dict[str, Any] = {
+        "code": code or _CODES.get(status, "error"),
+        "type": error_type,
+        "message": message,
+    }
+    if upstream_status is not None:
+        body["upstream_status"] = upstream_status
     return JSONResponse({"error": body}, status, dict(headers or {}))

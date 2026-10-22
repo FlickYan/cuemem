@@ -418,6 +418,13 @@ def _error(response: httpx2.Response) -> Exception:
         builtin = _BUILTIN_ERRORS.get(kind)
         if builtin is not None:
             return builtin(message)
+        if kind == "EmbeddingAPIError":  # 与本地一样带着上游的状态码与 Retry-After（据此退避）
+            upstream = error.get("upstream_status") if isinstance(error, dict) else None
+            return errors.EmbeddingAPIError(
+                message,
+                status=upstream if isinstance(upstream, int) else None,
+                retry_after=response.headers.get("retry-after"),
+            )
         known = getattr(errors, kind, None)  # 只认 cuemem.errors 里的异常类型
         if (
             isinstance(known, type)

@@ -294,6 +294,22 @@ def test_runs_scopes_export_and_load(mem: Mem) -> None:
     assert {s["space_id"] for s in mem.spaces()} == {"carol", "dave"}
 
 
+def test_export_and_load_errors_are_the_same_remotely(system: MemorySystem) -> None:
+    """导出不存在的空间（KeyError）、导入没有 space_id 的文件又没给 user_id（ValueError，以前本地
+    是 KeyError('space_id')）：MemoryClient 抛出与本地相同的异常。以前远程的这两个是没有说明的
+    500（MemoryAPIError）。"""
+    nameless = {"format": "cuemem.space", "version": 2, "sessions": []}
+    with (
+        TestClient(v1_app(system), raise_server_exceptions=False) as http,
+        MemoryClient("http://testserver", http_client=http) as client,
+    ):
+        for mem in (Memory.from_system(system), client):
+            with pytest.raises(KeyError, match="No memory space"):
+                mem.export(user_id="nobody")
+            with pytest.raises(ValueError, match="no space_id"):
+                mem.load(nameless)
+
+
 def test_images_reach_the_memory(mem: Mem, system: MemorySystem, tmp_path: Path) -> None:
     """add 的本地图片路径：本地 SDK 直接读；MemoryClient 先在客户端读成 data URL，服务器不读它
     自己磁盘上的文件。网络图片两边都报同样的错。"""
@@ -461,5 +477,11 @@ def test_v1_explains_provider_errors(
         response = http.post("/api/v1/memories/search", json=search)
         assert response.status_code == 429 and response.headers["retry-after"] == "3"
         assert response.json()["error"]["type"] == "EmbeddingAPIError"
-        with pytest.raises(EmbeddingAPIError):
+        with pytest.raises(EmbeddingAPIError) as remote:
             client.search("where?", user_id="alice", mode="l1")
+        with pytest.raises(EmbeddingAPIError) as local:
+            Memory.from_system(system).search("where?", user_id="alice", mode="l1")
+        # 与本地一样带着上游的状态码与 Retry-After：以前远程的两个都是 None，按它们退避的代码
+        # 换成 MemoryClient 就不退避了
+        assert (remote.value.status, remote.value.retry_after) == (429, "3")
+        assert (local.value.status, local.value.retry_after) == (429, "3")

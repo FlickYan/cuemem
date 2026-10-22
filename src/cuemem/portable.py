@@ -116,6 +116,8 @@ def import_space(
         raise ValueError(f"Not a CueMem export (format must be {FORMAT!r})")
     if int(data.get("version", 0)) > VERSION:
         raise ValueError(f"Export version {data.get('version')} is newer than this CueMem")
+    if not space_id and not data.get("space_id"):  # 以前是 KeyError，经 /api/v1 成了没有说明的 500
+        raise ValueError("The export has no space_id: pass user_id or agent_id to import it.")
     target = space_id or str(data["space_id"])
     turns_added = images_added = 0
     with tempfile.TemporaryDirectory(prefix="cuemem-import-") as scratch:
