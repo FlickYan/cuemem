@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,9 +34,15 @@ class VectorHit:
 
 class VectorStore:
     def __init__(self, path: Path | None, dim: int, *, url: str | None = None) -> None:
-        """url 非空时连接 Qdrant 服务端；否则用本地模式（path 为空则只放在内存里）。"""
+        """url 非空时连接 Qdrant 服务端；否则用本地模式（path 为空则只放在内存里）。
+
+        owned_units：空间 → 数据库里这个空间的几个记忆单元 ID（MemorySystem 设为
+        MemoryDB.some_unit_ids），用来确认旧名字的集合是不是这个空间的（见 collection_name）；
+        没设时（单独用的向量库，没有数据库可以核对）旧名字的集合照旧用。"""
         self.dim = dim
         self.remote = url is not None
+        self.owned_units: Callable[[str], Sequence[str]] | None = None
+        self._names: dict[str, str] = {}  # 空间 → 集合名（解析一次）
         if url is not None:
             self._client = QdrantClient(url=url)
         elif path is None:
@@ -58,10 +64,38 @@ class VectorStore:
         # （N11 压测里出现 "Bad file descriptor"）
         self._lock = threading.RLock()
 
+    def collection_name(self, space_id: str) -> str:
+        """这个空间的集合名：前 40 个字符（不是字母数字的换成 "_"）加上空间 ID 的 128 位摘要。
+
+        以前的名字（legacy_name）只带 32 位摘要：前 40 个字符相同、8 位十六进制又撞上的两个空间
+        落进同一个集合，检索不按空间过滤、delete_space 删掉整个集合。限定作用域的令牌可以随便起
+        agent_id，离线算约 2^32 次哈希就能撞上别人（例如 "shop/<用户的 UUID>"）的集合：删掉它，
+        或者往它的检索结果里塞东西。
+
+        升级之前建的旧名字集合（包括评测的构建）照旧用，但只给能证明是自己的空间：数据库里这个
+        空间的记忆单元在这个集合里（只读，不往库里写东西）。别的空间——包括为了撞上它而起的——
+        用新名字。新名字的集合已经有了时总用它。"""
+        with self._lock:
+            name = self._names.get(space_id)
+            if name is None:
+                name = self._names[space_id] = self._resolve(space_id)
+            return name
+
     @staticmethod
-    def collection_name(space_id: str) -> str:
-        safe = re.sub(r"[^A-Za-z0-9_-]", "_", space_id)[:40]
-        return f"space_{safe}_{stable_id(space_id, length=8)}"
+    def legacy_name(space_id: str) -> str:
+        """第二轮复审之前的集合名（32 位摘要），见 collection_name。"""
+        return f"space_{_safe(space_id)}_{stable_id(space_id, length=8)}"
+
+    def _resolve(self, space_id: str) -> str:
+        name = f"space_{_safe(space_id)}_{stable_id(space_id, length=32)}"
+        legacy = self.legacy_name(space_id)
+        if self._client.collection_exists(name) or not self._client.collection_exists(legacy):
+            return name
+        if self.owned_units is None:
+            return legacy
+        ids = [point_uuid(u) for u in self.owned_units(space_id)]
+        mine = ids and self._client.retrieve(legacy, ids=ids, with_payload=False)
+        return legacy if mine else name
 
     def ensure_space(self, space_id: str) -> None:
         name = self.collection_name(space_id)
@@ -318,10 +352,13 @@ class VectorStore:
         return counts
 
     def delete_space(self, space_id: str) -> None:
+        """删掉这个空间的两个集合（文字与图片）。要在数据库删掉这个空间的记忆单元之前调用：旧名字
+        的集合靠它们确认是这个空间的（见 collection_name）。"""
         with self._lock:
             for name in (self.collection_name(space_id), self._image_collection(space_id)):
                 if self._client.collection_exists(name):
                     self._client.delete_collection(name)
+            self._names.pop(space_id, None)
 
     def close(self) -> None:
         with self._lock:
@@ -352,6 +389,10 @@ class VectorStore:
             for point in response.points
             if point.payload
         ]
+
+
+def _safe(space_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", space_id)[:40]
 
 
 def _build_filter(

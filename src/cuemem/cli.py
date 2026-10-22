@@ -803,8 +803,8 @@ def demo(
             # 它连 LLM 缓存一起清，回放就不可复现了
             system = service.system
             with system.consolidator.exclusive(space_id):
+                system.vectors.delete_space(space_id)  # 先于数据库，见 VectorStore.delete_space
                 system.db.delete_space(space_id)
-                system.vectors.delete_space(space_id)
             console.print(f"[dim]已清空记忆空间 {space_id}[/dim]")
 
         def show(result: TurnResult) -> None:

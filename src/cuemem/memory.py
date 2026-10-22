@@ -314,6 +314,7 @@ class MemorySystem:
         self.settings = settings
         self.db = db
         self.vectors = vectors
+        vectors.owned_units = db.some_unit_ids  # 旧名字的集合按数据库核对归属（见 collection_name）
         self.embedder = embedder
         self.llm = llm
         self.ledger = ledger
@@ -1083,8 +1084,8 @@ class MemorySystem:
         两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。读写门与遗忘一样先拿。"""
         with self._gate(space_id).exclusive(), self.consolidator.exclusive(space_id):
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
+            self.vectors.delete_space(space_id)  # 先于数据库：旧名字的集合按库里的记忆单元核对归属
             self.db.delete_space(space_id)
-            self.vectors.delete_space(space_id)
             self.db.scrub()
         return report
 

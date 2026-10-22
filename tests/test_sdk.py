@@ -28,6 +28,7 @@ from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
 from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
 from cuemem.sdk import parse_messages, space_for
+from cuemem.store.vector import VectorStore
 
 AUG = datetime(2026, 8, 1, 10, 0)
 SEP = datetime(2026, 9, 1, 10, 0)
@@ -939,6 +940,44 @@ def test_reset_deletes_every_space(memory: Memory) -> None:
     assert memory.system.adopt_open("carol") == 0
     memory.add("I live in Oslo", user_id="alice", wait=True)  # 之后照常可用
     assert current_memories(memory, "alice") == ["The user lives in Oslo."]
+
+
+def colliding_agents() -> tuple[str, str]:
+    """两个 Agent：alice 在它们下面的两个空间，旧的集合名（前 40 个字符加 32 位摘要）相同。"""
+    seen: dict[str, str] = {}
+    for i in itertools.count():
+        agent = f"tenant0customer0support0assistant0prod0x{i}"
+        name = VectorStore.legacy_name(space_for("alice", agent))
+        if name in seen:
+            return seen[name], agent
+        seen[name] = agent
+    raise AssertionError("unreachable")
+
+
+def test_spaces_never_share_a_vector_collection(memory: Memory) -> None:
+    """集合名以前只带 32 位摘要：能自己起 agent_id 的令牌离线撞出与别人同名的集合，delete_all
+    删掉别人的向量（检索从此什么都找不到），写入挤进别人的检索结果。现在新集合带 128 位摘要；
+    升级之前的旧名字集合只给能证明是自己的空间（数据库里它的记忆单元在里面）用。"""
+    victim, attacker = colliding_agents()
+    mine, theirs = space_for("alice", victim), space_for("alice", attacker)
+    assert mine != theirs and VectorStore.legacy_name(mine) == VectorStore.legacy_name(theirs)
+    vectors = memory.system.vectors
+    vectors._names[mine] = VectorStore.legacy_name(mine)  # 升级之前建的：旧名字的集合
+    memory.add("I live in Berlin and love sailing", user_id="alice", agent_id=victim, infer=False)
+    vectors._names.clear()  # 升级之后的新进程
+
+    memory.system.db.ensure_space(theirs)  # 数据库里先有这个空间（例如 Claude 记忆工具）也一样
+    memory.add("My password hint is purple", user_id="alice", agent_id=attacker, infer=False)
+    assert vectors.collection_name(mine) == VectorStore.legacy_name(mine)
+    assert vectors.collection_name(theirs) != vectors.collection_name(mine)
+    assert vectors.count(mine) == vectors.count(theirs) == 1
+    memory.delete_all(user_id="alice", agent_id=attacker)
+    assert vectors.count(mine) == 1
+    found = memory.search("sailing", user_id="alice", agent_id=victim, mode="l1")["results"]
+    assert any("sailing" in hit["memory"] for hit in found)
+    memory.delete_all(user_id="alice", agent_id=victim)  # 自己的旧集合照样删得掉
+    names = [c.name for c in vectors._client.get_collections().collections]
+    assert VectorStore.legacy_name(mine) not in names
 
 
 def test_delete_leaves_no_vectors_or_traces_of_the_fact(

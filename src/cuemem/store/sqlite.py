@@ -621,6 +621,16 @@ class MemoryDB:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_unit(r) for r in fetched]
 
+    def some_unit_ids(self, space_id: str, limit: int = 3) -> list[str]:
+        """这个空间的几个记忆单元 ID，"轮"优先（在线写入时一定写了向量）：向量库据此确认旧名字的
+        集合是这个空间的（见 VectorStore.collection_name）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM units WHERE space_id = ? ORDER BY kind != 'round' LIMIT ?",
+                (space_id, limit),
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def has_units(self, space_id: str, kinds: Sequence[str]) -> bool:
         """空间里有没有这几种记忆单元（走 idx_units_space，不扫表）。"""
         marks = ", ".join("?" for _ in kinds)
