@@ -2,7 +2,7 @@
 
 **Cue-driven, self-regulating, multimodal long-term memory for LLM agents**
 
-English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [vs. Mem0, Letta, Zep…](docs/en/landscape.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/HbGS0_Yo4kI)
+English · [简体中文](README.zh-CN.md) · [Technical report](docs/en/report.md) · [Design](docs/en/design.md) · [API reference](docs/en/api.md) · [vs. Mem0, Letta, Zep…](docs/en/landscape.md) · [Demo guide](demo/README.en.md) · [60-second video](https://youtu.be/HbGS0_Yo4kI)
 
 CueMem gives an LLM agent a memory that lasts across months of conversations:
 
@@ -45,7 +45,38 @@ with m.run(user_id="alice") as run_id:
 
 Calling `add` once per turn with the same `run_id` also works, but it re-extracts the whole run every time and replays derived memory; wrap the chat in `with m.run(...)` instead. The SDK defaults to `peak_policy="warn"`: during DeepSeek's weekday peak hours calls go out at peak price instead of pausing until the peak ends; batch jobs that want the off-peak price pass `Memory(peak_policy="wait")`.
 
-Or as a drop-in proxy for any app that uses an OpenAI-compatible API, with no code changes beyond the base URL:
+The rest of Mem0's API is there too, with CueMem's semantics:
+
+```python
+m.add("I prefer aisle seats.", user_id="alice", metadata={"source": "crm"}, expiration_date="2026-12-31")
+m.search("Seat preference?", user_id="alice", filters={"source": {"in": ["crm", "app"]}})
+m.update(events[0]["id"], "I moved to Berlin, not Munich.")  # a logged correction; history() keeps both
+m.delete_all(user_id="alice", run_id=run_id)  # forget one conversation; reset() wipes every space
+```
+
+- **metadata and expiry:** metadata is stored with the raw turns (never shown to the extraction model), carried by every fact and excerpt derived from them, and usable in `filters` with Mem0's operators (`eq`, `ne`, `gt`, `in`, `contains`, `AND` / `OR` / `NOT`, …). Expired memories leave `search`, `get_all` and the profile; `get` and `history` still show them.
+- **`update`** logs "Correction: …" in the raw log; the fact extracted from it supersedes the old one as *corrected* (no reconciliation call needed), and forgetting the correction brings the old fact back.
+- **`search` never comes back empty because the controller chose L0:** calling it is already a decision to look, so L0 is raised to L1 (`min_level="l0"` keeps the controller's choice). `answer()` still lets the controller skip memory.
+- **Writes are safe to retry.** If embedding or the vector store fails, nothing is stored and the same call can be repeated. If extraction fails after the turns were stored, `add(wait=True)` returns `status: "queued"` with an `error` instead of raising, and extraction finishes on the next consolidation.
+
+Against a running `cuemem serve`, `MemoryClient` has the same methods and signatures, so switching between local and remote is one line, and several processes can share one server (local-mode Qdrant allows one process per data directory). Underneath is a Mem0-shaped HTTP API, `/api/v1/memories`, usable from any language:
+
+```python
+from cuemem import MemoryClient
+
+m = MemoryClient("http://127.0.0.1:7860", api_key="...")  # instead of Memory(); same calls as above
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:7860/api/v1/memories -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"messages": "I moved to Berlin", "user_id": "alice", "wait": true}'
+curl -s -X POST http://127.0.0.1:7860/api/v1/memories/search -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"query": "Where do I live?", "user_id": "alice"}'
+```
+
+Every method, route, error code and environment variable is in the [API reference](docs/en/api.md).
+
+Or as a drop-in proxy for any app that uses an OpenAI-compatible API, with no code changes beyond the base URL (for Chat Completions, embeddings and plain-text Responses calls):
 
 ```bash
 uv run cuemem --preset openai proxy          # http://127.0.0.1:8787/v1
@@ -60,11 +91,14 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 # Response headers say what the controller did: X-CueMem-Level: L0 (no recall) / L1 / L2
 ```
 
-The proxy accepts JSON requests only (`curl -d` needs `-H 'Content-Type: application/json'`) and refuses browser requests from other origins. Recalled memories go into a `<memory>` block that tells the model they are quoted from past conversations, information and not instructions, and a stored `</memory>` cannot close the block early. This reduces prompt injection from stored memories but cannot rule it out.
+- **Models:** every response names the upstream model actually used in `X-CueMem-Model`. A model name the proxy does not know is sent to the agent role's model with a logged warning; `--unknown-model reject` (or `proxy.unknown_model: reject`) answers 400 `model_not_found` instead.
+- **Other endpoints:** `/v1/embeddings` goes to the configured embedding model and touches no memory. `/v1/responses` supports non-streaming text input with the same recall and write-back; streaming, tools, `previous_response_id` and images get 501, so use Chat Completions for those (the OpenAI Agents SDK has its own [integration](docs/en/integrations.md)).
+- **Failures:** provider errors come back with their `Retry-After`, and an unreachable or timed-out upstream gives 502 or 504. A write-back that fails during an outage is kept in memory and written before the session's next one.
+- The proxy accepts JSON requests only (`curl -d` needs `-H 'Content-Type: application/json'`) and refuses browser requests from other origins. Recalled memories go into a `<memory>` block that tells the model they are quoted from past conversations, information and not instructions, and a stored `</memory>` cannot close the block early. This reduces prompt injection from stored memories but cannot rule it out.
 
 Or inside an agent framework: the OpenAI Agents SDK, LangGraph / LangChain, and Claude's memory tool, with the controller deciding before every model call ([integrations](docs/en/integrations.md)).
 
-Also: an HTTP API with a memory browser (`cuemem serve`), an MCP server, export and import of a user's memory (`cuemem export / import`), and a Docker image (`docker compose up`, with an access token). See [Quick start](#quick-start) and the [examples](examples/).
+Also: an HTTP API with a memory browser (`cuemem serve`), an MCP server, export and import of a user's memory (`cuemem export / import`), access tokens scoped to users and agents, and a Docker image (`docker compose up`, with an access token). See [Quick start](#quick-start), [Deployment](#deployment) and the [examples](examples/).
 
 ## Results at a glance
 
@@ -170,7 +204,7 @@ Checked against twelve open-source memory projects on 2026-10-14; the full compa
 
 L2 is ahead of all five systems under both protocols (paired sign tests, nominal p ≤ 0.017), A-MEM with k = 40 included. After a Holm correction over the ten tests of L1 and L2 against the five systems in each protocol, every one of these leads stays significant except L2 against Mem0 under DeepSeek only (+17 / −5, adjusted p = 0.068). L1, whose recall makes no LLM call, is not significantly different from Mem0, LangMem and Cognee under DeepSeek, and is significantly ahead of Graphiti and A-MEM. A-MEM is shown at the paper's main setting (k = 10) and at the authors' setting for GPT-4o-class models (k = 40), which uses 2.4 times L2's input per question. Graphiti and LangMem drop sharply under Qwen: with their own prompts, qwen3.8-flash extracts far fewer entities and memories. CueMem's extraction prompts and thresholds were developed with qwen3.8-flash and Qwen embeddings (N3–N7), so the Qwen-only protocol is its home ground; DeepSeek-only is the protocol where no system was tuned for the model, and L2 leads there too (nominally only against Mem0). The tests are conditional on one build per system: write-path randomness was not measured. Details in the Chinese [N12 external baselines](docs/results/n12-baselines/README.md) and the [comparison](docs/en/landscape.md#same-protocol-comparison-n12).
 
-CueMem's gaps are on the product side: Python only, SQLite + Qdrant only, one shared access token, three framework integrations so far ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
+CueMem's gaps are on the product side: a Python SDK only (other languages go through the HTTP API, with no TypeScript client), SQLite + Qdrant only (no multi-instance deployment), MCP over stdio only, three framework integrations so far ([what is missing](docs/en/landscape.md#7-what-is-still-missing)).
 
 ## Quick start
 
@@ -193,9 +227,18 @@ uv run cuemem export --space demo-en -o demo-en.json          # raw log + photos
 uv run cuemem --preset ollama doctor                          # the same commands work with any preset
 ```
 
-Without a checkout, install from GitHub: `pip install "cuemem[local] @ git+https://github.com/FlickYan/cuemem"`. The commands are then `cuemem …` instead of `uv run cuemem …`, data goes to `~/.cuemem` (`CUEMEM_HOME` to change it), and `cuemem serve` starts the plain assistant, because the shop demo's product catalogue exists only in the repository (`cuemem demo` reads the `catalog.json` next to its script). CI installs the wheel outside the repository and runs the CLI, the SDK and the server on every push.
+Without a checkout, install from GitHub: `pip install "cuemem @ git+https://github.com/FlickYan/cuemem"` installs the core: the SDK, `MemoryClient`, the CLI, the HTTP API, the memory proxy and MCP. Optional extras add the rest, and combine as `cuemem[ui,local]`:
 
-Command-line messages are in Chinese. The agent, the web UI, the demo and the MCP tools are in English. Without API keys you can still try writing and retrieval offline with hash embeddings (`CUEMEM_EMBEDDING__BACKEND=hash`); answering still needs an LLM.
+| Extra | Adds |
+|---|---|
+| `local` | Local embeddings with no key (fastembed; the `deepseek` preset needs it) |
+| `ui` | The browser UI of `cuemem serve` (Gradio). Without it, `cuemem serve` serves only `/api`, `/api/v1`, `/docs` and the `/v1` proxy, and prints how to install the UI |
+| `eval` | Evaluation charts and the controller and gate training scripts (matplotlib, scikit-learn). Without it, `cuemem eval run` and `eval report` say which extra to install and exit 1 |
+| `integrations` | The OpenAI Agents SDK, LangGraph / LangChain and Anthropic integrations (or one of `openai-agents`, `langgraph`, `anthropic`) |
+
+In a checkout, `uv sync` installs `ui` and `eval` through the dev group; add `--extra local` or `--extra integrations` as needed. With pip, the commands are `cuemem …` instead of `uv run cuemem …`, data goes to `~/.cuemem` (`CUEMEM_HOME` to change it), and `cuemem serve` starts the plain assistant, because the shop demo's product catalogue exists only in the repository (`cuemem demo` reads the `catalog.json` next to its script). `cuemem --help` and `import cuemem.sdk` take about 0.3–0.4 s on the development machine. CI installs the wheel outside the repository and runs the CLI, the SDK and the server on every push.
+
+Command-line messages are in Chinese. The agent, the web UI, the demo, the SDK, `/api/v1`, the proxy and the MCP tools are in English, and the [API reference](docs/en/api.md) is in English. Without API keys you can still try writing and retrieval offline with hash embeddings (`CUEMEM_EMBEDDING__BACKEND=hash`); answering still needs an LLM.
 
 The agent demo uses Qwen models only:
 
@@ -223,17 +266,21 @@ The script never overwrites the frozen controller files (the training steps only
 
 Development: `uv run pytest` (offline, no keys), `uv run pytest -m live` (needs keys), `uv run ruff check . && uv run mypy`.
 
-Deployment (N11, N12). By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory. Installed with pip, it keeps its data in `~/.cuemem` (`CUEMEM_HOME` to change it).
+### Deployment
 
-`cuemem serve` and `cuemem proxy` refuse to listen beyond loopback without `CUEMEM_API_TOKEN` (add `--insecure-no-auth` to run without authentication on a trusted network). Browser requests from other origins get 403, and on a loopback address only 127.0.0.1, localhost and [::1] are accepted as the Host; behind a reverse proxy or under another hostname, list those hostnames in `CUEMEM_ALLOWED_HOSTS` (comma-separated, can go in `.env`).
+By default CueMem uses embedded SQLite and Qdrant in local mode, which allows one process per data directory: apps that should share a memory talk to one `cuemem serve` through `MemoryClient` or `/api/v1`. Installed with pip, it keeps its data in `~/.cuemem` (`CUEMEM_HOME` to change it).
 
-For Docker, put a token in `.env` first (for example from `openssl rand -hex 32`). `docker compose up -d` then runs the UI, the HTTP API and the memory proxy on 127.0.0.1:7860 with a Qdrant server, and stops with an error if the token is missing; a single container is `docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem` after `docker build -t cuemem .`. The image includes local embeddings (the `local` extra); `--build-arg EXTRAS=` builds a slim one. Without Docker, run a Qdrant server and protect the API with a token:
+- **Access tokens.** `cuemem serve` and `cuemem proxy` refuse to listen beyond loopback without a token (add `--insecure-no-auth` to run without authentication on a trusted network). `CUEMEM_API_TOKEN` is the admin token. Scoped keys, in a YAML file named by `CUEMEM_API_KEYS_FILE` (or inline in `CUEMEM_API_KEYS`), limit each key to listed users and agents, for example `{name: alice-app, sha256: <printf %s "$TOKEN" | sha256sum>, scopes: [{user: alice}]}`. A key gets 403 for a user, agent or space outside its scope, on `/api`, `/api/v1`, the UI and the proxy alike, and other tenants' memory ids look like missing ones (404). MCP stays stdio-only, one space per process, and is not behind these keys. Format and rules are in the [API reference](docs/en/api.md#authentication-and-scoped-keys).
+- **Provider failures** have their own status codes on the HTTP API instead of a bare 500: 429 (with `Retry-After`) for rate limits, 402 for an empty balance, 503 (with `Retry-After`) when the provider is unavailable, 504 for timeouts, 422 when its content filter refuses, and 502 for other provider errors.
+- **Browsers.** Browser requests from other origins get 403, and on a loopback address only 127.0.0.1, localhost and [::1] are accepted as the Host; behind a reverse proxy or under another hostname, list those hostnames in `CUEMEM_ALLOWED_HOSTS` (comma-separated, can go in `.env`).
+
+For Docker, put a token in `.env` first (for example from `openssl rand -hex 32`). `docker compose up -d` then runs the UI, the HTTP API and the memory proxy on 127.0.0.1:7860 with a Qdrant server, and stops with an error if the token is missing; a single container is `docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem` after `docker build -t cuemem .`. The image includes the UI and local embeddings (the `ui` and `local` extras); `--build-arg EXTRAS=` builds an API-only one. For scoped keys in a container, put the keys file in the data volume (`/data`) and point `CUEMEM_API_KEYS_FILE` at it, or put the keys inline in `CUEMEM_API_KEYS`; compose still requires `CUEMEM_API_TOKEN`. Without Docker, run a Qdrant server and protect the API with a token:
 
 ```bash
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1
 uv run cuemem migrate-vectors --to http://localhost:6333   # copy existing local vectors first
 export CUEMEM_VECTOR_STORE__URL=http://localhost:6333     # or put it in .env
-CUEMEM_API_TOKEN=your-token uv run cuemem serve --host 0.0.0.0   # Bearer token for /api, sign-in for the UI
+CUEMEM_API_TOKEN=your-token uv run cuemem serve --host 0.0.0.0   # Bearer token for /api, /api/v1 and /v1, sign-in for the UI
 uv run python scripts/n11_latency.py                       # offline latency benchmark, no API calls
 ```
 
@@ -241,13 +288,13 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 
 | Path | What is there |
 |---|---|
-| `src/cuemem/sdk.py` | The Python SDK (`Memory`, `AsyncMemory`), shaped like Mem0's |
-| `src/cuemem/configs/` | Default config and presets (`openai`, `ollama`), shipped in the package |
+| `src/cuemem/sdk.py`, `client.py` | The Python SDK (`Memory`, `AsyncMemory`), shaped like Mem0's, and its remote twin (`MemoryClient`, `AsyncMemoryClient`) |
+| `src/cuemem/configs/` | Default config and presets (`openai`, `ollama`, `deepseek`, `qwen`), shipped in the package |
 | `src/cuemem/write/` | Online writer; consolidation: extraction, entity linking, fact reconciliation, captions, profile |
 | `src/cuemem/read/` | Naive, L1 and L2 retrieval; probe; controller; reader; agentic reader |
 | `src/cuemem/store/` | SQLite (log and derived memory), Qdrant local (vectors), content-addressed media |
 | `src/cuemem/llm/`, `embed/` | Model clients with response cache, cost ledger, off-peak scheduling; embeddings |
-| `src/cuemem/agent/`, `api/` | Agent loop and context assembly; HTTP API, Gradio UI, MCP server, OpenAI-compatible memory proxy, demo replay |
+| `src/cuemem/agent/`, `api/` | Agent loop and context assembly; HTTP API (`/api`, the memory API `/api/v1`), access tokens and scopes, Gradio UI, MCP server, OpenAI-compatible memory proxy, demo replay |
 | `src/cuemem/portable.py` | Export and import of a memory space |
 | `src/cuemem/evals/` | Datasets, splits, runner, judge, metrics, routing analysis |
 | `scripts/` | Experiment scripts for every node, `reproduce.py`, figure generators |
@@ -261,12 +308,13 @@ uv run python scripts/n11_latency.py                       # offline latency ben
 | Design: motivation, architecture, controller, multimodal memory, evaluation plan | [English](docs/en/design.md) · [中文](docs/design.md) |
 | Demo guide (3 minutes) | [English](demo/README.en.md) · [中文](demo/README.md) |
 | Comparison with open-source peers: capabilities, published scores, what N12 borrowed, what is missing | [English](docs/en/landscape.md) · [中文](docs/landscape.md) |
+| API reference: SDK, `MemoryClient`, HTTP API (`/api`, `/api/v1`), memory proxy, MCP, environment variables, extras | [English](docs/en/api.md) · [中文](docs/api.md) |
 | Framework integrations: OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | [English](docs/en/integrations.md) · [中文](docs/integrations.md) |
-| Decision records (68 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
+| Decision records (69 ADRs) | [English](docs/en/decisions.md) · [中文](docs/decisions.md) |
 | N12 results: same-protocol external baselines on LoCoMo; the LongMemEval session-ID leak, its fix and ablation | 中文: [external baselines](docs/results/n12-baselines/README.md), [session-ID leak](docs/results/n12-leak/README.md) |
 | Roadmap and progress log, related work, per-node results | 中文: [roadmap](docs/roadmap.md), [related work](docs/related-work.md), [results](docs/results/) |
 
-The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). After N12, a full audit fixed 24 verified problems in forgetting, concurrency, security, SDK writes, evaluation hygiene, packaging and read-path performance, without changing any evaluation request (D-068 in the decision records). Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
+The project was built node by node, from N0 (design) to N10 (packaging), followed by N11 (follow-up work after the test sets) and N12 (comparison with open-source peers, and the SDK, proxy, presets, export and Docker that came out of it). After N12, a full audit fixed 24 verified problems in forgetting, concurrency, security, SDK writes, evaluation hygiene, packaging and read-path performance, without changing any evaluation request (D-068 in the decision records). A second round then did 14 of the 17 items that audit had deferred (D-069): all-or-nothing online writes, clear provider errors, cheaper reconciliation, consolidation and forgetting, faster start-up and optional `ui` / `eval` extras, pinned datasets and Holm-corrected significance, the rest of Mem0's API with `MemoryClient` and `/api/v1`, scoped access tokens, and wider proxy coverage, again with evaluation requests unchanged. Every node's experiments and numbers are in the Chinese records above. The English documents cover the system, the final results, the N11 follow-up and every design decision.
 
 ## Licence
 

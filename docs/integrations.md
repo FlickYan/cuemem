@@ -2,21 +2,26 @@
 
 [English](en/integrations.md)
 
-CueMem 接进现成 Agent 框架的四种方式，从改动最少到最深：
+CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 
 | 方式 | 适合 | 谁决定要不要想起 | 见 |
 |---|---|---|---|
-| OpenAI 兼容的记忆代理 | 任何用 OpenAI SDK 的应用，代码不动 | 控制器（每轮） | `cuemem proxy`，README |
+| OpenAI 兼容的记忆代理 | 任何用 OpenAI SDK 的应用，代码不动：Chat Completions、embeddings 与非流式的纯文字 Responses 调用 | 控制器（每轮） | `cuemem proxy`，README |
 | MCP Server | Claude Code、Claude Desktop 等 MCP 客户端 | 模型调用 `recall`（控制器只决定深浅） | `cuemem mcp` |
 | 框架集成（本页） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool | 控制器（每次调用模型之前），模型还可以用工具补查 | `cuemem.integrations.*` |
 | Python SDK | 自己写的 Agent 循环 | 调用方 | `from cuemem import Memory` |
+| HTTP 记忆接口 | 别的语言写的应用，或几个进程共用一个服务 | 调用方 | `cuemem serve` 的 `/api/v1/memories`；`from cuemem import MemoryClient` |
+
+后两种的每个方法、接口与错误码见[接口参考](api.md)。`MemoryClient` 的方法与签名与 `Memory` 完全相同，代码在本地数据目录与共用的服务之间只换一行；下面的框架集成仍然要本地的 `Memory` 或 `AsyncMemory`。
 
 三个集成共用 `cuemem/evidence.py`：控制器先选档（L0 不检索、只给画像），取回的事实与对话片段排成与记忆代理、回答模型相同的证据块，放在最新一句用户消息的开头；系统提示与之前的消息不动，供应商的前缀缓存照常命中。工具（recall / remember / forget）的名字、说明与语义与 MCP 相同。
 
 - 证据块与 recall 工具的清单都声明里面是从过去的对话里引来的资料、不是指令；存下的 `<memory`、`</memory` 注入前会转义，关不上证据块。这只能减少、不能杜绝从记忆来的提示注入。
 - OpenAI Agents 与 LangGraph 里，当前对话里还在请求中的轮不进证据，带照片的轮也一样（`evidence.stored_text` 与 `in_context_rounds`，与记忆代理共用）。
+- 遗忘照实说：删除做完、用剩下的日志重建派生记忆却出错时（例如模型供应商余额不足），MCP、Agents 与 LangGraph 的 forget 工具回 "Deleted N conversation turn(s). Rebuilding the memory derived from the rest failed (…); it finishes on the next consolidation…"，不报成出错，模型不会告诉用户什么都没删。
+- 写入要么全写、要么不留：向量化或向量库出错时什么都不写，重试不会写出重复的发言。
 
-安装：`uv sync --extra integrations`（或分别 `--extra openai-agents`、`--extra langgraph`、`--extra anthropic`）。只有 DeepSeek 的 Key 时加上 `--extra local` 并用 `Memory(preset="deepseek")`。
+安装：`pip install "cuemem[integrations]"`（从 GitHub 装，见 README），源码仓库里 `uv sync --extra integrations`；只要一个框架时用 `openai-agents`、`langgraph` 或 `anthropic`。只有 DeepSeek 的 Key 时加上可选依赖 `local` 并用 `Memory(preset="deepseek")`。
 
 **高峰时段**：SDK，以及包在 `Memory` 外面的各个集成，缺省 `peak_policy="warn"`：DeepSeek 工作日的高峰时段（北京时间）里照常按高峰价调用模型，不会停下来等高峰结束。不用预设时也一样，默认配置的回答模型就是 DeepSeek。批量任务想等错峰价时用 `Memory(peak_policy="wait")`，开始等待时 SDK 在 `cuemem.sdk` 日志上记一条警告。评测与 `cuemem eval run --peak` 不受影响。
 
@@ -62,6 +67,8 @@ close_sessions(memory)  # 退出前、memory.close() 之前
 - 服务端保存对话状态（`conversation_id`、`previous_response_id`）时用 `memory_input_filter(..., placement="instructions")`：证据接在这次调用的 instructions 后面，不会随用户消息存到服务端。
 - 遗忘：`pop_item`、`clear_session` 撤回的消息在长期记忆里一并遗忘；forget 工具删掉的发言，下次读历史时也从内层会话里去掉。
 - 输入护栏拦下的、模型没有回应过的用户消息不写进长期记忆。
+- 写不进去的留着重试：一批写不进去时（向量接口或 Qdrant 故障），`CueMemSession` 留着它，下一批或 `end()` 时先按原来的时间写它。重试没有用的（大部分 4xx、内容审核拒绝、输入不合法），或这个空间之后遗忘过发言的，丢掉（trace 事件 `agents_mirror_dropped`），不把遗忘之前的消息写回去。留着的只在进程内存里。
+- 改走记忆代理：Agents SDK 缺省的模型类调用 Responses API，通常带工具或流式，记忆代理对这些回 501。用这里的集成，或者把 `OpenAIChatCompletionsModel` 指向记忆代理。
 
 ## LangGraph / LangChain
 
@@ -128,6 +135,7 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
 
 - 没有在真实的 Claude 上跑过（开发环境没有 Anthropic 的 Key；DeepSeek 的 Anthropic 兼容接口不接受 `memory_20250818`）。离线测试直接驱动工具的各个命令；联网冒烟用 DeepSeek 驱动了同样的命令（以普通工具的形式）。
 - 从文件里删掉一行，记作"这一条不再成立"，由抽取与对账决定后果；只有删掉整个文件才确定遗忘。
+- 笔记记下之后供应商出错：改动已经作为笔记写进日志、抽取却出错时（例如余额不足），文件的改动照样成功，笔记只记一次，下次巩固时补上抽取。删除之后重建出错时，删除也照样成功，并说明重建要等下次。
 - Claude 的文件不在 `Memory.export` 里（导出只有原始日志里的笔记）。
 
 ## 局限
@@ -135,4 +143,5 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
 - 进行中的会话按进程记在内存里：多个进程共用一个数据目录（Qdrant 服务端）时，一个进程可能提前交出另一个进程还在进行的会话。
 - 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
 - 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。
+- 供应商出错与过期：各集成自己的记忆工具不像 MCP 那样把供应商的出错（限流、余额不足、超时）换成说明，出来的是供应商客户端的异常。带 `expiration_date` 的记忆只在 SDK 的 `search`、`get_all` 与画像里排除，各集成在删除之前仍看得到。
 - 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉。
