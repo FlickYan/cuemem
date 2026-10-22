@@ -474,3 +474,39 @@ def test_llm_cache_hold_keeps_only_what_was_reused(tmp_path: Path) -> None:
     raw = on_disk()  # 还开着：删完就截断了 WAL
     assert b"secret-a" not in raw and b"secret-b" not in raw and b"other" in raw
     cache.close()
+
+
+def test_opening_the_cache_keeps_holds_of_a_forget_still_running(tmp_path: Path) -> None:
+    """遗忘在 hold 与 settle 之间时，别的进程（评测、CLI、另一个服务）或同一进程里别的缓存对象
+    打开同一份缓存：这次遗忘的标记不动，重放照样用得上（以前打开缓存就删掉全部标记，还记一条
+    "进程中途退出"的警告）。标记它的进程真的退出了（崩溃）时，下次打开照样删掉。"""
+    import subprocess
+    import sys
+
+    from cuemem.llm.cache import ResponseCache
+
+    path = tmp_path / "llm.sqlite"
+    first = ResponseCache(path)
+    for i in range(3):
+        first.put(f"k{i}", "m", {"decisions": [i]}, scope="alice|consolidate")
+    assert first.hold("alice|consolidate") == 3
+    with first.recording() as hits:
+        assert first.get("k0") is not None
+        second = ResponseCache(path)  # 遗忘重放到一半时打开
+        assert first.get("k1") is not None
+    assert first.settle("alice|consolidate", hits) == 1
+    assert [second.get(f"k{i}") is not None for i in range(3)] == [True, True, False]
+    second.close()
+
+    crash = (
+        "import os, sys; from pathlib import Path; from cuemem.llm.cache import ResponseCache; "
+        "c = ResponseCache(Path(sys.argv[1])); c.put('x', 'm', {'secret': 1}, scope='bob|c'); "
+        "c.hold('bob|c'); os._exit(1)"
+    )
+    subprocess.run([sys.executable, "-c", crash, str(path)], check=False)
+    assert first.get("x") is not None  # 还开着的对象不替别人核对
+    reopened = ResponseCache(path)
+    assert reopened.get("x") is None and reopened.get("k0") is not None
+    assert list((tmp_path / "llm.sqlite.holds").iterdir()) == []
+    reopened.close()
+    first.close()

@@ -10,6 +10,7 @@ import json
 import logging
 import sqlite3
 import threading
+import uuid
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -31,6 +32,47 @@ def request_key(request: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+class _HoldLock:
+    """一次遗忘（hold 到 settle）的锁：<缓存>.holds/ 下一个只用来上锁的 SQLite 文件，核对完之前
+    一直开着它的排他事务。进程退出（包括崩溃）时操作系统释放这把锁：别的进程、同一进程里别的
+    缓存对象据此分辨"中途退出了"与"还在核对"（见 ResponseCache._drop_held）。用 SQLite 的锁而不是
+    fcntl：Windows 上一样可用，同一进程里的另一个连接也看得到它。内存里的缓存（path 为 None）只有
+    一个对象用，不需要文件。"""
+
+    def __init__(self, directory: Path | None) -> None:
+        self.token = uuid.uuid4().hex
+        self._conn: sqlite3.Connection | None = None
+        self._path = directory / self.token if directory is not None else None
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(
+                str(self._path), isolation_level=None, check_same_thread=False
+            )
+            self._conn.execute("BEGIN EXCLUSIVE")
+
+    def release(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        if self._path is not None:
+            self._path.unlink(missing_ok=True)
+
+    @staticmethod
+    def alive(directory: Path | None, token: str) -> bool:
+        """这把锁还有人持有：那次遗忘还在核对。"""
+        path = directory / token if directory is not None else None
+        if path is None or not path.exists():
+            return False
+        probe = sqlite3.connect(str(path), timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError:  # database is locked
+            return True
+        finally:
+            probe.close()
+        return False
+
+
 class ResponseCache:
     def __init__(self, path: Path | None) -> None:
         if path is not None:
@@ -40,6 +82,8 @@ class ResponseCache:
             str(path) if path else ":memory:", check_same_thread=False, timeout=60.0
         )
         self._lock = threading.Lock()
+        self._locks_dir = path.with_name(path.name + ".holds") if path is not None else None
+        self._holds: dict[str, _HoldLock] = {}  # 本对象标记着、还没核对的归属
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
@@ -54,11 +98,14 @@ class ResponseCache:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_llm_cache_scope ON llm_cache (scope)"
             )
-            # 遗忘时标记、待核对的条目（见 hold、settle）
+            # 遗忘时标记、待核对的条目（见 hold、settle）；owner 是标记它的那次遗忘的锁（_HoldLock）
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS llm_cache_held ("
-                " key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+                " key TEXT PRIMARY KEY, scope TEXT NOT NULL, owner TEXT)"
             )
+            held = {row[1] for row in self._conn.execute("PRAGMA table_info(llm_cache_held)")}
+            if "owner" not in held:  # 第二轮复审之前建的缓存库：那时的标记没有 owner
+                self._conn.execute("ALTER TABLE llm_cache_held ADD COLUMN owner TEXT")
             self._conn.commit()
         self._drop_held()
 
@@ -85,22 +132,29 @@ class ResponseCache:
 
     def hold(self, scope: str) -> int:
         """遗忘开始时标记这个归属下的全部条目，等重放之后核对（settle）：重放时原样用到的留下，
-        其余删掉。标记写在库里：进程在核对之前退出时，下次打开缓存就把它们全部删掉。返回条数。"""
+        其余删掉。标记写在库里，带上这次遗忘的锁（_HoldLock）：进程在核对之前退出时锁随之释放，
+        下次打开缓存就把它们全部删掉。返回条数。"""
         with self._lock:
+            lock = self._holds.get(scope)
+            if lock is None:
+                lock = self._holds[scope] = _HoldLock(self._locks_dir)
             cursor = self._conn.execute(
-                "INSERT OR IGNORE INTO llm_cache_held (key, scope)"
-                " SELECT key, scope FROM llm_cache WHERE scope = ?",
-                (scope,),
+                "INSERT OR IGNORE INTO llm_cache_held (key, scope, owner)"
+                " SELECT key, scope, ? FROM llm_cache WHERE scope = ?",
+                (lock.token, scope),
             )
             self._conn.commit()
             return max(cursor.rowcount, 0)
 
     def settle(self, scope: str, kept: Collection[str]) -> int:
-        """核对 hold 标记的条目：键在 kept 里的（重放时命中过，见 recording）留下，其余删掉，
-        删除时覆写、删了就截断 WAL。返回删掉的条数。"""
+        """核对本对象 hold 标记的条目：键在 kept 里的（重放时命中过，见 recording）留下，其余
+        删掉，删除时覆写、删了就截断 WAL。返回删掉的条数。"""
         with self._lock:
+            lock = self._holds.pop(scope, None)
+            if lock is None:
+                return 0
             held = self._conn.execute(
-                "SELECT key FROM llm_cache_held WHERE scope = ?", (scope,)
+                "SELECT key FROM llm_cache_held WHERE owner = ?", (lock.token,)
             ).fetchall()
             doomed = [key for (key,) in held if key not in kept]
             deleted = 0
@@ -110,26 +164,38 @@ class ResponseCache:
                     f"DELETE FROM llm_cache WHERE key IN ({', '.join('?' * len(chunk))})", chunk
                 )
                 deleted += max(cursor.rowcount, 0)
-            self._conn.execute("DELETE FROM llm_cache_held WHERE scope = ?", (scope,))
+            self._conn.execute("DELETE FROM llm_cache_held WHERE owner = ?", (lock.token,))
             self._conn.commit()  # 删条目与去掉标记一起提交：中途退出时标记还在
+            lock.release()  # 提交之后才放锁：放了锁，库里就没有它的标记了
             if deleted:
                 self._checkpoint()
             return deleted
 
     def _drop_held(self) -> None:
-        """删掉还标记着的条目：上次遗忘重放到一半时进程退出了，没来得及核对。"""
+        """删掉还标记着、标记它的那次遗忘已经不在了的条目：上次遗忘重放到一半时进程退出了，没来得及
+        核对。别的进程（评测、CLI、另一个服务）或同一进程里别的缓存对象正在核对的不动：以前打开
+        缓存就删掉全部标记，正在进行的遗忘随后要原样用到的条目没了，又得付费请求一遍。"""
         with self._lock:
-            if self._conn.execute("SELECT 1 FROM llm_cache_held LIMIT 1").fetchone() is None:
+            owners = [o for (o,) in self._conn.execute("SELECT DISTINCT owner FROM llm_cache_held")]
+            gone = [o for o in owners if o is None or not _HoldLock.alive(self._locks_dir, o)]
+            if not gone:
                 return
-            cursor = self._conn.execute(
-                "DELETE FROM llm_cache WHERE key IN (SELECT key FROM llm_cache_held)"
-            )
-            self._conn.execute("DELETE FROM llm_cache_held")
+            dropped = 0
+            for owner in gone:
+                cursor = self._conn.execute(
+                    "DELETE FROM llm_cache WHERE key IN"
+                    " (SELECT key FROM llm_cache_held WHERE owner IS ?)",
+                    (owner,),
+                )
+                dropped += max(cursor.rowcount, 0)
+                self._conn.execute("DELETE FROM llm_cache_held WHERE owner IS ?", (owner,))
             self._conn.commit()
             self._checkpoint()
-        logger.warning(
-            "LLM 缓存里有上次遗忘没核对完的 %d 个条目（进程中途退出），已删除", cursor.rowcount
-        )
+        if self._locks_dir is not None:
+            for owner in gone:  # 崩溃留下的锁文件
+                if owner is not None:
+                    (self._locks_dir / owner).unlink(missing_ok=True)
+        logger.warning("LLM 缓存里有上次遗忘没核对完的 %d 个条目（进程中途退出），已删除", dropped)
 
     def put(
         self, key: str, model: str, response: dict[str, Any], *, scope: str | None = None
@@ -172,7 +238,11 @@ class ResponseCache:
             return int(self._conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0])
 
     def close(self) -> None:
+        """关闭。还没核对的标记留在库里、放掉它们的锁：下次打开缓存时删掉这些条目。"""
         with self._lock:
+            for lock in self._holds.values():
+                lock.release()
+            self._holds.clear()
             self._conn.close()
 
     def _checkpoint(self) -> None:
