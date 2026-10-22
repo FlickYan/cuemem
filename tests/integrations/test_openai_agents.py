@@ -11,6 +11,7 @@ import io
 import itertools
 import logging
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any, cast
 
 import pytest
@@ -40,6 +41,7 @@ import cuemem.integrations.openai_agents as oa
 from cuemem import AsyncMemory, Memory
 from cuemem.api.mcp import build_server
 from cuemem.config import Settings
+from cuemem.errors import EmbeddingAPIError
 from cuemem.evidence import MEMORY_NOTE
 from cuemem.integrations.openai_agents import (
     CueMemSession,
@@ -601,6 +603,56 @@ def test_storage_errors_do_not_break_the_conversation(
     result = run(Agent(name="a", model=AgentScript([reply("Noted!")])), "Hi", session=session)
     assert result.final_output == "Noted!"
     assert len(asyncio.run(session.get_items())) == 2  # 短期历史照常保存
+
+
+def test_messages_that_could_not_be_stored_are_retried(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """向量接口暂时不可用时这一轮写不进长期记忆：留着，下一轮或 end() 时照当时的时间再写。以前
+    先清掉等着的消息再写，出错时这一轮就永远丢了（内层会话的历史不会再写一遍）。弹出还没写进去
+    的消息时直接丢掉；之后这个用户的记忆被删过时也不再写（这是删之前说的话）。"""
+    embed = memory.system.embedder.embed
+    down = {"on": True}
+
+    def flaky(texts: Any, kind: Any) -> Any:
+        if down["on"] and kind == "document":
+            raise EmbeddingAPIError("HTTP 503", status=503)
+        return embed(texts, kind)
+
+    monkeypatch.setattr(memory.system.embedder, "embed", flaky)
+    script = [reply("Noted."), reply("Nice."), reply("Sure."), reply("Ok."), reply("Hi.")]
+    agent = Agent(name="a", model=AgentScript(script))
+    session = CueMemSession("monday", memory, user_id="alice")
+    before = datetime.now()
+    run(agent, "I live in Berlin", session=session)
+    after = datetime.now()
+    assert turns(memory, "oa-monday") == []
+    down["on"] = False
+    run(agent, "I like jazz", session=session)
+    stored = memory.system.db.get_turns("alice", "oa-monday")
+    assert [(t.role, t.text) for t in stored] == [
+        ("user", "I live in Berlin"),
+        ("assistant", "Noted."),
+        ("user", "I like jazz"),
+        ("assistant", "Nice."),
+    ]
+    assert before <= stored[0].ts <= after < stored[2].ts
+
+    down["on"] = True
+    run(agent, "I like tea", session=session)
+    asyncio.run(session.pop_item())  # 还没写进去的回复：直接丢掉
+    down["on"] = False
+    asyncio.run(session.end(wait=True))
+    assert turns(memory, "oa-monday")[4:] == [("user", "I like tea")]
+    assert sorted(facts(memory)) == ["I like jazz", "I like tea", "I live in Berlin"]
+
+    later = CueMemSession("tuesday", memory, user_id="alice")
+    down["on"] = True
+    run(agent, "My PIN is 4321", session=later)
+    memory.delete_all(user_id="alice")
+    down["on"] = False
+    run(agent, "Hello", session=later)
+    assert [t.text for t in memory.system.db.get_turns("alice")] == ["Hello", "Hi."]
 
 
 def test_session_ids_do_not_collide(memory: Memory) -> None:

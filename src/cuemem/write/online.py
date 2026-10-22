@@ -4,7 +4,7 @@
 巩固（抽取事实、实体、摘要、图片描述）不在这里做，而是登记成任务，由 write/consolidate.py 异步完成。
 
 一次写入要么全部写进去、要么什么都不留（见 OnlineWriter.writing）：向量化或写向量出错时调用方
-可以原样重试，发言不会写两遍。
+可以原样重试，发言不会写两遍（重试有没有用见 worth_retrying）。
 """
 
 from __future__ import annotations
@@ -17,17 +17,41 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from PIL import UnidentifiedImageError
+
 from cuemem.core.ids import stable_id
 from cuemem.core.models import MediaItem, MemoryUnit, SessionIn, Turn, TurnMeta
 from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import span
 from cuemem.embed.base import EmbeddingBatch, TextEmbedder
 from cuemem.embed.multimodal import ImageEmbedder
+from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 
 logger = logging.getLogger(__name__)
+
+
+def worth_retrying(exc: BaseException) -> bool:
+    """在线写入出错之后，过一会儿把同样的发言原样再写一次有没有可能写进去：记忆代理与 Agents 的
+    会话据此决定留着重试还是丢掉。向量接口暂时不可用、限流、超时、连不上、余额不足，向量库或
+    数据库出错时有。没有的：向量接口拒绝了请求本身（别的 4xx）、内容审核、发言本身不合法（图片
+    读不出来等），留着它们，这个会话后面的写入都得排在它们后面；撞号（ConcurrentWriteError）时
+    已经写进去了一部分，再写就重复了。"""
+    if isinstance(
+        exc,
+        ConcurrentWriteError
+        | ContentFilteredError
+        | UnidentifiedImageError
+        | ValueError
+        | TypeError
+        | LookupError,
+    ):
+        return False
+    if isinstance(exc, EmbeddingAPIError) and exc.status is not None:
+        return exc.status in (402, 408, 429) or exc.status >= 500
+    return isinstance(exc, Exception)
 
 
 @dataclass

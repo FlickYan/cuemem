@@ -8,6 +8,7 @@ import io
 import json
 import logging
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -440,6 +441,108 @@ def test_upstream_rate_limits_and_timeouts_reach_the_caller(
     late = chat(client, "I live in Berlin", user="alice", stream=stream)
     assert late.status_code == 504 and late.json()["error"]["type"] == "timeout"
     assert system.db.get_turns("alice") == []
+
+
+class Outage:
+    """向量接口写入时（文档向量）出错，status 为 None 时恢复。"""
+
+    def __init__(self, system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.status: int | None = 503
+        self._embed = system.embedder.embed
+        monkeypatch.setattr(system.embedder, "embed", self)
+
+    def __call__(self, texts: Any, kind: Any) -> Any:
+        if self.status is not None and kind == "document":
+            raise EmbeddingAPIError(f"HTTP {self.status}", status=self.status)
+        return self._embed(texts, kind)
+
+
+def test_write_backs_that_fail_are_retried(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """向量接口暂时不可用时写回失败：留着，下一次写回这个会话时先写它（照它当时的时间），会话
+    结束之前再试一次。在线写入要么全写、要么不写（R1）：以前这一轮就永远丢了，之后的请求只写
+    各自最后一句用户消息。"""
+    outage = Outage(system, monkeypatch)
+    before = datetime.now()
+    first = chat(client, "I live in Berlin", user="alice")
+    after = datetime.now()
+    assert first.status_code == 200  # 写不进记忆不影响回答
+    session = first.headers["x-cuemem-session"]
+    assert system.db.get_turns("alice", session) == []
+
+    outage.status = None
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    chat(client, "I like jazz", history, user="alice")
+    stored = system.db.get_turns("alice", session)
+    assert [t.text for t in stored] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+        "I like jazz",
+        "Happy to help, Alice!",
+    ]
+    assert before <= stored[0].ts <= after < stored[2].ts
+
+    outage.status = 503  # 会话结束之前再写一次
+    history += [
+        {"role": "user", "content": "I like jazz"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    chat(client, "I like tea", history, user="alice")
+    outage.status = None
+    proxy.close_all()
+    assert [t.text for t in system.db.get_turns("alice", session)][4:] == [
+        "I like tea",
+        "Happy to help, Alice!",
+    ]
+    system.consolidate("alice")
+    assert {f.statement for f in system.facts("alice")} == {
+        "The user lives in Berlin.",
+        "I like jazz",
+        "I like tea",
+    }
+
+
+def test_write_backs_that_cannot_succeed_are_dropped(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不留着重试的：向量接口拒绝了请求本身（4xx：再写一次还是一样，留着它这个会话后面的写回
+    都排在它后面）；写不进去的期间这个用户的记忆被删过（这是删之前说的话）；会话结束时还是写不
+    进去的。"""
+    outage = Outage(system, monkeypatch)
+    outage.status = 400
+    first = chat(client, "I live in Berlin", user="alice", headers={"X-CueMem-Session": "s1"})
+    assert first.status_code == 200
+    outage.status = None
+    chat(client, "I like jazz", headers={"X-CueMem-Session": "s1"}, user="alice")
+    assert [t.text for t in system.db.get_turns("alice", "s1")] == [
+        "I like jazz",
+        "Happy to help, Alice!",
+    ]
+
+    outage.status = 503
+    chat(client, "My PIN is 4321", user="alice", headers={"X-CueMem-Session": "s1"})
+    Memory.from_system(system).delete_all(user_id="alice")
+    outage.status = None
+    chat(client, "I like tea", user="alice", headers={"X-CueMem-Session": "s1"})
+    texts = [t.text for t in system.db.get_turns("alice")]
+    assert texts == ["I like tea", "Happy to help, Alice!"]
+
+    outage.status = 503
+    chat(client, "I like coffee", user="alice", headers={"X-CueMem-Session": "s1"})
+    proxy.close_all()
+    assert [t.text for t in system.db.get_turns("alice")] == texts
 
 
 def test_tool_follow_ups_only_store_the_answer(

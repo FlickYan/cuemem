@@ -15,7 +15,8 @@
    改用 agent 角色的模型并记一条警告，proxy.unknown_model: reject 时返回 400），流式与非流式
    都支持，响应原样返回；控制器的决定与实际用的模型（X-CueMem-Model）放在响应头里；
 4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）；上游出错时不写，流式
-   回答中途断开（客户端停下）只写用户的话。会话进行中不抽取事实，
+   回答中途断开（客户端停下）只写用户的话。写不进去（向量接口暂时不可用等）时留着，这个会话
+   下一次写回或结束之前再写（见 Run）。会话进行中不抽取事实，
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-045）。
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent）；会话：请求头
@@ -77,6 +78,7 @@ from cuemem.evidence import (
 )
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.sdk import Memory, space_for
+from cuemem.write.online import worth_retrying
 
 logger = logging.getLogger(__name__)
 
@@ -107,13 +109,31 @@ class ProxyError(Exception):
 
 
 @dataclass
+class Unsaved:
+    """没写进记忆的一次写回：消息、当时的时间（重试时照这个时间写），与当时这个空间删过几次发言
+    （MemoryDB.turn_epoch：之后遗忘过就不再写，它们是遗忘之前说的）。"""
+
+    messages: list[dict[str, Any]]
+    when: datetime
+    epoch: int
+
+
+@dataclass
 class Run:
-    """进行中的会话（一段对话）。"""
+    """进行中的会话（一段对话）。
+
+    unsaved：写回失败（向量接口暂时不可用等，见 write.online.worth_retrying）、留着重试的写回，
+    按先后排。之后每次写回这个会话时先写它们，会话结束（空闲、开了新的一段、close_all）之前
+    再试一次，还是写不进去才丢掉、记警告。在线写入要么全写、要么不写（R1），以前丢下它们就永远
+    丢了：之后的请求只写各自最后一句用户消息。"""
 
     space: str
     session_id: str
     last_seen: float
     lock: threading.Lock = field(default_factory=threading.Lock)
+    user_id: str | None = None
+    agent_id: str | None = None
+    unsaved: list[Unsaved] = field(default_factory=list)
 
 
 @dataclass
@@ -286,7 +306,7 @@ class MemoryProxy:
             stale = [k for k, r in self._runs.items() if now - r.last_seen >= self.idle_s]
             runs = [self._runs.pop(k) for k in stale]
         for run in runs:
-            self.system.close_session(run.space, run.session_id)
+            self._finish(run)
         return len(runs)
 
     def open_runs(self) -> int:
@@ -298,11 +318,26 @@ class MemoryProxy:
             runs = list(self._runs.values())
             self._runs.clear()
         for run in runs:
-            self.system.close_session(run.space, run.session_id)
+            self._finish(run)
 
-    def _run(self, space: str, explicit: str | None, *, fresh: bool = False) -> Run:
+    def _finish(self, run: Run) -> None:
+        """会话结束：没写进去的写回最后再写一次（见 Run），再交给后台抽取。"""
+        with run.lock:
+            self._save(run, final=True)
+        self.system.close_session(run.space, run.session_id)
+
+    def _run(
+        self,
+        space: str,
+        explicit: str | None,
+        *,
+        fresh: bool = False,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> Run:
         """这次请求属于哪个会话。fresh：请求里没有之前的对话（调用方开始了新的一段），
-        没指定会话时结束上一段、开新的一段——会话的边界跟着调用方的对话走。"""
+        没指定会话时结束上一段、开新的一段——会话的边界跟着调用方的对话走。user_id、agent_id：
+        这个空间是谁的（space_for 的参数，写回时用）。"""
         now = self._clock()
         self.close_idle()
         self._adopt(space, explicit)
@@ -318,12 +353,12 @@ class MemoryProxy:
             if run is None:
                 when = datetime.now()
                 sid = explicit or sortable_session_id("proxy", when)
-                run = Run(space, sid, now)
+                run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
                 self._runs[key] = run
                 self.system.open_session(space, sid)  # 进行中：每轮照常写入，但不抽取
             run.last_seen = now
         if ended is not None:
-            self.system.close_session(ended.space, ended.session_id)
+            self._finish(ended)
         return run
 
     def _adopt(self, space: str, explicit: str | None) -> None:
@@ -373,7 +408,7 @@ class MemoryProxy:
         explicit = headers.get("x-cuemem-session")
         session = _SESSION_ID.sub("_", explicit)[:80] if explicit else None
         earlier = [m for m in messages[:-1] if m.get("role") in ("user", "assistant")]
-        run = self._run(space, session, fresh=not earlier)
+        run = self._run(space, session, fresh=not earlier, user_id=user_id, agent_id=agent_id)
         turn = Turn(space=space, user_id=user_id, agent_id=agent_id, run=run)
         last = messages[-1]
         if last.get("role") != "user":  # 工具调用的后续请求：只写回回答
@@ -466,16 +501,48 @@ class MemoryProxy:
             messages.append({"role": "assistant", "content": answer})
         if not messages:
             return
-        try:
-            with turn.run.lock:  # 同一会话的写回按顺序进行（发言序号只增不减）
+        run = turn.run
+        with run.lock:  # 同一会话的写回按顺序进行（发言序号只增不减）
+            epoch = self.system.db.turn_epoch(run.space)
+            run.unsaved.append(Unsaved(messages, datetime.now(), epoch))
+            self._save(run)
+
+    def _save(self, run: Run, *, final: bool = False) -> None:
+        """把这个会话还没写进去的写回按先后写进记忆，各用各自的时间（调用方持有 run.lock）。
+        写回失败不影响已经返回给调用方的回答：重试有用的（worth_retrying）这一次与之后的都留着
+        （见 Run），final（会话要结束了）时丢掉；重试也没用的只丢这一次，接着写后面的。"""
+        while run.unsaved:
+            head = run.unsaved[0]
+            if head.epoch != self.system.db.turn_epoch(run.space):
+                # 之后这个空间遗忘过发言（例如调用方删了这个用户的记忆）：这是遗忘之前说的话
+                record_event("proxy_write_dropped", space=run.space, reason="forgotten")
+                del run.unsaved[0]
+                continue
+            try:
                 self.memory.add(
-                    messages,
-                    user_id=turn.user_id,
-                    agent_id=turn.agent_id,
-                    run_id=turn.run.session_id,
+                    head.messages,
+                    user_id=run.user_id,
+                    agent_id=run.agent_id,
+                    run_id=run.session_id,
+                    timestamp=head.when,
                 )
-        except Exception as exc:  # 写回失败不影响已经返回给调用方的回答
-            record_event("proxy_write_failed", error=f"{type(exc).__name__}: {exc}")
+            except Exception as exc:
+                keep = worth_retrying(exc) and not final
+                error = f"{type(exc).__name__}: {exc}"
+                record_event("proxy_write_failed", space=run.space, error=error, kept=keep)
+                if keep:
+                    return
+                lost = run.unsaved if worth_retrying(exc) else [head]
+                logger.warning(
+                    "CueMem could not store %d message(s) of proxy session %s and dropped "
+                    "them (%s).",
+                    sum(len(u.messages) for u in lost),
+                    run.session_id,
+                    error,
+                )
+                del run.unsaved[: len(lost)]
+                continue
+            del run.unsaved[0]
 
 
 class _Relay(Iterator[bytes]):

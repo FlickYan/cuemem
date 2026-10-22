@@ -289,6 +289,12 @@ class MemoryDB:
                 self._data_version(),
             )
 
+    def turn_epoch(self, space_id: str) -> int:
+        """这个空间经本连接删过几次发言（遗忘、删除空间）。写入失败、留着稍后重试的发言（记忆
+        代理与 Agents 的会话）据此判断期间有没有遗忘过：遗忘之前说的话不该在之后写进来。"""
+        with self._lock:
+            return self._turn_epochs.get(space_id, 0)
+
     def _data_version(self) -> int:
         """别的连接每提交一次写入就变一次（本连接自己的提交不算）。"""
         return int(self._conn.execute("PRAGMA data_version").fetchone()[0])

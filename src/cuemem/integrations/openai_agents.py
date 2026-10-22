@@ -41,7 +41,8 @@ idle_minutes（默认 30 分钟）或 close_sessions() 时交给后台抽取，�
 按请求新建 CueMemSession 的服务（一段对话跨多个请求）不要每个请求都 end()：那样一问一答各成一段。
 
 一问一答为一轮：用户消息先留着，等助手的文字回复来了一起写入；同一轮里工具调用之后的回复并进
-这一轮。模型没有回应过的用户消息（输入护栏拦下的、调用出错的）不写进长期记忆。
+这一轮。模型没有回应过的用户消息（输入护栏拦下的、调用出错的）不写进长期记忆。写不进去（向量
+接口暂时不可用等）时留着，下一批消息或 end() 时再写，不影响对话。
 
 遗忘（D-021）：pop_item 撤回的消息、clear_session 清掉的整段对话（各段都算），在长期记忆里也一并
 遗忘：删原始日志、按剩下的日志重建派生记忆。先在 CueMem 里遗忘，成功了才动内层会话，失败时抛出、
@@ -103,6 +104,7 @@ from cuemem.evidence import (
 from cuemem.memory import ForgetReport, MemorySystem, RecallMode
 from cuemem.read.controller import Router
 from cuemem.sdk import AsyncMemory, Memory, space_for
+from cuemem.write.online import worth_retrying
 
 __all__ = [
     "CueMemSession",
@@ -604,6 +606,17 @@ class _Mirrored:
     key: tuple[str, str]
 
 
+@dataclass
+class _Unsaved:
+    """没写进长期记忆、留着重试的一批（见 CueMemSession._write）：消息、要不要并进上一轮、当时的
+    时间（重试时照这个时间写）与当时这个空间删过几次发言（MemoryDB.turn_epoch）。"""
+
+    batch: list[_Pending]
+    merge: bool
+    when: datetime
+    epoch: int
+
+
 class CueMemSession:
     """Agents SDK 的 Session：内层会话保存原样的短期历史，用户与助手的文字消息同时写进 CueMem。
 
@@ -643,6 +656,7 @@ class CueMemSession:
         self._in_turn = False  # 最近写入的是这一轮助手的回复：之后的回复并进这一轮
         self._seen_user = False
         self._mirrored: list[_Mirrored] = []
+        self._unsaved: list[_Unsaved] = []  # 写不进去、留着重试的几批，按先后
         self._lock = threading.Lock()
         self._shared = _shared(self.memory.system)
 
@@ -671,8 +685,12 @@ class CueMemSession:
             lead = await self._lead(items)
             await asyncio.to_thread(self._take, items, lead)
         except Exception as exc:  # 写不进长期记忆不影响对话（与记忆代理的写回相同）
+            kept = "; they are retried with the next messages" if self._unsaved else ""
             logger.warning(
-                "CueMem could not store messages of session %s (%s).", self.session_id, _err(exc)
+                "CueMem could not store messages of session %s (%s)%s.",
+                self.session_id,
+                _err(exc),
+                kept,
             )
             record_event("agents_mirror_failed", space=self.space, error=_err(exc))
 
@@ -788,22 +806,52 @@ class CueMemSession:
         return []
 
     def _write(self, batch: list[_Pending], *, merge: bool = False) -> None:
+        """写进长期记忆：先是之前没写进去的几批（_unsaved），再是这一批，按先后、各用各自的时间
+        （调用方持有 self._lock）。写不进去、过一会儿重试有用（worth_retrying，例如向量接口暂时
+        不可用）时，这一批与之后的都留着，下一批或 end() 时再写，异常照常抛出。在线写入要么全写、
+        要么不写（R1），以前丢下它们就永远丢了：内层会话的历史不会再写一遍。重试也没用的丢掉、
+        记警告，接着写后面的；之后这个空间遗忘过发言（例如别处删了这个用户的记忆）时也丢掉：
+        它们是遗忘之前说的。"""
         system = self.memory.system
+        if batch:
+            epoch = system.db.turn_epoch(self.space)
+            self._unsaved.append(_Unsaved(batch, merge, datetime.now(), epoch))
         with self._shared.lock(self.space, self._base):
-            segment = self._open_segment()
-            out = self.memory.add(
-                [p.message for p in batch],
-                user_id=self.user_id,
-                agent_id=self.agent_id,
-                run_id=segment,
-            )
-            ids: list[str] = out["turn_ids"]
-            if merge and ids:
-                _merge_round(system, self.space, segment, ids[0])
-            self._mirrored.extend(
-                _Mirrored(turn_id, p.key) for p, turn_id in zip(batch, ids, strict=True)
-            )
-            self._touch(segment)
+            while self._unsaved:
+                head = self._unsaved[0]
+                if head.epoch != system.db.turn_epoch(self.space):
+                    record_event("agents_mirror_dropped", space=self.space, reason="forgotten")
+                    del self._unsaved[0]
+                    continue
+                try:
+                    segment = self._open_segment()
+                    out = self.memory.add(
+                        [p.message for p in head.batch],
+                        user_id=self.user_id,
+                        agent_id=self.agent_id,
+                        run_id=segment,
+                        timestamp=head.when,
+                    )
+                except Exception as exc:
+                    if worth_retrying(exc):
+                        raise
+                    logger.warning(
+                        "CueMem could not store %d message(s) of session %s and dropped them (%s).",
+                        len(head.batch),
+                        self.session_id,
+                        _err(exc),
+                    )
+                    record_event("agents_mirror_dropped", space=self.space, error=_err(exc))
+                    del self._unsaved[0]
+                    continue
+                del self._unsaved[0]
+                ids: list[str] = out["turn_ids"]
+                self._mirrored.extend(
+                    _Mirrored(turn_id, p.key) for p, turn_id in zip(head.batch, ids, strict=True)
+                )
+                self._touch(segment)
+                if head.merge and ids:  # 发言已经写进去了：并不进这一轮也不再重写
+                    _merge_round(system, self.space, segment, ids[0])
 
     def _open_segment(self) -> str:
         """现在写入的段：这个对象的段还在进行就接着写；同一对话的另一个对象（例如按请求新建的）
@@ -841,6 +889,12 @@ class CueMemSession:
                     del self._held[k]
                     self._answered = self._answered and bool(self._held)
                     return
+            for unsaved in reversed(self._unsaved):  # 还没写进去的：同样直接丢掉
+                for k in range(len(unsaved.batch) - 1, -1, -1):
+                    if unsaved.batch[k].key == key:
+                        del unsaved.batch[k]
+                        self._unsaved = [u for u in self._unsaved if u.batch]
+                        return
             index = next(
                 (k for k in range(len(self._mirrored) - 1, -1, -1) if self._mirrored[k].key == key),
                 None,
@@ -855,6 +909,9 @@ class CueMemSession:
                 if turn_id is not None:
                     system.forget_memories(self.space, turn_ids=[turn_id])
                     self._shared.forgot(self.space)
+                    epoch = system.db.turn_epoch(self.space)
+                    for unsaved in self._unsaved:  # 自己遗忘的是更早的一句：留着的照样要写
+                        unsaved.epoch = epoch
             if index is not None:
                 del self._mirrored[index]
             self._in_turn = False
@@ -878,12 +935,13 @@ class CueMemSession:
                 self._shared.forgot(self.space)
             self._held, self._answered, self._in_turn = [], False, False
             self._mirrored.clear()
+            self._unsaved.clear()
 
     def _end(self, wait: bool) -> dict[str, Any] | None:
         system = self.memory.system
         with self._lock:
             batch = self._settle()
-            if batch:
+            if batch or self._unsaved:
                 self._write(batch)
             self._in_turn = False
             with self._shared.lock(self.space, self._base):
