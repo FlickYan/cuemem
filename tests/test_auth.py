@@ -612,3 +612,32 @@ def test_ui_stays_in_scope(n3_settings: Settings, fake_api: FakeAPI, tmp_path: P
             admin.close()
     finally:
         service.close()
+
+
+def test_ui_ignores_a_session_of_another_space(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """页面状态里的会话属于作用域之外的空间时（会话 ID 不该能伪造，这里再查一遍）：结束、开新会话
+    与发消息都当作没有这个会话，不结束它、也不往里写。直接调用界面的事件函数，像状态被换掉了。"""
+    import gradio as gr
+
+    from cuemem.api.ui import build_ui
+
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"))
+    keys = Keys.parse(KEYS, ADMIN_TOKEN)
+    try:
+        demo = build_ui(service, access=keys.by_username)
+        events = {f.name: f.fn for f in demo.fns.values()}
+        bob = service.start("bob").session_id  # 别人的会话
+        alice = gr.Request(username="alice-app")
+        assert events["end"](bob, alice) == (None, "No session to end.")
+        new = events["start"]("alice", "", bob, alice)[0]
+        assert new != bob and service.get(new).space_id == "alice"
+        message = {"text": "My secret plan", "files": []}
+        outputs = list(events["send"](message, [], bob, "alice", "", "l0", "rule", 30, alice))
+        sid = outputs[-1][2]
+        assert sid != bob and service.get(sid).space_id == "alice"
+        assert not service.get(bob).closed and system.db.get_turns("bob") == []
+        assert "My secret plan" in [t.text for t in system.db.get_turns("alice")]
+    finally:
+        service.close()
