@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import FakeAPI
+from fakes import NO_BALANCE, FakeAPI
 from PIL import Image
 from scripted import ScriptedModel
 
@@ -407,6 +407,49 @@ def test_a_write_failing_after_the_vectors_takes_them_back(
         memory.add("I live in Berlin", user_id="alice", run_id="r1", metadata={"src": "crm"})
     assert system.db.get_turns("alice") == [] and system.vectors.count("alice") == 0
     assert system.db.get_turn_meta("alice") == {}
+
+
+def without_balance_for_reconciling(model: ScriptedModel, fake_api: FakeAPI) -> dict[str, bool]:
+    """对账时模型供应商余额不足（HTTP 402）；把返回的开关设成 False 就恢复。"""
+    broke = {"on": True}
+
+    def reply(body: dict[str, Any]) -> Any:
+        system = body["messages"][0]["content"]
+        if broke["on"] and system.startswith("You maintain a long-term memory"):
+            return NO_BALANCE
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    return broke
+
+
+def test_extraction_errors_after_the_write_are_reported_not_raised(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """add(wait=True) 写进发言之后对账时余额不足：不抛出，status 是 "queued"、error 写明，下次巩固
+    时补上。以前抛出供应商的 402，调用方分不清写没写进去，重试就把同一句话写了两遍。update 记下
+    更正之后抽取出错时同样不抛出。"""
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    broke = without_balance_for_reconciling(model, fake_api)
+    out = memory.add("I moved to Munich", user_id="alice", run_id="r2", timestamp=SEP, wait=True)
+    assert out["status"] == "queued" and out["results"] == []
+    assert "Error code: 402" in out["error"] and "Do not add them again" in out["error"]
+    assert [t.text for t in memory.system.db.get_turns("alice", "r2")] == ["I moved to Munich"]
+
+    broke["on"] = False
+    memory.consolidate(user_id="alice")
+    (munich,) = memory.get_all(user_id="alice")["results"]
+    assert munich["memory"] == "The user lives in Munich."
+
+    def broken(space: str, **kwargs: Any) -> Any:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(memory.system, "consolidate", broken)
+    update = memory.update(munich["id"], "I live in Hamburg")
+    assert update["message"].startswith("Correction logged, but extraction failed")
+    assert "provider down" in update["error"] and update["results"] == []
+    corrections = [t for t in memory.system.db.get_turns("alice") if t.text.startswith("Corr")]
+    assert [t.id for t in corrections] == update["turn_ids"]
 
 
 def _descending_uuids(monkeypatch: pytest.MonkeyPatch) -> None:

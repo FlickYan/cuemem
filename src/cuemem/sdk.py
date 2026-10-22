@@ -250,7 +250,10 @@ class Memory:
         时间，它就不过期。
         infer=False：只写原始日志、不抽取事实（之后调用 consolidate）。
         wait=True：同步抽取，返回新增与取代的事实（Mem0 的 ADD / UPDATE 事件）；run 进行中时
-        不能用（这段对话结束时才抽取），会报 ValueError。
+        不能用（这段对话结束时才抽取），会报 ValueError。发言写进去之后抽取出错（模型供应商
+        余额不足、限流等）时不抛出：status 是 "queued"，error 写明原因，下次巩固时补上——抛出的话
+        调用方重试就写了两遍。写进去之前出错（向量接口不可用等）时照常抛出，什么都没写，可以原样
+        重试。
         """
         space = space_for(user_id, agent_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
@@ -294,10 +297,15 @@ class Memory:
         if not infer:
             out["status"] = "logged"
         elif wait:
-            report = self.system.consolidate(space)
-            out["results"] = _events(self.system, space, before, user_id, agent_id)
-            out["status"] = "consolidated"
-            out["consolidation"] = report.as_dict()
+            try:
+                report = self.system.consolidate(space)
+            except Exception as exc:  # 发言已经写进去了：抛出的话调用方重试，就写了两遍（R1）
+                out["status"] = "queued"
+                out["error"] = _not_extracted(exc)
+            else:
+                out["results"] = _events(self.system, space, before, user_id, agent_id)
+                out["status"] = "consolidated"
+                out["consolidation"] = report.as_dict()
         else:
             out["status"] = "queued"
         return out
@@ -370,6 +378,8 @@ class Memory:
 
         新事实带上原来那条的 metadata（metadata 参数里的键覆盖它）与过期时间。返回 Mem0 风格的
         事件（UPDATE 附上被取代的旧版本）；从 data 里没有抽出事实时，原来那条不变，message 写明。
+        更正记下之后抽取出错时不抛出（与 add 的 wait=True 相同）：message 与 error 写明，下次
+        巩固时补上。
         只能改当前有效的版本（ValueError）；ID 不存在时 KeyError。"""
         found = self._find(memory_id)
         if found is None:
@@ -397,7 +407,19 @@ class Memory:
                 space, SessionIn(session_id=sid, started_at=when, turns=[turn]), 0, meta=[info]
             )
             self.system.db.set_meta(_idx_key(space, sid), "1")
-        report = self.system.consolidate(space)
+        failed = "Correction logged, but extraction failed: it is retried on consolidate()"
+        turn_ids = [stable_id(space, sid, 0)]
+        try:
+            report = self.system.consolidate(space)
+        except Exception as exc:  # 更正已经记下了：抛出的话调用方重试，就记了两句更正
+            return {
+                "message": failed,
+                "id": memory_id,
+                "results": [],
+                "session_id": sid,
+                "turn_ids": turn_ids,
+                "error": _not_extracted(exc),
+            }
         events = _events(self.system, space, before, None, None)
         for event in events:
             event["space_id"] = space
@@ -405,7 +427,7 @@ class Memory:
         if not after.is_current:
             message = "Memory updated"
         elif sid in report.failed:
-            message = "Correction logged, but extraction failed: it is retried on consolidate()"
+            message = failed
         else:
             message = "No memory could be extracted from data: the memory was not changed"
         return {
@@ -413,7 +435,7 @@ class Memory:
             "id": memory_id,
             "results": events,
             "session_id": sid,
-            "turn_ids": [stable_id(space, sid, 0)],
+            "turn_ids": turn_ids,
             "consolidation": report.as_dict(),
         }
 
@@ -1199,6 +1221,17 @@ def _answer_out(answer: Answer) -> dict[str, Any]:
         "level": str(route.get("level", "")).upper() or None,
         "reasons": [english_reason(r) for r in route.get("reasons", [])],
     }
+
+
+def _not_extracted(exc: Exception) -> str:
+    """发言已经写进原始日志（巩固任务也登记了），同步抽取却出错（例如对账时余额不足、向量接口
+    暂时不可用）时回给调用方的说明。不抛出：抛出的话调用方以为没写进去，重试就写了两遍。没做完的
+    任务留着，下次巩固（consolidate()，或后台线程下一次处理这个空间）时补上。"""
+    logger.warning("Extraction failed after the messages were stored: %s", exc, exc_info=True)
+    return (
+        f"Extraction failed ({type(exc).__name__}: {str(exc)[:300]}). The messages are stored; "
+        "their extraction is retried on the next consolidation. Do not add them again."
+    )
 
 
 def _events(

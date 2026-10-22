@@ -22,6 +22,7 @@ import httpx2  # noqa: E402
 from anthropic.lib.tools import ToolError  # noqa: E402
 from fakes import FakeAPI  # noqa: E402
 from scripted import ScriptedModel  # noqa: E402
+from test_sdk import without_balance_for_reconciling  # noqa: E402
 
 from cuemem import AsyncMemory, Memory  # noqa: E402
 from cuemem.config import Settings  # noqa: E402
@@ -552,6 +553,24 @@ def test_a_change_that_cannot_be_logged_leaves_the_file_unchanged(
     with pytest.raises(ToolError, match="was not changed"):
         run(tool, command="create", path="/memories/new.md", file_text="- The user likes tea.\n")
     assert tool.store.files("alice") == {"/memories/me.md": "- The user likes jazz.\n"}
+
+
+def test_an_extraction_error_after_logging_keeps_the_change(
+    tool: CueMemMemoryTool, memory: Memory, fake_api: FakeAPI
+) -> None:
+    """wait=True 时笔记写进日志之后对账出错（余额不足）：文件照样存下，笔记只记一次，下次巩固时
+    抽取。以前抛出 ToolError（"was not changed. Try again later."），笔记却已经在日志里、文件没存：
+    模型照提示重试，同一条笔记记了两遍。"""
+    run(tool, command="create", path="/memories/home.md", file_text="- The user lives in Berlin.\n")
+    broke = without_balance_for_reconciling(fake_api.chat_replies[0], fake_api)
+    text = "- The user lives in Munich.\n"
+    out = run(tool, command="create", path="/memories/move.md", file_text=text)
+    assert out == "File created successfully at: /memories/move.md"
+    assert tool.store.files("alice")["/memories/move.md"] == text
+    assert notes(memory)[1:] == ["Memory note /memories/move.md:\n- The user lives in Munich."]
+    broke["on"] = False
+    memory.consolidate(user_id="alice")
+    assert set(facts(memory)) == {"The user lives in Munich."}
 
 
 def message(content: list[dict[str, Any]], stop: str) -> dict[str, Any]:

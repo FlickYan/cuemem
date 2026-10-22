@@ -20,7 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from scripted import ScriptedModel
-from test_sdk import AUG, SEP, moved, where_i_live
+from test_sdk import AUG, SEP, moved, where_i_live, without_balance_for_reconciling
 
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
@@ -231,6 +231,23 @@ def test_update_delete_reset_and_their_errors(mem: Mem) -> None:
     out = mem.reset()
     assert sorted(out["spaces_deleted"]) == ["agent/bot", "alice"]
     assert mem.spaces() == []
+
+
+def test_extraction_errors_after_the_write_are_not_errors(
+    mem: Mem, system: MemorySystem, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """add(wait=True) 写进发言之后对账时余额不足：本地与远程一样不报错（/api/v1 是 200），status
+    "queued"、error 写明，下次巩固时补上。以前 /api/v1 回 402，MemoryClient 抛出异常，调用方重试
+    就把同一句话写了两遍。"""
+    mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    broke = without_balance_for_reconciling(model, fake_api)
+    out = mem.add("I moved to Munich", user_id="alice", timestamp=SEP, wait=True)
+    assert out["status"] == "queued" and "Error code: 402" in out["error"]
+    broke["on"] = False
+    mem.consolidate(user_id="alice")
+    assert current(mem, "alice") == ["The user lives in Munich."]
+    texts = [t.text for t in system.db.get_turns("alice")]
+    assert texts == ["I live in Berlin", "I moved to Munich"]
 
 
 def test_search_levels_and_answer(mem: Mem) -> None:
