@@ -212,6 +212,8 @@ Every record belongs to a **memory space** (`space_id`): one user in production,
 3. Images: store the original by content hash, compute the visual embedding, queue a captioning job.
 4. Update working memory.
 
+**All or nothing** (second audit round after N12, D-069). The steps that can fail (storing the photo, embedding, writing vectors) run first, and one transaction at the end writes the space, session, turns, image records, rounds and consolidation job. If anything fails, nothing is committed: vectors written without a record and photos nothing refers to are removed on a best-effort basis, so the caller can simply retry without writing twice.
+
 Target: writing never blocks the conversation; under 100 ms per turn (excluding model cold start).
 
 ### 5.2 Asynchronous consolidation
@@ -285,12 +287,14 @@ A predicate's **cardinality** decides the conflict rules:
 
 **A late-arriving old message does not overwrite the current state.** If a new fact's event time is earlier than the current fact's (e.g. an older conversation imported later), it is written as a historical version. Tests check that importing the newer session first and the older one second gives the same result as chronological import.
 
+**Corrections and expiry in the SDK** (second audit round after N12, D-069). `update(memory_id, data)` does not rewrite in place. It logs a user message "Correction: …", and the raw layer records which fact it corrects. Reconciliation takes one of the facts extracted from that message and supersedes the old fact as a change of knowledge, without asking an LLM (reconciliation alone would just add to a registered multi-valued predicate). `expiration_date` and `metadata` are stored in the raw layer and kept out of the extraction prompt; expired memories are excluded only by the SDK's search, get_all and profile, and `valid_to` is not rewritten.
+
 ### 5.4 Forgetting and privacy
 
 - **No automatic deletion.** Inspired by MemoryBank's Ebbinghaus curve, "memory strength" decays with time and grows with access, but it affects **ranking** only and never deletes data (N4).
 - **Explicit forgetting** (D-021). Derived memory is a function of the raw log, so forgetting means deleting from the log and replaying the derived memory from what remains.
   - Old facts that the deleted session had superseded become current again automatically.
-  - Caches are purged too: the deleted sessions' extraction cache, the space's reconciliation and answer caches, and embeddings of text that no longer appears.
+  - Caches are purged too: the deleted sessions' extraction cache, the space's answer cache, and embeddings of text that no longer appears. Of the space's reconciliation and entity-linking cache, only the entries the replay hits exactly are kept (a hit means that request was computed from the remaining log alone), and the rest are deleted (since the second audit round after N12, D-069; before, the whole cache was cleared and paid for again on replay).
   - SQLite runs with `secure_delete`; after forgetting, the memory database and both caches commit and truncate their WAL (no `VACUUM` since the audit after N12, D-068). Tests read the bytes of the database files and their WALs to confirm the deleted content is gone. If the replay fails halfway, the cleanup still runs before the exception reaches the caller.
 - **Whole rounds, following citations** (N8, D-046).
   - Deleting a fact or an image deletes the round it came from: the user's words and the assistant's reply.
@@ -545,8 +549,8 @@ Each turn returns a trace:
 
 Services (`src/cuemem/api/`):
 
-- **FastAPI**: sessions and chat (with photos), memory browsing (profile, fact timeline, entity graph, photos, sessions), forgetting, consolidation, and a retrieve-only `recall`. API docs at `/docs`.
-- **Gradio UI**, mounted on the same app: chat, a memory-trace panel, and a memory browser where a fact, a photo or a session can be forgotten.
+- **FastAPI**: sessions and chat (with photos), memory browsing (profile, fact timeline, entity graph, photos, sessions), forgetting, consolidation, and a retrieve-only `recall`. API docs at `/docs`. After N12 came a Mem0-shaped `/api/v1` that mirrors the SDK (what `MemoryClient` calls) and scoped access tokens (second audit round, D-069; see the [API reference](api.md)).
+- **Gradio UI**, mounted on the same app (an optional `ui` extra since the second audit round; without it the server offers only the APIs and the memory proxy): chat, a memory-trace panel, and a memory browser where a fact, a photo or a session can be forgotten.
 - **MCP server** (stdio): `remember` / `recall` / `forget` / `profile`, so other agents can use the memory directly. `recall` lets the controller pick a level and returns the numbered, dated memories as they are, without calling an answering model (D-047).
 - **Demo script**: `demo/shop/script.json`, replayed and checked with `cuemem demo`.
 
@@ -735,10 +739,10 @@ The development machine is an Apple M2 with **8 GB of RAM** and about **29 GB** 
 | Vector store | Qdrant (local mode, configurable to a server) | Named vectors (dense / sparse / image) + payload filters; about 5 ms dense search under 5k units (D-005) | LanceDB |
 | Structured storage | SQLite | Zero ops, a single portable file | Postgres |
 | Graph computation | PPR on scipy.sparse | Small, fast, no extra service | NetworkX; Neo4j |
-| Controller | numpy at run time; scikit-learn for training | Explainable, fast to train | A small encoder |
-| Service and UI | FastAPI + Gradio (one app) | An interactive, explainable demo, fast | Streamlit |
+| Controller | numpy at run time; scikit-learn for training (in the optional `eval` extra) | Explainable, fast to train | A small encoder |
+| Service and UI | FastAPI + Gradio (one app; Gradio is the optional `ui` extra) | An interactive, explainable demo, fast | Streamlit |
 | Agent tool protocol | Official MCP Python SDK (stdio) | Other agents can use the memory directly | Custom HTTP tools |
-| Evaluation | Own harness + pandas + matplotlib | One protocol, under control | — |
+| Evaluation | Own harness + pandas + matplotlib (matplotlib is in the optional `eval` extra) | One protocol, under control | — |
 
 ### 9.3 Model roles
 
@@ -767,10 +771,11 @@ rag/
 │   ├── write/         # online write, consolidation (extraction / linking / reconciliation / summaries / profile / captions)
 │   ├── read/          # probe, controller, L1, L2, reranking, reader, memory tools
 │   ├── agent/         # hand-written agent loop: context assembly, tools, sessions; the shopping scenario
-│   ├── api/           # service layer, FastAPI, Gradio UI, MCP server, demo replay; OpenAI-compatible memory proxy (N12)
-│   ├── configs/       # YAML configuration: defaults and presets (openai, ollama), shipped in the package (N12)
+│   ├── api/           # service layer, FastAPI, Gradio UI, MCP server, demo replay; OpenAI-compatible memory proxy (N12); /api/v1 and scoped tokens (after N12)
+│   ├── configs/       # YAML configuration: defaults and presets (openai, ollama, deepseek, qwen), shipped in the package (N12)
 │   ├── memory.py      # facade: write, consolidate, retrieve, answer, forget
 │   ├── sdk.py         # Python SDK: Memory / AsyncMemory, shaped like Mem0's (N12)
+│   ├── client.py      # remote SDK: MemoryClient / AsyncMemoryClient, calling /api/v1 (after N12)
 │   ├── portable.py    # export and import of a memory space (N12)
 │   └── evals/         # evaluation: datasets, splits, methods, judge, runner, metrics, reports, routing analysis
 ├── evals/             # development / test splits and the mixed stream (committed)
@@ -831,7 +836,7 @@ The project runs on a laptop, but the architecture was designed with millions of
 
 - **Server mode.** Setting `CUEMEM_VECTOR_STORE__URL` (e.g. `http://localhost:6333`, with `docker run -p 6333:6333 qdrant/qdrant:v1.19.1`) switches to a Qdrant server; new collections get payload indexes on `kind` and `ts`. Local mode allows one process per data directory, and a second one now gets a `StorageLockedError` that says so. Copy existing local data first with `cuemem migrate-vectors --to URL`: memories already in the database are not written to the vector store again, so switching without migrating gives an empty vector store.
 - **Scale** (`scripts/n11_latency.py`, excluding the ~110 ms query embedding call in production): the local work on the read path grows linearly in local mode, about 1.08 s at 46k retrieval units, against 91 ms with the server. Concurrency in one process: local mode saturates at about 9 reads per second; the server reaches 55 per second with 16 threads.
-- **Access token.** With `CUEMEM_API_TOKEN` set, the HTTP API requires a Bearer token and the UI asks to sign in. There is one shared token and no per-user isolation of memory spaces; running several instances would also need a server database instead of embedded SQLite.
+- **Access tokens.** With `CUEMEM_API_TOKEN` set, the HTTP API requires a Bearer token and the UI asks to sign in. In N11 that was the only, shared token. The second audit round after N12 (D-069) added scoped tokens (`CUEMEM_API_KEYS_FILE` or `CUEMEM_API_KEYS`): each token reaches only the users and agents it lists, and `/api`, `/api/v1`, the UI and the memory proxy all check this. `CUEMEM_API_TOKEN` remains the admin token, and MCP is still stdio only, one space per process. Running several instances would also need a server database instead of embedded SQLite.
 
 ## Appendix: glossary
 

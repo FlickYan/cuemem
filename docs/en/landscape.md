@@ -14,7 +14,7 @@ English edition of [docs/landscape.md](../landscape.md), which remains the sourc
   - the only models were DeepSeek and Qwen, with embeddings through Qwen's native API: no OpenAI, no local models;
   - it was usable only from the CLI, the HTTP API and MCP: no Python SDK and no "change the base_url" integration;
   - there was no export or import, no preview before forgetting, no way to tune what extraction keeps for a given app, and no container image.
-- **N12 adds that layer, following the mainstream projects (§5),** while keeping CueMem's own semantics: facts are never rewritten in place, recall goes through the controller first, and forgetting runs the full cascade.
+- **N12 adds that layer, following the mainstream projects (§5),** while keeping CueMem's own semantics: facts are never rewritten in place, recall goes through the controller first, and forgetting runs the full cascade. The second audit round after N12 (D-069) added the rest of Mem0's API (`metadata`, expiry, `update()`, `reset()`), an HTTP memory API with a remote `MemoryClient`, scoped access tokens, and the proxy's `/v1/embeddings` and `/v1/responses` subset.
 - **Deliberately not copied:** LLM-edited memory as the default (Letta), add-only memory (Mem0 v3), graph databases and twenty-odd vector-store backends (§6).
 
 ## 2. The projects
@@ -44,24 +44,24 @@ A few changes in 2025–2026 matter here:
 
 ## 3. Capabilities side by side
 
-"Not seen" means it was not found in the sources checked, not that it certainly does not exist.
+"Not seen" means it was not found in the sources checked, not that it certainly does not exist. The CueMem column reflects the code after the second audit round (D-069).
 
-| Capability | CueMem (N12) | Mem0 | Letta | Graphiti / Zep | Cognee | Supermemory |
+| Capability | CueMem (N12 and the second audit round) | Mem0 | Letta | Graphiti / Zep | Cognee | Supermemory |
 |---|---|---|---|---|---|---|
-| Python SDK | `Memory` / `AsyncMemory`, Mem0's method names | `Memory` / `AsyncMemory` | Deprecated (TypeScript first) | Fully async `Graphiti` | `remember` / `recall` and others | `supermemory` client |
-| Zero-code integration | OpenAI-compatible HTTP proxy (`/v1/chat/completions`, streaming) | Client-side wrapper (`Mem0().chat.completions.create`) | — | — | — | Memory Router (base URL; its docs now redirect, current status unverified) |
-| Retrieves on every turn? | No: the controller decides first; L0 retrieves nothing | Every turn in the wrapper | The LLM decides | The app decides | Rule-based routing | Every turn |
-| Updates | Invalidate, don't delete; version chain via `history()` | v3 add-only; `history()` | The LLM rewrites | Invalidate, don't delete | Contradiction detection (off by default) | `isLatest` version chain |
-| Two timelines | Replayed separately: `valid_at` (what was true then) and `known_at` (what the system believed then) | Recorded time; `expiration_date` | Not seen | Yes: edges carry `valid_at` / `invalid_at` and `created_at` / `expired_at` | Not seen | Not seen |
+| Python SDK | `Memory` / `AsyncMemory`, Mem0's method names (including `update`, `reset`, `metadata` and filter operators); a remote `MemoryClient` for your own `cuemem serve` | `Memory` / `AsyncMemory`; `MemoryClient` for the hosted platform | Deprecated (TypeScript first) | Fully async `Graphiti` | `remember` / `recall` and others | `supermemory` client |
+| Zero-code integration | OpenAI-compatible HTTP proxy (`/v1/chat/completions`, streaming; `/v1/embeddings`; a non-streaming, text-only subset of `/v1/responses`) | Client-side wrapper (`Mem0().chat.completions.create`) | — | — | — | Memory Router (base URL; its docs now redirect, current status unverified) |
+| Retrieves on every turn? | No: the controller decides first; L0 retrieves nothing (the SDK's `search` never goes below L1 by default) | Every turn in the wrapper | The LLM decides | The app decides | Rule-based routing | Every turn |
+| Updates | Invalidate, don't delete; version chain via `history()`; `update()` logs a correction that supersedes the old fact | v3 add-only; `update()` rewrites in place; `history()` | The LLM rewrites | Invalidate, don't delete | Contradiction detection (off by default) | `isLatest` version chain |
+| Two timelines | Replayed separately: `valid_at` (what was true then) and `known_at` (what the system believed then); `expiration_date` (excluded only by SDK reads) | Recorded time; `expiration_date` | Not seen | Yes: edges carry `valid_at` / `invalid_at` and `created_at` / `expired_at` | Not seen | Not seen |
 | Images | Original kept, context-aware captions, image-to-image search, the photo looked at again at answer time | A vision model turns it into text (`enable_vision`) | Not seen | No (text and JSON) | Vision or transcription models (details unverified) | OCR |
-| Forgetting | Delete from the log and replay; follows citations; finds uncited restatements; **dry run** | `delete` / `delete_all`; expiry | Edit memory | `remove_episode` | `forget` | `forget_matching(dry_run)` |
+| Forgetting | Delete from the log and replay; follows citations; finds uncited restatements; **dry run**; `reset()` | `delete` / `delete_all` / `reset`; expiry | Edit memory | `remove_episode` | `forget` | `forget_matching(dry_run)` |
 | Export / import | `export` / `load` (raw log + photos; derived memory is rebuilt) | Paid platform only | Agent File (removed from Letta Code) | Not seen | COGX, with importers from Mem0 / Zep / Letta | Not seen |
 | Custom extraction | `consolidation.instructions` | `custom_instructions` | Block labels and limits | Pydantic entity / edge types, `custom_extraction_instructions` | Custom data models, ontologies | Not seen |
 | Local models, no key | `ollama` preset | Ollama, LM Studio, vLLM | Unverified | Ollama and other compatible endpoints | Ollama, llama.cpp, a local extractor | Local mode |
-| Deployment | Docker image, compose (+ Qdrant server), MCP, HTTP | docker compose, hosted platform, hosted MCP | `letta server` | REST, MCP image | Docker, cloud | Local mode, Docker, hosted MCP |
+| Deployment | Docker image, compose (+ Qdrant server), MCP (stdio), HTTP (`/api` and the Mem0-shaped `/api/v1`); an admin token and scoped tokens | docker compose, hosted platform, hosted MCP | `letta server` | REST, MCP image | Docker, cloud | Local mode, Docker, hosted MCP |
 | Storage | SQLite + Qdrant (local or server) | ~26 vector stores | Postgres and others | Neo4j, FalkorDB, Neptune | LanceDB, pgvector, Kuzu, Neo4j, … | Hosted / local |
 | Published evaluation | Test sets used once, methods frozen; three benchmarks, three readers, ablations, hand audit, a second judge | `memory-benchmarks` repo (platform models undisclosed) | Blog | Paper | Own harness | Own harness |
-| Other languages / framework integrations | Python only (plus MCP, HTTP, the proxy); OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool ([integrations](integrations.md)) | TypeScript, a dozen frameworks | TypeScript, Vercel AI SDK | A dozen frameworks | TypeScript, Rust, Claude Code plugin | TypeScript, Vercel AI SDK middleware, several frameworks |
+| Other languages / framework integrations | A Python client only; other languages go through HTTP `/api/v1`, the proxy or MCP, with no TypeScript client; OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool ([integrations](integrations.md)) | TypeScript, a dozen frameworks | TypeScript, Vercel AI SDK | A dozen frameworks | TypeScript, Rust, Claude Code plugin | TypeScript, Vercel AI SDK middleware, several frameworks |
 
 ## 4. Scores: published (not comparable) and same-protocol
 
@@ -157,6 +157,16 @@ The mem0ai 2.2.1 tested here is the add-only v3 algorithm: the PyPI package is n
 | Tuning extraction for an app | Mem0's `custom_instructions`, Graphiti's `custom_extraction_instructions` | Appended to the extraction prompt; changing it rebuilds derived memory (the consolidation fingerprint changes) | `write/extract.py` | D-064 |
 | Container image and compose | Docker deployments of Mem0, Graphiti, Cognee | One process serves the UI, the HTTP API and the memory proxy; compose adds a Qdrant server | `Dockerfile`, `docker-compose.yml` | D-060 |
 
+The second audit round after N12 added the rest of Mem0 compatibility and multi-tenancy (D-069):
+
+| New capability | Following | CueMem's version and how it differs | Where | Decision |
+|---|---|---|---|---|
+| `metadata`, expiry and filter operators | Mem0's `metadata`, `expiration_date` and v3 filters | Stored in the raw layer (a new `turn_meta` table), kept out of the extraction prompt and the session content digest, so requests and cache keys are unchanged. Facts and excerpts carry their sources' metadata and the latest expiry. Expiry is applied only when the SDK reads; derived memory is not rewritten | `sdk.py`, `store/sqlite.py` | D-069 |
+| `update()` and `reset()` | Mem0 | Mem0's `update()` rewrites in place. CueMem logs a "Correction: …" line, and reconciliation uses its `edit_of` to supersede the old fact (no LLM call), which survives rebuilds and forgetting. `reset()` deletes every space in the data directory | `sdk.py`, `write/reconcile.py` | D-069 |
+| An HTTP memory API and a remote client | Mem0's REST API and `MemoryClient` | `/api/v1` of `cuemem serve` mirrors the SDK one to one, with errors as `{"error": {code, type, message}}`. `MemoryClient` has exactly `Memory`'s signatures and raises the same exceptions, so code moves between local and shared memory by changing one line | `api/memories.py`, `client.py` | D-069 |
+| Per-user authentication | Mem0's spaces (user_id, agent_id) | Scoped tokens: each token lists the users and agents it may reach. Naming a space outside the scope gets 403; a memory looked up by id outside the scope is the same as a missing one (404). `/api`, `/api/v1`, the UI and the proxy all check; MCP is not covered | `api/auth.py` | D-069 |
+| Proxy coverage | OpenAI's Embeddings and Responses APIs | `/v1/embeddings`; a non-streaming, text-only subset of `/v1/responses`, with 501 for the rest. Every response names the model actually forwarded (`X-CueMem-Model`), and unknown models can be rejected (`unknown_model: reject`) | `api/proxy.py` | D-069 |
+
 ## 6. Deliberately not copied
 
 - **The LLM deciding retrieval and editing memory by default** (tool-style memory in Letta and LangMem). This is the comparison arm of CueMem's research (B3, ReAct). N9 found it strong on text and weak on images (46.7% on MemLens), and more expensive ($3.15 per 1,000 LoCoMo questions against $1.44 for L1). It is kept as `mode="agent"` and as the agent's `memory_search` escape hatch, not as the default.
@@ -168,9 +178,9 @@ The mem0ai 2.2.1 tested here is the add-only v3 algorithm: the PyPI package is n
 
 In the order a user would run into them:
 
-1. **More framework integrations**: the OpenAI Agents SDK, LangGraph / LangChain and Claude's memory tool are done ([integrations](integrations.md)). Still missing: TypeScript and Vercel AI SDK middleware, a LangGraph `BaseStore`, CrewAI, AutoGen. The Claude memory tool backend has not been run against the real Claude API.
-2. **Multi-tenancy**: there is one shared access token. Memory spaces are isolated by user_id, but there is no per-user authentication. Multi-instance deployments need Postgres instead of SQLite.
+1. **More framework integrations**: the OpenAI Agents SDK, LangGraph / LangChain and Claude's memory tool are done ([integrations](integrations.md)). Still missing: a TypeScript client (other languages use HTTP `/api/v1` for now) and Vercel AI SDK middleware, a LangGraph `BaseStore`, CrewAI, AutoGen. The Claude memory tool backend has not been run against the real Claude API.
+2. **Multi-tenancy and multiple instances**: scoped tokens now limit each token to the users and agents it lists (second audit round, D-069). Still missing: MCP is stdio only, one space per process, and not behind these tokens; the key file is read only at startup, and `/api/v1/reset` needs the admin token; multi-instance deployments need Postgres instead of SQLite.
 3. **More external baselines**: Graphiti, LangMem, Cognee and A-MEM have been run under the same protocol (LoCoMo, DeepSeek-only and Qwen-only protocols; see §4). Not yet run: Letta, MemOS, Supermemory and others. Graphiti, LangMem, Cognee and A-MEM were run on LoCoMo only (Mem0 also has LongMemEval test100r runs, from N11 and the leak ablation): their LongMemEval writes would cost too much and take too long (Graphiti writes one episode per message; A-MEM takes about 15 s per turn under Qwen). Each configuration was run once.
 4. **Validating the presets**: the OpenAI and Ollama presets are covered by offline tests only and have not been evaluated on real models. The consolidation similarity thresholds were tuned for Qwen embeddings and may need re-tuning for another embedding model.
-5. **Metadata and expiry**: Mem0's `metadata` filters and `expiration_date`; Supermemory's automatically expiring temporary facts.
-6. **English developer-facing text**: CLI messages, most exceptions raised by the core (the HTTP API's error messages included) and most SDK docstrings are in Chinese, and there is no English reference for the SDK, the HTTP API or the proxy. The SDK's own errors, the MCP tools and the UI are in English (audit after N12, D-068).
+5. **Expiry**: Mem0's `metadata`, filters and `expiration_date` are now supported (second audit round, D-069). Expiry applies only to the SDK's `search`, `get_all` and profile; the proxy, MCP, `/api` and the integrations still see expired memories until they are deleted. Nothing yet recognises temporary facts and expires them on its own, as Supermemory does.
+6. **English developer-facing text**: CLI messages, most exceptions raised by the core (`/api`'s error messages included) and most SDK docstrings are in Chinese, and that is deliberate; instead there is an English [API reference](api.md) (D-069). The SDK's own errors, `/api/v1`, the proxy, the MCP tools and the UI are in English (audit after N12, D-068).
