@@ -783,7 +783,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         """撤销刚写进日志、文件却没存上的笔记（否则记忆里有、哪个文件都不认）。"""
         try:
             self._settle()
-            self.memory.system.forget_memories(self.space, session_ids=[note.session_id])
+            self.memory.system.forget_memories(  # 删了就算撤销了：重建出错不算失败
+                self.space, session_ids=[note.session_id], report_rebuild_errors=True
+            )
         except Exception as exc:
             logger.error("Could not undo memory note %s of %s: %s", note.turn_id, note.path, exc)
             record_event("claude_memory_rollback_failed", space=self.space, turn=note.turn_id)
@@ -814,24 +816,32 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         system = self.memory.system
         before = system.facts(self.space)
         current = {f.id for f in before if f.is_current}
-        try:
-            report = system.forget_memories(self.space, session_ids=sessions)
+        try:  # 删除之后重建出错时不抛出：笔记已经删了，文件照样删（rebuild_error）
+            report = system.forget_memories(
+                self.space, session_ids=sessions, report_rebuild_errors=True
+            )
         except Exception as exc:
             logger.warning("Could not forget memory notes: %s", exc, exc_info=True)
             raise ToolError(
                 f"Error: Could not forget what {notes[0].path} added to long-term memory "
                 f"({type(exc).__name__}); the file was kept. Try again later."
             ) from exc
-        after = system.facts(self.space, current_only=True)
-        now_ids = {f.id for f in after}
-        gone = [f for f in before if f.id in current and f.id not in now_ids]
-        known = {f.id for f in before}
-        back = [f for f in after if f.id not in current and f.id in known]  # 旧版本恢复为当前
         own = report.turns_deleted - report.cascaded
         what = "this file" if files == 1 else f"these {files} files"
         repeated = (
             f" and {report.cascaded} later message(s) that repeated them" if report.cascaded else ""
         )
+        if report.rebuild_error:  # 派生记忆只重建了一部分：不列哪些事实没了
+            return (
+                f"Forgotten from long-term memory: the {own} saved change(s) of {what}{repeated}. "
+                f"Rebuilding the memory derived from the rest failed ({report.rebuild_error}); "
+                "it finishes on the next consolidation."
+            )
+        after = system.facts(self.space, current_only=True)
+        now_ids = {f.id for f in after}
+        gone = [f for f in before if f.id in current and f.id not in now_ids]
+        known = {f.id for f in before}
+        back = [f for f in after if f.id not in current and f.id in known]  # 旧版本恢复为当前
         lines = [
             f"Forgotten from long-term memory: the {own} saved change(s) of {what}{repeated}; "
             "everything derived only from them was removed."

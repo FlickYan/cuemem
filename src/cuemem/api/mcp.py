@@ -23,7 +23,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
-from cuemem.evidence import format_listing
+from cuemem.evidence import forget_summary, format_listing
 
 INSTRUCTIONS = """CueMem is a long-term memory of past conversations with this user.
 Call recall before answering anything that may depend on the user's past (preferences, plans, people, things they own or did). Call remember when the user shares something worth keeping. Cite memory ids when you rely on them, and use forget when the user asks you to delete something."""  # noqa: E501
@@ -55,12 +55,9 @@ def build_server(service: ChatService, space_id: str) -> MCPServer[Any]:
     def forget(ids: list[str]) -> str:
         """Forget memories by the ids that recall returned (fact ids or excerpt ids). Deletes
         the conversation they came from and rebuilds everything derived from it."""
-        with _provider_errors():
+        with _provider_errors():  # 删除之后重建出错时不算出错，见 forget_summary
             report = service.forget_ids(space_id, ids)
-        return (
-            f"Deleted {report.turns_deleted} conversation turn(s); "
-            f"facts {report.facts_before} -> {report.facts_after}."
-        )
+        return forget_summary(report)
 
     @server.tool()
     def profile() -> str:

@@ -494,6 +494,29 @@ def test_extraction_errors_after_the_write_are_reported_not_raised(
     assert [t.id for t in corrections] == update["turn_ids"]
 
 
+def test_a_delete_whose_rebuild_fails_still_reports_the_deletion(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """delete 删掉原始日志之后、重建派生记忆时对账余额不足：已经删了，不抛出（/api/v1 是 200），
+    warning 写明重建下次巩固时补上。以前抛出供应商的 402，调用方以为没删。"""
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    munich = memory.add("I moved to Munich", user_id="alice", timestamp=SEP, wait=True)
+    memory.add("I moved to Paris", user_id="alice", timestamp=SEP + timedelta(days=1), wait=True)
+    broke = without_balance_for_reconciling(model, fake_api)
+    out = memory.delete(munich["results"][0]["id"])
+    assert out["message"] == "Memory deleted" and out["turns_deleted"] == 1
+    assert "Error code: 402" in out["warning"] and "next consolidation" in out["warning"]
+    assert [t.text for t in memory.system.db.get_turns("alice")] == [
+        "I live in Berlin",
+        "I moved to Paris",
+    ]
+    broke["on"] = False
+    memory.consolidate(user_id="alice")
+    assert [f["memory"] for f in memory.get_all(user_id="alice")["results"]] == [
+        "The user lives in Paris."
+    ]
+
+
 def _descending_uuids(monkeypatch: pytest.MonkeyPatch) -> None:
     """uuid4 依次变小：以前生成的会话 ID 以随机数结尾，开始时间相同时按 ID 排序，后写的排到前面。"""
     count = itertools.count()

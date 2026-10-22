@@ -105,6 +105,9 @@ class ForgetReport:
     traces_removed: int = 0  # 删除的 trace 条数（属性里有被删的原话）
     restated: int = 0  # 原始日志里复述了被删信息（没有引用、追不到）而一起删的发言数（N10）
     regrown: int = 0  # 重建后仍在复述被删信息、因而跟着删掉出处的事实数（N10）
+    # 删除做完之后重建派生记忆（或检查转述）时的出错，"类型: 原话"（只在 report_rebuild_errors
+    # 时有，否则抛出）：没做完的巩固任务留着，下次巩固时补齐，在那之前事实可能不全
+    rebuild_error: str | None = None
 
     def merged(self, later: ForgetReport) -> ForgetReport:
         """同一次遗忘的后续几轮并进来：计数相加，删除前后的事实数取首尾。"""
@@ -121,6 +124,7 @@ class ForgetReport:
             traces_removed=self.traces_removed + later.traces_removed,
             restated=self.restated + later.restated,
             regrown=self.regrown + later.regrown,
+            rebuild_error=later.rebuild_error or self.rebuild_error,
         )
 
 
@@ -213,6 +217,10 @@ def _strings(value: Any) -> Iterator[str]:
     elif isinstance(value, list):
         for item in value:
             yield from _strings(item)
+
+
+def _error_text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {str(exc)[:300]}"
 
 
 def _without_images(text: str) -> str:
@@ -633,6 +641,7 @@ class MemorySystem:
         turn_ids: Sequence[str] = (),
         follow_citations: bool = True,
         restated_turn_ids: Sequence[str] = (),
+        report_rebuild_errors: bool = False,
     ) -> ForgetReport:
         """遗忘（被遗忘权）：删除原始轮次，并清除由它们派生出的一切（D-021）。
 
@@ -661,7 +670,9 @@ class MemorySystem:
 
         重放失败（例如对账时余额不足）时照样清理 trace、向量缓存与 LLM 缓存（标记的条目只留下
         重放已经用到的），再把异常抛出去：原始日志已经删了，重试时找不到要删的发言。没做完的
-        巩固任务留着，下次巩固时补齐。
+        巩固任务留着，下次巩固时补齐。report_rebuild_errors=True 时不抛出，写在报告的
+        rebuild_error 里：HTTP 接口、MCP、SDK 与各集成据此说明删除已经做了、只是派生记忆要等下次
+        巩固（以前它们把供应商的出错照搬成"遗忘失败"，调用方以为没删）。
         """
         started = time.perf_counter()
         with (
@@ -715,11 +726,14 @@ class MemorySystem:
                 # 2. 派生层：清空，再从剩下的日志重放
                 removed = self.db.clear_derived(space_id)
                 self.vectors.delete(space_id, removed)
+                failed: Exception | None = None
                 try:
                     if consolidated:
                         with cache.recording(reused) if cache is not None else nullcontext():
                             self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
                             self.consolidator.run(space_id)
+                except Exception as exc:  # 清理照样做完（下面的 finally），之后再抛出或写进报告
+                    failed = exc
                 finally:
                     # 3. trace：属性里有被删原话的条目（提问、回答原文），以及检索时给回答模型
                     #    看过被删记忆的条目（回答可能复述了它，trace 里却没有原话）。带图的发言
@@ -740,6 +754,8 @@ class MemorySystem:
             finally:  # 中途出错时重放用到的更少，删得更多
                 if cache is not None:
                     llm_purged += cache.settle(held, reused)
+            if failed is not None and not report_rebuild_errors:
+                raise failed
             report = ForgetReport(
                 space_id=space_id,
                 turns_deleted=deleted,
@@ -752,8 +768,11 @@ class MemorySystem:
                 images_deleted=images_deleted,
                 cascaded=cascaded,
                 traces_removed=traces_removed,
+                rebuild_error=_error_text(failed) if failed is not None else None,
             )
             trace.attrs.update(turns_deleted=deleted, sessions=affected, cascaded=cascaded)
+            if report.rebuild_error:
+                trace.attrs.update(rebuild_error=report.rebuild_error)
         return report
 
     def _forget_targets(
@@ -942,6 +961,7 @@ class MemorySystem:
         turn_ids: Sequence[str] = (),
         fact_ids: Sequence[str] = (),
         media_ids: Sequence[str] = (),
+        report_rebuild_errors: bool = False,
     ) -> ForgetReport:
         """按记忆遗忘：会话、发言、事实或图片（服务层、SDK 与 MCP 共用，N12 从服务层移来）。
 
@@ -950,6 +970,10 @@ class MemorySystem:
         转述（D-051）：先在原始日志里找复述了它的发言（包括进行中的会话）一起删；重建之后如果
         同样的信息又从别处长了出来，再删它的出处，最多再追 REGROW_ROUNDS 轮。按内容找到的转述
         只删那条发言、不沿引用扩散：同一轮里用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。
+
+        report_rebuild_errors：删除做完之后重建或检查转述出错时不抛出，写在报告的 rebuild_error
+        里（见 forget），不再往下追转述（与抛出时相同）。删除之前出错（找转述时）照常抛出：什么都
+        没删。
         """
         turns, restated, statements = self._forget_plan(space_id, turn_ids, fact_ids, media_ids)
         try:
@@ -958,16 +982,26 @@ class MemorySystem:
                 session_ids=list(session_ids),
                 turn_ids=list(dict.fromkeys(turns)),
                 restated_turn_ids=restated,
+                report_rebuild_errors=report_rebuild_errors,
             )
             report = replace(report, restated=len(restated))
-            for _ in range(REGROW_ROUNDS if statements else 0):
-                regrown = self.regrown_facts(space_id, statements)
+            for _ in range(REGROW_ROUNDS if statements and not report.rebuild_error else 0):
+                try:
+                    regrown = self.regrown_facts(space_id, statements)
+                except Exception as exc:
+                    if not report_rebuild_errors:
+                        raise
+                    report = replace(report, rebuild_error=_error_text(exc))
+                    break
                 if not regrown:
                     break
                 more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
-                report = report.merged(
-                    replace(self.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
+                again = self.forget(
+                    space_id, restated_turn_ids=more, report_rebuild_errors=report_rebuild_errors
                 )
+                report = report.merged(replace(again, regrown=len(regrown)))
+                if report.rebuild_error:
+                    break
         finally:
             # 找转述与兜底时为被删的陈述算过查询与文档两种向量，兜底那次还在 forget 清理之后：
             # 一并删掉（中途失败时也删）。兜底的请求里有被删的陈述，最后一次没有 forget 跟在后面

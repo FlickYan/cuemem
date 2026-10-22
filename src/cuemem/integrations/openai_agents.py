@@ -94,6 +94,7 @@ from agents.run_config import (  # type: ignore[import-not-found, unused-ignore]
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
 from cuemem.evidence import (
+    forget_summary,
     format_listing,
     in_context_rounds,
     recall_evidence,
@@ -339,19 +340,18 @@ def memory_tools(
 
     @function_tool(name_override="forget", description_override=FORGET_DESCRIPTION)
     def forget(ctx: RunContextWrapper[Any], ids: list[str]) -> str:
-        report = _forget_ids(sync.system, who.space(ctx.context), ids)
-        return (
-            f"Deleted {report.turns_deleted} conversation turn(s); "
-            f"facts {report.facts_before} -> {report.facts_after}."
-        )
+        return forget_summary(_forget_ids(sync.system, who.space(ctx.context), ids))
 
     return [recall, remember, forget]
 
 
 def _forget_ids(system: MemorySystem, space: str, ids: Sequence[str]) -> ForgetReport:
-    """按 recall 给出的 ID 遗忘：事实 ID，或对话片段（轮）的 ID。缓存的证据随之作废。"""
+    """按 recall 给出的 ID 遗忘：事实 ID，或对话片段（轮）的 ID。缓存的证据随之作废。删除做完
+    之后重建出错时不抛出（rebuild_error，见 forget_summary）。"""
     fact_ids, turns = resolve_ids(system, space, ids)
-    report = system.forget_memories(space, fact_ids=fact_ids, turn_ids=turns)
+    report = system.forget_memories(
+        space, fact_ids=fact_ids, turn_ids=turns, report_rebuild_errors=True
+    )
     _shared(system).forgot(space)
     return report
 

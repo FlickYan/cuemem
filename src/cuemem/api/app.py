@@ -362,13 +362,19 @@ def create_app(
                 fact_ids=request.fact_ids,
                 media_ids=request.media_ids,
             )
-        return {
+        out: dict[str, Any] = {
             "turns_deleted": report.turns_deleted,
             "sessions_affected": report.sessions_affected,
             "facts_before": report.facts_before,
             "facts_after": report.facts_after,
             "images_deleted": report.images_deleted,
         }
+        if report.rebuild_error:  # 删除已经做了：不是出错，以前回 402 之类、调用方以为没删
+            out["warning"] = (
+                f"已经删除；用剩下的日志重建派生记忆时出错（{report.rebuild_error}），"
+                "下次巩固时补上，在那之前事实可能不全"
+            )
+        return out
 
     @api.get("/api/spaces/{space:path}/export")
     def export(space: AllowedSpace, derived: bool = True) -> dict[str, Any]:

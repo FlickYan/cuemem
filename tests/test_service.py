@@ -237,7 +237,7 @@ def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
     service: ChatService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """重建派生记忆失败（例如余额不足）时，原始日志已经删了：进行中的会话照样把被删的轮从
-    工作记忆里去掉，异常照常抛给调用方。"""
+    工作记忆里去掉，出错写在报告的 rebuild_error 里（不再抛给调用方：删除已经做了）。"""
     first = service.start("shop", at=DAY)
     service.chat(first.session_id, "I'm vegan, so no leather please.", mode="l0")
     service.end(first.session_id, wait=True)  # 有巩固过的会话：遗忘时要重建
@@ -250,8 +250,10 @@ def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
         raise RuntimeError("Insufficient Balance")
 
     monkeypatch.setattr(service.system.consolidator, "run", broken)
-    with pytest.raises(RuntimeError, match="Insufficient Balance"):
-        service.forget("shop", turn_ids=[said.id])
+    report = service.forget("shop", turn_ids=[said.id])
+    assert (
+        report.turns_deleted == 1 and report.rebuild_error == "RuntimeError: Insufficient Balance"
+    )
     assert live.window == []
 
 
@@ -738,6 +740,52 @@ def test_mcp_tools_explain_provider_errors(
     for name, arguments in (("remember", {"text": "I like tea."}), ("recall", {"query": "tea"})):
         with pytest.raises(ToolError, match=r"rate-limiting requests \(HTTP 429\).*about 3 s"):
             asyncio.run(server.call_tool(name, arguments))
+
+
+def test_a_forget_whose_rebuild_fails_still_reports_the_deletion(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """遗忘删掉原始日志之后、重建派生记忆时对账余额不足：MCP 的 forget 与 HTTP 的遗忘照实说删了、
+    重建下次巩固时补上。以前 MCP 回 "run out of balance (HTTP 402). Retrying will not help"、HTTP
+    回 402，调用方的模型（以及用户）以为这条隐私相关的删除没有发生，其实已经删了。"""
+    from test_sdk import moved, where_i_live, without_balance_for_reconciling
+
+    model = ScriptedModel(where_i_live, reconcile=moved)
+    fake_api.chat_replies = [model]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        service = ChatService(system, Agent(system, router="rule"))
+        notes = [
+            service.remember("notes", text, at=datetime(2026, 8, day + 1))["session_id"]
+            for day, text in enumerate(
+                ("I live in Berlin", "I moved to Zurich", "I moved to Munich", "I moved to Rome")
+            )
+        ]
+        system.consolidate("notes")
+        ids = {f.statement: f.id for f in system.facts("notes")}
+        broke = without_balance_for_reconciling(model, fake_api)
+
+        result = asyncio.run(
+            build_server(service, "notes").call_tool(
+                "forget", {"ids": [ids["The user lives in Zurich."]]}
+            )
+        )
+        said = "".join(getattr(c, "text", "") for c in result.content)
+        assert said.startswith("Deleted 1 conversation turn(s). Rebuilding the memory derived")
+        assert "Error code: 402" in said and "next consolidation" in said
+        with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False)) as http:
+            body = {"session_ids": [notes[2]]}  # 派生记忆只重建了一部分：按会话遗忘慕尼黑
+            response = http.post("/api/spaces/notes/forget", json=body)
+        assert response.status_code == 200 and response.json()["turns_deleted"] == 1
+        assert response.json()["warning"].startswith("已经删除；用剩下的日志重建派生记忆时出错")
+        assert [t.text for t in system.db.get_turns("notes")] == [
+            "I live in Berlin",
+            "I moved to Rome",
+        ]
+
+        broke["on"] = False
+        system.consolidate("notes")
+        current = [f.statement for f in system.facts("notes") if f.is_current]
+        assert current == ["The user lives in Rome."]
 
 
 # ---------- 界面与剧本 ----------

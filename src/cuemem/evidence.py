@@ -24,7 +24,7 @@ from typing import Any
 
 from cuemem.core.models import Fact
 from cuemem.core.timeutil import naive_local
-from cuemem.memory import MemorySystem, Recall, RecallMode
+from cuemem.memory import ForgetReport, MemorySystem, Recall, RecallMode
 from cuemem.read.controller import Router, english_reason
 from cuemem.read.reader import memory_blocks
 
@@ -270,6 +270,22 @@ def resolve_ids(
     rounds = system.db.get_units(space, list(ids))
     turns = [t for unit in rounds if unit.kind == "round" for t in unit.source_turn_ids]
     return fact_ids, turns
+
+
+def forget_summary(report: ForgetReport) -> str:
+    """forget 工具（MCP 与各框架集成）的回复。删除做完之后重建派生记忆出错时（rebuild_error，
+    见 MemorySystem.forget）照实说删了、只是重建要等下次巩固：以前报成遗忘失败，调用方的模型
+    （以及用户）以为没删。"""
+    if report.rebuild_error:
+        return (
+            f"Deleted {report.turns_deleted} conversation turn(s). Rebuilding the memory derived "
+            f"from the rest failed ({report.rebuild_error}); it finishes on the next "
+            "consolidation, and some facts may be missing until then."
+        )
+    return (
+        f"Deleted {report.turns_deleted} conversation turn(s); "
+        f"facts {report.facts_before} -> {report.facts_after}."
+    )
 
 
 def fact_state(fact: Fact) -> str:

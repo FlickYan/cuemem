@@ -597,7 +597,8 @@ class Memory:
         """遗忘一条事实（被遗忘权）：删掉它出自的那一轮对话与没有引用的转述，再用剩下的日志
         重建派生记忆。被它取代过的旧事实会恢复为当前有效。
 
-        dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。"""
+        dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。删除做完之后
+        重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。"""
         found = self._find(memory_id)
         if found is None:
             raise KeyError(f"No memory with id {memory_id}")
@@ -606,7 +607,9 @@ class Memory:
                 "message": "Dry run: nothing was deleted",
                 **self.system.preview_forget(found[0], fact_ids=[memory_id]),
             }
-        report = self.system.forget_memories(found[0], fact_ids=[memory_id])
+        report = self.system.forget_memories(
+            found[0], fact_ids=[memory_id], report_rebuild_errors=True
+        )
         return {"message": "Memory deleted", **_forget_out(report)}
 
     def delete_all(
@@ -616,7 +619,9 @@ class Memory:
         run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。"""
         space = space_for(user_id, agent_id)
         if run_id is not None:
-            report = self.system.forget_memories(space, session_ids=[run_id])
+            report = self.system.forget_memories(
+                space, session_ids=[run_id], report_rebuild_errors=True
+            )
             return {"message": "Memories of this run deleted", **_forget_out(report)}
         report = self.system.delete_space(space)
         return {"message": "All memories deleted", **_forget_out(report)}
@@ -1275,7 +1280,7 @@ def _events(
 
 
 def _forget_out(report: ForgetReport) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "turns_deleted": report.turns_deleted,
         "sessions_affected": report.sessions_affected,
         "facts_before": report.facts_before,
@@ -1283,3 +1288,10 @@ def _forget_out(report: ForgetReport) -> dict[str, Any]:
         "images_deleted": report.images_deleted,
         "restated": report.restated,
     }
+    if report.rebuild_error:  # 删除已经做了（见 MemorySystem.forget 的 report_rebuild_errors）
+        out["warning"] = (
+            f"The memories were deleted, but rebuilding what is derived from the rest failed "
+            f"({report.rebuild_error}); it finishes on the next consolidation, and some facts "
+            "may be missing until then."
+        )
+    return out

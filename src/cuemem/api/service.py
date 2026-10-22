@@ -327,7 +327,9 @@ class ChatService:
         fact_ids: Sequence[str] = (),
         media_ids: Sequence[str] = (),
     ) -> ForgetReport:
-        """遗忘（逻辑见 MemorySystem.forget_memories）；进行中的会话同步去掉被删的内容。"""
+        """遗忘（逻辑见 MemorySystem.forget_memories）；进行中的会话同步去掉被删的内容。
+        删除做完之后重建派生记忆出错时不抛出，写在报告的 rebuild_error 里（HTTP 接口与 MCP 据此
+        说明删除已经做了）。"""
         try:
             return self.system.forget_memories(
                 space_id,
@@ -335,6 +337,7 @@ class ChatService:
                 turn_ids=turn_ids,
                 fact_ids=fact_ids,
                 media_ids=media_ids,
+                report_rebuild_errors=True,
             )
         finally:  # 重建失败时原始日志也已经删了：进行中的会话照样去掉被删的轮
             for session in self.open_sessions(space_id):

@@ -428,6 +428,12 @@ def build_ui(
             cascade = ", including " + " and ".join(e for e in extra if e) if any(extra) else ""
             if report.regrown:
                 cascade += f"; {report.regrown} fact(s) grew back after the rebuild and went too"
+            if report.rebuild_error:  # 删了，只是重建没做完
+                return (
+                    f"Forgot {report.turns_deleted} conversation turn(s){cascade}. Rebuilding the "
+                    f"memory from the remaining log failed ({report.rebuild_error}); it finishes "
+                    "on the next consolidation."
+                )
             return (
                 f"Forgot {report.turns_deleted} conversation turn(s){cascade}; facts "
                 f"{report.facts_before} → {report.facts_after}, rebuilt from the remaining log "

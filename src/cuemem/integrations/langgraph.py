@@ -93,6 +93,7 @@ from pydantic import BaseModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
 from cuemem.evidence import (
+    forget_summary,
     format_listing,
     in_context_rounds,
     recall_evidence,
@@ -584,14 +585,13 @@ def memory_tools(
             space = space_for(*who(config))
             system = sync.system
             fact_ids, turns = resolve_ids(system, space, ids)
-            try:
-                report = system.forget_memories(space, fact_ids=fact_ids, turn_ids=turns)
+            try:  # 删除之后重建出错时不抛出，回复里照实说（forget_summary）
+                report = system.forget_memories(
+                    space, fact_ids=fact_ids, turn_ids=turns, report_rebuild_errors=True
+                )
             finally:  # 这一回合缓存的证据块可能含有刚删掉的内容：作废，下次模型调用重新召回
                 threads._forgot(space)
-            return (
-                f"Deleted {report.turns_deleted} conversation turn(s); "
-                f"facts {report.facts_before} -> {report.facts_after}."
-            )
+            return forget_summary(report)
 
         return _tool("forget", run)
 
