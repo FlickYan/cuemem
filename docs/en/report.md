@@ -24,7 +24,7 @@ The final evaluation used three test sets: LongMemEval test400, the last 7 LoCoM
 - **Letting the model retrieve for itself (ReAct) wins on some data and loses on other data.** It is the strongest method on text memory (LoCoMo 85.5%) and fails on image memory (MemLens 46.7%). "Controller first, LLM may search more" holds up on all three datasets, at the highest cost.
 - **Few errors are true retrieval misses.** Most come from the controller picking the wrong level, from miscounting, and from wrong LoCoMo gold answers (10 of 40 sampled errors).
 - **Every N2–N11 number can be replayed from the local cache with one command.** The controller's live runs match offline replay of the frozen model question by question.
-- **External systems under the same protocol (N12, 200 LoCoMo questions, §13).** With DeepSeek models only, L2 (87.0%) is significantly above Mem0 (81.0%), LangMem (78.0%), Cognee (77.5%), Graphiti (59.0%) and A-MEM (58.0%); L1 (82.5%) is not significantly different from Mem0, LangMem and Cognee. With k = 40, the authors' setting for GPT-4o-class models, A-MEM rises to 75.0%, and L1 and L2 are still significantly higher. Graphiti and LangMem are sensitive to the extraction model: with Qwen models only, Graphiti drops to 41.5% and LangMem to 30.0%.
+- **External systems under the same protocol (N12, 200 LoCoMo questions, §13).** With DeepSeek models only, L2 (87.0%) is above Mem0 (81.0%), LangMem (78.0%), Cognee (77.5%), Graphiti (59.0%) and A-MEM (58.0%); after a multiple-comparison correction the lead stays significant against the last four and is only nominal against Mem0 (p = 0.017, adjusted 0.068). L1 (82.5%) is not significantly different from Mem0, LangMem and Cognee. With k = 40, the authors' setting for GPT-4o-class models, A-MEM rises to 75.0%, and L1 and L2 are still significantly higher. Graphiti and LangMem are sensitive to the extraction model: with Qwen models only, Graphiti drops to 41.5% and LangMem to 30.0%.
 
 ## 1. Problem
 
@@ -166,6 +166,7 @@ On MemLens, L1 and L2 also have re-perception versions (B4-see, B5-see); B4-mm i
   - Actual spend is tracked separately (D-010). It excludes local cache hits and includes the provider's cache discount and DeepSeek's 50% off-peak discount.
   - All DeepSeek calls ran off-peak (D-024).
 - **Statistics.** Confidence intervals are 95% bootstrap intervals. Two methods on the same questions are compared with a paired sign test, which only counts questions where one is right and the other wrong.
+- **Multiple comparisons** (added after the second audit round, D-069). The p-values in the text are per comparison. Where one result holds many tests, `scripts/multiplicity.py` applies a Holm correction within families (for example, in N9 each dataset's overall comparisons, one comparison's question types, the controller, and the comparisons under one reader are each a family; in N12, "L1 and L2 against the external systems" is one family per protocol) and writes a `*-holm.json` next to each result. Claims that do not survive the correction are labelled "nominal" in the text, with the adjusted p; accuracies, wins and losses and raw p-values are unchanged. Claims with no JSON (N5, N6 and N9's pooled controller comparison) were recomputed from the wins and losses in the text; see D-069.
 - **Replay.** The local response cache makes every result free to replay. The level a controller chooses issues a request byte-identical to the fixed-level method, so it hits the cache. That is why the live B6 run and the offline replay of the frozen model can be checked against each other question by question.
 
 ### 3.5 The LongMemEval session-ID leak (N12 note)
@@ -198,7 +199,7 @@ The raw arm has the same configuration and the same raw IDs as the numbers publi
 
 - **No measurable inflation of L1, L2 or the controller.** No single method's label-vs-anon difference is significant. Pooled over retrieval methods (the same questions, so not independent): +21 / −12 under the original protocol (+1.8 points, p = 0.16, including Mem0); +10 / −14 under the Qwen-only protocol (pq, §13.1), whose reader is qwen3.8-flash (−1.0 point, p = 0.54). Full context is not affected, so the gaps between retrieval methods and full context show no measurable change.
 - **Renaming noise is the same order as the leak.** Pooled over B2, L1, L2 and the controller: renaming alone (raw vs label) is +5 / −14 (−2.25 points, p = 0.064); pre-fix against post-fix (raw vs anon) is +8 / −14 (−1.5 points, p = 0.29), so the pre-fix condition scored slightly lower, not higher.
-- **Mem0 moves the most** (+9 / −3, p = 0.15). The 83.0% published for Mem0 in N11 may be a few points high; after the fix, the same configuration gives L1 90.0% and Mem0 79.0%, and L1 against Mem0 is +15 / −4 (p = 0.019).
+- **Mem0 moves the most** (+9 / −3, p = 0.15). The 83.0% published for Mem0 in N11 may be a few points high; after the fix, the same configuration gives L1 90.0% and Mem0 79.0%, and L1 against Mem0 is +15 / −4 (nominal p = 0.019; 0.058 after correcting for the 4 comparisons against Mem0 in this arm).
 - **Limitations.** One run per arm. Renaming alone reorders rounds within a session and adds noise. The learned controller's accuracy table and λ were fitted on outcomes from before the fix and have not been refitted. Agentic retrieval (B3, B6a), B2F, L1 + take notes first and the small reader tier of §6 were not part of this ablation.
 - **The published numbers stay as they are.** N2–N11's LongMemEval numbers are not changed. `scripts/reproduce.py` keeps the raw IDs for those steps (`CUEMEM_EVAL_RAW_SESSION_IDS=1`), so the prompts are byte-identical and, with the original response cache, the published numbers reproduce; new LongMemEval runs use the renamed IDs by default.
 
@@ -232,14 +233,14 @@ Accuracy / nominal cost per 1,000 questions. On MemLens, L1 and L2 attach the or
 
 - **Memory versus full context.**
   - LongMemEval: L1 is 17.5 points above full context (+84 / −14 questions) at about 1/20 of the cost. Full context is worst on multi-session questions (62.9%) and temporal questions (52.0%).
-  - LoCoMo: a conversation is only about 20k tokens, so full context is not long here. L1 is 2.3 points lower (p = 0.038) and L2 2.5 points higher (p = 0.021), at less than half the cost. (N11: L1 being lower is not significant under a second judge and shrinks to 1.5 points in a rerun, so the two should be read as close; see §12.3.)
+  - LoCoMo: a conversation is only about 20k tokens, so full context is not long here. L1 is 2.3 points lower (nominal p = 0.038) and L2 2.5 points higher (nominal p = 0.021), at less than half the cost. Corrected together with LoCoMo's 7 overall comparisons, neither survives (0.151 and 0.107). (N11: L1 being lower is not significant under a second judge and shrinks to 1.5 points in a rerun, so the two should be read as close; see §12.3.)
   - MemLens: full context drops 5.6 points from 32K to 128K, while L2 with photos barely moves (65.6% → 65.1%). L2 with photos beats full context +33 / −6 (32K) and +47 / −10 (128K).
 - **The write path.**
   - The same naive retrieval, given the write path's output, goes from 82.0% to 91.0% on LongMemEval (+53 / −17, p < 0.001). The output is facts with validity, fact-augmented index keys and a profile.
   - Multi-session and temporal questions each gain about 16.5 points.
   - On top of that, L1's retrieval improvements gain nothing more on LongMemEval (90.5% vs 91.0%, +9 / −11), while on LoCoMo L1 is 11.5 points above naive retrieval (+168 / −36).
 - **L2 versus L1.**
-  - LoCoMo: +4.8 points (+76 / −20, p < 0.001), significant within each of the four question types (multi-hop, open-domain, temporal, single-hop). This is the per-type significance that N5 could not reach on the development set.
+  - LoCoMo: +4.8 points (+76 / −20, p < 0.001). The raw p is below 0.05 for each of the four question types; after a Holm correction over the four types, multi-hop (+29 / −7, adjusted 0.0013) and single-hop (+24 / −7, 0.010) stay significant, while open-domain (+8 / −1) and temporal (+15 / −5) are only nominal (both adjusted to 0.078). So the test sets reach, for multi-hop and single-hop, the per-type significance that N5 could not reach on the development set.
   - LongMemEval: +2.7 points (p = 0.071).
   - MemLens (with photos): +2.5 points at 32K (n.s.), +9.7 points at 128K (p < 0.001).
   - The price: L2 costs 2.1–2.3 times as much as L1. On LongMemEval's unanswerable questions L2 gets 4 fewer right than L1: the deeper the search, the more likely it finds something related and answers anyway.
@@ -269,7 +270,7 @@ The N7 numbers are estimates on the 585 development questions, cross-fitted by c
 - **In the mixed stream, B6 is 41% cheaper than always retrieving, and 1.3 points more accurate on memory questions.** The development estimate was 45%.
   - The gate separates memory questions from unrelated queries with AUC 0.990 (development: 0.983).
   - The probe takes 163–487 ms at p50, depending on the size of the memory.
-- **On memory questions alone, it sits between the two fixed levels.** It beats always-L1 +60 / −37 (p = 0.025) and loses to always-L2 +15 / −64 (p < 0.001). H2 comes out as in N7: the mixed-stream half holds and the memory-only half does not.
+- **On memory questions alone, it sits between the two fixed levels.** It beats always-L1 +60 / −37 (p = 0.025, uncorrected: the pooled per-question results over three datasets were not stored in a JSON; in a family of two with the comparison against always-L2 it stays at 0.025) and loses to always-L2 +15 / −64 (p < 0.001). H2 comes out as in N7: the mixed-stream half holds and the memory-only half does not.
 - **B6 and the zero-shot LLM router each have their strengths.**
   - B6z almost never recalls when it should not, but misses 3% of memory questions and costs one extra LLM call per message.
   - B6 calls no LLM and misses less, but still retrieves for 17% of unrelated queries.
@@ -287,7 +288,7 @@ The N7 numbers are estimates on the 585 development questions, cross-fitted by c
 - **On LongMemEval, B6 did not beat always-L1**: +10 / −10, at 51% higher cost.
   - The gate sent 7 questions to L0 and 6 of them were answered wrongly (L1 answers all six correctly). That cancelled what L2 gained.
   - The rule-based B6r did better (+12 / −4, p = 0.077). Its cue words happen to cover LongMemEval's multi-session and temporal questions, as already seen in N7.
-- **On LoCoMo, B6 beats the rules** (+34 / −16, p = 0.015); the rules almost never fire on multi-hop questions.
+- **On LoCoMo, B6 beats the rules** (+34 / −16, nominal p = 0.015; 0.061 after correcting with the 12 tests of the controller family); the rules almost never fire on multi-hop questions. On MemLens, B6 is below always-L2 at both lengths (+2 / −13 at 32K, +2 / −11 at 128K), with raw p 0.0074 and 0.023 and adjusted 0.052 and 0.067, so this is also only nominal.
 - **"L1 + take notes first" is still more cost-effective than any routing.** It scores 91.8% at $1.86 on LongMemEval and 82.8% at $1.70 on LoCoMo, more accurate and cheaper than B6 (+56 / −44 over the two datasets, n.s.). The N7 conclusion holds on the test sets too.
 
 ### 5.3 A design flaw on MemLens: saturated photo gain
@@ -331,11 +332,11 @@ The same stratified subsets were used for every reader: 99 LongMemEval questions
 
 - **Agentic retrieval is not less stable than the controller.**
   - The spread across the three readers is 5.0 points for B3 and 10.1 for B6 on LongMemEval, and 10.5 for B3 and 9.0 for B6 on LoCoMo.
-  - With qwen3.8-flash, B3 beats L2 on LoCoMo +15 / −5 (p = 0.041), repeating the N7 finding: this model is good at using a search tool.
+  - With qwen3.8-flash, B3 beats L2 on LoCoMo +15 / −5 (nominal p = 0.041; 0.116 after correcting for the 5 comparisons under this reader), which points the same way as the N7 finding: this model is good at using a search tool.
 - **On the smallest model, B3 loses only a little**: +9 / −20 against L2 on LoCoMo (p = 0.061), and level with L2 on LongMemEval. "The controller's advantage grows on small models" was not confirmed.
 - **The controller's weakness lies elsewhere: its per-level accuracy table was calibrated on the main reader.**
   - The small model struggles to read L1's evidence: on LongMemEval it scores 80.8% at L1 and 89.9% at L2, a 9-point gap. For the main reader the gap is 4 points.
-  - The controller does not know this and keeps choosing L1: B6 against L2 is 0 / −7 (p = 0.016).
+  - The controller does not know this and keeps choosing L1: B6 against L2 is 0 / −7 (nominal p = 0.016, adjusted 0.078).
   - The features that choose the level do not depend on the reader, but how well a level answers does. A new reader needs the table recalibrated from a few labelled examples.
 - **B6a is never the worst method under any reader.** When the model is poor at using tools, the controller's recall backs it up. When the controller picks the wrong level, the model can search for itself.
 - **The large tier (deepseek-v4-pro) was not run.** The DeepSeek account ran out of balance before that step. The commands are in `scripts/reproduce.py` as optional steps (no cache; about $17 nominal), run with `--with-optional`.
@@ -611,9 +612,9 @@ Two changes; the gate, the reasoning-type model and λ (still 30) are unchanged 
 
 Accuracy / answer cost per 1,000 questions (writing excluded); CueMem's numbers are N9's results on the same questions.
 
-> **N12 correction.** The LongMemEval row was measured with the session-ID leak (§3.5). When the retrieved items' headers show the raw session IDs again, Mem0 wins 9 questions and loses 3 (p = 0.15), the largest change of any method; the published 83.0% may be a few points high. Rerun after the fix with the same configuration: L1 90.0%, Mem0 79.0%. After the fix, L1 against Mem0 is +15 / −4 (p = 0.019), so L1's lead holds. The LoCoMo row is not affected.
+> **N12 correction.** The LongMemEval row was measured with the session-ID leak (§3.5). When the retrieved items' headers show the raw session IDs again, Mem0 wins 9 questions and loses 3 (p = 0.15), the largest change of any method; the published 83.0% may be a few points high. Rerun after the fix with the same configuration: L1 90.0%, Mem0 79.0%. After the fix, L1 against Mem0 is +15 / −4 (nominal p = 0.019, adjusted 0.058), so L1's lead does not shrink. The LoCoMo row is not affected.
 
-- On LoCoMo, L1 ties with Mem0 (+15 / −14); on LongMemEval it is 9 points higher (+13 / −4, p = 0.049). The controller is higher on both, just short of significance (p = 0.076 and 0.078). Mem0's nominal write cost is 2.3–2.9 times CueMem's.
+- On LoCoMo, L1 ties with Mem0 (+15 / −14); on LongMemEval it is 9 points higher (+13 / −4, nominal p = 0.049; 0.147 after a Holm correction over the 3 comparisons against Mem0 in this run, so not significant). The controller is higher on both, just short of significance (p = 0.076 and 0.078). Mem0's nominal write cost is 2.3–2.9 times CueMem's.
 - Mem0's retrieved memories almost always come from the evidence sessions (session recall 99–100%); it loses points on what the memories contain: temporal reasoning (78% against L1's 96%), knowledge updates (81% against 100%) and details the assistant gave (82% against 100%). Mem0 2.x only adds, keeps no validity periods, and extracts mostly the user's facts; that is what CueMem's write path (facts on two timelines, plus the raw turns) covers. Mem0 is better on preference questions.
 - Qwen's JSON mode sometimes returns a bare list of memories, and Mem0 then drops the whole session (8 of about 5,400 extractions). The adapter adds the missing wrapper, and the 7 affected spaces were rebuilt.
 - Limitations: one run per dataset; Mem0 runs on CueMem's models rather than its default OpenAI models; the Mem0 paper's numbers (different reader and judge) are not comparable.
@@ -631,7 +632,7 @@ Protocol (D-055): open-source mem0ai 2.2.1, writing with its own pipeline (one `
 | MemLens 32K | 96.8% | 0.93 | 58.1% / 61.4% | 0.87 |
 | MemLens 128K | 96.7% | 0.93 | 56.8% / 59.6% | 1.00 |
 
-Of the 17 key comparisons, one changes significance: L1 below full context on LoCoMo, +65 / −92 (p = 0.038) → +64 / −77 (p = 0.31). Ranking changes are only between adjacent methods less than 2 points apart. The second judge is more lenient everywhere; it is also the main reader and may favour its own answers, so it is used to test the conclusions, not to replace the primary judge.
+Of the 17 key comparisons, one changes significance: L1 below full context on LoCoMo, +65 / −92 (p = 0.038) → +64 / −77 (p = 0.31). That statement is uncorrected: after a Holm correction over each dataset's key comparisons under each judge, the controller against L2 on LongMemEval and L1 against full context on LoCoMo under the primary judge, and the controller and B6a against L2 on LongMemEval and the controller against L1 on LoCoMo under the second judge, are all only nominal (`second_judge-holm.json`). Ranking changes are only between adjacent methods less than 2 points apart. The second judge is more lenient everywhere; it is also the main reader and may favour its own answers, so it is used to test the conclusions, not to replace the primary judge.
 
 **The same configuration, run again.** With the LLM cache off, on the same memory spaces:
 
@@ -641,7 +642,7 @@ Of the 17 key comparisons, one changes significance: L1 below full context on Lo
 | | Controller | 90.5% | 90.2% | 8 / 7 (3.8%) |
 | LoCoMo | L1 | 79.7% | 80.5% | 16 / 26 (3.6%) |
 
-At temperature 0, more than half of the answers are still worded differently; accuracy moves within ±1 point and 3–4% of questions flip. **Comparisons about 1 point apart are not stable conclusions**: "L1 is 2.3 points below full context on LoCoMo" shrinks to 1.5 points in the rerun and is not significant under the second judge, so the two are close; the controller's 10 / 10 against L1 on LongMemEval is the same. The large conclusions (L1 against full context on LongMemEval, +84 / −14; the controller against L2) are far outside this noise.
+At temperature 0, more than half of the answers are still worded differently; accuracy moves within ±1 point and 3–4% of questions flip. **Comparisons about 1 point apart are not stable conclusions**: "L1 is 2.3 points below full context on LoCoMo" shrinks to 1.5 points in the rerun and is not significant under the second judge, so the two are close; the controller's 10 / 10 against L1 on LongMemEval is the same. The large conclusions (L1 against full context on LongMemEval, +84 / −14; the controller against L2) are far outside this noise. The rerun used the same memory spaces, so it leaves out write-path randomness, and this noise is a lower bound.
 
 Human audit: 50 judgements were sampled from N9, stratified by dataset (LongMemEval 15, LoCoMo 15, MemLens 20) and half judged correct, half wrong (`scripts/n11_audit.py`), then checked by hand. The hand labels agree with the judge on all 48 that were labelled (48 / 48; the 95% confidence interval goes down to about 93%). The other 2 are LoCoMo items that were left unlabelled; both judges marked them wrong. The second judge also scored 44 of the 50 and agreed with the primary judge on 42. The 2 disagreements are LoCoMo list questions whose answers leave out one item of the gold list: the primary judge marked them wrong, as the official rule requires for a partial answer, the second judge marked them right, and the hand labels side with the primary judge. The sample is small: it finds no clear judging errors, which is consistent with the 94.7–97.9% agreement between the two judges.
 
@@ -722,11 +723,11 @@ Accuracy / answer cost per 1,000 questions (writing excluded):
 | MA A-MEM (k = 10) | 58.0% / $3.48 | 59.5% / $0.88 |
 | MA A-MEM, k = 40 (sensitivity) | 75.0% / $8.97 | 65.0% / $2.49 |
 
-- **Under pds, L2 is significantly above all five external systems**: against Mem0 +17 / −5 (p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002), Graphiti +62 / −6 (p < 0.001) and A-MEM +64 / −6 (p < 0.001); against A-MEM with k = 40 it is +32 / −8 (p < 0.001).
-- **L1 is not significantly different from Mem0, LangMem or Cognee**: under pds, +14 / −11 (p = 0.69), +24 / −15 (p = 0.20) and +20 / −10 (p = 0.10). It is significantly above Graphiti (+55 / −8) and A-MEM (+56 / −7, both p < 0.001), and above A-MEM with k = 40 at +27 / −12 (p = 0.024). In N11, on the original configuration, L1 and Mem0 were also level (81.0% against 80.5%).
-- **Under pq, CueMem leads by more**: L2 against Mem0 +24 / −9 (p = 0.014) and against Cognee +30 / −8 (p < 0.001); L1 against Cognee +25 / −10 (p = 0.017) and against Mem0 +19 / −11 (p = 0.20); against A-MEM, both L1 and L2 at p < 0.001. This is CueMem's home ground (§13.1).
+- **Under pds, L2 is above all five external systems**: against Mem0 +17 / −5 (nominal p = 0.017), LangMem +25 / −7 (p = 0.002), Cognee +27 / −8 (p = 0.002), Graphiti +62 / −6 (p < 0.001) and A-MEM +64 / −6 (p < 0.001); against A-MEM with k = 40 it is +32 / −8 (p < 0.001). With a Holm correction over the 10 tests of "L1 and L2 against the external systems", the lead over Mem0 is 0.068 and no longer significant; the other four stay significant (LangMem and Cognee both adjusted to 0.011).
+- **L1 is not significantly different from Mem0, LangMem or Cognee**: under pds, +14 / −11 (p = 0.69), +24 / −15 (p = 0.20) and +20 / −10 (p = 0.10). It is significantly above Graphiti (+55 / −8) and A-MEM (+56 / −7, both p < 0.001), and above A-MEM with k = 40 at +27 / −12 (p = 0.024; unchanged after correction within the sensitivity family, 0.19 in the 20-test whole-document family). In N11, on the original configuration, L1 and Mem0 were also level (81.0% against 80.5%).
+- **Under pq, CueMem leads by more**: L2 against Mem0 +24 / −9 (p = 0.014) and against Cognee +30 / −8 (p < 0.001); L1 against Cognee +25 / −10 (p = 0.017) and against Mem0 +19 / −11 (p = 0.20); against A-MEM, both L1 and L2 at p < 0.001. The two comparisons against Mem0 and Cognee are adjusted to 0.041 within their family and stay significant, but not in the whole-document family (0.12 and 0.13). This is CueMem's home ground (§13.1).
 - **A-MEM is sensitive to how many notes it retrieves**: with the paper's main setting, k = 10, it is level with naive retrieval; with k = 40 it gains 17 points under pds (vs k = 10, +40 / −6, p < 0.001), but at 29,550 input tokens per question, 2.4 times L2's 12,255.
-- **L2 is not significantly different from full context**: +12 / −7 under pds (p = 0.36), +19 / −9 under pq (p = 0.087). The controller sits between L1 and L2; under pds, L2 beats it +7 / −0 (p = 0.016).
+- **L2 is not significantly different from full context**: +12 / −7 under pds (p = 0.36), +19 / −9 under pq (p = 0.087). The controller sits between L1 and L2; under pds, L2 beats it +7 / −0 (nominal p = 0.016; 0.078 after correcting with the 7 tests of "CueMem and the references").
 
 ### 13.3 Switching models: Graphiti and LangMem are sensitive to the extraction model
 
@@ -750,7 +751,7 @@ The external systems' prompts were written for their default models, and a chang
 
 ### 13.4 Limitations
 
-- **One dataset, one run per configuration.** On 200 questions, differences of a few points (L1 against Mem0, for example) are within the noise: in N11's rerun, accuracy moved within ±1 point and 3–4% of questions flipped (§12.3). On LongMemEval, the only external comparison is Mem0: N11's numbers carry the leak (§12.2), and there is one post-fix rerun on test100r, L1 90.0% against Mem0 79.0% (§3.5).
+- **One dataset, one run per configuration.** On 200 questions, differences of a few points (L1 against Mem0, for example) are within the noise: in N11's rerun, accuracy moved within ±1 point and 3–4% of questions flipped (§12.3). The paired tests are conditional on one build per system; N11's rerun used the same memory spaces and leaves out write-path randomness, which is the largest random component for systems such as Graphiti and A-MEM, so that noise is a lower bound. Repeated builds and a cluster bootstrap by conversation were not done (D-069). On LongMemEval, the only external comparison is Mem0: N11's numbers carry the leak (§12.2), and there is one post-fix rerun on test100r, L1 90.0% against Mem0 79.0% (§3.5).
 - **The judge is related to the reader** (§13.1).
 - **Not each system's default setup.** The external systems run on DeepSeek or Qwen models and embeddings, and their memories go to the shared reader and prompt instead of their own answer prompts. Numbers from their papers and official reports (different models, readers and judges) are not comparable.
 - **Adapter-level additions needed to get the systems to run:**

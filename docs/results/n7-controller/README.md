@@ -164,6 +164,8 @@ LoCoMo 上只要 20 条（其中约三分之一是记忆题），门控就学会
 
 qwen3.8-flash 下 B3 对其他方法（配对）：LongMemEval 对 B6、B6r、always-L2 都是 +12 / −3（p = 0.035）；LoCoMo 对 B6 +40 / −8、对 B6r +43 / −11（p < 0.001），对 always-L2 +28 / −13（p = 0.028）。
 
+表与上一段的 p 都没有校正。按数据集分族做 Holm 校正后（[h3-holm.json](h3-holm.json)，`scripts/multiplicity.py`，D-069）：LongMemEval 上 B3 对 B6、B6r、always-L2 的三个 +12 / −3 都只是名义显著（校正后 0.105）；LoCoMo 上换回答模型前后 always-L1（+13 / −30）与 B6r（+13 / −29）的下降也只是名义显著（0.055、0.059），B6 的下降（校正后 0.026）与 B3 对 B6、B6r（p < 0.001）、对 always-L2（0.028）仍显著。下面"H3 不成立"的方向不变，LongMemEval 上的证据只是名义的。
+
 - **H3 不成立**：设想是"控制器在不同回答模型之间更稳定、在小模型上优势更大"。实际是固定档位与控制器在新模型上掉了 2–7 个点，B3 持平或变好。qwen3.8-flash 读一大段静态的检索结果（L1 约 5k tokens、L2 约 12k tokens）不如 deepseek-flash，但在"决定查什么、读几条结果、再决定"的循环里更强：LongMemEval 上平均只检索 1.9 次（deepseek-flash 2.8 次），LoCoMo 上 1.4 次（2.2 次），回答长度相近。
 - **"小模型"那一半没有测到**：qwen3.8-flash 与 deepseek-flash 是同一档的便宜模型，不是更小的模型。
 - **判分的家族偏差**：qwen3.8-flash 与判分模型 qwen3.8-max 同一家族（D-008 要避开）。同一个回答模型下比较方法之间的差异仍然有效；两个回答模型之间的绝对准确率不能直接比。

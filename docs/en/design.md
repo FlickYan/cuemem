@@ -593,7 +593,7 @@ QwenCloud does not offer qwen3-vl-embedding, which would embed an image together
 
 - **Re-perception** adds 12 points at 32K and 7 points at 128K over captions alone (H5 supported).
 - **L2 with re-perception** scores 65.6% / 64.6% at 32K / 128K, against 52.3% / 46.2% for a long-context model looking at the images directly, at 1/2 and 1/9 of its cost.
-- **Stability with length**: from 32K to 128K, full context and L1 degrade significantly; only L2 holds.
+- **Stability with length**: from 32K to 128K, full context and L1 degrade (p = 0.012 and 0.016, uncorrected; they stay significant after a Holm correction over these three pairs, but not once the two other methods compared across lengths are counted; see the note on D-037); only L2 holds.
 - **Two intuitions were not supported**:
   - context-aware captions did not beat isolated captions (H6);
   - text-to-image search greatly improved retrieval but not accuracy.
