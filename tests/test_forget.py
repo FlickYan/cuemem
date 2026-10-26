@@ -568,3 +568,75 @@ def test_forget_other_session_during_background_reconciliation(
         assert all(j["status"] == "done" for j in system.db.get_jobs("demo"))
         core = system.core_memory("demo")
         assert core is not None and "林晓" not in core.text and "新加坡" in core.text
+
+
+def _one_turn(session_id: str, text: str) -> SessionIn:
+    return SessionIn(
+        session_id=session_id,
+        started_at=datetime(2026, 9, 1, 10),
+        turns=[TurnIn(role="user", text=text)],
+    )
+
+
+@pytest.mark.parametrize("how", ["forget", "delete_space"])
+def test_reads_go_on_while_a_forget_waits_for_background_consolidation(
+    n3_settings: Settings, fake_api: FakeAPI, how: str
+) -> None:
+    """后台线程正在巩固（慢的抽取、限流退避、长的重放）时来了遗忘：遗忘等巩固锁的这段时间里，
+    这个空间的检索照常进行。以前遗忘先拿读写门、再等巩固锁，新的读取排在它后面，要等整轮
+    巩固做完。"""
+    entered, release = threading.Event(), threading.Event()
+
+    def extract(prompt: str) -> dict[str, Any]:
+        if "slow" in prompt:
+            entered.set()
+            release.wait(10)  # 后台线程里慢的抽取
+        return EMPTY_EXTRACTION
+
+    fake_api.chat_replies = [ScriptedModel(extract)]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        system.append("alice", _one_turn("s1", f"My PIN is {PIN}"), 0)
+        system.consolidate("alice")
+        worker = system.start_worker()
+        system.append("alice", _one_turn("s2", "a slow session to extract"), 0)
+        assert entered.wait(5)
+        if how == "forget":
+            forgetting, out = _in_thread(system.forget, "alice", session_ids=["s1"])
+        else:
+            forgetting, out = _in_thread(system.delete_space, "alice")
+        forgetting.join(0.3)
+        assert forgetting.is_alive()  # 等着后台线程的巩固
+        reading, found = _in_thread(system.retrieve, "alice", "What is my PIN?", mode="l1")
+        reading.join(2)
+        went_on = not reading.is_alive()
+        release.set()
+        forgetting.join(10)
+        reading.join(10)
+        worker.wait()
+
+        assert went_on, "检索排在等巩固锁的遗忘后面"
+        [recall] = found
+        assert not isinstance(recall, Exception)
+        [report] = out
+        assert not isinstance(report, Exception) and report.turns_deleted >= 1
+        assert PIN not in json.dumps([t.text for t in system.db.get_turns("alice")])
+
+
+def test_forget_inside_a_read_is_refused_instead_of_deadlocking(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """持有读（reading）的线程里遗忘、删除空间或巩固：直接报错。遗忘先拿巩固锁、再等进行中的
+    读取做完，读取里再去拿巩固锁就互相等死（两个各自持有读的线程同时遗忘，以前也会等死）。"""
+    fake_api.chat_replies = [ScriptedModel(lambda prompt: EMPTY_EXTRACTION)]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        system.append("alice", _one_turn("s1", "a note to keep around"), 0)
+        with system.reading("alice"):
+            for call in (
+                lambda: system.forget("alice", session_ids=["s1"]),
+                lambda: system.delete_space("alice"),
+                lambda: system.consolidate("alice"),
+            ):
+                with pytest.raises(RuntimeError, match="reading"):
+                    call()
+            assert len(system.db.get_turns("alice")) == 1
+        assert system.forget("alice", session_ids=["s1"]).turns_deleted == 1

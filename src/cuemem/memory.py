@@ -232,7 +232,11 @@ def _without_images(text: str) -> str:
 class _ReadGate:
     """一个空间的读写门（见 MemorySystem.reading）：读取可以同时进行，遗忘独占。遗忘先等进行中的
     读取做完，等着的时候新来的读取排在它后面（不会一直等不到）。同一线程里读可以重入（ask 里的
-    检索、Agent 一轮对话里的检索），遗忘里的读取直接通过，删除空间里的遗忘可以重入。"""
+    检索、Agent 一轮对话里的检索），遗忘里的读取直接通过，删除空间里的遗忘可以重入。
+
+    持有读的线程不能再拿独占（遗忘、删除空间与巩固在 MemorySystem 里先查 reading_here、报错）：
+    独占在巩固锁之后拿（锁的顺序见 MemorySystem.reading），读取里遗忘会与另一个拿着巩固锁、
+    等这个读取做完的遗忘互相等死。"""
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
@@ -263,6 +267,10 @@ class _ReadGate:
                     self._readers -= 1
                     self._cond.notify_all()
 
+    def reading_here(self) -> bool:
+        """本线程持有读（不算遗忘自己的读：那时它已经独占了）。"""
+        return self._writer != threading.get_ident() and getattr(self._local, "depth", 0) > 0
+
     @contextmanager
     def exclusive(self) -> Iterator[None]:
         me = threading.get_ident()
@@ -270,10 +278,9 @@ class _ReadGate:
             if self._writer == me:
                 self._writes += 1
             else:
-                own = int(getattr(self._local, "depth", 0) > 0)  # 本线程自己持有的读不用等
                 self._waiting += 1
                 try:
-                    while self._writer is not None or self._readers > own:
+                    while self._writer is not None or self._readers:
                         self._cond.wait()
                 finally:
                     self._waiting -= 1
@@ -568,8 +575,30 @@ class MemorySystem:
         """读这个空间的记忆、并把结果写下来（回答写进 LLM 缓存与 trace，Agent 的回复写进日志）时
         持有：可以同时有多个。遗忘等进行中的读取都做完才开始，期间新的读取等它做完——否则回答
         模型还在生成时遗忘清掉了缓存与 trace，回答随后又带着被删的内容写进去。同一线程里可以
-        重入。"""
+        重入。
+
+        锁的顺序：先巩固锁（Consolidator.exclusive），后读写门。遗忘与删除空间按这个顺序拿
+        （见 _exclusive）：等后台线程做完这一轮巩固的时候还没拿读写门，这个空间的读取照常进行，
+        拿到巩固锁之后才等进行中的读取做完、挡住新的读取。持有读的时候不拿巩固锁：在 reading
+        里遗忘、删除空间或巩固（包括 SDK 的 add(wait=True)、update 与 close_session(wait=True)）
+        报 RuntimeError，否则它等巩固锁、拿着巩固锁的遗忘等它的读，谁都动不了。"""
         return self._gate(space_id).shared()
+
+    def _not_reading(self, space_id: str) -> None:
+        """本线程持有这个空间的读时不能遗忘、删除空间或巩固（见 reading 里锁的顺序）。"""
+        if self._gate(space_id).reading_here():
+            raise RuntimeError(
+                f"持有空间 {space_id!r} 的读取（reading）时不能遗忘、删除空间或巩固："
+                "它们要先拿巩固锁，再等进行中的读取做完"
+            )
+
+    @contextmanager
+    def _exclusive(self, space_id: str) -> Iterator[None]:
+        """遗忘与删除空间独占这个空间：先拿巩固锁，再拿读写门（见 reading）。同一线程里可以
+        重入（删除空间里的遗忘）。"""
+        self._not_reading(space_id)
+        with self.consolidator.exclusive(space_id), self._gate(space_id).exclusive():
+            yield
 
     def _gate(self, space_id: str) -> _ReadGate:
         with self._gates_guard:
@@ -607,7 +636,10 @@ class MemorySystem:
 
         进行中的会话拿到锁之后再读（重建时在清空之后读，见 Consolidator.rebuild）：等锁可能要等
         后台线程做完一整轮巩固，这期间新开的会话不能被抽取半段，结束的会话也不能没有任务。
+
+        不能在这个空间的 reading 里调用（RuntimeError，见 reading 里锁的顺序）。
         """
+        self._not_reading(space_id)
         with (
             self.consolidator.exclusive(space_id),  # 清空重建不能和后台线程的巩固交错
             start_trace("consolidate", self.tracer, space=space_id) as trace,
@@ -667,7 +699,10 @@ class MemorySystem:
 
         整个过程持有这个空间的巩固锁（Consolidator.exclusive）：后台线程正在巩固时先等它做完，
         否则它会把由被删轮次抽出的事实、向量与缓存写回来。进行中的回答、检索与 Agent 的对话
-        也先等它们做完（reading），否则它们随后把看过的被删内容写进缓存、trace 与日志。
+        也先等它们做完（reading），否则它们随后把看过的被删内容写进缓存、trace 与日志。先拿
+        巩固锁、后拿读写门（见 reading）：等后台巩固的时候读取照常进行，以前先拿读写门，这个
+        空间的每次读取都要等整轮巩固做完（可能是几分钟的导入、重放或限流退避）。不能在这个空间
+        的 reading 里调用（RuntimeError）。
 
         重放失败（例如对账时余额不足）时照样清理 trace、向量缓存与 LLM 缓存（标记的条目只留下
         重放已经用到的），再把异常抛出去：原始日志已经删了，重试时找不到要删的发言。没做完的
@@ -677,8 +712,8 @@ class MemorySystem:
         """
         started = time.perf_counter()
         with (
-            self._gate(space_id).exclusive(),  # 先于巩固锁：读取不会去拿巩固锁
-            self.consolidator.exclusive(space_id),
+            # 先巩固锁：等后台巩固时读取照常；再读写门：清理在进行中的读取做完之后开始
+            self._exclusive(space_id),
             start_trace("forget", self.tracer, space=space_id) as trace,
         ):
             targets, cascaded = self._forget_targets(
@@ -1081,8 +1116,9 @@ class MemorySystem:
         """删除整个记忆空间（SDK 的 delete_all，N12）：先按会话遗忘全部日志（连带清理缓存、
         trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合。
 
-        两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。读写门与遗忘一样先拿。"""
-        with self._gate(space_id).exclusive(), self.consolidator.exclusive(space_id):
+        两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。读写门与遗忘一样在巩固锁
+        之后拿（见 _exclusive），里面的遗忘重入两把锁。不能在这个空间的 reading 里调用。"""
+        with self._exclusive(space_id):
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.vectors.delete_space(space_id)  # 先于数据库：旧名字的集合按库里的记忆单元核对归属
             self.db.delete_space(space_id)
