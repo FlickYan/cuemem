@@ -254,8 +254,10 @@ class Memory:
         wait=True：同步抽取，返回新增与取代的事实（Mem0 的 ADD / UPDATE 事件）；run 进行中时
         不能用（这段对话结束时才抽取），会报 ValueError。发言写进去之后抽取出错（模型供应商
         余额不足、限流等）时不抛出：status 是 "queued"，error 写明原因，下次巩固时补上——抛出的话
-        调用方重试就写了两遍。写进去之前出错（向量接口不可用等）时照常抛出，什么都没写，可以原样
-        重试；写进去之后 trace 写不进去时只记一条警告（见 core/trace.py 的 start_trace）。
+        调用方重试就写了两遍。这个会话的抽取失败（不抛出，记在任务上）时同样（以前 status 照样是
+        "consolidated"、没有 error）。写进去之前出错（向量接口不可用等）时照常抛出，什么都没写，
+        可以原样重试；写进去之后 trace 写不进去时只记一条警告（见 core/trace.py 的 start_trace）。
+        后台抽取的状态与出错见 status()。
         """
         space = space_for(user_id, agent_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
@@ -310,6 +312,9 @@ class Memory:
                 out["results"] = _events(self.system, space, before, user_id, agent_id)
                 out["status"] = "consolidated"
                 out["consolidation"] = report.as_dict()
+                if sid in report.failed:  # 这个会话的抽取失败了（不抛出）：与上面一样说明
+                    out["status"] = "queued"
+                    out["error"] = _not_extracted(_job_error(self.system, space, sid))
         else:
             out["status"] = "queued"
         return out
@@ -432,6 +437,7 @@ class Memory:
             message = "Memory updated"
         elif sid in report.failed:
             message = failed
+            extra["error"] = _not_extracted(_job_error(self.system, space, sid))
         else:
             # 没有抽出取代它的事实：这句更正也不留在日志里。否则它作为对话片段与原来那条一起被
             # 检索出来、随导出带走，换了抽取模型重建时还可能取代原来那条——与"没有改"不符
@@ -462,9 +468,50 @@ class Memory:
         return self.system.consolidate(space_for(user_id, agent_id), rebuild=rebuild).as_dict()
 
     def wait(self) -> None:
-        """等后台线程把已登记的抽取做完（测试、脚本退出前用）。"""
+        """等后台线程把已登记的抽取做完（测试、脚本退出前用）。抽取失败时不抛出（与 Mem0
+        相同），后台线程记一条警告日志；失败的会话与原因见 status()。"""
         if self.system.worker is not None:
             self.system.worker.wait()
+
+    def status(self, *, user_id: str | None = None, agent_id: str | None = None) -> dict[str, Any]:
+        """这个用户（或 Agent）的记忆的抽取状态：pending 是等着抽取的会话数；failed 是抽取失败的
+        会话，每个带 session_id、attempts（失败了几次）、error（出错的第一行）与 retry_at（后台
+        线程什么时候自动重试，ISO 时间；不再自动重试——失败次数到了上限、没有后台线程——时为
+        None，要显式地 consolidate()）；background 是有没有后台线程；errors 是后台线程在这个空间
+        最近的几条出错。以前抽取失败（没配好密钥、余额不足）时 add() 照常返回、wait() 正常结束，
+        get_all() 一直是空的，SDK 里看不到原因。"""
+        from cuemem.write.consolidate import MAX_ATTEMPTS, RETRY_BASE_S
+        from cuemem.write.extract import PIPELINE_VERSION
+
+        space = space_for(user_id, agent_id)
+        jobs = self.system.db.get_jobs(space)
+        worker = self.system.worker
+        base_s = worker.retry_base_s if worker is not None else RETRY_BASE_S
+        failed = []
+        for job in jobs:
+            if job["status"] != "failed":
+                continue
+            retry_at = None
+            due = job["attempts"] < MAX_ATTEMPTS and job["version"] == PIPELINE_VERSION
+            if due and worker is not None:  # 与后台线程的退避相同（Consolidator.retry_due）
+                wait = timedelta(seconds=base_s * 4 ** max(job["attempts"] - 1, 0))
+                retry_at = (datetime.fromisoformat(job["updated_at"]) + wait).isoformat()
+            lines = (job["error"] or "").splitlines()
+            failed.append(
+                {
+                    "session_id": job["session_id"],
+                    "attempts": job["attempts"],
+                    "error": lines[0][:300] if lines else "",
+                    "retry_at": retry_at,
+                }
+            )
+        return {
+            "pending": sum(1 for j in jobs if j["status"] == "pending"),
+            "failed": failed,
+            "background": worker is not None,
+            # 只给这个空间的：worker.errors 里有别的用户的空间 ID 与出错
+            "errors": worker.errors_for(space)[-3:] if worker is not None else [],
+        }
 
     # ---------- 读取 ----------
 
@@ -1265,15 +1312,30 @@ def _answer_out(answer: Answer) -> dict[str, Any]:
     }
 
 
-def _not_extracted(exc: Exception) -> str:
+def _not_extracted(error: Exception | str) -> str:
     """发言已经写进原始日志（巩固任务也登记了），同步抽取却出错（例如对账时余额不足、向量接口
     暂时不可用）时回给调用方的说明。不抛出：抛出的话调用方以为没写进去，重试就写了两遍。没做完的
-    任务留着，下次巩固（consolidate()，或后台线程下一次处理这个空间）时补上。"""
-    logger.warning("Extraction failed after the messages were stored: %s", exc, exc_info=True)
+    任务留着，下次巩固（consolidate()，或后台线程下一次处理这个空间）时补上。
+
+    error：巩固抛出的异常，或者抽取失败的任务记下的出错（"<类型>: <说明>"，见 _job_error：逐个
+    会话的抽取失败不抛出）。日志只记出错的第一行：结构化输出不合格时，之后几行引着模型的输出。"""
+    if isinstance(error, Exception):
+        name, text = type(error).__name__, str(error)
+    else:
+        name, _, text = (error or "Error: unknown").partition(": ")
+    lines = text.splitlines()
+    first = lines[0][:300] if lines else ""
+    logger.warning("Extraction failed after the messages were stored: %s: %s", name, first)
     return (
-        f"Extraction failed ({type(exc).__name__}: {str(exc)[:300]}). The messages are stored; "
+        f"Extraction failed ({name}: {text[:300]}). The messages are stored; "
         "their extraction is retried on the next consolidation. Do not add them again."
     )
+
+
+def _job_error(system: MemorySystem, space: str, session_id: str) -> str:
+    """这个会话抽取失败的任务记下的出错（"<类型>: <说明>"）。"""
+    jobs = system.db.get_jobs(space, status="failed")
+    return next((j["error"] or "" for j in jobs if j["session_id"] == session_id), "")
 
 
 def _events(

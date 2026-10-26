@@ -11,6 +11,7 @@
     DELETE /api/v1/memories/{id}             delete（dry_run）
     DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id）
     POST   /api/v1/reset                     reset
+    GET    /api/v1/status                    status（抽取的状态：待处理、失败的会话与原因）
     以及 answer、profile、runs（open_run）、runs/end（end_run）、consolidate、wait、export、
     import（load）、spaces。
 
@@ -430,6 +431,14 @@ def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) ->
     def wait() -> dict[str, bool]:
         memory.wait()
         return {"ok": True}
+
+    @router.get("/status")
+    def status(
+        http: Request, user_id: str | None = None, agent_id: str | None = None
+    ) -> dict[str, Any]:
+        with _sdk_errors():
+            allow(http, user_id, agent_id)
+            return memory.status(user_id=user_id, agent_id=agent_id)
 
     @router.get("/export")
     def export(

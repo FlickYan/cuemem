@@ -171,6 +171,11 @@ class MemoryClient:
         """等服务端的后台线程把已登记的抽取做完。"""
         self._call("POST", "/wait")
 
+    def status(self, *, user_id: str | None = None, agent_id: str | None = None) -> dict[str, Any]:
+        """抽取的状态：待处理与失败的会话、失败的原因（见 Memory.status）。"""
+        params = {"user_id": user_id, "agent_id": agent_id}
+        return self._call("GET", "/status", params=params)
+
     # ---------- 读取 ----------
 
     def search(

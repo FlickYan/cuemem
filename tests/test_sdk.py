@@ -597,6 +597,82 @@ def test_extraction_errors_after_the_write_are_reported_not_raised(
     assert [t.id for t in corrections] == update["turn_ids"]
 
 
+def without_balance_for_extracting(model: ScriptedModel, fake_api: FakeAPI) -> dict[str, bool]:
+    """抽取时模型供应商余额不足（HTTP 402；密钥不对、没充值时一样）；开关设成 False 就恢复。"""
+    broke = {"on": True}
+
+    def reply(body: dict[str, Any]) -> Any:
+        system = body["messages"][0]["content"]
+        if broke["on"] and system.startswith("You build the long-term memory"):
+            return NO_BALANCE
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    return broke
+
+
+def test_add_wait_reports_a_failed_extraction(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """add(wait=True) 时这个会话的抽取失败（不抛出，记在任务上）：status 是 "queued"、error 写明，
+    与巩固抛出时相同。以前 status 是 "consolidated"、没有 error，调用方以为抽取做完了。update 的
+    更正抽取失败时同样带上 error。没有后台线程时 status() 里的失败不会自动重试（retry_at 是
+    None）。"""
+    broke = without_balance_for_extracting(model, fake_api)
+    out = memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    assert out["status"] == "queued" and out["results"] == [] and "consolidation" in out
+    assert "Error code: 402" in out["error"] and "Do not add them again" in out["error"]
+    (failed,) = memory.status(user_id="alice")["failed"]
+    assert failed["session_id"] == out["session_id"] and failed["retry_at"] is None
+    assert memory.status(user_id="alice")["background"] is False
+
+    broke["on"] = False
+    memory.consolidate(user_id="alice")
+    (berlin,) = memory.get_all(user_id="alice")["results"]
+    broke["on"] = True
+    update = memory.update(berlin["id"], "I live in Rome")
+    assert update["message"].startswith("Correction logged, but extraction failed")
+    assert "Error code: 402" in update["error"]
+
+
+def test_background_extraction_failure_is_logged(
+    n3_settings: Settings,
+    fake_api: FakeAPI,
+    model: ScriptedModel,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """后台抽取失败（余额不足、密钥不对）时记一条警告日志，写明空间与原因。以前只记在
+    worker.errors 里：add() 照常返回、wait() 正常结束，get_all() 一直是空的，什么都看不到。
+    同一个空间同一种出错只记一次；这个空间之后有一次巩固顺利做完了，再出错时再记。"""
+    broke = without_balance_for_extracting(model, fake_api)
+    with (
+        Memory(n3_settings, http_client=fake_api.client()) as m,
+        caplog.at_level("WARNING", "cuemem.write.consolidate"),
+    ):
+
+        def warnings() -> list[str]:
+            return [r.getMessage() for r in caplog.records if r.name == "cuemem.write.consolidate"]
+
+        for text in ("I live in Berlin", "I like jazz"):
+            assert m.add(text, user_id="alice")["status"] == "queued"
+            m.wait()
+        assert m.get_all(user_id="alice")["results"] == []
+        (first,) = warnings()
+        assert "'alice'" in first and "402" in first and "Memory.status()" in first
+        state = m.status(user_id="alice")
+        assert len(state["failed"]) == 2 and state["background"] is True
+        assert all(f["attempts"] == 1 and f["retry_at"] for f in state["failed"])
+        assert state["errors"] and all("402" in e for e in state["errors"])
+
+        broke["on"] = False
+        m.add("I like tea", user_id="alice")  # 顺利做完：之后同样的出错再记
+        m.wait()
+        broke["on"] = True
+        m.add("I like rain", user_id="alice")
+        m.wait()
+        assert len(warnings()) == 2
+
+
 def test_a_delete_whose_rebuild_fails_still_reports_the_deletion(
     memory: Memory, model: ScriptedModel, fake_api: FakeAPI
 ) -> None:

@@ -307,13 +307,15 @@ class ChatService:
         ]
 
     def status(self, space_id: str) -> dict[str, Any]:
+        """巩固任务的状态与后台线程最近的出错，都只是这个空间的：以前 errors 是全部空间的最近
+        3 条，限定作用域的令牌借自己的空间就看得到别的用户的空间 ID 与出错里引着的模型输出。"""
         jobs = self.system.db.get_jobs(space_id)
         worker = self.system.worker
         return {
             "pending": sum(1 for j in jobs if j["status"] == "pending"),
             "failed": sum(1 for j in jobs if j["status"] == "failed"),
             "done": sum(1 for j in jobs if j["status"] == "done"),
-            "errors": list(worker.errors)[-3:] if worker is not None else [],
+            "errors": worker.errors_for(space_id)[-3:] if worker is not None else [],
         }
 
     # ---------- 遗忘与巩固 ----------

@@ -787,6 +787,8 @@ class MemorySystem:
                         removed = self.db.clear_derived(space_id)
                         self.consolidator.requeue(space_id, before, skip)
                 committed = True
+                if self.worker is not None:  # 后台巩固记下的出错可能引着被删的内容
+                    self.worker.drop(space_id)
 
                 # 4. 原图文件（没有别处引用的），期间新写的派生向量（通常没有），再从剩下的日志
                 #    重放。出错时任务都还在，下面的清理照样做完
@@ -1200,6 +1202,8 @@ class MemorySystem:
                         self.db.delete_meta(key)
             if purge_traces:  # 在遗忘之后：遗忘自己的 trace 也删掉
                 self.purge_space_traces([space_id])
+            if self.worker is not None:  # 遗忘里删过一遍；期间后台线程又记下的也删
+                self.worker.drop(space_id)
             self.db.scrub()
         return report
 

@@ -10,7 +10,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from scripted import ScriptedModel
-from test_sdk import AUG, SEP, moved, where_i_live, without_balance_for_reconciling
+from test_sdk import (
+    AUG,
+    SEP,
+    moved,
+    where_i_live,
+    without_balance_for_extracting,
+    without_balance_for_reconciling,
+)
 
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
@@ -96,6 +103,7 @@ def test_the_client_has_the_same_methods_and_signatures_as_memory() -> None:
     参数或方法而客户端没跟上时，这个测试失败。构造方式（from_config、from_system）只在本地有。"""
     local_only = {"from_config", "from_system"}
     assert _methods(MemoryClient) == _methods(Memory) - local_only
+    assert "status" in _methods(MemoryClient)  # 抽取的状态（第三轮体检）：本地与远程都有
     for name in [*sorted(_methods(Memory) - local_only), "__enter__", "__exit__"]:
         ours = inspect.signature(getattr(MemoryClient, name))
         theirs = inspect.signature(getattr(Memory, name))
@@ -248,6 +256,30 @@ def test_extraction_errors_after_the_write_are_not_errors(
     assert current(mem, "alice") == ["The user lives in Munich."]
     texts = [t.text for t in system.db.get_turns("alice")]
     assert texts == ["I live in Berlin", "I moved to Munich"]
+
+
+def test_status_reports_failed_extractions(
+    mem: Mem, system: MemorySystem, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """status()（/api/v1/status）：本地与远程一样给出失败的会话、失败了几次、原因与后台线程什么时候
+    重试，只看这个用户的。以前 SDK、MemoryClient 与 /api/v1 都没有办法知道后台抽取失败了。"""
+    system.start_worker()
+    without_balance_for_extracting(model, fake_api)
+    sid = mem.add("I live in Berlin", user_id="alice")["session_id"]
+    mem.wait()
+    state = mem.status(user_id="alice")
+    assert state["pending"] == 0 and state["background"] is True
+    (failed,) = state["failed"]
+    assert failed["session_id"] == sid and failed["attempts"] == 1
+    assert "Error code: 402" in failed["error"] and "\n" not in failed["error"]
+    assert datetime.fromisoformat(failed["retry_at"]) > datetime.now()
+    assert len(state["errors"]) == 1 and "402" in state["errors"][0]
+    assert mem.status(user_id="bob") == {
+        "pending": 0,
+        "failed": [],
+        "background": True,
+        "errors": [],
+    }
 
 
 def test_search_levels_and_answer(mem: Mem) -> None:

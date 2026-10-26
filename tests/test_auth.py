@@ -302,6 +302,44 @@ def test_api_space_routes_stay_in_scope(world: World, token: str) -> None:
     assert {row["space_id"] for row in listed} == REACH[token]
 
 
+def test_space_status_is_scoped_and_forgotten(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """/api/spaces/{space}/status 只给这个空间的后台出错：以前是全部空间最近的 3 条，alice 的令牌
+    借自己的空间就看得到 bob 的空间 ID 与出错（结构化输出不合格时出错里引着模型的输出）。遗忘 bob
+    的会话之后，他的出错也不再给出。"""
+    model = ScriptedModel(echo_extraction)
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "PIN" in str(body["messages"][-1]["content"]) or "schema" in str(body["messages"]):
+            return '{"facts": [{"statement": "s", "negated": "My bank PIN is 4711"}]}'
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"))
+    keys = Keys.parse(KEYS, ADMIN_TOKEN)
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, keys=keys)
+    try:
+        sid = service.remember("bob", "My bank PIN is 4711")["session_id"]
+        assert system.worker is not None
+        system.worker.wait()
+        assert any(e.startswith("bob: ") for e in system.worker.errors)
+        with TestClient(app) as http:
+            mine = http.get("/api/spaces/alice/status", headers=bearer(ALICE_TOKEN))
+            assert mine.status_code == 200 and mine.json()["errors"] == []
+            assert "bob" not in mine.text and "PIN" not in mine.text
+            his = http.get("/api/spaces/bob/status", headers=bearer(ADMIN_TOKEN)).json()
+            assert his["failed"] == 1 and his["errors"]
+            forget = {"session_ids": [sid]}
+            assert http.post("/api/spaces/bob/forget", json=forget, headers=bearer(ADMIN_TOKEN))
+            his = http.get("/api/spaces/bob/status", headers=bearer(ADMIN_TOKEN)).json()
+            assert his == {"pending": 0, "failed": 0, "done": 0, "errors": []}
+        assert not any(e.startswith("bob: ") for e in system.worker.errors)
+    finally:
+        service.close()
+
+
 def test_api_escapes_through_the_path_are_refused(world: World) -> None:
     """alice 的令牌：编码过的 "/"、"%"、".." 解出来都不是 alice 的空间；真的遗忘也做不到。"""
     headers = bearer(ALICE_TOKEN)

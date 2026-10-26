@@ -867,6 +867,11 @@ class ConsolidationWorker:
     （限流、余额不足、超时）按退避时间自动重试（见 Consolidator.retry_due），巩固整个抛出了
     异常（对账、向量化时出错）时整个空间按同样的退避再做（见 _retry_after_crash），不用等下一次
     显式的巩固。reports 与 errors 只留最近 100 条。
+
+    失败记一条警告日志（_fail）：每个空间、每种出错一次，这个空间之后有一次巩固顺利做完了，
+    同样的出错再记。以前只记在 errors 里，SDK 的用户什么都看不到：没配好模型供应商的密钥时
+    add() 照常返回、wait() 正常结束，get_all() 却一直是空的。errors 是全部空间的，给某个用户看的
+    状态（状态接口、Memory.status）用 errors_for。
     """
 
     def __init__(
@@ -882,7 +887,11 @@ class ConsolidationWorker:
         self.stop_timeout_s = 30.0
         self.closing = False  # stop() 没等到线程结束：数据库随后关闭，之后的报错不再记录
         self.reports: deque[ConsolidationReport] = deque(maxlen=100)
-        self.errors: deque[str] = deque(maxlen=100)
+        self.errors: deque[str] = deque(maxlen=100)  # "<空间>: <出错的第一行>"，全部空间的
+        # 与 errors 一一对应的（空间，出错）：按空间筛（errors_for），遗忘时删掉（drop）
+        self._failures: deque[tuple[str, str]] = deque(maxlen=100)
+        self._warned: set[tuple[str, str]] = set()  # 记过警告的（空间，出错的类型）
+        self._failures_lock = threading.Lock()  # 上面三个：别的线程读、删，这个线程写
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._retry: dict[str, float] = {}  # 空间 → 可以重试的时刻（time.monotonic），只在线程里用
         self._crashes: dict[str, int] = {}  # 空间 → 巩固连续抛出异常的次数，只在线程里用
@@ -908,6 +917,42 @@ class ConsolidationWorker:
                 self.stop_timeout_s,
             )
 
+    def errors_for(self, space_id: str) -> list[str]:
+        """这个空间最近的出错（从早到晚，不带空间 ID）。给某个用户看的状态只能用它：errors 里有
+        别的用户的空间 ID 与出错（结构化输出不合格时，出错里引着模型的输出）。"""
+        with self._failures_lock:
+            return [message for space, message in self._failures if space == space_id]
+
+    def drop(self, space_id: str) -> None:
+        """忘掉这个空间的出错（遗忘、删除空间之后）：出错里可能引着被删的内容。"""
+        with self._failures_lock:
+            kept = [(space, message) for space, message in self._failures if space != space_id]
+            self._failures.clear()
+            self._failures.extend(kept)
+            self.errors.clear()
+            self.errors.extend(f"{space}: {message}" for space, message in kept)
+            self._warned = {key for key in self._warned if key[0] != space_id}
+
+    def _fail(self, space_id: str, kind: str, message: str) -> None:
+        """记下一次失败（errors 与 errors_for），这个空间第一次出这种错（kind 是出错的类型）时
+        记一条警告日志。只留出错的第一行：结构化输出不合格时，之后几行引着模型的输出（可能有
+        用户的个人信息），日志里的遗忘删不到。"""
+        lines = message.splitlines()
+        first = lines[0][:300] if lines else ""
+        with self._failures_lock:
+            self.errors.append(f"{space_id}: {first}")
+            self._failures.append((space_id, first))
+            if (space_id, kind) in self._warned:
+                return
+            self._warned.add((space_id, kind))
+        logger.warning(
+            "Background extraction failed in space %r: %s. It is retried automatically "
+            "(up to %d attempts); see Memory.status().",
+            space_id,
+            first,
+            MAX_ATTEMPTS,
+        )
+
     def _loop(self) -> None:
         while True:
             try:
@@ -924,7 +969,7 @@ class ConsolidationWorker:
                 self._resubmit_due()  # 到期的重试排在 task_done 之前：wait() 一并等它们
             except Exception as exc:  # 后台线程不能崩：记录下来，任务保持待处理，按退避再试
                 if not self.closing:  # 关闭超时后数据库已经关了，这时的报错说明不了什么
-                    self.errors.append(f"{space_id}: {type(exc).__name__}: {exc}")
+                    self._fail(space_id, type(exc).__name__, f"{type(exc).__name__}: {exc}")
                     self._retry_after_crash(space_id)
                     self._resubmit_due()
             finally:
@@ -944,7 +989,12 @@ class ConsolidationWorker:
                 jobs = consolidator.db.get_jobs(space_id, status="failed")
                 error = next((j["error"] or "" for j in jobs if j["session_id"] in failed), "")
                 record_event("consolidate_failed", sessions=report.failed, error=error[:200])
-                self.errors.append(f"{space_id}: {len(failed)} 个会话抽取失败：{error[:200]}")
+                # 任务记下的出错是 "<类型>: <说明>"（Consolidator._run 的 fail_job）
+                kind = error.split(":", 1)[0]
+                self._fail(space_id, kind, f"{len(failed)} 个会话抽取失败：{error[:200]}")
+            elif report.sessions:  # 顺利做完了：这个空间之后同样的出错再记警告
+                with self._failures_lock:
+                    self._warned = {key for key in self._warned if key[0] != space_id}
         self.reports.append(report)
         if wait is None:
             self._retry.pop(space_id, None)
