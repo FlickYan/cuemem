@@ -345,6 +345,34 @@ def test_unknown_models_are_rejected_on_request(
         assert response.json()["error"]["code"] == "model_not_found"
 
 
+def test_serve_ends_idle_sessions(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """cuemem serve --idle-minutes（默认 30）：界面与 /api 的会话、/api/v1 的 run 与 /v1 记忆代理的
+    会话闲置这么久就结束、交给抽取。不大于 0 时在打开记忆系统之前报错。"""
+    from cuemem.api import app as app_module
+    from cuemem.api import proxy as proxy_module
+
+    idle: list[Any] = []
+    create_app = app_module.create_app
+
+    def recorded(*args: Any, **kwargs: Any) -> Any:
+        idle.append(kwargs["idle_minutes"])
+        return create_app(*args, **kwargs)
+
+    class Recorded(proxy_module.MemoryProxy):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            idle.append(self.idle_s)
+
+    monkeypatch.setattr(app_module, "create_app", recorded)
+    monkeypatch.setattr(proxy_module, "MemoryProxy", Recorded)
+    command = ["serve", "--no-ui", "--scenario", "plain"]
+    result = runner.invoke(app, [*command, "--idle-minutes", "0"])
+    assert result.exit_code == 1 and "--idle-minutes" in result.output and served == []
+    assert runner.invoke(app, command).exit_code == 0
+    assert runner.invoke(app, [*command, "--idle-minutes", "5"]).exit_code == 0
+    assert idle == [1800.0, 30.0, 300.0, 5.0] and len(served) == 2
+
+
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_scoped_keys_from_the_environment(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]

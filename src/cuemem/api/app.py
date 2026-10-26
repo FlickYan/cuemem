@@ -24,9 +24,10 @@ from __future__ import annotations
 import importlib.util
 import logging
 import shutil
+import threading
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, get_args
@@ -191,6 +192,20 @@ def _allowed_space(space: str, http: Request) -> str:
 AllowedSpace = Annotated[str, Depends(_allowed_space)]
 
 
+SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话
+
+
+def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]) -> None:
+    """清理线程的循环：每 interval_s 秒依次做一遍 jobs（结束闲置的会话），直到 stop。一个出错
+    不影响别的、也不让线程退出（记一条警告）。"""
+    while not stop.wait(interval_s):
+        for job in jobs:
+            try:
+                job()
+            except Exception:
+                logger.warning("结束闲置的会话时出错", exc_info=True)
+
+
 def create_app(
     service: ChatService,
     *,
@@ -201,6 +216,7 @@ def create_app(
     proxy: MemoryProxy | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
+    idle_minutes: float | None = 30.0,
 ) -> FastAPI:
     """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。keys：管理令牌之外还有限定
     作用域的令牌（Keys.from_env，见 api/auth.py；给了时不看 token）：每个令牌只能访问自己作用域
@@ -215,12 +231,44 @@ def create_app(
     upload_dir：上传的图片只在请求期间放在这里，写进记忆之后就删（媒体库里另存一份）。建应用时
     先清掉里面留下的图片：以前的版本一直留着上传的原图，遗忘之后磁盘上还有一份（D-021）；
     会话不跨进程，这时没有会话还在读它们。
+
+    idle_minutes：闲置这么久的会话结束、交给后台抽取（None 不结束）。应用运行期间（lifespan）
+    一个清理线程每分钟查一遍：/api 与界面的会话（ChatService.close_idle）、/api/v1 的 run
+    （Memory.close_idle_runs）与记忆代理的会话（MemoryProxy.close_idle，按它自己的 idle_minutes）。
+    以前关掉的标签页、崩溃的客户端留下的会话一直开着，服务运行期间一直不抽取；与记忆代理和各个
+    框架集成一样，默认 30 分钟。
     """
     _clear_uploads(upload_dir)
+    v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if idle_minutes is None:
+            yield
+            return
+        service.idle_minutes = idle_minutes  # 404 与界面的说明里写上
+        idle_s = idle_minutes * 60
+        jobs: list[Callable[[], object]] = [
+            lambda: service.close_idle(idle_s),
+            lambda: v1.close_idle_runs(idle_s),
+        ]
+        if proxy is not None:  # cuemem serve 里的记忆代理：以前要等下一个 /v1 请求才结束闲置的会话
+            jobs.append(proxy.close_idle)
+        stop = threading.Event()
+        args = (stop, SWEEP_INTERVAL_S, *jobs)
+        sweeper = threading.Thread(target=_sweep, args=args, name="cuemem-api-sweep", daemon=True)
+        sweeper.start()
+        try:
+            yield
+        finally:  # 退出时还开着的会话由 cuemem serve 结束（ChatService.close、close_all）
+            stop.set()
+            sweeper.join(timeout=5)
+
     app = FastAPI(
         title="CueMem",
         version=__version__,
         description="Long-term multimodal memory for LLM agents: chat, browse, forget, recall.",
+        lifespan=lifespan,
     )
     keys = keys if keys is not None else Keys.from_token(token)
     guarded = guard(keys)  # 认出令牌（principal_of）；没有配令牌时不鉴权
@@ -402,7 +450,7 @@ def create_app(
 
     app.include_router(api)
     # Mem0 形状的记忆接口（/api/v1）：与界面、记忆代理共用同一个记忆系统，鉴权与作用域相同
-    app.include_router(memories_router(Memory.from_system(service.system), dependencies=guarded))
+    app.include_router(memories_router(v1, dependencies=guarded))
     install_error_format(app)
     if proxy is not None:
         from cuemem.api.proxy import proxy_router

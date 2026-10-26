@@ -116,8 +116,9 @@ class MemoryClient:
     def open_run(
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
     ) -> str:
-        """开始一段对话（见 Memory.open_run）。客户端异常退出、没有 end_run 时，这段对话要等服务
-        重启时才交给抽取。"""
+        """开始一段对话（见 Memory.open_run）。客户端异常退出、没有 end_run 时，服务端在这段对话
+        闲置 idle_minutes（cuemem serve --idle-minutes，默认 30）分钟之后把它交给抽取；之后再往
+        这个 run_id 里 add 时重新打开，end_run 时整段再抽取一次。"""
         body = {"run_id": run_id, "user_id": user_id, "agent_id": agent_id}
         rid = str(self._call("POST", "/runs", body=body)["run_id"])
         with self._runs_lock:

@@ -9,6 +9,7 @@ import inspect
 import json
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -101,7 +102,8 @@ def _methods(cls: type) -> set[str]:
 def test_the_client_has_the_same_methods_and_signatures_as_memory() -> None:
     """MemoryClient 的方法与参数（名字、种类、缺省值、类型注解）与 Memory 逐个相同：Memory 加了
     参数或方法而客户端没跟上时，这个测试失败。构造方式（from_config、from_system）只在本地有。"""
-    local_only = {"from_config", "from_system"}
+    # close_idle_runs 是服务端结束闲置的 run 用的（cuemem serve 的清理线程），远程调用没有意义
+    local_only = {"from_config", "from_system", "close_idle_runs"}
     assert _methods(MemoryClient) == _methods(Memory) - local_only
     assert "status" in _methods(MemoryClient)  # 抽取的状态（第三轮体检）：本地与远程都有
     for name in [*sorted(_methods(Memory) - local_only), "__enter__", "__exit__"]:
@@ -374,6 +376,42 @@ def test_closing_the_client_ends_its_runs(system: MemorySystem) -> None:
         client.close()
         assert system.open_sessions("eve") == set()
         assert [j["session_id"] for j in system.db.get_jobs("eve")] == [run_id]
+
+
+@pytest.mark.parametrize("where", ["local", "remote"])
+def test_idle_remote_run_is_ended_and_reopened(system: MemorySystem, where: str) -> None:
+    """open_run 之后闲置的 run 由服务端的 close_idle_runs 交给抽取（cuemem serve 每分钟调用）：以前
+    调用方崩溃、没有 end_run 时，这段对话要等服务重启。调用方之后接着往这个 run 里 add 时重新打开
+    （不登记新的任务），end_run 时整段只登记一次；end_run 之后再写就是一个普通的会话。"""
+    server = Memory.from_system(system)
+    app = FastAPI()
+    app.include_router(memories_router(server, dependencies=guard(Keys())))
+    install_error_format(app)
+
+    def pending() -> list[str]:
+        return [j["session_id"] for j in system.db.get_jobs("eve", status="pending")]
+
+    with TestClient(app) as http:
+        mem: Mem = (
+            server if where == "local" else MemoryClient("http://testserver", http_client=http)
+        )
+        rid = mem.open_run(user_id="eve")
+        mem.add("I live in Lisbon", user_id="eve", run_id=rid)
+        later = time.monotonic() + 29 * 60
+        assert server.close_idle_runs(30 * 60, now=later) == 0 and pending() == []
+        later = time.monotonic() + 31 * 60
+        assert server.close_idle_runs(30 * 60, now=later) == 1
+        assert system.open_sessions("eve") == set() and pending() == [rid]
+
+        mem.add("I like tea", user_id="eve", run_id=rid)  # 接着写：重新打开
+        assert system.open_sessions("eve") == {rid} and pending() == [rid]
+        with pytest.raises(ValueError, match="still open"):
+            mem.add("I like jazz", user_id="eve", run_id=rid, wait=True)
+        assert mem.end_run(rid, user_id="eve")["turns"] == 2
+        assert system.open_sessions("eve") == set() and pending() == [rid]
+        assert len(system.db.get_jobs("eve", status="superseded")) == 1
+        mem.add("I like rain", user_id="eve", run_id=rid)  # end_run 之后不再重新打开
+        assert system.open_sessions("eve") == set()
 
 
 def test_async_client(system: MemorySystem) -> None:

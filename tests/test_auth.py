@@ -679,3 +679,35 @@ def test_ui_ignores_a_session_of_another_space(n3_settings: Settings, fake_api: 
         assert "My secret plan" in [t.text for t in system.db.get_turns("alice")]
     finally:
         service.close()
+
+
+def test_ui_starts_a_new_session_after_an_idle_end(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """页面里的会话闲置太久、被清理线程结束了（ChatService.close_idle）：下一句话开一个新的会话，
+    状态栏说明原因。以前页面一直拿着结束了的会话，之后每句话都显示 "⚠️ KeyError: '没有进行中的
+    会话 …'"，直到点 New session。"""
+    import gradio as gr
+
+    from cuemem.api.ui import build_ui
+
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"))
+    service.idle_minutes = 30
+    keys = Keys.parse(KEYS, ADMIN_TOKEN)
+    try:
+        demo = build_ui(service, access=keys.by_username)
+        events = {f.name: f.fn for f in demo.fns.values()}
+        alice = gr.Request(username="alice-app")
+        old = events["start"]("alice", "", None, alice)[0]
+        service.end(old)  # 关掉的标签页：清理线程把会话结束了（与 close_idle 相同）
+        message = {"text": "I like jazz", "files": []}
+        outputs = list(events["send"](message, [], old, "alice", "", "l0", "rule", 30, alice))
+        history, _, sid, _, status = outputs[-1]
+        assert sid != old and service.get(sid).space_id == "alice"
+        assert history[-1]["role"] == "assistant" and "⚠️" not in str(history[-1]["content"])
+        assert "ended after 30 idle minutes" in status
+        assert [t.session_id for t in system.db.get_turns("alice")] == [sid, sid]
+    finally:
+        service.close()

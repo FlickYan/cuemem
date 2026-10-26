@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,7 @@ from scripted import ScriptedModel, echo_extraction
 
 from cuemem.agent import Agent
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, Product, shop_tools
-from cuemem.api.app import create_app
+from cuemem.api.app import _sweep, create_app
 from cuemem.api.mcp import build_server
 from cuemem.api.replay import DemoScript, check, replay
 from cuemem.api.service import ChatService
@@ -170,6 +171,74 @@ def test_session_lifecycle_and_memory_views(service: ChatService, model: Scripte
     graph = service.graph("shop")
     assert {"nodes", "edges"} <= set(graph)
     assert "svg" in render_graph(graph) or "No entities" in render_graph(graph)
+
+
+def test_idle_chat_sessions_are_ended(service: ChatService, tmp_path: Path) -> None:
+    """闲置超过 idle_s 的会话由 close_idle 结束、交给后台抽取（HTTP 应用的清理线程每分钟调用）；
+    发消息重新计时。以前只有 end 接口与界面的按钮结束会话：关掉的标签页、崩溃的客户端留下的会话
+    一直开着，服务运行期间一直不抽取。结束之后再往这个会话发消息是 404，说明里写着闲置结束。"""
+    now = [1000.0]
+    chat = ChatService(service.system, service.agent, clock=lambda: now[0])
+    sid = chat.start("shop", at=DAY).session_id
+    chat.chat(sid, "I'm vegan and I wear EU 39.", mode="l0")
+    now[0] += 25 * 60
+    chat.chat(sid, "I like trail running.", mode="l0")  # 重新计时
+    now[0] += 29 * 60
+    assert chat.close_idle(30 * 60) == 0 and chat.is_open(sid)
+    now[0] += 2 * 60
+    assert chat.close_idle(30 * 60) == 1
+    assert service.system.worker is not None
+    service.system.worker.wait()
+    assert [j["status"] for j in service.system.db.get_jobs("shop")] == ["done"]
+    assert any("vegan" in f["statement"] for f in chat.facts("shop"))
+    assert chat.sessions == {} and service.system.open_sessions("shop") == set()
+    assert service.system.db.meta_keys("open-session:") == []
+    chat.idle_minutes = 30
+    client = TestClient(create_app(chat, upload_dir=tmp_path / "uploads", ui=False))
+    reply = client.post(f"/api/sessions/{sid}/messages", data={"text": "hi"})
+    assert reply.status_code == 404 and "闲置 30 分钟" in reply.json()["detail"]
+
+    busy = chat.start("shop", at=DAY)  # 正在回答的会话：等这一轮做完再结束
+    busy.lock.acquire()
+    now[0] += 31 * 60
+    sweeping = threading.Thread(target=chat.close_idle, args=(30 * 60,))
+    sweeping.start()
+    sweeping.join(0.3)
+    assert sweeping.is_alive() and not busy.closed
+    busy.lock.release()
+    sweeping.join(5)
+    assert busy.closed and not chat.is_open(busy.session_id)
+
+
+def test_the_app_sweeps_idle_sessions_while_it_runs(service: ChatService, tmp_path: Path) -> None:
+    """create_app 的清理线程只在应用运行期间（lifespan）跑，idle_minutes=None 时不起；一项出错不影响
+    别的，线程也不退出。"""
+
+    def sweepers() -> int:
+        return sum(t.name == "cuemem-api-sweep" for t in threading.enumerate())
+
+    before = sweepers()
+    with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=30)):
+        assert sweepers() == before + 1 and service.idle_minutes == 30
+    assert sweepers() == before
+    service.idle_minutes = None
+    with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)):
+        assert sweepers() == before and service.idle_minutes is None
+
+    calls: list[str] = []
+    stop = threading.Event()
+
+    def broken() -> None:
+        calls.append("broken")
+        raise RuntimeError("boom")
+
+    def fine() -> None:
+        calls.append("fine")
+        if calls.count("fine") == 2:
+            stop.set()
+
+    _sweep(stop, 0.01, broken, fine)
+    assert calls == ["broken", "fine", "broken", "fine"]
 
 
 def test_graph_links_entities_named_in_statements(

@@ -320,6 +320,9 @@ def build_ui(
             if not text and not files:
                 yield history, gr.MultimodalTextbox(value=None), sid, gr.skip(), gr.skip()
                 return
+            notice = ""
+            if sid and not service.is_open(sid):  # 闲置太久，清理线程结束了它（已经交给抽取）
+                sid, notice = None, _ended_notice(service)
             if not sid:
                 sid = service.start(space, at=_parse_date(date)).session_id
             user: list[Any] = [text] if text else []
@@ -330,7 +333,7 @@ def build_ui(
                 gr.MultimodalTextbox(value=None, interactive=False),
                 sid,
                 '<div class="trace muted"><h4>Memory trace</h4>Thinking…</div>',
-                _status_text(service, sid),
+                _status_text(service, sid, notice),
             )
             try:
                 reply = service.chat(
@@ -353,7 +356,7 @@ def build_ui(
                     gr.MultimodalTextbox(value=None, interactive=True),
                     sid,
                     EMPTY_TRACE,
-                    _status_text(service, sid),
+                    _status_text(service, sid, notice),
                 )
                 return
             history = [*history, {"role": "assistant", "content": answer}]
@@ -362,7 +365,7 @@ def build_ui(
                 gr.MultimodalTextbox(value=None, interactive=True),
                 sid,
                 panel,
-                _status_text(service, sid),
+                _status_text(service, sid, notice),
             )
 
         box.submit(
@@ -750,6 +753,16 @@ def _status_text(service: ChatService, sid: str | None, notice: str = "") -> str
     if notice:
         parts.append(notice)
     return " · ".join(parts) or "No session yet: sending a message starts one."
+
+
+def _ended_notice(service: ChatService) -> str:
+    """页面里的会话已经不在了（闲置太久，HTTP 应用的清理线程结束了它）：发的这句话开一个新的会话。
+    以前页面一直拿着结束了的会话，之后每句话都报 KeyError，直到点 New session。"""
+    idle = f" after {service.idle_minutes:g} idle minutes" if service.idle_minutes else ""
+    return (
+        f"The previous session ended{idle} and is being consolidated; "
+        "this message starts a new one."
+    )
 
 
 def _end(service: ChatService, sid: str) -> str:

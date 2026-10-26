@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,8 @@ from cuemem.memory import ForgetReport, MemorySystem
 
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SessionInfo:
@@ -39,6 +43,10 @@ class SessionInfo:
 
 
 class ChatService:
+    """clock：会话最后一次活动的时间用的时钟（close_idle 据此判断闲置，测试里可以换）。
+    idle_minutes：会话闲置多久由 HTTP 应用的清理线程结束（create_app 设置；None 是不结束），
+    只用于说明。"""
+
     def __init__(
         self,
         system: MemorySystem,
@@ -46,12 +54,16 @@ class ChatService:
         *,
         catalog: Catalog | None = None,
         default_space: str = "default",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.system = system
         self.agent = agent
         self.catalog = catalog
         self.default_space = default_space
         self.sessions: dict[str, ChatSession] = {}
+        self.idle_minutes: float | None = None
+        self._clock = clock
+        self._seen: dict[str, float] = {}  # 会话 → 最后一次活动（开始、发消息）的时刻
         self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间（见 start）
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的巩固在后台完成
@@ -106,14 +118,23 @@ class ChatService:
         session = self.agent.start(space, at=at, session_id=session_id)
         with self._lock:
             self.sessions[session.session_id] = session
+            self._seen[session.session_id] = self._clock()
         return session
 
     def get(self, session_id: str) -> ChatSession:
         with self._lock:
             session = self.sessions.get(session_id)
         if session is None:
-            raise KeyError(f"没有进行中的会话 {session_id}")
+            raise KeyError(self._missing(session_id))
         return session
+
+    def is_open(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self.sessions
+
+    def _missing(self, session_id: str) -> str:
+        idle = f"（闲置 {self.idle_minutes:g} 分钟的会话自动结束）" if self.idle_minutes else ""
+        return f"没有进行中的会话 {session_id}：不存在或已经结束{idle}，请开始一个新的会话"
 
     def chat(
         self,
@@ -126,8 +147,16 @@ class ChatService:
         router: Router | None = None,
         lam: float | None = None,
     ) -> Reply:
+        # 取会话与记下这次活动在同一把锁里：清理线程（close_idle）在这把锁里判断闲置、取走会话，
+        # 不会结束一个正要发消息的会话
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is not None:
+                self._seen[session_id] = self._clock()
+        if session is None:
+            raise KeyError(self._missing(session_id))
         return self.agent.chat(
-            self.get(session_id), text, images=images, at=at, mode=mode, router=router, lam=lam
+            session, text, images=images, at=at, mode=mode, router=router, lam=lam
         )
 
     def end(self, session_id: str, *, wait: bool = False) -> dict[str, Any]:
@@ -135,12 +164,35 @@ class ChatService:
         report = self.agent.end(session, wait=wait)
         with self._lock:
             self.sessions.pop(session_id, None)
+            self._seen.pop(session_id, None)
         out: dict[str, Any] = {"session_id": session_id, "turns": session.next_idx}
         if report is not None:
             out["consolidation"] = report.as_dict()
         elif session.next_idx:
             out["consolidation"] = "queued"
         return out
+
+    def close_idle(self, idle_s: float) -> int:
+        """闲置（开始或上一条消息之后）超过 idle_s 秒的会话结束、交给后台抽取，与 end 相同；返回
+        结束的个数。HTTP 应用的清理线程每分钟调用一次（create_app 的 idle_minutes）。以前只有
+        /api/sessions/{id}/end 与界面的按钮结束会话：关掉的标签页、崩溃的客户端留下的会话一直
+        开着，服务运行期间一直不抽取。之后再往这个会话发消息是 404（与不存在的会话一样，不告诉
+        作用域之外的调用方这个 ID 存在过），界面开一个新的会话。
+
+        判断闲置与取走会话在发消息记下活动的同一把锁里（见 chat）：正要发消息的会话不会被结束。
+        正在回答的会话（持有会话锁）等这一轮做完再结束，这一轮也一起抽取。"""
+        now = self._clock()
+        with self._lock:
+            stale = [sid for sid, seen in self._seen.items() if now - seen >= idle_s]
+            sessions = [self.sessions.pop(sid) for sid in stale if sid in self.sessions]
+            for sid in stale:
+                del self._seen[sid]
+        for session in sessions:
+            try:
+                self.agent.end(session)
+            except Exception:  # 一个会话结束不了不影响别的
+                logger.warning("闲置的会话 %s 没能结束", session.session_id, exc_info=True)
+        return len(sessions)
 
     def open_sessions(self, space_id: str) -> list[ChatSession]:
         with self._lock:

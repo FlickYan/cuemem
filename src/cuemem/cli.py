@@ -555,6 +555,10 @@ UNKNOWN_MODEL_HELP = (
     "记忆代理收到模型目录里没有的 model 时：remap 改用 agent 角色的模型（响应头 X-CueMem-Model "
     "写明，日志里记一条警告）；reject 返回 400。默认取配置 proxy.unknown_model（remap）"
 )
+IDLE_HELP = (
+    "会话闲置多少分钟后结束并交给抽取：界面与 /api 的会话、/api/v1 的 run、/v1 记忆代理的会话。"
+    "之后再往 /api 的会话发消息是 404，界面开一个新的会话，/api/v1 的 run 再 add 时重新打开"
+)
 
 
 def _unknown_model(value: str | None) -> UnknownModel | None:
@@ -597,6 +601,7 @@ def serve(
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
+    idle_minutes: Annotated[float, typer.Option(help=IDLE_HELP)] = 30.0,
 ) -> None:
     """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。
 
@@ -607,6 +612,9 @@ def serve(
     from cuemem.api.auth import TOKEN_ENV, Keys
     from cuemem.api.proxy import MemoryProxy
 
+    if not idle_minutes > 0:  # 在打开记忆系统之前检查
+        console.print("[red]--idle-minutes 要大于 0[/red]")
+        raise typer.Exit(1)
     ui = not no_ui
     if ui and importlib.util.find_spec("gradio") is None:
         console.print(
@@ -625,7 +633,7 @@ def serve(
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
     allowed_hosts, origin_hosts = _host_policy(host)
     # 同一个记忆系统：经代理写入的对话在界面里也能看到
-    proxy = MemoryProxy(service.system, unknown_model=unknown)
+    proxy = MemoryProxy(service.system, unknown_model=unknown, idle_minutes=idle_minutes)
     try:
         app_ = create_app(
             service,
@@ -635,6 +643,7 @@ def serve(
             proxy=proxy,
             allowed_hosts=allowed_hosts,
             origin_hosts=origin_hosts,
+            idle_minutes=idle_minutes,
         )
         where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
         console.print(

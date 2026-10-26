@@ -42,6 +42,7 @@ import json
 import logging
 import tempfile
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -76,6 +77,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+IDLE_CLOSED_KEPT = 10_000  # 记着多少个闲置结束的 run（见 close_idle_runs），之后再 add 时重新打开
 SearchMode = Literal["auto", "l0", "l1", "l2"]
 AnswerMode = Literal["auto", "l0", "l1", "l2", "agent", "hatch"]
 Message = Mapping[str, Any]
@@ -190,9 +192,7 @@ class Memory:
         self.system = MemorySystem.from_settings(
             settings, http_client=http_client, on_peak_wait=_log_peak_wait
         )
-        self._runs: set[tuple[str, str]] = set()  # open_run 开始、还没结束的（空间，run_id）
-        self._adopted: set[str] = set()  # 接手过崩溃前留下的 run 的空间（见 _adopt）
-        self._runs_lock = threading.Lock()
+        self._init_runs()
         if background:
             self.system.start_worker()
 
@@ -208,10 +208,16 @@ class Memory:
         memory = cls.__new__(cls)
         memory.settings = system.settings
         memory.system = system
-        memory._runs = set()
-        memory._adopted = set()
-        memory._runs_lock = threading.Lock()
+        memory._init_runs()
         return memory
+
+    def _init_runs(self) -> None:
+        self._runs: set[tuple[str, str]] = set()  # open_run 开始、还没结束的（空间，run_id）
+        self._run_seen: dict[tuple[str, str], float] = {}  # 这些 run 最后一次活动的时刻
+        # close_idle_runs 结束的 run（按结束的先后，最多 IDLE_CLOSED_KEPT 个）：再 add 时重新打开
+        self._idle_closed: dict[tuple[str, str], None] = {}
+        self._adopted: set[str] = set()  # 接手过崩溃前留下的 run 的空间（见 _adopt）
+        self._runs_lock = threading.Lock()
 
     def _adopt(self, space: str, keep: Sequence[str] = ()) -> None:
         """这个对象第一次碰到这个空间：之前的进程崩溃时还开着的 run（open_run 了、没来得及
@@ -260,6 +266,8 @@ class Memory:
         后台抽取的状态与出错见 status()。
         """
         space = space_for(user_id, agent_id)
+        if run_id is not None:
+            self._resume(space, run_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
             raise ValueError(
                 f"Run {run_id!r} is still open: its memories are extracted when it ends. "
@@ -326,13 +334,16 @@ class Memory:
         end_run 时整段只抽取一次。返回 run_id（不给时生成一个）。
 
         进程崩溃时还开着的 run 由下一个进程第一次碰到这个用户时交给抽取（见 _adopt）；用同一个
-        run_id 再 open_run 就是接着这段对话写，它不被接手。"""
+        run_id 再 open_run 就是接着这段对话写，它不被接手。cuemem serve 的 /api/v1 上闲置（默认
+        30 分钟没有 add）的 run 先交给抽取，之后再 add 时重新打开（close_idle_runs）。"""
         space = space_for(user_id, agent_id)
         rid = run_id or sortable_session_id("run", datetime.now())
         self._adopt(space, keep=[rid])
         self.system.open_session(space, rid)
         with self._runs_lock:
             self._runs.add((space, rid))
+            self._run_seen[(space, rid)] = time.monotonic()
+            self._idle_closed.pop((space, rid), None)
         return rid
 
     def end_run(
@@ -348,6 +359,8 @@ class Memory:
         space = space_for(user_id, agent_id)
         with self._runs_lock:
             self._runs.discard((space, run_id))
+            self._run_seen.pop((space, run_id), None)
+            self._idle_closed.pop((space, run_id), None)
         turns = len(self.system.db.get_turns(space, run_id))
         if not turns:  # 什么都没写：只结束，不抽取
             self.system.close_session(space, run_id, submit=False)
@@ -376,6 +389,57 @@ class Memory:
             yield rid
         finally:
             self.end_run(rid, user_id=user_id, agent_id=agent_id, wait=wait)
+
+    def close_idle_runs(self, idle_s: float, *, now: float | None = None) -> int:
+        """open_run 开始、之后 idle_s 秒没有 add 的 run 交给抽取（与 end_run(wait=False) 相同），
+        返回结束的个数。同一个 run_id 之后再 add 时重新打开（_resume）：调用方没有 end_run，还在
+        接着这段对话写，结束时整段只抽取一次。cuemem serve 每分钟为 /api/v1 调用一次：远程的调用方
+        崩溃、没有 end_run 时，以前这段对话要等服务重启才交给抽取。本地的 SDK 不调用就不会结束。
+        now：time.monotonic() 的时刻（测试用）。"""
+        clock = time.monotonic() if now is None else now
+        with self._runs_lock:
+            stale = [k for k in self._runs if clock - self._run_seen.get(k, clock) >= idle_s]
+        closed = 0
+        for space, rid in stale:
+            # 在会话锁里：与 add 写这个 run（_resume、写入）一个一个来，正要写的不会被结束
+            with self.system.session_lock(space, rid):
+                with self._runs_lock:
+                    seen = self._run_seen.get((space, rid), clock)
+                    if (space, rid) not in self._runs or clock - seen < idle_s:
+                        continue
+                    self._runs.discard((space, rid))
+                    self._run_seen.pop((space, rid), None)
+                    self._idle_closed[(space, rid)] = None
+                    while len(self._idle_closed) > IDLE_CLOSED_KEPT:  # 最早结束的不再记着
+                        del self._idle_closed[next(iter(self._idle_closed))]
+                turns = self.system.db.get_turns(space, rid)
+                submit = bool(turns) and self.system.worker is not None
+                self.system.close_session(space, rid, submit=submit)
+            closed += 1
+        return closed
+
+    def _resume(self, space: str, run_id: str) -> None:
+        """add 写进 run 之前：还开着的记下这次活动（close_idle_runs 据此判断闲置）；闲置太久、被
+        close_idle_runs 结束了的重新打开（open_session），结束时整段只抽取一次。不重新打开的话，
+        之后每次 add 都把整段重新抽取、从原始日志重放一遍。"""
+        key = (space, run_id)
+        with self._runs_lock:
+            if key in self._runs:
+                self._run_seen[key] = time.monotonic()
+                return
+            if key not in self._idle_closed:
+                return
+        with self.system.session_lock(space, run_id):
+            with self._runs_lock:
+                if key not in self._idle_closed:  # 期间别的 add 已经重新打开了
+                    if key in self._runs:
+                        self._run_seen[key] = time.monotonic()
+                    return
+                del self._idle_closed[key]
+            self.system.open_session(space, run_id)
+            with self._runs_lock:
+                self._runs.add(key)
+                self._run_seen[key] = time.monotonic()
 
     def update(
         self, memory_id: str, data: str, *, metadata: Mapping[str, Any] | None = None
@@ -715,6 +779,8 @@ class Memory:
         with self._runs_lock:
             runs = sorted(self._runs)
             self._runs.clear()
+            self._run_seen.clear()
+            self._idle_closed.clear()
             self._adopted.clear()
         for space, rid in runs:
             self.system.close_session(space, rid, submit=False)
@@ -769,6 +835,8 @@ class Memory:
         with self._runs_lock:
             runs = sorted(self._runs)
             self._runs.clear()
+            self._run_seen.clear()
+            self._idle_closed.clear()
         for space, rid in runs:
             self.system.close_session(space, rid, submit=False)
         self.system.close()
