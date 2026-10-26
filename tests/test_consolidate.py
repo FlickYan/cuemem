@@ -25,7 +25,7 @@ from scripted import (
     growing_extraction,
     reconcile_by_keyword,
 )
-from test_sdk import where_i_live
+from test_sdk import AUG, SEP, moved, where_i_live
 
 from cuemem import Memory
 from cuemem import sdk as sdk_module
@@ -39,6 +39,7 @@ from cuemem.sdk import space_for
 from cuemem.store import MemoryDB
 from cuemem.write import consolidate as consolidate_module
 from cuemem.write.consolidate import MAX_ATTEMPTS
+from cuemem.write.extract import PIPELINE_VERSION
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
 RECONCILE = "You maintain a long-term memory"  # 对账请求的系统提示开头
@@ -625,6 +626,37 @@ def test_a_replay_extracts_only_what_was_extracted_before(
 
         memory.consolidate(user_id="u")  # 显式的巩固：infer=False 的会话这时才抽取
         assert "DIARY raw log only" in statements(memory)
+
+
+def test_a_replay_survives_a_vector_store_error(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """会话又长了时的重放，删派生记忆的向量时向量库出错（Qdrant 服务一时连不上）：任务都还在，
+    后台线程的重试把重放做完。以前先提交清空（任务也一起清空了）再删向量，出错时任务一个不剩，
+    重试与重启都找不到要做的事，整个空间的事实都没了。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=moved)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Berlin", user_id="u", run_id="a", timestamp=AUG, wait=True)
+        day2 = AUG + timedelta(days=1)
+        memory.add("I like jazz", user_id="u", run_id="b", timestamp=day2, wait=True)
+        memory.add("I like chess", user_id="u", run_id="b", timestamp=SEP)  # b 又长了，待处理
+        delete, calls = system.vectors.delete, Counter[str]()
+
+        def unreachable_once(space: str, ids: Sequence[str]) -> Any:
+            calls["delete"] += 1
+            if calls["delete"] == 1:
+                raise ConnectionError("qdrant unreachable")
+            return delete(space, ids)
+
+        monkeypatch.setattr(system.vectors, "delete", unreachable_once)
+        with pytest.raises(ConnectionError):
+            system.consolidator.run("u")  # 后台线程的做法
+        assert len(statements(memory)) == 2  # 什么都没清空
+        assert system.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS) == ["u"]
+        system.consolidator.run("u")  # 后台线程按退避重试
+        assert statements(memory) == ["I like chess", "I like jazz", "The user lives in Berlin."]
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
 
 
 def said(

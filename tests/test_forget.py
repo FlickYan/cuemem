@@ -8,14 +8,14 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
-from datetime import datetime
+from collections.abc import Iterator, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import openai
 import pytest
-from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
+from fakes import NO_BALANCE, REJECT, TOY_CONVERSATION, FakeAPI
 from scripted import (
     EMPTY_EXTRACTION,
     TOY_EXTRACTIONS,
@@ -24,13 +24,16 @@ from scripted import (
     reconcile_by_keyword,
 )
 from scripted import _fact as fact_reply
-from test_sdk import moved, where_i_live
+from test_sdk import AUG, SEP, moved, where_i_live
 
 import cuemem.llm.client as llm_client
+from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.models import Conversation, SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
 from cuemem.memory import MemorySystem
+from cuemem.write.consolidate import MAX_ATTEMPTS
+from cuemem.write.extract import PIPELINE_VERSION
 
 SECRET = "电商"  # 只出现在第 4 段会话（s4）里的词
 PIN = "SECRET-1234"
@@ -396,6 +399,119 @@ def test_forget_cleans_up_even_when_replay_fails(
         assert all(j["status"] == "done" for j in system.db.get_jobs("demo"))
         core = system.core_memory("demo")
         assert core is not None and "新加坡" in core.text
+
+
+def _sdk(settings: Settings, fake_api: FakeAPI, reply: Any = None, **kwargs: Any) -> Memory:
+    fake_api.chat_replies = [reply or ScriptedModel(where_i_live, reconcile=moved)]
+    return Memory(settings, http_client=fake_api.client(), **kwargs)
+
+
+def _statements(memory: Memory) -> list[str]:
+    return sorted(f["memory"] for f in memory.get_all(user_id="u")["results"])
+
+
+def test_forget_vector_store_error_keeps_jobs_and_cleans_traces(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """清空派生层之后删它们的向量时向量库出错：照样清理 trace，写进报告的 rebuild_error，重新
+    登记的任务还在，下次巩固补齐。以前这一步在清理之外：异常连 report_rebuild_errors 也挡不住，
+    任务一个不剩（下次巩固也补不回来），trace 里留着被删的原话。"""
+    with _sdk(n3_settings, fake_api, background=False) as memory:
+        system = memory.system
+        memory.add("I live in Berlin", user_id="u", run_id="a", timestamp=AUG, wait=True)
+        day2 = AUG + timedelta(days=1)
+        memory.add("I like jazz", user_id="u", run_id="b", timestamp=day2, wait=True)
+        memory.add("I like PINCODE chess", user_id="u", run_id="c", timestamp=SEP, wait=True)
+        memory.search("PINCODE chess?", user_id="u", mode="l1")
+        facts = {f.id for f in system.db.get_facts("u")}
+        delete = system.vectors.delete
+
+        def unreachable(space: str, ids: Sequence[str]) -> Any:
+            if facts & set(ids):
+                raise ConnectionError("qdrant unreachable")
+            return delete(space, ids)
+
+        monkeypatch.setattr(system.vectors, "delete", unreachable)
+        report = system.forget("u", session_ids=["c"], report_rebuild_errors=True)
+        monkeypatch.setattr(system.vectors, "delete", delete)
+
+        assert report.turns_deleted == 1 and report.rebuild_error
+        assert "PINCODE" not in _traces(system)
+        assert system.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS) == ["u"]
+        system.consolidator.run("u")
+        assert _statements(memory) == ["I like jazz", "The user lives in Berlin."]
+
+
+def test_forget_does_not_extract_log_only_sessions(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """遗忘之后的重放只为原来有任务的会话登记（与会话又长了时的重放相同）：infer=False 只记了
+    日志的会话（"之后调用 consolidate 再抽取"）不会因为删了别的记忆就被抽取。以前遗忘为每个
+    会话都登记任务，删一条无关的事实，证件号就进了事实。显式的 consolidate 照旧抽取它。"""
+    with _sdk(n3_settings, fake_api, background=True) as memory:
+        memory.add("My passport number is X123", user_id="u", run_id="private", infer=False)
+        memory.add("I live in Berlin", user_id="u", timestamp=AUG)
+        memory.add("I moved to Munich", user_id="u", timestamp=SEP)
+        memory.wait()
+        munich = next(f for f in memory.get_all(user_id="u")["results"] if "Munich" in f["memory"])
+
+        memory.delete(munich["id"])
+        memory.wait()
+
+        assert _statements(memory) == ["The user lives in Berlin."]
+        assert "private" not in {j["session_id"] for j in memory.system.db.get_jobs("u")}
+        memory.consolidate(user_id="u")
+        assert "My passport number is X123" in _statements(memory)
+
+
+def test_forget_keeps_moderated_and_failed_outcomes(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """遗忘之后的重放，内容没变的会话保留原来的结局：内容审核拒绝过的不再发给两家（拒绝不进
+    缓存，以前每删一次都再请求一遍），失败的保留失败次数与退避时间，不在遗忘里同步再试一次。"""
+    model = ScriptedModel(where_i_live, reconcile=moved)
+
+    def reply(body: dict[str, Any]) -> Any:
+        if body["messages"][0]["content"].startswith("You build the long-term memory"):
+            said = body["messages"][-1]["content"]
+            if "forbidden" in said:
+                return REJECT
+            if "BROKEN" in said:
+                return NO_BALANCE
+        return model(body)
+
+    def extractions(word: str) -> int:  # 遗忘时找转述的请求里可以有它们，不算
+        return sum(
+            body["messages"][0]["content"].startswith("You build the long-term memory")
+            and word in body["messages"][-1]["content"]
+            for body in fake_api.chat_requests
+        )
+
+    with _sdk(n3_settings, fake_api, reply, background=True) as memory:
+        memory.add("some forbidden content", user_id="u", run_id="mod", timestamp=AUG)
+        memory.add("BROKEN extraction", user_id="u", run_id="broken", timestamp=AUG)
+        memory.add("I live in Berlin", user_id="u", run_id="a", timestamp=AUG)
+        memory.add("I moved to Munich", user_id="u", run_id="b", timestamp=SEP)
+        memory.wait()
+
+        def outcomes() -> dict[str, tuple[str, int, str | None]]:
+            jobs = memory.system.db.get_jobs("u")
+            return {
+                j["session_id"]: (j["status"], j["attempts"], j["stats"].get("skipped"))
+                for j in jobs
+                if j["session_id"] in ("mod", "broken")
+            }
+
+        before = outcomes()
+        assert before == {"mod": ("done", 0, "content_filter"), "broken": ("failed", 1, None)}
+        sent = extractions("forbidden"), extractions("BROKEN")
+        munich = next(f for f in memory.get_all(user_id="u")["results"] if "Munich" in f["memory"])
+
+        memory.delete(munich["id"])
+
+        assert (extractions("forbidden"), extractions("BROKEN")) == sent
+        assert outcomes() == before
+        assert _statements(memory) == ["The user lives in Berlin."]
 
 
 def test_close_closes_its_own_caches(n3_settings: Settings, fake_api: FakeAPI) -> None:

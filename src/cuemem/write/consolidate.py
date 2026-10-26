@@ -255,18 +255,43 @@ class Consolidator:
 
         replay=True（会话又长了时的重放，见 _replay_regrown）：只为原来有任务的会话登记，
         SDK 的 infer=False 只记了日志的会话照旧等显式的 consolidate；内容没变的会话保留原来的
-        结局（_keeps_outcome）。清空前的任务与清空在同一个事务里读：期间别的线程登记的任务
-        不会被删掉而没人补上。"""
+        结局（_keeps_outcome，见 requeue）。清空前的任务与清空在同一个事务里读：期间别的线程
+        登记的任务不会被删掉而没人补上。
+
+        先删派生记忆的向量，再清空数据库（与遗忘相同：先删向量、后删记录）：向量库出错时数据库
+        里什么都没改，会话又长了的那对任务还在，后台线程按退避把重放再做一遍。以前先提交清空
+        （任务也清空了）、再删向量、最后才重新登记：删向量时出错，任务一个不剩，后台线程的重试与
+        重启都找不到要做的事，整个空间的事实、实体与画像都没了，直到有人显式地巩固。现在清空与
+        重新登记之间只有本地的读写。"""
+        derived = self.db.derived_unit_ids(space_id)
+        self.vectors.delete(space_id, derived)
         with self.db.transaction():
-            before = self.db.get_jobs(space_id) if replay else []
+            before = self.db.get_jobs(space_id) if replay else None
             removed = self.db.clear_derived(space_id)
-        self.vectors.delete(space_id, removed)
-        skip = self.open_sessions(space_id)
-        if not replay:
-            self.enqueue(space_id, skip=skip)
-            return
-        self.enqueue(space_id, sorted({j["session_id"] for j in before}), skip=skip)
-        self.db.restore_jobs([j for j in before if _keeps_outcome(j)])
+        self.requeue(space_id, before, self.open_sessions(space_id))
+        self.vectors.delete(space_id, sorted(set(removed) - set(derived)))  # 通常没有
+
+    def requeue(
+        self,
+        space_id: str,
+        before: Sequence[Mapping[str, Any]] | None,
+        skip: Collection[str],
+    ) -> int:
+        """清空派生记忆（clear_derived，任务也清空了）之后重新登记任务，返回新登记的个数。
+
+        before：清空之前的任务（与清空在同一个事务里读）。只为其中有任务的会话登记：SDK 的
+        infer=False 只记了日志的会话照旧不抽取；内容没变（任务键相同）的会话保留原来的结局
+        （_keeps_outcome）：内容审核拒绝过的不再请求两家，失败的保留失败次数与退避时间。
+        before=None 时为全部会话登记（清空重建）。会话又长了时的重放与遗忘共用。
+
+        skip：进行中的会话，由调用方读好传进来。这里不调用 open_sessions：open_session 先拿
+        进行中会话的锁、再写数据库，调用方在数据库的事务里调用时反过来拿就会互相等死。"""
+        sessions = None if before is None else sorted({j["session_id"] for j in before})
+        with self.db.transaction():
+            added = self.enqueue(space_id, sessions, skip=skip)
+            if before is not None:
+                self.db.restore_jobs([j for j in before if _keeps_outcome(j)])
+        return added
 
     def retry_due(
         self,

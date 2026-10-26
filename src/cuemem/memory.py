@@ -726,7 +726,6 @@ class MemorySystem:
             affected = sorted({t.session_id for t in targets})
             if not targets:
                 return ForgetReport(space_id, 0, [], 0, 0, 0, 0, 0.0)
-            consolidated = bool(self.db.get_jobs(space_id))
             facts = self.db.get_facts(space_id)
             texts_before = {u.text for u in self.db.list_units(space_id)}
             doomed = {t.id for t in targets}
@@ -763,15 +762,19 @@ class MemorySystem:
                         images_deleted += int(self.media.delete_unused(path, item.sha256, in_use))
                 self.writer.reindex_sessions(space_id, affected)
 
-                # 2. 派生层：清空，再从剩下的日志重放
-                removed = self.db.clear_derived(space_id)
-                self.vectors.delete(space_id, removed)
+                # 2. 派生层：清空，再从剩下的日志重放。清空前的任务与清空在同一个事务里读，紧接着
+                #    重新登记（Consolidator.requeue，与会话又长了时的重放相同）：infer=False 只记了
+                #    日志的会话照旧不抽取，内容审核拒绝过的不再请求，失败的保留退避。删向量或重放
+                #    出错时任务都还在，下面的清理照样做完
                 failed: Exception | None = None
                 try:
-                    if consolidated:
-                        with cache.recording(reused) if cache is not None else nullcontext():
-                            self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
-                            self.consolidator.run(space_id)
+                    with self.db.transaction():
+                        before = self.db.get_jobs(space_id)
+                        removed = self.db.clear_derived(space_id)
+                    self.consolidator.requeue(space_id, before, self.open_sessions(space_id))
+                    self.vectors.delete(space_id, removed)
+                    with cache.recording(reused) if cache is not None else nullcontext():
+                        self.consolidator.run(space_id)  # 没有待处理的任务时什么都不做
                 except Exception as exc:  # 清理照样做完（下面的 finally），之后再抛出或写进报告
                     failed = exc
                 finally:

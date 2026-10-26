@@ -972,6 +972,15 @@ class MemoryDB:
             updated_at=_dt(row[3]),
         )
 
+    def derived_unit_ids(self, space_id: str) -> list[str]:
+        """这个空间里除"轮"以外的检索单元（派生记忆）的 ID：清空之前先删它们的向量（见
+        Consolidator.rebuild）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM units WHERE space_id = ? AND kind != 'round'", (space_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def clear_derived(self, space_id: str) -> list[str]:
         """清空某个空间的全部派生数据（事实、实体、片段、核心记忆、任务，以及除"轮"以外的
         检索单元），返回被删除的检索单元 ID，供调用方同步删除向量。"""
