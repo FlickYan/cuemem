@@ -271,6 +271,10 @@ class _ReadGate:
         """本线程持有读（不算遗忘自己的读：那时它已经独占了）。"""
         return self._writer != threading.get_ident() and getattr(self._local, "depth", 0) > 0
 
+    def held(self) -> bool:
+        """本线程持有读或独占：这期间这个空间不会被遗忘。"""
+        return self._writer == threading.get_ident() or getattr(self._local, "depth", 0) > 0
+
     @contextmanager
     def exclusive(self) -> Iterator[None]:
         me = threading.get_ident()
@@ -1327,7 +1331,10 @@ class MemorySystem:
         探针打过分的候选不丢：控制器选 L1 时直接打包；选 L2 时原问题的召回用探针的结果（见
         L2Retriever.search）；返回的 Recall 带着它们，调用方把 L0 改走 L1 时（recall_listing 的
         at_least_l1）以 mode="l1" 与 candidates 传回来、直接打包，不再检索一遍。candidates 必须
-        是同一个问题、同一个问题时间、同样的 exclude 与 L1 配置下的探针结果。
+        是同一个问题、同一个问题时间、同样的 exclude 与 L1 配置下的探针结果，调用方还要在两次
+        检索期间一直持有这个空间的读（with reading(space_id)）：候选是探针取到内存里的轮与事实，
+        两次之间插进来的遗忘删掉了它们，打包出来的却还是它们。没有持有读时不用 candidates、
+        重新检索（R5 之前的做法，结果相同，只是多检索一遍）。
 
         不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
@@ -1339,6 +1346,8 @@ class MemorySystem:
             if current_trace() is not None
             else start_trace("retrieve", self.tracer, space=space_id, question=question, mode=mode)
         )
+        if candidates is not None and not self._gate(space_id).held():
+            candidates = None  # 在下面的 reading 里查就晚了：那时总是持有读
         with self.reading(space_id), tracing:
             when = naive_local(question_time) if question_time is not None else datetime.now()
             cache_scope = cache_scope or scope(space_id, "ask")

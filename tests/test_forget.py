@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ from scripted import (
     reconcile_by_keyword,
 )
 from scripted import _fact as fact_reply
+from test_sdk import moved, where_i_live
 
 import cuemem.llm.client as llm_client
 from cuemem.config import Settings
@@ -533,6 +535,65 @@ def test_forget_waits_for_an_answer_in_flight(n3_settings: Settings, fake_api: F
         assert not any(PIN in p.read_text("utf-8") for p in traces)
 
         assert system.ask("alice", "What is my PIN?", mode="l1").answer  # 之后照常回答
+
+
+@pytest.mark.parametrize("entry", ["sdk_search", "recall_listing"])
+def test_forget_waits_for_a_raised_search_in_flight(
+    n3_settings: Settings,
+    fake_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """SDK 的 search 与 recall_listing（MCP、各框架集成的 recall）控制器选了 L0、改走 L1 时检索
+    两次，第二次直接打包探针的候选：遗忘要等整次检索做完。以前两次各自持有读，探针做完、打包之前
+    遗忘插了进来，返回的是已经删掉的事实与对话片段，第二次检索的 trace 也在遗忘清理之后才写下。"""
+    from cuemem import Memory
+    from cuemem.evidence import recall_listing
+
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=moved)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I like green tea", user_id="u", wait=True)
+        memory.add("My PIN is 4321 and I like chess", user_id="u", run_id="pin", wait=True)
+        assert memory.search("Hi there", user_id="u", min_level="l0")["level"] == "L0"
+        doomed = {u.id for u in system.db.list_units("u", kinds=["round"]) if u.session_id == "pin"}
+        doomed |= {f.id for f in system.db.get_facts("u") if f.session_id == "pin"}
+        assert doomed
+
+        run, pack = system.probe.run, system.l1.pack
+        forgetting: list[tuple[threading.Thread, list[Any]]] = []
+        at_pack: list[int] = []
+
+        def probe_while_a_forget_arrives(*args: Any, **kwargs: Any) -> Any:
+            out = run(*args, **kwargs)
+            if not forgetting:  # 探针做完时来了一次遗忘，等着这次检索
+                forgetting.append(_in_thread(system.forget, "u", session_ids=["pin"]))
+                while system._gate("u")._waiting == 0:
+                    time.sleep(0.001)
+            return out
+
+        def recording_pack(*args: Any, **kwargs: Any) -> Any:
+            at_pack.append(len(system.db.get_turns("u", "pin")))
+            return pack(*args, **kwargs)
+
+        monkeypatch.setattr(system.probe, "run", probe_while_a_forget_arrives)
+        monkeypatch.setattr(system.l1, "pack", recording_pack)
+        if entry == "sdk_search":
+            level = memory.search("Hi there", user_id="u")["level"]
+        else:
+            level = recall_listing(system, "u", "Hi there", at_least_l1=True)["level"]
+        [(thread, out)] = forgetting
+        thread.join(10)
+
+        assert level == "L1"
+        [report] = out
+        assert not isinstance(report, Exception) and report.turns_deleted == 1
+        assert at_pack == [1]  # 打包时被删的发言还在：遗忘在这次检索之后
+        assert system.db.get_turns("u", "pin") == []
+        for path in n3_settings.paths.traces.glob("*.jsonl"):
+            for line in path.read_text("utf-8").splitlines():
+                if json.loads(line)["attrs"].get("space") == "u":
+                    assert "4321" not in line and not any(i in line for i in doomed)
 
 
 def test_forget_other_session_during_background_reconciliation(

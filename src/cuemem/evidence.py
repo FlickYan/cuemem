@@ -193,15 +193,19 @@ def recall_listing(
 
     at_least_l1：调用方已经决定要查记忆（例如 MCP 的 recall），控制器选了 L0 时改走 L1，
     控制器只决定要不要查得更深。改走 L1 时直接打包探针已经打过分的候选（两次用同一个问题
-    时间），不再检索一遍。
+    时间），不再检索一遍。两次检索都在同一次 reading 里：遗忘不能插在中间，否则打包的是它
+    已经删掉的记忆（见 MemorySystem.retrieve）。
     """
     when = naive_local(at) if at is not None else datetime.now()
-    recall = system.retrieve(space, query, question_time=when, mode=mode, router=router, lam=lam)
-    raised = at_least_l1 and recall.level == "l0"
-    if raised:
+    with system.reading(space):
         recall = system.retrieve(
-            space, query, question_time=when, mode="l1", candidates=recall.candidates
+            space, query, question_time=when, mode=mode, router=router, lam=lam
         )
+        raised = at_least_l1 and recall.level == "l0"
+        if raised:
+            recall = system.retrieve(
+                space, query, question_time=when, mode="l1", candidates=recall.candidates
+            )
     view = recall.view
     decision = recall.decision
     return {

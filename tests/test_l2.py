@@ -343,6 +343,39 @@ def test_sdk_search_raised_from_l0_packs_the_probe(
     assert raised["results"] and raised["results"] == plain["results"]
 
 
+def test_probe_candidates_are_packed_only_under_a_held_read(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retrieve(mode="l1", candidates=...) 只在调用方持有这个空间的读（reading）时直接打包探针的
+    候选：两次检索之间没有持有读时，遗忘可以插在中间，打包出来的是已经删掉的记忆。这时照 R5 之前
+    那样重新检索一遍。"""
+    system, _ = toy
+    question = "Max 喜欢吃什么？"
+    probe = system.retrieve("demo", question, question_time=ASKED, lam=1e9)
+    assert probe.level == "l0" and probe.candidates is not None
+    calls: list[bool] = []
+    real = system.l1.candidates
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        calls.append(bool(kwargs.get("probe")))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(system.l1, "candidates", counting)
+    unheld = system.retrieve(
+        "demo", question, question_time=ASKED, mode="l1", candidates=probe.candidates
+    )
+    assert calls == [False]
+    calls.clear()
+    with system.reading("demo"):
+        held = system.retrieve(
+            "demo", question, question_time=ASKED, mode="l1", candidates=probe.candidates
+        )
+    assert calls == []
+    assert held.view.rounds and [h.unit.id for h in held.view.rounds] == [
+        h.unit.id for h in unheld.view.rounds
+    ]
+
+
 def test_planner_and_checker_failures_fall_back(toy: tuple[MemorySystem, ScriptedModel]) -> None:
     system, model = toy
     model.planner = lambda prompt: {"answer_type": ["not", "a", "string"], "exhaustive": "maybe"}

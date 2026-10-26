@@ -499,16 +499,19 @@ class Memory:
 
         # 两次检索用同一个问题时间：改走 L1 时打包的是探针在这个时间打过分的候选
         when = naive_local(at) if at is not None else datetime.now()
-        recall = self.system.retrieve(
-            space, query, question_time=when, mode=mode, router=router, lam=lam
-        )
-        raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
-        if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同：不把探针的检索再做一遍
+        # 从检索到读出各句的 metadata 与画像一直持有读：改走 L1 时打包的是探针取到的记忆，两次检索
+        # 之间插进来的遗忘会让结果里留着已经删掉的事实与对话片段（见 MemorySystem.retrieve）
+        with self.system.reading(space):
             recall = self.system.retrieve(
-                space, query, question_time=when, mode="l1", candidates=recall.candidates
+                space, query, question_time=when, mode=mode, router=router, lam=lam
             )
-        select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
-        out = _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
+            raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
+            if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同：不把探针的检索再做一遍
+                recall = self.system.retrieve(
+                    space, query, question_time=when, mode="l1", candidates=recall.candidates
+                )
+            select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
+            out = _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
         if raised:
             out["reasons"] = [RAISED_REASON]
         return out
