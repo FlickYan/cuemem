@@ -12,6 +12,8 @@ from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
 from cuemem.errors import ConfigMismatchError, StorageLockedError
 from cuemem.store import MemoryDB, VectorStore
+from cuemem.store import sqlite as sqlite_module
+from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 from cuemem.write import build_rounds, build_turns
 
 
@@ -150,6 +152,64 @@ def test_versions_change_with_every_write_that_matters(tmp_path: Path) -> None:
         before = db.turns_version("demo", "other")
         step()
         assert db.turns_version("demo", "other") != before
+
+
+def _one_turn(db: MemoryDB, space: str, session_id: str) -> Turn:
+    session = SessionIn(
+        session_id=session_id,
+        started_at=datetime(2026, 8, 1, 10, 0),
+        turns=[TurnIn(role="user", text=f"hello from {space}")],
+    )
+    db.ensure_space(space)
+    db.add_session(space, session_id, session.started_at)
+    [turn] = build_turns(space, session)
+    db.add_turns([turn])
+    return turn
+
+
+def test_turn_numbers_of_sessions_without_turns_are_dropped_exactly(tmp_path: Path) -> None:
+    """删掉空间、删光一个会话的发言时，它们的 next_idx 一起删（键里是用户 ID 与会话 ID）。以前的
+    版本写下的键有歧义（next_idx:{空间}:{会话}）：空间 'acme' 的会话 'alice:x' 与空间 'acme:alice'
+    的会话 'x' 是同一个键，按前缀删会删掉别人的；每种拆法都核对，还有会话在用的留着。"""
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    kept = _one_turn(db, "acme:alice", "x")
+    _one_turn(db, "acme", "y")
+    gone = _one_turn(db, "acme", "z")
+    for space, sid in [("acme", "y"), ("acme", "z"), ("acme:alice", "x")]:
+        db.set_meta(next_idx_key(space, sid), "1")
+    db.set_meta(legacy_idx_key("acme", "y"), "1")
+    db.set_meta(legacy_idx_key("acme:alice", "x"), "1")  # 也是 legacy_idx_key("acme", "alice:x")
+    db.set_meta(legacy_idx_key("acme", "left-by-an-old-forget"), "3")
+    db.set_meta("consolidation:acme", "fingerprint")
+
+    db.delete_turns("acme", [gone.id])  # 会话 z 没有发言了
+    assert next_idx_key("acme", "z") not in db.meta_keys("next")
+    assert legacy_idx_key("acme", "left-by-an-old-forget") not in db.meta_keys("next")
+    assert db.get_meta(next_idx_key("acme", "y")) == "1"
+
+    db.delete_space("acme")
+    assert db.meta_keys("next") == sorted(
+        [next_idx_key("acme:alice", "x"), legacy_idx_key("acme:alice", "x")]
+    )
+    assert db.get_meta("consolidation:acme") is None
+    assert [t.id for t in db.get_turns("acme:alice")] == [kept.id]
+
+
+def test_turn_write_counts_are_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """记着写入次数的会话数有上限（不给 run_id 的 add 每次都是一个新会话，常驻的服务以前一直
+    记着）：到了上限就清空、换一代，清空之前读到的版本都算变过，巩固不会把清空后重新数到同一个
+    次数的会话当成没变。delete_space 也不再记着这个空间的会话。"""
+    monkeypatch.setattr(sqlite_module, "TURN_WRITES_KEPT", 2, raising=False)
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    versions = {}
+    for sid in ("a", "b", "c", "d"):
+        _one_turn(db, "demo", sid)
+        versions[sid] = db.turns_version("demo", sid)
+    assert len(db._turn_writes) <= 2
+    assert db.turns_version("demo", "a") != versions["a"]
+    assert db.turns_version("demo", "d") == versions["d"]
+    db.delete_space("demo")
+    assert not [key for key in db._turn_writes if key[0] == "demo"]
 
 
 def test_scrub_leaves_no_deleted_text_without_vacuum(tmp_path: Path) -> None:

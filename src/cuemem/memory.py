@@ -1175,18 +1175,53 @@ class MemorySystem:
             "images": len(self.db.get_media(space_id, turn_ids=sorted(doomed))) if doomed else 0,
         }
 
-    def delete_space(self, space_id: str) -> ForgetReport:
+    def delete_space(self, space_id: str, *, purge_traces: bool = True) -> ForgetReport:
         """删除整个记忆空间（SDK 的 delete_all，N12）：先按会话遗忘全部日志（连带清理缓存、
-        trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合。
+        trace 与没有别处引用的原图），再删掉空间本身的记录与向量集合，以及元信息里写着它的 ID
+        的（各会话的 next_idx、巩固配置的指纹、崩溃时留下的进行中会话的标记；本进程里还在进行中
+        的会话的标记留着，否则进程崩溃时它之后写的发言没人接手）。
+
+        purge_traces：再删掉这个空间的全部 trace（purge_space_traces）。遗忘只删看过被删内容的，
+        留下的（例如没有列出记忆 ID 的 L0 检索）里还有用户问过的话。一次删很多空间时（reset）传
+        False，删完之后一起调用 purge_space_traces，不为每个空间把 trace 文件读一遍。
 
         两步都在巩固锁里：并发写入登记的巩固不会落在遗忘与删除之间。读写门与遗忘一样在巩固锁
-        之后拿（见 _exclusive），里面的遗忘重入两把锁。不能在这个空间的 reading 里调用。"""
+        之后拿（见 _exclusive），里面的遗忘重入两把锁。不能在这个空间的 reading 里调用。
+        空间的读写门与巩固锁本身不删：已经在等旧的门的读取会与拿到新的门的遗忘同时进去。"""
         with self._exclusive(space_id):
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.vectors.delete_space(space_id)  # 先于数据库：旧名字的集合按库里的记忆单元核对归属
             self.db.delete_space(space_id)
+            prefix = _open_mark(space_id)
+            with self._open_lock:  # 与 open_session 的顺序相同：先这把锁、后数据库
+                live = {sid for space, sid in self._open if space == space_id}
+                for key in self.db.meta_keys(prefix):
+                    if key.removeprefix(prefix) not in live:
+                        self.db.delete_meta(key)
+            if purge_traces:  # 在遗忘之后：遗忘自己的 trace 也删掉
+                self.purge_space_traces([space_id])
             self.db.scrub()
         return report
+
+    def purge_space_traces(self, space_ids: Collection[str]) -> int:
+        """删掉这些空间的全部 trace（删除空间之后），连同其中提问的查询向量。返回删除的条数。"""
+        wanted = set(space_ids)
+        if self.tracer is None or not wanted:
+            return 0
+        questions: list[str] = []
+
+        def gone(record: dict[str, Any]) -> bool:
+            attrs = record.get("attrs") or {}
+            space = attrs.get("space")
+            if not isinstance(space, str) or space not in wanted:
+                return False
+            questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
+            return True
+
+        removed = self.tracer.remove(gone)
+        if questions and isinstance(self.embedder, CachedEmbedder):
+            self.embedder.purge(questions, "query")
+        return removed
 
     # ---------- 读取 ----------
 

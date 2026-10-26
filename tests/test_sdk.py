@@ -6,6 +6,7 @@ import asyncio
 import base64
 import io
 import itertools
+import json
 import re
 import sqlite3
 import tempfile
@@ -27,6 +28,7 @@ from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
 from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
+from cuemem.memory import _open_mark
 from cuemem.sdk import parse_messages, space_for
 from cuemem.store.vector import VectorStore
 
@@ -488,7 +490,7 @@ def test_next_turn_number_is_written_with_the_turns(
     set_meta = type(system.db).set_meta
 
     def locked(db: Any, key: str, value: str) -> None:
-        if key.startswith("next_idx:"):
+        if key.startswith("next-idx:"):
             raise sqlite3.OperationalError("database is locked")
         set_meta(db, key, value)
 
@@ -1047,6 +1049,93 @@ def test_reset_deletes_every_space(memory: Memory) -> None:
     assert memory.system.adopt_open("carol") == 0
     memory.add("I live in Oslo", user_id="alice", wait=True)  # 之后照常可用
     assert current_memories(memory, "alice") == ["The user lives in Oslo."]
+
+
+def naming(memory: Memory, user: str) -> tuple[list[str], bool, int]:
+    """还写着这个用户 ID 的：元信息的键、数据库文件里的字节、trace 的条数（attrs.space）。"""
+    db, paths = memory.system.db, memory.system.settings.paths
+    db.scrub()  # WAL 写回数据库文件
+    keys = [k for (k,) in db._conn.execute("SELECT key FROM meta") if user in k]
+    records = [
+        json.loads(line)
+        for path in paths.traces.glob("*.jsonl")
+        for line in path.read_text("utf-8").splitlines()
+    ]
+    traces = [r for r in records if r["attrs"].get("space") == user]
+    return keys, user.encode() in paths.db.read_bytes(), len(traces)
+
+
+@pytest.mark.parametrize("how", ["delete_all", "reset"])
+def test_delete_all_and_reset_leave_nothing_naming_the_user(memory: Memory, how: str) -> None:
+    """delete_all 与 reset 之后，库里与 trace 里不再有写着这个用户 ID（常常是邮箱）的东西。以前
+    留着：每次 add 一个写着用户 ID 与时间的 next_idx 键、巩固配置的指纹、崩溃时留下的进行中会话的
+    标记，以及控制器选了 L0 的那次检索的 trace（没有列出记忆 ID，遗忘按 ID 找不到它）——里面有
+    用户问过的话。别的用户的不动。"""
+    user, system = "alice@example.com", memory.system
+    for i in range(3):
+        memory.add(f"note {i}", user_id=user, infer=False)
+    memory.add("I live in Berlin", user_id=user, timestamp=AUG, wait=True)
+    with memory.run(user_id=user) as rid:
+        memory.add("I like jazz", user_id=user, run_id=rid)
+    memory.search("Where do I live?", user_id=user)
+    system.db.set_meta(_open_mark(user, "chat-1"), AUG.isoformat())  # 之前的进程崩溃时留下的
+    memory.add("I live in Paris", user_id="bob", run_id="r", infer=False)
+    keys, in_db, traces = naming(memory, user)
+    assert len(keys) >= 7 and in_db and traces >= 7
+
+    if how == "delete_all":
+        memory.delete_all(user_id=user)
+    else:
+        memory.reset()
+    assert naming(memory, user) == ([], False, 0)
+    if how == "delete_all":
+        assert naming(memory, "bob")[2] == 1  # bob 的写入的 trace 还在
+        memory.add("I moved to Rome", user_id="bob", run_id="r", infer=False)
+        assert [t.idx for t in system.db.get_turns("bob", "r")] == [0, 1]
+
+
+def test_delete_all_keeps_the_mark_of_a_run_still_open(memory: Memory) -> None:
+    """delete_all 删掉崩溃时留下的进行中会话的标记，本进程里还开着的 run 的标记留着：进程随后
+    崩溃时，它之后写的发言还有人接手（adopt_open）。"""
+    system = memory.system
+    run = memory.open_run(user_id="alice")
+    memory.add("I live in Berlin", user_id="alice", run_id=run)
+    system.db.set_meta(_open_mark("alice", "chat-1"), AUG.isoformat())
+    memory.delete_all(user_id="alice")
+    assert system.db.meta_keys(_open_mark("alice")) == [_open_mark("alice", run)]
+    memory.add("I live in Rome", user_id="alice", run_id=run)  # 序号从 0 重新开始
+    assert [t.idx for t in system.db.get_turns("alice", run)] == [0]
+    assert memory.end_run(run, user_id="alice")["turns"] == 1
+    assert system.db.meta_keys(_open_mark("alice")) == []
+
+
+def test_a_forget_keeps_the_next_turn_number_until_the_session_is_gone(memory: Memory) -> None:
+    """遗忘会话末尾的发言之后，序号照旧不复用（D-059：下一句是 2，抽取时看得出中间删过）；会话的
+    发言全删了，它的 next_idx 也删掉（以前一直留着，键里是用户 ID 与会话 ID）。"""
+    system = memory.system
+    both = [{"role": "user", "content": "first thing"}, {"role": "user", "content": "second one"}]
+    memory.add(both, user_id="erin", run_id="r", infer=False)
+    system.forget("erin", turn_ids=[system.db.get_turns("erin", "r")[1].id])
+    memory.add("third thing", user_id="erin", run_id="r", infer=False)
+    assert [t.idx for t in system.db.get_turns("erin", "r")] == [0, 2]
+    assert [k for k in system.db.meta_keys("next") if "erin" in k]
+    system.forget("erin", session_ids=["r"])
+    assert [k for k in system.db.meta_keys("next") if "erin" in k] == []
+
+
+def test_users_whose_ids_share_a_prefix_keep_their_turn_numbers(memory: Memory) -> None:
+    """空间 'acme' 与 'acme:alice'（作用域 acme:* 的用户 ID 带冒号）：删掉 acme 的全部记忆不碰
+    acme:alice 的会话的序号；acme 用 run_id 'alice:x' 写入也不让 acme:alice 的会话 'x' 跳号。
+    以前两者的 next_idx 是同一行（next_idx:acme:alice:x）。"""
+    system = memory.system
+    two = [{"role": "user", "content": "one"}, {"role": "user", "content": "two"}]
+    memory.add(two, user_id="acme:alice", run_id="x", infer=False)
+    system.forget("acme:alice", turn_ids=[system.db.get_turns("acme:alice", "x")[1].id])
+    six = [{"role": "user", "content": str(i)} for i in range(6)]
+    memory.add(six, user_id="acme", run_id="alice:x", infer=False)
+    memory.delete_all(user_id="acme")
+    memory.add("three", user_id="acme:alice", run_id="x", infer=False)
+    assert [t.idx for t in system.db.get_turns("acme:alice", "x")] == [0, 2]
 
 
 def colliding_agents() -> tuple[str, str]:

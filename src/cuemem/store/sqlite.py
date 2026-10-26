@@ -196,6 +196,22 @@ _MEDIA_COLUMNS = (
     "id, space_id, sha256, path, caption, ocr_text, tags, entity_ids, source_turn_id, ts,"
     " caption_iso, width, height"
 )
+TURN_WRITES_KEPT = 100_000  # 记着写入次数的会话数（见 turns_version），超过时清空、换一代
+_IDX = "next-idx:"
+_LEGACY_IDX = "next_idx:"
+
+
+def next_idx_key(space_id: str, session_id: str) -> str:
+    """SDK 记下的会话里下一句发言的序号（元信息的键，见 sdk.Memory._next_idx）：遗忘删掉的末尾
+    几句的序号不再复用。空间 ID 带上长度（与进行中会话的标记相同）：以前的键 legacy_idx_key 里，
+    空间 'a:b' 的会话 'c' 与空间 'a' 的会话 'b:c' 是同一行，一个用户的写入会让另一个用户会话里的
+    序号跳过一段（抽取时当成有发言被删过）。以前的键照旧读。"""
+    return f"{_IDX}{len(space_id)}:{space_id}:{session_id}"
+
+
+def legacy_idx_key(space_id: str, session_id: str) -> str:
+    """以前的 next_idx 的键（有歧义，见 next_idx_key）：只读，不再写。"""
+    return f"{_LEGACY_IDX}{space_id}:{session_id}"
 
 
 class MemoryDB:
@@ -210,6 +226,7 @@ class MemoryDB:
         self._derived: dict[str, int] = {}  # 空间 → 事实、实体与实体检索单元改过几次
         self._turn_epochs: dict[str, int] = {}  # 空间 → 删过几次发言（遗忘、删除空间）
         self._turn_writes: dict[tuple[str, str], int] = {}  # （空间，会话）→ 写过几次发言
+        self._turn_generation = 0  # _turn_writes 清空过几次（见 _count_turn_writes）
         self._rollbacks = 0  # 回滚过的事务与保存点
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -280,9 +297,10 @@ class MemoryDB:
         """这个会话的发言的版本：两次读到的相同，期间这个会话的发言就没有变过（巩固据此不用
         每次都重算全部会话的内容指纹，见 Consolidator.enqueue）。发言只会追加（add_turns）或
         删除（delete_turns、delete_space），这几个方法计数（以后加的改动发言的方法也要计数）；
-        回滚与别的连接的提交同样算变过。"""
+        回滚与别的连接的提交同样算变过。写入计数清空过（_count_turn_writes）也算变过。"""
         with self._lock:
             return (
+                self._turn_generation,
                 self._turn_epochs.get(space_id, 0),
                 self._turn_writes.get((space_id, session_id), 0),
                 self._rollbacks,
@@ -336,12 +354,8 @@ class MemoryDB:
 
     def meta_keys(self, prefix: str) -> list[str]:
         """以 prefix 开头的键。按区间查询而不用 LIKE：键里的空间 ID 可能有 % 与 _。"""
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT key FROM meta WHERE key >= ? AND key < ? ORDER BY key", (prefix, upper)
-            ).fetchall()
-        return [r[0] for r in rows]
+            return _keys_under(self._conn, prefix)
 
     # ---------- 原始层 ----------
 
@@ -405,8 +419,7 @@ class MemoryDB:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
-            for key in {(t.space_id, t.session_id) for t in turns}:
-                self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
+            self._count_turn_writes(turns)
             return max(cursor.rowcount, 0)
 
     def _add_turns_with_meta(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta]) -> int:
@@ -448,9 +461,19 @@ class MemoryDB:
                     )
             # 与不带附加信息的写入一样计数（turns_version）：以前不计，同一个 run_id 带着 metadata
             # 再写时巩固以为会话没变，新的发言不再抽取
-            for key in {(t.space_id, t.session_id) for t in turns}:
-                self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
+            self._count_turn_writes(turns)
         return added
+
+    def _count_turn_writes(self, turns: Sequence[Turn]) -> None:
+        """给写到的会话的写入次数加一（turns_version，持有 _lock 时调用）。记着的会话到了
+        TURN_WRITES_KEPT 个时先清空、换一代：不给 run_id 的 add 每次都是一个新会话，以前一直
+        记着，常驻的服务每 100 万次写入约 250 MB。换了一代，每个会话的版本都算变过，巩固重算
+        一遍同样的内容指纹（Consolidator._digest），登记的任务不变。"""
+        if len(self._turn_writes) >= TURN_WRITES_KEPT:
+            self._turn_writes.clear()
+            self._turn_generation += 1
+        for key in {(t.space_id, t.session_id) for t in turns}:
+            self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
 
     def get_turn_meta(
         self, space_id: str, turn_ids: Sequence[str] | None = None
@@ -497,7 +520,8 @@ class MemoryDB:
         return [_row_to_turn(r) for r in fetched]
 
     def delete_turns(self, space_id: str, turn_ids: Sequence[str]) -> int:
-        """删除原始轮次（遗忘）；会话里的轮次全部删除后，会话本身也删除。"""
+        """删除原始轮次（遗忘）；会话里的轮次全部删除后，会话本身也删除，连同它的 next_idx
+        （_drop_idle_idx）。还有发言的会话的 next_idx 留着：删掉的末尾几句的序号不再复用。"""
         if not turn_ids:
             return 0
         with self.transaction() as conn:
@@ -516,6 +540,7 @@ class MemoryDB:
                 " (SELECT DISTINCT session_id FROM turns WHERE space_id = ?)",
                 (space_id, space_id),
             )
+            self._drop_idle_idx(conn, space_id)
             # 被删发言里的图片记录一并删除（原图文件由调用方按引用情况清理）
             conn.execute(
                 "DELETE FROM media WHERE space_id = ? AND source_turn_id NOT IN"
@@ -534,6 +559,26 @@ class MemoryDB:
                 (space_id, space_id),
             )
         return deleted
+
+    def _drop_idle_idx(self, conn: sqlite3.Connection, space_id: str) -> None:
+        """删掉这个空间里已经没有发言的会话的 next_idx（next_idx_key，在调用方的事务里）：会话
+        没有发言时 SDK 的序号本来就从 0 开始，留着的只是写着用户 ID 与写入时间的键（不给 run_id
+        的 add 每次一个）。以前遗忘与删除空间都不删，delete_all 之后用户 ID 还在库里。
+
+        以前的键有歧义：不能按前缀删（空间 'acme' 的前缀 'next_idx:acme:' 底下也有空间
+        'acme:alice' 的键），每个键按每一种拆法核对，哪一种拆出的会话还在就留着。顺带删掉以前的
+        遗忘留下的。新的键带着空间 ID 的长度，前缀底下的都是这个空间的。"""
+        idle: list[tuple[str]] = []
+        prefix = next_idx_key(space_id, "")
+        for key in _keys_under(conn, prefix):
+            if not _has_session(conn, space_id, key.removeprefix(prefix)):
+                idle.append((key,))
+        for key in _keys_under(conn, legacy_idx_key(space_id, "")):
+            rest = key.removeprefix(_LEGACY_IDX)
+            owners = [(rest[:i], rest[i + 1 :]) for i, c in enumerate(rest) if c == ":"]
+            if not any(_has_session(conn, space, sid) for space, sid in owners):
+                idle.append((key,))
+        conn.executemany("DELETE FROM meta WHERE key = ?", idle)
 
     # ---------- 溯源：助手的回复引用了哪些记忆（N8） ----------
 
@@ -1137,6 +1182,10 @@ class MemoryDB:
     # ---------- 空间级操作 ----------
 
     def delete_space(self, space_id: str) -> None:
+        """删掉这个空间的全部记录，连同元信息里写着它的 ID 的：各会话的 next_idx 与巩固配置的
+        指纹（consolidation:<空间>，见 Consolidator.stale；没有指纹的空间不算过期）。以前这两种
+        都留着，delete_all 之后用户 ID（常常是邮箱）与每次 add 的时间还在库里。进行中会话的标记
+        由 MemorySystem.delete_space 清理（本进程里还在进行中的要留着）。"""
         with self.transaction() as conn:
             self._bump([space_id])
             self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
@@ -1144,6 +1193,11 @@ class MemoryDB:
             for table in (*raw, *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))
+            self._drop_idle_idx(conn, space_id)
+            conn.execute("DELETE FROM meta WHERE key = ?", (f"consolidation:{space_id}",))
+            # 写入计数也不再记着这个空间的会话：删除次数（_turn_epochs）在上面加过，版本不会重复
+            for key in [k for k in self._turn_writes if k[0] == space_id]:
+                del self._turn_writes[key]
 
     def list_spaces(self) -> list[dict[str, Any]]:
         sql = (
@@ -1187,6 +1241,22 @@ class MemoryDB:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+
+def _keys_under(conn: sqlite3.Connection, prefix: str) -> list[str]:
+    """元信息里以 prefix 开头的键（见 MemoryDB.meta_keys）。"""
+    upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    rows = conn.execute(
+        "SELECT key FROM meta WHERE key >= ? AND key < ? ORDER BY key", (prefix, upper)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _has_session(conn: sqlite3.Connection, space_id: str, session_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sessions WHERE space_id = ? AND id = ?", (space_id, session_id)
+    ).fetchone()
+    return row is not None
 
 
 # ---------- 行 ↔ 模型 ----------

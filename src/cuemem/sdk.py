@@ -68,6 +68,7 @@ from cuemem.core.models import (
 from cuemem.core.timeutil import expiry_instant, naive_local, normalize_expiry
 from cuemem.core.types import PeakPolicy, Router
 from cuemem.errors import ConcurrentWriteError
+from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 
 # 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
 if TYPE_CHECKING:
@@ -286,7 +287,7 @@ class Memory:
                 with self.system.appending(
                     space, [(session, first)], enqueue=infer, meta=extra
                 ) as written:
-                    self.system.db.set_meta(_idx_key(space, sid), str(first + len(turns)))
+                    self.system.db.set_meta(next_idx_key(space, sid), str(first + len(turns)))
             if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
                 raise ConcurrentWriteError(
                     f"Only {written.turns_added} of {len(turns)} messages were written to session "
@@ -411,7 +412,7 @@ class Memory:
             self.system.session_lock(space, sid),
             self.system.appending(space, [(session, 0)], meta={(sid, 0): info}),
         ):
-            self.system.db.set_meta(_idx_key(space, sid), "1")  # 与更正在同一个事务里（见 add）
+            self.system.db.set_meta(next_idx_key(space, sid), "1")  # 与更正在同一个事务里（见 add）
         failed = "Correction logged, but extraction failed: it is retried on consolidate()"
         turn_ids = [stable_id(space, sid, 0)]
         try:
@@ -648,7 +649,8 @@ class Memory:
     def delete_all(
         self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
     ) -> dict[str, Any]:
-        """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图。
+        """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图，以及这个
+        空间的 trace 与库里写着它的 ID 的元信息（见 MemorySystem.delete_space）。
         run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。"""
         space = space_for(user_id, agent_id)
         if run_id is not None:
@@ -670,7 +672,9 @@ class Memory:
         for space, rid in runs:
             self.system.close_session(space, rid, submit=False)
         spaces = [s["space_id"] for s in self.system.db.list_spaces()]
-        reports = [self.system.delete_space(space) for space in spaces]
+        # 这些空间的 trace 最后一起删：每个空间删一遍要把 trace 文件读一遍
+        reports = [self.system.delete_space(space, purge_traces=False) for space in spaces]
+        self.system.purge_space_traces(spaces)
         return {
             "message": "All memories deleted",
             "spaces_deleted": spaces,
@@ -740,11 +744,15 @@ class Memory:
 
     def _next_idx(self, space: str, session_id: str) -> int:
         """会话里下一句发言的序号：只增不减，遗忘删掉的序号不再复用（与 Agent 相同）；
-        新会话（包括删掉后重建的空间）从 0 开始，否则抽取时会被当成有发言被删过。"""
+        新会话（包括删掉后重建的空间）从 0 开始，否则抽取时会被当成有发言被删过。记在
+        next_idx_key 下；以前的版本记在 legacy_idx_key 下的照旧读。"""
         turns = self.system.db.get_turns(space, session_id)
         if not turns:
             return 0
-        recorded = self.system.db.get_meta(_idx_key(space, session_id))
+        db = self.system.db
+        recorded = db.get_meta(next_idx_key(space, session_id))
+        if recorded is None:
+            recorded = db.get_meta(legacy_idx_key(space, session_id))
         return max(int(recorded or 0), max(t.idx for t in turns) + 1)
 
 
@@ -1101,10 +1109,6 @@ def _as_datetime(value: datetime | str | float | None) -> datetime | None:
     if isinstance(value, str):
         return naive_local(datetime.fromisoformat(value))
     return datetime.fromtimestamp(value)
-
-
-def _idx_key(space: str, session_id: str) -> str:
-    return f"next_idx:{space}:{session_id}"
 
 
 # ---------- 输出 ----------
