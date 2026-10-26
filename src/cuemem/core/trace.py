@@ -12,6 +12,7 @@ LLM 客户端与向量化模块会自动往当前 trace 里记事件；不在 tr
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import uuid
@@ -21,6 +22,8 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class Trace:
@@ -73,6 +76,7 @@ class TraceSink:
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory
+        self.failing = False  # 上一次写入失败了（见 start_trace：接连失败只记一次警告）
         self._lock = threading.Lock()
 
     def remove(self, predicate: Callable[[dict[str, Any]], bool]) -> int:
@@ -112,7 +116,11 @@ _current: ContextVar[Trace | None] = ContextVar("cuemem_trace", default=None)
 @contextmanager
 def start_trace(name: str, sink: TraceSink | None = None, **attrs: Any) -> Iterator[Trace]:
     """开始一个 trace；如果已经在某个 trace 里（例如评测 runner 调用 MemorySystem.ask），
-    就记为父 trace 的一个阶段，事件也都记到父 trace 上，便于外层统一统计用量。"""
+    就记为父 trace 的一个阶段，事件也都记到父 trace 上，便于外层统一统计用量。
+
+    trace 只是排查用的记录，在块做完（写入已经提交、遗忘已经做完）之后才写：写不进去（磁盘满、
+    目录不可写）时记一条警告，不抛出。以前它的 OSError 让已经提交的写入报错，调用方原样重试就
+    写了两遍；块里出错时还盖住了原来的异常。接连失败只记一次，写成功之后再失败时再记。"""
     parent = _current.get()
     if parent is not None:
         with parent.span(name, **attrs):
@@ -126,7 +134,19 @@ def start_trace(name: str, sink: TraceSink | None = None, **attrs: Any) -> Itera
         trace.finish()
         _current.reset(token)
         if sink is not None:
-            sink.write(trace)
+            try:
+                sink.write(trace)
+            except Exception as exc:
+                if not sink.failing:
+                    logger.warning(
+                        "trace 写不进 %s，这次（%s）与之后的 trace 不记，直到写入恢复：%s",
+                        sink.directory,
+                        name,
+                        exc,
+                    )
+                sink.failing = True
+            else:
+                sink.failing = False
 
 
 def current_trace() -> Trace | None:

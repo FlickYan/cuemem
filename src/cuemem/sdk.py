@@ -254,7 +254,7 @@ class Memory:
         不能用（这段对话结束时才抽取），会报 ValueError。发言写进去之后抽取出错（模型供应商
         余额不足、限流等）时不抛出：status 是 "queued"，error 写明原因，下次巩固时补上——抛出的话
         调用方重试就写了两遍。写进去之前出错（向量接口不可用等）时照常抛出，什么都没写，可以原样
-        重试。
+        重试；写进去之后 trace 写不进去时只记一条警告（见 core/trace.py 的 start_trace）。
         """
         space = space_for(user_id, agent_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
@@ -277,14 +277,16 @@ class Memory:
             with self.system.session_lock(space, sid):
                 first = self._next_idx(space, sid)
                 started = self.system.db.get_sessions(space).get(sid, when)
-                written = self.system.append(
-                    space,
-                    SessionIn(session_id=sid, started_at=started, turns=turns),
-                    first,
-                    enqueue=infer,
-                    meta=[info] * len(turns) if info is not None else None,
-                )
-                self.system.db.set_meta(_idx_key(space, sid), str(first + len(turns)))
+                session = SessionIn(session_id=sid, started_at=started, turns=turns)
+                extra = None
+                if info is not None:
+                    extra = {(sid, first + i): info for i in range(len(turns))}
+                # 下一句的序号与发言在同一个事务里提交：以前另起一个事务写，出错时发言已经写进去，
+                # 调用方原样重试就写了两遍
+                with self.system.appending(
+                    space, [(session, first)], enqueue=infer, meta=extra
+                ) as written:
+                    self.system.db.set_meta(_idx_key(space, sid), str(first + len(turns)))
             if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
                 raise ConcurrentWriteError(
                     f"Only {written.turns_added} of {len(turns)} messages were written to session "
@@ -404,11 +406,12 @@ class Memory:
         sid = sortable_session_id("edit", when)
         turn = TurnIn(role="user", text=f"Correction: {data.strip()}", ts=when)
         before = self.system.db.fact_links(space)
-        with self.system.session_lock(space, sid):
-            self.system.append(
-                space, SessionIn(session_id=sid, started_at=when, turns=[turn]), 0, meta=[info]
-            )
-            self.system.db.set_meta(_idx_key(space, sid), "1")
+        session = SessionIn(session_id=sid, started_at=when, turns=[turn])
+        with (
+            self.system.session_lock(space, sid),
+            self.system.appending(space, [(session, 0)], meta={(sid, 0): info}),
+        ):
+            self.system.db.set_meta(_idx_key(space, sid), "1")  # 与更正在同一个事务里（见 add）
         failed = "Correction logged, but extraction failed: it is retried on consolidate()"
         turn_ids = [stable_id(space, sid, 0)]
         try:

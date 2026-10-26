@@ -410,6 +410,106 @@ def test_a_write_failing_after_the_vectors_takes_them_back(
     assert system.db.get_turn_meta("alice") == {}
 
 
+def _unwritable_traces(settings: Settings, tmp_path: Path) -> Settings:
+    """trace 目录建不起来（放在一个普通文件下面）：每次写 trace 都抛 NotADirectoryError，
+    与磁盘满、目录没有写权限时一样。打开 Memory 时不建目录，照常打开。"""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    paths = settings.paths.model_copy(update={"traces": blocker / "traces"})
+    return settings.model_copy(update={"paths": paths})
+
+
+def test_a_trace_that_cannot_be_written_does_not_fail_a_committed_write(
+    n3_settings: Settings,
+    fake_api: FakeAPI,
+    model: ScriptedModel,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """trace 在提交之后才写：写不进去时 add、update 与 delete 照常返回，记一条警告（接连失败只记
+    一次）。以前它的 OSError 让已经提交的 add 抛出，调用方（记忆代理与 CueMemSession 也会）原样
+    重试，同一句话在日志里有两遍；已经做完的遗忘也报成失败。"""
+    fake_api.chat_replies = [model]
+    settings = _unwritable_traces(n3_settings, tmp_path)
+    with (
+        Memory(settings, http_client=fake_api.client(), background=False) as m,
+        caplog.at_level("WARNING", "cuemem.core.trace"),
+    ):
+        out = m.add("I live in Berlin", user_id="alice", run_id="r1", timestamp=AUG)
+        turns = m.system.db.get_turns("alice", "r1")
+        assert [(t.idx, t.text) for t in turns] == [(0, "I live in Berlin")]
+        assert out["status"] == "queued" and out["turn_ids"] == [turns[0].id]
+
+        jazz = m.add("I like jazz", user_id="alice", timestamp=AUG, wait=True)["results"][0]
+        updated = m.update(jazz["id"], "I like blues")
+        assert updated["message"] == "Memory updated"
+        assert len(m.system.db.get_turns("alice", updated["session_id"])) == 1
+        blues = updated["results"][0]["id"]
+        assert m.delete(blues)["message"] == "Memory deleted"
+        assert m.get(blues) is None
+    warnings = [r for r in caplog.records if r.name == "cuemem.core.trace"]
+    assert len(warnings) == 1 and "traces" in warnings[0].getMessage()
+
+
+def test_a_trace_that_cannot_be_written_does_not_hide_the_error(
+    n3_settings: Settings,
+    fake_api: FakeAPI,
+    model: ScriptedModel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """写入本身出错、trace 又写不进去：调用方拿到的是原来的异常。以前是 trace 的 OSError（原来的
+    异常只在 __context__ 里），worth_retrying 据此把一次不该重试的写入（HTTP 400）当成可以重试。"""
+    fake_api.chat_replies = [model]
+    with Memory(
+        _unwritable_traces(n3_settings, tmp_path), http_client=fake_api.client(), background=False
+    ) as m:
+
+        def rejected(texts: Sequence[str], kind: EmbedKind) -> Any:
+            raise EmbeddingAPIError("向量接口返回 HTTP 400", status=400)
+
+        monkeypatch.setattr(m.system.embedder, "embed", rejected)
+        with pytest.raises(EmbeddingAPIError):
+            m.add("I live in Berlin", user_id="alice", run_id="r1")
+        assert m.system.db.get_turns("alice") == []
+
+
+@pytest.mark.parametrize("call", ["add", "update"])
+def test_next_turn_number_is_written_with_the_turns(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    """add 与 update 记下会话里下一句的序号（next_idx）与发言在同一个事务里：写它出错时发言也
+    不留，调用方原样重试只写一遍。以前它在发言提交之后另起一个事务写，出错时（另一个进程长时间
+    占着写锁的 "database is locked"、磁盘满）发言已经在日志里，重试又写一遍。"""
+    system = memory.system
+    jazz = memory.add("I like jazz", user_id="alice", timestamp=AUG, wait=True)["results"][0]
+    sessions = set(system.db.get_sessions("alice"))
+    jobs = len(system.db.get_jobs("alice"))
+    set_meta = type(system.db).set_meta
+
+    def locked(db: Any, key: str, value: str) -> None:
+        if key.startswith("next_idx:"):
+            raise sqlite3.OperationalError("database is locked")
+        set_meta(db, key, value)
+
+    def write() -> dict[str, Any]:
+        if call == "add":
+            return memory.add("I live in Berlin", user_id="alice", run_id="r1", timestamp=SEP)
+        return memory.update(jazz["id"], "I like blues")
+
+    monkeypatch.setattr(type(system.db), "set_meta", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        write()
+    assert set(system.db.get_sessions("alice")) == sessions
+    assert len(system.db.get_jobs("alice")) == jobs
+
+    monkeypatch.setattr(type(system.db), "set_meta", set_meta)
+    out = write()
+    turns = system.db.get_turns("alice", out["session_id"])
+    assert [t.idx for t in turns] == [0] and [t.id for t in turns] == out["turn_ids"]
+    assert set(system.db.get_sessions("alice")) == sessions | {out["session_id"]}
+
+
 def test_a_failed_write_leaves_no_image_behind(
     memory: Memory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
