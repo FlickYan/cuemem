@@ -285,7 +285,8 @@ class Consolidator:
         before=None 时为全部会话登记（清空重建）。会话又长了时的重放与遗忘共用。
 
         skip：进行中的会话，由调用方读好传进来。这里不调用 open_sessions：open_session 先拿
-        进行中会话的锁、再写数据库，调用方在数据库的事务里调用时反过来拿就会互相等死。"""
+        进行中会话的锁、再写数据库，调用方在数据库的事务里调用时反过来拿就会互相等死；遗忘拿着
+        进行中会话的锁调用它（见 MemorySystem.forget），那把锁不可重入。"""
         sessions = None if before is None else sorted({j["session_id"] for j in before})
         with self.db.transaction():
             added = self.enqueue(space_id, sessions, skip=skip)

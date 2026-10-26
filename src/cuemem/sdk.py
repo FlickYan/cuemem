@@ -616,7 +616,11 @@ class Memory:
         重建派生记忆。被它取代过的旧事实会恢复为当前有效。
 
         dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。删除做完之后
-        重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。"""
+        重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。
+
+        一句发言都没删、这条事实却还在（它出处的发言已经不在日志里，例如之前的版本遗忘到一半
+        出错留下的）时 message 是 "Nothing deleted"，warning 让调用方 consolidate(rebuild=True)：
+        以前照样回 "Memory deleted"。"""
         found = self._find(memory_id)
         if found is None:
             raise KeyError(f"No memory with id {memory_id}")
@@ -628,6 +632,17 @@ class Memory:
         report = self.system.forget_memories(
             found[0], fact_ids=[memory_id], report_rebuild_errors=True
         )
+        if not report.turns_deleted and self.system.db.get_facts(found[0], ids=[memory_id]):
+            return {
+                "message": "Nothing deleted",
+                **_forget_out(report),
+                "warning": (
+                    "Nothing was deleted: none of the conversation turns this memory came from "
+                    "are in the log any more (an earlier version can leave this behind when a "
+                    "forget failed partway). Run consolidate(rebuild=True) to rebuild the "
+                    "memories from the log."
+                ),
+            }
         return {"message": "Memory deleted", **_forget_out(report)}
 
     def delete_all(

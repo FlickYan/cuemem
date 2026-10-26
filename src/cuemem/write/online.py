@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -321,22 +321,21 @@ class OnlineWriter:
             turn.media_ids = [m.id for m in items if m.source_turn_id == turn.id]
         return items
 
-    def reindex_sessions(self, space_id: str, session_ids: Sequence[str]) -> int:
-        """按数据库里现存的轮次重建这些会话的"轮"（遗忘部分轮次之后使用）。
+    def prepare_rounds(
+        self, space_id: str, session_ids: Sequence[str], exclude: Collection[str]
+    ) -> list[MemoryUnit]:
+        """遗忘的第一步：这些会话去掉 exclude 里的发言之后的"轮"，向量化（一次请求）、写进向量库，
+        返回它们；数据库不动，由调用方在删发言的同一个事务里换上（见 MemorySystem.forget）。
 
-        调用方需先删除这些会话原有的"轮"；返回新写入的单元数。
-        """
+        先写向量、后写数据库：数据库里有这条记录，就说明向量一定已经写入。请求与以前先删旧的
+        "轮"、再按剩下的发言重建（reindex_sessions）时相同：同样的文本、同样的顺序。"""
         units: list[MemoryUnit] = []
         for session_id in session_ids:
-            units.extend(build_rounds(self.db.get_turns(space_id, session_id)))
-        missing = set(self.db.missing_unit_ids(space_id, [u.id for u in units]))
-        new_units = [u for u in units if u.id in missing]
-        if new_units:
-            self._upsert(space_id, new_units, self._embed(new_units))
-            # 先写向量、后写数据库：数据库里有这条记录，就说明向量一定已经写入；
-            # 中途失败时重跑会补齐（向量化命中缓存，不会重复计费）。
-            self.db.add_units(new_units)
-        return len(new_units)
+            turns = self.db.get_turns(space_id, session_id)
+            units.extend(build_rounds([t for t in turns if t.id not in exclude]))
+        if units:
+            self._upsert(space_id, units, self._embed(units))
+        return units
 
     def replace_rounds(self, space_id: str, session_id: str, stale: Sequence[str]) -> int:
         """把会话里的这些"轮"换成按现存发言重建的（例如同一轮里工具调用之后的回复并进这一轮），

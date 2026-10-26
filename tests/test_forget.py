@@ -31,9 +31,8 @@ from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.models import Conversation, SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
+from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
-from cuemem.write.consolidate import MAX_ATTEMPTS
-from cuemem.write.extract import PIPELINE_VERSION
 
 SECRET = "电商"  # 只出现在第 4 段会话（s4）里的词
 PIN = "SECRET-1234"
@@ -410,35 +409,149 @@ def _statements(memory: Memory) -> list[str]:
     return sorted(f["memory"] for f in memory.get_all(user_id="u")["results"])
 
 
-def test_forget_vector_store_error_keeps_jobs_and_cleans_traces(
-    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+def _consistent(system: MemorySystem) -> None:
+    """向量库里的点与数据库里的记忆单元一一对应。"""
+    assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def _pin_chat(memory: Memory) -> str:
+    """三段会话，最后一段（c）是一问一答，用户那句带着要删的 PINCODE，检索过一次（trace 里有）。
+    返回这句的 ID。"""
+    memory.add("I live in Berlin", user_id="u", run_id="a", timestamp=AUG, wait=True)
+    day2 = AUG + timedelta(days=1)
+    memory.add("I like jazz", user_id="u", run_id="b", timestamp=day2, wait=True)
+    out = memory.add(
+        [
+            {"role": "user", "content": "I like PINCODE chess"},
+            {"role": "assistant", "content": "Chess it is."},
+        ],
+        user_id="u",
+        run_id="c",
+        timestamp=SEP,
+        wait=True,
+    )
+    memory.search("PINCODE chess?", user_id="u", mode="l1")
+    return str(out["turn_ids"][0])
+
+
+def _forgotten(memory: Memory) -> None:
+    """_pin_chat 里用户那句删干净了：事实、trace 与"轮"里都没有它，向量与记录一一对应。"""
+    system = memory.system
+    assert _statements(memory) == ["I like jazz", "The user lives in Berlin."]
+    rounds = system.db.list_units("u", kinds=["round"], session_ids=["c"])
+    assert [u.text for u in rounds] == ["Assistant: Chess it is."]
+    assert "PINCODE" not in _traces(system)
+    _consistent(system)
+
+
+@pytest.mark.parametrize("broken", ["upsert", "delete"])
+def test_forget_vector_store_error_deletes_nothing(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch, broken: str
 ) -> None:
-    """清空派生层之后删它们的向量时向量库出错：照样清理 trace，写进报告的 rebuild_error，重新
-    登记的任务还在，下次巩固补齐。以前这一步在清理之外：异常连 report_rebuild_errors 也挡不住，
-    任务一个不剩（下次巩固也补不回来），trace 里留着被删的原话。"""
+    """遗忘的第一步向量库出错（写新"轮"的向量，或删要失去记录的向量）：数据库与 LLM 缓存都还
+    没动，什么都没删，异常照常抛出（report_rebuild_errors 也一样），原样重试就删干净。以前先删
+    发言、各自提交，之后才动向量：出错时发言没了，由它抽出的事实还是当前有效的；删派生向量出错时
+    任务也一个不剩。"""
     with _sdk(n3_settings, fake_api, background=False) as memory:
         system = memory.system
-        memory.add("I live in Berlin", user_id="u", run_id="a", timestamp=AUG, wait=True)
-        day2 = AUG + timedelta(days=1)
-        memory.add("I like jazz", user_id="u", run_id="b", timestamp=day2, wait=True)
-        memory.add("I like PINCODE chess", user_id="u", run_id="c", timestamp=SEP, wait=True)
-        memory.search("PINCODE chess?", user_id="u", mode="l1")
+        user_turn = _pin_chat(memory)
         facts = {f.id for f in system.db.get_facts("u")}
-        delete = system.vectors.delete
+        real = getattr(system.vectors, broken)
 
-        def unreachable(space: str, ids: Sequence[str]) -> Any:
-            if facts & set(ids):
+        def unreachable(space: str, ids: Sequence[str], *rest: Any) -> Any:
+            if broken == "upsert" or facts & set(ids):
                 raise ConnectionError("qdrant unreachable")
-            return delete(space, ids)
+            return real(space, ids, *rest)
 
-        monkeypatch.setattr(system.vectors, "delete", unreachable)
-        report = system.forget("u", session_ids=["c"], report_rebuild_errors=True)
-        monkeypatch.setattr(system.vectors, "delete", delete)
+        assert system.llm.cache is not None
+        cached = len(system.llm.cache)
+        monkeypatch.setattr(system.vectors, broken, unreachable)
+        with pytest.raises(ConnectionError):
+            system.forget("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        monkeypatch.setattr(system.vectors, broken, real)
 
-        assert report.turns_deleted == 1 and report.rebuild_error
-        assert "PINCODE" not in _traces(system)
-        assert system.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS) == ["u"]
-        system.consolidator.run("u")
+        assert len(system.db.get_turns("u")) == 4
+        assert "I like PINCODE chess" in _statements(memory)
+        assert [j["status"] for j in system.db.get_jobs("u")] == ["done"] * 3
+        assert len(system.llm.cache) == cached
+        report = system.forget("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        assert report.turns_deleted == 1 and report.rebuild_error is None
+        _forgotten(memory)
+
+
+def test_forget_during_an_embedding_outage_deletes_nothing(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """按发言删（HTTP 的 forget 带 turn_ids、CLI 的 --turn）时向量接口不可用：剩下的那句组成的
+    "轮"文本变了、要向量化，在删任何东西之前就出错，原样重试就删干净。以前发言已经删了，由它
+    抽出的事实还是当前有效的、还检索得到，剩下的那句再也没有"轮"，重试找不到要删的发言。"""
+    with _sdk(n3_settings, fake_api, background=False) as memory:
+        system = memory.system
+        user_turn = _pin_chat(memory)
+        assert isinstance(system.embedder, CachedEmbedder)
+        inner = system.embedder.inner
+
+        def down(texts: Sequence[str], kind: Any) -> Any:
+            raise EmbeddingAPIError("向量接口返回 HTTP 503", status=503)
+
+        monkeypatch.setattr(inner, "embed", down)
+        with pytest.raises(EmbeddingAPIError):
+            system.forget_memories("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        monkeypatch.undo()
+
+        assert len(system.db.get_turns("u")) == 4
+        assert "I like PINCODE chess" in _statements(memory)
+        again = system.forget_memories("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        assert again.turns_deleted == 1 and again.rebuild_error is None
+        _forgotten(memory)
+
+
+def test_forget_deletes_and_clears_in_one_transaction(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """换上新的"轮"、删发言、清空派生层与重新登记任务在同一个事务里：其中一步出错（磁盘满）时
+    一起撤销，什么都没删，原样重试就删干净（向量已经删掉的派生记忆在重放时重建）。以前删发言
+    先提交了：之后出错时由被删发言抽出的事实还是当前有效的，按事实 ID 再删也找不到发言。"""
+    with _sdk(n3_settings, fake_api, background=False) as memory:
+        system = memory.system
+        user_turn = _pin_chat(memory)
+
+        def disk_full(space_id: str) -> list[str]:
+            raise sqlite3.OperationalError("database or disk is full")
+
+        monkeypatch.setattr(system.db, "clear_derived", disk_full)
+        with pytest.raises(sqlite3.OperationalError):
+            system.forget("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        monkeypatch.undo()
+
+        assert len(system.db.get_turns("u")) == 4
+        rounds = system.db.list_units("u", kinds=["round"], session_ids=["c"])
+        assert [u.text for u in rounds] == ["User: I like PINCODE chess\nAssistant: Chess it is."]
+        assert "I like PINCODE chess" in _statements(memory)
+        assert [j["status"] for j in system.db.get_jobs("u")] == ["done"] * 3
+        assert system.forget("u", turn_ids=[user_turn]).turns_deleted == 1
+        _forgotten(memory)
+
+
+def test_sdk_delete_says_so_when_nothing_was_deleted(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """事实出处的发言已经不在日志里（之前的版本遗忘到一半出错留下的：发言与"轮"删了，事实还是
+    当前有效的）：按 ID 删它一句发言都删不到，回 "Nothing deleted" 并让调用方重建，不再回
+    "Memory deleted"。"""
+    with _sdk(n3_settings, fake_api, background=False) as memory:
+        system = memory.system
+        _pin_chat(memory)
+        [fact] = [f for f in system.db.get_facts("u") if "PINCODE" in f.statement]
+        rounds = system.db.list_units("u", kinds=["round"], session_ids=["c"])
+        system.db.delete_units("u", [u.id for u in rounds])
+        system.db.delete_turns("u", [t.id for t in system.db.get_turns("u", "c")])
+
+        out = memory.delete(fact.id)
+
+        assert out["message"] == "Nothing deleted" and out["turns_deleted"] == 0
+        assert "consolidate(rebuild=True)" in out["warning"]
+        memory.consolidate(user_id="u", rebuild=True)
         assert _statements(memory) == ["I like jazz", "The user lives in Berlin."]
 
 
@@ -512,6 +625,80 @@ def test_forget_keeps_moderated_and_failed_outcomes(
         assert (extractions("forbidden"), extractions("BROKEN")) == sent
         assert outcomes() == before
         assert _statements(memory) == ["The user lives in Berlin."]
+
+
+def _fails_once(prefix: str) -> tuple[Any, dict[str, int]]:
+    """回复函数：系统提示以 prefix 开头的请求，把 failures 设成 1 之后的第一次回余额不足（402），
+    之后供应商恢复。"""
+    model = ScriptedModel(where_i_live, reconcile=moved)
+    left = {"failures": 0}
+
+    def reply(body: dict[str, Any]) -> Any:
+        if left["failures"] and body["messages"][0]["content"].startswith(prefix):
+            left["failures"] -= 1
+            return NO_BALANCE
+        return model(body)
+
+    return reply, left
+
+
+def _settles(memory: Memory, expected: list[str]) -> list[str]:
+    """等后台线程把事实补到 expected（最多 10 秒），返回最后看到的。"""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _statements(memory) != expected:
+        time.sleep(0.05)
+    return _statements(memory)
+
+
+def test_a_replay_that_raised_is_handed_to_the_worker(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """遗忘之后的重放抛出了异常（对账时余额不足）：删除已经做了（warning），没做完的任务交给
+    后台线程按退避补齐。以前任务留着却没人提交，要等这个空间的下一次写入或重启，在那之前被删
+    事实之后的住址与喜好都不见了。"""
+    reply, left = _fails_once("You maintain a long-term memory")
+    with _sdk(n3_settings, fake_api, reply, background=True) as memory:
+        assert memory.system.worker is not None
+        memory.system.worker.retry_base_s = 0.05  # 后台线程的退避，测试里缩短
+        memory.add("I live in Berlin", user_id="u", timestamp=AUG)
+        memory.add("I moved to Munich", user_id="u", timestamp=SEP)
+        memory.add("I moved to Paris", user_id="u", timestamp=SEP + timedelta(days=1))
+        memory.add("I like jazz", user_id="u", timestamp=SEP + timedelta(days=2))
+        memory.wait()
+        everything = memory.get_all(user_id="u", include_superseded=True)["results"]
+        munich = next(f for f in everything if "Munich" in f["memory"])
+
+        left["failures"] = 1
+        out = memory.delete(munich["id"])
+
+        assert out["message"] == "Memory deleted" and out.get("warning")
+        expected = ["I like jazz", "The user lives in Paris."]
+        assert _settles(memory, expected) == expected
+
+
+def test_a_failed_extraction_in_the_replay_is_retried_by_the_worker(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """遗忘之后的重放里一个会话抽取失败（不抛出，任务记为失败）：同样交给后台线程，按退避重试。
+    以前没人提交，要等这个空间的下一次写入或重启，会话里没删的那句一直没有事实。"""
+    reply, left = _fails_once("You build the long-term memory")
+    with _sdk(n3_settings, fake_api, reply, background=True) as memory:
+        assert memory.system.worker is not None
+        memory.system.worker.retry_base_s = 0.05
+        chat = [
+            {"role": "user", "content": "I live in Berlin"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "I like jazz"},
+            {"role": "assistant", "content": "nice"},
+        ]
+        memory.add(chat, user_id="u", run_id="r1", timestamp=AUG)
+        memory.wait()
+        berlin = next(f for f in memory.get_all(user_id="u")["results"] if "Berlin" in f["memory"])
+
+        left["failures"] = 1
+        memory.delete(berlin["id"])
+
+        assert _settles(memory, ["I like jazz"]) == ["I like jazz"]
 
 
 def test_close_closes_its_own_caches(n3_settings: Settings, fake_api: FakeAPI) -> None:

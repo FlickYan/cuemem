@@ -264,6 +264,36 @@ def test_forget_deletes_images(mm: tuple[MemorySystem, ScriptedModel]) -> None:
     assert system.db.get_media("pics") == []
 
 
+def test_forget_goes_on_when_an_image_file_cannot_be_deleted(
+    mm: tuple[MemorySystem, ScriptedModel],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """原图文件删不掉（没有权限）：记录已经删了，遗忘照样重放派生记忆、清理缓存，别的原图照删，
+    记一条写明路径的警告（之后的遗忘找不到它，要手动删）。以前异常在删发言之后、清空派生层之前
+    抛出：由这段会话抽出的事实还是当前有效的，重试找不到要删的发言。"""
+    system, _ = mm
+    assert system.media is not None
+    paths = sorted(Path(m.path) for m in system.db.get_media("pics"))
+    delete_unused = system.media.delete_unused
+
+    def locked(path: Path, sha256: str, in_use: Any) -> bool:
+        if path == paths[0]:
+            raise PermissionError(13, "Permission denied", str(path))
+        return delete_unused(path, sha256, in_use)
+
+    monkeypatch.setattr(system.media, "delete_unused", locked)
+    with caplog.at_level("WARNING", logger="cuemem.memory"):
+        report = system.forget("pics", session_ids=["s1"])
+
+    assert report.turns_deleted == 3 and report.images_deleted == 1
+    assert report.rebuild_error is None
+    assert paths[0].exists() and not paths[1].exists()
+    assert str(paths[0]) in caplog.text
+    assert system.db.get_media("pics") == []
+    assert not any("CUE 42" in f.statement for f in system.facts("pics"))
+
+
 def test_memlens_loader_and_judge(tmp_path: Path, images: dict[str, Path], fake_api: FakeAPI,
                                   settings: Settings) -> None:  # fmt: skip
     (tmp_path / "release_images" / "needle_images").mkdir(parents=True)
