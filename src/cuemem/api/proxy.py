@@ -64,6 +64,7 @@ from starlette.types import Receive, Scope, Send
 from cuemem import __version__
 from cuemem.api.auth import Keys, Principal, guard, principal_of
 from cuemem.api.failures import provider_failure
+from cuemem.api.limits import MAX_BODY_BYTES
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
@@ -961,12 +962,15 @@ def create_proxy_app(
     keys: Keys | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
+    max_body_bytes: int = MAX_BODY_BYTES,
 ) -> FastAPI:
     """单独运行的记忆代理（cuemem proxy）。token 非空时要求 Authorization: Bearer <token>：
     OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。keys：另有限定作用域
     的令牌（Keys.from_env；给了时不看 token），每个令牌只能用作用域里的用户。
 
-    不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。"""
+    不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。
+    max_body_bytes：请求体的上限（字节，超过时 413，见 api/limits.py），cuemem proxy 从环境变量
+    CUEMEM_MAX_BODY_BYTES 读。"""
     from cuemem.api.app import SWEEP_INTERVAL_S, _guard, _sweep, _sweep_jobs
 
     stop = threading.Event()
@@ -1000,5 +1004,5 @@ def create_proxy_app(
 
     keys = keys if keys is not None else Keys.from_token(token)
     app.include_router(proxy_router(proxy, dependencies=guard(keys)))
-    _guard(app, allowed_hosts, origin_hosts)
+    _guard(app, allowed_hosts, origin_hosts, max_body_bytes=max_body_bytes)
     return app

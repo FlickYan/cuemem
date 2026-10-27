@@ -642,6 +642,7 @@ def serve(
 
     from cuemem.api.app import create_app
     from cuemem.api.auth import TOKEN_ENV, Keys
+    from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits
     from cuemem.api.proxy import MemoryProxy
 
     if not idle_minutes > 0:  # 在打开记忆系统之前检查
@@ -656,10 +657,12 @@ def serve(
         ui = False
     unknown = _unknown_model(unknown_model)
     keys = Keys()
+    limits = MAX_BODY_BYTES, MAX_IMPORT_BYTES
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
-        nonlocal keys
+        nonlocal keys, limits
         keys = _access_keys()
+        limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
         _require_token(host, keys, insecure_no_auth)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
@@ -676,6 +679,8 @@ def serve(
             allowed_hosts=allowed_hosts,
             origin_hosts=origin_hosts,
             idle_minutes=idle_minutes,
+            max_body_bytes=limits[0],
+            max_import_bytes=limits[1],
         )
         where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
         console.print(
@@ -716,6 +721,7 @@ def proxy(
     import uvicorn
 
     from cuemem.api.auth import TOKEN_ENV
+    from cuemem.api.limits import body_limits
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -726,6 +732,7 @@ def proxy(
     settings = load_settings(peak_policy="warn")
     try:
         keys = _access_keys()  # load_settings 已读入 .env
+        max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
@@ -760,7 +767,11 @@ def proxy(
                 "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
             )
         app_ = create_proxy_app(
-            memory_proxy, keys=keys, allowed_hosts=allowed_hosts, origin_hosts=origin_hosts
+            memory_proxy,
+            keys=keys,
+            allowed_hosts=allowed_hosts,
+            origin_hosts=origin_hosts,
+            max_body_bytes=max_body_bytes,
         )
         uvicorn.run(app_, host=host, port=port)
     finally:

@@ -17,6 +17,10 @@ Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密�
 任何网页都能借访问者的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受
 这些 Host（cuemem serve / proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，
 它的网页就算同源）。
+
+请求体的上限（第三轮体检，api/limits.py）：/api、/v1 与界面的上传默认 64 MiB，导入 1 GiB，界面
+别的接口 8 MiB，超过时 413，在读请求体之前；/api 与 /api/v1 也先认令牌再读请求体
+（auth.authenticated_route）。
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from cuemem import __version__
 from cuemem.agent import Reply
 from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of, ui_login
 from cuemem.api.failures import provider_failure
+from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, BodyLimit
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
@@ -105,8 +110,17 @@ class SameOriginOnly:
         return parts.netloc.lower() == host.lower() or name in self.hosts
 
 
-def _guard(app: FastAPI, allowed_hosts: Sequence[str] | None, origin_hosts: Sequence[str]) -> None:
-    """浏览器侧的防护（create_app 与 create_proxy_app 共用）；Host 检查在最外层，先于 Origin。"""
+def _guard(
+    app: FastAPI,
+    allowed_hosts: Sequence[str] | None,
+    origin_hosts: Sequence[str],
+    *,
+    max_body_bytes: int = MAX_BODY_BYTES,
+    max_import_bytes: int = MAX_IMPORT_BYTES,
+) -> None:
+    """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
+    先于 Origin，再是请求体的上限（api/limits.py）。这三项都不读请求体。"""
+    app.add_middleware(BodyLimit, max_body_bytes=max_body_bytes, max_import_bytes=max_import_bytes)
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
@@ -230,6 +244,8 @@ def create_app(
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
     idle_minutes: float | None = 30.0,
+    max_body_bytes: int = MAX_BODY_BYTES,
+    max_import_bytes: int = MAX_IMPORT_BYTES,
 ) -> FastAPI:
     """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。keys：管理令牌之外还有限定
     作用域的令牌（Keys.from_env，见 api/auth.py；给了时不看 token）：每个令牌只能访问自己作用域
@@ -240,6 +256,10 @@ def create_app(
 
     allowed_hosts：只接受这些 Host（接口与界面；None 不检查）。origin_hosts：除同源外放行的
     Origin 主机名（"*" 不限）。见模块说明。
+
+    max_body_bytes、max_import_bytes：请求体的上限（字节，超过时 413；导入用后者，/api、/v1 与
+    界面的上传用前者，界面别的接口固定 8 MiB，见 api/limits.py）。cuemem serve 从环境变量
+    CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES 读（limits.body_limits）。
 
     upload_dir：上传的图片只在请求期间放在这里，写进记忆之后就删（媒体库里另存一份）。建应用时
     先清掉里面留下的图片：以前的版本一直留着上传的原图，遗忘之后磁盘上还有一份（D-021）；
@@ -492,6 +512,7 @@ def create_app(
             theme=THEME,
             css=CSS,
             allowed_paths=[str(service.system.settings.paths.media)],  # 界面不读上传目录
+            max_file_size=max_body_bytes,  # 上传的图片与 /api 同一个上限（页面里先查一遍）
             footer_links=[],  # 接口文档在 /docs
             auth=ui_login(keys),
             auth_message=(
@@ -504,7 +525,14 @@ def create_app(
         # Gradio 都在事件函数之前把它复制进缓存，再经 /gradio_api/file= 交出去。不在 ui.py 的事件
         # 函数里查：它拿到的已经是缓存里的副本，聊天记录这个输入也不经过它
         demo.has_launched = True
-    _guard(app, allowed_hosts, origin_hosts)  # 中间件：落到界面的预检请求也先过这里
+    # 中间件：落到界面的预检请求也先过这里；请求体的上限也管界面的登录与事件接口
+    _guard(
+        app,
+        allowed_hosts,
+        origin_hosts,
+        max_body_bytes=max_body_bytes,
+        max_import_bytes=max_import_bytes,
+    )
     return app
 
 

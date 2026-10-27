@@ -485,6 +485,29 @@ def test_scoped_keys_from_the_environment(
     assert result.exit_code == 1 and "只能设一个" in result.output
 
 
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_body_limits_from_the_environment(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """CUEMEM_MAX_BODY_BYTES 给出请求体的上限（超过时 413）；它或 CUEMEM_MAX_IMPORT_BYTES 写错时
+    在打开记忆系统之前报错（退出码 1）。"""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("CUEMEM_MAX_BODY_BYTES", "1024")
+    assert runner.invoke(app, command).exit_code == 0
+    client = TestClient(served[-1], base_url="http://127.0.0.1:7860")
+    # 不存在的接口：没有上限时是 404，不会转发给上游
+    assert client.post("/v1/nothing", content=b"x" * 1024).status_code == 404
+    assert client.post("/v1/nothing", content=b"x" * 1025).status_code == 413
+    for name in ("CUEMEM_MAX_BODY_BYTES", "CUEMEM_MAX_IMPORT_BYTES"):
+        monkeypatch.setenv(name, "64MB")
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, result.output
+        assert "错误" in result.output and name in result.output
+        monkeypatch.delenv(name)
+    assert len(served) == 1
+
+
 def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
