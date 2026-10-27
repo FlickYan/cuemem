@@ -1995,9 +1995,31 @@
     }
    }
   },
+  "三个记忆数据集合并：控制器": {
+   "description": "冻结的控制器对固定档位，LongMemEval、LoCoMo 与 MemLens 32K 的胜负相加（报告里合并三个记忆数据集的说法；MemLens 128K 与 32K 是同一批题，不重复算）",
+   "m": 2,
+   "tests": {
+    "B6 (frozen) vs always-L1": {
+     "wins": 60,
+     "losses": 37,
+     "p": 0.025,
+     "p_holm": 0.025,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 (frozen) vs always-L2": {
+     "wins": 15,
+     "losses": 64,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
   "全文": {
    "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
-   "m": 219,
+   "m": 221,
    "tests": {
     "longmemeval_s：方法对比（总体） | B5 vs B4-nobm25": {
      "wins": 21,
@@ -2019,7 +2041,7 @@
      "wins": 53,
      "losses": 17,
      "p": 0.0,
-     "p_holm": 0.0038,
+     "p_holm": 0.0039,
      "nominal": true,
      "holm": true
     },
@@ -2219,7 +2241,7 @@
      "wins": 21,
      "losses": 4,
      "p": 0.0009,
-     "p_holm": 0.1703,
+     "p_holm": 0.1712,
      "nominal": true,
      "holm": false
     },
@@ -2483,7 +2505,7 @@
      "wins": 25,
      "losses": 6,
      "p": 0.0009,
-     "p_holm": 0.1659,
+     "p_holm": 0.1668,
      "nominal": true,
      "holm": false
     },
@@ -2635,7 +2657,7 @@
      "wins": 29,
      "losses": 7,
      "p": 0.0003,
-     "p_holm": 0.0606,
+     "p_holm": 0.0609,
      "nominal": true,
      "holm": false
     },
@@ -2659,7 +2681,7 @@
      "wins": 24,
      "losses": 7,
      "p": 0.0033,
-     "p_holm": 0.6155,
+     "p_holm": 0.6188,
      "nominal": true,
      "holm": false
     },
@@ -2699,7 +2721,7 @@
      "wins": 15,
      "losses": 1,
      "p": 0.0005,
-     "p_holm": 0.0996,
+     "p_holm": 0.1001,
      "nominal": true,
      "holm": false
     },
@@ -2843,7 +2865,7 @@
      "wins": 32,
      "losses": 9,
      "p": 0.0004,
-     "p_holm": 0.0832,
+     "p_holm": 0.0836,
      "nominal": true,
      "holm": false
     },
@@ -3075,7 +3097,7 @@
      "wins": 25,
      "losses": 6,
      "p": 0.0009,
-     "p_holm": 0.1659,
+     "p_holm": 0.1668,
      "nominal": true,
      "holm": false
     },
@@ -3083,7 +3105,7 @@
      "wins": 38,
      "losses": 13,
      "p": 0.0006,
-     "p_holm": 0.118,
+     "p_holm": 0.1186,
      "nominal": true,
      "holm": false
     },
@@ -3131,7 +3153,7 @@
      "wins": 12,
      "losses": 1,
      "p": 0.0034,
-     "p_holm": 0.6289,
+     "p_holm": 0.6323,
      "nominal": true,
      "holm": false
     },
@@ -3139,7 +3161,7 @@
      "wins": 11,
      "losses": 0,
      "p": 0.001,
-     "p_holm": 0.1816,
+     "p_holm": 0.1826,
      "nominal": true,
      "holm": false
     },
@@ -3187,7 +3209,7 @@
      "wins": 15,
      "losses": 1,
      "p": 0.0005,
-     "p_holm": 0.0996,
+     "p_holm": 0.1001,
      "nominal": true,
      "holm": false
     },
@@ -3299,7 +3321,7 @@
      "wins": 42,
      "losses": 13,
      "p": 0.0001,
-     "p_holm": 0.0224,
+     "p_holm": 0.0225,
      "nominal": true,
      "holm": true
     },
@@ -3307,7 +3329,7 @@
      "wins": 7,
      "losses": 34,
      "p": 0.0,
-     "p_holm": 0.005,
+     "p_holm": 0.0051,
      "nominal": true,
      "holm": true
     },
@@ -3323,7 +3345,7 @@
      "wins": 30,
      "losses": 68,
      "p": 0.0002,
-     "p_holm": 0.0306,
+     "p_holm": 0.0308,
      "nominal": true,
      "holm": true
     },
@@ -3331,7 +3353,7 @@
      "wins": 26,
      "losses": 52,
      "p": 0.0043,
-     "p_holm": 0.7933,
+     "p_holm": 0.7976,
      "nominal": true,
      "holm": false
     },
@@ -3419,7 +3441,7 @@
      "wins": 36,
      "losses": 10,
      "p": 0.0002,
-     "p_holm": 0.0306,
+     "p_holm": 0.0308,
      "nominal": true,
      "holm": true
     },
@@ -3467,7 +3489,7 @@
      "wins": 11,
      "losses": 43,
      "p": 0.0,
-     "p_holm": 0.0028,
+     "p_holm": 0.0029,
      "nominal": true,
      "holm": true
     },
@@ -3683,7 +3705,7 @@
      "wins": 16,
      "losses": 3,
      "p": 0.0044,
-     "p_holm": 0.8054,
+     "p_holm": 0.8098,
      "nominal": true,
      "holm": false
     },
@@ -3691,7 +3713,7 @@
      "wins": 24,
      "losses": 3,
      "p": 0.0,
-     "p_holm": 0.0097,
+     "p_holm": 0.0098,
      "nominal": true,
      "holm": true
     },
@@ -3750,6 +3772,22 @@
      "p_holm": 1.0,
      "nominal": false,
      "holm": false
+    },
+    "三个记忆数据集合并：控制器 | B6 (frozen) vs always-L1": {
+     "wins": 60,
+     "losses": 37,
+     "p": 0.025,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "三个记忆数据集合并：控制器 | B6 (frozen) vs always-L2": {
+     "wins": 15,
+     "losses": 64,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
     }
    }
   }
@@ -3814,6 +3852,7 @@
   "全文 | longmemeval_s：换回答模型（qwen3.6-35b-a3b） | B6 vs B5",
   "全文 | locomo：换回答模型（qwen3.8-flash） | B6a vs B5",
   "全文 | locomo：换回答模型（qwen3.8-flash） | B3 vs B5",
-  "全文 | locomo：换回答模型（qwen3.8-flash） | B6 vs B5"
+  "全文 | locomo：换回答模型（qwen3.8-flash） | B6 vs B5",
+  "全文 | 三个记忆数据集合并：控制器 | B6 (frozen) vs always-L1"
  ]
 }

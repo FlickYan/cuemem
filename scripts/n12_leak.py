@@ -23,6 +23,11 @@ label 对 anon 只差标题里的字，是泄漏本身的效应；raw 对 label 
 另外在每一臂里，照 N11 的 mem0.json 把朴素检索与 CueMem 各方法同 Mem0 逐题比较（vs_mem0），
 看 N11 "L1 对 Mem0" 的结论在修复之后是否还成立。
 
+符号检验只回答"有没有差别"；泄漏最多可能把发表的数字抬高多少，要看差的置信区间：每个配对
+另记 ci95（准确率之差的 95% 区间，Newcombe 的配对方法，routing.paired_diff_ci）；pooled_cuemem
+把 CueMem 的 L1、L2 与控制器合起来，按题取三者之差的平均，对题做 bootstrap 得到 95% 区间
+（metrics.bootstrap_ci，种子 0）。
+
     uv run python scripts/n12_leak.py
 
 结果写到 docs/results/n12-leak/summary.json；配对检验按族做 Holm 校正，写到 summary-holm.json
@@ -37,7 +42,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from cuemem.evals.routing import sign_test
+from cuemem.evals.metrics import bootstrap_ci
+from cuemem.evals.routing import paired_diff_ci, sign_test
 
 sys.path.insert(0, str(Path(__file__).parent))
 import multiplicity
@@ -74,6 +80,7 @@ COMPARISONS = [  # （甲，乙，含义）
     ("raw", "anon", "leak + renaming noise (pre-fix vs post-fix)"),
 ]
 VS_MEM0 = ["B2", "B4-nobm25", "B5", "B6"]  # 同一臂里与 Mem0 逐题比较的方法（N11 mem0.json 的写法）
+CUEMEM = ["B4-nobm25", "B5", "B6"]  # pooled_cuemem 合并的方法：L1、L2、控制器
 
 
 def load(run: str) -> dict[tuple[str, str], dict[str, Any]]:
@@ -89,18 +96,55 @@ def accuracy(rows: list[dict[str, Any]]) -> float | None:
 
 
 def paired(ra: dict[str, dict[str, Any]], rb: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    """同一批题上甲对乙的逐题胜负与精确符号检验（只数一边对、另一边错的题）。"""
+    """同一批题上甲对乙的逐题胜负与精确符号检验（只数一边对、另一边错的题），以及准确率之差
+    （甲 − 乙）的 95% 置信区间 ci95（比例，Newcombe 的配对方法）。"""
     common = sorted(ra.keys() & rb.keys())
     if not common:
         return None
     wins = sum(1 for s in common if ra[s]["correct"] and not rb[s]["correct"])
     losses = sum(1 for s in common if rb[s]["correct"] and not ra[s]["correct"])
+    both = sum(1 for s in common if ra[s]["correct"] and rb[s]["correct"])
+    low, high = paired_diff_ci(both, wins, losses, len(common) - both - wins - losses)
     return {
         "n": len(common),
         "wins": wins,
         "losses": losses,
         "p": round(sign_test(wins, losses), 4),
+        "ci95": [round(low, 4), round(high, 4)],
     }
+
+
+def pooled_cuemem(by_arm: dict[str, dict[tuple[str, str], dict[str, Any]]]) -> dict[str, Any]:
+    """CueMem 的 L1、L2 与控制器合起来的差（每组对照）：每道题取三个方法（甲对 − 乙对）的平均，
+    对题做 bootstrap 的 95% 区间。三个方法答的是同一批题、彼此相关，按题重抽才不低估区间。"""
+    out: dict[str, Any] = {}
+    for a, b, _ in COMPARISONS:
+        methods = [
+            m
+            for m in CUEMEM
+            if any(k[0] == m for k in by_arm[a]) and any(k[0] == m for k in by_arm[b])
+        ]
+        questions = sorted({s for m, s in by_arm[a] if m in methods})
+        diffs = [
+            sum(
+                int(bool(by_arm[a][(m, s)]["correct"])) - int(bool(by_arm[b][(m, s)]["correct"]))
+                for m in methods
+            )
+            / len(methods)
+            for s in questions
+            if all((m, s) in by_arm[a] and (m, s) in by_arm[b] for m in methods)
+        ]
+        if not diffs:
+            continue
+        low, high = bootstrap_ci(diffs)
+        out[f"{a}_vs_{b}"] = {
+            "methods": methods,
+            "n": len(diffs),
+            "mean_diff": round(sum(diffs) / len(diffs), 4),
+            "ci95": [round(low, 4), round(high, 4)],
+            "note": "per-question mean of the methods' differences; question-level bootstrap",
+        }
+    return out
 
 
 def vs_mem0(by_arm: dict[str, dict[tuple[str, str], dict[str, Any]]]) -> dict[str, Any]:
@@ -166,6 +210,7 @@ def main() -> None:
                 "p": round(sign_test(wins, losses), 4),
                 "note": "summed over retrieval methods on the same questions (not independent)",
             }
+        section["pooled_cuemem"] = pooled_cuemem(by_arm)
         section["vs_mem0"] = vs_mem0(by_arm)
         summary[protocol] = section
         print(f"\n== {protocol}")
@@ -176,13 +221,21 @@ def main() -> None:
                 if v["accuracy"]
             )
             pairs = "  ".join(
-                f"{k}: +{v['wins']}/-{v['losses']} p={v['p']}" for k, v in entry["paired"].items()
+                f"{k}: +{v['wins']}/-{v['losses']} p={v['p']} "
+                f"[{100 * v['ci95'][0]:+.1f}, {100 * v['ci95'][1]:+.1f}]"
+                for k, v in entry["paired"].items()
             )
             print(f"  {entry['label']:<18} {accs}\n  {'':<18} {pairs}")
         for key, v in section["pooled"].items():
             print(
                 f"  pooled {key}: +{v['wins']}/-{v['losses']}"
                 f" (net {v['net_points']} pt, p={v['p']})"
+            )
+        for key, v in section["pooled_cuemem"].items():
+            low, high = v["ci95"]
+            print(
+                f"  CueMem pooled {key}: {100 * v['mean_diff']:+.2f} pt"
+                f" [{100 * low:+.2f}, {100 * high:+.2f}]"
             )
         for arm, tests in section["vs_mem0"].items():
             pairs = "  ".join(

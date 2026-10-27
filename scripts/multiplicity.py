@@ -8,7 +8,10 @@
   - "<数据集>：方法对比（总体）"：comparisons 里每个对比的总体一行（L2 对 L1、对全上下文……）；
   - "<数据集>：<甲> vs <乙>（分题型）"：同一个对比在各题型上（"四种题型都显著"这类说法）；
   - "<数据集>：控制器"：冻结的控制器、B6a、B3 与各固定档位、规则版和彼此之间的配对；
-  - "<数据集>：换回答模型（<模型>）"：同一个回答模型下的几个对比。
+  - "<数据集>：换回答模型（<模型>）"：同一个回答模型下的几个对比；
+  - "三个记忆数据集合并：控制器"：冻结的控制器对 always-L1、always-L2，LongMemEval、LoCoMo 与
+    MemLens 32K 的胜负相加（报告里"合并三个记忆数据集"的说法；MemLens 128K 与 32K 是同一批题，
+    不重复算）。单独一族，不改各数据集那几族的 m。
 - N12 docs/results/n12-baselines/<协议>-<数据集>.json，每个协议一份：
   - "L1、L2 对外部系统"：CueMem L1、L2 各对 Mem0、Graphiti、LangMem、Cognee、A-MEM；
   - "CueMem 与参照"：L1、L2 对全上下文、朴素检索、控制器与彼此；
@@ -16,8 +19,9 @@
 - N12 docs/results/n12-leak/summary.json，每个协议：泄漏的逐方法对照、合并各检索方法的对照、
   每一臂里对 Mem0 的比较，各是一族。
 - N11 docs/results/n11-improvements/：mem0.json 每个运行的"对 Mem0"；second_judge.json 每个数据集
-  在每个判分模型下的关键对比；controller_v2.json 开发集与测试集事后分析（总体、各数据集）、换回答
-  模型后的对比与 λ 扫描；see_gate.json 测试集事后分析。
+  在每个判分模型下的关键对比（主判分那一族只是两个判分模型同口径对照的参照：族比 N9 的小、校正
+  更松，主判分下的结论以 n9-final/results-holm.json 为准）；controller_v2.json 开发集与测试集事后
+  分析（总体、各数据集）、换回答模型后的对比与 λ 扫描；see_gate.json 测试集事后分析。
 - N7 docs/results/n7-controller/：results.json 每个范围（全部、各数据集）里控制器的配对；h3.json
   每个数据集里换回答模型前后的配对、换成通义之后对 B3 的配对。
 
@@ -52,6 +56,8 @@ RESULTS = ROOT / "docs" / "results"
 ALPHA = 0.05
 CUEMEM_REFERENCES = ("B4-nobm25", "B5")  # 与 n12_baselines.REFERENCES 相同：L1、L2
 EVERYTHING = "全文"
+# N9 报告里合并的三个记忆数据集（控制器对固定档位的胜负相加）
+POOLED_DATASETS = ("longmemeval_s", "locomo", "memlens_32k")
 
 Test = Mapping[str, Any]
 
@@ -172,6 +178,20 @@ def n9(results: dict[str, Any]) -> Families:
                     name,
                     test,
                 )
+    controller = results.get("controller", {})
+    if all(dataset in controller for dataset in POOLED_DATASETS):
+        for baseline in ("always-L1", "always-L2"):
+            tests = [controller[d]["tests"]["B6 (frozen)"][baseline] for d in POOLED_DATASETS]
+            fam.add(
+                "三个记忆数据集合并：控制器",
+                "冻结的控制器对固定档位，LongMemEval、LoCoMo 与 MemLens 32K 的胜负相加（报告里"
+                "合并三个记忆数据集的说法；MemLens 128K 与 32K 是同一批题，不重复算）",
+                f"B6 (frozen) vs {baseline}",
+                {
+                    "wins": sum(int(t["wins"]) for t in tests),
+                    "losses": sum(int(t["losses"]) for t in tests),
+                },
+            )
     return fam
 
 
@@ -233,16 +253,29 @@ def n11_mem0(result: dict[str, Any]) -> Families:
     return fam
 
 
+# 主判分那一族与第二判分同口径（同样几个关键对比）校正，只用来比较两个判分模型；它比 N9 自己的
+# 族小、校正更松，同一个检验在这里显著、在 N9 里只是名义上显著时，以 N9 的为准
+SECOND_JUDGE_FAMILIES = (
+    (
+        "primary",
+        "主判分",
+        "报告里的关键对比在主判分下的胜负：只作两个判分模型同口径对照的参照（族比 N9 的小、"
+        "校正更松），主判分下的结论以 n9-final/results-holm.json 为准",
+    ),
+    ("second", "第二判分", "报告里的关键对比在这个判分模型下的胜负"),
+)
+
+
 def n11_second_judge(result: dict[str, Any]) -> Families:
     fam = Families()
     for dataset, section in result.items():
         if not isinstance(section, dict) or "comparisons" not in section:
             continue
         for comparison in section["comparisons"]:
-            for judge, label in (("primary", "主判分"), ("second", "第二判分")):
+            for judge, label, description in SECOND_JUDGE_FAMILIES:
                 fam.add(
                     f"{dataset}：关键对比（{label}）",
-                    "报告里的关键对比在这个判分模型下的胜负",
+                    description,
                     f"{comparison['a']} vs {comparison['b']}",
                     comparison[judge],
                 )

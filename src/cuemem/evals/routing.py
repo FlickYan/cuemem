@@ -1073,6 +1073,38 @@ def sign_test(wins: int, losses: int) -> float:
     return min(1.0, 2 * tail)
 
 
+def paired_diff_ci(
+    both: int, a_only: int, b_only: int, neither: int, z: float = 1.96
+) -> tuple[float, float]:
+    """同一批题上甲、乙准确率之差（甲 − 乙）的置信区间（默认 95%），Newcombe（1998）的方法 10：
+    两边各自的 Wilson 区间，按配对的相关（φ，ad − bc 先扣掉 n / 2）合起来。
+
+    both：两边都对的题数，a_only：只有甲对，b_only：只有乙对，neither：都错。符号检验只看
+    a_only 与 b_only，回答"有没有差别"；这个区间回答"差别最多可能有多大"。"""
+    n = both + a_only + b_only + neither
+    if n == 0:
+        return math.nan, math.nan
+
+    def wilson(x: int) -> tuple[float, float]:
+        p = x / n
+        center = p + z * z / (2 * n)
+        half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        return (center - half) / (1 + z * z / n), (center + half) / (1 + z * z / n)
+
+    p1, p2 = (both + a_only) / n, (both + b_only) / n
+    (l1, u1), (l2, u2) = wilson(both + a_only), wilson(both + b_only)
+    margins = (both + a_only) * (b_only + neither) * (both + b_only) * (a_only + neither)
+    cross: float = both * neither - a_only * b_only
+    if cross > n / 2:
+        cross -= n / 2
+    elif cross >= 0:
+        cross = 0
+    phi = cross / math.sqrt(margins) if margins else 0.0
+    low = math.sqrt((p1 - l1) ** 2 - 2 * phi * (p1 - l1) * (u2 - p2) + (u2 - p2) ** 2)
+    high = math.sqrt((u1 - p1) ** 2 - 2 * phi * (u1 - p1) * (p2 - l2) + (p2 - l2) ** 2)
+    return p1 - p2 - low, p1 - p2 + high
+
+
 def holm(pvalues: Mapping[str, float]) -> dict[str, float]:
     """Holm–Bonferroni 校正：一族检验（键 → p 值）各自校正后的 p 值，键的顺序不变。
 

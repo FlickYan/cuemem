@@ -4,7 +4,7 @@
  "alpha": 0.05,
  "families": {
   "longmemeval_s：关键对比（主判分）": {
-   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "description": "报告里的关键对比在主判分下的胜负：只作两个判分模型同口径对照的参照（族比 N9 的小、校正更松），主判分下的结论以 n9-final/results-holm.json 为准",
    "m": 5,
    "tests": {
     "B4-nobm25 vs B1": {
@@ -96,7 +96,7 @@
    }
   },
   "locomo：关键对比（主判分）": {
-   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "description": "报告里的关键对比在主判分下的胜负：只作两个判分模型同口径对照的参照（族比 N9 的小、校正更松），主判分下的结论以 n9-final/results-holm.json 为准",
    "m": 5,
    "tests": {
     "B4-nobm25 vs B1": {
@@ -188,7 +188,7 @@
    }
   },
   "memlens_32k：关键对比（主判分）": {
-   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "description": "报告里的关键对比在主判分下的胜负：只作两个判分模型同口径对照的参照（族比 N9 的小、校正更松），主判分下的结论以 n9-final/results-holm.json 为准",
    "m": 4,
    "tests": {
     "B4-see vs B1": {
@@ -264,7 +264,7 @@
    }
   },
   "memlens_128k：关键对比（主判分）": {
-   "description": "报告里的关键对比在这个判分模型下的胜负",
+   "description": "报告里的关键对比在主判分下的胜负：只作两个判分模型同口径对照的参照（族比 N9 的小、校正更松），主判分下的结论以 n9-final/results-holm.json 为准",
    "m": 3,
    "tests": {
     "B4-see vs B1": {
