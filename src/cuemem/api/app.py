@@ -483,9 +483,10 @@ def create_app(
 
         from cuemem.api.ui import CSS, THEME, build_ui
 
+        demo = build_ui(service, access=keys.by_username)  # 界面里登录的是哪个令牌
         app = gr.mount_gradio_app(
             app,
-            build_ui(service, access=keys.by_username),  # 界面里登录的是哪个令牌
+            demo,
             path="/",
             theme=THEME,
             css=CSS,
@@ -497,6 +498,11 @@ def create_app(
                 "token, the key's name for a scoped key."
             ),
         )
+        # Gradio 只在 Blocks.launch() 之后检查请求里的文件路径（FileData.path 要是经它上传的）；
+        # 挂载的界面从不 launch。不打开时，登录的用户（限定作用域的也行）点名服务器上的任何文件，
+        # Gradio 都在事件函数之前把它复制进缓存，再经 /gradio_api/file= 交出去。不在 ui.py 的事件
+        # 函数里查：它拿到的已经是缓存里的副本，聊天记录这个输入也不经过它
+        demo.has_launched = True
     _guard(app, allowed_hosts, origin_hosts)  # 中间件：落到界面的预检请求也先过这里
     return app
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import io
 import json
 import re
 from collections.abc import Callable, Iterator
@@ -18,6 +19,7 @@ import pytest
 from fakes import FakeAPI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 
 from cuemem import MemoryClient
@@ -650,6 +652,96 @@ def test_ui_stays_in_scope(n3_settings: Settings, fake_api: FakeAPI, tmp_path: P
             admin.close()
     finally:
         service.close()
+
+
+@pytest.fixture
+def ui_alice(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[TestClient, MemorySystem]]:
+    """挂上界面的应用，alice-app 已经登录；Gradio 的上传目录（缓存）在 tmp_path/gradio。"""
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "gradio"))
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="alice")
+    app = create_app(
+        service, upload_dir=tmp_path / "uploads", ui=True, keys=Keys.parse(KEYS, ADMIN_TOKEN)
+    )
+    try:
+        with TestClient(app) as http:
+            login = {"username": "alice-app", "password": ALICE_TOKEN}
+            assert http.post("/login", data=login).status_code == 200
+            yield http, system
+    finally:
+        service.close()
+
+
+def _png(color: tuple[int, int, int]) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _last_data(sse: str) -> Any:
+    """SSE 里最后一个 data 事件的内容（事件的输出）。"""
+    return json.loads([line[6:] for line in sse.splitlines() if line.startswith("data: ")][-1])
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+@pytest.mark.parametrize(
+    ("planted", "space"), [("message", "alice"), ("history", "alice"), ("history", "bob")]
+)
+def test_ui_rejects_server_side_paths(
+    ui_alice: tuple[TestClient, MemorySystem], tmp_path: Path, planted: str, space: str
+) -> None:
+    """界面是挂载的（gr.mount_gradio_app），从不 launch()，而 Gradio 只在 launch() 之后检查请求里
+    的文件路径（FileData.path）。以前登录的用户（限定作用域的也行）点名服务器上的任何文件，Gradio
+    就在事件函数之前把它复制进自己的缓存：消息里的图片进了自己的记忆、能导出；聊天记录这个输入
+    没有文件类型的限制，.env 经 /gradio_api/file= 能下载（里面有管理令牌）。复制在事件函数之前，
+    所以空间在作用域之外（bob）也一样。要经 HTTP 调用：直接调用事件函数不经过 Gradio 的预处理。"""
+    http, system = ui_alice
+    server = tmp_path / "server"
+    server.mkdir()
+    env = server / ".env"
+    env.write_text(f"CUEMEM_API_TOKEN={ADMIN_TOKEN}\nDEEPSEEK_API_KEY=sk-real-secret\n")
+    picture = server / "secret.png"
+    picture.write_bytes(_png((200, 10, 10)))
+    meta = {"_type": "gradio.FileData"}
+    if planted == "message":
+        message = {"text": "look", "files": [{"path": str(picture), "meta": meta}]}
+        history: list[Any] = []
+    else:
+        file = {"type": "file", "file": {"path": str(env), "meta": meta}}
+        message, history = {"text": "", "files": []}, [{"role": "user", "content": [file]}]
+    out = _ui_call(http, "send", [message, history, None, space, "", "l0", "rule", 30])
+    assert "event: error" in out, out
+    assert "/gradio_api/file=" not in out and "sk-real-secret" not in out
+    copies = [*(tmp_path / "gradio").rglob(".env"), *(tmp_path / "gradio").rglob("secret.png")]
+    assert copies == []  # 没有复制进 Gradio 的缓存
+    assert system.db.get_media("alice") == []
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_ui_uploads_pass_the_path_checks(ui_alice: tuple[TestClient, MemorySystem]) -> None:
+    """路径检查打开之后正常的用法照常：图片先传到 /gradio_api/upload，再带着它发消息；下一轮带着
+    上一轮的聊天记录（里面是缓存里的图片）；记忆面板的图片在媒体库里。"""
+    http, system = ui_alice
+    uploaded = http.post(
+        "/gradio_api/upload", files={"files": ("pic.png", _png((1, 2, 3)), "image/png")}
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    message = {
+        "text": "see",
+        "files": [{"path": uploaded.json()[0], "meta": {"_type": "gradio.FileData"}}],
+    }
+    first = _ui_call(http, "send", [message, [], None, "alice", "", "l0", "rule", 30])
+    assert "event: error" not in first, first
+    history, _, sid, *_ = _last_data(first)
+    again = {"text": "again", "files": []}
+    second = _ui_call(http, "send", [again, history, sid, "alice", "", "l0", "rule", 30])
+    assert "event: error" not in second, second
+    assert len(system.db.get_media("alice")) == 1
+    panel = _ui_call(http, "load_memory", ["alice", False, "fact"])
+    assert "event: error" not in panel, panel
 
 
 def test_ui_ignores_a_session_of_another_space(n3_settings: Settings, fake_api: FakeAPI) -> None:
