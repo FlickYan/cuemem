@@ -7,6 +7,7 @@ import itertools
 import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 from collections import Counter
@@ -30,7 +31,8 @@ from test_sdk import AUG, SEP, moved, where_i_live
 from cuemem import Memory
 from cuemem import sdk as sdk_module
 from cuemem.config import PathsConfig, Settings
-from cuemem.core.models import Conversation, Entity, Fact, SessionIn, TurnIn
+from cuemem.core.ids import stable_id
+from cuemem.core.models import Conversation, Entity, Fact, SessionIn, Turn, TurnIn
 from cuemem.core.trace import start_trace
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbeddingBatch, EmbedKind
@@ -39,7 +41,7 @@ from cuemem.sdk import space_for
 from cuemem.store import MemoryDB
 from cuemem.write import consolidate as consolidate_module
 from cuemem.write.consolidate import MAX_ATTEMPTS
-from cuemem.write.extract import PIPELINE_VERSION
+from cuemem.write.extract import PIPELINE_VERSION, session_content_hash
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
 RECONCILE = "You maintain a long-term memory"  # 对账请求的系统提示开头
@@ -446,6 +448,138 @@ def test_consolidate_reads_open_sessions_once_it_holds_the_lock(
             assert jobs == {"slow": "done"} and facts == ["SLOW extraction in flight"]
             system.close_session("u", "y", wait=True)
             assert "I am planning a trip" in [f.statement for f in system.facts("u")]
+
+
+def test_stale_enqueue_and_run_do_not_read_the_whole_space(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """判断派生记忆是否过期（add(wait=True) 与 update 每次都有）不再读出全部任务；为几个会话登记
+    任务（每次 add）与执行任务不再读出全部会话。以前这几处都随空间里的会话数变慢：2 万个会话时
+    读全部任务约 0.1 秒、读全部会话约 20 毫秒，都拿着数据库的锁。"""
+    whole: list[str] = []
+    get_jobs, get_sessions = MemoryDB.get_jobs, MemoryDB.get_sessions
+
+    def jobs_spy(db: MemoryDB, space_id: str, status: str | None = None) -> Any:
+        if status is None:
+            whole.append(f"get_jobs({space_id})")
+        return get_jobs(db, space_id, status)
+
+    def sessions_spy(db: MemoryDB, space_id: str) -> Any:
+        whole.append(f"get_sessions({space_id})")
+        return get_sessions(db, space_id)
+
+    monkeypatch.setattr(MemoryDB, "get_jobs", jobs_spy)
+    monkeypatch.setattr(MemoryDB, "get_sessions", sessions_spy)
+    consolidator = system.consolidator
+    assert not consolidator.stale("demo")
+    system.append("demo", said_once("s9", "I bought a bike", 9), 0, enqueue=False)
+    assert consolidator.enqueue("demo", ["s9", "nope", "s9"]) == 1
+    assert consolidator.enqueue("demo", ["s9"]) == 0
+    assert consolidator.run("demo").sessions == 1
+    system.db.set_meta("consolidation:empty", "another fingerprint")
+    assert not consolidator.stale("empty")  # 没有任务的空间：没有要重建的
+    system.db.set_meta("consolidation:demo", "another fingerprint")
+    assert consolidator.stale("demo")
+    system.db.set_meta("consolidation:demo", consolidator.fingerprint())
+    assert not consolidator.stale("demo")
+    system.db.enqueue_job("old", "demo", "s9", "an older pipeline", "h")
+    assert consolidator.stale("demo")
+    assert whole == []
+
+
+def reference_enqueue(
+    db: MemoryDB, space_id: str, session_ids: Sequence[str] | None, skip: set[str]
+) -> int:
+    """以前登记任务的做法：读出全部会话，逐个会话读发言、算指纹，各自 INSERT OR IGNORE，新登记
+    时取代同一会话还没执行的旧任务。"""
+    sessions = db.get_sessions(space_id)
+    added = 0
+    for session_id in session_ids if session_ids is not None else sorted(sessions):
+        if session_id not in sessions or session_id in skip:
+            continue
+        turns = db.get_turns(space_id, session_id)
+        if not turns:
+            continue
+        digest = session_content_hash(turns, sessions[session_id])
+        job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
+        now = datetime.now().isoformat()
+        with db.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO jobs (id, space_id, session_id, version, content_hash,"
+                " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (job_id, space_id, session_id, PIPELINE_VERSION, digest, now, now),
+            )
+            if cursor.rowcount > 0:
+                added += 1
+                conn.execute(
+                    "UPDATE jobs SET status = 'superseded', updated_at = ?"
+                    " WHERE space_id = ? AND session_id = ? AND id != ?"
+                    " AND status IN ('pending', 'failed')",
+                    (now, space_id, session_id, job_id),
+                )
+    return added
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["all", "listed"])
+def test_batched_enqueue_matches_enqueueing_one_session_at_a_time(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, listed: bool
+) -> None:
+    """登记任务改成只读列出的会话、一次取发言的版本、一个事务批量插入（MemoryDB.enqueue_jobs，
+    任务多时先读出已有的任务 ID）之后，任务表（按 rowid 的顺序）与返回的个数与以前逐个会话登记
+    时逐行相同：巩固过、没变的，巩固过又长了的，已经登记、还没执行的（没变的与又长了的），新的，
+    只记了日志的（infer=False），没有发言的，重复列出的，库里没有的，以及跳过的会话。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        db = system.db
+        system.append("u", said_once("done", "I live in Paris", 1), 0)
+        system.append("u", said_once("grown", "I like jazz", 2), 0)
+        system.append("u", said_once("skipped", "I like tea", 3), 0)
+        system.consolidate("u")
+        system.append("u", said_once("pending", "I am planning a trip", 4), 0)
+        bulk = [f"bulk-{i:03d}" for i in range(120)]  # 任务多于 100 个：先读出已有的任务 ID
+        for i, sid in enumerate(bulk):
+            started = datetime(2026, 10, 1) + timedelta(minutes=i)
+            db.add_session("u", sid, started)
+            db.add_turns(
+                [
+                    Turn(
+                        id=f"{sid}-0",
+                        space_id="u",
+                        session_id=sid,
+                        idx=0,
+                        role="user",
+                        text=f"note {i}",
+                        ts=started,
+                    )
+                ]
+            )
+        # 已经登记的会话：同时记下它们的内容指纹（之后的登记先查它，发言变了才重算）
+        system.consolidator.enqueue("u", ["done", "grown", "skipped", "pending", *bulk[::2]])
+        for sid, text, day in (("grown", "and blues", 2), ("skipped", "and coffee", 3)):
+            system.append("u", said_once(sid, text, day), 1, enqueue=False)
+        system.append("u", said_once("pending", "to Rome", 4), 1, enqueue=False)
+        system.append("u", said_once("new", "I bought a bike", 5), 0, enqueue=False)
+        system.append("u", said_once("logged", "I only log this", 6), 0, enqueue=False)
+        db.add_session("u", "empty", datetime(2026, 9, 7, 10))
+        copy = tmp_path / "copy.sqlite"
+        with sqlite3.connect(copy) as target:
+            db._conn.backup(target)
+        target.close()
+
+        ids = None
+        if listed:
+            ids = ["new", "grown", "new", "missing", "skipped", "empty", "done", "pending"]
+            ids += bulk[::-1]
+        skip = {"skipped"}
+        added = system.consolidator.enqueue("u", ids, skip=skip)
+        reference = MemoryDB(copy)
+        try:
+            expected = reference_enqueue(reference, "u", ids, skip)
+            rows = "SELECT id, session_id, status, content_hash FROM jobs ORDER BY rowid"
+            assert db._conn.execute(rows).fetchall() == reference._conn.execute(rows).fetchall()
+        finally:
+            reference.close()
+        assert added == expected == (63 if listed else 64)
 
 
 def test_content_filter_skips_session_or_falls_back_to_rules(

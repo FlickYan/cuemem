@@ -287,7 +287,10 @@ class Memory:
             # 发言序号在会话锁里分配、写完再放：同一个 run_id 的并发 add 不会撞号
             with self.system.session_lock(space, sid):
                 first = self._next_idx(space, sid)
-                started = self.system.db.get_sessions(space).get(sid, when)
+                # 按主键只查这个会话：以前读出整个空间的会话（2 万个会话时约 20 毫秒）
+                started = self.system.db.session_started(space, sid)
+                if started is None:
+                    started = when
                 session = SessionIn(session_id=sid, started_at=started, turns=turns)
                 extra = None
                 if info is not None:
@@ -608,7 +611,7 @@ class Memory:
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit or top_k
         space = space_for(user_id, agent_id)
-        if not self.system.db.get_sessions(space):
+        if not self.system.db.has_sessions(space):
             return _empty(self.system, space)
         from cuemem.evidence import RAISED_REASON
 

@@ -455,7 +455,7 @@ class ThreadMemory:
     ) -> None:
         query = str(message.text)
         system = self.memory.system
-        if not query.strip() or not system.db.get_sessions(space):
+        if not query.strip() or not system.db.has_sessions(space):
             return
         # 按写进记忆后的样子比对（_openai 之后：只有 data URL 的图片记作 <image>）
         present = {stored_text(_openai(m)).strip() for m in earlier if _is_turn(m)}
@@ -623,7 +623,7 @@ def _tool(name: str, run: Callable[[], str]) -> str:
 def _recall(system: MemorySystem, space: str, query: str, deep: bool) -> dict[str, Any]:
     """与 MCP 的 recall 相同的清单（控制器选了 L0 时改走 L1，见 recall_listing）。
     空间里还没有记忆时与 SDK 的 search 相同：不检索（不为问题算向量），只给画像。"""
-    if not system.db.get_sessions(space):
+    if not system.db.has_sessions(space):
         core = system.core_memory(space)
         profile = core.text if core is not None else ""
         return {

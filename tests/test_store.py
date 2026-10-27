@@ -157,6 +157,40 @@ def test_versions_change_with_every_write_that_matters(tmp_path: Path) -> None:
         assert db.turns_version("demo", "other") != before
 
 
+def test_point_reads_agree_with_the_whole_space_reads(tmp_path: Path) -> None:
+    """按主键或 LIMIT 1 的读取（检索前判断空间是不是空的、add 查会话的开始时间、为几个会话登记
+    任务、判断派生记忆是否过期）与读出整个空间再挑出来的结果相同：以前这些地方都读整个空间，
+    耗时随会话数增长。"""
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    when = datetime(2026, 1, 1, 10)
+    sessions = {f"s{i:04d}": when.replace(minute=i % 60, second=i // 60) for i in range(1200)}
+    for sid, started in sessions.items():
+        db.add_session("demo", sid, started)
+    db.add_session("other", "s0001", when)
+    assert db.has_sessions("demo") and not db.has_sessions("empty")
+    assert db.session_started("demo", "s0007") == sessions["s0007"]
+    assert db.session_started("demo", "nope") is None
+    wanted = ["s1100", "s0003", "nope", "s0003", *sorted(sessions)[::2]]  # 多于一批（500 个）
+    assert db.sessions_of("demo", wanted) == {s: sessions[s] for s in wanted if s in sessions}
+    assert db.sessions_of("demo", []) == {}
+    assert db.turns_versions("demo", ["s0001", "nope"]) == {
+        s: db.turns_version("demo", s) for s in ("s0001", "nope")
+    }
+
+    assert not db.has_jobs("demo") and not db.has_jobs_of_other_version("demo", "v2")
+    db.enqueue_job("old", "demo", "s0001", "v1", "h0")
+    assert db.has_jobs("demo") and not db.has_jobs("other")
+    assert db.has_jobs_of_other_version("demo", "v2")
+    assert not db.has_jobs_of_other_version("demo", "v1")
+    # 一批登记与逐个登记相同：已有的任务不动，新任务取代同一会话还没执行的旧任务
+    rows = [("a", "s0001", "v2", "h1"), ("old", "s0001", "v1", "h0"), ("a", "s0001", "v2", "h1")]
+    rows += [(f"j{i}", f"s{i:04d}", "v2", "h") for i in range(2, 200)]
+    assert db.enqueue_jobs("demo", rows) == 199
+    jobs = {j["id"]: j["status"] for j in db.get_jobs("demo")}
+    assert jobs["old"] == "superseded" and jobs["a"] == "pending" and len(jobs) == 200
+    assert db.enqueue_jobs("demo", rows) == 0
+
+
 def _one_turn(db: MemoryDB, space: str, session_id: str) -> Turn:
     session = SessionIn(
         session_id=session_id,

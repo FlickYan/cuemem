@@ -415,7 +415,7 @@ class MemoryProxy:
             return turn
         turn.write_user = last
         query = message_text(last.get("content"))
-        if not query.strip() or not self.system.db.get_sessions(space):
+        if not query.strip() or not self.system.db.has_sessions(space):
             return turn
         try:
             evidence = recall_evidence(

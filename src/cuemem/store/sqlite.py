@@ -298,14 +298,27 @@ class MemoryDB:
         每次都重算全部会话的内容指纹，见 Consolidator.enqueue）。发言只会追加（add_turns）或
         删除（delete_turns、delete_space），这几个方法计数（以后加的改动发言的方法也要计数）；
         回滚与别的连接的提交同样算变过。写入计数清空过（_count_turn_writes）也算变过。"""
+        return self.turns_versions(space_id, [session_id])[session_id]
+
+    def turns_versions(
+        self, space_id: str, session_ids: Sequence[str]
+    ) -> dict[str, tuple[int, ...]]:
+        """同 turns_version，一次取一批会话：只拿一次锁、只查一次 PRAGMA data_version。巩固为
+        全部会话登记任务时用它，以前每个会话各拿一次锁、各查一次。"""
         with self._lock:
-            return (
-                self._turn_generation,
-                self._turn_epochs.get(space_id, 0),
-                self._turn_writes.get((space_id, session_id), 0),
-                self._rollbacks,
-                self._data_version(),
-            )
+            generation = self._turn_generation
+            epoch = self._turn_epochs.get(space_id, 0)
+            rollbacks, changed = self._rollbacks, self._data_version()
+            return {
+                sid: (
+                    generation,
+                    epoch,
+                    self._turn_writes.get((space_id, sid), 0),
+                    rollbacks,
+                    changed,
+                )
+                for sid in session_ids
+            }
 
     def turn_epoch(self, space_id: str) -> int:
         """这个空间经本连接删过几次发言（遗忘、删除空间）。写入失败、留着稍后重试的发言（记忆
@@ -374,12 +387,45 @@ class MemoryDB:
             )
 
     def get_sessions(self, space_id: str) -> dict[str, datetime]:
-        """会话 ID → 开始时间。"""
+        """会话 ID → 开始时间：整个空间的会话（2 万个会话约 30 毫秒）。只问有没有会话、或者
+        某几个会话时用下面三个方法（按主键查，与会话数无关）。"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, started_at FROM sessions WHERE space_id = ?", (space_id,)
             ).fetchall()
         return {r[0]: _dt(r[1]) for r in rows}
+
+    def has_sessions(self, space_id: str) -> bool:
+        """这个空间有没有会话（检索之前判断空间是不是空的）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE space_id = ? LIMIT 1", (space_id,)
+            ).fetchone()
+        return row is not None
+
+    def session_started(self, space_id: str, session_id: str) -> datetime | None:
+        """这个会话的开始时间；没有这个会话时为 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT started_at FROM sessions WHERE space_id = ? AND id = ?",
+                (space_id, session_id),
+            ).fetchone()
+        return None if row is None else _dt(row[0])
+
+    def sessions_of(self, space_id: str, session_ids: Sequence[str]) -> dict[str, datetime]:
+        """同 get_sessions，只取这几个会话（不在库里的不出现）。"""
+        ids = list(dict.fromkeys(session_ids))
+        found: dict[str, datetime] = {}
+        with self._lock:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                marks = ",".join("?" * len(chunk))
+                rows = self._conn.execute(
+                    f"SELECT id, started_at FROM sessions WHERE space_id = ? AND id IN ({marks})",
+                    [space_id, *chunk],
+                ).fetchall()
+                found.update((r[0], _dt(r[1])) for r in rows)
+        return found
 
     def speakers(self, space_id: str) -> list[str]:
         """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。"""
@@ -1058,23 +1104,57 @@ class MemoryDB:
         新登记时，同一会话还没执行（或失败待重试）的旧任务标记为 superseded：会话又追加了
         发言，旧任务对应的是过时的内容，执行它只会把同一个会话多抽取一遍。
         """
+        return self.enqueue_jobs(space_id, [(job_id, session_id, version, content_hash)]) > 0
+
+    def enqueue_jobs(self, space_id: str, rows: Sequence[tuple[str, str, str, str]]) -> int:
+        """按顺序登记一批任务（任务 ID，会话，流水线版本，内容指纹），每个与 enqueue_job 相同，
+        在一个事务里、不为每个任务另开保存点。返回新登记的个数。
+
+        任务多时（显式的巩固为全部会话登记）先读出这个空间已有的任务 ID，已有的不再插入：
+        INSERT OR IGNORE 本来也什么都不做，结果相同，2 万个会话时省下约 30 毫秒。"""
         now = datetime.now().isoformat()
+        added = 0
         with self.transaction() as conn:
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO jobs"
-                " (id, space_id, session_id, version, content_hash, status, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (job_id, space_id, session_id, version, content_hash, now, now),
-            )
-            added = cursor.rowcount > 0
-            if added:
-                conn.execute(
-                    "UPDATE jobs SET status = 'superseded', updated_at = ?"
-                    " WHERE space_id = ? AND session_id = ? AND id != ?"
-                    " AND status IN ('pending', 'failed')",
-                    (now, space_id, session_id, job_id),
+            known: set[str] = set()
+            if len(rows) > 100:
+                known = {
+                    r[0]
+                    for r in conn.execute("SELECT id FROM jobs WHERE space_id = ?", (space_id,))
+                }
+            for job_id, session_id, version, content_hash in rows:
+                if job_id in known:
+                    continue
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO jobs (id, space_id, session_id, version, content_hash,"
+                    " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (job_id, space_id, session_id, version, content_hash, now, now),
                 )
-            return added
+                if cursor.rowcount > 0:
+                    added += 1
+                    conn.execute(
+                        "UPDATE jobs SET status = 'superseded', updated_at = ?"
+                        " WHERE space_id = ? AND session_id = ? AND id != ?"
+                        " AND status IN ('pending', 'failed')",
+                        (now, space_id, session_id, job_id),
+                    )
+        return added
+
+    def has_jobs(self, space_id: str) -> bool:
+        """这个空间有没有巩固任务（任何状态）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE space_id = ? LIMIT 1", (space_id,)
+            ).fetchone()
+        return row is not None
+
+    def has_jobs_of_other_version(self, space_id: str, version: str) -> bool:
+        """这个空间有没有按别的流水线版本登记的任务（派生记忆过期，见 Consolidator.stale）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE space_id = ? AND version != ? LIMIT 1",
+                (space_id, version),
+            ).fetchone()
+        return row is not None
 
     def get_jobs(self, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
         sql = (

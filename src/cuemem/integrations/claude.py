@@ -1016,7 +1016,7 @@ def _recall(message: Mapping[str, Any], memory: Memory, space: str, mode: Recall
         )
     )
     system = memory.system
-    if not query.strip() or not system.db.get_sessions(space):
+    if not query.strip() or not system.db.has_sessions(space):
         return none
     found = recall_evidence(system, space, query, mode=mode)
     if found.block:

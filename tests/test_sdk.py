@@ -512,6 +512,36 @@ def test_next_turn_number_is_written_with_the_turns(
     assert set(system.db.get_sessions("alice")) == sessions | {out["session_id"]}
 
 
+def whole_space_session_reads(statements: Sequence[str]) -> list[str]:
+    """读出一个空间的全部会话（ID 与开始时间，不按会话 ID 查）的语句。"""
+    pattern = r"SELECT id, started_at FROM sessions WHERE space_id = '[^']*'$"
+    return [s for s in statements if re.search(pattern, s)]
+
+
+def test_add_and_search_do_not_read_every_session_of_the_space(memory: Memory) -> None:
+    """add 只按主键查它写的那个会话（开始时间、登记任务），search 只问空间里有没有会话。以前每次
+    add 读两遍整个空间的会话、每次 search 读一遍：不带 run_id 的 add 每次都是一个新会话，2 万个
+    会话时每遍约 20 毫秒，都拿着整个进程共用的数据库锁。"""
+    system = memory.system
+    for day in (1, 2, 3):
+        memory.add(f"I like jazz no. {day}", user_id="alice", timestamp=AUG + timedelta(days=day))
+    assert len(system.db.get_sessions("alice")) == 3
+    statements: list[str] = []
+    system.db._conn.set_trace_callback(statements.append)
+    try:
+        memory.add("I live in Berlin", user_id="alice", timestamp=SEP)
+        memory.add("I play chess", user_id="alice", run_id="r1", timestamp=SEP)
+        added = whole_space_session_reads(statements)
+        assert any("FROM sessions" in s for s in statements)
+        statements.clear()
+        found = memory.search("Where do I live?", user_id="alice")
+        searched = whole_space_session_reads(statements)
+    finally:
+        system.db._conn.set_trace_callback(None)
+    assert found["results"] and any("FROM sessions" in s for s in statements)
+    assert added == [] and searched == []
+
+
 def test_a_failed_write_leaves_no_image_behind(
     memory: Memory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

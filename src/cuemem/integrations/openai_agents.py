@@ -477,7 +477,7 @@ class MemoryInputFilter:
         system = self.memory.system
         _adopt(system, space)
         _sweep(system)
-        if not system.db.get_sessions(space):
+        if not system.db.has_sessions(space):
             return Evidence(query, "none", ["no memories yet"], 0, "")
         found = recall_evidence(
             system,

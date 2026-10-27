@@ -197,27 +197,35 @@ class Consolidator:
         skip：暂不巩固的会话（Agent 正在进行的会话，结束后再登记）。同一会话的内容变了
         （又追加了发言）时，新任务取代还没执行的旧任务（见 MemoryDB.enqueue_job）；这个会话
         已经巩固过时，执行前先从原始日志重放（见 run）。
-        """
-        sessions = self.db.get_sessions(space_id)
-        todo: list[tuple[str, str]] = []
-        for session_id in session_ids if session_ids is not None else sorted(sessions):
-            if session_id not in sessions or session_id in skip:
-                continue
-            digest = self._digest(space_id, session_id, sessions[session_id])
-            if digest is not None:
-                todo.append((session_id, digest))
-        added = 0
-        with self.db.transaction():  # 一次提交（以前每个会话各提交一次）
-            for session_id, digest in todo:
-                job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
-                added += self.db.enqueue_job(job_id, space_id, session_id, PIPELINE_VERSION, digest)
-        return added
 
-    def _digest(self, space_id: str, session_id: str, started_at: datetime) -> str | None:
-        """会话的内容指纹（session_content_hash；没有发言时为 None）。发言没变过（MemoryDB 的
-        turns_version）时用上次算的：显式的巩固与遗忘每次都为全部会话登记任务，以前每次都把每个
-        会话的发言读出来重算一遍（800 个会话约 0.18 秒）。"""
-        version = self.db.turns_version(space_id, session_id)
+        给了 session_ids 时只读这几个会话（SDK 的每次 add 都登记它写的那个会话）：以前每次都把
+        整个空间的会话读出来，2 万个会话时约 20 毫秒。发言的版本一次取完、在读发言之前取（见
+        _digest），任务在一个事务里登记（MemoryDB.enqueue_jobs）。
+        """
+        if session_ids is None:
+            sessions = self.db.get_sessions(space_id)
+            order: Sequence[str] = sorted(sessions)
+        else:
+            sessions = self.db.sessions_of(space_id, session_ids)
+            order = session_ids
+        wanted = [s for s in dict.fromkeys(order) if s in sessions and s not in skip]
+        versions = self.db.turns_versions(space_id, wanted)
+        rows: list[tuple[str, str, str, str]] = []
+        for session_id in wanted:
+            digest = self._digest(space_id, session_id, sessions[session_id], versions[session_id])
+            if digest is not None:
+                job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
+                rows.append((job_id, session_id, PIPELINE_VERSION, digest))
+        return self.db.enqueue_jobs(space_id, rows)
+
+    def _digest(
+        self, space_id: str, session_id: str, started_at: datetime, version: tuple[int, ...]
+    ) -> str | None:
+        """会话的内容指纹（session_content_hash；没有发言时为 None）。发言没变过（version 是
+        MemoryDB 的 turns_version，要在读发言之前取）时用上次算的：显式的巩固与遗忘每次都为全部
+        会话登记任务，以前每次都把每个会话的发言读出来重算一遍（800 个会话约 0.18 秒）。先取版本
+        再读发言：期间又写进来的发言让下次取到的版本不同、重算一遍；反过来就可能把旧的指纹记在
+        新的版本下，再也不重算。"""
         key = (space_id, session_id)
         with self._digests_guard:
             known = self._digests.get(key)
@@ -241,12 +249,16 @@ class Consolidator:
         return stable_id(PIPELINE_VERSION, model, config)
 
     def stale(self, space_id: str) -> bool:
-        """派生记忆是否过期：有用旧版本流水线处理过的会话，或巩固配置变了（需要重建）。"""
-        jobs = self.db.get_jobs(space_id)
-        if any(j["version"] != PIPELINE_VERSION for j in jobs):
+        """派生记忆是否过期：有用旧版本流水线处理过的会话，或巩固配置变了（需要重建）。
+
+        两个 LIMIT 1 的查询：以前读出这个空间的全部任务、逐个解析统计（2 万个会话约 0.1 秒），
+        add(wait=True) 与 update 每次都有一次。"""
+        if self.db.has_jobs_of_other_version(space_id, PIPELINE_VERSION):
             return True
         recorded = self.db.get_meta(f"consolidation:{space_id}")
-        return bool(jobs) and recorded is not None and recorded != self.fingerprint()
+        if recorded is None or recorded == self.fingerprint():
+            return False
+        return self.db.has_jobs(space_id)
 
     def rebuild(self, space_id: str, *, replay: bool = False) -> None:
         """清空派生记忆（数据库与向量），再为全部会话登记任务，进行中的会话（open_sessions）
@@ -371,12 +383,11 @@ class Consolidator:
     def _run(self, space_id: str, cache_scope: str) -> ConsolidationReport:
         started = time.perf_counter()
         report = ConsolidationReport(space_id)
-        sessions = self.db.get_sessions(space_id)
-        jobs = [
-            j
-            for j in self.db.get_jobs(space_id, status="pending")
-            if j["session_id"] in sessions and j["version"] == PIPELINE_VERSION
-        ]
+        pending = self.db.get_jobs(space_id, status="pending")
+        jobs = [j for j in pending if j["version"] == PIPELINE_VERSION]
+        # 只读有任务的会话（以前每次都读出整个空间的会话）
+        sessions = self.db.sessions_of(space_id, [j["session_id"] for j in jobs])
+        jobs = [j for j in jobs if j["session_id"] in sessions]
         if not jobs:
             return report
         jobs.sort(key=lambda j: (sessions[j["session_id"]], j["session_id"]))
