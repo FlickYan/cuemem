@@ -160,6 +160,7 @@ consolidation:
   assistant_chars: 600          # 抽取时每条助手回复只保留开头（记忆以用户为主，输入 token 少一大半）
   max_session_chars: 24000      # 超长会话按轮次切成多个窗口分别抽取
   workers: 8                    # 同一空间内并行抽取的会话数（受供应商并发上限约束）
+  background_workers: 4         # 后台巩固同时处理的空间数（同一空间仍串行；请求同样受供应商并发上限约束）
   fallback_model: deepseek-flash  # 供应商内容审核误拒（如 QwenCloud 的 data_inspection_failed）时改用的模型
   duplicate_threshold: 0.93     # 陈述几乎相同 → 合并（只追加溯源）
   conflict_threshold: 0.75      # 单值事实与已有事实相似 → 交给 LLM 判断是新增、取代还是更正

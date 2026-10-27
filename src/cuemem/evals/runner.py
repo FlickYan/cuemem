@@ -808,7 +808,7 @@ def _check_resume_extended(
     }
     for section, (relevant, current_values) in sections.items():
         for key, old in info.get(section, {}).items() if relevant else ():
-            if key not in ("workers", "controller") and key in current_values:
+            if key not in ("workers", "background_workers", "controller") and key in current_values:
                 compare(f"{section}.{key}", old, current_values[key])
     if methods & CONTROLLER_METHODS:
         stored = _stored_controller(info)

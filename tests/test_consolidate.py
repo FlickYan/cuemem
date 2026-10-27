@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
 from scripted import (
@@ -36,6 +37,7 @@ from cuemem.core.models import Conversation, Entity, Fact, SessionIn, Turn, Turn
 from cuemem.core.trace import start_trace
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbeddingBatch, EmbedKind
+from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store import MemoryDB
@@ -312,7 +314,7 @@ def test_worker_retries_a_space_whose_consolidation_raised(
         monkeypatch.setattr(system.consolidator, "run", broken)
         worker.retry_base_s = 0.0
         worker.submit("demo")
-        worker.wait()  # 退避时间为 0：到期的重试排在 task_done 之前，wait() 一并等
+        worker.wait()  # 退避时间为 0：到期的重试在这一轮清出 _running 之前排上，wait() 一并等
         assert calls == ["demo"] * MAX_ATTEMPTS and worker._until_due() is None
 
 
@@ -377,8 +379,9 @@ def test_close_timeout_does_not_record_closed_db_error(
         memory.close()
     assert worker.closing and "下次启动时接着做" in caplog.text
     release.set()
-    worker._thread.join(10)
-    assert not worker._thread.is_alive() and not worker.errors
+    for thread in worker._threads:
+        thread.join(10)
+    assert not any(t.is_alive() for t in worker._threads) and not worker.errors
 
     with Memory(n3_settings, http_client=fake_api.client()) as again:
         again.wait()
@@ -386,6 +389,98 @@ def test_close_timeout_does_not_record_closed_db_error(
         assert [f["memory"] for f in again.get_all(user_id="alice")["results"]] == [
             "The user lives in Berlin."
         ]
+
+
+def test_one_slow_space_does_not_hold_back_another(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """一个用户的巩固很慢（几百个会话的重放、供应商限流）时，别的用户的抽取照常开始：后台有几个
+    线程（consolidation.background_workers，缺省 4）。以前只有一个线程，别的用户都排在它后面
+    （离线复现：600 个会话的重放期间，另一个用户一个会话的抽取等了近 20 秒，单独只要 0.01 秒）。"""
+    model = ScriptedModel(echo_extraction)
+    alice_in, bob_in = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        text = str(body["messages"])
+        if "ALICE" in text:
+            alice_in.set()
+            bob_in.wait(10)
+        if "BOB" in text:
+            bob_in.set()
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        assert len(worker._threads) == n3_settings.consolidation.background_workers == 4
+        system.append("alice", said_once("s1", "ALICE lives in Rome", 1), 0)
+        assert alice_in.wait(10)  # alice 的抽取卡在供应商那里
+        system.append("bob", said_once("s1", "BOB lives in Oslo", 1), 0)
+        assert bob_in.wait(5), "bob 的抽取排在 alice 的后面"
+        worker.wait()
+        assert not worker.errors
+        assert [f.statement for f in system.facts("bob")] == ["BOB lives in Oslo"]
+        assert [f.statement for f in system.facts("alice")] == ["ALICE lives in Rome"]
+
+
+def test_repeated_submits_of_one_space_are_merged(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """一个空间在队列里最多排一次：线程都忙时同一个用户连着写 30 次（每次都提交），轮到它时只
+    巩固一轮。以前提交几次就巩固几轮，其余的什么都不做、各写一条 trace（离线复现：30 次后台的
+    add 巩固了 30 轮，24 轮一个会话都没有）。"""
+    model = ScriptedModel(echo_extraction)
+    held, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "HOLD" in str(body["messages"]):
+            held.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    one = n3_settings.consolidation.model_copy(update={"background_workers": 1})
+    settings = n3_settings.model_copy(update={"consolidation": one})
+    with MemorySystem.from_settings(settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        assert len(worker._threads) == 1
+        system.append("hold", said_once("s1", "HOLD the only thread", 1), 0)
+        assert held.wait(10)
+        system.append("dave", said_once("s1", "I bought a bike", 1), 0)
+        for _ in range(29):
+            worker.submit("dave")
+        release.set()
+        worker.wait()
+        runs = [r for r in worker.reports if r.space_id == "dave"]
+        assert [r.sessions for r in runs] == [1]
+
+
+def test_a_space_submitted_while_it_consolidates_runs_again(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """正在巩固的空间又提交了（期间又写了一个会话）：这一轮做完再做一轮，新会话不会因为合并
+    提交而漏掉，wait() 也等到它做完。"""
+    model = ScriptedModel(echo_extraction)
+    entered, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "FIRST" in str(body["messages"]) and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        system.append("erin", said_once("s1", "FIRST I live in Lima", 1), 0)
+        assert entered.wait(10)
+        system.append("erin", said_once("s2", "I work as a nurse", 2), 0)
+        release.set()
+        worker.wait()
+        assert {j["status"] for j in system.db.get_jobs("erin")} == {"done"}
+        assert sorted(f.statement for f in system.facts("erin")) == [
+            "FIRST I live in Lima",
+            "I work as a nurse",
+        ]
+        assert [r.sessions for r in worker.reports if r.space_id == "erin"] == [1, 1]
 
 
 def said_once(session_id: str, text: str, day: int) -> SessionIn:
@@ -615,12 +710,13 @@ def test_content_filter_skips_session_or_falls_back_to_rules(
 def test_config_change_triggers_rebuild(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:
-    """影响巩固结果的配置（如阈值）变了：派生记忆自动重建；只改并发数不算。"""
+    """影响巩固结果的配置（如阈值）变了：派生记忆自动重建；只改并发数（同一空间里并行抽取的
+    会话数、后台同时巩固的空间数）不算。"""
     with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
         memory.ingest(toy(), consolidate=True)
         before = memory.consolidator.fingerprint()
         assert not memory.consolidator.stale("demo")
-    faster = n3_settings.consolidation.model_copy(update={"workers": 7})
+    faster = n3_settings.consolidation.model_copy(update={"workers": 7, "background_workers": 2})
     with MemorySystem.from_settings(
         n3_settings.model_copy(update={"consolidation": faster}), http_client=fake_api.client()
     ) as memory:
@@ -1162,6 +1258,33 @@ def test_add_with_wait_does_not_reload_the_whole_space(
     # 只读新会话的发言（分配序号、登记任务、抽取），其余 12 个会话的内容指纹不重算
     assert calls["get_turns"] == calls["get_turns:s12"] == 3
     assert calls["cached texts"] <= 3  # 只查这次新抽取的陈述
+
+
+def test_image_and_text_embeddings_share_one_cache_connection(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """默认配置（通义的多模态向量）下图片与文本向量器共用一个向量缓存连接，图片向量写缓存时文本
+    向量器的版本不变，巩固留着的镜像照样能用。以前图片的另开一个连接：以文搜图遇到没见过的问题、
+    写入带图的发言都写缓存，文本那边读到的 PRAGMA data_version 就变了，巩固当缓存被别的进程改过，
+    丢掉所有空间的镜像（9,000 条事实时每次巩固多花约 0.3 秒）。"""
+    with MemorySystem.from_settings(settings, http_client=fake_api.client()) as system:
+        embedder, image = system.embedder, system.image_embedder
+        assert isinstance(embedder, CachedEmbedder)
+        assert isinstance(image, DashScopeMultimodalEmbedder) and image.cache is not None
+        assert image.cache is embedder.cache
+        before = embedder.version()
+        image.cache.put_many([("mm-key", np.zeros(4, dtype=np.float32), None)])
+        assert embedder.version() == before
+
+
+def test_default_consolidation_fingerprint_is_unchanged(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """默认配置的巩固配置指纹（第三轮体检之前的值）。新加的配置字段计入指纹时，每个已有空间都被
+    判为过期：显式的巩固把它重建一遍，评测复用的空间报 ConfigMismatchError。并发数这类不影响结果
+    的字段（workers、background_workers）要放进 Consolidator.fingerprint 的 exclude。"""
+    with MemorySystem.from_settings(settings, http_client=fake_api.client()) as system:
+        assert system.consolidator.fingerprint() == "2f0adc7890b6a52e"
 
 
 def test_reused_state_notices_writes_from_another_connection(

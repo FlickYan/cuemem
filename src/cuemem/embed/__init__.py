@@ -112,8 +112,13 @@ def build_image_embedder(
     *,
     ledger: Ledger | None = None,
     http_client: httpx2.Client | None = None,
+    cache: EmbeddingCache | None = None,
 ) -> ImageEmbedder | None:
-    """图片向量器（N6）。文本向量用离线哈希时也用哈希；没有 Key 时返回 None（不建图片向量）。"""
+    """图片向量器（N6）。文本向量用离线哈希时也用哈希；没有 Key 时返回 None（不建图片向量）。
+
+    cache：向量缓存，缺省另开一个连接（同一个文件）。MemorySystem 传文本向量器的那个：另开的连接
+    每写一次缓存（以文搜图时没见过的问题、写入带图的发言），文本那个连接读到的 data_version 就
+    变一次，巩固就当向量缓存被别人改过，丢掉所有空间的镜像（见 Consolidator._load_states）。"""
     from cuemem.embed.cache import EmbeddingCache
     from cuemem.embed.multimodal import DashScopeMultimodalEmbedder, HashMultimodalEmbedder
 
@@ -131,5 +136,5 @@ def build_image_embedder(
         api_key,
         http_client=http_client,
         ledger=ledger,
-        cache=EmbeddingCache(settings.paths.embed_cache),
+        cache=cache if cache is not None else EmbeddingCache(settings.paths.embed_cache),
     )

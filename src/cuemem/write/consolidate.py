@@ -21,7 +21,6 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
-import queue
 import threading
 import time
 from collections import Counter, OrderedDict, deque
@@ -240,11 +239,17 @@ class Consolidator:
         return digest
 
     def fingerprint(self) -> str:
-        """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。"""
+        """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。
+
+        并发数（workers、background_workers）不影响结果，不计入：计入的话每个空间的指纹都变了，
+        显式的巩固会把每个空间重建一遍，评测复用的空间都报 ConfigMismatchError。以后加的这类字段
+        也要放进 exclude。"""
         role = self.extractor.llm.settings.roles.get(self.extractor.role)
         model = self.extractor.model or (role.model if role else "")
         # 没有补充说明时不计入指纹：加这个字段之前巩固过的空间不会被判为过期
-        exclude = {"workers"} | ({"instructions"} if self.config.instructions is None else set())
+        exclude = {"workers", "background_workers"}
+        if self.config.instructions is None:
+            exclude.add("instructions")
         config = json.dumps(self.config.model_dump(exclude=exclude), sort_keys=True)
         return stable_id(PIPELINE_VERSION, model, config)
 
@@ -872,12 +877,18 @@ class Consolidator:
 
 
 class ConsolidationWorker:
-    """后台巩固：在线写入只负责登记任务，这个线程在空闲时把任务做完，不阻塞对话。
+    """后台巩固：在线写入只负责登记任务，这几个线程在空闲时把任务做完，不阻塞对话。
 
-    同一时间只处理一个空间；同一空间的任务按会话时间顺序串行（对账需要）。抽取失败的会话
-    （限流、余额不足、超时）按退避时间自动重试（见 Consolidator.retry_due），巩固整个抛出了
-    异常（对账、向量化时出错）时整个空间按同样的退避再做（见 _retry_after_crash），不用等下一次
-    显式的巩固。reports 与 errors 只留最近 100 条。
+    threads 个线程（consolidation.background_workers，缺省 4）从同一个队列里取空间：同一时间
+    最多这么多个空间在巩固，同一空间同一时间只有一个；同一空间的任务按会话时间顺序串行（对账
+    需要）。一个空间在队列里最多排一次，正在巩固时又提交的，做完这一轮再做一轮（期间登记的任务
+    不会漏）。以前只有一个线程、提交一次排一次：一个用户的重放（几百个会话要十几秒）让别的用户的
+    抽取都排在它后面，同一个用户连着 add 30 次就巩固 30 轮，大多什么都不做、各写一条 trace。
+    几个空间同时巩固时，发给供应商的请求仍由 LLMClient 按供应商的并发上限排队。
+
+    抽取失败的会话（限流、余额不足、超时）按退避时间自动重试（见 Consolidator.retry_due），巩固
+    整个抛出了异常（对账、向量化时出错）时整个空间按同样的退避再做（见 _retry_after_crash），
+    不用等下一次显式的巩固。reports 与 errors 只留最近 100 条。
 
     失败记一条警告日志（_fail）：每个空间、每种出错一次，这个空间之后有一次巩固顺利做完了，
     同样的出错再记。以前只记在 errors 里，SDK 的用户什么都看不到：没配好模型供应商的密钥时
@@ -891,6 +902,7 @@ class ConsolidationWorker:
         *,
         tracer: TraceSink | None = None,
         retry_base_s: float = RETRY_BASE_S,
+        threads: int = 1,
     ) -> None:
         self.consolidator = consolidator
         self.tracer = tracer
@@ -902,26 +914,48 @@ class ConsolidationWorker:
         # 与 errors 一一对应的（空间，出错）：按空间筛（errors_for），遗忘时删掉（drop）
         self._failures: deque[tuple[str, str]] = deque(maxlen=100)
         self._warned: set[tuple[str, str]] = set()  # 记过警告的（空间，出错的类型）
-        self._failures_lock = threading.Lock()  # 上面三个：别的线程读、删，这个线程写
-        self._queue: queue.Queue[str | None] = queue.Queue()
-        self._retry: dict[str, float] = {}  # 空间 → 可以重试的时刻（time.monotonic），只在线程里用
-        self._crashes: dict[str, int] = {}  # 空间 → 巩固连续抛出异常的次数，只在线程里用
-        self._thread = threading.Thread(target=self._loop, name="cuemem-consolidate", daemon=True)
-        self._thread.start()
+        self._failures_lock = threading.Lock()  # 上面三个：后台线程写，别的线程读、删
+        # 下面几项只在持有 _cond 时读写
+        self._cond = threading.Condition()
+        self._pending: dict[str, None] = {}  # 排队的空间，按提交的先后，每个最多一次
+        self._running: set[str] = set()  # 正在巩固的空间
+        self._again: set[str] = set()  # 巩固时又提交了的空间：这一轮做完再排上
+        self._stopping = False
+        self._retry: dict[str, float] = {}  # 空间 → 可以重试的时刻（time.monotonic）
+        self._crashes: dict[str, int] = {}  # 空间 → 巩固连续抛出异常的次数
+        self._threads = [
+            threading.Thread(target=self._loop, name=f"cuemem-consolidate-{i}", daemon=True)
+            for i in range(max(1, threads))
+        ]
+        for thread in self._threads:
+            thread.start()
 
     def submit(self, space_id: str) -> None:
-        self._queue.put(space_id)
+        """把这个空间排上（已经排着的不再排；正在巩固的，这一轮做完再做一轮）。stop() 之后提交的
+        不再做，与以前排在结束标记之后的一样：任务留在数据库里，下次启动时接着做。"""
+        with self._cond:
+            if self._stopping:
+                return
+            self._enqueue(space_id)
+            self._cond.notify_all()
 
     def wait(self) -> None:
         """等待已提交的空间全部处理完（其间到期的重试也等；还没到期的不等）。"""
-        self._queue.join()
+        with self._cond:
+            while self._pending or self._running or self._again:
+                self._cond.wait()
 
     def stop(self) -> None:
-        """排在前面的空间做完再退出，最多等 stop_timeout_s 秒。等不到时不再等：调用方随后关闭
-        数据库，线程之后的报错不再记录，没做完的任务留在数据库里，下次启动时接着做。"""
-        self._queue.put(None)
-        self._thread.join(timeout=self.stop_timeout_s)
-        if self._thread.is_alive():
+        """已经排着的空间做完再退出（之后到期的重试不再排），所有线程一共最多等 stop_timeout_s
+        秒。等不到时不再等：调用方随后关闭数据库，线程之后的报错不再记录，没做完的任务留在数据库
+        里，下次启动时接着做。"""
+        with self._cond:
+            self._stopping = True
+            self._cond.notify_all()
+        deadline = time.monotonic() + self.stop_timeout_s
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in self._threads):
             self.closing = True
             logger.warning(
                 "后台巩固 %.0f 秒内没有做完，不再等待：没做完的抽取下次启动时接着做",
@@ -966,25 +1000,36 @@ class ConsolidationWorker:
 
     def _loop(self) -> None:
         while True:
-            try:
-                space_id = self._queue.get(timeout=self._until_due())
-            except queue.Empty:
-                self._resubmit_due()
-                continue
-            if space_id is None:
-                self._queue.task_done()
-                return
+            with self._cond:
+                while True:
+                    if not self._stopping:
+                        self._resubmit_due()
+                    space_id = next(iter(self._pending), None)
+                    if space_id is not None:
+                        break
+                    if self._stopping:
+                        return
+                    self._cond.wait(timeout=self._until_due())
+                del self._pending[space_id]
+                self._running.add(space_id)
             try:
                 self._consolidate(space_id)
-                self._crashes.pop(space_id, None)
-                self._resubmit_due()  # 到期的重试排在 task_done 之前：wait() 一并等它们
+                with self._cond:
+                    self._crashes.pop(space_id, None)
             except Exception as exc:  # 后台线程不能崩：记录下来，任务保持待处理，按退避再试
                 if not self.closing:  # 关闭超时后数据库已经关了，这时的报错说明不了什么
                     self._fail(space_id, type(exc).__name__, f"{type(exc).__name__}: {exc}")
-                    self._retry_after_crash(space_id)
-                    self._resubmit_due()
+                    with self._cond:
+                        self._retry_after_crash(space_id)
             finally:
-                self._queue.task_done()
+                with self._cond:
+                    self._running.discard(space_id)
+                    if space_id in self._again:
+                        self._again.discard(space_id)
+                        self._pending.setdefault(space_id)
+                    if not self._stopping:  # 到期的重试在清掉 _running 的同时排上：wait() 一并等
+                        self._resubmit_due()
+                    self._cond.notify_all()
 
     def _consolidate(self, space_id: str) -> None:
         consolidator = self.consolidator
@@ -1007,15 +1052,23 @@ class ConsolidationWorker:
                 with self._failures_lock:
                     self._warned = {key for key in self._warned if key[0] != space_id}
         self.reports.append(report)
-        if wait is None:
-            self._retry.pop(space_id, None)
+        with self._cond:
+            if wait is None:
+                self._retry.pop(space_id, None)
+            else:
+                self._retry[space_id] = time.monotonic() + wait
+
+    def _enqueue(self, space_id: str) -> None:
+        """排上这个空间（调用方持有 _cond）：正在巩固的，这一轮做完再排。"""
+        if space_id in self._running:
+            self._again.add(space_id)
         else:
-            self._retry[space_id] = time.monotonic() + wait
+            self._pending.setdefault(space_id)
 
     def _retry_after_crash(self, space_id: str) -> None:
         """巩固整个抛出了异常（对账、向量化、图片描述遇上余额不足、限流等；逐个会话的抽取失败
         不会抛出来，见 retry_due）：任务还是待处理，按同样的退避时间再做一遍，连续 MAX_ATTEMPTS
-        次都抛出就不再自动重试，等这个空间的下一次提交或显式的巩固。"""
+        次都抛出就不再自动重试，等这个空间的下一次提交或显式的巩固（调用方持有 _cond）。"""
         crashes = self._crashes[space_id] = self._crashes.get(space_id, 0) + 1
         if crashes >= MAX_ATTEMPTS:
             return
@@ -1029,11 +1082,12 @@ class ConsolidationWorker:
         return max(0.0, min(self._retry.values()) - time.monotonic())
 
     def _resubmit_due(self) -> None:
+        """退避时间到了的空间重新排上（调用方持有 _cond）。"""
         now = time.monotonic()
         for space_id, due in list(self._retry.items()):
             if due <= now:
                 del self._retry[space_id]
-                self._queue.put(space_id)
+                self._enqueue(space_id)
 
 
 def scope(space_id: str, part: str) -> str:

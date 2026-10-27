@@ -399,6 +399,9 @@ class MemorySystem:
             http_client=http_client,
             on_peak_wait=on_peak_wait,
         )
+        # 图片向量与文本向量共用一个缓存连接：另开一个连接写缓存，文本那边就当缓存被别人改过，
+        # 巩固丢掉跨运行留着的镜像（见 build_image_embedder）
+        cache = embedder.cache if isinstance(embedder, CachedEmbedder) else None
         return cls(
             settings,
             db=db,
@@ -410,7 +413,9 @@ class MemorySystem:
             owns_caches=True,
             reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
             media=MediaStore(paths.media),
-            image_embedder=build_image_embedder(settings, ledger=ledger, http_client=http_client),
+            image_embedder=build_image_embedder(
+                settings, ledger=ledger, http_client=http_client, cache=cache
+            ),
         )
 
     @classmethod
@@ -671,13 +676,18 @@ class MemorySystem:
         return report
 
     def start_worker(self) -> ConsolidationWorker:
-        """启动后台巩固线程：此后 ingest 只登记任务，巩固在后台完成。
+        """启动后台巩固线程（consolidation.background_workers 个，同时巩固几个空间）：此后
+        ingest 只登记任务，巩固在后台完成。
 
         第一次启动时接着做上次没做完的：进程退出、崩溃或关闭超时时还待处理的任务，以及失败
         次数还没到上限的任务，所在的空间都提交一遍。"""
         with self._worker_lock:
             if self.worker is None:
-                self.worker = ConsolidationWorker(self.consolidator, tracer=self.tracer)
+                self.worker = ConsolidationWorker(
+                    self.consolidator,
+                    tracer=self.tracer,
+                    threads=self.settings.consolidation.background_workers,
+                )
                 for space_id in self.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS):
                     self.worker.submit(space_id)
             return self.worker
@@ -1633,11 +1643,18 @@ class MemorySystem:
         if self._owns_caches:  # 关掉最后一个连接时，SQLite 把 WAL 写回并删掉
             if self.llm.cache is not None:
                 self.llm.cache.close()
+            text_cache = None
             if isinstance(self.embedder, CachedEmbedder):
-                self.embedder.cache.close()
+                text_cache = self.embedder.cache
+                text_cache.close()
             image = self.image_embedder
-            if isinstance(image, DashScopeMultimodalEmbedder) and image.cache is not None:
-                image.cache.close()  # 与文本向量同一个文件的另一个连接
+            # 与文本向量同一个文件的另一个连接（from_settings 让两者共用一个，已经关了）
+            if (
+                isinstance(image, DashScopeMultimodalEmbedder)
+                and image.cache is not None
+                and image.cache is not text_cache
+            ):
+                image.cache.close()
         if self._owns_ledger:
             self.ledger.close()
 

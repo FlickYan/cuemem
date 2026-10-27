@@ -217,6 +217,8 @@ class ConsolidationConfig(BaseModel):
     assistant_chars: int | None = 600  # 抽取时每条助手回复最多保留的字符数；None 表示不截断
     max_session_chars: int = 24_000  # 单次抽取的会话文本上限，超过时按轮次切成多个窗口
     workers: int = 8  # 同一空间内并行抽取的会话数
+    # 后台巩固同时处理的空间数（同一空间仍只有一个在巩固）；与 workers 一样不计入巩固配置的指纹
+    background_workers: int = Field(default=4, ge=1)
     fallback_model: str | None = "deepseek-flash"  # 内容审核误拒时改用的模型（另一家供应商）
     duplicate_threshold: float = 0.93  # 陈述相似度超过它视为同一条事实（MERGE）
     conflict_threshold: float = 0.75  # 单值事实与已有事实相似度超过它，交给 LLM 判断是否冲突

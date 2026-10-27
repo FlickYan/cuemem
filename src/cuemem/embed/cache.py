@@ -84,7 +84,8 @@ class EmbeddingCache:
         """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。
 
         删除时覆写（secure_delete），删了东西就把 WAL 写回并截断：否则被删的键与向量留在
-        WAL 里，直到进程退出。同一个文件的另一个连接（图片向量器的）不用再截断一次。"""
+        WAL 里，直到进程退出。截断的是整个文件的 WAL，同一个文件的别的连接（评测与 tune_mm 里
+        图片向量器另开的；MemorySystem.from_settings 让图片与文本共用这一个）不用再截断一次。"""
         deleted = 0
         unique = list(dict.fromkeys(keys))
         with self._lock:
