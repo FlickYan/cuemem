@@ -39,6 +39,7 @@ from cuemem.sdk import space_for, space_owner
 ADMIN_TOKEN = "admin-token-0123456789"
 ALICE_TOKEN = "alice-token-0123456789"
 SHOP_TOKEN = "shop-token-0123456789"
+SHOP_USERS_TOKEN = "shop-users-token-0123456789"
 
 
 def _sha256(token: str) -> str:
@@ -56,14 +57,20 @@ keys:
     scopes:
       - {{user: "*", agent: shop}}
       - {{agent: shop}}
+  - name: shop-users
+    token: {SHOP_USERS_TOKEN}
+    scopes:
+      - {{user: "*", agent: shop}}
 """
 # 每个空间各记一句"秘密"：alice 的令牌只能访问前两个，shop-backend 只能访问 shop 下面的与
-# shop 自己的。agent/alice 是 Agent alice 自己的记忆（也是 space_for("alice", "agent")），
+# shop 自己的，shop-users 只能访问 shop 下面的用户（没有 {agent: shop} 那一项，碰不到 shop
+# 自己的记忆）。agent/alice 是 Agent alice 自己的记忆（也是 space_for("alice", "agent")），
 # alice/bob 是用户 bob 在名叫 alice 的 Agent 下的记忆
 SPACES = ["alice", "shop/alice", "bob", "shop/bob", "agent/shop", "agent/alice", "alice/bob"]
 REACH = {
     ALICE_TOKEN: {"alice", "shop/alice"},
     SHOP_TOKEN: {"shop/alice", "shop/bob", "agent/shop"},
+    SHOP_USERS_TOKEN: {"shop/alice", "shop/bob"},
     ADMIN_TOKEN: set(SPACES),
 }
 
@@ -102,11 +109,14 @@ def test_space_owner_of_the_agent_collision_and_foreign_spaces() -> None:
 
 
 def test_scopes_cover_only_the_named_users_and_agents() -> None:
+    """{user: "*", agent: shop} 只管 shop 下面的用户，shop 自己的记忆要另有一项 {agent: shop}
+    （以前唯一带它的令牌两项都有，把两条规则混成一条也没有测试失败）。"""
     keys = Keys.parse(KEYS)
-    alice, shop = (keys.resolve(t) for t in (ALICE_TOKEN, SHOP_TOKEN))
-    assert alice is not None and shop is not None
-    for token, principal in ((ALICE_TOKEN, alice), (SHOP_TOKEN, shop)):
+    alice, shop, users = (keys.resolve(t) for t in (ALICE_TOKEN, SHOP_TOKEN, SHOP_USERS_TOKEN))
+    assert alice is not None and shop is not None and users is not None
+    for token, principal in ((ALICE_TOKEN, alice), (SHOP_TOKEN, shop), (SHOP_USERS_TOKEN, users)):
         assert {s for s in SPACES if principal.allows(s)} == REACH[token]
+    assert not users.allows("agent/shop") and not Scope(("*",), ("shop",)).covers(None, "shop")
     for escape in ("alice%2Fbob", "alice/../bob", "x/y/alice", "", "Alice", "alice ", "agent/x"):
         assert not alice.allows(escape), escape
     assert alice.allows("bot%2Fx/alice") and not alice.allows(None)
@@ -131,7 +141,7 @@ def test_tokens_are_compared_as_digests_against_every_key(monkeypatch: pytest.Mo
         calls.clear()
         found = keys.resolve(token)
         assert (found.name if found else None) == name
-        assert len(calls) == 3 and all(len(a) == len(b) == 32 for a, b in calls)
+        assert len(calls) == 4 and all(len(a) == len(b) == 32 for a, b in calls)
         assert all(token.encode() not in a + b for a, b in calls)
 
 
@@ -196,7 +206,10 @@ def test_keys_from_the_environment(tmp_path: Path) -> None:
     path = tmp_path / "keys.yaml"
     path.write_text(KEYS, encoding="utf-8")
     from_file = Keys.from_env({"CUEMEM_API_KEYS_FILE": str(path), "CUEMEM_API_TOKEN": ADMIN_TOKEN})
-    assert from_file.names == ["alice-app", "shop-backend"] and from_file.admin is not None
+    assert (
+        from_file.names == ["alice-app", "shop-backend", "shop-users"]
+        and from_file.admin is not None
+    )
     inline = Keys.from_env({"CUEMEM_API_KEYS": json.dumps({"keys": [
         {"name": "a", "token": "t", "scopes": [{"user": ["a", "b"]}]}
     ]})})  # fmt: skip
@@ -287,7 +300,7 @@ SPACE_ROUTES: list[tuple[str, str, dict[str, Any] | None]] = [
 ]
 
 
-@pytest.mark.parametrize("token", [ALICE_TOKEN, SHOP_TOKEN, ADMIN_TOKEN])
+@pytest.mark.parametrize("token", [ALICE_TOKEN, SHOP_TOKEN, SHOP_USERS_TOKEN, ADMIN_TOKEN])
 def test_api_space_routes_stay_in_scope(world: World, token: str) -> None:
     """/api/spaces/{space}/… 的每个接口：作用域里的照常，之外的 403；"/" 写成 %2F 一样。"""
     headers = bearer(token)

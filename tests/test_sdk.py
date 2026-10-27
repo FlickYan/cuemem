@@ -29,7 +29,7 @@ from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
 from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
 from cuemem.memory import _open_mark
-from cuemem.sdk import parse_messages, space_for
+from cuemem.sdk import _matches, parse_messages, space_for
 from cuemem.store.vector import VectorStore
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -938,6 +938,37 @@ def test_metadata_is_kept_on_memories_and_filterable(memory: Memory, tmp_path: P
     )
     assert [i["metadata"] for i in kitchen["images"]] == [{"topic": "kitchen"}]
     assert {r["metadata"]["topic"] for r in kitchen["results"]} == {"kitchen"}
+
+
+RECORD = {"n": 5, "tags": ["Work", "home"], "s": "Hello World"}
+FILTER_CASES: list[tuple[dict[str, Any], bool]] = [
+    # 比较正好落在边界上：lt / lte、gt / gte 写反了才分得出来
+    ({"n": {"lt": 5}}, False),
+    ({"n": {"lte": 5}}, True),
+    ({"n": {"gt": 5}}, False),
+    ({"n": {"gte": 5}}, True),
+    ({"n": {"gt": "x"}}, False),  # 不能比较的类型：不算满足
+    # NOT 是"一个都不满足"：两个条件里有一个满足就是 False
+    ({"NOT": [{"n": 5}, {"n": 6}]}, False),
+    ({"NOT": [{"n": 6}, {"n": 7}]}, True),
+    ({"OR": [{"n": 6}, {"n": 5}]}, True),
+    ({"AND": [{"n": 5}, {"s": "*"}]}, True),
+    # 列表：contains 认原样的一项，icontains 不分大小写；字符串里找子串
+    ({"tags": {"contains": "Work"}}, True),
+    ({"tags": {"contains": "work"}}, False),
+    ({"tags": {"icontains": "work"}}, True),
+    ({"s": {"icontains": "world"}}, True),
+    ({"missing": {"ne": 1}}, True),
+    ({"missing": {"nin": [1]}}, True),
+    ({"missing": "*"}, False),
+]
+
+
+@pytest.mark.parametrize(("where", "expected"), FILTER_CASES, ids=[str(c) for c, _ in FILTER_CASES])
+def test_filter_operators_at_their_edges(where: dict[str, Any], expected: bool) -> None:
+    """filters 的运算符（Mem0 的写法，D-069）逐个钉住：以前没有一个值正好在边界上，NOT 只给过
+    一个条件，lte 写成 <、lt 写成 <=、gt 写成 >=、NOT 写成"不全满足"都没有测试失败。"""
+    assert _matches(where, RECORD) is expected
 
 
 def test_metadata_and_expiration_stay_out_of_extraction(

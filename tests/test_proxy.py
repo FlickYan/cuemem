@@ -21,7 +21,7 @@ from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from scripted import ScriptedModel
 from test_sdk import where_i_live
 
@@ -29,8 +29,9 @@ from cuemem import Memory
 from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
 from cuemem.config import Settings
 from cuemem.embed import CachedEmbedder
-from cuemem.errors import EmbeddingAPIError
+from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.write.online import worth_retrying
 
 SYSTEM = {"role": "system", "content": "You are a helpful shopping assistant."}
 
@@ -517,10 +518,12 @@ def test_write_backs_that_cannot_succeed_are_dropped(
     system: MemorySystem,
     upstream: Upstream,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """不留着重试的：向量接口拒绝了请求本身（4xx：再写一次还是一样，留着它这个会话后面的写回
     都排在它后面）；写不进去的期间这个用户的记忆被删过（这是删之前说的话）；会话结束时还是写不
-    进去的。"""
+    进去的：留着的几次写回一起丢掉、警告一次（以前改成会话结束时照样留着、或只丢第一次接着写
+    后面的，都没有测试失败）。"""
     outage = Outage(system, monkeypatch)
     outage.status = 400
     first = chat(client, "I live in Berlin", user="alice", headers={"X-CueMem-Session": "s1"})
@@ -542,8 +545,42 @@ def test_write_backs_that_cannot_succeed_are_dropped(
 
     outage.status = 503
     chat(client, "I like coffee", user="alice", headers={"X-CueMem-Session": "s1"})
-    proxy.close_all()
+    chat(client, "I like milk", user="alice", headers={"X-CueMem-Session": "s1"})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        proxy.close_all()
     assert [t.text for t in system.db.get_turns("alice")] == texts
+    dropped = [r.getMessage() for r in caplog.records if "could not store" in r.getMessage()]
+    assert len(dropped) == 1 and "store 4 message(s)" in dropped[0], dropped
+
+
+# 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）
+WORTH_RETRYING: list[tuple[BaseException, bool]] = [
+    (EmbeddingAPIError("no balance", status=402), True),
+    (EmbeddingAPIError("timeout", status=408), True),
+    (EmbeddingAPIError("throttled", status=429), True),
+    (EmbeddingAPIError("unavailable", status=503), True),
+    (EmbeddingAPIError("bad request", status=400), False),
+    (EmbeddingAPIError("no response"), True),  # 连不上、超时
+    (ConcurrentWriteError("collided"), False),  # 已经写进去一部分，再写就重复了
+    (ContentFilteredError("blocked"), False),
+    (UnidentifiedImageError("not an image"), False),
+    (ValueError("too many pixels"), False),
+    (TypeError("bad message"), False),
+    (KeyError("k"), False),
+    (OSError("qdrant down"), True),
+]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    WORTH_RETRYING,
+    ids=[f"{type(e).__name__}-{i}" for i, (e, _) in enumerate(WORTH_RETRYING)],
+)
+def test_which_write_errors_are_worth_retrying(exc: BaseException, expected: bool) -> None:
+    """worth_retrying 逐行钉住：以前把向量接口的 402 / 408 改成不重试、把撞号
+    （ConcurrentWriteError）或不合法的发言（ValueError）改成要重试，都没有测试失败。"""
+    assert worth_retrying(exc) is expected
 
 
 @pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")

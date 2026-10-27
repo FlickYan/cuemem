@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import email.utils
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx2
 import pytest
 from fakes import FakeAPI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 
 from cuemem.config import Settings
 from cuemem.errors import CacheMissError, MissingAPIKeyError, StructuredOutputError
 from cuemem.llm import ChatResult, Ledger, LLMClient, ResponseCache, ToolCall, Usage, chat_cost
+from cuemem.llm import client as llm_client
 from cuemem.llm.cache import request_key
 from cuemem.llm.client import unparsable_json
 
@@ -284,6 +290,71 @@ def test_rate_limits_and_server_errors_are_retried_like_the_sdk(
         with pytest.raises(error):
             client.chat("reader", [{"role": "user", "content": reply}])
         assert len(fake_api.chat_requests) == sent
+
+
+UPSTREAM = httpx2.Request("POST", "https://upstream.invalid/v1/chat/completions")
+
+
+def _status(code: int, **headers: str) -> Callable[[], Exception]:
+    def make() -> Exception:
+        response = httpx2.Response(code, headers=headers, request=UPSTREAM)
+        return APIStatusError("upstream", response=response, body=None)
+
+    return make
+
+
+def _in_30_seconds() -> Exception:
+    """Retry-After 写成 HTTP 日期，约 30 秒之后（运行时才算：收集测试之后可能已过了几分钟）。"""
+    soon = email.utils.formatdate(time.time() + 30, usegmt=True)
+    return _status(429, **{"retry-after": soon})()
+
+
+# （说明，造出异常，retry_timeouts，要等的秒数；None 表示不重试；"about30" 表示约 30 秒）
+RETRY_CASES: list[tuple[str, Callable[[], Exception], bool, float | str | None]] = [
+    ("429 retry-after-ms", _status(429, **{"retry-after-ms": "1500"}), True, 1.5),
+    ("429 retry-after seconds", _status(429, **{"retry-after": "3"}), True, 3.0),
+    ("429 over 120 s", _status(429, **{"retry-after": "121"}), True, None),
+    ("429 overflowing number", _status(429, **{"retry-after": "1e400"}), True, None),
+    ("429 literal inf", _status(429, **{"retry-after": "inf"}), True, 0.5),
+    ("429 zero", _status(429, **{"retry-after": "0"}), True, 0.5),
+    ("429 HTTP date", _in_30_seconds, True, "about30"),
+    ("500", _status(500), True, 0.5),
+    ("503", _status(503), True, 0.5),
+    ("408", _status(408), True, 0.5),
+    ("409", _status(409), True, 0.5),
+    ("400", _status(400), True, None),
+    ("402", _status(402), True, None),
+    ("404", _status(404), True, None),
+    ("400 x-should-retry true", _status(400, **{"x-should-retry": "true"}), True, 0.5),
+    ("500 x-should-retry false", _status(500, **{"x-should-retry": "false"}), True, None),
+    ("connection error", lambda: APIConnectionError(request=UPSTREAM), True, 0.5),
+    ("timeout with a fallback", lambda: APITimeoutError(request=UPSTREAM), False, None),
+    ("timeout without a fallback", lambda: APITimeoutError(request=UPSTREAM), True, 0.5),
+]
+
+
+@pytest.mark.parametrize(
+    ("make", "retry_timeouts", "expected"),
+    [case[1:] for case in RETRY_CASES],
+    ids=[case[0] for case in RETRY_CASES],
+)
+def test_retry_rules_follow_the_sdk(
+    make: Callable[[], Exception],
+    retry_timeouts: bool,
+    expected: float | str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_retry_delay 的每条规则（照 OpenAI SDK，D-069）各一行：Retry-After 超过 2 分钟、
+    x-should-retry、409、字面的 inf、HTTP 日期、0、连不上。以前只有三个脚本化的序列走到这里，
+    这些规则改掉哪一条都没有测试失败。"""
+    monkeypatch.setattr(llm_client.random, "random", lambda: 0.0)  # 不减随机的零头
+    exc = make()
+    assert isinstance(exc, APIError)
+    delay = llm_client._retry_delay(exc, 0, retry_timeouts=retry_timeouts)
+    if expected == "about30":
+        assert delay is not None and 25 < delay <= 30
+    else:
+        assert delay == expected
 
 
 def test_identical_concurrent_requests_are_coalesced(settings: Settings, fake_api: FakeAPI) -> None:

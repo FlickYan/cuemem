@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx2
@@ -174,6 +175,107 @@ def test_the_client_has_the_same_methods_and_signatures_as_memory() -> None:
     assert ours == inspect.signature(AsyncMemory.run)
     for name in ("__getattr__", "__aenter__", "__aexit__"):
         assert hasattr(AsyncMemoryClient, name)
+
+
+WHEN = datetime(2026, 1, 2, 3, 4, 5)
+# 每个参数一个不是缺省值的值（按参数名）；同名、意思不同的按（方法，参数）另给。Memory 加了参数
+# 而这里没有时 KeyError：表要跟着改，新参数也要走一遍
+ARGUMENTS: dict[str, Any] = {
+    "messages": "hello",
+    "user_id": "alice",
+    "agent_id": "shop",
+    "run_id": "r1",
+    "metadata": {"k": "v"},
+    "expiration_date": "2027-01-01",
+    "timestamp": WHEN.isoformat(),
+    "infer": False,
+    "wait": True,
+    "query": "q",
+    "limit": 3,
+    "mode": "l2",
+    "at": WHEN,
+    "router": "rule",
+    "lam": 0.25,
+    "filters": {"topic": "x"},
+    "top_k": 4,
+    "min_level": "l0",
+    "show_expired": True,
+    "question": "q?",
+    "include_superseded": True,
+    "valid_at": "2026-01-01",
+    "known_at": WHEN,
+    "memory_id": "m1",
+    "media_id": "0123456789abcdef",
+    "text": "new text",
+    "data": "new text",  # update 的 data 与 text 是同一个参数
+    "dry_run": True,
+    "rebuild": True,
+    "derived": False,
+}
+PER_METHOD: dict[tuple[str, str], Any] = {("load", "data"): {"version": 2, "space_id": "alice"}}
+RETURNS: dict[str, Any] = {
+    "history": [],
+    "profile": "",
+    "open_run": "r1",
+    "spaces": [],
+    "media": b"image",
+    "wait": None,
+}
+
+
+class _Recorder:
+    """站在 Memory 的位置，记下 /api/v1 交给它的参数（位置参数按 Memory 的签名换成名字）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        db = SimpleNamespace(memory_kind=lambda memory_id: None)  # 按 ID 找的记忆：没有主人
+        self.system = SimpleNamespace(db=db)
+
+    def __getattr__(self, name: str) -> Callable[..., Any]:
+        signature = inspect.signature(getattr(Memory, name))
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind(None, *args, **kwargs).arguments
+            self.calls.append((name, {k: v for k, v in bound.items() if k != "self"}))
+            return RETURNS.get(name, {})
+
+        return call
+
+
+def _meaning(name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """比较用：日期、时间换成 ISO 字符串（经 JSON 传过去）；update 的 text 与 data 合成一个
+    （MemoryClient 合成后以 data 发送）。"""
+    out = {k: v.isoformat() if isinstance(v, date) else v for k, v in kwargs.items()}
+    if name == "update":
+        data = out.pop("data", None)
+        out["text"] = out["text"] if out.get("text") is not None else data
+    return out
+
+
+def _v1_recorder(recorder: _Recorder) -> FastAPI:
+    app = FastAPI()
+    app.include_router(memories_router(cast(Memory, recorder), dependencies=guard(Keys())))
+    install_error_format(app)
+    return app
+
+
+@pytest.mark.parametrize("name", sorted(_methods(MemoryClient) - {"close", "run"}))
+def test_every_argument_reaches_memory(name: str) -> None:
+    """MemoryClient 的每个方法、每个参数（都给不是缺省值的值）经 /api/v1 原样交到服务端的
+    Memory。以前本地与远程的测试只用缺省参数：客户端或服务端丢掉 search 的 run_id（远程就悄悄
+    搜了整个用户的空间）也没有测试失败；lam、top_k、limit、export 的 derived、answer 的 mode 与
+    router、consolidate 的 rebuild 同样。"""
+    recorder = _Recorder()
+    signature = inspect.signature(getattr(Memory, name))
+    args = {p: PER_METHOD.get((name, p), ARGUMENTS[p]) for p in list(signature.parameters)[1:]}
+    with (
+        TestClient(_v1_recorder(recorder)) as http,
+        MemoryClient("http://testserver", http_client=http) as client,
+    ):
+        getattr(client, name)(**args)
+    called, got = recorder.calls[0]  # open_run 之后，关掉客户端时还会 end_run
+    assert called == name
+    assert _meaning(name, got) == _meaning(name, args)
 
 
 @pytest.mark.parametrize(

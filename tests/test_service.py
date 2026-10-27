@@ -13,22 +13,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
 from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi.testclient import TestClient
 from mcp.server.mcpserver.exceptions import ToolError
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 
 from cuemem.agent import Agent
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, Product, shop_tools
 from cuemem.api.app import _sweep, create_app
+from cuemem.api.failures import provider_failure
 from cuemem.api.mcp import build_server
 from cuemem.api.replay import DemoScript, check, replay
 from cuemem.api.service import ChatService
 from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
 from cuemem.config import Settings
-from cuemem.errors import EmbeddingAPIError
+from cuemem.errors import ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
 from cuemem.store.media import image_data_url
 
@@ -613,6 +616,54 @@ def test_http_api_explains_provider_errors(
     monkeypatch.setattr(service.system.embedder, "embed", throttled)
     response = client.post("/api/spaces/alice/recall", json={"query": "shoes", "mode": "l1"})
     assert response.status_code == 429 and response.headers["retry-after"] == "3"
+
+
+UPSTREAM = httpx2.Request("POST", "https://upstream.invalid/v1/x")
+
+
+def _upstream(code: int, **headers: str) -> APIStatusError:
+    response = httpx2.Response(code, headers=headers, request=UPSTREAM)
+    return APIStatusError("upstream", response=response, body=None)
+
+
+def _embedding_timeout() -> EmbeddingAPIError:
+    error = EmbeddingAPIError("timed out")
+    error.__cause__ = httpx2.ReadTimeout("timed out", request=UPSTREAM)
+    return error
+
+
+# 供应商的错误 → （回给调用方的状态码，种类，Retry-After）
+FAILURES: list[tuple[BaseException, tuple[int, str, str | None]]] = [
+    (_upstream(429, **{"retry-after": "7"}), (429, "rate_limited", "7")),
+    (_upstream(402), (402, "no_balance", None)),
+    (_upstream(503, **{"retry-after": "9"}), (503, "unavailable", "9")),
+    (_upstream(408), (504, "timeout", None)),
+    (_upstream(504), (504, "timeout", None)),
+    (_upstream(500), (502, "upstream_error", None)),
+    (_upstream(401), (502, "upstream_error", None)),
+    (APITimeoutError(request=UPSTREAM), (504, "timeout", None)),
+    (APIConnectionError(request=UPSTREAM), (502, "upstream_error", None)),
+    (ContentFilteredError("blocked"), (422, "content_filtered", None)),
+    (EmbeddingAPIError("throttled", status=429, retry_after="3"), (429, "rate_limited", "3")),
+    (EmbeddingAPIError("bad json"), (502, "upstream_error", None)),
+    (_embedding_timeout(), (504, "timeout", None)),
+]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    FAILURES,
+    ids=[f"{type(e).__name__}-{i}" for i, (e, _) in enumerate(FAILURES)],
+)
+def test_provider_failures_map_to_documented_statuses(
+    exc: BaseException, expected: tuple[int, str, str | None]
+) -> None:
+    """HTTP 接口与 MCP 共用的状态码表（D-069）逐行钉住：以前把上游的 504 改成不算超时（回 502）、
+    把连不上改成回 500，都没有测试失败。"""
+    failure = provider_failure(exc)
+    assert failure is not None
+    assert (failure.status, failure.kind, failure.retry_after) == expected
+    assert provider_failure(ValueError("ours")) is None  # 不是供应商的错误：照常处理
 
 
 def test_http_photo_stays_in_the_conversation(
