@@ -43,14 +43,16 @@ import hashlib
 import os
 import re
 import secrets
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
 import yaml
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Request, Response
+from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security.utils import get_authorization_scheme_param
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from cuemem.errors import AccessKeysError
@@ -289,22 +291,50 @@ def _patterns(value: str | list[str] | None, where: str) -> tuple[str, ...] | No
 # ---------- FastAPI ----------
 
 
-def guard(keys: Keys) -> list[Any]:
-    """路由的依赖：认出 Bearer 令牌，记在 request.state.principal 上（principal_of 读它）。
-    令牌不对时 401；没有配任何令牌时不鉴权，按管理令牌算。"""
+def authenticate(keys: Keys, request: Request) -> Principal:
+    """认出 Bearer 令牌（与 HTTPBearer 一样解析 Authorization 头），记在 request.state.principal
+    上（principal_of 读它）。令牌不对时 401；没有配任何令牌时不鉴权，按管理令牌算。"""
+    principal: Principal | None = ADMIN
+    if keys.enabled:
+        scheme, token = get_authorization_scheme_param(request.headers.get("Authorization"))
+        principal = keys.resolve(token) if scheme.lower() == "bearer" and token else None
+    if principal is None:
+        raise HTTPException(401, "缺少或错误的访问令牌", headers={"WWW-Authenticate": "Bearer"})
+    request.state.principal = principal
+    return principal
 
-    def authenticate(
+
+def guard(keys: Keys) -> list[Any]:
+    """路由的依赖：authenticate。FastAPI 先读完、解析完请求体才执行依赖，所以带请求体的路由还要
+    用 authenticated_route 做路由类（令牌不对时不读请求体）；这个依赖照样挂着，OpenAPI 的安全
+    方案（/docs 的 Authorize）由它的 HTTPBearer 而来。"""
+
+    def check(
         request: Request,
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],
     ) -> None:
-        principal: Principal | None = ADMIN
-        if keys.enabled:
-            principal = keys.resolve(credentials.credentials) if credentials is not None else None
-        if principal is None:
-            raise HTTPException(401, "缺少或错误的访问令牌", headers={"WWW-Authenticate": "Bearer"})
-        request.state.principal = principal
+        authenticate(keys, request)  # 令牌由 authenticate 自己从请求头读
 
-    return [Depends(authenticate)]
+    return [Depends(check)]
+
+
+def authenticated_route(keys: Keys) -> type[APIRoute]:
+    """路由类：先 authenticate，再交给 FastAPI 读请求体、解析参数、执行依赖。以前令牌只由 guard
+    检查，而 FastAPI 在执行依赖之前就把请求体读完、解析完：不带令牌的请求也能让服务器解析任意大的
+    JSON（内存是请求体的二十多倍），表单里的文件先写进临时文件，写坏的 JSON 回 422 而不是 401。
+    接口的签名与 OpenAPI 不变。"""
+
+    class AuthenticatedRoute(APIRoute):
+        def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+            handler = super().get_route_handler()
+
+            async def run(request: Request) -> Response:
+                authenticate(keys, request)
+                return await handler(request)
+
+            return run
+
+    return AuthenticatedRoute
 
 
 def principal_of(request: Request) -> Principal:

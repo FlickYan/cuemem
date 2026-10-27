@@ -42,7 +42,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
-from cuemem.api.auth import Keys, Principal, guard, principal_of, ui_login
+from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of, ui_login
 from cuemem.api.failures import provider_failure
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
@@ -290,7 +290,8 @@ def create_app(
     )
     keys = keys if keys is not None else Keys.from_token(token)
     guarded = guard(keys)  # 认出令牌（principal_of）；没有配令牌时不鉴权
-    api = APIRouter(dependencies=guarded)
+    checked = authenticated_route(keys)  # 令牌不对时在读请求体之前就 401
+    api = APIRouter(dependencies=guarded, route_class=checked)
 
     def own_session(http: Request, session_id: str) -> None:
         """会话属于作用域之外的空间时，与不存在的会话一样 404（会话 ID 不是探测的途径）。"""
@@ -468,7 +469,7 @@ def create_app(
 
     app.include_router(api)
     # Mem0 形状的记忆接口（/api/v1）：与界面、记忆代理共用同一个记忆系统，鉴权与作用域相同
-    app.include_router(memories_router(v1, dependencies=guarded))
+    app.include_router(memories_router(v1, dependencies=guarded, route_class=checked))
     install_error_format(app)
     if proxy is not None:
         from cuemem.api.proxy import proxy_router

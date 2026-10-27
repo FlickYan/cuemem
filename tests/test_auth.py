@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import starlette.requests
 from fakes import FakeAPI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -396,6 +397,53 @@ def test_every_api_route_needs_a_token(world: World) -> None:
             assert response.status_code == 401, (method, url)
             checked += 1
     assert checked > 30  # /api、/api/v1 与 /v1 的全部接口
+
+
+def test_a_bad_token_is_refused_before_the_body_is_read(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """令牌不对时在读请求体之前就 401。以前 FastAPI 先把整个请求体读完、解析完（任意大的 JSON；
+    表单里的文件先写进临时文件），才轮到 guard 检查令牌：不带令牌就能让服务器花掉内存与磁盘，
+    写坏的 JSON 回 422 而不是 401。"""
+    http = world.http
+    for headers in ({}, bearer("wrong")):
+        broken = {**headers, "content-type": "application/json"}
+        for path in ("/api/v1/memories", "/api/sessions"):
+            response = http.post(path, content=b"{not json", headers=broken)
+            assert response.status_code == 401, (path, response.text)
+
+    def unread(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the body was read before the token was checked")
+
+    for name in ("body", "json", "form"):
+        monkeypatch.setattr(starlette.requests.Request, name, unread)
+    for headers in ({}, bearer("wrong")):
+        for path, body in (
+            ("/api/v1/memories", {"messages": "hi", "user_id": "alice"}),
+            ("/api/v1/memories/search", {"query": "hi", "user_id": "alice"}),
+            ("/api/v1/import", {"data": {"version": 2}, "user_id": "alice"}),
+            ("/api/sessions", {"space": "alice"}),
+            ("/api/spaces/alice/recall", {"query": "hi"}),
+            ("/api/spaces/import", {"version": 2, "space_id": "alice"}),
+            ("/v1/chat/completions", {"messages": []}),  # 记忆代理以前就是这样
+        ):
+            response = http.post(path, json=body, headers=headers)
+            assert response.status_code == 401, (path, response.text)
+            assert response.headers["www-authenticate"] == "Bearer"
+            if path.startswith("/api/v1/"):
+                assert response.json()["error"]["code"] == "unauthorized"
+            elif path.startswith("/api/"):
+                assert response.json() == {"detail": "缺少或错误的访问令牌"}
+        upload = http.post(
+            "/api/sessions/x/messages",
+            data={"text": "hi"},
+            files={"images": ("a.png", b"\0" * 4096, "image/png")},
+            headers=headers,
+        )
+        assert upload.status_code == 401 and upload.headers["www-authenticate"] == "Bearer"
+    # 请求体仍在接口的签名里：OpenAPI 不变（/docs 的 Authorize 也照旧）
+    operation = world.app.openapi()["paths"]["/api/v1/memories"]["post"]
+    assert "requestBody" in operation and operation["security"] == [{"HTTPBearer": []}]
 
 
 def test_api_sessions_and_import_stay_in_scope(world: World) -> None:

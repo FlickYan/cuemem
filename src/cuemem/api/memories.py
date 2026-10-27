@@ -46,6 +46,7 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -237,13 +238,23 @@ def _allow(who: Principal, space: str | None) -> None:
         raise V1Error(403, f"This API key cannot access the memory space {space!r}.")
 
 
-def memories_router(memory: Memory, *, dependencies: list[Any] | None = None) -> APIRouter:
+def memories_router(
+    memory: Memory,
+    *,
+    dependencies: list[Any] | None = None,
+    route_class: type[APIRoute] = APIRoute,
+) -> APIRouter:
     """/api/v1 下的记忆接口，包住一个 Memory（服务里是 Memory.from_system，与界面、记忆代理共用
     同一个记忆系统）。同步的接口：FastAPI 在线程池里执行，Memory 本身线程安全。
 
     dependencies 要有 api.auth.guard（认出令牌）：每个接口按它的作用域检查，没有时报错（500），
-    不当成管理令牌放行。"""
-    router = APIRouter(prefix=PREFIX, dependencies=dependencies or [], tags=["memories (v1)"])
+    不当成管理令牌放行。route_class：api.auth.authenticated_route，令牌不对时不读请求体。"""
+    router = APIRouter(
+        prefix=PREFIX,
+        dependencies=dependencies or [],
+        tags=["memories (v1)"],
+        route_class=route_class,
+    )
 
     def allow(
         http: Request,
