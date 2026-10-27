@@ -1,7 +1,8 @@
 """外部基线 MC（Cognee）：写入格式、出处与日期、检索结果到证据的转换、子进程协议。
 
 不装 cognee 也能跑：Cognee 只在子进程里导入，这里测父进程一侧的纯函数与协议；
-需要 cognee 的部分用 importorskip（用 uv run --with cognee==1.6.4 pytest 运行）。"""
+需要 cognee 的部分用 importorskip（用 uv run --with cognee==1.6.4 pytest 运行；CI 的"外部基线"，
+.github/workflows/baselines.yml，照这个命令跑）。"""
 
 from __future__ import annotations
 

@@ -22,7 +22,38 @@ jobs:
       - name: 类型检查
         run: uv run mypy
       - name: 单元测试（离线，不需要 API Key）
+        # tests/conftest.py 的网络守卫：只许连本机，有访问外网的尝试时测试失败
         run: uv run pytest
+
+  qdrant-server:
+    # Qdrant 服务端模式（vector_store.url，docker-compose 推荐的部署）：只在服务端才走的分支——
+    # payload 索引、indexed()、迁到服务端——在别的任务里从不运行（测试都用本地模式）。版本与
+    # docker-compose.yml 相同
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: 安装依赖
+        run: uv sync --locked
+      - name: 等 Qdrant 起来
+        run: |
+          for _ in $(seq 60); do curl -fsS http://localhost:6333/readyz && break; sleep 1; done
+          curl -fsS http://localhost:6333/readyz
+      - name: 服务端模式的测试（不许跳过）
+        shell: bash
+        env:
+          CUEMEM_TEST_QDRANT_URL: http://localhost:6333
+        run: |
+          set -o pipefail
+          uv run pytest tests/test_qdrant_server.py -rs | tee pytest.log
+          if grep -q SKIPPED pytest.log; then exit 1; fi
 
   package:
     # pip 安装的路径：在仓库外装上构建出的 wheel（只有核心依赖，不带可选依赖），跑命令行、SDK、

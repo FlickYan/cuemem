@@ -2,7 +2,12 @@
 调用失败的处理、k 与写入缓存的协议。
 
 不装 A-MEM 也能跑：A-MEM 只在 setup / build 里导入，这里测纯函数与替换进 A-MEM 的两个方法；
-需要 A-MEM 的端到端写入与检索用 importorskip。"""
+需要 A-MEM 的端到端写入与检索用 importorskip，装上评测用的版本（固定的提交与试过的 chromadb，
+见 evals/baselines/amem.py）再跑：
+    AMEM=git+https://github.com/agiresearch/A-mem@ceffb860f0712bbae97b184d440df62bc910ca8d
+    uv run --with "agentic-memory @ $AMEM" --with chromadb==1.5.9 pytest tests/test_baseline_amem.py
+它会顺带装上 sentence-transformers 与 torch（几 GB）。CI 的"外部基线"
+（.github/workflows/baselines.yml）照这个命令跑。"""
 
 from __future__ import annotations
 

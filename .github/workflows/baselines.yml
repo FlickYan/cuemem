@@ -1,0 +1,66 @@
+name: 外部基线
+
+# 外部基线（N11、N12 发表的 Mem0、LangMem、Graphiti、Cognee、A-MEM 的数字出自它们）的适配层测试。
+# 这些包不是 CueMem 的依赖，平时的 CI 不装，相关的测试一直跳过。这里按各测试文件说明里的命令临时
+# 装上固定的版本，用模拟接口离线跑（不需要 API Key；tests/conftest.py 的网络守卫照样生效）。
+# 装得重（A-MEM 带着 torch），所以不跟着每次 push 跑：手动、每周一次、改到评测或模型调用的 PR。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1" # 每周一（UTC）
+  pull_request:
+    paths:
+      - "src/cuemem/evals/**"
+      - "src/cuemem/llm/**"
+      - "tests/test_baseline_*.py"
+      - "tests/test_mem0_baseline.py"
+      - "tests/fakes.py"
+      - "tests/conftest.py"
+      - "tests/netguard.py"
+      - "uv.lock"
+      - ".github/workflows/baselines.yml"
+
+jobs:
+  adapters:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Mem0
+            test: tests/test_mem0_baseline.py
+            # 带上 spaCy 的模型：没有它时 Mem0 在测试里去 GitHub 下载（网络守卫让测试失败）
+            packages: >-
+              --with mem0ai==2.2.1 --with spacy --with fastembed
+              --with "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+          - name: LangMem
+            test: tests/test_baseline_langmem.py
+            packages: >-
+              --with langmem==0.0.30 --with langchain-openai==1.7.2 --with langchain-core==1.6.10
+              --with langgraph==1.2.15 --with langgraph-checkpoint==4.3.0 --with trustcall==0.0.39
+          - name: Graphiti
+            test: tests/test_baseline_graphiti.py
+            packages: --with "graphiti-core[kuzu]==0.30.2"
+          - name: Cognee
+            test: tests/test_baseline_cognee.py
+            packages: --with cognee==1.6.4
+          - name: A-MEM
+            test: tests/test_baseline_amem.py
+            packages: >-
+              --with "agentic-memory @ git+https://github.com/agiresearch/A-mem@ceffb860f0712bbae97b184d440df62bc910ca8d"
+              --with chromadb==1.5.9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # 临时装的包（torch 就有几 GB）不进 GitHub 的缓存，免得挤掉 CI 任务的缓存
+          enable-cache: false
+      - name: 安装依赖
+        run: uv sync --locked
+      - name: 适配层的测试（不许跳过：跳过说明包没装上）
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run ${{ matrix.packages }} pytest ${{ matrix.test }} -rs | tee pytest.log
+          if grep -q SKIPPED pytest.log; then exit 1; fi

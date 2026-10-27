@@ -1,8 +1,13 @@
 """外部基线 M0（Mem0）的接线测试：不联网、不调用模型。
 
 mem0ai 不是 CueMem 的依赖，平时只跑写入记录（协议、会话 ID 的写法）的测试，其余跳过；要跑全部
-时临时装上：
-    uv run --with mem0ai==2.2.1 --with spacy --with fastembed pytest tests/test_mem0_baseline.py
+时临时装上（与 scripts/reproduce.py 相同，带上 spaCy 的模型：没有它时 Mem0 在测试里去 GitHub
+下载，网络守卫让测试失败）：
+    SM=https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0
+    uv run --with mem0ai==2.2.1 --with spacy --with fastembed \\
+        --with "en_core_web_sm @ $SM/en_core_web_sm-3.8.0-py3-none-any.whl" \\
+        pytest tests/test_mem0_baseline.py
+CI 的"外部基线"（.github/workflows/baselines.yml）照这个命令跑。
 """
 
 from __future__ import annotations

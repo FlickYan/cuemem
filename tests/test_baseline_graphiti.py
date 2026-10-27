@@ -4,6 +4,7 @@
 不需要 graphiti-core；最后几个测试把 Graphiti 真正接到评测网关上（模型与重排都是脚本化的
 假接口），要装上它才跑：
     uv run --with "graphiti-core[kuzu]==0.30.2" pytest tests/test_baseline_graphiti.py
+CI 的"外部基线"（.github/workflows/baselines.yml）照这个命令跑。
 """
 
 from __future__ import annotations

@@ -4,7 +4,7 @@
 uv run --with langmem==0.0.30 --with langchain-openai==1.7.2 --with langchain-core==1.6.10 \\
     --with langgraph==1.2.15 --with langgraph-checkpoint==4.3.0 --with trustcall==0.0.39 \\
     pytest tests/test_baseline_langmem.py
-跑。
+跑（CI 的"外部基线"，.github/workflows/baselines.yml，照这个命令跑）。
 """
 
 from __future__ import annotations
