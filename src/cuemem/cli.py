@@ -86,8 +86,39 @@ def main(
     ] = None,
 ) -> None:
     """CueMem：线索驱动的多模态 Agent 长期记忆系统"""
+    _raise_open_file_limit()
     if preset:  # 各命令都通过 load_settings 读配置，它看这个环境变量（N12）
         os.environ["CUEMEM_PRESET"] = preset
+
+
+def _raise_open_file_limit() -> tuple[int, int] | None:
+    """把这个进程打开文件数的软上限调到硬上限（最多 65536），返回调整之后的（软，硬）上限；
+    没有 resource 模块（Windows）时返回 None。从不调低。
+
+    Qdrant 本地模式每个集合（每个记忆空间一个，有图片的空间两个）一直开着一个文件、启动时全部
+    打开：软上限常见的 1024（Linux、systemd）与 256（macOS）只够几百个用户，超过之后 cuemem serve
+    建不了新的空间，重启时打不开向量库，cuemem migrate-vectors 也打不开、搬不走。macOS 的硬上限
+    是不限，超过 kern.maxfilesperproc 时 setrlimit 报 ValueError，依次退到 10240、4096。
+
+    只在命令行里调：库（MemorySystem、SDK 的 Memory）不改进程级别的设置，那是用户自己的应用；
+    它们打不开时抛出写明原因的 VectorStoreOpenError。"""
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return soft, hard
+    top = 65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)
+    for target in (top, 10240, 4096):
+        if target <= soft or (hard != resource.RLIM_INFINITY and target > hard):
+            continue
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ValueError, OSError):
+            continue
+        break
+    return resource.getrlimit(resource.RLIMIT_NOFILE)
 
 
 DATETIME_FORMATS = ["%Y-%m-%d", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"]
@@ -174,6 +205,7 @@ def doctor(
     """检查配置、API Key，以及（可选）各模型的连通性。"""
     settings = load_settings()
     _print_config(settings)
+    _print_local_store(settings)
     if live:
         _live_check(settings)
     else:
@@ -907,9 +939,13 @@ def mcp_cmd(
     from cuemem.api.service import ChatService
 
     settings = load_settings(peak_policy="warn")
-    service = ChatService.create(
-        settings, scenario="plain", default_space=space, router=cast(Router, router)
-    )
+    try:  # 缺 Key、向量库打不开等：说明原因，不打印调用栈；写到 stderr（stdout 是 MCP 的通道）
+        service = ChatService.create(
+            settings, scenario="plain", default_space=space, router=cast(Router, router)
+        )
+    except CueMemError as exc:
+        Console(stderr=True).print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     try:
         build_server(service, space).run("stdio")
     finally:
@@ -1530,6 +1566,37 @@ def _print_config(settings: Settings) -> None:
     for line in _peak_status(settings):
         console.print(line)
     console.print(f"批量任务（评测）在高峰时段的策略：{settings.peak_policy}")
+
+
+def _print_local_store(settings: Settings) -> None:
+    """本地模式的向量库有几个集合，与打开文件数的上限（main 已经调到硬上限）比一比：每个集合
+    一直开着一个文件、启动时全部打开。只读 meta.json、不打开向量库，cuemem serve 正在用它时也能
+    查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端。"""
+    meta = settings.paths.qdrant / "meta.json"
+    if settings.vector_store.url or not meta.is_file():
+        return
+    try:
+        collections = len(json.loads(meta.read_text("utf-8"))["collections"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        console.print(f"[yellow]读不出 {escape(str(meta))}[/yellow]：{escape(str(exc))}")
+        return
+    line = f"本地向量库：{collections} 个集合（每个一直开着一个文件，启动时全部打开）"
+    limits = _raise_open_file_limit()
+    if limits is None:
+        console.print(line)
+        return
+    import resource
+
+    soft = limits[0]
+    shown = ["不限" if v == resource.RLIM_INFINITY else str(v) for v in limits]
+    line += f"，打开文件数上限 {shown[0]}（硬上限 {shown[1]}）"
+    if soft == resource.RLIM_INFINITY or collections <= soft / 2:
+        console.print(line)
+        return
+    console.print(
+        f"[yellow]{line}：集合再多就打不开、建不了新的空间。用户多时改用 Qdrant 服务端："
+        f"{cli_command('migrate-vectors --to URL')}，再设置 CUEMEM_VECTOR_STORE__URL[/yellow]"
+    )
 
 
 def _live_check(settings: Settings) -> None:

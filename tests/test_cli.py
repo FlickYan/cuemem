@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +56,71 @@ def test_offline_ingest_spaces_doctor_usage(
 
     result = runner.invoke(app, ["usage"])
     assert result.exit_code == 0, result.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")
+def test_open_file_limit_raised() -> None:
+    """命令行一启动就把打开文件数的软上限调到硬上限（最多 65536）：Qdrant 本地模式每个集合一直
+    开着一个文件，以前软上限 1024（systemd）或 256（macOS）只够几百个用户。"""
+    script = (
+        "import resource\n"
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (256, 4096))\n"
+        "from cuemem.cli import _raise_open_file_limit\n"
+        "print(_raise_open_file_limit(), resource.getrlimit(resource.RLIMIT_NOFILE))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["(4096,", "4096)", "(4096,", "4096)"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")
+def test_open_file_limit_falls_back_below_the_macos_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """macOS 的硬上限是不限，setrlimit 超过 kern.maxfilesperproc 时报 ValueError：依次退到 10240、
+    4096。软上限已经够大时不动（从不调低）。"""
+    import resource
+
+    from cuemem.cli import _raise_open_file_limit
+
+    limits = [256, resource.RLIM_INFINITY]
+    tried: list[int] = []
+
+    def setrlimit(_: int, value: tuple[int, int]) -> None:
+        tried.append(value[0])
+        if value[0] > 10240:
+            raise ValueError("current limit exceeds maximum limit")
+        limits[:] = list(value)
+
+    monkeypatch.setattr(resource, "getrlimit", lambda _: tuple(limits))
+    monkeypatch.setattr(resource, "setrlimit", setrlimit)
+    assert _raise_open_file_limit() == (10240, resource.RLIM_INFINITY)
+    assert tried == [65536, 10240]
+    tried.clear()
+    limits[:] = [100_000, resource.RLIM_INFINITY]
+    assert _raise_open_file_limit() == (100_000, resource.RLIM_INFINITY) and tried == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")
+def test_doctor_counts_local_collections(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor 读本地向量库的 meta.json（不打开向量库，serve 正在用时也能查）：集合数与打开文件数
+    的上限；集合超过软上限的一半时提醒改用 Qdrant 服务端。"""
+    meta = tmp_path / "qdrant" / "meta.json"
+    meta.parent.mkdir(parents=True)
+    meta.write_text(json.dumps({"collections": {f"space_{i}": {} for i in range(3)}}), "utf-8")
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "本地向量库：3个集合" in flat and "打开文件数上限" in flat
+    assert "migrate-vectors" not in flat
+
+    monkeypatch.setattr("cuemem.cli._raise_open_file_limit", lambda: (4, 4))
+    result = runner.invoke(app, ["doctor"])
+    flat = _flat(result.output)
+    assert "打开文件数上限4（硬上限4）" in flat
+    assert "migrate-vectors--toURL" in flat and "CUEMEM_VECTOR_STORE__URL" in flat
 
 
 def test_missing_key_gives_friendly_error(isolated_paths: None) -> None:
@@ -491,13 +559,15 @@ def test_eval_commands_say_which_extra_to_install(
 
 
 @pytest.mark.parametrize(
-    "command", [["serve", "--no-ui", "--scenario", "plain"], ["chat", "--space", "s"], ["proxy"]]
+    "command",
+    [["serve", "--no-ui", "--scenario", "plain"], ["chat", "--space", "s"], ["proxy"], ["mcp"]],
 )
 def test_missing_key_is_a_friendly_error_for_servers(
     clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]
 ) -> None:
-    """缺 Key 时 serve、chat 与 proxy 只打印原因并以 1 退出，不再抛出调用栈（Docker 里会反复
-    重启）；pip 安装后的提示是 cuemem configure。"""
+    """缺 Key 时 serve、chat、proxy 与 mcp 只打印原因并以 1 退出，不再抛出调用栈（Docker 里会反复
+    重启；本地向量库打不开时也是这样，见 VectorStoreOpenError）；pip 安装后的提示是 cuemem
+    configure。mcp 写到 stderr：stdout 是 MCP 的通道。"""
     monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
     monkeypatch.setattr("cuemem.config.source_checkout", lambda: False)
     calls: list[Any] = []
@@ -507,6 +577,8 @@ def test_missing_key_is_a_friendly_error_for_servers(
     flat = _flat(result.output)
     assert "错误" in flat and "DASHSCOPE_API_KEY" in flat and "请运行cuememconfigure" in flat
     assert calls == []
+    if command == ["mcp"]:
+        assert "错误" in result.stderr and result.stdout == ""
 
 
 def test_demo_fresh_waits_for_resumed_consolidation(

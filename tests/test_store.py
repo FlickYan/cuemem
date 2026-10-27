@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -10,7 +13,7 @@ from fakes import TOY_CONVERSATION
 from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
-from cuemem.errors import ConfigMismatchError, StorageLockedError
+from cuemem.errors import ConfigMismatchError, StorageLockedError, VectorStoreOpenError
 from cuemem.store import MemoryDB, VectorStore
 from cuemem.store import sqlite as sqlite_module
 from cuemem.store.sqlite import legacy_idx_key, next_idx_key
@@ -318,6 +321,65 @@ def test_locked_local_store_explains_itself(tmp_path: Path) -> None:
         VectorStore(tmp_path / "qdrant", dim=4)
     first.close()
     VectorStore(tmp_path / "qdrant", dim=4).close()  # 锁随关闭释放
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")
+def test_too_many_collections_explains_itself(tmp_path: Path) -> None:
+    """本地模式每个集合一直开着一个文件、启动时全部打开：集合多过打开文件数的上限时，以前抛出
+    sqlite3.OperationalError（不是 CueMemError：cuemem serve、proxy 与 migrate-vectors 都打印调用栈
+    退出），现在是写明集合数、上限与办法的 VectorStoreOpenError。"""
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    vector = l2_normalize(np.ones((1, 4), dtype=np.float32))
+    for i in range(80):
+        store.upsert(f"user-{i}", ["u"], vector, None, [{"kind": "round", "ts": 0.0}])
+    store.close()
+    script = (
+        "import resource, sys\n"
+        "from pathlib import Path\n"
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))\n"
+        "from cuemem.store.vector import VectorStore\n"
+        "VectorStore(Path(sys.argv[1]), dim=4)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "qdrant")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode != 0
+    assert "VectorStoreOpenError" in done.stderr and "OperationalError" in done.stderr
+    assert "这里有 80 个集合，打开文件数的上限是 64（硬上限 64）" in done.stderr
+    assert "CUEMEM_VECTOR_STORE__URL" in done.stderr
+
+
+def test_local_store_errors_say_what_to_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """本地向量库的文件打不开时（打开与建集合都是）抛出 VectorStoreOpenError（CueMemError：命令行
+    提示原因，写入与后台线程的出错、HTTP 接口都看得到）；集合不多时说要检查权限与磁盘。"""
+    import sqlite3
+
+    import qdrant_client.local.persistence as persistence
+
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    vector = l2_normalize(np.ones((1, 4), dtype=np.float32))
+    store.upsert("old", ["u"], vector, None, [{"kind": "round", "ts": 0.0}])
+    connect = sqlite3.connect
+
+    def refuse(location: str, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if location == ":memory:":
+            return connect(location, *args, **kwargs)
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(persistence.sqlite3, "connect", refuse)
+    with pytest.raises(VectorStoreOpenError, match="权限与磁盘空间"):
+        store.upsert("new", ["u"], vector, None, [{"kind": "round", "ts": 0.0}])
+    with pytest.raises(VectorStoreOpenError, match="权限与磁盘空间"):
+        store.upsert_images("old", ["m"], l2_normalize(np.ones((1, 2), dtype=np.float32)), [{}])
+    assert store.count("old") == 1  # 已有的集合照常可用
+    store.close()
+    with pytest.raises(VectorStoreOpenError, match="unable to open database file"):
+        VectorStore(tmp_path / "qdrant", dim=4)
 
 
 def test_copy_into_moves_every_collection(tmp_path: Path) -> None:

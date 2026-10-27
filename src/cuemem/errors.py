@@ -55,6 +55,10 @@ class StorageLockedError(CueMemError):
     """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
 
 
+class VectorStoreOpenError(CueMemError):
+    """本地模式的向量库打不开或建不了集合：多半是打开的文件太多（每个集合一直开着一个文件）。"""
+
+
 class AccessKeysError(CueMemError):
     """限定作用域的访问令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）读不出来或写错了。"""
 
