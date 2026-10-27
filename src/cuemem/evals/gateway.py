@@ -64,7 +64,13 @@ from cuemem.api.failures import retry_after_header
 from cuemem.core.trace import Trace, start_trace
 from cuemem.embed.base import EmbedKind, TextEmbedder
 from cuemem.errors import ContentFilteredError, CueMemError, EmbeddingAPIError
-from cuemem.llm.client import LLMClient, Message, unparsable_json
+from cuemem.llm.client import (
+    LLMClient,
+    Message,
+    fallback_errors,
+    replay_miss,
+    unparsable_json,
+)
 from cuemem.llm.types import ChatResult
 
 DEFAULT_BUCKET = "default"
@@ -348,7 +354,8 @@ class Gateway:
     def _call(
         self, messages: list[Message], kwargs: dict[str, Any], primary: str
     ) -> tuple[ChatResult, str, bool]:
-        """先用主模型；内容审核误拒、超时或 JSON 生成被中止时换备用模型。
+        """先用主模型；内容审核误拒、超时或 JSON 生成被中止时换备用模型（只读缓存模式下主模型
+        未命中缓存时也换，见 fallback_errors）。
 
         限流不换模型（RateLimitError 原样抛出，由接口回 429）：换了模型就不是同一个协议了。
         有备用模型时主模型超时一次就换（retry_timeouts=False，见 LLMClient.chat）。"""
@@ -356,11 +363,13 @@ class Gateway:
         try:
             result = self.llm.chat(self.role, messages, retry_timeouts=not usable, **kwargs)
             return result, primary, False
-        except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
+        except fallback_errors(self.llm.settings, BadRequestError) as exc:
             aborted = "Model output became abnormal" in str(exc)
             if not usable or (isinstance(exc, BadRequestError) and not aborted):
                 raise
-        result = self.llm.chat(self.role, messages, model=self.fallback, **kwargs)
+            failed = exc
+        with replay_miss(failed, self.role, primary, str(self.fallback)):
+            result = self.llm.chat(self.role, messages, model=self.fallback, **kwargs)
         return result, str(self.fallback), True
 
     def _chat_response(self, bucket: str, body: dict[str, Any]) -> JSONResponse | StreamingResponse:

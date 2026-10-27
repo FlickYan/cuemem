@@ -161,6 +161,31 @@ def test_timeout_falls_back_after_one_try(
     assert gateway.usage("t")["fallbacks"] == 1
 
 
+def test_read_only_replays_a_cached_fallback(
+    offline_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """构建时主模型被拒、备用模型回答（被拒的请求不缓存）：只读重放（--cache-only）时主模型
+    未命中就换备用模型，回 200、记一次 fallback，不发请求。以前回 502（CacheMissError）。"""
+    fake_api.chat_replies = [lambda body: REJECT if body["model"] == "qwen3.8-flash" else "fine"]
+    cache = ResponseCache(tmp_path / "llm.sqlite")
+    read_only = offline_settings.model_copy(update={"llm_cache_mode": "read_only"})
+    embedder = build_embedder(offline_settings, use_cache=False)
+    for settings, sent in ((offline_settings, 2), (read_only, 0)):
+        fake_api.chat_requests.clear()
+        llm = LLMClient(settings, cache=cache, ledger=Ledger(None), http_client=fake_api.client())
+        gateway = Gateway(llm, embedder)
+        with TestClient(gateway.app()) as client:
+            response = client.post("/b/r/v1/chat/completions", json={"messages": HELLO})
+        assert response.status_code == 200 and response.json()["model"] == "deepseek-flash"
+        assert gateway.usage("r")["fallbacks"] == 1 and len(fake_api.chat_requests) == sent
+
+    # 备用模型也没有缓存：照旧 502
+    with TestClient(gateway.app()) as client:
+        missed = client.post("/b/r/v1/chat/completions", json={"messages": [*HELLO, *HELLO]})
+    assert missed.status_code == 502 and "deepseek-flash" in missed.json()["error"]["message"]
+    assert fake_api.chat_requests == []
+
+
 def test_embeddings(client: TestClient, gateway: Gateway, offline_settings: Settings) -> None:
     response = client.post("/b/e/v1/embeddings", json={"model": "x", "input": ["a b", "c"]})
     data = response.json()["data"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -208,6 +209,57 @@ def test_timeout_falls_back_after_one_timeout(settings: Settings, fake_api: Fake
         client.structured("extractor", messages, Out)
     assert [r["model"] for r in fake_api.chat_requests] == ["qwen3.8-flash"] * 4
     assert all(0.75 * b <= w <= b for w, b in zip(waits, (0.5, 1.0, 2.0), strict=True))
+
+
+def test_read_only_replays_a_cached_fallback(
+    settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """构建时主模型被拒、备用模型回答：缓存里只有备用模型的回复（被拒的请求不缓存）。只读重放
+    （--cache-only）时主模型未命中就换备用模型，拿到构建时的结果，不发请求，trace 里记下
+    llm_fallback（reason=CacheMissError）。以前在主模型那里就 CacheMissError。"""
+    from fakes import REJECT
+
+    from cuemem.core.trace import start_trace
+
+    class Out(BaseModel):
+        ok: bool
+
+    fake_api.chat_replies = [
+        lambda body: REJECT if body["model"] == "qwen3.8-flash" else '{"ok": true}'
+    ]
+    cache = ResponseCache(tmp_path / "llm.sqlite")
+    messages = [{"role": "user", "content": "hello"}]
+    build = LLMClient(settings, cache=cache, http_client=fake_api.client())
+    built = build.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert built.result.model_alias == "deepseek-flash" and not built.result.from_cache
+    sent = len(fake_api.chat_requests)
+
+    read_only = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    replay = LLMClient(read_only, cache=cache, http_client=fake_api.client())
+    with start_trace("replay") as trace:
+        result = replay.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert result.value.ok and result.result.model_alias == "deepseek-flash"
+    assert result.result.from_cache and len(fake_api.chat_requests) == sent
+    fallbacks = [e for e in trace.events if e["kind"] == "llm_fallback"]
+    assert [(e["model"], e["reason"]) for e in fallbacks] == [("deepseek-flash", "CacheMissError")]
+
+    # 没有备用模型：照旧 CacheMissError
+    with pytest.raises(CacheMissError):
+        replay.structured("extractor", messages, Out)
+    # 备用模型也没有缓存：CacheMissError 写明两个模型，cause 是主模型的未命中
+    with pytest.raises(CacheMissError, match=r"qwen3\.8-flash.*qwen3\.7-plus") as caught:
+        replay.structured("extractor", messages, Out, fallback_model="qwen3.7-plus")
+    assert isinstance(caught.value.__cause__, CacheMissError)
+    assert len(fake_api.chat_requests) == sent
+
+    # 别的模式未命中时照常调用 API（主模型被拒才换），与以前相同
+    build.structured(
+        "extractor", [{"role": "user", "content": "new"}], Out, fallback_model="deepseek-flash"
+    )
+    assert [r["model"] for r in fake_api.chat_requests[sent:]] == [
+        "qwen3.8-flash",
+        "deepseek-flash",
+    ]
 
 
 def test_rate_limits_and_server_errors_are_retried_like_the_sdk(

@@ -42,13 +42,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from openai import APITimeoutError, BadRequestError
+from openai import BadRequestError
 
 from cuemem.core.models import Hit, MemoryUnit
 from cuemem.core.trace import start_trace
 from cuemem.embed import build_embedder
 from cuemem.embed.base import EmbedKind, TextEmbedder
-from cuemem.errors import ContentFilteredError
 from cuemem.evals.datasets import (
     EvalSession,
     SessionIds,
@@ -57,7 +56,7 @@ from cuemem.evals.datasets import (
 )
 from cuemem.evals.external import check_protocol, protocol_of
 from cuemem.evals.methods import MethodContext, MethodOutput
-from cuemem.llm.client import LLMClient, Message
+from cuemem.llm.client import LLMClient, Message, fallback_errors, replay_miss
 
 TOP_K = 30  # Mem0 默认 20；多给一些，免得说限制了它的召回
 USER = "user"
@@ -72,6 +71,7 @@ class _LLM:
 
     与 CueMem 自己的抽取一样：内容审核误拒、请求超时、JSON 生成被中止时，改用备用模型
     （另一家供应商）再试一次；有备用模型时主模型超时一次就换（retry_timeouts，见 LLMClient.chat）。
+    只读缓存模式下主模型未命中缓存时也换（见 llm.client.fallback_errors）。
     """
 
     def __init__(self, llm: LLMClient, scope: str) -> None:
@@ -79,10 +79,10 @@ class _LLM:
         self.scope = scope
         fallback = llm.settings.consolidation.fallback_model
         roles = llm.settings.roles
-        primary = roles["extractor"].model if "extractor" in roles else None
+        self.primary = roles["extractor"].model if "extractor" in roles else None
         # 备用模型就是抽取模型时等于没有备用（与 LLMClient.structured、评测网关相同）：超时照常
         # 重试。以前先只发一次（以为有备用），再把同样的请求当备用重发满 1 + max_retries 次
-        self.fallback = fallback if fallback != primary else None
+        self.fallback = fallback if fallback != self.primary else None
 
     def generate_response(
         self,
@@ -107,12 +107,13 @@ class _LLM:
 
         try:
             return call(None)
-        except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
+        except fallback_errors(self.llm.settings, BadRequestError) as exc:
             # 通义在 JSON 模式下偶尔中止生成（"Model output became abnormal"），重发多半还会中止
             aborted = "Model output became abnormal" in str(exc)
             if self.fallback is None or (isinstance(exc, BadRequestError) and not aborted):
                 raise
-            return call(self.fallback)
+            with replay_miss(exc, "extractor", self.primary, self.fallback):
+                return call(self.fallback)
 
 
 def _wrap_list(content: str) -> str:

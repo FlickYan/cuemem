@@ -3,8 +3,9 @@
 按节点依次执行：评测运行（固定的运行名与方法列表；同名运行断点续跑、请求命中本地缓存时不花钱）、
 生成报告、把报告与图复制到 docs/results/，再跑各节点的分析脚本。
 
-在已有缓存的机器上重跑几乎免费，只是重新生成报告与图；在新机器上从零跑，需要数据集
-（uv run cuemem data download）与 API Key，全部重跑的名义成本约 $150（各节点的花费见路线图）。
+在保存着原始响应缓存的机器上重跑几乎免费，只是重新生成报告与图；响应缓存（data/cache）与评测
+运行（runs/eval）都不在仓库里，在新机器上从零跑需要数据集（uv run cuemem data download）与
+API Key，全部重跑的名义成本约 $150（各节点的花费见路线图）。
 
 注意：
 - N2、N3 的数字用的是 N1 选的向量模型 text-embedding-v4（N4 起换成 qwen3.7-text-embedding），
@@ -26,6 +27,10 @@
   照常继续：那是发表时就有、每次重跑都一样的出错（例如被内容审核拒绝的题）。探针也加了
   --fail-on-error，有题出错就停下（混合流脚本同样）：之后的分析会悄悄略过没有探针特征的题；
 - 续跑没有新答的题时不复制 run.json（续跑只在里面追加时间与环境）；
+- 读别的运行的分析步骤写明要哪些运行（Step.requires）：执行到这一步时缺了就跳过，不拿缺了的
+  数据重写结果（N11 的方差分析要两个可选的重跑，以前没跑时把 variance.json 写成 {}）；
+- 结果随机器而变的步骤写到 runs/ 下，不写 docs/results：N11 的延迟基准（发表的表是另一台
+  机器测的）与 N8 的演示摘要（从缓存回放时花费与模型耗时都接近 0）；
 - --cache-only 让每一步的 LLM 请求都只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：未命中
   即报错、不调用 API，要重新算的请求有一个字节变了，也会在复制报告之前停下（向量请求照常，
   未命中时花费很小）。关掉缓存的步骤（按定义不能从缓存复现）跳过；N8 的演示回放未命中时只跳过
@@ -94,6 +99,8 @@ class Step:
     optional: bool = False  # 没有缓存、要真花钱的步骤：默认跳过
     # --cache-only 时失败（未命中缓存）只跳过这个节点余下的步骤，不让整个脚本停下
     best_effort: bool = False
+    # 这一步要读的评测运行（RUNS 下的运行名）：执行到这一步时还没有结果就跳过
+    requires: tuple[str, ...] = ()
 
     def environment(self) -> dict[str, str]:
         """这一步在当前环境之上另外设的环境变量（LEAK_ERA、节点的、这一步自己的）。"""
@@ -102,6 +109,10 @@ class Step:
     def uncached(self) -> bool:
         """关掉了缓存的步骤：按定义不能从缓存复现。"""
         return self.environment().get("CUEMEM_LLM_CACHE_MODE") == "off"
+
+    def missing(self) -> list[str]:
+        """requires 里还没有结果（results.jsonl）的运行。"""
+        return [name for name in self.requires if not (RUNS / name / "results.jsonl").exists()]
 
     def run_name(self) -> str | None:
         """评测运行的运行名（其他步骤为 None）。探针也不算：它出错只会是空间没建好，没有"发表时
@@ -148,8 +159,8 @@ def probe(node: str, name: str, dataset: str, split: str, *, limit: int | None =
     return Step(node, command)
 
 
-def script(node: str, path: str, *args: str) -> Step:
-    return Step(node, ["uv", "run", "python", path, *args])
+def script(node: str, path: str, *args: str, requires: tuple[str, ...] = ()) -> Step:
+    return Step(node, ["uv", "run", "python", path, *args], requires=requires)
 
 
 N7_LME = "B0,B1,B3,B4-nobm25,B4-note,B5,B6,B6h,B6r,B6z,L0,ORACLE"
@@ -213,7 +224,9 @@ STEPS: list[Step] = [
     # N8 Agent 与演示：剧本回放与核对（只用通义）
     Step("N8", ["uv", "run", "cuemem", "demo", "demo/shop/script.json", "--fresh", "--report",
                 "runs/demo/final-full.json"], best_effort=True),
-    script("N8", "scripts/n8_summary.py", "runs/demo/final-full.json"),
+    # 摘要写到 runs/ 下：从缓存回放时花费与模型耗时接近 0，不覆盖发表的 demo.json
+    script("N8", "scripts/n8_summary.py", "runs/demo/final-full.json",
+           "--out", "runs/demo/summary.json"),
     # N9 测试集上的最终评测
     run("N9", "test400-n9", "longmemeval_s", "test400", N9_LME),
     run("N9", "locomo-test7-n9", "locomo", "test7", N9_LOCOMO),
@@ -242,7 +255,8 @@ STEPS: list[Step] = [
     # 核对 v2 并写 controller_v2.json；核对 v3（再感知的门槛，D-058）并写 see_gate.json
     script("N11", "scripts/n11_controller_v2.py", *VERIFY_ONLY),
     script("N11", "scripts/n11_see_gate.py", *VERIFY_ONLY),
-    script("N11", "scripts/n11_latency.py"),  # 离线；服务端那一组要先起 Qdrant（见脚本说明）
+    # 离线；服务端那一组要先起 Qdrant（见脚本说明）。写到 runs/ 下：发表的表是另一台机器测的
+    script("N11", "scripts/n11_latency.py", "--out", "runs/n11-latency"),
     Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "locomo", "--split", "test200r",
                  "--methods", "M0", "--name", "locomo-test200r-mem0", "--workers", "12",
                  "--max-cost", "5", FAIL_ON_ERROR]),
@@ -260,7 +274,8 @@ STEPS: list[Step] = [
         env={**NO_CACHE, **V1}, optional=True),
     run("N11", "locomo-test7-n11-rerun", "locomo", "test7", "B4-nobm25", env=NO_CACHE,
         optional=True),
-    script("N11", "scripts/n11_variance.py"),
+    script("N11", "scripts/n11_variance.py", requires=(
+        "test400-n11-rerun", "locomo-test7-n11-rerun", "test400-n9", "locomo-test7-n9")),
     script("N11", "scripts/n11_audit.py"),  # 导出人工抽检的样本（已存在时不覆盖）
 ]  # fmt: skip
 
@@ -317,6 +332,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if step.node in skipped:
             print(f"（{step.node} 的演示回放没有复现，跳过）{step.describe()}", flush=True)
+            continue
+        if missing := step.missing():
+            print(f"（还没有运行 {'、'.join(missing)} 的结果，跳过）{step.describe()}", flush=True)
             continue
         print(step.describe(), flush=True)
         if args.dry_run:

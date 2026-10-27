@@ -343,6 +343,32 @@ def test_mem0_llm_falls_back_after_one_timeout(settings: Settings) -> None:
     assert [r["model"] for r in fake.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
 
 
+def test_mem0_llm_read_only_replays_a_cached_fallback(settings: Settings, tmp_path: Path) -> None:
+    """构建时主模型被拒、备用模型回答：只读重放（--cache-only，reproduce.py 的 N11 M0）时主模型
+    未命中就换备用模型，拿到构建时的回复，不发请求。以前 CacheMissError。"""
+    from fakes import REJECT, FakeAPI
+
+    from cuemem.errors import CacheMissError
+    from cuemem.evals.mem0_baseline import _LLM
+    from cuemem.llm import LLMClient, ResponseCache
+
+    fake = FakeAPI()
+    fake.chat_replies = [lambda body: REJECT if body["model"] == "qwen3.8-flash" else "{}"]
+    cache = ResponseCache(tmp_path / "llm.sqlite")
+    messages = [{"role": "user", "content": "hi"}]
+    build = LLMClient(settings, cache=cache, http_client=fake.client())
+    assert _LLM(build, "mem0|x").generate_response(messages) == "{}"
+    assert [r["model"] for r in fake.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+
+    read_only = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    replay = LLMClient(read_only, cache=cache, http_client=fake.client())
+    fake.chat_requests.clear()
+    assert _LLM(replay, "mem0|x").generate_response(messages) == "{}"
+    with pytest.raises(CacheMissError, match="deepseek-flash"):  # 两个都未命中
+        _LLM(replay, "mem0|x").generate_response([*messages, *messages])
+    assert fake.chat_requests == []
+
+
 def test_mem0_llm_treats_the_extractor_itself_as_no_fallback(settings: Settings) -> None:
     """consolidation.fallback_model 就是抽取模型时等于没有备用模型（与 LLMClient.structured、
     评测网关相同）：超时照常重试，一共 1 + max_retries 次。以前先只发一次（以为有备用），再把

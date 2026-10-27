@@ -19,7 +19,8 @@ import random
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
@@ -319,6 +320,10 @@ class LLMClient:
         fallback_model：内容审核拒绝或请求超时时改用的模型（通常是另一家供应商的）。
         超时多半不是网络问题：模型在某条输入上生成失控、迟迟不结束，重发同样的请求还会超时，
         所以有备用模型时主模型超时一次就换（约 1 × timeout_s，以前 SDK 先重试满 max_retries 次）。
+
+        只读缓存（llm_cache_mode=read_only，--cache-only）下主模型未命中缓存时也换备用模型：
+        构建时主模型被拒或超时的请求没有缓存，缓存里只有备用模型的回复，以前重放到这里就
+        CacheMissError。两个都未命中时抛出 CacheMissError（写明两个模型）。
         """
         primary = model or (
             self.settings.roles[role].model if role in self.settings.roles else None
@@ -335,13 +340,14 @@ class LLMClient:
                 cache_scope,
                 retry_timeouts=fallback is None,
             )
-        except (ContentFilteredError, APITimeoutError) as exc:
+        except fallback_errors(self.settings) as exc:
             if fallback is None:
                 raise
             record_event("llm_fallback", role=role, model=fallback, reason=type(exc).__name__)
-            return self._structured(
-                role, messages, schema, fallback, max_tokens, max_attempts, cache_scope
-            )
+            with replay_miss(exc, role, primary, fallback):
+                return self._structured(
+                    role, messages, schema, fallback, max_tokens, max_attempts, cache_scope
+                )
 
     def _structured[T: BaseModel](
         self,
@@ -566,6 +572,34 @@ def unparsable_json(result: ChatResult) -> bool:
     except ValueError:  # 包括 json.JSONDecodeError
         return True
     return False
+
+
+def fallback_errors(settings: Settings, *also: type[Exception]) -> tuple[type[Exception], ...]:
+    """有备用模型时，主模型出哪些错换备用模型：内容审核拒绝、超时与 also；只读缓存模式下还有
+    缓存未命中。
+
+    被拒与超时的请求不缓存，所以构建时换过备用模型的调用，缓存里只有备用模型的回复：只读
+    重放（--cache-only）时主模型未命中就换备用模型，原样复现构建时的结果，不发请求。别的模式
+    未命中时照常调用 API，不受影响。LLMClient.structured、评测网关与 Mem0 的适配层共用。"""
+    errors: tuple[type[Exception], ...] = (ContentFilteredError, APITimeoutError, *also)
+    return (*errors, CacheMissError) if settings.llm_cache_mode == "read_only" else errors
+
+
+@contextmanager
+def replay_miss(
+    primary_error: Exception, role: str, primary: str | None, fallback: str
+) -> Iterator[None]:
+    """包住备用模型的调用：主模型是缓存未命中、备用模型也未命中时，抛出写明两个模型的
+    CacheMissError（cause 是主模型的未命中）。"""
+    try:
+        yield
+    except CacheMissError:
+        if not isinstance(primary_error, CacheMissError):
+            raise
+        raise CacheMissError(
+            f"read_only 模式下缓存未命中：role={role}, model={primary}，"
+            f"备用模型 {fallback} 也未命中"
+        ) from primary_error
 
 
 def _retry_delay(exc: APIError, attempt: int, *, retry_timeouts: bool) -> float | None:

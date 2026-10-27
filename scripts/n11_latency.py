@@ -13,6 +13,10 @@
 会话里附上几张图片（媒体记录与图片向量，以文搜图那一路会跑起来）。用了这两个参数时结果写进
 latency-extended.json，不覆盖 latency.json。
 
+结果写进 docs/results/n11-improvements/ 下（按 local / server 各占一组，替换本机这一组）；
+--out 换一个目录。复现脚本（scripts/reproduce.py）写到 runs/n11-latency/：延迟随机器而变，
+发表的表是在另一台机器上测的。
+
 用法：
     uv run python scripts/n11_latency.py                     # Qdrant 本地模式
     docker run -d --name cuemem-qdrant -p 6333:6333 qdrant/qdrant:v1.19.1
@@ -466,6 +470,9 @@ def main() -> None:
         help="每轮写入多少个合成实体（如 0.6）；默认 0，与发表的延迟表一致",
     )
     parser.add_argument("--photos", type=int, default=0, help="每个空间附几张图片（如 30）；默认 0")
+    parser.add_argument(
+        "--out", type=Path, default=OUT, help="结果写进哪个目录（默认是发表结果的目录）"
+    )
     args = parser.parse_args()
     mode = "server" if args.qdrant_url else "local"
     extended = bool(args.entities_per_round or args.photos)
@@ -504,9 +511,9 @@ def main() -> None:
                 system.vectors.delete_space(space)
         finally:
             system.close()
-    OUT.mkdir(parents=True, exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
     # 带实体或图片的结果另存一个文件：发表的 latency.json 与以前的合成数据可比
-    path = OUT / ("latency-extended.json" if extended else "latency.json")
+    path = args.out / ("latency-extended.json" if extended else "latency.json")
     existing = json.loads(path.read_text("utf-8")) if path.exists() else {}
     existing[mode] = {
         "machine": f"{platform.platform()}, {os.cpu_count()} CPUs",
@@ -527,7 +534,7 @@ def main() -> None:
         },
     }
     path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", "utf-8")
-    print(f"→ {path.relative_to(ROOT)}")
+    print(f"→ {path}")
 
 
 if __name__ == "__main__":

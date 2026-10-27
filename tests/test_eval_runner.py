@@ -879,3 +879,116 @@ def test_reproduce_cache_only(
     assert all(env["CUEMEM_LLM_CACHE_MODE"] == "read_only" for _, env in fake.calls)
     with pytest.raises(SystemExit):
         module.main([])
+
+
+def test_reproduce_skips_analyses_whose_runs_are_missing(
+    reproduce: tuple[Any, _FakeSteps], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """读别的运行的分析（Step.requires）：执行到这一步时还缺运行的结果就跳过，不拿缺了的数据
+    重写 docs/results。以前可选的重跑没跑时照样执行 n11_variance，把 variance.json 写成 {}。"""
+    module, fake = reproduce
+    (variance,) = [s for s in module.STEPS if "scripts/n11_variance.py" in s.command]
+    reruns = [s.run_name() for s in module.STEPS if s.optional and s.node == "N11"]
+    assert set(variance.requires) == {*reruns, "test400-n9", "locomo-test7-n9"}
+
+    rerun = module.run("N11", "rerun", "locomo", "test7", "B1", env=module.NO_CACHE, optional=True)
+    analysis = module.script("N11", "scripts/n11_variance.py", requires=("rerun", "n9"))
+    monkeypatch.setattr(module, "STEPS", [rerun, analysis])
+    module.main(["--dry-run"])
+    module.main([])
+    assert fake.calls == []
+    for name in ("rerun", "n9"):
+        (tmp_path / "runs" / name).mkdir(parents=True)
+        (tmp_path / "runs" / name / "results.jsonl").write_text("{}\n", "utf-8")
+    module.main([])
+    assert [command for command, _ in fake.calls] == [analysis.command]
+
+
+def test_reproduce_writes_machine_dependent_results_under_runs() -> None:
+    """延迟基准与演示摘要随机器、随缓存而变：复现脚本让它们写到 runs/ 下，不覆盖发表的
+    latency.json（另一台机器测的）与 demo.json（从缓存回放时花费与模型耗时接近 0）。"""
+    module = _reproduce()
+    for script in ("scripts/n11_latency.py", "scripts/n8_summary.py"):
+        (step,) = [s for s in module.STEPS if script in s.command]
+        out = step.command[step.command.index("--out") + 1]
+        assert out.startswith("runs/"), script
+
+
+def _script_module(name: str) -> Any:
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_n11_variance_does_not_write_without_every_run(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缺一个重跑或原运行就退出码非零、不写：以前打印"还没有结果，跳过"后照样写 {}，把发表的
+    variance.json 清空。"""
+    module = _script_module("n11_variance")
+    out = tmp_path / "variance.json"
+    out.write_text("published\n", "utf-8")
+    monkeypatch.setattr(module, "OUT", out)
+    runs = tmp_path / "eval"
+    (runs / "test400-n9").mkdir(parents=True)
+    row = {"sample_id": "q1", "method": "B6", "correct": True, "response": "x"}
+    (runs / "test400-n9" / "results.jsonl").write_text(json.dumps(row) + "\n", "utf-8")
+    monkeypatch.setenv("CUEMEM_PATHS__EVAL_RUNS", str(runs))
+    with pytest.raises(SystemExit, match="test400-n11-rerun"):
+        module.main()
+    assert out.read_text("utf-8") == "published\n"
+
+
+def test_n8_summary_does_not_publish_a_cached_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回放里有命中本地缓存的模型调用（花费记 0、几乎不耗时）时不写发表的 demo.json；--out
+    另写、--allow-cached 照写。以前从缓存回放就把发表的花费与耗时改成接近 0。"""
+    module = _script_module("n8_summary")
+    out = tmp_path / "demo.json"
+    out.write_text("published\n", "utf-8")
+    monkeypatch.setattr(module, "OUT", out)
+    usage = {
+        "llm_calls": 2.0,
+        "cache_hits": 2.0,
+        "input_tokens": 10.0,
+        "cached_input_tokens": 0.0,
+        "output_tokens": 5.0,
+        "spent": 0.0,
+    }
+    turn = {
+        "session": "s1",
+        "index": 0,
+        "text": "hi",
+        "passed": True,
+        "failures": [],
+        "level": "L0",
+        "expected_level": "L0",
+        "reply": {
+            "trace": {
+                "usage": usage,
+                "scores": {},
+                "tools": [],
+                "recalled": [],
+                "partitions": {},
+                "timings": {"total": 5.0, "llm": 1.0, "write": 1.0},
+            },
+            "citations": [],
+            "plain": "hello",
+        },
+    }
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"turns": [turn]}), "utf-8")
+    with pytest.raises(SystemExit, match="--allow-cached"):
+        module.main([str(report)])
+    assert out.read_text("utf-8") == "published\n"
+    elsewhere = tmp_path / "runs" / "summary.json"
+    module.main([str(report), "--out", str(elsewhere)])
+    assert json.loads(elsewhere.read_text("utf-8"))["summary"]["spent_per_turn"] == 0.0
+    module.main([str(report), "--allow-cached"])
+    assert json.loads(out.read_text("utf-8"))["summary"]["chat_turns"] == 1
