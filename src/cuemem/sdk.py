@@ -849,15 +849,25 @@ class Memory:
         """删除这个数据目录里的全部记忆（Mem0 的 reset）：每个空间都按 delete_all 删除（原始
         日志、派生记忆、向量、缓存与原图），包括 HTTP 服务、记忆代理与演示写下的空间；还开着的
         run 一并结束。不可恢复。"""
+        return self._reset()
+
+    def _reset(self, keep: Callable[[str], bool] | None = None) -> dict[str, Any]:
+        """reset 的实现。keep：只删它认的空间（/api/v1/reset 收到限定作用域的令牌时是
+        Principal.allows），也只结束、只忘掉这些空间里的 run 与接手记录，别的空间不碰；None 时
+        是全部。不做成 reset 的公开参数：MemoryClient 与 Memory 的签名逐字相同。"""
+
+        def chosen(space: str) -> bool:
+            return keep is None or keep(space)
+
         with self._runs_lock:
-            runs = sorted(self._runs)
-            self._runs.clear()
-            self._run_seen.clear()
-            self._idle_closed.clear()
-            self._adopted.clear()
+            runs = sorted(r for r in self._runs if chosen(r[0]))
+            self._runs.difference_update(runs)
+            self._run_seen = {k: t for k, t in self._run_seen.items() if not chosen(k[0])}
+            self._idle_closed = {k: v for k, v in self._idle_closed.items() if not chosen(k[0])}
+            self._adopted.difference_update([s for s in self._adopted if chosen(s)])
         for space, rid in runs:
             self.system.close_session(space, rid, submit=False)
-        spaces = [s["space_id"] for s in self.system.db.list_spaces()]
+        spaces = [s["space_id"] for s in self.system.db.list_spaces() if chosen(s["space_id"])]
         # 这些空间的 trace 最后一起删：每个空间删一遍要把 trace 文件读一遍
         reports = [self.system.delete_space(space, purge_traces=False) for space in spaces]
         self.system.purge_space_traces(spaces)

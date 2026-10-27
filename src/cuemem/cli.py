@@ -629,15 +629,21 @@ def serve(
     router: Annotated[str, typer.Option(help="默认的检索控制器")] = "learned",
     lam: Annotated[float | None, typer.Option(help="成本旋钮 λ；默认取控制器模型里的值")] = None,
     no_ui: Annotated[bool, typer.Option("--no-ui", help="只启动 HTTP 接口")] = False,
+    no_mcp: Annotated[
+        bool, typer.Option("--no-mcp", help="不在 /mcp 提供 MCP（Streamable HTTP）")
+    ] = False,
     insecure_no_auth: Annotated[
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
     idle_minutes: Annotated[float, typer.Option(help=IDLE_HELP)] = 30.0,
 ) -> None:
-    """启动 HTTP 接口（/api，文档在 /docs）与演示界面（Gradio，根路径）。
+    """启动 HTTP 接口（/api，文档在 /docs）、记忆代理（/v1）、MCP（/mcp）与演示界面（Gradio，
+    根路径）。
 
-    界面要用可选依赖 ui（Gradio）；没装时只启动 HTTP 接口与记忆代理，并说明怎么装。"""
+    界面要用可选依赖 ui（Gradio）；没装时只启动 HTTP 接口与记忆代理，并说明怎么装。/mcp 与
+    cuemem mcp 的工具相同，共用这个进程的记忆系统（cuemem mcp 不能与 serve 同时打开数据目录），
+    请求头 X-CueMem-User 选用户，令牌同 /api。"""
     import uvicorn
 
     from cuemem.api.app import create_app
@@ -681,12 +687,18 @@ def serve(
             idle_minutes=idle_minutes,
             max_body_bytes=limits[0],
             max_import_bytes=limits[1],
+            mcp=not no_mcp,
         )
         where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
         console.print(
             f"{where}接口文档：http://{host}:{port}/docs"
             f" · OpenAI 兼容的记忆代理：http://{host}:{port}/v1"
         )
+        if not no_mcp:
+            console.print(
+                f"MCP（Streamable HTTP）：http://{host}:{port}/mcp"
+                "（请求头 X-CueMem-User 选用户，令牌同 /api；--no-mcp 关掉）"
+            )
         if keys.enabled:
             console.print(f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录")
         elif not _is_loopback(host):  # 加了 --insecure-no-auth
@@ -945,7 +957,9 @@ def mcp_cmd(
     space: Annotated[str, typer.Option(help="记忆空间 ID")] = "default",
     router: Annotated[str, typer.Option(help="recall 用的检索控制器")] = "learned",
 ) -> None:
-    """以 MCP Server（stdio）提供记忆工具，让其他 Agent（如 Claude Code）直接使用这套记忆。"""
+    """以 MCP Server（stdio）提供记忆工具，让其他 Agent（如 Claude Code）直接使用这套记忆。
+
+    独占数据目录：开着 cuemem serve 时改用它的 /mcp（同样的工具，HTTP）。"""
     from cuemem.api.mcp import build_server
     from cuemem.api.service import ChatService
 

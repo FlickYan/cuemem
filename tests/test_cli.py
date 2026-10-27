@@ -508,6 +508,23 @@ def test_body_limits_from_the_environment(
     assert len(served) == 1
 
 
+def test_serve_offers_mcp_over_http(served: list[Any]) -> None:
+    """cuemem serve 默认在 /mcp 提供 MCP（Streamable HTTP），启动时打印地址；--no-mcp 时没有。
+    （应用没有进入 lifespan：只看在交给 MCP 之前的检查，不带 X-CueMem-User 时 400。）"""
+    from fastapi.testclient import TestClient
+
+    command = ["serve", "--no-ui", "--scenario", "plain"]
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert "http://127.0.0.1:7860/mcp" in _flat(result.output)
+    result = runner.invoke(app, [*command, "--no-mcp"])
+    assert result.exit_code == 0, result.output
+    assert "/mcp" not in result.output
+    with_mcp, without = (TestClient(a, base_url="http://127.0.0.1:7860") for a in served)
+    assert with_mcp.post("/mcp", json={}).status_code == 400
+    assert without.post("/mcp", json={}).status_code == 404
+
+
 def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

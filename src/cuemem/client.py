@@ -324,7 +324,8 @@ class MemoryClient:
         return self._call("DELETE", "/memories", params=params)
 
     def reset(self) -> dict[str, Any]:
-        """删除服务端数据目录里的全部记忆（见 Memory.reset）。不可恢复。"""
+        """删除服务端数据目录里的全部记忆（见 Memory.reset）。不可恢复。限定作用域的令牌只删它
+        作用域里的用户（每个都能用 delete_all 删），管理令牌删全部。"""
         return self._call("POST", "/reset")
 
     # ---------- 导出与导入 ----------

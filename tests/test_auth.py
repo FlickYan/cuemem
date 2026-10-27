@@ -481,7 +481,7 @@ def _forbidden(call: Callable[[], Any]) -> None:
 
 def test_v1_api_stays_in_scope(world: World) -> None:
     """/api/v1（MemoryClient）：点名作用域之外的用户（包括 filters 里的、Agent 的空间）403；
-    按 ID 找别人的记忆与不存在的 ID 一样；reset 只有管理令牌能用。"""
+    按 ID 找别人的记忆与不存在的 ID 一样。reset 见 test_v1_reset_stays_in_scope。"""
     alice = MemoryClient("http://testserver", api_key=ALICE_TOKEN, http_client=world.http)
     admin = MemoryClient("http://testserver", api_key=ADMIN_TOKEN, http_client=world.http)
     before = world.turns()
@@ -511,7 +511,6 @@ def test_v1_api_stays_in_scope(world: World) -> None:
     _forbidden(lambda: alice.search("secret", user_id="alice", filters={"user_id": "bob"}))
     _forbidden(lambda: alice.get_all(filters={"user_id": "bob"}))
     _forbidden(lambda: alice.get_all(user_id="alice", filters={"agent_id": "agent"}))
-    _forbidden(alice.reset)
     assert world.turns() == before  # 什么都没写、没删
 
     # 自己的照常
@@ -544,7 +543,36 @@ def test_v1_api_stays_in_scope(world: World) -> None:
     _forbidden(lambda: alice.load(dump, user_id="bob"))
     assert alice.load(dump, user_id="alice")["space_id"] == "alice"
     assert len(world.system.db.get_turns("bob")) == before["bob"]
-    assert {s["space_id"] for s in admin.spaces()} == set(SPACES)  # reset 没有发生
+    assert {s["space_id"] for s in admin.spaces()} == set(SPACES)
+
+
+def test_v1_reset_stays_in_scope(world: World) -> None:
+    """限定作用域的令牌 reset：只删它作用域里的空间（每个都能用 delete_all 删掉），只结束这些
+    空间里还开着的 run；别的空间、别的令牌开的 run 不碰。返回值与管理令牌的 reset 同样的键。
+    以前限定作用域的令牌一律 403（Mem0 的测试收尾 client.reset() 换成 MemoryClient 就出错）。"""
+    alice = MemoryClient("http://testserver", api_key=ALICE_TOKEN, http_client=world.http)
+    shop = MemoryClient("http://testserver", api_key=SHOP_TOKEN, http_client=world.http)
+    admin = MemoryClient("http://testserver", api_key=ADMIN_TOKEN, http_client=world.http)
+    mine = alice.open_run("mine", user_id="alice")
+    theirs = shop.open_run("theirs", user_id="bob", agent_id="shop")
+    before = world.turns()
+
+    out = alice.reset()
+    assert out["message"] == "All memories in this key's scope deleted"
+    assert sorted(out["spaces_deleted"]) == sorted(REACH[ALICE_TOKEN])
+    assert out["turns_deleted"] == sum(before[s] for s in REACH[ALICE_TOKEN])
+    assert out.keys() == {"message", "spaces_deleted", "turns_deleted", "images_deleted"}
+    assert {s["space_id"] for s in admin.spaces()} == set(SPACES) - REACH[ALICE_TOKEN]
+    assert {s: n for s, n in world.turns().items() if s not in REACH[ALICE_TOKEN]} == {
+        s: n for s, n in before.items() if s not in REACH[ALICE_TOKEN]
+    }
+    assert world.system.open_sessions("alice") == set()  # alice 的 run 结束了
+    assert world.system.open_sessions("shop/bob") == {theirs}  # shop 的还开着
+    assert mine == "mine"
+
+    everything = admin.reset()  # 管理令牌照旧删全部、结束全部
+    assert everything["message"] == "All memories deleted"
+    assert admin.spaces() == [] and world.system.open_sessions("shop/bob") == set()
 
 
 def test_v1_excerpt_and_image_ids_stay_in_scope(world: World) -> None:

@@ -3,8 +3,8 @@
 令牌都以 Authorization: Bearer <令牌> 发送（MemoryClient 与 OpenAI SDK 的 api_key；界面登录时是
 密码）。两种：
 
-- 管理令牌：环境变量 CUEMEM_API_TOKEN（N11 起就有），不受作用域限制，包括 /api/v1/reset 与不是
-  由 user_id、agent_id 得来的空间（评测、手工起的名字）；
+- 管理令牌：环境变量 CUEMEM_API_TOKEN（N11 起就有），不受作用域限制，包括 /api/v1/reset 删全部
+  与不是由 user_id、agent_id 得来的空间（评测、手工起的名字）；
 - 限定作用域的令牌：环境变量 CUEMEM_API_KEYS_FILE 指向的 YAML 文件，或环境变量 CUEMEM_API_KEYS
   里同样内容的 YAML / JSON 文本（只能设一个），启动时读一次：
 
@@ -25,8 +25,9 @@
 
 作用域之外：请求里点名了空间（user_id、agent_id、空间 ID）时 403；按 ID 找的记忆与会话当作不存在
 （404，history 是空列表），不让 ID 成为探测别人有没有某条记忆的途径。/api/spaces 与 /api/v1/spaces
-只列出作用域里的空间，/api/v1/reset 只有管理令牌能用。记忆代理按 user 字段与 X-CueMem-User、
-X-CueMem-Agent 头判断；没有用户、原样转发的请求不碰记忆，照常转发。
+只列出作用域里的空间，/api/v1/reset 只删作用域里的空间（管理令牌删全部）。记忆代理按 user 字段与
+X-CueMem-User、X-CueMem-Agent 头判断；没有用户、原样转发的请求不碰记忆，照常转发。/mcp（MCP 的
+Streamable HTTP，api/mcp.py）也按这两个头判断，不给时是令牌作用域里的第一个用户（Principal.home）。
 
 判断按记忆空间（sdk.space_for 的结果）解回的用户与 Agent（sdk.space_owner），不按请求里的 ID：
 "agent/x" 一律算 Agent x 自己的记忆——用户 x 在名叫 agent 的 Agent 下的记忆也落在这个空间，只能
@@ -34,7 +35,7 @@ X-CueMem-Agent 头判断；没有用户、原样转发的请求不碰记忆，�
 的空间判断；不是由 user_id、agent_id 得来的空间只有管理令牌能访问。
 
 令牌只比较 sha256 摘要：secrets.compare_digest 与每个令牌都比一遍，不提前返回。没有配任何令牌时
-不鉴权（只适合本机演示，见 api/app.py）。MCP 仍然只有 stdio：一个进程一个空间，不经过这里。
+不鉴权（只适合本机演示，见 api/app.py）。cuemem mcp（stdio）一个进程一个空间，不经过这里。
 """
 
 from __future__ import annotations
@@ -291,15 +292,24 @@ def _patterns(value: str | list[str] | None, where: str) -> tuple[str, ...] | No
 # ---------- FastAPI ----------
 
 
+UNAUTHORIZED = "缺少或错误的访问令牌"
+
+
+def bearer_principal(keys: Keys, authorization: str | None) -> Principal | None:
+    """Authorization 头（与 HTTPBearer 一样解析）→ Principal；令牌不对时 None。没有配任何令牌时
+    不鉴权，按管理令牌算。authenticate 与 /mcp（api/mcp.py）共用。"""
+    if not keys.enabled:
+        return ADMIN
+    scheme, token = get_authorization_scheme_param(authorization)
+    return keys.resolve(token) if scheme.lower() == "bearer" and token else None
+
+
 def authenticate(keys: Keys, request: Request) -> Principal:
-    """认出 Bearer 令牌（与 HTTPBearer 一样解析 Authorization 头），记在 request.state.principal
-    上（principal_of 读它）。令牌不对时 401；没有配任何令牌时不鉴权，按管理令牌算。"""
-    principal: Principal | None = ADMIN
-    if keys.enabled:
-        scheme, token = get_authorization_scheme_param(request.headers.get("Authorization"))
-        principal = keys.resolve(token) if scheme.lower() == "bearer" and token else None
+    """认出 Bearer 令牌（bearer_principal），记在 request.state.principal 上（principal_of
+    读它）。令牌不对时 401。"""
+    principal = bearer_principal(keys, request.headers.get("Authorization"))
     if principal is None:
-        raise HTTPException(401, "缺少或错误的访问令牌", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(401, UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"})
     request.state.principal = principal
     return principal
 

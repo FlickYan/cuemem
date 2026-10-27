@@ -13,7 +13,10 @@ Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密�
 （与 Agent）的记忆，/api、/api/v1、界面与记忆代理都按它检查（格式与规则见 api/auth.py）。界面里
 用这种令牌登录时，用户名填令牌的名字。
 
-浏览器（N12）：/api、/v1 与界面的 /gradio_api 不接受别的网站发来的请求（SameOriginOnly），否则
+MCP（第三轮体检）：/mcp 是 MCP 的 Streamable HTTP，工具与 cuemem mcp（stdio）相同，令牌与作用域
+同 /api，请求头 X-CueMem-User、X-CueMem-Agent 选用户（api/mcp.py）。
+
+浏览器（N12）：/api、/v1、/mcp 与界面的 /gradio_api 不接受别的网站发来的请求（SameOriginOnly），否则
 任何网页都能借访问者的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受
 这些 Host（cuemem serve / proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，
 它的网页就算同源）。
@@ -70,17 +73,17 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")  # Host 头里的 IPv6 地�
 
 
 class SameOriginOnly:
-    """/api、/v1 与界面自己的接口（/gradio_api）不接受别的网站发来的浏览器请求：带 Origin 头时，
-    Origin 的主机与端口要与 Host 头相同（同源，例如 /docs 的 Try it out、界面本身），或者 Origin
-    的主机名在 hosts 里（反向代理改写了 Host 时）；Origin: null 一律拒绝。不带 Origin 的请求（SDK、
-    curl、gradio_client）不受影响。
+    """/api、/v1、/mcp 与界面自己的接口（/gradio_api）不接受别的网站发来的浏览器请求：带 Origin
+    头时，Origin 的主机与端口要与 Host 头相同（同源，例如 /docs 的 Try it out、界面本身），或者
+    Origin 的主机名在 hosts 里（反向代理改写了 Host 时）；Origin: null 一律拒绝。不带 Origin 的
+    请求（SDK、curl、gradio_client、MCP 的客户端）不受影响。
 
     是整个应用的中间件，不是接口的依赖：预检请求（OPTIONS）匹配不到接口，会落到根路径上的
     Gradio。Gradio 只在 Host 正好是 localhost、127.0.0.1、0.0.0.0 时限制来源，别的 Host（监听
     ::1、127.0.0.2 等本机地址，Docker、局域网）放行任何来源并允许带凭据：它的 /gradio_api 能读出
     任何空间的记忆、遗忘、对话，上传接口不经预检就会写文件。"""
 
-    PATHS = ("/api/", "/v1/", "/gradio_api/")
+    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp")
 
     def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
         self.app = app
@@ -246,13 +249,18 @@ def create_app(
     idle_minutes: float | None = 30.0,
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
+    mcp: bool = True,
 ) -> FastAPI:
     """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。keys：管理令牌之外还有限定
     作用域的令牌（Keys.from_env，见 api/auth.py；给了时不看 token）：每个令牌只能访问自己作用域
-    里的空间，/api、/api/v1、界面与记忆代理都检查。
+    里的空间，/api、/api/v1、/mcp、界面与记忆代理都检查。
 
     proxy：同时提供 OpenAI 兼容的记忆代理（/v1/chat/completions，N12），与界面共用一个记忆系统，
     经代理写入的对话可以在界面里浏览。
+
+    mcp：在 /mcp 提供 MCP 的 Streamable HTTP（第三轮体检，api/mcp.py 的 McpEndpoint），与界面、
+    接口共用一个记忆系统；请求头 X-CueMem-User、X-CueMem-Agent 选用户，令牌与作用域同 /api。
+    cuemem serve --no-mcp 时不提供。
 
     allowed_hosts：只接受这些 Host（接口与界面；None 不检查）。origin_hosts：除同源外放行的
     Origin 主机名（"*" 不限）。见模块说明。
@@ -495,6 +503,8 @@ def create_app(
         from cuemem.api.proxy import proxy_router
 
         app.include_router(proxy_router(proxy, dependencies=guarded))
+    if mcp:  # 在界面之前：界面挂在根路径上
+        _serve_mcp(app, service, keys)
     if ui and importlib.util.find_spec("gradio") is None:
         # 界面是可选依赖 cuemem[ui]：没装时照常提供接口与记忆代理
         logger.warning("演示界面要用可选依赖 ui（Gradio），没有安装：%s", extra_remedy("ui"))
@@ -534,6 +544,26 @@ def create_app(
         max_import_bytes=max_import_bytes,
     )
     return app
+
+
+def _serve_mcp(app: FastAPI, service: ChatService, keys: Keys) -> None:
+    """/mcp：McpEndpoint 挂成一个路由，它的会话管理器接在应用的 lifespan 上（Gradio 挂载时
+    接着套在外面）。不用 app.mount：挂载的子应用的 lifespan 不运行（每个请求 500），/mcp 还
+    被 307 重定向到 /mcp/。MCP 的 SDK 在这里才导入（cuemem serve 的启动不多加载它）。"""
+    from starlette.routing import Route
+
+    from cuemem.api.mcp import McpEndpoint
+
+    endpoint = McpEndpoint(service, keys)
+    app.router.routes.append(Route("/mcp", endpoint, methods=["GET", "POST", "DELETE"]))
+    outer = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(app_: Any) -> AsyncIterator[Any]:
+        async with outer(app_) as state, endpoint.lifespan():
+            yield state
+
+    app.router.lifespan_context = lifespan
 
 
 def _clear_uploads(directory: Path) -> None:

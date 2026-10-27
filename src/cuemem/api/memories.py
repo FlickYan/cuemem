@@ -20,7 +20,8 @@
 作用域与 SDK 相同：user_id、agent_id 合起来定一个记忆空间，不碰原始的空间 ID（"/" 不用转义）。
 鉴权与 /api 的其他接口相同（CUEMEM_API_TOKEN）；限定作用域的令牌（api/auth.py）只能访问自己的
 用户：点名了作用域之外的 user_id、agent_id（包括写在 filters 里的）时 403，按 ID 找的记忆在作用域
-之外时与不存在的一样（404；history 是空列表），spaces 只列出作用域里的，reset 只有管理令牌能用。
+之外时与不存在的一样（404；history 是空列表），spaces 只列出作用域里的，reset 只删作用域里的空间
+（管理令牌删全部）。
 
 报错是英文的 {"error": {"code", "type", "message"}}：type 是 SDK 抛出的异常类型（KeyError、
 ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此抛出同样的异常。请求体不合
@@ -420,10 +421,14 @@ def memories_router(
 
     @router.post("/reset")
     def reset(http: Request) -> dict[str, Any]:
-        if not principal_of(http).admin:  # 删的是每个用户的记忆
-            raise V1Error(403, "Only the admin token (CUEMEM_API_TOKEN) can reset all memories.")
+        """管理令牌删全部；限定作用域的令牌只删它作用域里的空间（每个都能用 delete_all 删掉），
+        还开着的 run 也只结束这些空间里的。以前限定作用域的令牌一律 403。"""
+        who = principal_of(http)
         with _sdk_errors():
-            return memory.reset()
+            if who.admin:
+                return memory.reset()
+            out = memory._reset(who.allows)
+        return {**out, "message": "All memories in this key's scope deleted"}
 
     @router.post("/answer")
     def answer(http: Request, request: AnswerRequest) -> dict[str, Any]:
