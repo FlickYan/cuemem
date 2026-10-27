@@ -2750,6 +2750,187 @@
         ]
       }
     },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Status",
+        "operationId": "status_api_v1_status_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Status Api V1 Status Get",
+                  "$ref": "#/components/schemas/StatusResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/export": {
       "get": {
         "tags": [
@@ -4640,6 +4821,44 @@
         "title": "FactItem",
         "description": "A fact. Times are ISO 8601 in the server's local time."
       },
+      "FailedSession": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "error": {
+            "type": "string",
+            "title": "Error",
+            "description": "The first line of the error."
+          },
+          "retry_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry At",
+            "description": "When the background worker retries (ISO 8601); null when it will not retry by itself (too many attempts, or no background worker): call consolidate."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "session_id",
+          "attempts",
+          "error",
+          "retry_at"
+        ],
+        "title": "FailedSession"
+      },
       "ForgetResult": {
         "properties": {
           "message": {
@@ -5422,6 +5641,45 @@
           "entities"
         ],
         "title": "SpaceRow"
+      },
+      "StatusResult": {
+        "properties": {
+          "pending": {
+            "type": "integer",
+            "title": "Pending",
+            "description": "Sessions waiting for extraction."
+          },
+          "failed": {
+            "items": {
+              "$ref": "#/components/schemas/FailedSession"
+            },
+            "type": "array",
+            "title": "Failed"
+          },
+          "background": {
+            "type": "boolean",
+            "title": "Background",
+            "description": "Whether a background worker extracts."
+          },
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Errors",
+            "description": "The worker's last errors in this space."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "pending",
+          "failed",
+          "background",
+          "errors"
+        ],
+        "title": "StatusResult",
+        "description": "Extraction status of one memory space."
       },
       "UpdateRequest": {
         "properties": {

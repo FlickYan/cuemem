@@ -120,6 +120,12 @@ class AsyncMethods:
         """见 Memory.wait。"""
         await asyncio.to_thread(self.sync.wait)
 
+    async def status(
+        self, *, user_id: str | None = None, agent_id: str | None = None
+    ) -> dict[str, Any]:
+        """见 Memory.status。"""
+        return await asyncio.to_thread(self.sync.status, user_id=user_id, agent_id=agent_id)
+
     # ---------- 读取 ----------
 
     async def search(

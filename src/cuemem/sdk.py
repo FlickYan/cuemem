@@ -35,6 +35,7 @@ CueMem 自己的设计：
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -1022,6 +1023,10 @@ class AsyncMemory(AsyncMethods):
         memory = cls.__new__(cls)
         memory.sync = Memory.from_system(system)
         return memory
+
+    async def close_idle_runs(self, idle_s: float, *, now: float | None = None) -> int:
+        """见 Memory.close_idle_runs（只有本地的有：MemoryClient 没有这个方法）。"""
+        return await asyncio.to_thread(self.sync.close_idle_runs, idle_s, now=now)
 
 
 # ---------- 输入 ----------

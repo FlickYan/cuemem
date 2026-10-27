@@ -284,8 +284,10 @@ def test_every_argument_reaches_memory(name: str) -> None:
 def test_the_async_classes_declare_every_method(async_cls: type, sync_cls: type) -> None:
     """AsyncMemory 与 AsyncMemoryClient 的每个方法都写明了：协程函数，参数与类型注解与同步的
     逐字相同，构造参数也相同。以前它们经 __getattr__ 转发，类上没有这些方法，类型检查器看到的
-    都是 Any（await m.serach(...)、AsyncMemoryClient(api_kye=...) 都查不出来）。"""
-    for name in sorted(_methods(Memory) - {"from_config", "from_system", "run"}):
+    都是 Any（await m.serach(...)、AsyncMemoryClient(api_kye=...) 都查不出来）。按各自的同步类
+    核对：status 两边都有，close_idle_runs 只有本地的 Memory 有（AsyncMemory 也有）。"""
+    assert _methods(async_cls) == _methods(sync_cls)  # 不多也不少
+    for name in sorted(_methods(sync_cls) - {"from_config", "from_system", "run"}):
         method = getattr(async_cls, name)  # 在类上找：以前只有实例的 __getattr__ 转发
         assert inspect.iscoroutinefunction(method), name
         ours, theirs = inspect.signature(method), inspect.signature(getattr(sync_cls, name))
@@ -783,11 +785,43 @@ def test_idle_remote_run_is_ended_and_reopened(system: MemorySystem, where: str)
         assert system.open_sessions("eve") == set()
 
 
+def test_a_scoped_reset_forgets_the_idle_runs_of_its_spaces_only(system: MemorySystem) -> None:
+    """限定作用域的令牌 reset（/api/v1/reset）与闲置结束的 run：作用域里闲置结束过的 run 跟着
+    忘掉，之后同名的 add 是一个普通的会话，不会把删掉的 run 重新打开；作用域外的照旧记着，接着
+    写时重新打开。只结束作用域里的 run、却不忘掉它们闲置结束的记录（或者全都忘掉）时这里失败。"""
+    eve_token, admin_token = "eve-token-0123456789", "admin-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: eve-app\n    token: {eve_token}\n    scopes:\n      - user: eve\n",
+        admin_token,
+    )
+    server = Memory.from_system(system)
+    app = FastAPI()
+    app.include_router(memories_router(server, dependencies=guard(keys)))
+    install_error_format(app)
+    with TestClient(app) as http:
+        eve = MemoryClient("http://testserver", api_key=eve_token, http_client=http)
+        admin = MemoryClient("http://testserver", api_key=admin_token, http_client=http)
+        mine = eve.open_run(user_id="eve")
+        eve.add("I live in Lisbon", user_id="eve", run_id=mine)
+        theirs = admin.open_run(user_id="zoe")
+        admin.add("I live in Oslo", user_id="zoe", run_id=theirs)
+        assert server.close_idle_runs(30 * 60, now=time.monotonic() + 31 * 60) == 2
+        assert eve.reset()["spaces_deleted"] == ["eve"]
+        eve.add("I like tea", user_id="eve", run_id=mine)
+        assert system.open_sessions("eve") == set()
+        admin.add("I like rain", user_id="zoe", run_id=theirs)
+        assert system.open_sessions("zoe") == {theirs}
+
+
 def test_async_client(system: MemorySystem) -> None:
     async def main(client: AsyncMemoryClient) -> list[str]:
         async with client.run(user_id="eve", wait=True) as run_id:
             await client.add("I live in Lisbon", user_id="eve", run_id=run_id)
         found = await client.search("Where do I live?", user_id="eve", mode="l1")
+        # status 在两个异步的类上也是协程：经 __getattr__ 转发的是同步的方法，await 时 TypeError
+        local = AsyncMemory.from_system(system)
+        assert await client.status(user_id="eve") == await local.status(user_id="eve")
+        assert await local.close_idle_runs(60.0) == 0
         return [r["memory"] for r in found["results"] if r["type"] == "fact"]
 
     with TestClient(v1_app(system)) as http:
@@ -866,7 +900,7 @@ def test_the_openapi_documents_every_v1_response() -> None:
     HTTPValidationError（实际不会出现），别的出错一个都没写。"""
     spec = openapi_v1()
     operations = [(p, m, op) for p, ops in spec["paths"].items() for m, op in ops.items()]
-    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 19
+    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 20
     for path, method, op in operations:
         for status in V1_ERRORS:
             schema = op["responses"][str(status)]["content"]["application/json"]["schema"]
@@ -953,6 +987,12 @@ def test_every_v1_response_matches_its_documented_model(
         assert mem.end_run(mem.open_run(user_id="bob"), user_id="bob")["consolidation"] is None
         mem.consolidate(user_id="bob")
         mem.wait()
+        assert mem.status(user_id="bob") == {
+            "pending": 0,
+            "failed": [],
+            "background": False,
+            "errors": [],
+        }
         dump = mem.export(user_id="alice")
         assert mem.load(dump, user_id="carol", wait=True)["consolidation"]
         assert mem.spaces() and mem.delete_all(user_id="carol")["turns_deleted"]

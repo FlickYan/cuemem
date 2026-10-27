@@ -406,6 +406,25 @@ class WaitResult(_Out):
     ok: bool
 
 
+class FailedSession(_Out):
+    session_id: str
+    attempts: int
+    error: str = Field(description="The first line of the error.")
+    retry_at: str | None = Field(
+        description="When the background worker retries (ISO 8601); null when it will not "
+        "retry by itself (too many attempts, or no background worker): call consolidate."
+    )
+
+
+class StatusResult(_Out):
+    """Extraction status of one memory space."""
+
+    pending: int = Field(description="Sessions waiting for extraction.")
+    failed: list[FailedSession]
+    background: bool = Field(description="Whether a background worker extracts.")
+    errors: list[str] = Field(description="The worker's last errors in this space.")
+
+
 class ExportImage(_Out):
     sha256: str
     mime: str
@@ -819,10 +838,8 @@ def memories_router(
         memory.wait()
         return {"ok": True}
 
-    @router.get("/status")
-    def status(
-        http: Request, user_id: str | None = None, agent_id: str | None = None
-    ) -> dict[str, Any]:
+    @router.get("/status", responses=_ok(StatusResult))
+    def status(http: Request, user_id: str | None = None, agent_id: str | None = None) -> V1Json:
         with _sdk_errors():
             allow(http, user_id, agent_id)
             return memory.status(user_id=user_id, agent_id=agent_id)
