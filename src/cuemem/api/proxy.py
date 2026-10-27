@@ -967,17 +967,20 @@ def create_proxy_app(
     的令牌（Keys.from_env；给了时不看 token），每个令牌只能用作用域里的用户。
 
     不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。"""
-    from cuemem.api.app import _guard
+    from cuemem.api.app import SWEEP_INTERVAL_S, _guard, _sweep, _sweep_jobs
 
     stop = threading.Event()
-
-    def sweep() -> None:  # 每分钟把空闲的会话交给后台抽取
-        while not stop.wait(60):
-            proxy.close_idle()
+    # 每分钟把空闲的会话交给后台抽取；设了 traces_retention_days 时再删过期的 trace
+    jobs = _sweep_jobs(proxy.system, proxy.close_idle)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        threading.Thread(target=sweep, name="cuemem-proxy-sweep", daemon=True).start()
+        threading.Thread(
+            target=_sweep,
+            args=(stop, SWEEP_INTERVAL_S, *jobs),
+            name="cuemem-proxy-sweep",
+            daemon=True,
+        ).start()
         try:
             yield
         finally:  # 退出时把进行中的会话都登记抽取（后台没做完的，下次巩固时完成）

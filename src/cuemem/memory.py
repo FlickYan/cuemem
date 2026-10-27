@@ -5,13 +5,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
@@ -232,6 +233,13 @@ def _without_images(text: str) -> str:
     return " ".join(text.replace("<image>", " ").split())
 
 
+def _space_needle(space_id: str) -> str:
+    """trace 的一行属于这个空间时必定含有的文字（TraceSink.remove 的 contains）：属性里的
+    "space": "<空间 ID>"。要与 TraceSink.write 的 json.dumps(…, ensure_ascii=False) 写法
+    一致（默认的分隔符 ": "），否则会漏删。"""
+    return '"space": ' + json.dumps(space_id, ensure_ascii=False)
+
+
 class _ReadGate:
     """一个空间的读写门（见 MemorySystem.reading）：读取可以同时进行，遗忘独占。遗忘先等进行中的
     读取做完，等着的时候新来的读取排在它后面（不会一直等不到）。同一线程里读可以重入（ask 里的
@@ -366,6 +374,7 @@ class MemorySystem:
         self._session_locks = [threading.Lock() for _ in range(64)]
         self._gates: dict[str, _ReadGate] = {}  # 空间 → 读写门（见 reading）
         self._gates_guard = threading.Lock()
+        self._traces_expired: date | None = None  # 哪天删过过期的 trace（见 expire_traces）
 
     @classmethod
     def from_settings(
@@ -924,7 +933,7 @@ class MemorySystem:
                 questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
             return hit
 
-        return self.tracer.remove(doomed), questions
+        return self.tracer.remove(doomed, contains=_space_needle(space_id)), questions
 
     def _follow_citations(self, space_id: str, turns: set[str]) -> set[str]:
         """沿引用扩散：要删的发言所在的轮、由它们抽取的事实、其中的图片，凡是被后来的回复
@@ -1222,10 +1231,47 @@ class MemorySystem:
             questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
             return True
 
-        removed = self.tracer.remove(gone)
+        # 一个空间（delete_all）时先按空间 ID 筛；reset 删的是全部空间，筛不掉几行
+        only = next(iter(wanted)) if len(wanted) == 1 else None
+        removed = self.tracer.remove(gone, contains=None if only is None else _space_needle(only))
         if questions and isinstance(self.embedder, CachedEmbedder):
             self.embedder.purge(questions, "query")
         return removed
+
+    def prune_traces(self, days: int, *, today: date | None = None) -> tuple[int, int]:
+        """删掉 days 天之前的 trace 文件（traces_retention_days，见 expire_traces），连同其中提问的
+        查询向量。返回删掉的文件数与查询向量数。
+
+        查询向量跟着 trace 一起删：遗忘只能从 trace 里找到问过被删内容的提问（见 _remove_traces），
+        trace 过期了、查询向量还在的话，之后遗忘就清不掉它。带图的提问另外按去掉图片标记的文字删
+        （记忆代理拿消息里的文字部分做检索查询，见 forget）。评测共用向量缓存：服务的用户问过与
+        评测逐字相同的问题时，评测的那条查询向量也删了，重放时要重新算（遗忘本来也是这样）。
+        LLM 缓存不动：回答的条目与评测的分不开（同样按空间的 ask 归属），源码仓库里又是同一个
+        文件，按时间删会删掉评测的回答。"""
+        if self.tracer is None:
+            return 0, 0
+        files, questions = self.tracer.prune((today or date.today()) - timedelta(days=days))
+        purged = 0
+        if questions and isinstance(self.embedder, CachedEmbedder):
+            texts = [*questions, *(_without_images(q) for q in questions if "<image>" in q)]
+            purged = self.embedder.purge(texts, "query")
+        return files, purged
+
+    def expire_traces(self, *, today: date | None = None) -> tuple[int, int]:
+        """按配置的 traces_retention_days 删过期的 trace（prune_traces）：cuemem serve 与 cuemem
+        proxy 启动时与之后每分钟调用一次（见 api.app._sweep），每天只在第一次真的去删。没设时什么
+        都不做。以前 trace 一直留着：每次请求都写一两行，遗忘要把全部用户的 trace 读一遍。"""
+        days = self.settings.traces_retention_days
+        today = today or date.today()
+        if days is None or self._traces_expired == today:
+            return 0, 0
+        files, purged = self.prune_traces(days, today=today)
+        self._traces_expired = today  # 出错时下一分钟再试
+        if files:
+            logger.info(
+                "删掉了 %d 个 %d 天之前的 trace 文件，清掉 %d 个查询向量", files, days, purged
+            )
+        return files, purged
 
     # ---------- 读取 ----------
 

@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import logging
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -573,6 +574,22 @@ def test_tool_follow_ups_only_store_the_answer(
     assert [(t.role, t.text) for t in system.db.get_turns("alice", "t1")] == [
         ("assistant", "Happy to help, Alice!")
     ]
+
+
+def test_the_proxy_expires_old_traces_when_it_starts(
+    proxy: MemoryProxy, system: MemorySystem
+) -> None:
+    """cuemem proxy 设了 traces_retention_days 时，定时线程一启动就删过期的 trace 文件，之后每天
+    一次（与 cuemem serve 相同，见 MemorySystem.expire_traces）。"""
+    system.settings = system.settings.model_copy(update={"traces_retention_days": 7})
+    old = system.settings.paths.traces / "20200101.jsonl"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(json.dumps({"attrs": {"space": "alice", "question": "q"}}) + "\n", "utf-8")
+    with TestClient(create_proxy_app(proxy)):
+        deadline = time.monotonic() + 10
+        while old.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
 
 
 def test_access_token(proxy: MemoryProxy, upstream: Upstream) -> None:

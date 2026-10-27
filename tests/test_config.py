@@ -43,6 +43,18 @@ def test_env_overrides_are_deep_merged(clean_env: None, monkeypatch: pytest.Monk
     assert loaded.embedding.model == "qwen3.7-text-embedding"
 
 
+def test_trace_retention_is_off_unless_set(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """trace 默认一直留着；CUEMEM_TRACES_RETENTION_DAYS 设保留天数（至少 1 天）。"""
+    assert load_settings().traces_retention_days is None
+    monkeypatch.setenv("CUEMEM_TRACES_RETENTION_DAYS", "30")
+    assert load_settings().traces_retention_days == 30
+    monkeypatch.setenv("CUEMEM_TRACES_RETENTION_DAYS", "0")
+    with pytest.raises(ValidationError, match="traces_retention_days"):
+        load_settings()
+
+
 def test_unknown_model_reference_is_rejected(
     clean_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -48,7 +48,7 @@ from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError
-from cuemem.memory import RecallMode
+from cuemem.memory import MemorySystem, RecallMode
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router
 from cuemem.sdk import Memory
@@ -192,18 +192,31 @@ def _allowed_space(space: str, http: Request) -> str:
 AllowedSpace = Annotated[str, Depends(_allowed_space)]
 
 
-SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话
+SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话与过期的 trace（见 _sweep_jobs）
 
 
 def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]) -> None:
-    """清理线程的循环：每 interval_s 秒依次做一遍 jobs（结束闲置的会话），直到 stop。一个出错
-    不影响别的、也不让线程退出（记一条警告）。"""
-    while not stop.wait(interval_s):
+    """清理线程的循环：先依次做一遍 jobs（结束闲置的会话、删过期的 trace），之后每 interval_s
+    秒一遍，直到 stop。一个出错不影响别的、也不让线程退出（记一条警告）。以前先等 interval_s
+    秒再做第一遍：过期的 trace 要在启动时就删。"""
+    while True:
         for job in jobs:
             try:
                 job()
             except Exception:
-                logger.warning("结束闲置的会话时出错", exc_info=True)
+                logger.warning("清理线程（结束闲置的会话、删过期的 trace）出错", exc_info=True)
+        if stop.wait(interval_s):
+            return
+
+
+def _sweep_jobs(system: MemorySystem, *idle: Callable[[], object]) -> list[Callable[[], object]]:
+    """清理线程要做的事：结束闲置的会话（idle），设了 traces_retention_days 时再加上删过期的
+    trace（启动时与之后每天一次，见 MemorySystem.expire_traces）。cuemem serve 与 cuemem proxy
+    共用。"""
+    jobs = list(idle)
+    if system.settings.traces_retention_days is not None:
+        jobs.append(system.expire_traces)
+    return jobs
 
 
 def create_app(
@@ -236,24 +249,29 @@ def create_app(
     一个清理线程每分钟查一遍：/api 与界面的会话（ChatService.close_idle）、/api/v1 的 run
     （Memory.close_idle_runs）与记忆代理的会话（MemoryProxy.close_idle，按它自己的 idle_minutes）。
     以前关掉的标签页、崩溃的客户端留下的会话一直开着，服务运行期间一直不抽取；与记忆代理和各个
-    框架集成一样，默认 30 分钟。
+    框架集成一样，默认 30 分钟。设了 traces_retention_days 时这个线程还删过期的 trace（启动时与
+    之后每天一次，见 _sweep_jobs），idle_minutes 为 None 时也起。
     """
     _clear_uploads(upload_dir)
     v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        if idle_minutes is None:
+        idle: list[Callable[[], object]] = []
+        if idle_minutes is not None:
+            service.idle_minutes = idle_minutes  # 404 与界面的说明里写上
+            idle_s = idle_minutes * 60
+            idle += [
+                lambda: service.close_idle(idle_s),
+                lambda: v1.close_idle_runs(idle_s),
+            ]
+            # cuemem serve 里的记忆代理：以前要等下一个 /v1 请求才结束闲置的会话
+            if proxy is not None:
+                idle.append(proxy.close_idle)
+        jobs = _sweep_jobs(service.system, *idle)  # 只设了 traces_retention_days 时也要起线程
+        if not jobs:
             yield
             return
-        service.idle_minutes = idle_minutes  # 404 与界面的说明里写上
-        idle_s = idle_minutes * 60
-        jobs: list[Callable[[], object]] = [
-            lambda: service.close_idle(idle_s),
-            lambda: v1.close_idle_runs(idle_s),
-        ]
-        if proxy is not None:  # cuemem serve 里的记忆代理：以前要等下一个 /v1 请求才结束闲置的会话
-            jobs.append(proxy.close_idle)
         stop = threading.Event()
         args = (stop, SWEEP_INTERVAL_S, *jobs)
         sweeper = threading.Thread(target=_sweep, args=args, name="cuemem-api-sweep", daemon=True)

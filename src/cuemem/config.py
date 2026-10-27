@@ -255,6 +255,9 @@ class Settings(BaseSettings):
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     consolidation: ConsolidationConfig = Field(default_factory=ConsolidationConfig)
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+    # trace 保留几天（cuemem serve 与 cuemem proxy 启动时与之后每天删一遍更早的 trace 文件，连同
+    # 其中提问的查询向量，见 MemorySystem.prune_traces）；None 一直留着
+    traces_retention_days: int | None = Field(default=None, ge=1)
 
     @classmethod
     def settings_customise_sources(

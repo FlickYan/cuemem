@@ -1309,6 +1309,64 @@ def test_delete_purges_the_query_vectors_of_searches_that_found_it(
         assert not any("PIN" in p.read_text("utf-8") for p in traces)
 
 
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x85"])
+def test_delete_purges_searches_whose_question_has_a_line_separator(
+    n3_settings: Settings, fake_api: FakeAPI, sep: str
+) -> None:
+    """提问里有 U+2028、U+2029 或 U+0085（代理与 Agent 拿用户的原话做提问）：trace 照样删掉、
+    提问的查询向量照样清掉。以前删 trace 时按 splitlines 分行，这样的 trace 断成几行解析不了的，
+    原样留着，提问的查询向量也找不到。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("My PIN is 4321", user_id="u", timestamp=AUG, wait=True)
+        memory.add("I like hiking", user_id="u", timestamp=SEP, wait=True)
+        question = f"What is my PIN?{sep}Is it 4321?"
+        assert memory.search(question, user_id="u", mode="l1")["results"]
+        embedder = memory.system.embedder
+        assert isinstance(embedder, CachedEmbedder) and embedder.cached([question], "query")
+        [fact] = [f for f in memory.system.facts("u") if "PIN" in f.statement]
+
+        memory.delete(fact.id)
+        assert embedder.cached([question], "query") == set()
+        traces = memory.system.settings.paths.traces.glob("*.jsonl")
+        assert not any("PIN" in p.read_text("utf-8") for p in traces)
+
+
+def test_trace_retention_takes_the_query_vectors_of_expired_traces(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """traces_retention_days：删掉更早的 trace 文件，连同其中提问的查询向量（遗忘只能从 trace 里
+    找到提问：trace 过期了、查询向量还在的话，遗忘就清不掉它）；没过期的 trace 与提问留着。没设
+    时什么都不删；设了时每天只删一遍。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        directory = system.settings.paths.traces
+        memory.add("My PIN is 4321", user_id="u", timestamp=AUG, wait=True)
+        old, new = "What is my PIN?", "Is my PIN 4321?"
+        assert memory.search(old, user_id="u", mode="l1")["results"]
+        [today_file] = directory.glob("*.jsonl")
+        today_file.rename(directory / "20200101.jsonl")  # 这些 trace 都算很久以前的
+        assert memory.search(new, user_id="u", mode="l1")["results"]
+        embedder = system.embedder
+        assert isinstance(embedder, CachedEmbedder)
+        assert embedder.cached([old, new], "query") == {old, new}
+
+        assert system.expire_traces() == (0, 0)  # 没设保留天数
+        assert (directory / "20200101.jsonl").exists()
+        system.settings = system.settings.model_copy(update={"traces_retention_days": 30})
+        files, purged = system.expire_traces()
+        assert files == 1 and purged >= 1
+        assert embedder.cached([old, new], "query") == {new}
+        assert sorted(p.name for p in directory.glob("*.jsonl")) == [today_file.name]
+
+        (directory / "20200102.jsonl").write_text("{}\n", "utf-8")
+        assert system.expire_traces() == (0, 0)  # 今天已经删过
+        tomorrow = date.today() + timedelta(days=1)
+        assert system.expire_traces(today=tomorrow)[0] == 1
+        assert not (directory / "20200102.jsonl").exists()
+
+
 def test_a_run_is_extracted_once_when_it_ends(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:

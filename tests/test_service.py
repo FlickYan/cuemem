@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -239,6 +240,23 @@ def test_the_app_sweeps_idle_sessions_while_it_runs(service: ChatService, tmp_pa
 
     _sweep(stop, 0.01, broken, fine)
     assert calls == ["broken", "fine", "broken", "fine"]
+
+
+def test_serve_expires_old_traces_when_it_starts(service: ChatService, tmp_path: Path) -> None:
+    """设了 traces_retention_days 时，create_app 的定时线程一启动就删过期的 trace 文件（之后每天
+    一次，见 MemorySystem.expire_traces），不结束空闲的会话（idle_minutes=None）时也删。以前 trace
+    一直留着。"""
+    system = service.system
+    system.settings = system.settings.model_copy(update={"traces_retention_days": 7})
+    old = system.settings.paths.traces / "20200101.jsonl"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(json.dumps({"attrs": {"space": "shop", "question": "q"}}) + "\n", "utf-8")
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, idle_minutes=None)
+    with TestClient(app):
+        deadline = time.monotonic() + 10
+        while old.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
 
 
 def test_graph_links_entities_named_in_statements(
