@@ -1,10 +1,13 @@
-"""测试公共设施：离线配置与模拟接口。所有测试都不访问网络，也不读取项目里的 .env。"""
+"""测试公共设施：离线配置与模拟接口。所有测试都不访问网络（netguard 守着），也不读取项目里的
+.env。"""
 
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
+import netguard
 import pytest
 from fakes import FakeAPI
 
@@ -18,6 +21,63 @@ GUARDED_ENV = (
     "CUEMEM_PROVIDERS__QWEN__BASE_URL",
     "CUEMEM_EMBEDDING__NATIVE_URL",
 )
+# 离线的测试会话里删掉：代理（见 netguard）与模型供应商的 Key（D-069 记下过一个测试草稿真的
+# 调用了上游；没有真 Key 时，漏网的请求也只会被拒绝）
+OFFLINE_UNSET = (
+    *netguard.PROXY_ENV,
+    "DEEPSEEK_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+# 第三方库导入或使用时自己联网的开关：Gradio 的使用统计（以前界面的测试每次向 api.gradio.app 与
+# huggingface.co 发请求）；LiteLLM 导入时下载模型价格表（在主进程里导入 cognee 的测试，适配层给
+# 子进程设了同样的变量）
+OFFLINE_SET = {"GRADIO_ANALYTICS_ENABLED": "False", "LITELLM_LOCAL_MODEL_COST_MAP": "True"}
+LIVE = pytest.StashKey[bool]()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """按 -m 筛完之后：选中了联网测试（uv run pytest -m live）时不装网络守卫。"""
+    config.stash[LIVE] = any(item.get_closest_marker("live") for item in items)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def offline(request: pytest.FixtureRequest) -> Iterator[None]:
+    """整个测试会话不访问网络：删掉代理与供应商 Key 的环境变量，关掉第三方库自己联网的开关，
+    装上 netguard。"""
+    if request.config.stash.get(LIVE, False):
+        yield
+        return
+    with pytest.MonkeyPatch.context() as patch:
+        netguard.install(patch)  # 先装：记下删掉之前的代理
+        for name in OFFLINE_UNSET:
+            patch.delenv(name, raising=False)
+        for name, value in OFFLINE_SET.items():
+            patch.setenv(name, value)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def no_network(offline: None) -> Iterator[None]:
+    """测试里有访问网络的尝试（哪怕异常被后台线程吞掉了）就让它失败；上一个测试结束之后才发生的
+    （后台线程）记在下一个测试上，说明里写着当时在跑的测试。"""
+    earlier = netguard.unreported()
+    if earlier:
+        pytest.fail(f"上一个测试结束之后有访问网络的尝试：{earlier}")
+    yield
+    attempts = netguard.unreported()
+    if attempts:
+        pytest.fail(f"测试试图访问网络：{attempts}")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """最后一个测试结束之后（后台线程）才有的尝试：整个会话算失败。"""
+    late = netguard.unreported()
+    if late:
+        print(f"\n测试结束之后有访问网络的尝试：{late}")
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture

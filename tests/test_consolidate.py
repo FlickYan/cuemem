@@ -1124,9 +1124,12 @@ def test_reused_state_matches_loading_from_the_database(
     """以前每次巩固都从库里读全部事实与实体、逐条查向量缓存；现在上一次巩固之后留下镜像，
     派生记忆没变过就直接用。经过遗忘、会话又长了的重放、导入、重建与删除空间，发给模型的请求、
     向量缓存的未命中、add 的事件与最后的事实和实体，与每次都从库里读完全相同。"""
-    monkeypatch.setattr(consolidate_module, "MIRRORED_SPACES", 0)  # 不留镜像：每次都从库里读
-    cold = story(story_settings, fake_api, tmp_path / "cold")
-    monkeypatch.undo()
+    # 只撤销这一处：以前 monkeypatch.undo() 把这个测试的环境变量也全撤了（settings 夹具设的假 Key、
+    # clean_env 指到临时目录的 .env），第二遍只在环境里本来就有真 Key 时才跑得通（CI 没有 Key：
+    # 抽取失败，找不到 chess 那条事实）
+    with monkeypatch.context() as patch:
+        patch.setattr(consolidate_module, "MIRRORED_SPACES", 0)  # 不留镜像：每次都从库里读
+        cold = story(story_settings, fake_api, tmp_path / "cold")
     warm = story(story_settings, fake_api, tmp_path / "warm")
     assert warm["requests"] == cold["requests"]
     assert warm["misses"] == cold["misses"]
