@@ -33,6 +33,7 @@ from cuemem.api.auth import ADMIN, Principal
 from cuemem.api.service import ChatService
 from cuemem.memory import RecallMode
 from cuemem.read.controller import Router, english_reason
+from cuemem.store.media import decoding
 
 THEME = gr.themes.Soft(
     primary_hue="teal",
@@ -797,9 +798,9 @@ def _file_path(item: Any) -> str:
 
 
 def _thumbnail(path: str, size: int = 144) -> str:
-    with Image.open(path) as source:
+    with Image.open(path) as source, decoding(source):  # 大图的解码排队（store/media.py）
         image = source.convert("RGB")
-    image.thumbnail((size, size))
+        image.thumbnail((size, size))
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=80)
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")

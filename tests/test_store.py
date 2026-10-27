@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -9,13 +13,15 @@ from typing import Any
 import numpy as np
 import pytest
 from fakes import TOY_CONVERSATION
+from PIL import Image
 
 from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
 from cuemem.errors import ConfigMismatchError, StorageLockedError, VectorStoreOpenError
-from cuemem.store import MemoryDB, VectorStore
+from cuemem.store import MemoryDB, VectorStore, media
 from cuemem.store import sqlite as sqlite_module
+from cuemem.store.media import MediaStore, image_data_url
 from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 from cuemem.write import build_rounds, build_turns
 
@@ -666,3 +672,95 @@ def test_opening_the_cache_keeps_holds_of_a_forget_still_running(tmp_path: Path)
     assert list((tmp_path / "llm.sqlite.holds").iterdir()) == []
     reopened.close()
     first.close()
+
+
+# ---------- 媒体库：解压炸弹 ----------
+
+
+def _png(path: Path, side: int) -> Path:
+    Image.new("RGB", (side, side), "white").save(path)
+    return path
+
+
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+def test_media_store_refuses_images_with_too_many_pixels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """像素数超过 Pillow 的 Image.MAX_IMAGE_PIXELS 的图片不进媒体库，报 ValueError（在线写入因此
+    什么都不留，记忆代理只丢这一次写回）。以前超过两倍的抛出 DecompressionBombError（不是
+    ValueError），一到两倍之间的只有警告、照样存下，之后每次用到都解码一遍。上限在调用时读，
+    CueMem 不改它（整个进程共用这个设置，SDK 用户的程序也在用）。"""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10_000)
+    store = MediaStore(tmp_path / "media")
+    for side in (200, 120):  # 两倍以上；一到两倍之间
+        with pytest.raises(ValueError, match="too large"):
+            store.put(_png(tmp_path / f"{side}.png", side))
+    assert not (tmp_path / "media").exists()
+    stored = store.put(_png(tmp_path / "50.png", 50))
+    assert stored.path.exists() and (stored.width, stored.height) == (50, 50)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", None)  # 关掉了 Pillow 的上限：照常存
+    assert store.put(tmp_path / "200.png").width == 200
+    assert Image.MAX_IMAGE_PIXELS is None
+
+
+@pytest.mark.parametrize("thumbnail", [False, True], ids=["data-url", "ui-thumbnail"])
+def test_large_images_are_decoded_two_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, thumbnail: bool
+) -> None:
+    """解码大图（像素数超过 LARGE_PIXELS）的同时最多 LARGE_DECODES 张：几十 KB 的 PNG 可以有
+    八千多万像素，解码要两三百 MB，几个请求同时解码就能撑爆共用的服务。小图不排队。"""
+    if thumbnail:
+        pytest.importorskip("gradio")
+        from cuemem.api.ui import _thumbnail as decode
+    else:
+        decode = image_data_url
+    path = str(_png(tmp_path / "a.png", 64))
+    convert = Image.Image.convert
+    lock = threading.Lock()
+    active = peak = 0
+    barrier: threading.Barrier | None = None
+
+    def counted(self: Image.Image, *args: Any, **kwargs: Any) -> Image.Image:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if barrier is not None:
+                barrier.wait()  # 小图：六个要同时在解码
+            else:
+                time.sleep(0.1)
+            return convert(self, *args, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(Image.Image, "convert", counted)
+    monkeypatch.setattr(media, "LARGE_PIXELS", 64 * 64 - 1)
+    with ThreadPoolExecutor(6) as pool:
+        outputs = list(pool.map(lambda _: decode(path), range(6)))
+    assert peak == media.LARGE_DECODES == 2 and len(set(outputs)) == 1
+    monkeypatch.setattr(media, "LARGE_PIXELS", 64 * 64)
+    barrier, peak = threading.Barrier(6, timeout=10), 0
+    with ThreadPoolExecutor(6) as pool:
+        assert set(pool.map(lambda _: decode(path), range(6))) == set(outputs)
+    assert peak == 6
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["small", "large"])
+def test_image_bytes_sent_to_models_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch, queued: bool
+) -> None:
+    """发给模型的图片字节（因而缓存的键）与以前逐字节相同，排不排队都一样（不用 draft()、
+    thumbnail() 之类的捷径）。768 不缩放，512 缩放。"""
+    if queued:
+        monkeypatch.setattr(media, "LARGE_PIXELS", 0)
+    photo = Path(__file__).parents[1] / "demo" / "shop" / "images" / "P01.jpg"
+
+    def digest(**kwargs: Any) -> str:
+        return hashlib.sha256(image_data_url(photo, **kwargs).encode()).hexdigest()
+
+    assert digest() == "372131d73958967e1c0b7bfdccebc90b21457e8848456a5c10d15c9ab1f4ed84"
+    assert digest(max_side=512) == (
+        "48ef386cd0e7b9249270ccdb24f8893b05e666346a6982c5603881e90971af22"
+    )

@@ -5,7 +5,9 @@ Memory 与经 HTTP 的 MemoryClient 上，结果相同；方法签名逐个核�
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
+import io
 import json
 import subprocess
 import sys
@@ -504,6 +506,34 @@ def test_the_server_does_not_read_its_own_files(system: MemorySystem, tmp_path: 
             assert response.status_code == 400, url
             assert "data URL" in response.json()["error"]["message"]
     assert system.db.list_spaces() == [] and system.db.get_media("a") == []
+
+
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+def test_oversized_images_are_refused(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """像素数超过 Pillow 的 Image.MAX_IMAGE_PIXELS 的图片（解压炸弹：几十 KB 的 PNG 解码要几百
+    MB）：400 ValueError，什么都不写、不存原图，也不交给图片向量器解码。以前超过两倍的抛出
+    DecompressionBombError（500），一到两倍之间的照样存下，每次用到都解码一遍。"""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10_000)
+    embedder = system.image_embedder
+    assert embedder is not None
+    embedded: list[Any] = []
+    monkeypatch.setattr(embedder, "embed_images", embedded.append)
+    with TestClient(v1_app(system), raise_server_exceptions=False) as http:
+        for side in (200, 120):  # 两倍以上；一到两倍之间
+            photo = io.BytesIO()
+            Image.new("RGB", (side, side), "white").save(photo, format="PNG")
+            url = "data:image/png;base64," + base64.b64encode(photo.getvalue()).decode()
+            block = {"type": "image_url", "image_url": {"url": url}}
+            message = {"role": "user", "content": [{"type": "text", "text": "look"}, block]}
+            body = {"messages": message, "user_id": "a", "infer": False}
+            response = http.post("/api/v1/memories", json=body)
+            assert response.status_code == 400, (side, response.text)
+            error = response.json()["error"]
+            assert error["type"] == "ValueError" and "too large" in error["message"]
+    assert system.db.list_spaces() == [] and system.db.get_media("a") == []
+    assert embedded == [] and not list(system.settings.paths.media.rglob("*.png"))
 
 
 def test_v1_explains_provider_errors(

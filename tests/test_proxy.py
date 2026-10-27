@@ -546,6 +546,35 @@ def test_write_backs_that_cannot_succeed_are_dropped(
     assert [t.text for t in system.db.get_turns("alice")] == texts
 
 
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+def test_a_write_back_with_an_oversized_image_is_dropped_alone(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """图片的像素数超过 Pillow 的 Image.MAX_IMAGE_PIXELS（几十 KB 的 PNG 可以有一亿多像素）：只丢
+    这一次写回，这个会话之后的照常写。以前 Pillow 的 DecompressionBombError 不是 ValueError，算作
+    值得重试：它一直排在最前面，之后的写回都写不进去，会话结束时全部丢掉。"""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10_000)
+    buffer = io.BytesIO()
+    Image.new("1", (200, 200)).save(buffer, format="PNG")
+    bomb = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    content = [
+        {"type": "text", "text": "Look at my cat"},
+        {"type": "image_url", "image_url": {"url": bomb}},
+    ]
+    headers = {"X-CueMem-Session": "s1"}
+    assert chat(client, content, user="alice", headers=headers).status_code == 200
+    assert chat(client, "My cat is called Momo", user="alice", headers=headers).status_code == 200
+    texts = [t.text for t in system.db.get_turns("alice", "s1")]
+    assert texts == ["My cat is called Momo", "Happy to help, Alice!"]
+    proxy.close_all()
+    assert [t.text for t in system.db.get_turns("alice", "s1")] == texts
+    assert system.db.get_media("alice") == []
+
+
 def test_tool_follow_ups_only_store_the_answer(
     client: TestClient, system: MemorySystem, upstream: Upstream
 ) -> None:

@@ -7,6 +7,10 @@
 
 发给模型的图片统一缩放到最长边不超过 max_side 像素、转成 JPEG：图片 token 大致与像素数成正比，
 缩放是控制成本最直接的手段。
+
+解压炸弹（第三轮体检）：几十 KB 的 PNG 可以有一亿多像素，解码时要几百 MB。像素数超过 Pillow 的
+Image.MAX_IMAGE_PIXELS（默认约 8950 万）的图片不进媒体库（put 报 ValueError）；同时解码的大图
+（超过 LARGE_PIXELS）最多 LARGE_DECODES 张，几个请求一起解码也撑不爆共用的服务。
 """
 
 from __future__ import annotations
@@ -17,11 +21,18 @@ import io
 import shutil
 import threading
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
+
+# 像素数超过这个数的图片，解码、转换与缩放要排队，同时最多 LARGE_DECODES 张（一张 1600 万像素的
+# RGB 图解码约 50 MB，8900 万像素的约 270 MB）；小图不受限制
+LARGE_PIXELS = 16_000_000
+LARGE_DECODES = 2
+_large_decodes = threading.BoundedSemaphore(LARGE_DECODES)
 
 
 @dataclass(frozen=True)
@@ -43,8 +54,7 @@ class MediaStore:
         """把图片存进媒体库（已存在则跳过），返回内容哈希、存放路径与尺寸。调用方的写入结束
         （图片记录提交了或放弃了）时调用 release；在那之前 delete_unused 不删这个文件。"""
         data = source.read_bytes()
-        with Image.open(io.BytesIO(data)) as image:  # 先认图：不是图片的文件不进媒体库
-            width, height = image.size
+        width, height = _checked_size(data)  # 先认图：不是图片、像素太多的文件不进媒体库
         sha = hashlib.sha256(data).hexdigest()
         suffix = source.suffix.lower() or ".jpg"
         target = self.root / sha[:2] / f"{sha}{suffix}"
@@ -86,14 +96,43 @@ class MediaStore:
         return True
 
 
+def _checked_size(data: bytes) -> tuple[int, int]:
+    """图片的尺寸（只读文件头，不解码）。不是图片时照常抛出 PIL 的错误；像素数超过 Pillow 的
+    Image.MAX_IMAGE_PIXELS 时 ValueError。上限在调用时读、不改它：它是整个进程的设置，SDK 用户的
+    程序也在用；为 None（关掉了）时不查。Pillow 自己只在超过两倍时报 DecompressionBombError（不是
+    ValueError：记忆代理会当成值得重试，挡住这个会话之后的写回），一到两倍之间只警告、照样解码。"""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"Image too large: {exc}") from exc
+    limit = Image.MAX_IMAGE_PIXELS
+    if limit is not None and width * height > limit:
+        raise ValueError(f"Image too large: {width}x{height} pixels (limit {limit}).")
+    return width, height
+
+
+@contextmanager
+def decoding(image: Image.Image) -> Iterator[None]:
+    """解码 image（已经打开、只读了文件头）的期间：像素数超过 LARGE_PIXELS 时占一个大图解码的
+    名额，名额用完时等着；小图直接解码。只排队，解码的结果不变。"""
+    if image.width * image.height > LARGE_PIXELS:
+        with _large_decodes:
+            yield
+    else:
+        yield
+
+
 def image_data_url(path: Path | str, *, max_side: int = 768, quality: int = 85) -> str:
-    """读图、缩放、编码成 data URL（OpenAI 兼容接口的图片输入格式）。"""
-    with Image.open(path) as source:
+    """读图、缩放、编码成 data URL（OpenAI 兼容接口的图片输入格式）。大图的解码与缩放排队
+    （decoding），输出的字节与不排队时相同；不用 draft()、thumbnail() 之类的捷径，它们会改变
+    发给模型的字节（以及缓存的键）。"""
+    with Image.open(path) as source, decoding(source):
         image = source.convert("RGB")
-    scale = max_side / max(image.size)
-    if scale < 1:
-        size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
-        image = image.resize(size, Image.Resampling.LANCZOS)
+        scale = max_side / max(image.size)
+        if scale < 1:
+            size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+            image = image.resize(size, Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=quality)
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
