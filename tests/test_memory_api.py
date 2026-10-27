@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
 from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi import FastAPI
@@ -39,7 +40,12 @@ from cuemem.api.auth import Keys, guard
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
-from cuemem.errors import ContentFilteredError, EmbeddingAPIError, MemoryAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    ContentFilteredError,
+    EmbeddingAPIError,
+    MemoryAPIError,
+)
 from cuemem.evidence import RAISED_REASON
 from cuemem.memory import MemorySystem
 
@@ -408,6 +414,68 @@ def test_export_and_load_errors_are_the_same_remotely(system: MemorySystem) -> N
                 mem.load(nameless)
 
 
+def _export(sessions: Any) -> dict[str, Any]:
+    return {"format": "cuemem.space", "version": 2, "space_id": "x", "sessions": sessions}
+
+
+MALFORMED = {
+    "no turns": _export([{"session_id": "s1", "started_at": "2026-08-01T10:00:00"}]),
+    "started_at is a number": _export([{"session_id": "s1", "started_at": 5, "turns": []}]),
+    "sessions is a string": _export("abc"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_malformed_exports_are_value_errors(mem: Mem, system: MemorySystem, name: str) -> None:
+    """导入的文件缺键、类型不对：本地与远程都是 ValueError("Malformed export…")（/api/v1 的
+    400），什么都不写。以前本地是 KeyError 或 TypeError，/api/v1 是没有说明的 500 或 400。"""
+    with pytest.raises(ValueError, match="Malformed export"):
+        mem.load(MALFORMED[name])
+    assert system.db.list_spaces() == []
+
+
+def test_concurrent_write_conflicts_are_409(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """序号撞上已有的发言（ConcurrentWriteError）：/api/v1 回 409 conflict，MemoryClient 抛出同样的
+    异常，什么都没写。以前没有测试守着这个状态码：改成 500 也没有测试失败。"""
+    with TestClient(v1_app(system), raise_server_exceptions=False) as http:
+        client = MemoryClient("http://testserver", http_client=http)
+        client.add("I live in Berlin", user_id="alice", run_id="chat", infer=False)
+        monkeypatch.setattr(Memory, "_next_idx", lambda self, space, session_id: 0)
+        body = {"messages": "I like jazz", "user_id": "alice", "run_id": "chat", "infer": False}
+        response = http.post("/api/v1/memories", json=body)
+        assert response.status_code == 409
+        error = response.json()["error"]
+        assert (error["code"], error["type"]) == ("conflict", "ConcurrentWriteError")
+        with pytest.raises(ConcurrentWriteError, match="chat"):
+            client.add("I like jazz", user_id="alice", run_id="chat", infer=False)
+    assert [t.text for t in system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
+
+
+def test_the_client_explains_a_wrong_base_url(system: MemorySystem) -> None:
+    """base_url 照文档里 curl 的写法以 /api/v1 结尾时照样能用（以前每个调用都是 404 "Not Found"）；
+    指向别的服务（记忆代理的端口、别的网站）时 404 的报错写明 base_url 要是 cuemem serve 的根
+    地址；连不上时问一句服务开着没有。"""
+    with TestClient(v1_app(system)) as http:
+        for url in ("http://testserver/api/v1", "http://testserver/api/v1/"):
+            assert MemoryClient(url, http_client=http).spaces() == []
+    with TestClient(FastAPI()) as other:
+        elsewhere = MemoryClient("http://testserver", http_client=other)
+        for call in (lambda: elsewhere.spaces(), lambda: elsewhere.get("abc")):
+            with pytest.raises(MemoryAPIError, match="root of `cuemem serve`") as raised:
+                call()
+            assert raised.value.status == 404 and raised.value.type is None
+
+    def refuse(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("Connection refused", request=request)
+
+    with httpx2.Client(transport=httpx2.MockTransport(refuse)) as dead:
+        with pytest.raises(MemoryAPIError, match="is `cuemem serve` running") as raised:
+            MemoryClient("http://127.0.0.1:9", http_client=dead).spaces()
+        assert raised.value.status is None
+
+
 def test_images_reach_the_memory(mem: Mem, system: MemorySystem, tmp_path: Path) -> None:
     """add 的本地图片路径：本地 SDK 直接读；MemoryClient 先在客户端读成 data URL，服务器不读它
     自己磁盘上的文件。网络图片两边都报同样的错。"""
@@ -428,6 +496,57 @@ def test_images_reach_the_memory(mem: Mem, system: MemorySystem, tmp_path: Path)
     gone = [{"type": "image_url", "image_url": "/no/such.png"}]
     with pytest.raises(ValueError, match="not found"):
         mem.add({"role": "user", "content": gone}, user_id="alice")
+
+
+def test_every_id_search_returns_works_by_id(
+    mem: Mem, system: MemorySystem, tmp_path: Path
+) -> None:
+    """search 给出的三种 ID（事实、对话片段、图片）get 都取得到、delete 都删得掉（删那一轮对话，
+    与 MCP 的 forget 相同），图片的原文件用 media 取（path 是服务器上的路径）。以前片段与图片的
+    ID get 是 None、delete 是 KeyError：infer=False 写入的会话 search 只给出片段，Mem0 的
+    for r in results: delete(r["id"]) 第一条就出错。本地与远程相同。"""
+    mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    mem.add("I like chess a lot", user_id="alice", infer=False)
+    photo = tmp_path / "shoe.png"
+    Image.new("RGB", (16, 16), "blue").save(photo)
+    content = [
+        {"type": "text", "text": "My running shoes"},
+        {"type": "image_url", "image_url": {"url": str(photo)}},
+    ]
+    mem.add({"role": "user", "content": content}, user_id="alice", infer=False)
+    found = mem.search("Where do I live? chess running shoes", user_id="alice", mode="l1")
+    assert {r["type"] for r in found["results"]} == {"fact", "excerpt"}
+    (image,) = found["images"]
+    for r in [*found["results"], image]:
+        item = mem.get(r["id"])
+        assert item is not None and item["type"] == r["type"] and item["space_id"] == "alice"
+        assert item["memory"] == r["memory"] and "score" not in item
+        if r["type"] != "fact":
+            assert mem.history(r["id"]) == []  # 只有事实有版本
+            with pytest.raises(ValueError, match="Only facts can be updated"):
+                mem.update(r["id"], "I like go")
+    assert mem.media(image["id"]) == photo.read_bytes()
+    assert mem.media(found["results"][0]["id"]) is None and mem.media("no-such-id") is None
+
+    chess = next(r for r in found["results"] if "chess" in r["memory"])
+    preview = mem.delete(chess["id"], dry_run=True)
+    assert [t["text"] for t in preview["turns"]] == ["I like chess a lot"]
+    assert len(system.db.get_turns("alice")) == 3  # 预演什么都没删
+    assert mem.delete(chess["id"])["turns_deleted"] == 1
+    assert mem.delete(image["id"])["turns_deleted"] == 1
+    assert mem.get(image["id"]) is None and mem.media(image["id"]) is None
+    assert [t.text for t in system.db.get_turns("alice")] == ["I live in Berlin"]
+    with pytest.raises(KeyError):
+        mem.delete(chess["id"])  # 已经删了：与不存在的一样
+
+    # infer=False 写入的会话：search 只给出片段，Mem0 的写法逐条删
+    mem.add("I like tea", user_id="bob", infer=False)
+    mem.add("I like jazz", user_id="bob", infer=False)
+    listed = mem.search("tea jazz", user_id="bob", mode="l1")["results"]
+    assert len(listed) == 2 and {r["type"] for r in listed} == {"excerpt"}
+    for r in listed:
+        mem.delete(r["id"])
+    assert system.db.get_turns("bob") == []
 
 
 def test_closing_the_client_ends_its_runs(system: MemorySystem) -> None:
@@ -628,6 +747,9 @@ def test_v1_explains_provider_errors(
                 client.answer(**question)
             if isinstance(raised.value, MemoryAPIError):
                 assert (raised.value.status, raised.value.code) == (status, code)
+                # 与本地的 openai 异常一样带着 Retry-After 与异常类型：以前没有 retry_after
+                assert raised.value.retry_after == ("7" if status == 429 else None)
+                assert raised.value.type == error["type"] and error["type"]
 
         def throttled(texts: Any, kind: str) -> Any:
             raise EmbeddingAPIError(

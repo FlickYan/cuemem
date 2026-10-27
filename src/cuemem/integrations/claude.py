@@ -905,6 +905,7 @@ def delete_all(
     存的文件原文，当场删除（被遗忘权）。只调用 Memory.delete_all 的话，文件在下次访问时才清掉。
     异步代码里放进线程执行：await asyncio.to_thread(delete_all, memory.sync, user_id=...)。"""
     space = _space(user_id, agent_id)
+    memory = _sync(memory)  # MemoryClient 先报错：不能删了服务端的记忆、留下本机的文件
     out = memory.delete_all(user_id=user_id, agent_id=agent_id)
     path = _store_path(memory, store)
     if not path.exists():  # 从没用过记忆工具：不为了删除建一个空的存储
@@ -954,12 +955,13 @@ def with_recall(
     level 为 "error"。这个函数会等网络请求：异步代码里用 awith_recall。
     """
     space = _space(user_id, agent_id)
+    local = _sync(memory)  # 传错了类型（MemoryClient）是调用方的错：照常抛出，不当成检索出错
     out = [dict(m) for m in messages]
     at = _newest_user(out)
     if at is None:
         return cast("list[BetaMessageParam]", out), Evidence("none", [], 0, "")
     try:
-        evidence = _recall(out[at], _sync(memory), space, mode)
+        evidence = _recall(out[at], local, space, mode)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         logger.debug("Recall failed", exc_info=True)
@@ -1400,7 +1402,16 @@ def _statements(facts: Sequence[Fact]) -> list[str]:
 
 
 def _sync(memory: Memory | AsyncMemory) -> Memory:
-    return memory.sync if isinstance(memory, AsyncMemory) else memory
+    """AsyncMemory 换成它包着的 Memory。别的（MemoryClient）TypeError：集成直接用本地的记忆
+    系统，以前要到用时才报 AttributeError（'settings'、'system'）。"""
+    if isinstance(memory, AsyncMemory):
+        return memory.sync
+    if not isinstance(memory, Memory):
+        raise TypeError(
+            "The Claude integration needs a local Memory or AsyncMemory; "
+            f"{type(memory).__name__} is not supported."
+        )
+    return memory
 
 
 def _space(user_id: str | None, agent_id: str | None) -> str:

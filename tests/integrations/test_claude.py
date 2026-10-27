@@ -12,7 +12,7 @@ import time
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -24,7 +24,7 @@ from fakes import FakeAPI  # noqa: E402
 from scripted import ScriptedModel  # noqa: E402
 from test_sdk import without_balance_for_reconciling  # noqa: E402
 
-from cuemem import AsyncMemory, Memory  # noqa: E402
+from cuemem import AsyncMemory, Memory, MemoryClient  # noqa: E402
 from cuemem.config import Settings  # noqa: E402
 from cuemem.evidence import MEMORY_NOTE  # noqa: E402
 from cuemem.integrations.claude import (  # noqa: E402
@@ -1116,3 +1116,22 @@ def test_history_stays_append_only_across_turns(tool: CueMemMemoryTool, memory: 
     assert last[-1]["content"].startswith("<memory>")
     assert last[-1]["content"].endswith("Where do I live?")
     assert len(last) == len(first) + 2
+
+
+def test_a_remote_client_is_refused_up_front(tmp_path: Path) -> None:
+    """MemoryClient（远程）：记忆工具、with_recall 与 delete_all 当场 TypeError，说明要本地的
+    Memory 或 AsyncMemory。以前记忆工具是 AttributeError（'settings'），with_recall 把它当成检索
+    出错、只给一个警告，delete_all 先删了服务端的记忆才出错。"""
+    store = tmp_path / "files.sqlite"
+    with MemoryClient("http://127.0.0.1:9") as client:
+        remote = cast(Any, client)
+        user = [{"role": "user", "content": "Where do I live?"}]
+        for make in (
+            lambda: CueMemMemoryTool(remote, user_id="alice", store=store),
+            lambda: AsyncCueMemMemoryTool(remote, user_id="alice", store=store),
+            lambda: with_recall(user, remote, user_id="alice"),
+            lambda: delete_all(remote, user_id="alice", store=store),
+        ):
+            with pytest.raises(TypeError, match="needs a local Memory or AsyncMemory"):
+                make()
+    assert not store.exists()

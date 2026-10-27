@@ -791,6 +791,29 @@ def test_http_import_rejects_bad_attachments(service: ChatService, tmp_path: Pat
     assert service.system.db.list_spaces() == []
 
 
+@pytest.mark.parametrize(
+    "sessions",
+    [
+        [{"session_id": "s1", "started_at": "2026-08-28T19:30:00"}],  # 没有 turns
+        [{"session_id": "s1", "started_at": 5, "turns": []}],
+        "abc",
+    ],
+)
+def test_http_import_rejects_malformed_files(
+    service: ChatService, tmp_path: Path, sessions: Any
+) -> None:
+    """导入的文件缺键、类型不对：与别的坏文件一样 409（Malformed export），什么都不写。以前缺
+    turns 是 404 {"detail": "turns"}，类型不对是没有说明的 500。"""
+    client = TestClient(
+        create_app(service, upload_dir=tmp_path / "uploads", ui=False),
+        raise_server_exceptions=False,
+    )
+    data = {"format": "cuemem.space", "version": 2, "space_id": "x", "sessions": sessions}
+    response = client.post("/api/spaces/import", json=data)
+    assert response.status_code == 409 and "Malformed export" in response.json()["detail"]
+    assert service.system.db.list_spaces() == []
+
+
 # ---------- MCP ----------
 
 

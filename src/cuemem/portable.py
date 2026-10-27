@@ -111,30 +111,17 @@ def import_space(
 
     space_id 不填用文件里的；目标空间里已有同名会话时，相同序号的发言跳过（导入是幂等的）。
     consolidate=True 时立即同步巩固，否则只登记任务（后台线程或下次 consolidate 时完成）。
+
+    文件不合格式时（缺键、类型不对）一律 ValueError("Malformed export: …")，什么都不写：以前是
+    KeyError、TypeError、AttributeError，本地与 MemoryClient 抛出的不同，/api 回 404 或 500，
+    /api/v1 回 400 或没有说明的 500。
     """
-    if data.get("format") != FORMAT:
-        raise ValueError(f"Not a CueMem export (format must be {FORMAT!r})")
-    if int(data.get("version", 0)) > VERSION:
-        raise ValueError(f"Export version {data.get('version')} is newer than this CueMem")
-    if not space_id and not data.get("space_id"):  # 以前是 KeyError，经 /api/v1 成了没有说明的 500
-        raise ValueError("The export has no space_id: pass user_id or agent_id to import it.")
-    target = space_id or str(data["space_id"])
     turns_added = images_added = 0
     with tempfile.TemporaryDirectory(prefix="cuemem-import-") as scratch:
-        # 先读完、校验完整个文件再写：有一张坏图时一条发言也不写，不留下导入了一半的空间
-        chunks: list[tuple[SessionIn, int]] = []
-        meta: dict[tuple[str, int], TurnMeta | None] = {}  # （会话，序号）→ 附加信息
-        for session in data.get("sessions", []):
-            started = datetime.fromisoformat(session["started_at"])
-            # 遗忘留下的序号空缺照原样保留（重新抽取时要标出来，D-059）：按连续的序号分段写入
-            ordered = sorted(session["turns"], key=lambda t: int(t["idx"]))
-            for _, run in groupby(enumerate(ordered), key=lambda p: int(p[1]["idx"]) - p[0]):
-                chunk = [turn for _, turn in run]
-                turns = [_turn_in(t, Path(scratch)) for t in chunk]
-                piece = SessionIn(session_id=session["session_id"], started_at=started, turns=turns)
-                chunks.append((piece, int(chunk[0]["idx"])))
-                for t in chunk:  # 序号重复时与发言一样先写的算（INSERT OR IGNORE）
-                    meta.setdefault((piece.session_id, int(t["idx"])), _meta_in(t))
+        try:
+            target, chunks, meta = _parse_export(data, space_id, Path(scratch))
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Malformed export: {type(exc).__name__}: {exc}") from exc
         # 整个文件在一个事务里提交：向量化中途出错时一条都不写，重试从头开始（每段各向量化一次，
         # 与以前逐段写入时的请求相同）
         if chunks:
@@ -150,6 +137,36 @@ def import_space(
     if consolidate:
         out["consolidation"] = system.consolidate(target).as_dict()
     return out
+
+
+def _parse_export(
+    data: Mapping[str, Any], space_id: str | None, scratch: Path
+) -> tuple[str, list[tuple[SessionIn, int]], dict[tuple[str, int], TurnMeta | None]]:
+    """导入的第一步：检查格式、读完整个文件（图片写进 scratch），还什么都不写。返回（目标空间，
+    按连续序号分好的段，（会话，序号）→ 附加信息）。文件不可信：缺键、类型不对时抛出 KeyError、
+    TypeError 或 AttributeError，由 import_space 统一改成 ValueError。"""
+    if data.get("format") != FORMAT:
+        raise ValueError(f"Not a CueMem export (format must be {FORMAT!r})")
+    if int(data.get("version", 0)) > VERSION:
+        raise ValueError(f"Export version {data.get('version')} is newer than this CueMem")
+    if not space_id and not data.get("space_id"):  # 以前是 KeyError，经 /api/v1 成了没有说明的 500
+        raise ValueError("The export has no space_id: pass user_id or agent_id to import it.")
+    target = space_id or str(data["space_id"])
+    # 先读完、校验完整个文件再写：有一张坏图时一条发言也不写，不留下导入了一半的空间
+    chunks: list[tuple[SessionIn, int]] = []
+    meta: dict[tuple[str, int], TurnMeta | None] = {}  # （会话，序号）→ 附加信息
+    for session in data.get("sessions", []):
+        started = datetime.fromisoformat(session["started_at"])
+        # 遗忘留下的序号空缺照原样保留（重新抽取时要标出来，D-059）：按连续的序号分段写入
+        ordered = sorted(session["turns"], key=lambda t: int(t["idx"]))
+        for _, run in groupby(enumerate(ordered), key=lambda p: int(p[1]["idx"]) - p[0]):
+            chunk = [turn for _, turn in run]
+            turns = [_turn_in(t, scratch) for t in chunk]
+            piece = SessionIn(session_id=session["session_id"], started_at=started, turns=turns)
+            chunks.append((piece, int(chunk[0]["idx"])))
+            for t in chunk:  # 序号重复时与发言一样先写的算（INSERT OR IGNORE）
+                meta.setdefault((piece.session_id, int(t["idx"])), _meta_in(t))
+    return target, chunks, meta
 
 
 def _turn_out(turn: Turn, media: Mapping[str, Any], meta: TurnMeta | None) -> dict[str, Any]:

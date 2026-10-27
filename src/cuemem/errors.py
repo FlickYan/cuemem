@@ -65,10 +65,21 @@ class AccessKeysError(CueMemError):
 
 class MemoryAPIError(CueMemError):
     """远程记忆接口（cuemem.client.MemoryClient）的出错里，没有对应的本地异常的那些：令牌不对、
-    连不上服务、找不到接口等。status 是 HTTP 状态码（连不上时为 None），code 是 /api/v1 的
-    错误码。"""
+    连不上服务、找不到接口、模型供应商限流等。status 是 HTTP 状态码（连不上时为 None），code 是
+    /api/v1 的错误码，type 是服务端的异常类型（例如 openai 的 RateLimitError；没有时为 None），
+    retry_after 是响应的 Retry-After 头（限流 429、暂时不可用 503 时据此退避）。"""
 
-    def __init__(self, message: str, *, status: int | None = None, code: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        code: str | None = None,
+        retry_after: str | None = None,
+        type: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.retry_after = retry_after
+        self.type = type

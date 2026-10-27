@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -37,7 +37,7 @@ from test_evidence import PLANTED, wrapped_once
 from test_sdk import moved, where_i_live
 
 import cuemem.integrations.langgraph as lg
-from cuemem import AsyncMemory, Memory
+from cuemem import AsyncMemory, Memory, MemoryClient
 from cuemem.api.mcp import build_server
 from cuemem.config import Settings
 from cuemem.evidence import MEMORY_NOTE
@@ -741,3 +741,17 @@ def test_concurrent_saves_keep_the_turn_order(memory: Memory) -> None:
     stored = memory.system.db.get_turns("alice", session_for("t1"))
     assert len({t.idx for t in stored}) == 32
     assert threads.save([HumanMessage("q0", id="h0"), AIMessage("a0", id="a0")], thread("t1")) == 0
+
+
+def test_a_remote_client_is_refused_up_front() -> None:
+    """MemoryClient（远程）：每个入口当场 TypeError，说明要本地的 Memory 或 AsyncMemory。以前是
+    AttributeError（'system'）。"""
+    with MemoryClient("http://127.0.0.1:9") as client:
+        remote = cast(Any, client)
+        for make in (
+            lambda: memory_tools(remote, user_id="alice"),
+            lambda: ThreadMemory(remote, user_id="alice"),
+            lambda: CueMemMiddleware(remote, user_id="alice"),
+        ):
+            with pytest.raises(TypeError, match="needs a local Memory or AsyncMemory"):
+                make()

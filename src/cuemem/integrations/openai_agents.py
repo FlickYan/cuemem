@@ -1042,7 +1042,16 @@ def _existing(system: MemorySystem, space: str, turn_ids: Sequence[str]) -> set[
 
 
 def _sync(memory: Memory | AsyncMemory) -> Memory:
-    return memory.sync if isinstance(memory, AsyncMemory) else memory
+    """AsyncMemory 换成它包着的 Memory。别的（MemoryClient）TypeError：集成直接用本地的记忆
+    系统，以前 memory_tools 照样建好，要到模型调用 recall 时才报 AttributeError（'system'）。"""
+    if isinstance(memory, AsyncMemory):
+        return memory.sync
+    if not isinstance(memory, Memory):
+        raise TypeError(
+            "The OpenAI Agents integration needs a local Memory or AsyncMemory; "
+            f"{type(memory).__name__} is not supported."
+        )
+    return memory
 
 
 def _err(exc: BaseException) -> str:

@@ -61,12 +61,12 @@ class MemoryClient:
     用完调用 close()，或用 with 语句。
 
     base_url：服务的地址（默认 cuemem serve 的 http://127.0.0.1:7860），要以 http:// 或 https://
-    开头（ValueError）；host 是它的别名（Mem0 的 MemoryClient 这样叫），两个不能都给。api_key：
-    访问令牌，不填时读环境变量 CUEMEM_API_TOKEN（与服务端同名）。限定作用域的令牌（服务端的
-    CUEMEM_API_KEYS_FILE）只能访问它的用户：之外的 user_id、agent_id 报 MemoryAPIError（status
-    403），别人的记忆 ID 与不存在的一样；timeout：单次请求的秒数（wait=True 的 add、update
-    要等抽取做完）；http_client：自带的 httpx2.Client（测试里传 FastAPI 的 TestClient；超时照它
-    自己的设置，timeout 不再起作用）。
+    开头（ValueError），末尾的 /api/v1 去掉；host 是它的别名（Mem0 的 MemoryClient 这样叫），
+    两个不能都给。api_key：访问令牌，不填时读环境变量 CUEMEM_API_TOKEN（与服务端同名）。限定
+    作用域的令牌（服务端的 CUEMEM_API_KEYS_FILE）只能访问它的用户：之外的 user_id、agent_id 报
+    MemoryAPIError（status 403），别人的记忆 ID 与不存在的一样；timeout：单次请求的秒数
+    （wait=True 的 add、update 要等抽取做完）；http_client：自带的 httpx2.Client（测试里传
+    FastAPI 的 TestClient；超时照它自己的设置，timeout 不再起作用）。
     """
 
     def __init__(
@@ -88,7 +88,8 @@ class MemoryClient:
                 "base_url must start with http:// or https:// (cuemem serve listens on "
                 f"{DEFAULT_URL} by default); the token goes in api_key=, not the first argument."
             )
-        self.base_url = url.rstrip("/")
+        # 文档里 curl 的写法以 /api/v1 结尾：照样认，以前每个调用都是 404 "Not Found"
+        self.base_url = url.rstrip("/").removesuffix("/api/v1")
         token = api_key or os.environ.get(TOKEN_ENV) or None
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
         self._owns_http = http_client is None
@@ -296,6 +297,13 @@ class MemoryClient:
         except KeyError:
             return None
 
+    def media(self, media_id: str) -> bytes | None:
+        """一张图片的原文件（见 Memory.media）：图片项里的 path 是服务器上的路径，读不到。"""
+        try:
+            return self._send("GET", f"/media/{_id(media_id)}").content
+        except KeyError:
+            return None
+
     def history(self, memory_id: str) -> list[dict[str, Any]]:
         return self._call("GET", f"/memories/{_id(memory_id)}/history")
 
@@ -374,6 +382,16 @@ class MemoryClient:
         body: Any = None,
         params: Mapping[str, Any] | None = None,
     ) -> Any:
+        return self._send(method, path, body=body, params=params).json()
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Any = None,
+        params: Mapping[str, Any] | None = None,
+    ) -> httpx2.Response:
         query = {k: v for k, v in (params or {}).items() if v is not None}  # None 不发
         try:
             response = self._http.request(
@@ -384,10 +402,12 @@ class MemoryClient:
                 headers=self._headers,
             )
         except httpx2.HTTPError as exc:
-            raise MemoryAPIError(f"Cannot reach {self.base_url}: {exc}") from exc
+            refused = isinstance(exc, httpx2.ConnectError)
+            hint = "; is `cuemem serve` running there?" if refused else ""
+            raise MemoryAPIError(f"Cannot reach {self.base_url}: {exc}{hint}") from exc
         if response.status_code >= 400:
-            raise _error(response)
-        return response.json()
+            raise _error(response, self.base_url)
+        return response
 
 
 class AsyncMemoryClient:
@@ -436,9 +456,11 @@ def _threaded[**P, R](method: Callable[P, R]) -> Callable[P, Any]:
     return run
 
 
-def _error(response: httpx2.Response) -> Exception:
-    """/api/v1 的出错 → 与本地 Memory 相同的异常；别的（401、找不到接口、代理返回的 HTML）是
-    MemoryAPIError。"""
+def _error(response: httpx2.Response, base_url: str) -> Exception:
+    """/api/v1 的出错 → 与本地 Memory 相同的异常；别的（401、找不到接口、代理返回的 HTML、模型
+    供应商限流）是 MemoryAPIError，带着状态码、错误码、服务端的异常类型与 Retry-After（以前
+    没有 retry_after，按它退避的代码换成 MemoryClient 就不退避了）。404 却没有异常类型的是找不到
+    接口：多半 base_url 不是 cuemem serve 的根地址（记忆代理的端口、别的服务），报错里写明。"""
     try:
         body = response.json()
     except ValueError:
@@ -467,7 +489,18 @@ def _error(response: httpx2.Response) -> Exception:
             and known is not MemoryAPIError
         ):
             return known(message)
-    return MemoryAPIError(message, status=response.status_code, code=code)
+    if response.status_code == 404 and not isinstance(kind, str):
+        message += (
+            f": base_url must be the root of `cuemem serve`, e.g. {DEFAULT_URL} (got {base_url}); "
+            "an older server may also lack this endpoint"
+        )
+    return MemoryAPIError(
+        message,
+        status=response.status_code,
+        code=code if isinstance(code, str) else None,
+        retry_after=response.headers.get("retry-after"),
+        type=kind if isinstance(kind, str) else None,
+    )
 
 
 def _iso(value: date | datetime | str | float | None) -> str | float | None:

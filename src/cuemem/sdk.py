@@ -61,8 +61,8 @@ from cuemem.core.models import (
     CoreMemory,
     Fact,
     FactHit,
-    Hit,
     MediaItem,
+    MemoryUnit,
     SessionIn,
     TurnIn,
     TurnMeta,
@@ -75,6 +75,7 @@ from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 # 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
 if TYPE_CHECKING:
     from cuemem.memory import ForgetReport, MemorySystem, Recall
+    from cuemem.store.sqlite import MemoryKind
 
 logger = logging.getLogger(__name__)
 
@@ -467,10 +468,17 @@ class Memory:
         message 写明，这句更正也从日志里遗忘（turn_ids 是空的）。
         更正记下之后抽取出错时不抛出（与 add 的 wait=True 相同）：message 与 error 写明，下次
         巩固时补上。
-        只能改当前有效的版本（ValueError）；ID 不存在时 KeyError。"""
+        只能改当前有效的版本（ValueError）；对话片段与图片的 ID 不能改（ValueError，要改就
+        delete）；ID 不存在时 KeyError。"""
         data = _correction(text, data)
         found = self._find(memory_id)
         if found is None:
+            located = self._locate(memory_id)
+            if located is not None:
+                raise ValueError(
+                    f"Only facts can be updated: {memory_id} is an {located[1]}. "
+                    "Delete it instead (delete() forgets the conversation turns it came from)."
+                )
             raise KeyError(f"No memory with id {memory_id}")
         space, fact = found
         if not fact.is_current:
@@ -710,7 +718,25 @@ class Memory:
         return {"results": items[:limit] if limit is not None else items}
 
     def get(self, memory_id: str) -> dict[str, Any] | None:
-        """按 ID 取一条事实（不用给 user_id：ID 里已经带着空间）。过期的也取得到。"""
+        """按 ID 取一条记忆（不用给 user_id：ID 里已经带着空间）：事实，或 search 给出的对话片段
+        （type "excerpt"）与图片（type "image"，原文件用 media() 取）。过期的也取得到。以前只认
+        事实的 ID，search 给出的另外两种都当成不存在。"""
+        located = self._locate(memory_id)
+        if located is None:
+            return None
+        space, kind = located
+        if kind == "excerpt":
+            units = self.system.db.get_units(space, [memory_id])
+            if not units:  # 刚好被遗忘删掉了
+                return None
+            sources = _Sources.load(self.system, space, units[0].source_turn_ids)
+            return {**_unit_item(units[0], None, sources), "space_id": space}
+        if kind == "image":
+            image = self._image(memory_id)
+            if image is None:
+                return None
+            sources = _Sources.load(self.system, space, [image.source_turn_id])
+            return {**_image_item(image, False, sources), "space_id": space}
         found = self._find(memory_id)
         if found is None:
             return None
@@ -718,8 +744,18 @@ class Memory:
         sources = _Sources.load(self.system, space, fact.source_turn_ids)
         return _fact_item(fact, None, None, None, sources, space=space)
 
+    def media(self, media_id: str) -> bytes | None:
+        """一张图片的原文件（search 结果 images 里的 id）：图片项里的 path 是服务器上的路径，
+        远程调用方（MemoryClient）用这个方法取图片。没有这张图片、或原图已经不在时是 None。"""
+        image = self._image(media_id)
+        if image is None:
+            return None
+        path = Path(image.path)
+        return path.read_bytes() if path.is_file() else None
+
     def history(self, memory_id: str) -> list[dict[str, Any]]:
-        """一条事实的版本链，从最早到最新：每个版本何时记下、何时因为什么被取代。"""
+        """一条事实的版本链，从最早到最新：每个版本何时记下、何时因为什么被取代。只有事实有
+        版本：对话片段与图片的 ID 与不存在的一样，是空列表。"""
         found = self._find(memory_id)
         if found is None:
             return []
@@ -755,7 +791,11 @@ class Memory:
 
     def delete(self, memory_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         """遗忘一条事实（被遗忘权）：删掉它出自的那一轮对话与没有引用的转述，再用剩下的日志
-        重建派生记忆。被它取代过的旧事实会恢复为当前有效。
+        重建派生记忆。被它取代过的旧事实会恢复为当前有效。memory_id 也可以是 search 给出的
+        对话片段或图片的 ID：删掉那一轮对话（图片所在的那一轮），与 MCP、各框架集成的 forget
+        相同。以前这两种 ID 报 KeyError，Mem0 的 for r in results: delete(r["id"]) 中途出错。
+        与 Mem0 不同的是删的是整轮对话：同一轮的对话片段、由它抽出的别的事实随之消失，之后再
+        delete 它们的 ID 是 KeyError（与不存在的一样），逐条删时要接住。
 
         dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。删除做完之后
         重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。
@@ -763,6 +803,9 @@ class Memory:
         一句发言都没删、这条事实却还在（它出处的发言已经不在日志里，例如之前的版本遗忘到一半
         出错留下的）时 message 是 "Nothing deleted"，warning 让调用方 consolidate(rebuild=True)：
         以前照样回 "Memory deleted"。"""
+        located = self._locate(memory_id)
+        if located is not None and located[1] != "fact":
+            return self._delete_source(located[0], located[1], memory_id, dry_run=dry_run)
         found = self._find(memory_id)
         if found is None:
             raise KeyError(f"No memory with id {memory_id}")
@@ -882,10 +925,42 @@ class Memory:
     ) -> None:
         self.close()
 
+    def _locate(self, memory_id: str) -> tuple[str, MemoryKind] | None:
+        """（空间，种类）：search 给出的三种 ID——事实、对话片段、图片（MemoryDB.memory_kind）。"""
+        return self.system.db.memory_kind(memory_id)
+
     def _find(self, memory_id: str) -> tuple[str, Fact] | None:
-        space = self.system.db.fact_space(memory_id)
-        facts = self.system.db.get_facts(space, ids=[memory_id]) if space is not None else []
-        return (space, facts[0]) if space is not None and facts else None
+        located = self._locate(memory_id)
+        if located is None or located[1] != "fact":
+            return None
+        facts = self.system.db.get_facts(located[0], ids=[memory_id])
+        return (located[0], facts[0]) if facts else None
+
+    def _image(self, media_id: str) -> MediaItem | None:
+        located = self._locate(media_id)
+        if located is None or located[1] != "image":
+            return None
+        items = self.system.db.get_media(located[0], ids=[media_id])
+        return items[0] if items else None
+
+    def _delete_source(
+        self, space: str, kind: MemoryKind, memory_id: str, *, dry_run: bool
+    ) -> dict[str, Any]:
+        """delete 一个对话片段或一张图片：按发言（片段那一轮的发言）或按图片遗忘，与 MCP、
+        各框架集成的 forget（evidence.resolve_ids）相同。"""
+        from cuemem.evidence import resolve_ids
+
+        turns = resolve_ids(self.system, space, [memory_id])[1] if kind == "excerpt" else []
+        media = [memory_id] if kind == "image" else []
+        if dry_run:
+            return {
+                "message": "Dry run: nothing was deleted",
+                **self.system.preview_forget(space, turn_ids=turns, media_ids=media),
+            }
+        report = self.system.forget_memories(
+            space, turn_ids=turns, media_ids=media, report_rebuild_errors=True
+        )
+        return {"message": "Memory deleted", **_forget_out(report)}
 
     def _next_idx(self, space: str, session_id: str) -> int:
         """会话里下一句发言的序号：只增不减，遗忘删掉的序号不再复用（与 Agent 相同）；
@@ -1370,17 +1445,18 @@ def _fact_item(
     return item
 
 
-def _excerpt_item(hit: Hit, sources: _Sources) -> dict[str, Any]:
+def _unit_item(unit: MemoryUnit, score: float | None, sources: _Sources) -> dict[str, Any]:
+    """对话片段（"轮"）→ 结果里的一项：search 的带 score，get 的不带。"""
+    item: dict[str, Any] = {"id": unit.id, "memory": unit.text, "type": "excerpt"}
+    if score is not None:
+        item["score"] = round(score, 4)
     return {
-        "id": hit.unit.id,
-        "memory": hit.unit.text,
-        "type": "excerpt",
-        "score": round(hit.score, 4),
-        "created_at": hit.unit.ts.isoformat(),
-        "session_id": hit.unit.session_id,
-        "source_turn_ids": hit.unit.source_turn_ids,
-        "metadata": sources.metadata(hit.unit.source_turn_ids),
-        "expiration_date": sources.expires(hit.unit.source_turn_ids),
+        **item,
+        "created_at": unit.ts.isoformat(),
+        "session_id": unit.session_id,
+        "source_turn_ids": unit.source_turn_ids,
+        "metadata": sources.metadata(unit.source_turn_ids),
+        "expiration_date": sources.expires(unit.source_turn_ids),
     }
 
 
@@ -1432,7 +1508,7 @@ def _recall_out(
     }
     media = [m for m in media if select.keep(session_of.get(m.id), [m.source_turn_id], sources)]
     items = [_fact_item(fh.fact, fh.score, user_id, agent_id, sources) for fh in facts]
-    items += [_excerpt_item(h, sources) for h in sorted(rounds, key=lambda h: -h.score)]
+    items += [_unit_item(h.unit, h.score, sources) for h in sorted(rounds, key=lambda h: -h.score)]
     decision = recall.decision
     return {
         "results": items[:limit] if limit is not None else items,

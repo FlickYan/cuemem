@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import io
@@ -544,6 +545,37 @@ def test_v1_api_stays_in_scope(world: World) -> None:
     assert alice.load(dump, user_id="alice")["space_id"] == "alice"
     assert len(world.system.db.get_turns("bob")) == before["bob"]
     assert {s["space_id"] for s in admin.spaces()} == set(SPACES)  # reset 没有发生
+
+
+def test_v1_excerpt_and_image_ids_stay_in_scope(world: World) -> None:
+    """按 ID 找的对话片段与图片（search 给出的另外两种 ID）：别人的与不存在的一样，alice 的令牌
+    get、media 是 None，delete（含预演）与 update 是 KeyError，bob 的发言一句不少；管理令牌照常
+    取得到。片段的 ID 由空间、会话与序号派生，算得出来：Memory.delete 认了片段的 ID 之后，
+    /api/v1 若仍只按事实查作用域，限定作用域的令牌就能删掉别人的对话。"""
+    alice = MemoryClient("http://testserver", api_key=ALICE_TOKEN, http_client=world.http)
+    admin = MemoryClient("http://testserver", api_key=ADMIN_TOKEN, http_client=world.http)
+    photo = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(photo, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(photo.getvalue()).decode()
+    content = [{"type": "text", "text": "My photo"}, {"type": "image_url", "image_url": url}]
+    admin.add({"role": "user", "content": content}, user_id="bob", infer=False)
+    excerpt = world.system.db.list_units("bob", kinds=["round"])[0].id
+    (image,) = world.system.db.get_media("bob")
+    before = world.turns()
+    for memory_id in (excerpt, image.id):
+        assert alice.get(memory_id) is None and alice.history(memory_id) == []
+        assert alice.media(memory_id) is None
+        for call in (
+            functools.partial(alice.delete, memory_id),
+            functools.partial(alice.delete, memory_id, dry_run=True),
+            functools.partial(alice.update, memory_id, "My PIN is 0000"),
+        ):
+            with pytest.raises(KeyError):
+                call()
+        kept = admin.get(memory_id)
+        assert kept is not None and kept["space_id"] == "bob"
+    assert admin.media(image.id) == photo.getvalue()
+    assert world.turns() == before
 
 
 def test_v1_agent_backend_key(world: World) -> None:

@@ -19,7 +19,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from cuemem.core.models import (
     CoreMemory,
@@ -35,6 +35,8 @@ from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConfigMismatchError
 
 logger = logging.getLogger(__name__)
+
+MemoryKind = Literal["fact", "excerpt", "image"]  # 按 ID 找到的记忆的种类（MemoryDB.memory_kind）
 
 # v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
@@ -977,13 +979,21 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: (bool(r[1]), r[2]) for r in rows}
 
-    def fact_space(self, fact_id: str) -> str | None:
-        """事实所在的记忆空间（事实 ID 由空间派生，全局唯一；SDK 按 ID 取事实用，N12）。"""
+    def memory_kind(self, memory_id: str) -> tuple[str, MemoryKind] | None:
+        """SDK 按 ID 找的记忆：（所在的记忆空间，种类）——事实、对话片段（"轮"）或图片，就是
+        search 结果里的三种 ID；都不是时 None。三张表的 id 都是主键，ID 由空间派生、全局唯一。
+        以前只查事实：search 给出的对话片段与图片的 ID，get、delete 都当成不存在。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT space_id FROM facts WHERE id = ?", (fact_id,)
+                "SELECT space_id, 'fact', 0 FROM facts WHERE id = ?"
+                " UNION ALL"
+                " SELECT space_id, 'excerpt', 1 FROM units WHERE id = ? AND kind = 'round'"
+                " UNION ALL"
+                " SELECT space_id, 'image', 2 FROM media WHERE id = ?"
+                " ORDER BY 3 LIMIT 1",
+                (memory_id, memory_id, memory_id),
             ).fetchone()
-        return row[0] if row else None
+        return (row[0], row[1]) if row else None
 
     def get_entities(self, space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
         sql = f"SELECT {_ENTITY_COLUMNS} FROM entities WHERE space_id = ?"

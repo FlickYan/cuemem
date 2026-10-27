@@ -38,7 +38,7 @@ from scripted import ScriptedModel, echo_extraction
 from test_evidence import PLANTED, wrapped_once
 
 import cuemem.integrations.openai_agents as oa
-from cuemem import AsyncMemory, Memory
+from cuemem import AsyncMemory, Memory, MemoryClient
 from cuemem.api.mcp import build_server
 from cuemem.config import Settings
 from cuemem.errors import EmbeddingAPIError
@@ -894,6 +894,21 @@ def test_async_memory_is_accepted(memory: Memory) -> None:
     wrapped.sync = memory
     assert CueMemSession("s", wrapped, user_id="alice").memory is memory
     assert memory_input_filter(wrapped, user_id="alice").memory is memory
+
+
+def test_a_remote_client_is_refused_up_front() -> None:
+    """MemoryClient（远程）：每个入口当场 TypeError，说明要本地的 Memory 或 AsyncMemory。以前
+    memory_tools 照样建好，要到模型调用 recall 时才报 AttributeError（'system'）。"""
+    with MemoryClient("http://127.0.0.1:9") as client:
+        remote = cast(Any, client)
+        for make in (
+            lambda: memory_tools(remote, user_id="alice"),
+            lambda: CueMemSession("s", remote, user_id="alice"),
+            lambda: memory_input_filter(remote, user_id="alice"),
+            lambda: close_sessions(remote),
+        ):
+            with pytest.raises(TypeError, match="needs a local Memory or AsyncMemory"):
+                make()
 
 
 def _text(item: Any) -> str:

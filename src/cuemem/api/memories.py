@@ -6,11 +6,12 @@
     POST   /api/v1/memories/search           search（query、filters、top_k、mode、min_level、
                                              show_expired…）
     GET    /api/v1/memories                  get_all（filters 是 JSON 字符串）
-    GET    /api/v1/memories/{id}             get（不存在时 404）
+    GET    /api/v1/memories/{id}             get（事实、对话片段或图片的 ID；不存在时 404）
     PUT    /api/v1/memories/{id}             update（text 或 data、metadata）
     GET    /api/v1/memories/{id}/history     history
     DELETE /api/v1/memories/{id}             delete（dry_run）
     DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id）
+    GET    /api/v1/media/{id}                media（图片的原文件）
     POST   /api/v1/reset                     reset
     GET    /api/v1/status                    status（抽取的状态：待处理、失败的会话与原因）
     以及 answer、profile、runs（open_run）、runs/end（end_run）、consolidate、wait、export、
@@ -26,7 +27,8 @@ ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此�
 格式（422）、令牌不对（401）在 /api/v1 下也写成这个形状（install_error_format）。模型与向量供应商
 出错时的状态码与 /api 相同（api/failures.py：限流 429 带 Retry-After、余额不足 402、超时 504……），
 code 是出错的类别（rate_limited、no_balance、timeout 等）；向量接口的出错另带 upstream_status
-（上游原来的状态码），MemoryClient 抛出的 EmbeddingAPIError 与本地一样带着 status 与 retry_after。
+（上游原来的状态码），MemoryClient 抛出的 EmbeddingAPIError 与本地一样带着 status 与 retry_after，
+没有对应的本地异常时抛出的 MemoryAPIError 带着 status、code、type 与 retry_after（Retry-After 头）。
 
 图片只收 data URL：服务器不读自己磁盘上的文件（与记忆代理相同），MemoryClient 把本地路径先读成
 data URL 再发；网络图片照 SDK 的规矩不下载。
@@ -34,6 +36,7 @@ data URL 再发；网络图片照 SDK 的规矩不下载。
 
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -48,6 +51,7 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
+from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -224,6 +228,15 @@ def _no_server_files(messages: str | dict[str, Any] | list[dict[str, Any]]) -> N
                 )
 
 
+def _image_type(data: bytes) -> str:
+    """图片的 Content-Type：按 PIL 认出的格式（只读文件头），认不出时是通用的二进制。"""
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            return Image.MIME.get(probe.format or "", "application/octet-stream")
+    except Exception:  # 坏图时 PIL 抛的异常五花八门
+        return "application/octet-stream"
+
+
 def _filters(raw: str | None) -> dict[str, Any] | None:
     """GET 的 filters 是 JSON 字符串（嵌套的条件放不进普通的查询参数）。"""
     if raw is None or not raw.strip():
@@ -273,9 +286,11 @@ def memories_router(
         _allow(principal_of(http), space_for(user_id, agent_id))
 
     def visible(http: Request, memory_id: str) -> bool:
-        """按 ID 找的记忆：不存在的，或者在作用域里的。作用域之外的与不存在的一样处理。"""
-        space = memory.system.db.fact_space(memory_id)
-        return space is None or principal_of(http).allows(space)
+        """按 ID 找的记忆：不存在的，或者在作用域里的。作用域之外的与不存在的一样处理。事实、
+        对话片段与图片三种 ID 都查（与 Memory.get、delete 认的相同）：只查事实的话，限定作用域
+        的令牌能按算得出来的片段 ID 删掉别人的对话。"""
+        located = memory.system.db.memory_kind(memory_id)
+        return located is None or principal_of(http).allows(located[0])
 
     def missing(memory_id: str) -> V1Error:
         return V1Error(404, f"No memory with id {memory_id}", error_type="KeyError")
@@ -390,6 +405,18 @@ def memories_router(
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
             return memory.delete(memory_id, dry_run=dry_run)
+
+    @router.get("/media/{media_id}", response_class=Response)
+    def media(http: Request, media_id: str) -> Response:
+        """一张图片的原文件（Memory.media）：图片项里的 path 是服务器上的路径，远程调用方
+        用这个接口取。作用域之外的、不是图片的 ID 与不存在的一样（404）。"""
+        if not visible(http, media_id):
+            raise missing(media_id)
+        with _sdk_errors(by_id=True):
+            data = memory.media(media_id)
+        if data is None:
+            raise missing(media_id)
+        return Response(data, media_type=_image_type(data))
 
     @router.post("/reset")
     def reset(http: Request) -> dict[str, Any]:
