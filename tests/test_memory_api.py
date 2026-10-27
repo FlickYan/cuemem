@@ -6,23 +6,26 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.resources
 import inspect
 import io
 import json
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 import pytest
-from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
+from fakes import NO_BALANCE, PROJECT_ROOT, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
+from pydantic import BaseModel, TypeAdapter
 from scripted import ScriptedModel
 from test_sdk import (
     AUG,
@@ -37,7 +40,14 @@ from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
 from cuemem.api.app import create_app
 from cuemem.api.auth import Keys, guard
-from cuemem.api.memories import install_error_format, memories_router
+from cuemem.api.memories import (
+    PREFIX,
+    V1ErrorBody,
+    install_error_format,
+    memories_router,
+    openapi_v1,
+    v1_part,
+)
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
 from cuemem.errors import (
@@ -84,6 +94,45 @@ def v1_app(system: MemorySystem, keys: Keys | None = None) -> FastAPI:
     return app
 
 
+# /api/v1 的接口（路由的元数据与包住的 Memory 无关）：按它们找响应在 OpenAPI 里写的模型
+V1_ROUTES = [r for r in memories_router(cast(Memory, None)).routes if isinstance(r, APIRoute)]
+V1_ERRORS = (400, 401, 402, 403, 404, 409, 413, 422, 429, 502, 503, 504)
+
+
+def _undocumented(value: Any, where: str = "") -> list[str]:
+    """校验过的返回值里没写进模型的键（extra="allow" 的模型把它们放在 model_extra 里）。"""
+    if isinstance(value, BaseModel):
+        found = [f"{where}.{key}" for key in value.model_extra or {}]
+        for name in type(value).model_fields:
+            found += _undocumented(getattr(value, name), f"{where}.{name}")
+        return found
+    if isinstance(value, list):
+        return [key for i, v in enumerate(value) for key in _undocumented(v, f"{where}[{i}]")]
+    return []
+
+
+def documented(seen: set[str]) -> Callable[[httpx2.Response], None]:
+    """TestClient 的响应钩子：/api/v1 的 JSON 响应按 OpenAPI 里写的模型校验（200 按接口的模型，
+    出错按 V1ErrorBody），SDK 给出的每个键都要写在模型里。走过的接口记进 seen。"""
+
+    def check(response: httpx2.Response) -> None:
+        method, path = response.request.method, response.request.url.path
+        route = next(
+            (r for r in V1_ROUTES if method in r.methods and r.path_regex.match(path)), None
+        )
+        if route is None:
+            return
+        seen.add(f"{method} {route.path}")
+        if not response.headers.get("content-type", "").startswith("application/json"):
+            return  # 图片的原文件
+        response.read()
+        model = route.responses[200]["model"] if response.status_code == 200 else V1ErrorBody
+        parsed = TypeAdapter(model).validate_python(response.json())
+        assert _undocumented(parsed) == [], (method, path, response.status_code)
+
+    return check
+
+
 @pytest.fixture(params=["local", "remote"])
 def mem(request: pytest.FixtureRequest, system: MemorySystem) -> Iterator[Mem]:
     if request.param == "local":
@@ -93,6 +142,7 @@ def mem(request: pytest.FixtureRequest, system: MemorySystem) -> Iterator[Mem]:
         TestClient(v1_app(system)) as http,
         MemoryClient("http://testserver", http_client=http) as client,
     ):
+        http.event_hooks = {"request": [], "response": [documented(set())]}
         yield client
 
 
@@ -126,6 +176,40 @@ def test_the_client_has_the_same_methods_and_signatures_as_memory() -> None:
         assert hasattr(AsyncMemoryClient, name)
 
 
+@pytest.mark.parametrize(
+    ("async_cls", "sync_cls"), [(AsyncMemory, Memory), (AsyncMemoryClient, MemoryClient)]
+)
+def test_the_async_classes_declare_every_method(async_cls: type, sync_cls: type) -> None:
+    """AsyncMemory 与 AsyncMemoryClient 的每个方法都写明了：协程函数，参数与类型注解与同步的
+    逐字相同，构造参数也相同。以前它们经 __getattr__ 转发，类上没有这些方法，类型检查器看到的
+    都是 Any（await m.serach(...)、AsyncMemoryClient(api_kye=...) 都查不出来）。"""
+    for name in sorted(_methods(Memory) - {"from_config", "from_system", "run"}):
+        method = getattr(async_cls, name)  # 在类上找：以前只有实例的 __getattr__ 转发
+        assert inspect.iscoroutinefunction(method), name
+        ours, theirs = inspect.signature(method), inspect.signature(getattr(sync_cls, name))
+        assert list(ours.parameters.values()) == list(theirs.parameters.values()), name
+        assert ours.return_annotation == theirs.return_annotation, name
+    ours, theirs = inspect.signature(async_cls.__init__), inspect.signature(sync_cls.__init__)
+    assert list(ours.parameters.values()) == list(theirs.parameters.values())
+    if async_cls is AsyncMemory:
+        assert {"from_config", "from_system"} <= set(vars(AsyncMemory))
+
+
+def test_async_memory_passes_other_attributes_through(system: MemorySystem) -> None:
+    """不是方法的属性（.system、.settings）照旧取包着的 Memory 的；写错的名字 AttributeError。"""
+    memory = AsyncMemory.from_system(system)
+    assert memory.system is system and memory.settings is system.settings
+    with pytest.raises(AttributeError):
+        memory.serach  # type: ignore[attr-defined]  # noqa: B018
+    assert asyncio.run(memory.spaces()) == []
+
+
+def test_the_package_ships_its_type_hints() -> None:
+    """py.typed（PEP 561）：没有它时用户的 mypy 跳过整个包（"missing library stubs or py.typed
+    marker"），cuemem 的类型都成了 Any。CI 的 package 任务另查 wheel 里有它。"""
+    assert importlib.resources.files("cuemem").joinpath("py.typed").is_file()
+
+
 def test_the_client_does_not_load_the_memory_stack() -> None:
     """远程客户端只依赖 httpx2：不加载向量库、模型客户端与 SDK 本身。"""
     code = (
@@ -134,7 +218,7 @@ def test_the_client_does_not_load_the_memory_stack() -> None:
         "('cuemem', 'qdrant_client', 'numpy', 'openai', 'fastapi'))))"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    assert json.loads(out.stdout) == ["cuemem", "cuemem.client", "cuemem.errors"]
+    assert json.loads(out.stdout) == ["cuemem", "cuemem._async", "cuemem.client", "cuemem.errors"]
 
 
 # ---------- 本地与远程，同样的结果 ----------
@@ -672,6 +756,111 @@ def test_cuemem_serve_mounts_the_v1_api_behind_the_token(
             assert [s["space_id"] for s in client.spaces()] == ["bot/alice"]
     finally:
         service.close()
+
+
+def test_the_openapi_documents_every_v1_response() -> None:
+    """/openapi.json 里 /api/v1 的每个接口：200 指向写明形状的模型（图片的原文件是 image/*），每个
+    出错的状态码都是 V1ErrorBody（422 也是）。以前 200 只写着"任意对象"，422 写的是 FastAPI 的
+    HTTPValidationError（实际不会出现），别的出错一个都没写。"""
+    spec = openapi_v1()
+    operations = [(p, m, op) for p, ops in spec["paths"].items() for m, op in ops.items()]
+    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 19
+    for path, method, op in operations:
+        for status in V1_ERRORS:
+            schema = op["responses"][str(status)]["content"]["application/json"]["schema"]
+            assert schema == {"$ref": "#/components/schemas/V1ErrorBody"}, (path, method, status)
+        ok = op["responses"]["200"]["content"]
+        if path == f"{PREFIX}/media/{{media_id}}":
+            assert list(ok) == ["image/*"]
+        else:
+            assert "#/components/schemas/" in json.dumps(ok["application/json"]["schema"]), path
+    assert "HTTPValidationError" not in json.dumps(spec)
+
+
+def test_the_openapi_snapshot_is_current(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, tmp_path: Path
+) -> None:
+    """docs/openapi-v1.json（按它生成别的语言的客户端）与接口一致：改了接口或模型之后要运行
+    scripts/openapi_v1.py。cuemem serve（create_app）的 /openapi.json 里 /api/v1 的部分与它相同。"""
+    snapshot = json.loads((PROJECT_ROOT / "docs" / "openapi-v1.json").read_text(encoding="utf-8"))
+    assert snapshot == openapi_v1(), "过时了：运行 uv run python scripts/openapi_v1.py"
+    fake_api.chat_replies = [model]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"))
+    try:
+        app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, token="t0k")
+        assert {**v1_part(app.openapi()), "info": None} == {**snapshot, "info": None}
+    finally:
+        service.close()
+
+
+def test_v1_responses_keep_the_json_serializer(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文档里的模型不改变返回值：接口照旧按 dict 序列化（NaN 写成 null，不是 500）。用
+    response_model=None 写文档的话 FastAPI 改走 json.dumps(allow_nan=False)，分数是 NaN 时 500。"""
+    for route in V1_ROUTES:
+        if route.path != f"{PREFIX}/media/{{media_id}}":  # 图片的原文件不是 JSON
+            assert route.response_field is not None, route.path
+    nan = {"id": "x", "score": float("nan"), "memory": "m"}
+    monkeypatch.setattr(Memory, "get", lambda self, memory_id: nan)
+    with TestClient(v1_app(system)) as http:
+        response = http.get("/api/v1/memories/x")
+    assert response.status_code == 200 and response.json() == {**nan, "score": None}
+
+
+def test_every_v1_response_matches_its_documented_model(
+    system: MemorySystem, tmp_path: Path
+) -> None:
+    """每个 /api/v1 接口经 MemoryClient 走一遍：返回的 JSON 照 OpenAPI 里写的模型校验，SDK 给出的
+    每个键都写在模型里，出错是 V1ErrorBody。（本地与远程的测试经 mem 的远程那一半也这样校验。）"""
+    seen: set[str] = set()
+    photo = tmp_path / "shoe.png"
+    Image.new("RGB", (16, 16), "blue").save(photo)
+    image = [
+        {"type": "text", "text": "My running shoes"},
+        {"type": "image_url", "image_url": {"url": str(photo)}},
+    ]
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as mem,
+    ):
+        http.event_hooks = {"request": [], "response": [documented(seen)]}
+        added = mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+        berlin = added["results"][0]
+        mem.add("I like chess a lot", user_id="alice", metadata={"k": 1}, infer=False)
+        mem.add({"role": "user", "content": image}, user_id="alice", infer=False)
+        found = mem.search("Where do I live? chess running shoes", user_id="alice", mode="l1")
+        assert {r["type"] for r in found["results"]} == {"fact", "excerpt"} and found["images"]
+        for item in [*found["results"], *found["images"]]:
+            assert mem.get(item["id"]) is not None
+        assert mem.media(found["images"][0]["id"]) == photo.read_bytes()
+        assert mem.get_all(user_id="alice", show_expired=True)["results"]
+        events = mem.update(berlin["id"], "I live in Paris")["results"]
+        paris = next(e["id"] for e in events if e["event"] == "UPDATE")
+        assert len(mem.history(paris)) == 2
+        assert mem.delete(paris, dry_run=True)["turns"]
+        assert mem.delete(paris)["turns_deleted"] == 1
+        assert mem.answer("Where do I live?", user_id="alice", mode="l1", router="rule")
+        assert "Berlin" in mem.profile(user_id="alice")
+        with mem.run(user_id="bob", wait=True) as run_id:
+            mem.add("I like tea", user_id="bob", run_id=run_id)
+        later = mem.open_run(user_id="bob")
+        mem.add("I like jazz", user_id="bob", run_id=later)
+        assert mem.end_run(later, user_id="bob")["consolidation"] == "queued"
+        assert mem.end_run(mem.open_run(user_id="bob"), user_id="bob")["consolidation"] is None
+        mem.consolidate(user_id="bob")
+        mem.wait()
+        dump = mem.export(user_id="alice")
+        assert mem.load(dump, user_id="carol", wait=True)["consolidation"]
+        assert mem.spaces() and mem.delete_all(user_id="carol")["turns_deleted"]
+        for call in (lambda: mem.update("no-such-id", "x"), lambda: mem.export(user_id="nobody")):
+            with pytest.raises(KeyError):
+                call()
+        bad = http.post("/api/v1/memories/search", json={"query": "x", "mode": "l9"})
+        assert bad.status_code == 422
+        assert mem.reset()["spaces_deleted"]
+    assert seen == {f"{m} {r.path}" for r in V1_ROUTES for m in r.methods}
 
 
 def test_the_server_does_not_read_its_own_files(system: MemorySystem, tmp_path: Path) -> None:

@@ -35,17 +35,15 @@ CueMem 自己的设计：
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
-import functools
 import json
 import logging
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -54,6 +52,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx2
 
+from cuemem._async import AsyncMethods
 from cuemem.config import Settings, load_settings, presets, unknown_keys
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import (
@@ -986,54 +985,43 @@ class Memory:
         return max(int(recorded or 0), max(t.idx for t in turns) + 1)
 
 
-class AsyncMemory:
-    """Memory 的异步版本（与 Mem0 的 AsyncMemory 对应）：同样的方法，在线程池里执行。"""
+class AsyncMemory(AsyncMethods):
+    """Memory 的异步版本（与 Mem0 的 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
+    （cuemem/_async.py）。self.sync 是包着的 Memory；别的属性（.system、.settings）取它的。"""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.sync = Memory(*args, **kwargs)
+    sync: Memory
+
+    def __init__(
+        self,
+        config: Mapping[str, Any] | Settings | None = None,
+        *,
+        preset: str | None = None,
+        home: str | Path | None = None,
+        instructions: str | None = None,
+        background: bool = True,
+        peak_policy: PeakPolicy | None = None,
+        http_client: httpx2.Client | None = None,
+    ) -> None:
+        self.sync = Memory(
+            config,
+            preset=preset,
+            home=home,
+            instructions=instructions,
+            background=background,
+            peak_policy=peak_policy,
+            http_client=http_client,
+        )
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any], **kwargs: Any) -> AsyncMemory:
         return cls(config, **kwargs)
 
-    def __getattr__(self, name: str) -> Any:
-        method = getattr(self.sync, name)
-        if not callable(method) or name.startswith("_"):
-            return method
-        return _threaded(method)
-
-    @asynccontextmanager
-    async def run(
-        self,
-        run_id: str | None = None,
-        *,
-        user_id: str | None = None,
-        agent_id: str | None = None,
-        wait: bool = False,
-    ) -> AsyncIterator[str]:
-        """async with m.run(user_id="alice") as run_id: ...（见 Memory.run）。"""
-        sync = self.sync
-        rid = await asyncio.to_thread(sync.open_run, run_id, user_id=user_id, agent_id=agent_id)
-        try:
-            yield rid
-        finally:
-            await asyncio.to_thread(
-                sync.end_run, rid, user_id=user_id, agent_id=agent_id, wait=wait
-            )
-
-    async def __aenter__(self) -> AsyncMemory:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await asyncio.to_thread(self.sync.close)
-
-
-def _threaded[**P, R](method: Callable[P, R]) -> Callable[P, Any]:
-    @functools.wraps(method)
-    async def run(*args: P.args, **kwargs: P.kwargs) -> R:
-        return await asyncio.to_thread(method, *args, **kwargs)
-
-    return run
+    @classmethod
+    def from_system(cls, system: MemorySystem) -> AsyncMemory:
+        """包住一个已经打开的记忆系统（见 Memory.from_system）。"""
+        memory = cls.__new__(cls)
+        memory.sync = Memory.from_system(system)
+        return memory
 
 
 # ---------- 输入 ----------

@@ -22,16 +22,14 @@ cuemem serve 的 /api/v1 记忆接口（api/memories.py）。本地与远程之�
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextlib
-import functools
 import json
 import mimetypes
 import os
 import threading
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
@@ -41,6 +39,7 @@ from urllib.parse import quote
 import httpx2
 
 from cuemem import errors
+from cuemem._async import AsyncMethods
 from cuemem.errors import CueMemError, MemoryAPIError
 
 if TYPE_CHECKING:  # 只用于类型注解：签名与 Memory 逐字相同（tests/test_memory_api.py 核对）
@@ -411,50 +410,24 @@ class MemoryClient:
         return response
 
 
-class AsyncMemoryClient:
-    """MemoryClient 的异步版本（与 AsyncMemory 对应）：同样的方法，在线程池里执行。"""
+class AsyncMemoryClient(AsyncMethods):
+    """MemoryClient 的异步版本（与 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
+    （cuemem/_async.py）。self.sync 是包着的 MemoryClient；别的属性（.base_url）取它的。"""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.sync = MemoryClient(*args, **kwargs)
+    sync: MemoryClient
 
-    def __getattr__(self, name: str) -> Any:
-        method = getattr(self.sync, name)
-        if not callable(method) or name.startswith("_"):
-            return method
-        return _threaded(method)
-
-    @asynccontextmanager
-    async def run(
+    def __init__(
         self,
-        run_id: str | None = None,
+        base_url: str | None = None,
         *,
-        user_id: str | None = None,
-        agent_id: str | None = None,
-        wait: bool = False,
-    ) -> AsyncIterator[str]:
-        """async with m.run(user_id="alice") as run_id: ...（见 Memory.run）。"""
-        sync = self.sync
-        rid = await asyncio.to_thread(sync.open_run, run_id, user_id=user_id, agent_id=agent_id)
-        try:
-            yield rid
-        finally:
-            await asyncio.to_thread(
-                sync.end_run, rid, user_id=user_id, agent_id=agent_id, wait=wait
-            )
-
-    async def __aenter__(self) -> AsyncMemoryClient:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await asyncio.to_thread(self.sync.close)
-
-
-def _threaded[**P, R](method: Callable[P, R]) -> Callable[P, Any]:
-    @functools.wraps(method)
-    async def run(*args: P.args, **kwargs: P.kwargs) -> R:
-        return await asyncio.to_thread(method, *args, **kwargs)
-
-    return run
+        api_key: str | None = None,
+        host: str | None = None,
+        timeout: float = 300.0,
+        http_client: httpx2.Client | None = None,
+    ) -> None:
+        self.sync = MemoryClient(
+            base_url, api_key=api_key, host=host, timeout=timeout, http_client=http_client
+        )
 
 
 def _error(response: httpx2.Response, base_url: str) -> Exception:

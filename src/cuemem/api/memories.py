@@ -31,6 +31,10 @@ code 是出错的类别（rate_limited、no_balance、timeout 等）；向量接
 （上游原来的状态码），MemoryClient 抛出的 EmbeddingAPIError 与本地一样带着 status 与 retry_after，
 没有对应的本地异常时抛出的 MemoryAPIError 带着 status、code、type 与 retry_after（Retry-After 头）。
 
+OpenAPI（/openapi.json 与它的快照 docs/openapi-v1.json，第三轮体检）：每个接口写明返回值的形状
+（下面的 FactItem、SearchResult……）与出错的状态码（都是 V1ErrorBody），别的语言的客户端可以按它
+生成。
+
 图片只收 data URL：服务器不读自己磁盘上的文件（与记忆代理相同），MemoryClient 把本地路径先读成
 data URL 再发；网络图片照 SDK 的规矩不下载。
 """
@@ -42,7 +46,7 @@ import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import (
@@ -53,11 +57,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from cuemem.api.auth import Principal, principal_of
+from cuemem import __version__
+from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of
 from cuemem.api.failures import provider_failure
+from cuemem.core.models import FactCategory, SupersedeReason
 from cuemem.errors import ConcurrentWriteError, CueMemError, EmbeddingAPIError
 from cuemem.read.controller import Router
 from cuemem.sdk import AnswerMode, Memory, SearchMode, _scope, space_for
@@ -174,6 +180,318 @@ class ImportRequest(BaseModel):
     wait: bool = False
 
 
+# ---------- 返回值的形状（只用于 OpenAPI，第三轮体检）----------
+#
+# 以前 /openapi.json 里每个接口的 200 都是"任意对象"，422 写的是 FastAPI 的 HTTPValidationError
+# （实际是下面的 V1ErrorBody），别的出错一个都没写：按它生成的客户端（openapi-typescript、Orval）
+# 只拿到 Record<string, any> 与一个不会出现的出错类型。这些模型照 SDK 现在给出的键写（sdk.py 的
+# _fact_item、_unit_item、_image_item、_recall_out……），extra="allow"：以后多了键，旧的客户端照常
+# 能用。接口的返回值不经它们校验、不被改写（见 V1Json）；tests/test_memory_api.py 核对 SDK 给出的
+# 每个键都写在这里。
+
+
+class _Out(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class ErrorDetail(_Out):
+    code: str = Field(description="Error category: invalid_request, forbidden, rate_limited, ...")
+    type: str | None = Field(
+        description="The SDK's exception type (KeyError, ValueError, TypeError or one of "
+        "cuemem.errors); MemoryClient raises the same. null for 401 and for scope errors."
+    )
+    message: str
+    upstream_status: int | None = Field(
+        None, description="The embedding provider's own status code (EmbeddingAPIError)."
+    )
+
+
+class V1ErrorBody(_Out):
+    """Every /api/v1 error has this shape, including 401, 404 and 422."""
+
+    error: ErrorDetail
+
+
+class FactItem(_Out):
+    """A fact. Times are ISO 8601 in the server's local time."""
+
+    id: str
+    memory: str
+    type: Literal["fact"]
+    subject: str
+    predicate: str
+    object: str
+    category: FactCategory
+    importance: int
+    status: str = Field(description='"current", or since when it is no longer true or corrected.')
+    valid_from: str | None
+    valid_to: str | None
+    created_at: str
+    invalidated_at: str | None
+    superseded_by: str | None
+    session_id: str
+    source_turn_ids: list[str]
+    metadata: dict[str, Any]
+    expiration_date: str | None
+    score: float | None = Field(None, description="Search only: for ranking, not a similarity.")
+    space_id: str | None = None
+    user_id: str | None = None
+    agent_id: str | None = None
+
+
+class FactEvent(FactItem):
+    """A fact that add or update created (Mem0's ADD / UPDATE events)."""
+
+    event: Literal["ADD", "UPDATE"]
+    previous_memory: list[str] | None = None
+    reason: SupersedeReason | None = None
+
+
+class HistoryItem(FactItem):
+    event: Literal["ADD", "UPDATE"]
+
+
+class ExcerptItem(_Out):
+    """A conversation excerpt (one round)."""
+
+    id: str
+    memory: str
+    type: Literal["excerpt"]
+    score: float | None = None
+    created_at: str
+    session_id: str
+    source_turn_ids: list[str]
+    metadata: dict[str, Any]
+    expiration_date: str | None
+    space_id: str | None = None
+
+
+class ImageItem(_Out):
+    """An image; GET /api/v1/media/{id} returns the file (path is on the server)."""
+
+    id: str
+    memory: str = Field(description="The image's caption.")
+    type: Literal["image"]
+    path: str
+    created_at: str
+    attached: bool
+    metadata: dict[str, Any]
+    expiration_date: str | None
+    space_id: str | None = None
+
+
+SearchHit = Annotated[FactItem | ExcerptItem, Field(discriminator="type")]
+MemoryItem = Annotated[FactItem | ExcerptItem | ImageItem, Field(discriminator="type")]
+
+
+class ConsolidationReport(_Out):
+    sessions: int
+    facts_extracted: int
+    added: int
+    superseded: int
+    merged: int
+    noop: int
+    entities_created: int
+    entities_linked: int
+    llm_calls: int
+    rules: dict[str, int]
+    failed: list[str]
+    skipped: list[str]
+    elapsed_ms: float
+
+
+class AddResult(_Out):
+    results: list[FactEvent]
+    session_id: str | None
+    turn_ids: list[str]
+    status: Literal["empty", "logged", "queued", "consolidated"]
+    error: str | None = None
+    consolidation: ConsolidationReport | None = None
+
+
+class SearchResult(_Out):
+    results: list[SearchHit]
+    images: list[ImageItem]
+    profile: str
+    level: Literal["L0", "L1", "L2"]
+    see: bool
+    reasons: list[str]
+
+
+class GetAllResult(_Out):
+    results: list[FactItem]
+
+
+class UpdateResult(_Out):
+    message: str
+    id: str
+    results: list[FactEvent]
+    session_id: str
+    turn_ids: list[str]
+    consolidation: ConsolidationReport | None = None
+    error: str | None = None
+
+
+class ForgetResult(_Out):
+    message: str
+    turns_deleted: int
+    sessions_affected: list[str]
+    facts_before: int
+    facts_after: int
+    images_deleted: int
+    restated: int
+    warning: str | None = None
+
+
+class DryRunTurn(_Out):
+    id: str
+    session_id: str
+    role: str
+    text: str
+
+
+class DryRunFact(_Out):
+    id: str
+    memory: str
+
+
+class DryRunResult(_Out):
+    """delete with dry_run=true: what would be deleted; nothing is."""
+
+    message: str
+    turns: list[DryRunTurn]
+    sessions_affected: list[str]
+    cascaded: int
+    restated: int
+    facts: list[DryRunFact]
+    images: int
+
+
+class ResetResult(_Out):
+    message: str
+    spaces_deleted: list[str]
+    turns_deleted: int
+    images_deleted: int
+
+
+class Citation(_Out):
+    ref: str
+    id: str
+    memory: str
+
+
+class AnswerResult(_Out):
+    answer: str
+    evidence_sufficient: bool
+    citations: list[Citation]
+    level: str | None
+    reasons: list[str]
+
+
+class ProfileResult(_Out):
+    profile: str
+
+
+class RunResult(_Out):
+    run_id: str
+
+
+class EndRunResult(_Out):
+    session_id: str
+    turns: int
+    consolidation: ConsolidationReport | Literal["queued"] | None
+
+
+class WaitResult(_Out):
+    ok: bool
+
+
+class ExportImage(_Out):
+    sha256: str
+    mime: str
+    data: str = Field(description="Base64.")
+
+
+class ExportTurn(_Out):
+    idx: int
+    role: str
+    text: str
+    ts: str
+    speaker: str | None
+    images: list[ExportImage]
+    metadata: dict[str, Any] | None = None
+    expires_at: str | None = None
+    edit_of: str | None = None
+
+
+class ExportSession(_Out):
+    session_id: str
+    started_at: str
+    turns: list[ExportTurn]
+
+
+class ExportDerived(_Out):
+    facts: list[dict[str, Any]]
+    profile: str
+
+
+class ExportDocument(_Out):
+    """A memory space as a portable file (cuemem/portable.py); POST /api/v1/import takes it."""
+
+    format: Literal["cuemem.space"]
+    version: int
+    exported_at: str
+    space_id: str
+    sessions: list[ExportSession]
+    derived: ExportDerived | None = None
+
+
+class ImportReport(_Out):
+    space_id: str
+    sessions: int
+    turns_added: int
+    images_added: int
+    consolidation: ConsolidationReport | None = None
+
+
+class SpaceRow(_Out):
+    space_id: str
+    created_at: str
+    sessions: int
+    turns: int
+    units: int
+    current_facts: int
+    facts: int
+    entities: int
+
+
+# 接口照旧返回 SDK 算出的字典，FastAPI 照旧按 dict[str, Any] 序列化（NaN 写成 null、键的顺序
+# 不变）；WithJsonSchema({}) 只让 OpenAPI 不写"任意对象"，200 的形状由 responses 里的模型给出。
+# 不用 response_model=None：那样 FastAPI 改走 json.dumps(allow_nan=False)，分数是 NaN 时 500
+V1Json = Annotated[dict[str, Any], WithJsonSchema({})]
+V1JsonList = Annotated[list[dict[str, Any]], WithJsonSchema({})]
+_BINARY = {"type": "string", "format": "binary"}  # GET /api/v1/media/{id}：图片文件本身
+
+_ERRORS = {
+    400: "Invalid request (the SDK raised ValueError or TypeError).",
+    401: "Missing or wrong access token.",
+    402: "The model provider's balance is exhausted.",
+    403: "The memory space is outside this API key's scope.",
+    404: "No such memory, run or space (KeyError), or outside this key's scope.",
+    409: "A concurrent write to the same run (ConcurrentWriteError).",
+    413: "Request body too large.",
+    422: "Malformed request body or parameters (type ValueError).",
+    429: "Rate-limited by the model provider; see Retry-After.",
+    502: "The model or embedding provider failed.",
+    503: "The model provider is temporarily unavailable; see Retry-After.",
+    504: "The model provider timed out.",
+}
+
+
+def _ok(model: Any) -> dict[int | str, dict[str, Any]]:
+    return {200: {"model": model}}
+
+
 @contextmanager
 def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
     """SDK 的异常 → /api/v1 的出错。KeyError 只在按 ID 找记忆的接口上算"没有这条"（404），
@@ -267,12 +585,18 @@ def memories_router(
     同一个记忆系统）。同步的接口：FastAPI 在线程池里执行，Memory 本身线程安全。
 
     dependencies 要有 api.auth.guard（认出令牌）：每个接口按它的作用域检查，没有时报错（500），
-    不当成管理令牌放行。route_class：api.auth.authenticated_route，令牌不对时不读请求体。"""
+    不当成管理令牌放行。route_class：api.auth.authenticated_route，令牌不对时不读请求体。
+
+    OpenAPI：每个接口的 200 写明形状（上面的模型），出错的状态码都写成 V1ErrorBody（422 也是，
+    不再是 FastAPI 的 HTTPValidationError）。docs/openapi-v1.json 是它的快照（openapi_v1）。"""
     router = APIRouter(
         prefix=PREFIX,
         dependencies=dependencies or [],
         tags=["memories (v1)"],
         route_class=route_class,
+        responses={
+            status: {"model": V1ErrorBody, "description": text} for status, text in _ERRORS.items()
+        },
     )
 
     def allow(
@@ -296,8 +620,8 @@ def memories_router(
     def missing(memory_id: str) -> V1Error:
         return V1Error(404, f"No memory with id {memory_id}", error_type="KeyError")
 
-    @router.post("/memories")
-    def add(http: Request, request: AddRequest) -> dict[str, Any]:
+    @router.post("/memories", responses=_ok(AddResult))
+    def add(http: Request, request: AddRequest) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             _no_server_files(request.messages)
@@ -313,8 +637,8 @@ def memories_router(
                 wait=request.wait,
             )
 
-    @router.post("/memories/search")
-    def search(http: Request, request: SearchRequest) -> dict[str, Any]:
+    @router.post("/memories/search", responses=_ok(SearchResult))
+    def search(http: Request, request: SearchRequest) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id, request.filters)
             return memory.search(
@@ -333,7 +657,7 @@ def memories_router(
                 show_expired=request.show_expired,
             )
 
-    @router.get("/memories")
+    @router.get("/memories", responses=_ok(GetAllResult))
     def get_all(
         http: Request,
         user_id: str | None = None,
@@ -346,7 +670,7 @@ def memories_router(
         filters: str | None = None,
         top_k: int | None = None,
         show_expired: bool = False,
-    ) -> dict[str, Any]:
+    ) -> V1Json:
         where = _filters(filters)
         with _sdk_errors():
             allow(http, user_id, agent_id, where)
@@ -363,19 +687,19 @@ def memories_router(
                 show_expired=show_expired,
             )
 
-    @router.delete("/memories")
+    @router.delete("/memories", responses=_ok(ForgetResult))
     def delete_all(
         http: Request,
         user_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> V1Json:
         with _sdk_errors():
             allow(http, user_id, agent_id)
             return memory.delete_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
-    @router.get("/memories/{memory_id}")
-    def get(http: Request, memory_id: str) -> dict[str, Any]:
+    @router.get("/memories/{memory_id}", responses=_ok(MemoryItem))
+    def get(http: Request, memory_id: str) -> V1Json:
         if not visible(http, memory_id):
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
@@ -384,8 +708,8 @@ def memories_router(
             raise missing(memory_id)
         return item
 
-    @router.put("/memories/{memory_id}")
-    def update(http: Request, memory_id: str, request: UpdateRequest) -> dict[str, Any]:
+    @router.put("/memories/{memory_id}", responses=_ok(UpdateResult))
+    def update(http: Request, memory_id: str, request: UpdateRequest) -> V1Json:
         if not visible(http, memory_id):
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
@@ -393,24 +717,31 @@ def memories_router(
                 memory_id, request.text, metadata=request.metadata, data=request.data
             )
 
-    @router.get("/memories/{memory_id}/history")
-    def history(http: Request, memory_id: str) -> list[dict[str, Any]]:
+    @router.get("/memories/{memory_id}/history", responses=_ok(list[HistoryItem]))
+    def history(http: Request, memory_id: str) -> V1JsonList:
         if not visible(http, memory_id):
             return []  # 与不存在的 ID 相同
         with _sdk_errors(by_id=True):
             return memory.history(memory_id)
 
-    @router.delete("/memories/{memory_id}")
-    def delete(http: Request, memory_id: str, dry_run: bool = False) -> dict[str, Any]:
+    @router.delete("/memories/{memory_id}", responses=_ok(ForgetResult | DryRunResult))
+    def delete(http: Request, memory_id: str, dry_run: bool = False) -> V1Json:
         if not visible(http, memory_id):
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
             return memory.delete(memory_id, dry_run=dry_run)
 
-    @router.get("/media/{media_id}", response_class=Response)
+    @router.get(
+        "/media/{media_id}",
+        response_class=Response,
+        responses={200: {"content": {"image/*": {"schema": _BINARY}}}},
+        description="The original file of an image memory (the path in image items is on the "
+        "server). Out-of-scope, non-image and unknown ids are 404.",
+    )
     def media(http: Request, media_id: str) -> Response:
-        """一张图片的原文件（Memory.media）：图片项里的 path 是服务器上的路径，远程调用方
-        用这个接口取。作用域之外的、不是图片的 ID 与不存在的一样（404）。"""
+        # 一张图片的原文件（Memory.media）：图片项里的 path 是服务器上的路径，远程调用方用这个接口
+        # 取。作用域之外的、不是图片的 ID 与不存在的一样（404）。说明写在 description 里（英文，
+        # 进 OpenAPI），不写 docstring：FastAPI 把 docstring 当成接口的说明
         if not visible(http, media_id):
             raise missing(media_id)
         with _sdk_errors(by_id=True):
@@ -419,10 +750,15 @@ def memories_router(
             raise missing(media_id)
         return Response(data, media_type=_image_type(data))
 
-    @router.post("/reset")
-    def reset(http: Request) -> dict[str, Any]:
-        """管理令牌删全部；限定作用域的令牌只删它作用域里的空间（每个都能用 delete_all 删掉），
-        还开着的 run 也只结束这些空间里的。以前限定作用域的令牌一律 403。"""
+    @router.post(
+        "/reset",
+        responses=_ok(ResetResult),
+        description="The admin token deletes every memory; a scoped key deletes the memory "
+        "spaces in its scope.",
+    )
+    def reset(http: Request) -> V1Json:
+        # 管理令牌删全部；限定作用域的令牌只删它作用域里的空间（每个都能用 delete_all 删掉），
+        # 还开着的 run 也只结束这些空间里的。以前限定作用域的令牌一律 403
         who = principal_of(http)
         with _sdk_errors():
             if who.admin:
@@ -430,8 +766,8 @@ def memories_router(
             out = memory._reset(who.allows)
         return {**out, "message": "All memories in this key's scope deleted"}
 
-    @router.post("/answer")
-    def answer(http: Request, request: AnswerRequest) -> dict[str, Any]:
+    @router.post("/answer", responses=_ok(AnswerResult))
+    def answer(http: Request, request: AnswerRequest) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             return memory.answer(
@@ -444,16 +780,14 @@ def memories_router(
                 lam=request.lam,
             )
 
-    @router.get("/profile")
-    def profile(
-        http: Request, user_id: str | None = None, agent_id: str | None = None
-    ) -> dict[str, str]:
+    @router.get("/profile", responses=_ok(ProfileResult))
+    def profile(http: Request, user_id: str | None = None, agent_id: str | None = None) -> V1Json:
         with _sdk_errors():
             allow(http, user_id, agent_id)
             return {"profile": memory.profile(user_id=user_id, agent_id=agent_id)}
 
-    @router.post("/runs")
-    def open_run(http: Request, request: RunRequest) -> dict[str, str]:
+    @router.post("/runs", responses=_ok(RunResult))
+    def open_run(http: Request, request: RunRequest) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             run_id = memory.open_run(
@@ -461,8 +795,8 @@ def memories_router(
             )
         return {"run_id": run_id}
 
-    @router.post("/runs/end")
-    def end_run(http: Request, request: EndRunRequest) -> dict[str, Any]:
+    @router.post("/runs/end", responses=_ok(EndRunResult))
+    def end_run(http: Request, request: EndRunRequest) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             return memory.end_run(
@@ -472,16 +806,16 @@ def memories_router(
                 wait=request.wait,
             )
 
-    @router.post("/consolidate")
-    def consolidate(http: Request, request: ConsolidateRequest) -> dict[str, Any]:
+    @router.post("/consolidate", responses=_ok(ConsolidationReport))
+    def consolidate(http: Request, request: ConsolidateRequest) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             return memory.consolidate(
                 user_id=request.user_id, agent_id=request.agent_id, rebuild=request.rebuild
             )
 
-    @router.post("/wait")
-    def wait() -> dict[str, bool]:
+    @router.post("/wait", responses=_ok(WaitResult))
+    def wait() -> V1Json:
         memory.wait()
         return {"ok": True}
 
@@ -493,16 +827,16 @@ def memories_router(
             allow(http, user_id, agent_id)
             return memory.status(user_id=user_id, agent_id=agent_id)
 
-    @router.get("/export")
+    @router.get("/export", responses=_ok(ExportDocument))
     def export(
         http: Request, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
-    ) -> dict[str, Any]:
+    ) -> V1Json:
         with _sdk_errors(by_id=True):  # 没有这个空间：KeyError（404），与本地相同
             allow(http, user_id, agent_id)
             return memory.export(user_id=user_id, agent_id=agent_id, derived=derived)
 
-    @router.post("/import")
-    def load(http: Request, request: ImportRequest) -> dict[str, Any]:
+    @router.post("/import", responses=_ok(ImportReport))
+    def load(http: Request, request: ImportRequest) -> V1Json:
         # 写进哪个空间与 Memory.load 的取法相同：给了 user_id、agent_id 时是它们的空间，否则是
         # 文件里的 space_id
         if request.user_id or request.agent_id:
@@ -518,8 +852,8 @@ def memories_router(
                 wait=request.wait,
             )
 
-    @router.get("/spaces")
-    def spaces(http: Request) -> list[dict[str, Any]]:
+    @router.get("/spaces", responses=_ok(list[SpaceRow]))
+    def spaces(http: Request) -> V1JsonList:
         who = principal_of(http)
         return [row for row in memory.spaces() if who.allows(row["space_id"])]
 
@@ -577,3 +911,56 @@ def _error(
     if upstream_status is not None:
         body["upstream_status"] = upstream_status
     return JSONResponse({"error": body}, status, dict(headers or {}))
+
+
+def openapi_v1() -> dict[str, Any]:
+    """/api/v1 的 OpenAPI：只有 /api/v1 的接口与它们引用的组件，与 cuemem serve 的 /openapi.json
+    里的这一部分相同（测试核对）。docs/openapi-v1.json 是它的快照（scripts/openapi_v1.py 写出，
+    测试核对没有过时），别的语言的客户端按它生成，例如
+    npx openapi-typescript docs/openapi-v1.json -o cuemem.d.ts。不打开记忆系统。"""
+    keys = Keys()
+    app = FastAPI(
+        title="CueMem memory API",
+        version=__version__,
+        description="The /api/v1 memory API of `cuemem serve`, one endpoint per method of the "
+        "Python SDK (cuemem.Memory); cuemem.MemoryClient is its Python client.",
+    )
+    router = memories_router(
+        cast(Memory, None),  # 生成 OpenAPI 时不调用接口
+        dependencies=guard(keys),
+        route_class=authenticated_route(keys),
+    )
+    app.include_router(router)
+    install_error_format(app)
+    return v1_part(app.openapi())
+
+
+def v1_part(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """一份 OpenAPI 里 /api/v1 的部分：这些接口，与它们（直接或间接）引用的组件。"""
+    paths = {p: ops for p, ops in spec["paths"].items() if p.startswith(PREFIX + "/")}
+    components = spec.get("components", {})
+    schemas = components.get("schemas", {})
+    wanted: set[str] = set()
+    pending: list[Any] = [paths]
+    while pending:
+        for name in _refs(pending.pop()):
+            if name not in wanted:
+                wanted.add(name)
+                pending.append(schemas[name])
+    out: dict[str, Any] = {"schemas": {name: schemas[name] for name in sorted(wanted)}}
+    if "securitySchemes" in components:
+        out["securitySchemes"] = components["securitySchemes"]
+    return {"openapi": spec["openapi"], "info": spec["info"], "paths": paths, "components": out}
+
+
+def _refs(node: Any) -> Iterator[str]:
+    """node 里引用的组件名（"$ref": "#/components/schemas/<名字>"）。"""
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            yield ref.rsplit("/", 1)[-1]
+        for value in node.values():
+            yield from _refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _refs(value)

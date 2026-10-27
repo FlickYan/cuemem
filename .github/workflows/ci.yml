@@ -35,7 +35,7 @@ jobs:
           enable-cache: true
       - name: 构建 wheel
         run: uv build --wheel
-      - name: wheel 里有配置、预设与控制器
+      - name: wheel 里有配置、预设、控制器与类型标记（py.typed）
         run: |
           python3 - <<'EOF'
           import glob
@@ -43,7 +43,7 @@ jobs:
 
           [wheel] = glob.glob("dist/*.whl")
           names = set(zipfile.ZipFile(wheel).namelist())
-          need = {"cuemem/configs/default.yaml"}
+          need = {"cuemem/configs/default.yaml", "cuemem/py.typed"}
           need |= {f"cuemem/configs/presets/{p}.yaml" for p in ("openai", "ollama", "deepseek", "qwen")}
           need |= {f"cuemem/read/controller_model{v}.json" for v in ("", "_v1", "_v2")}
           missing = sorted(need - names)

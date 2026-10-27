@@ -1,0 +1,5563 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CueMem memory API",
+    "description": "The /api/v1 memory API of `cuemem serve`, one endpoint per method of the Python SDK (cuemem.Memory); cuemem.MemoryClient is its Python client.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/memories": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Add",
+        "operationId": "add_api_v1_memories_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Add Api V1 Memories Post",
+                  "$ref": "#/components/schemas/AddResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Get All",
+        "operationId": "get_all_api_v1_memories_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "include_superseded",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Include Superseded"
+            }
+          },
+          {
+            "name": "valid_at",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Valid At"
+            }
+          },
+          {
+            "name": "known_at",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Known At"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "filters",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filters"
+            }
+          },
+          {
+            "name": "top_k",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Top K"
+            }
+          },
+          {
+            "name": "show_expired",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Show Expired"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Get All Api V1 Memories Get",
+                  "$ref": "#/components/schemas/GetAllResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Delete All",
+        "operationId": "delete_all_api_v1_memories_delete",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Delete All Api V1 Memories Delete",
+                  "$ref": "#/components/schemas/ForgetResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/memories/search": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Search",
+        "operationId": "search_api_v1_memories_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResult",
+                  "title": "Response Search Api V1 Memories Search Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/memories/{memory_id}": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Get",
+        "operationId": "get_api_v1_memories__memory_id__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "memory_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Memory Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response 200 Get Api V1 Memories  Memory Id  Get",
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/FactItem"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ExcerptItem"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ImageItem"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "type",
+                    "mapping": {
+                      "fact": "#/components/schemas/FactItem",
+                      "excerpt": "#/components/schemas/ExcerptItem",
+                      "image": "#/components/schemas/ImageItem"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Update",
+        "operationId": "update_api_v1_memories__memory_id__put",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "memory_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Memory Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Update Api V1 Memories  Memory Id  Put",
+                  "$ref": "#/components/schemas/UpdateResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Delete",
+        "operationId": "delete_api_v1_memories__memory_id__delete",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "memory_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Memory Id"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Dry Run"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response 200 Delete Api V1 Memories  Memory Id  Delete",
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ForgetResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunResult"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/memories/{memory_id}/history": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "History",
+        "operationId": "history_api_v1_memories__memory_id__history_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "memory_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Memory Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response 200 History Api V1 Memories  Memory Id  History Get",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HistoryItem"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/{media_id}": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Media",
+        "description": "The original file of an image memory (the path in image items is on the server). Out-of-scope, non-image and unknown ids are 404.",
+        "operationId": "media_api_v1_media__media_id__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "media_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Media Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/reset": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Reset",
+        "description": "The admin token deletes every memory; a scoped key deletes the memory spaces in its scope.",
+        "operationId": "reset_api_v1_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetResult",
+                  "title": "Response Reset Api V1 Reset Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/answer": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Answer",
+        "operationId": "answer_api_v1_answer_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnswerResult",
+                  "title": "Response Answer Api V1 Answer Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/profile": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Profile",
+        "operationId": "profile_api_v1_profile_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Profile Api V1 Profile Get",
+                  "$ref": "#/components/schemas/ProfileResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Open Run",
+        "operationId": "open_run_api_v1_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunResult",
+                  "title": "Response Open Run Api V1 Runs Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/runs/end": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "End Run",
+        "operationId": "end_run_api_v1_runs_end_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EndRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndRunResult",
+                  "title": "Response End Run Api V1 Runs End Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/consolidate": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Consolidate",
+        "operationId": "consolidate_api_v1_consolidate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsolidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsolidationReport",
+                  "title": "Response Consolidate Api V1 Consolidate Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/wait": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Wait",
+        "operationId": "wait_api_v1_wait_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaitResult",
+                  "title": "Response Wait Api V1 Wait Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/export": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Export",
+        "operationId": "export_api_v1_export_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Derived"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Export Api V1 Export Get",
+                  "$ref": "#/components/schemas/ExportDocument"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/import": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Load",
+        "operationId": "load_api_v1_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportReport",
+                  "title": "Response Load Api V1 Import Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/spaces": {
+      "get": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Spaces",
+        "operationId": "spaces_api_v1_spaces_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SpaceRow"
+                  },
+                  "type": "array",
+                  "title": "Response 200 Spaces Api V1 Spaces Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddRequest": {
+        "properties": {
+          "messages": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Messages"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "expiration_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiration Date",
+            "description": "ISO date or datetime"
+          },
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestamp",
+            "description": "ISO datetime or Unix time"
+          },
+          "infer": {
+            "type": "boolean",
+            "title": "Infer",
+            "default": true
+          },
+          "wait": {
+            "type": "boolean",
+            "title": "Wait",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "messages"
+        ],
+        "title": "AddRequest"
+      },
+      "AddResult": {
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/FactEvent"
+            },
+            "type": "array",
+            "title": "Results"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "turn_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Turn Ids"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "empty",
+              "logged",
+              "queued",
+              "consolidated"
+            ],
+            "title": "Status"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "consolidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConsolidationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "results",
+          "session_id",
+          "turn_ids",
+          "status"
+        ],
+        "title": "AddResult"
+      },
+      "AnswerRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "title": "Question"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "l0",
+              "l1",
+              "l2",
+              "agent",
+              "hatch"
+            ],
+            "title": "Mode",
+            "default": "auto"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "router": {
+            "type": "string",
+            "enum": [
+              "learned",
+              "hybrid",
+              "rule",
+              "llm"
+            ],
+            "title": "Router",
+            "default": "learned"
+          },
+          "lam": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lam"
+          }
+        },
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "AnswerRequest"
+      },
+      "AnswerResult": {
+        "properties": {
+          "answer": {
+            "type": "string",
+            "title": "Answer"
+          },
+          "evidence_sufficient": {
+            "type": "boolean",
+            "title": "Evidence Sufficient"
+          },
+          "citations": {
+            "items": {
+              "$ref": "#/components/schemas/Citation"
+            },
+            "type": "array",
+            "title": "Citations"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "answer",
+          "evidence_sufficient",
+          "citations",
+          "level",
+          "reasons"
+        ],
+        "title": "AnswerResult"
+      },
+      "Citation": {
+        "properties": {
+          "ref": {
+            "type": "string",
+            "title": "Ref"
+          },
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "ref",
+          "id",
+          "memory"
+        ],
+        "title": "Citation"
+      },
+      "ConsolidateRequest": {
+        "properties": {
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "rebuild": {
+            "type": "boolean",
+            "title": "Rebuild",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ConsolidateRequest"
+      },
+      "ConsolidationReport": {
+        "properties": {
+          "sessions": {
+            "type": "integer",
+            "title": "Sessions"
+          },
+          "facts_extracted": {
+            "type": "integer",
+            "title": "Facts Extracted"
+          },
+          "added": {
+            "type": "integer",
+            "title": "Added"
+          },
+          "superseded": {
+            "type": "integer",
+            "title": "Superseded"
+          },
+          "merged": {
+            "type": "integer",
+            "title": "Merged"
+          },
+          "noop": {
+            "type": "integer",
+            "title": "Noop"
+          },
+          "entities_created": {
+            "type": "integer",
+            "title": "Entities Created"
+          },
+          "entities_linked": {
+            "type": "integer",
+            "title": "Entities Linked"
+          },
+          "llm_calls": {
+            "type": "integer",
+            "title": "Llm Calls"
+          },
+          "rules": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Rules"
+          },
+          "failed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Failed"
+          },
+          "skipped": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Skipped"
+          },
+          "elapsed_ms": {
+            "type": "number",
+            "title": "Elapsed Ms"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "sessions",
+          "facts_extracted",
+          "added",
+          "superseded",
+          "merged",
+          "noop",
+          "entities_created",
+          "entities_linked",
+          "llm_calls",
+          "rules",
+          "failed",
+          "skipped",
+          "elapsed_ms"
+        ],
+        "title": "ConsolidationReport"
+      },
+      "DryRunFact": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "memory"
+        ],
+        "title": "DryRunFact"
+      },
+      "DryRunResult": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/DryRunTurn"
+            },
+            "type": "array",
+            "title": "Turns"
+          },
+          "sessions_affected": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sessions Affected"
+          },
+          "cascaded": {
+            "type": "integer",
+            "title": "Cascaded"
+          },
+          "restated": {
+            "type": "integer",
+            "title": "Restated"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/DryRunFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "images": {
+            "type": "integer",
+            "title": "Images"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "message",
+          "turns",
+          "sessions_affected",
+          "cascaded",
+          "restated",
+          "facts",
+          "images"
+        ],
+        "title": "DryRunResult",
+        "description": "delete with dry_run=true: what would be deleted; nothing is."
+      },
+      "DryRunTurn": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "role",
+          "text"
+        ],
+        "title": "DryRunTurn"
+      },
+      "EndRunRequest": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "wait": {
+            "type": "boolean",
+            "title": "Wait",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id"
+        ],
+        "title": "EndRunRequest"
+      },
+      "EndRunResult": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "turns": {
+            "type": "integer",
+            "title": "Turns"
+          },
+          "consolidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConsolidationReport"
+              },
+              {
+                "type": "string",
+                "const": "queued"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consolidation"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "session_id",
+          "turns",
+          "consolidation"
+        ],
+        "title": "EndRunResult"
+      },
+      "ErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Error category: invalid_request, forbidden, rate_limited, ..."
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type",
+            "description": "The SDK's exception type (KeyError, ValueError, TypeError or one of cuemem.errors); MemoryClient raises the same. null for 401 and for scope errors."
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "upstream_status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upstream Status",
+            "description": "The embedding provider's own status code (EmbeddingAPIError)."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "code",
+          "type",
+          "message"
+        ],
+        "title": "ErrorDetail"
+      },
+      "ExcerptItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory"
+          },
+          "type": {
+            "type": "string",
+            "const": "excerpt",
+            "title": "Type"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "source_turn_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Turn Ids"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "expiration_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiration Date"
+          },
+          "space_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Space Id"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "memory",
+          "type",
+          "created_at",
+          "session_id",
+          "source_turn_ids",
+          "metadata",
+          "expiration_date"
+        ],
+        "title": "ExcerptItem",
+        "description": "A conversation excerpt (one round)."
+      },
+      "ExportDerived": {
+        "properties": {
+          "facts": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "profile": {
+            "type": "string",
+            "title": "Profile"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "facts",
+          "profile"
+        ],
+        "title": "ExportDerived"
+      },
+      "ExportDocument": {
+        "properties": {
+          "format": {
+            "type": "string",
+            "const": "cuemem.space",
+            "title": "Format"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "exported_at": {
+            "type": "string",
+            "title": "Exported At"
+          },
+          "space_id": {
+            "type": "string",
+            "title": "Space Id"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/ExportSession"
+            },
+            "type": "array",
+            "title": "Sessions"
+          },
+          "derived": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExportDerived"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "format",
+          "version",
+          "exported_at",
+          "space_id",
+          "sessions"
+        ],
+        "title": "ExportDocument",
+        "description": "A memory space as a portable file (cuemem/portable.py); POST /api/v1/import takes it."
+      },
+      "ExportImage": {
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "title": "Sha256"
+          },
+          "mime": {
+            "type": "string",
+            "title": "Mime"
+          },
+          "data": {
+            "type": "string",
+            "title": "Data",
+            "description": "Base64."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "sha256",
+          "mime",
+          "data"
+        ],
+        "title": "ExportImage"
+      },
+      "ExportSession": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "started_at": {
+            "type": "string",
+            "title": "Started At"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/ExportTurn"
+            },
+            "type": "array",
+            "title": "Turns"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "session_id",
+          "started_at",
+          "turns"
+        ],
+        "title": "ExportSession"
+      },
+      "ExportTurn": {
+        "properties": {
+          "idx": {
+            "type": "integer",
+            "title": "Idx"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "ts": {
+            "type": "string",
+            "title": "Ts"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "images": {
+            "items": {
+              "$ref": "#/components/schemas/ExportImage"
+            },
+            "type": "array",
+            "title": "Images"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "edit_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edit Of"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "idx",
+          "role",
+          "text",
+          "ts",
+          "speaker",
+          "images"
+        ],
+        "title": "ExportTurn"
+      },
+      "FactEvent": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory"
+          },
+          "type": {
+            "type": "string",
+            "const": "fact",
+            "title": "Type"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "predicate": {
+            "type": "string",
+            "title": "Predicate"
+          },
+          "object": {
+            "type": "string",
+            "title": "Object"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "attribute",
+              "preference",
+              "possession",
+              "relationship",
+              "event",
+              "plan",
+              "other"
+            ],
+            "title": "Category"
+          },
+          "importance": {
+            "type": "integer",
+            "title": "Importance"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "\"current\", or since when it is no longer true or corrected."
+          },
+          "valid_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid From"
+          },
+          "valid_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid To"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "invalidated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invalidated At"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "source_turn_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Turn Ids"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "expiration_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiration Date"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score",
+            "description": "Search only: for ranking, not a similarity."
+          },
+          "space_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Space Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "event": {
+            "type": "string",
+            "enum": [
+              "ADD",
+              "UPDATE"
+            ],
+            "title": "Event"
+          },
+          "previous_memory": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Memory"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "changed",
+                  "corrected"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "memory",
+          "type",
+          "subject",
+          "predicate",
+          "object",
+          "category",
+          "importance",
+          "status",
+          "valid_from",
+          "valid_to",
+          "created_at",
+          "invalidated_at",
+          "superseded_by",
+          "session_id",
+          "source_turn_ids",
+          "metadata",
+          "expiration_date",
+          "event"
+        ],
+        "title": "FactEvent",
+        "description": "A fact that add or update created (Mem0's ADD / UPDATE events)."
+      },
+      "FactItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory"
+          },
+          "type": {
+            "type": "string",
+            "const": "fact",
+            "title": "Type"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "predicate": {
+            "type": "string",
+            "title": "Predicate"
+          },
+          "object": {
+            "type": "string",
+            "title": "Object"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "attribute",
+              "preference",
+              "possession",
+              "relationship",
+              "event",
+              "plan",
+              "other"
+            ],
+            "title": "Category"
+          },
+          "importance": {
+            "type": "integer",
+            "title": "Importance"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "\"current\", or since when it is no longer true or corrected."
+          },
+          "valid_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid From"
+          },
+          "valid_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid To"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "invalidated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invalidated At"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "source_turn_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Turn Ids"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "expiration_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiration Date"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score",
+            "description": "Search only: for ranking, not a similarity."
+          },
+          "space_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Space Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "memory",
+          "type",
+          "subject",
+          "predicate",
+          "object",
+          "category",
+          "importance",
+          "status",
+          "valid_from",
+          "valid_to",
+          "created_at",
+          "invalidated_at",
+          "superseded_by",
+          "session_id",
+          "source_turn_ids",
+          "metadata",
+          "expiration_date"
+        ],
+        "title": "FactItem",
+        "description": "A fact. Times are ISO 8601 in the server's local time."
+      },
+      "ForgetResult": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "turns_deleted": {
+            "type": "integer",
+            "title": "Turns Deleted"
+          },
+          "sessions_affected": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sessions Affected"
+          },
+          "facts_before": {
+            "type": "integer",
+            "title": "Facts Before"
+          },
+          "facts_after": {
+            "type": "integer",
+            "title": "Facts After"
+          },
+          "images_deleted": {
+            "type": "integer",
+            "title": "Images Deleted"
+          },
+          "restated": {
+            "type": "integer",
+            "title": "Restated"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "message",
+          "turns_deleted",
+          "sessions_affected",
+          "facts_before",
+          "facts_after",
+          "images_deleted",
+          "restated"
+        ],
+        "title": "ForgetResult"
+      },
+      "GetAllResult": {
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/FactItem"
+            },
+            "type": "array",
+            "title": "Results"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "results"
+        ],
+        "title": "GetAllResult"
+      },
+      "HistoryItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory"
+          },
+          "type": {
+            "type": "string",
+            "const": "fact",
+            "title": "Type"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "predicate": {
+            "type": "string",
+            "title": "Predicate"
+          },
+          "object": {
+            "type": "string",
+            "title": "Object"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "attribute",
+              "preference",
+              "possession",
+              "relationship",
+              "event",
+              "plan",
+              "other"
+            ],
+            "title": "Category"
+          },
+          "importance": {
+            "type": "integer",
+            "title": "Importance"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "\"current\", or since when it is no longer true or corrected."
+          },
+          "valid_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid From"
+          },
+          "valid_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid To"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "invalidated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invalidated At"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "source_turn_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Turn Ids"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "expiration_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiration Date"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score",
+            "description": "Search only: for ranking, not a similarity."
+          },
+          "space_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Space Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "event": {
+            "type": "string",
+            "enum": [
+              "ADD",
+              "UPDATE"
+            ],
+            "title": "Event"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "memory",
+          "type",
+          "subject",
+          "predicate",
+          "object",
+          "category",
+          "importance",
+          "status",
+          "valid_from",
+          "valid_to",
+          "created_at",
+          "invalidated_at",
+          "superseded_by",
+          "session_id",
+          "source_turn_ids",
+          "metadata",
+          "expiration_date",
+          "event"
+        ],
+        "title": "HistoryItem"
+      },
+      "ImageItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "memory": {
+            "type": "string",
+            "title": "Memory",
+            "description": "The image's caption."
+          },
+          "type": {
+            "type": "string",
+            "const": "image",
+            "title": "Type"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "attached": {
+            "type": "boolean",
+            "title": "Attached"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "expiration_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiration Date"
+          },
+          "space_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Space Id"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id",
+          "memory",
+          "type",
+          "path",
+          "created_at",
+          "attached",
+          "metadata",
+          "expiration_date"
+        ],
+        "title": "ImageItem",
+        "description": "An image; GET /api/v1/media/{id} returns the file (path is on the server)."
+      },
+      "ImportReport": {
+        "properties": {
+          "space_id": {
+            "type": "string",
+            "title": "Space Id"
+          },
+          "sessions": {
+            "type": "integer",
+            "title": "Sessions"
+          },
+          "turns_added": {
+            "type": "integer",
+            "title": "Turns Added"
+          },
+          "images_added": {
+            "type": "integer",
+            "title": "Images Added"
+          },
+          "consolidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConsolidationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "space_id",
+          "sessions",
+          "turns_added",
+          "images_added"
+        ],
+        "title": "ImportReport"
+      },
+      "ImportRequest": {
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "wait": {
+            "type": "boolean",
+            "title": "Wait",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "ImportRequest"
+      },
+      "ProfileResult": {
+        "properties": {
+          "profile": {
+            "type": "string",
+            "title": "Profile"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "profile"
+        ],
+        "title": "ProfileResult"
+      },
+      "ResetResult": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "spaces_deleted": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Spaces Deleted"
+          },
+          "turns_deleted": {
+            "type": "integer",
+            "title": "Turns Deleted"
+          },
+          "images_deleted": {
+            "type": "integer",
+            "title": "Images Deleted"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "message",
+          "spaces_deleted",
+          "turns_deleted",
+          "images_deleted"
+        ],
+        "title": "ResetResult"
+      },
+      "RunRequest": {
+        "properties": {
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          }
+        },
+        "type": "object",
+        "title": "RunRequest"
+      },
+      "RunResult": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "run_id"
+        ],
+        "title": "RunResult"
+      },
+      "SearchRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "l0",
+              "l1",
+              "l2"
+            ],
+            "title": "Mode",
+            "default": "auto"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "router": {
+            "type": "string",
+            "enum": [
+              "learned",
+              "hybrid",
+              "rule",
+              "llm"
+            ],
+            "title": "Router",
+            "default": "learned"
+          },
+          "lam": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lam"
+          },
+          "filters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filters"
+          },
+          "top_k": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top K"
+          },
+          "min_level": {
+            "type": "string",
+            "enum": [
+              "l0",
+              "l1"
+            ],
+            "title": "Min Level",
+            "default": "l1"
+          },
+          "show_expired": {
+            "type": "boolean",
+            "title": "Show Expired",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest"
+      },
+      "SearchResult": {
+        "properties": {
+          "results": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/FactItem"
+                },
+                {
+                  "$ref": "#/components/schemas/ExcerptItem"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "type",
+                "mapping": {
+                  "excerpt": "#/components/schemas/ExcerptItem",
+                  "fact": "#/components/schemas/FactItem"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Results"
+          },
+          "images": {
+            "items": {
+              "$ref": "#/components/schemas/ImageItem"
+            },
+            "type": "array",
+            "title": "Images"
+          },
+          "profile": {
+            "type": "string",
+            "title": "Profile"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "L0",
+              "L1",
+              "L2"
+            ],
+            "title": "Level"
+          },
+          "see": {
+            "type": "boolean",
+            "title": "See"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "results",
+          "images",
+          "profile",
+          "level",
+          "see",
+          "reasons"
+        ],
+        "title": "SearchResult"
+      },
+      "SpaceRow": {
+        "properties": {
+          "space_id": {
+            "type": "string",
+            "title": "Space Id"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "sessions": {
+            "type": "integer",
+            "title": "Sessions"
+          },
+          "turns": {
+            "type": "integer",
+            "title": "Turns"
+          },
+          "units": {
+            "type": "integer",
+            "title": "Units"
+          },
+          "current_facts": {
+            "type": "integer",
+            "title": "Current Facts"
+          },
+          "facts": {
+            "type": "integer",
+            "title": "Facts"
+          },
+          "entities": {
+            "type": "integer",
+            "title": "Entities"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "space_id",
+          "created_at",
+          "sessions",
+          "turns",
+          "units",
+          "current_facts",
+          "facts",
+          "entities"
+        ],
+        "title": "SpaceRow"
+      },
+      "UpdateRequest": {
+        "properties": {
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "title": "UpdateRequest"
+      },
+      "UpdateResult": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/FactEvent"
+            },
+            "type": "array",
+            "title": "Results"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "turn_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Turn Ids"
+          },
+          "consolidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConsolidationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "message",
+          "id",
+          "results",
+          "session_id",
+          "turn_ids"
+        ],
+        "title": "UpdateResult"
+      },
+      "V1ErrorBody": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "V1ErrorBody",
+        "description": "Every /api/v1 error has this shape, including 401, 404 and 422."
+      },
+      "WaitResult": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "title": "WaitResult"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}
