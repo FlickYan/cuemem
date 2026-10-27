@@ -209,6 +209,68 @@ def test_metadata_filters_and_expiration(mem: Mem) -> None:
         mem.get_all()
     assert len(mem.get_all(user_id="dan")["results"]) == 3  # 报错时什么都没写
 
+    # show_expired（Mem0 的写法）：过期的也列出；画像照旧不给。以前只有 export 与已知的 ID
+    shown = mem.get_all(user_id="dan", show_expired=True)["results"]
+    assert sorted(f["memory"] for f in shown) == [
+        "I like chess",
+        "I like green tea",
+        "I like rain",
+        "I like snow",
+    ]
+    rain = mem.search("Do I like rain?", user_id="dan", mode="l1", show_expired=True)
+    assert any("rain" in r["memory"] for r in rain["results"])
+    assert "rain" not in rain["profile"]
+    hidden = mem.search("Do I like rain?", user_id="dan", mode="l1")["results"]
+    assert not any("rain" in r["memory"] for r in hidden)
+
+
+def test_mem0_call_shapes(mem: Mem) -> None:
+    """Mem0 2.x 的写法：update(memory_id=, text=)（data 是它旧的名字）、只给 metadata 的 update
+    报 ValueError（以前是 TypeError）；limit、top_k 要是正整数：以前 limit=0 给出全部结果，
+    limit=-1 悄悄少给一条。本地与远程相同。"""
+    berlin = mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)["results"][0]
+    mem.add("I like chess", user_id="alice", wait=True)
+    moved = mem.update(memory_id=berlin["id"], text="I moved to Munich")
+    assert moved["message"] == "Memory updated"
+    paris = mem.update(moved["results"][0]["id"], data="I live in Paris")
+    assert paris["message"] == "Memory updated"
+    current = paris["results"][0]["id"]
+    for call in (
+        lambda: mem.update(current, metadata={"k": 1}),
+        lambda: mem.update(current, text="I live in Rome", data="I live in Oslo"),
+    ):
+        with pytest.raises(ValueError, match="text"):
+            call()
+    every = mem.get_all(user_id="alice")["results"]
+    assert len(every) == 2 and len(mem.get_all(user_id="alice", limit=1)["results"]) == 1
+    for bad in (0, -1, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            mem.get_all(user_id="alice", limit=bad)
+        with pytest.raises(ValueError, match="positive integer"):
+            mem.search("Where do I live?", user_id="alice", limit=bad)
+        with pytest.raises(ValueError, match="positive integer"):
+            mem.search("Where do I live?", user_id="alice", top_k=bad)
+    found = mem.search("Where do I live?", user_id="alice", mode="l1")["results"]
+    assert len(found) > 1
+    two = mem.search("Where do I live?", user_id="alice", mode="l1", top_k=len(found) - 1)
+    assert len(two["results"]) == len(found) - 1
+
+
+def test_client_host_and_base_url(system: MemorySystem) -> None:
+    """MemoryClient(host=…) 是 Mem0 的写法，与 base_url 相同；没有 http(s):// 的地址（Mem0 的
+    MemoryClient("m0-…") 把 API Key 放在第一个参数）在构造时报错，报错里不带这个值。以前要等
+    第一次调用才报"Cannot reach"。"""
+    with TestClient(v1_app(system)) as http:
+        assert MemoryClient(host="http://testserver", http_client=http).spaces() == []
+        with pytest.raises(ValueError, match="not both"):
+            MemoryClient("http://testserver", host="http://testserver", http_client=http)
+    for wrong in ("m0-secret-key", "localhost:7860"):
+        with pytest.raises(ValueError, match="http://") as raised:
+            MemoryClient(wrong)
+        assert wrong not in str(raised.value)
+    with pytest.raises(ValueError, match="http://"):
+        AsyncMemoryClient("m0-secret-key")
+
 
 def test_update_delete_reset_and_their_errors(mem: Mem) -> None:
     berlin = mem.add(

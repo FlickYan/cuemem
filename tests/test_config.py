@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
-from cuemem.config import PROJECT_ROOT, QWENCLOUD_EMBEDDING_URL, Settings, load_settings
+from cuemem.config import (
+    DEFAULT_CONFIG,
+    PRESETS_DIR,
+    PROJECT_ROOT,
+    QWENCLOUD_EMBEDDING_URL,
+    Settings,
+    load_settings,
+    unknown_keys,
+)
 
 
 def test_default_config(settings: Settings) -> None:
@@ -61,3 +70,38 @@ def test_unknown_model_reference_is_rejected(
     monkeypatch.setenv("CUEMEM_ROLES__READER__MODEL", "no-such-model")
     with pytest.raises(ValidationError, match="no-such-model"):
         load_settings()
+
+
+def test_shipped_configs_have_no_unknown_keys() -> None:
+    """默认配置与每个预设都只用配置模型认识的键：Memory(config) 对不认识的键报错，YAML 本身
+    照旧宽松（CLI 与评测都读它），这个测试防止它们悄悄写错。"""
+    for path in [DEFAULT_CONFIG, *sorted(PRESETS_DIR.glob("*.yaml"))]:
+        assert unknown_keys(yaml.safe_load(path.read_text(encoding="utf-8")) or {}) == [], path
+
+
+def test_unknown_keys_walks_the_config_models() -> None:
+    """子模型、X | None、dict[str, 子模型] 的每个值都查，extra_body 里是供应商的参数，不查；
+    附上最像的已知键。"""
+    found = unknown_keys(
+        {
+            "retreival": {},
+            "consolidation": {"instruction": "x", "workers": 2},
+            "retrieval": {"controler": "v1.json"},
+            "proxy": {"unknown_models": "reject"},
+            "roles": {"reader": {"modle": "x", "temperature": 0.1}},
+            "models": {"m": {"extra_body": {"anything": 1}, "pricee": 1}},
+            "providers": {"p": {"base_url": "u", "peak_hours": {"windowz": []}}},
+            "llm": {"provider": "openai"},
+        }
+    )
+    assert found == [
+        ("retreival", "retrieval"),
+        ("consolidation.instruction", "consolidation.instructions"),
+        ("retrieval.controler", "retrieval.controller"),
+        ("proxy.unknown_models", "proxy.unknown_model"),
+        ("roles.reader.modle", "roles.reader.model"),
+        ("models.m.pricee", "models.m.price"),
+        ("providers.p.peak_hours.windowz", "providers.p.peak_hours.windows"),
+        ("llm", None),
+    ]
+    assert unknown_keys({"embedding": {"backend": "hash", "dim": 64}, "peak_policy": "warn"}) == []

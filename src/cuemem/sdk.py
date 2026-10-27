@@ -16,7 +16,8 @@ CueMem 自己的设计：
   search / get_all / delete_all 给了 run_id 时只看、只删这个会话的记忆；
 - add 的 metadata 随发言存在原始层（不进抽取），事实与对话片段带上出处各句的 metadata，
   filters 里可以按它筛（Mem0 的 eq / ne / in / gte / lte… 与 AND / OR / NOT）；expiration_date
-  过期之后 search、get_all 与画像里不再出现（get 与 history 照样取得到，数据要 delete 才删）；
+  过期之后 search、get_all 与画像里不再出现（show_expired=True 时 search、get_all 照样列出，
+  get 与 history 照样取得到，数据要 delete 才删）；
 - 写入分两步：add 先在线写入原始日志（不调用 LLM，立即可检索），抽取事实在后台完成；
   wait=True 时同步抽取，并按 Mem0 的格式返回 ADD / UPDATE 事件；一段对话分多次写入时用
   run() 包起来，结束时整段只抽取一次；
@@ -53,7 +54,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx2
 
-from cuemem.config import Settings, load_settings
+from cuemem.config import Settings, load_settings, presets, unknown_keys
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import (
     Answer,
@@ -149,7 +150,8 @@ class Memory:
     """CueMem 的 Python SDK。线程安全；用完调用 close()，或用 with 语句。
 
     config：嵌套的字典，与默认配置（及预设）深度合并，例如
-    {"roles": {"reader": {"model": "qwen3.8-flash"}}}；home：数据目录（默认 CUEMEM_HOME，
+    {"roles": {"reader": {"model": "qwen3.8-flash"}}}；有不认识的键（写错的、Mem0 格式的配置）时
+    报 ValueError，不悄悄用默认的模型供应商（见 _check_config）；home：数据目录（默认 CUEMEM_HOME，
     源码仓库里是仓库根目录，否则 ~/.cuemem）；instructions：给抽取的补充说明（记什么、不记什么）；
     background：后台线程抽取事实（默认开）。
 
@@ -178,6 +180,7 @@ class Memory:
                 settings = settings.model_copy(update={"peak_policy": peak_policy})
         else:
             overrides = dict(config or {})
+            _check_config(overrides)
             if peak_policy is not None:
                 overrides["peak_policy"] = peak_policy
             # 交互式调用不继承配置里批量任务用的 wait：高峰最长 4 小时，调用方看起来像卡死（D-024）
@@ -445,19 +448,27 @@ class Memory:
                 self._run_seen[key] = time.monotonic()
 
     def update(
-        self, memory_id: str, data: str, *, metadata: Mapping[str, Any] | None = None
+        self,
+        memory_id: str,
+        text: str | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        data: str | None = None,
     ) -> dict[str, Any]:
         """改一条记忆（Mem0 的 update）。事实不就地改写（派生记忆是原始日志的函数，D-021、
-        D-061）：像用户那样说一句更正——"Correction: <data>" 记进一段新的会话（edit-…），原始层
+        D-061）：像用户那样说一句更正——"Correction: <text>" 记进一段新的会话（edit-…），原始层
         记下它要取代的事实（edit_of）——再同步巩固：由这句抽出的新事实以"说错了"（corrected）
         取代原来那条，不问 LLM；history() 里看得到前后两个版本，遗忘这句更正时原来那条恢复。
 
-        新事实带上原来那条的 metadata（metadata 参数里的键覆盖它）与过期时间。返回 Mem0 风格的
-        事件（UPDATE 附上被取代的旧版本）；从 data 里没有抽出事实时，原来那条不变，message 写明，
-        这句更正也从日志里遗忘（turn_ids 是空的）。
+        text 与 data 是同一个参数（Mem0 2.x 叫 text，data 是它旧的名字）：给一个就行，两个都给且
+        不同时 ValueError。只给 metadata 时 ValueError：metadata 记在原始层的发言上，要随一句
+        更正写进去。新事实带上原来那条的 metadata（metadata 参数里的键覆盖它）与过期时间。返回
+        Mem0 风格的事件（UPDATE 附上被取代的旧版本）；从 text 里没有抽出事实时，原来那条不变，
+        message 写明，这句更正也从日志里遗忘（turn_ids 是空的）。
         更正记下之后抽取出错时不抛出（与 add 的 wait=True 相同）：message 与 error 写明，下次
         巩固时补上。
         只能改当前有效的版本（ValueError）；ID 不存在时 KeyError。"""
+        data = _correction(text, data)
         found = self._find(memory_id)
         if found is None:
             raise KeyError(f"No memory with id {memory_id}")
@@ -468,7 +479,7 @@ class Memory:
                 "update the current version (see history())."
             )
         if not data.strip():
-            raise ValueError("data is empty: to remove a memory, call delete().")
+            raise ValueError("text is empty: to remove a memory, call delete().")
         sources = _Sources.load(self.system, space, fact.source_turn_ids)
         inherited = {**sources.metadata(fact.source_turn_ids), **dict(metadata or {})}
         info = _turn_meta(inherited, sources.expires(fact.source_turn_ids)) or TurnMeta()
@@ -597,19 +608,27 @@ class Memory:
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
         min_level: Literal["l0", "l1"] = "l1",
+        show_expired: bool = False,
     ) -> dict[str, Any]:
         """检索（不回答）。mode="auto" 由检索控制器选档，结果里的 level 与 reasons 说明它为什么
-        这么选；limit 截断结果条数。调用 search 就是已经决定要查记忆：与 MCP、各框架集成的
-        recall 相同，控制器选了 L0（这句话不需要回忆）时改走 L1，reasons 写明，控制器只决定要不要
-        查得更深。min_level="l0" 时照控制器的决定，L0 只返回画像；mode="l0" 直接只要画像。
+        这么选；limit 截断结果条数（正整数，否则 ValueError）。调用 search 就是已经决定要查记忆：
+        与 MCP、各框架集成的 recall 相同，控制器选了 L0（这句话不需要回忆）时改走 L1，reasons
+        写明，控制器只决定要不要查得更深。min_level="l0" 时照控制器的决定，L0 只返回画像；
+        mode="l0" 直接只要画像。
 
         filters={"user_id": …, "agent_id": …, "run_id": …} 与 top_k 是 Mem0 v3 的写法，与
         user_id、limit 等价。run_id：只要这个会话里的事实、对话片段与图片。filters 里的其他键是
         metadata 的条件（见 _check_where）。检索照常在整个空间里做（控制器与 L1 / L2 不变），
-        再按会话、条件与过期时间筛，所以结果可能少于 limit；画像是整个空间的（去掉过期的事实）。
+        再按会话、条件与过期时间筛，所以结果可能少于 limit；show_expired=True 时过期的也给
+        （Mem0 的写法）。画像是整个空间的（总是去掉过期的事实）。
+
+        score 只用来排序（L1 是排名融合的分数，第一名约 0.016），不是相似度：没有 Mem0 的
+        threshold（按 Mem0 默认的 0.1 截断会什么都不剩）；Mem0 的 rerank 对应 mode="l2"。
         """
+        _count("limit", limit)
+        _count("top_k", top_k)
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
-        limit = limit or top_k
+        limit = limit if limit is not None else top_k
         space = space_for(user_id, agent_id)
         if not self.system.db.has_sessions(space):
             return _empty(self.system, space)
@@ -628,7 +647,9 @@ class Memory:
                 recall = self.system.retrieve(
                     space, query, question_time=when, mode="l1", candidates=recall.candidates
                 )
-            select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
+            select = _Select(
+                run_id, where, _scope_record(user_id, agent_id), datetime.now(), show_expired
+            )
             out = _recall_out(self.system, space, recall, user_id, agent_id, limit, select)
         if raised:
             out["reasons"] = [RAISED_REASON]
@@ -664,23 +685,29 @@ class Memory:
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
+        show_expired: bool = False,
     ) -> dict[str, Any]:
         """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at="2025-06" 是那时
         现实中成立的事实，known_at 是系统在那一刻相信的事实。run_id：只要这个会话里记下的事实；
-        filters 里的其他键是 metadata 的条件（同 search）。过期的事实不给。"""
+        filters 里的其他键是 metadata 的条件（同 search）。过期的事实默认不给，show_expired=True
+        时也给（以前除了 export 与已知的 ID，没有办法列出过期的记忆）。limit 同 search。"""
+        _count("limit", limit)
+        _count("top_k", top_k)
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
-        limit = limit or top_k
+        limit = limit if limit is not None else top_k
         space = space_for(user_id, agent_id)
         current = not include_superseded and valid_at is None and known_at is None
         facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
         sources = _Sources.load(self.system, space, [t for f in facts for t in f.source_turn_ids])
-        select = _Select(run_id, where, _scope_record(user_id, agent_id), datetime.now())
+        select = _Select(
+            run_id, where, _scope_record(user_id, agent_id), datetime.now(), show_expired
+        )
         items = [
             _fact_item(f, None, user_id, agent_id, sources)
             for f in facts
             if select.keep(f.session_id, f.source_turn_ids, sources)
         ]
-        return {"results": items[:limit] if limit else items}
+        return {"results": items[:limit] if limit is not None else items}
 
     def get(self, memory_id: str) -> dict[str, Any] | None:
         """按 ID 取一条事实（不用给 user_id：ID 里已经带着空间）。过期的也取得到。"""
@@ -926,6 +953,52 @@ def _threaded[**P, R](method: Callable[P, R]) -> Callable[P, Any]:
 
 # ---------- 输入 ----------
 
+# Mem0 配置字典的键（Mem0 2.2 的 MemoryConfig）：出现时报错里附上换成 CueMem 写法的提示
+_MEM0_KEYS = {
+    "llm",
+    "embedder",
+    "vector_store.provider",
+    "vector_store.config",
+    "custom_instructions",
+    "history_db_path",
+    "reranker",
+    "graph_store",
+    "version",
+}
+# 是 Memory() 与 load_settings 的参数、不是配置字段的键：以前写进 config 时被悄悄丢掉（preset、
+# home 报"multiple values"，config_path、env_file 被当成 load_settings 自己的参数）
+_KEYWORD_KEYS = ("preset", "home", "config_path", "env_file")
+
+
+def _check_config(config: Mapping[str, Any]) -> None:
+    """Memory(config) 的配置字典里有配置模型不认识的键时报 ValueError（config.unknown_keys）。
+
+    以前不认识的键被悄悄丢掉：写错的键（consolidation.instruction）不起作用，Mem0 格式的配置
+    （llm: openai……）照样用默认的模型供应商，用户的话发给了调用方没有配置过的供应商。只查
+    Memory() 收到的字典：Settings 对象、CUEMEM_* 环境变量与 YAML（CLI、评测都经过）不变。"""
+    unknown = unknown_keys(config)
+    if not unknown:
+        return
+    listed = ", ".join(f"{key} (did you mean {near}?)" if near else key for key, near in unknown)
+    message = (
+        f"Unknown config keys: {listed}. The config dict is merged into CueMem's own "
+        "configuration (see configs/default.yaml); unknown keys are refused, not ignored."
+    )
+    keys = {key for key, _ in unknown}
+    keywords = [key for key in _KEYWORD_KEYS if key in keys]
+    if keywords:
+        message += " Pass " + ", ".join(f"{k}=" for k in keywords) + " as keyword arguments."
+    if keys & _MEM0_KEYS:
+        choices = ", ".join(f'"{name}"' for name in presets())
+        message += (
+            " This looks like a Mem0 config, which CueMem does not read: choose the models "
+            f'with a preset, Memory(preset="openai") (presets: {choices}), or with "models" '
+            'and "roles" as in configs/default.yaml; pass custom_instructions as '
+            "Memory(instructions=...); use a Qdrant server with "
+            '{"vector_store": {"url": "http://localhost:6333"}}.'
+        )
+    raise ValueError(message)
+
 
 def parse_messages(messages: MessagesIn, when: datetime) -> tuple[list[TurnIn], list[Path]]:
     """OpenAI 格式的消息 → 发言。返回发言与需要事后删除的临时图片文件。"""
@@ -1017,6 +1090,27 @@ def _turn_meta(
         raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
     expires = normalize_expiry(expiration_date)
     return TurnMeta(metadata=meta, expires_at=expires) if meta or expires else None
+
+
+def _correction(text: str | None, data: str | None) -> str:
+    """update 的 text 与 data（Mem0 2.x 的新旧两个名字）→ 更正的内容。MemoryClient.update 先在
+    客户端做第一项检查（报错相同），都没给时由服务端的这里报错。"""
+    if text is not None and data is not None and text != data:
+        raise ValueError("Give text or data (the same argument), not two different values.")
+    chosen = text if text is not None else data
+    if chosen is None:
+        raise ValueError(
+            "update needs text: CueMem keeps metadata on the conversation turns a memory came "
+            "from, so pass text= (the corrected memory) together with metadata=."
+        )
+    return chosen
+
+
+def _count(name: str, value: int | None) -> None:
+    """search / get_all 的 limit、top_k：None 或正整数。以前 limit=0 给出全部结果，limit=-1 悄悄
+    少给一条（items[:-1]）。MemoryClient 有一份相同的检查（client._count）。"""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError(f"{name} must be a positive integer (got {value!r}).")
 
 
 _SCOPE_KEYS = ("user_id", "agent_id", "run_id")
@@ -1179,17 +1273,19 @@ class _Sources:
 
 @dataclass
 class _Select:
-    """search / get_all 的事后筛选：会话（run_id）、metadata 的条件与过期时间。"""
+    """search / get_all 的事后筛选：会话（run_id）、metadata 的条件与过期时间（show_expired 时
+    不看过期时间；画像另算，总是去掉过期的）。"""
 
     run_id: str | None
     where: Mapping[str, Any] | None
     scope: Mapping[str, str]
     now: datetime
+    show_expired: bool = False
 
     def keep(self, session_id: str | None, turn_ids: Sequence[str], sources: _Sources) -> bool:
         if self.run_id is not None and session_id != self.run_id:
             return False
-        if sources.expired(turn_ids, self.now):
+        if not self.show_expired and sources.expired(turn_ids, self.now):
             return False
         if not self.where:
             return True
@@ -1339,7 +1435,7 @@ def _recall_out(
     items += [_excerpt_item(h, sources) for h in sorted(rounds, key=lambda h: -h.score)]
     decision = recall.decision
     return {
-        "results": items[:limit] if limit else items,
+        "results": items[:limit] if limit is not None else items,
         "images": [_image_item(m, m.id in view.attach, sources) for m in media],
         "profile": _profile(system, space, view.core, select.now),
         "level": recall.level.upper(),

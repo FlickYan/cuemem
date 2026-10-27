@@ -10,7 +10,11 @@ API Key 不写进配置文件，而是从环境变量或数据目录的 .env 中
 
 from __future__ import annotations
 
+import difflib
 import os
+import types
+import typing
+from collections.abc import Mapping
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
@@ -303,6 +307,47 @@ class Settings(BaseSettings):
         if self.rerank.provider is not None:
             used.add(self.rerank.provider)
         return [name for name in self.providers if name in used]
+
+
+def unknown_keys(
+    data: Mapping[str, Any], model: type[BaseModel] = Settings, prefix: str = ""
+) -> list[tuple[str, str | None]]:
+    """配置字典里配置模型不认识的键：（带点的路径，最像的已知键或 None）。
+
+    Settings 与各层的子模型都悄悄丢掉不认识的键（extra="ignore"）：写错的键、Mem0 格式的配置
+    （llm、embedder……）被当成没写，用的仍是默认的模型供应商。这里沿配置模型往下走：子模型
+    （包括 X | None）、dict[str, 子模型] 的每个值（providers、models、roles）；dict[str, Any]
+    （extra_body）里是供应商自己的参数，不查。值的类型不对时不管，交给 pydantic 报错。"""
+    found: list[tuple[str, str | None]] = []
+    fields = model.model_fields
+    for key, value in data.items():
+        dotted = f"{prefix}{key}"
+        if key not in fields:
+            near = difflib.get_close_matches(str(key), list(fields), n=1)
+            found.append((dotted, f"{prefix}{near[0]}" if near else None))
+            continue
+        annotation = fields[key].annotation
+        sub = _model_of(annotation)
+        if sub is not None:
+            if isinstance(value, Mapping):
+                found += unknown_keys(value, sub, f"{dotted}.")
+        elif typing.get_origin(annotation) is dict and isinstance(value, Mapping):
+            item_model = _model_of(typing.get_args(annotation)[1])
+            for name, item in value.items():
+                if item_model is not None and isinstance(item, Mapping):
+                    found += unknown_keys(item, item_model, f"{dotted}.{name}.")
+    return found
+
+
+def _model_of(annotation: Any) -> type[BaseModel] | None:
+    """注解里的配置子模型：X 或 X | None 中的 BaseModel 子类；没有时是 None。"""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        for arg in typing.get_args(annotation):
+            if (found := _model_of(arg)) is not None:
+                return found
+    return None
 
 
 def source_checkout() -> bool:

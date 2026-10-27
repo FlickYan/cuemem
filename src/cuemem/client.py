@@ -60,23 +60,35 @@ class MemoryClient:
     """cuemem serve 的记忆接口（/api/v1）的客户端，方法与 cuemem.sdk.Memory 相同。线程安全；
     用完调用 close()，或用 with 语句。
 
-    base_url：服务的地址（默认 cuemem serve 的 http://127.0.0.1:7860）；api_key：访问令牌，不填时
-    读环境变量 CUEMEM_API_TOKEN（与服务端同名）。限定作用域的令牌（服务端的 CUEMEM_API_KEYS_FILE）
-    只能访问它的用户：之外的 user_id、agent_id 报 MemoryAPIError（status 403），别人的记忆 ID 与
-    不存在的一样；timeout：单次请求的秒数（wait=True 的 add、update
+    base_url：服务的地址（默认 cuemem serve 的 http://127.0.0.1:7860），要以 http:// 或 https://
+    开头（ValueError）；host 是它的别名（Mem0 的 MemoryClient 这样叫），两个不能都给。api_key：
+    访问令牌，不填时读环境变量 CUEMEM_API_TOKEN（与服务端同名）。限定作用域的令牌（服务端的
+    CUEMEM_API_KEYS_FILE）只能访问它的用户：之外的 user_id、agent_id 报 MemoryAPIError（status
+    403），别人的记忆 ID 与不存在的一样；timeout：单次请求的秒数（wait=True 的 add、update
     要等抽取做完）；http_client：自带的 httpx2.Client（测试里传 FastAPI 的 TestClient；超时照它
     自己的设置，timeout 不再起作用）。
     """
 
     def __init__(
         self,
-        base_url: str = DEFAULT_URL,
+        base_url: str | None = None,
         *,
         api_key: str | None = None,
+        host: str | None = None,
         timeout: float = 300.0,
         http_client: httpx2.Client | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        if base_url is not None and host is not None:
+            raise ValueError("Give base_url or host (the same argument), not both.")
+        url = base_url if base_url is not None else host if host is not None else DEFAULT_URL
+        # 以前 Mem0 的写法 MemoryClient("m0-…")（第一个参数是 API Key）在第一次调用时才报错。
+        # 报错里不带这个值：它可能就是令牌
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ValueError(
+                "base_url must start with http:// or https:// (cuemem serve listens on "
+                f"{DEFAULT_URL} by default); the token goes in api_key=, not the first argument."
+            )
+        self.base_url = url.rstrip("/")
         token = api_key or os.environ.get(TOKEN_ENV) or None
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
         self._owns_http = http_client is None
@@ -156,10 +168,19 @@ class MemoryClient:
             self.end_run(rid, user_id=user_id, agent_id=agent_id, wait=wait)
 
     def update(
-        self, memory_id: str, data: str, *, metadata: Mapping[str, Any] | None = None
+        self,
+        memory_id: str,
+        text: str | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        data: str | None = None,
     ) -> dict[str, Any]:
-        """改一条记忆：记进原始日志的一句更正（见 Memory.update）。"""
-        body = {"data": data, "metadata": _metadata(metadata)}
+        """改一条记忆：记进原始日志的一句更正（见 Memory.update）。text 与 data 在这里合成一个，
+        照旧以 "data" 发送：以前的服务端只认这个键。都没给时交给服务端报 ValueError。"""
+        if text is not None and data is not None and text != data:
+            raise ValueError("Give text or data (the same argument), not two different values.")
+        chosen = text if text is not None else data
+        body = {"data": chosen, "metadata": _metadata(metadata)}
         return self._call("PUT", f"/memories/{_id(memory_id)}", body=body)
 
     def consolidate(
@@ -194,8 +215,11 @@ class MemoryClient:
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
         min_level: Literal["l0", "l1"] = "l1",
+        show_expired: bool = False,
     ) -> dict[str, Any]:
         """检索（见 Memory.search）。"""
+        _count("limit", limit)
+        _count("top_k", top_k)
         body = {
             "query": query,
             "user_id": user_id,
@@ -209,6 +233,7 @@ class MemoryClient:
             "filters": dict(filters) if filters is not None else None,
             "top_k": top_k,
             "min_level": min_level,
+            "show_expired": show_expired,
         }
         return self._call("POST", "/memories/search", body=body)
 
@@ -246,8 +271,11 @@ class MemoryClient:
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
+        show_expired: bool = False,
     ) -> dict[str, Any]:
         """全部事实（见 Memory.get_all）。filters 以 JSON 字符串放在查询参数里。"""
+        _count("limit", limit)
+        _count("top_k", top_k)
         params = {
             "user_id": user_id,
             "agent_id": agent_id,
@@ -258,6 +286,7 @@ class MemoryClient:
             "limit": limit,
             "filters": _json_param(filters),
             "top_k": top_k,
+            "show_expired": show_expired,
         }
         return self._call("GET", "/memories", params=params)
 
@@ -461,6 +490,12 @@ def _metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
         return dict(json.loads(json.dumps(dict(metadata), allow_nan=False)))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
+
+
+def _count(name: str, value: int | None) -> None:
+    """与 Memory 相同的检查（sdk._count）：不先查的话，JSON 里的 true 到服务端成了 1。"""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError(f"{name} must be a positive integer (got {value!r}).")
 
 
 def _json_param(value: Mapping[str, Any] | None) -> str | None:

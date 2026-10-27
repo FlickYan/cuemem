@@ -3,10 +3,11 @@
 
     POST   /api/v1/memories                  add（messages、user_id、agent_id、run_id、metadata、
                                              expiration_date、timestamp、infer、wait）
-    POST   /api/v1/memories/search           search（query、filters、top_k、mode、min_level…）
+    POST   /api/v1/memories/search           search（query、filters、top_k、mode、min_level、
+                                             show_expired…）
     GET    /api/v1/memories                  get_all（filters 是 JSON 字符串）
     GET    /api/v1/memories/{id}             get（不存在时 404）
-    PUT    /api/v1/memories/{id}             update（data、metadata）
+    PUT    /api/v1/memories/{id}             update（text 或 data、metadata）
     GET    /api/v1/memories/{id}/history     history
     DELETE /api/v1/memories/{id}             delete（dry_run）
     DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id）
@@ -122,6 +123,7 @@ class SearchRequest(BaseModel):
     filters: dict[str, Any] | None = None
     top_k: int | None = None
     min_level: Literal["l0", "l1"] = "l1"
+    show_expired: bool = False
 
 
 class AnswerRequest(BaseModel):
@@ -135,7 +137,9 @@ class AnswerRequest(BaseModel):
 
 
 class UpdateRequest(BaseModel):
-    data: str
+    # text 与 data 是同一个参数（Mem0 2.x 的新旧两个名字，见 Memory.update）；MemoryClient 发 data
+    text: str | None = None
+    data: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -310,6 +314,7 @@ def memories_router(
                 filters=request.filters,
                 top_k=request.top_k,
                 min_level=request.min_level,
+                show_expired=request.show_expired,
             )
 
     @router.get("/memories")
@@ -324,6 +329,7 @@ def memories_router(
         limit: int | None = None,
         filters: str | None = None,
         top_k: int | None = None,
+        show_expired: bool = False,
     ) -> dict[str, Any]:
         where = _filters(filters)
         with _sdk_errors():
@@ -338,6 +344,7 @@ def memories_router(
                 limit=limit,
                 filters=where,
                 top_k=top_k,
+                show_expired=show_expired,
             )
 
     @router.delete("/memories")
@@ -366,7 +373,9 @@ def memories_router(
         if not visible(http, memory_id):
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
-            return memory.update(memory_id, request.data, metadata=request.metadata)
+            return memory.update(
+                memory_id, request.text, metadata=request.metadata, data=request.data
+            )
 
     @router.get("/memories/{memory_id}/history")
     def history(http: Request, memory_id: str) -> list[dict[str, Any]]:

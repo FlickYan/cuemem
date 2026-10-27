@@ -1517,6 +1517,46 @@ def test_config_dict_and_home(
         memory.close()
 
 
+MEM0_CONFIG = {
+    "llm": {"provider": "openai", "config": {"model": "gpt-4.1-mini"}},
+    "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small"}},
+    "vector_store": {"provider": "qdrant", "config": {"host": "localhost", "port": 6333}},
+    "custom_instructions": "Only remember shoe sizes.",
+    "history_db_path": "/tmp/history.db",
+}
+
+
+@pytest.mark.parametrize(
+    ("config", "said"),
+    [
+        ({"consolidation": {"instruction": "x"}}, "consolidation.instructions"),
+        ({"retreival": {}}, "did you mean retrieval?"),
+        ({"retrieval": {"controler": "v1.json"}}, "retrieval.controller"),
+        (MEM0_CONFIG, 'Memory(preset="openai")'),
+        (MEM0_CONFIG, "Memory(instructions=...)"),
+        (MEM0_CONFIG, '{"vector_store": {"url": "http://localhost:6333"}}'),
+        ({"preset": "openai", "home": "/tmp/x"}, "Pass preset=, home= as keyword arguments"),
+    ],
+)
+def test_unknown_config_keys_are_refused(
+    clean_env: None,
+    fake_api: FakeAPI,
+    tmp_path: Path,
+    config: dict[str, Any],
+    said: str,
+) -> None:
+    """配置字典里不认识的键：ValueError，列出带点的路径与最像的已知键；Mem0 格式的配置附上换成
+    CueMem 写法的提示。以前它们被悄悄丢掉：Mem0 的 llm: openai 照样用默认的千问与 DeepSeek（用户
+    的话发给了没有配置过的供应商），custom_instructions、qdrant 服务器与写错的键都不起作用。
+    报错在打开数据目录之前：什么都没建。"""
+    for make in (Memory, Memory.from_config):
+        with pytest.raises(ValueError, match=re.escape(said)):
+            make(config, home=tmp_path / "home", http_client=fake_api.client(), background=False)
+    with pytest.raises(ValueError, match="Unknown config keys"):
+        AsyncMemory(config, home=tmp_path / "home", http_client=fake_api.client())
+    assert not (tmp_path / "home").exists() and fake_api.chat_requests == []
+
+
 HASH = {"embedding": {"backend": "hash", "dim": 64}}
 
 
