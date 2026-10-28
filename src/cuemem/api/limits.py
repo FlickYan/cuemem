@@ -12,6 +12,18 @@ api.auth.authenticated_route），界面（Gradio）的登录与事件接口也�
 - 别的路径（界面的登录、事件等）：8 MiB。界面的文件经上传接口另传，事件的 JSON 很小。
 
 超过上限时 413：/api/v1 下是它的出错格式（code 为 payload_too_large），别处是 {"detail": …}。
+
+限定作用域的令牌（第三轮复审，keys 给了时）：上限管的是字节，JSON 解析出来的对象却是请求体的二十
+多倍（[{},{},…] 约 24 倍），在接口处理完之前一直占着。以前一个令牌导入 1 GiB 要约 25 GB 内存，并发
+几个 64 MiB 的请求也能撑爆共用的服务。现在：
+
+- 导入那一档只给管理令牌（与没配令牌的本机演示）；限定作用域的令牌导入也是 max_body_bytes；
+- 一个限定作用域的令牌同时在读、在处理的请求体加起来不超过 max_body_bytes，超过时 429（带
+  Retry-After: 1，/api/v1 下 code 为 rate_limited）。一个令牌解析出来的对象因此最多约是
+  max_body_bytes 的 25 倍（默认约 1.6 GB）。
+
+管不到的：好几个令牌一起来（每个各算各的）；界面的事件接口（登录的会话不带 Bearer 令牌，固定
+8 MiB 那一档）。共用的服务要按令牌数与这个倍数留内存，或者调小 CUEMEM_MAX_BODY_BYTES。
 """
 
 from __future__ import annotations
@@ -24,6 +36,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from cuemem.api.auth import Keys, bearer_principal
 from cuemem.api.memories import PREFIX, _error
 from cuemem.errors import CueMemError
 
@@ -39,7 +52,11 @@ BODY_PATHS = ("/api/", "/v1/", "/gradio_api/upload")
 class BodyLimit:
     """整个应用的中间件：请求体超过这个路径的上限时 413（档位见模块说明）。带 Content-Length
     时在应用读请求体之前就回；分块传输时边读边数，超过时抛出 HTTPException(413)：FastAPI 读请求体
-    时遇到 HTTPException 原样抛出，由应用（或挂载的 Gradio）的出错处理写成响应。"""
+    时遇到 HTTPException 原样抛出，由应用（或挂载的 Gradio）的出错处理写成响应。
+
+    keys：配置的令牌（cuemem serve 与 proxy 传入）。给了时按 Bearer 令牌认出限定作用域的令牌：导入
+    不用 max_import_bytes，同时在处理的请求体加起来有上限（见模块说明）。令牌不对的请求不算：接口
+    在读请求体之前就 401（auth.authenticated_route）。"""
 
     def __init__(
         self,
@@ -47,34 +64,66 @@ class BodyLimit:
         *,
         max_body_bytes: int = MAX_BODY_BYTES,
         max_import_bytes: int = MAX_IMPORT_BYTES,
+        keys: Keys | None = None,
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.max_import_bytes = max_import_bytes
+        self.keys = keys
+        # 限定作用域的令牌（名字）→ 正在读、在处理的请求体的字节数。只在事件循环里读写
+        self.in_flight: dict[str, int] = {}
 
-    def limit(self, path: str) -> tuple[int, str | None]:
-        """这个路径的（上限，设置它的环境变量）；固定的那一档没有环境变量。"""
-        if path in IMPORT_PATHS:
+    def limit(self, path: str, tenant: str | None = None) -> tuple[int, str | None]:
+        """这个路径的（上限，设置它的环境变量）；固定的那一档没有环境变量。tenant：限定作用域的
+        令牌的名字（导入也用 max_body_bytes）。"""
+        if path in IMPORT_PATHS and tenant is None:
             return self.max_import_bytes, MAX_IMPORT_ENV
-        if path.startswith(BODY_PATHS):
+        if path in IMPORT_PATHS or path.startswith(BODY_PATHS):
             return self.max_body_bytes, MAX_BODY_ENV
         return OTHER_BODY_BYTES, None
+
+    def _tenant(self, scope: Scope) -> str | None:
+        """请求带的是哪个限定作用域的令牌（名字）；管理令牌、令牌不对、没有配令牌时 None。"""
+        if self.keys is None or not self.keys.scoped:
+            return None
+        principal = bearer_principal(self.keys, Headers(scope=scope).get("authorization"))
+        return None if principal is None or principal.admin else principal.name
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         path: str = scope["path"]
-        cap, env = self.limit(path)
+        tenant = self._tenant(scope)
+        cap, env = self.limit(path, tenant)
         length = Headers(scope=scope).get("content-length", "")
-        if length.isascii() and length.isdigit() and int(length) > cap:
-            message = _too_large(path, cap, env)
+        declared = int(length) if length.isascii() and length.isdigit() else 0
+        if declared > cap:
+            message = _too_large(path, cap, env, tenant)
             response = (
                 _error(413, message, None) if _v1(path) else JSONResponse({"detail": message}, 413)
             )
             await response(scope, receive, send)
             return
+        if tenant is not None and self.in_flight.get(tenant, 0) + declared > self.max_body_bytes:
+            message = _too_many(path, self.max_body_bytes)
+            response = (
+                _error(429, message, None, RETRY)
+                if _v1(path)
+                else JSONResponse({"detail": message}, 429, RETRY)
+            )
+            await response(scope, receive, send)
+            return
         received = 0
+        held = 0  # 这个请求记在 in_flight 里的字节数
+
+        def hold(size: int) -> None:
+            nonlocal held
+            if tenant is not None and size > held:
+                if self.in_flight.get(tenant, 0) + size - held > self.max_body_bytes:
+                    raise HTTPException(429, _too_many(path, self.max_body_bytes), RETRY)
+                self.in_flight[tenant] = self.in_flight.get(tenant, 0) + size - held
+                held = size
 
         async def counted() -> Message:
             nonlocal received
@@ -82,22 +131,56 @@ class BodyLimit:
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > cap:
-                    raise HTTPException(413, _too_large(path, cap, env))
+                    raise HTTPException(413, _too_large(path, cap, env, tenant))
+                hold(received)  # 分块传输，或者比声明的长
             return message
 
-        await self.app(scope, counted, send)
+        hold(declared)
+        try:
+            await self.app(scope, counted, send)
+        finally:
+            if tenant is not None and held:
+                left = self.in_flight.get(tenant, 0) - held
+                if left > 0:
+                    self.in_flight[tenant] = left
+                else:
+                    self.in_flight.pop(tenant, None)
+
+
+RETRY = {"Retry-After": "1"}
 
 
 def _v1(path: str) -> bool:
     return path == PREFIX or path.startswith(PREFIX + "/")
 
 
-def _too_large(path: str, cap: int, env: str | None) -> str:
-    """/api（/api/v1 除外）的出错是中文的；/api/v1、记忆代理与界面是英文的。"""
+def _too_large(path: str, cap: int, env: str | None, tenant: str | None = None) -> str:
+    """/api（/api/v1 除外）的出错是中文的；/api/v1、记忆代理与界面是英文的。限定作用域的令牌
+    导入时另外说明更大的导入要用管理令牌。"""
+    imported = tenant is not None and path in IMPORT_PATHS
     if path.startswith("/api/") and not _v1(path):
-        return f"请求体太大：这里的上限是 {cap} 字节" + (f"（环境变量 {env}）" if env else "")
-    return f"Request body too large: the limit here is {cap} bytes" + (
-        f" (set with {env})." if env else "."
+        return (
+            f"请求体太大：这里的上限是 {cap} 字节"
+            + (f"（环境变量 {env}）" if env else "")
+            + ("；更大的导入要用管理令牌" if imported else "")
+        )
+    return (
+        f"Request body too large: the limit here is {cap} bytes"
+        + (f" (set with {env})" if env else "")
+        + ("; larger imports need the admin token." if imported else ".")
+    )
+
+
+def _too_many(path: str, budget: int) -> str:
+    """一个限定作用域的令牌同时在处理的请求体加起来超过上限（429）。"""
+    if path.startswith("/api/") and not _v1(path):
+        return (
+            f"这个访问令牌同时在处理的请求体太多：加起来最多 {budget} 字节"
+            f"（环境变量 {MAX_BODY_ENV}），请稍后重试"
+        )
+    return (
+        f"Too many request bodies in flight for this access key: at most {budget} bytes at "
+        f"once (set with {MAX_BODY_ENV}); retry shortly."
     )
 
 

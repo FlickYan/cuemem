@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ from cuemem.api.service import ChatService
 from cuemem.config import Settings
 from cuemem.errors import CueMemError
 from cuemem.memory import MemorySystem
+from cuemem.sdk import Memory
 
 TOKEN = "admin-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -45,9 +48,8 @@ class Served:
         app = create_app(
             self.service,
             upload_dir=self.tmp_path / "uploads",
-            keys=Keys.from_token(TOKEN),
             proxy=self.proxy,
-            **{"ui": False, **kwargs},
+            **{"ui": False, "keys": Keys.from_token(TOKEN), **kwargs},
         )
         return TestClient(app)
 
@@ -149,6 +151,97 @@ def test_imports_have_their_own_limit(served: Served) -> None:
     named = loose.post("/api/spaces/import/recall", content=_json(2048), headers={**AUTH, **JSON})
     assert named.status_code == 413
     assert {"c2", "c3"}.isdisjoint(s["space_id"] for s in served.service.spaces())
+
+
+ALICE_TOKEN, BOB_TOKEN = "alice-app-token-0123", "bob-app-token-0123"
+SCOPED = Keys.parse(
+    f"""
+keys:
+  - {{name: alice-app, token: {ALICE_TOKEN}, scopes: [{{user: alice}}]}}
+  - {{name: bob-app, token: {BOB_TOKEN}, scopes: [{{user: bob}}]}}
+""",
+    TOKEN,
+)
+ALICE = {"Authorization": f"Bearer {ALICE_TOKEN}"}
+BOB = {"Authorization": f"Bearer {BOB_TOKEN}"}
+
+
+def test_scoped_keys_import_within_the_body_limit(served: Served) -> None:
+    """导入的那一档（max_import_bytes）只给管理令牌：JSON 解析出来的对象是请求体的二十多倍，以前
+    限定作用域的令牌导入 1 GiB 要约 25 GB 内存（作用域在解析之后才查）。限定作用域的令牌导入也用
+    max_body_bytes，出错说明更大的导入要用管理令牌；管理令牌照旧。"""
+    served.service.remember("alice", "My diary: " + "a long day. " * 200)
+    http = served.client(keys=SCOPED, max_body_bytes=1024, max_import_bytes=1 << 20)
+    dump = http.get("/api/spaces/alice/export", headers=AUTH).json()
+    assert 2048 < len(json.dumps(dump)) < 1 << 20
+    refused = http.post("/api/spaces/import", json=dump, params={"space": "alice"}, headers=ALICE)
+    assert refused.status_code == 413
+    assert refused.json()["detail"] == (
+        "请求体太大：这里的上限是 1024 字节（环境变量 CUEMEM_MAX_BODY_BYTES）；更大的导入要用"
+        "管理令牌"
+    )
+    refused = http.post("/api/v1/import", json={"data": dump, "user_id": "alice"}, headers=ALICE)
+    error = refused.json()["error"]
+    assert refused.status_code == 413 and error["code"] == "payload_too_large"
+    assert "1024 bytes" in error["message"] and "admin token" in error["message"]
+    small = served.client(keys=SCOPED, max_body_bytes=1 << 20, max_import_bytes=1 << 20)
+    assert small.post("/api/v1/import", json={"data": dump}, headers=ALICE).status_code == 200
+    copied = http.post("/api/v1/import", json={"data": dump, "user_id": "c1"}, headers=AUTH)
+    assert copied.status_code == 200, copied.text
+
+
+def test_a_scoped_key_has_a_budget_for_bodies_in_flight(
+    served: Served, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个限定作用域的令牌同时在读、在处理的请求体加起来不超过 max_body_bytes，超过时 429（带
+    Retry-After）：解析出来的对象在接口处理完之前一直占着，以前一个令牌并发几个大请求就能撑爆共用
+    的服务。别的令牌、管理令牌不受影响；请求结束就还回去，分块传输边读边算。"""
+    entered, release = threading.Event(), threading.Event()
+    add = Memory.add
+
+    def slow(self: Memory, *args: Any, **kwargs: Any) -> Any:  # 接口还在处理第一个请求
+        entered.set()
+        assert release.wait(30)
+        return add(self, *args, **kwargs)
+
+    monkeypatch.setattr(Memory, "add", slow)
+    body = json.dumps({"messages": "x" * 2400, "user_id": "alice", "infer": False}).encode()
+    search = json.dumps({"query": "x" * 2400, "user_id": "alice"}).encode()
+    with TestClient(
+        create_app(
+            served.service,
+            upload_dir=served.tmp_path / "uploads",
+            keys=SCOPED,
+            ui=False,
+            max_body_bytes=4096,
+        )
+    ) as http:
+        with ThreadPoolExecutor(1) as pool:
+            first = pool.submit(
+                http.post, "/api/v1/memories", content=body, headers={**ALICE, **JSON}
+            )
+            assert entered.wait(30)
+            for content in (search, _chunks(search)):  # 声明的长度，与分块传输
+                busy = http.post(
+                    "/api/v1/memories/search", content=content, headers={**ALICE, **JSON}
+                )
+                assert busy.status_code == 429, busy.text
+                assert busy.headers["retry-after"] == "1"
+                assert busy.json()["error"]["code"] == "rate_limited"
+                assert "4096 bytes" in busy.json()["error"]["message"]
+            short = json.dumps({"query": "where?", "user_id": "alice"}).encode()
+            ok = http.post("/api/v1/memories/search", content=short, headers={**ALICE, **JSON})
+            assert ok.status_code == 200, ok.text
+            other = json.dumps({"query": "x" * 2400, "user_id": "bob"}).encode()
+            for headers in (BOB, AUTH):
+                fine = http.post(
+                    "/api/v1/memories/search", content=other, headers={**headers, **JSON}
+                )
+                assert fine.status_code == 200, fine.text
+            release.set()
+            assert first.result(30).status_code == 200
+        again = http.post("/api/v1/memories/search", content=search, headers={**ALICE, **JSON})
+        assert again.status_code == 200, again.text
 
 
 def test_the_standalone_proxy_has_the_limit_too(

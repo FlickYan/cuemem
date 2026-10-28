@@ -1004,5 +1004,5 @@ def create_proxy_app(
 
     keys = keys if keys is not None else Keys.from_token(token)
     app.include_router(proxy_router(proxy, dependencies=guard(keys)))
-    _guard(app, allowed_hosts, origin_hosts, max_body_bytes=max_body_bytes)
+    _guard(app, allowed_hosts, origin_hosts, max_body_bytes=max_body_bytes, keys=keys)
     return app

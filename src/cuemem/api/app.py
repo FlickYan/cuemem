@@ -23,7 +23,8 @@ MCP（第三轮体检）：/mcp 是 MCP 的 Streamable HTTP，工具与 cuemem m
 
 请求体的上限（第三轮体检，api/limits.py）：/api、/v1 与界面的上传默认 64 MiB，导入 1 GiB，界面
 别的接口 8 MiB，超过时 413，在读请求体之前；/api 与 /api/v1 也先认令牌再读请求体
-（auth.authenticated_route）。
+（auth.authenticated_route）。限定作用域的令牌导入也用 /api 的上限，同时在处理的请求体加起来也
+不超过它（超过时 429）：JSON 解析出来的对象是请求体的二十多倍。
 """
 
 from __future__ import annotations
@@ -120,10 +121,14 @@ def _guard(
     *,
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
+    keys: Keys | None = None,
 ) -> None:
     """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
-    先于 Origin，再是请求体的上限（api/limits.py）。这三项都不读请求体。"""
-    app.add_middleware(BodyLimit, max_body_bytes=max_body_bytes, max_import_bytes=max_import_bytes)
+    先于 Origin，再是请求体的上限（api/limits.py；keys：限定作用域的令牌导入也用 max_body_bytes，
+    同时在处理的请求体加起来有上限）。这三项都不读请求体。"""
+    app.add_middleware(
+        BodyLimit, max_body_bytes=max_body_bytes, max_import_bytes=max_import_bytes, keys=keys
+    )
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
@@ -542,6 +547,7 @@ def create_app(
         origin_hosts,
         max_body_bytes=max_body_bytes,
         max_import_bytes=max_import_bytes,
+        keys=keys,
     )
     return app
 
