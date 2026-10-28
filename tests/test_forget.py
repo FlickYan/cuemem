@@ -33,6 +33,7 @@ from cuemem.core.models import Conversation, SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.write.consolidate import scope
 
 SECRET = "电商"  # 只出现在第 4 段会话（s4）里的词
 PIN = "SECRET-1234"
@@ -531,6 +532,48 @@ def test_forget_deletes_and_clears_in_one_transaction(
         assert [j["status"] for j in system.db.get_jobs("u")] == ["done"] * 3
         assert system.forget("u", turn_ids=[user_turn]).turns_deleted == 1
         _forgotten(memory)
+
+
+def test_a_forget_whose_transaction_fails_keeps_the_reconciliation_cache(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """遗忘的事务出错（磁盘满）时日志与派生层都没动：遗忘开始时标记的对账与消歧条目全部留下，
+    不留标记。以前外层的 finally 照样核对，重放还没开始、一条都没用到，这个空间的对账与消歧
+    缓存全部删掉，重试时每次对账都要重新付费。受影响会话的抽取与回答缓存、派生记忆的向量在事务
+    之前已经删了（先删副本、后删日志），重试的重放补上。"""
+    with _sdk(n3_settings, fake_api, background=False) as memory:
+        system = memory.system
+        user_turn = _pin_chat(memory)
+        later = SEP + timedelta(days=1)
+        memory.add("I moved to Munich", user_id="u", run_id="d", timestamp=later, wait=True)
+        cache = system.llm.cache
+        assert cache is not None
+
+        def reconciliations() -> set[str]:
+            rows = cache._conn.execute(
+                "SELECT key FROM llm_cache WHERE scope = ?", (scope("u", "consolidate"),)
+            )
+            return {key for (key,) in rows}
+
+        reconciled = reconciliations()
+        assert reconciled  # d 的新住址与 a 的旧住址对过账
+
+        def disk_full(space_id: str) -> list[str]:
+            raise sqlite3.OperationalError("database or disk is full")
+
+        monkeypatch.setattr(system.db, "clear_derived", disk_full)
+        with pytest.raises(sqlite3.OperationalError):
+            system.forget("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        monkeypatch.undo()
+
+        assert len(system.db.get_turns("u")) == 5
+        assert reconciliations() == reconciled
+        assert cache._conn.execute("SELECT COUNT(*) FROM llm_cache_held").fetchone() == (0,)
+        report = system.forget("u", turn_ids=[user_turn], report_rebuild_errors=True)
+        assert report.turns_deleted == 1 and report.rebuild_error is None
+        assert _statements(memory) == ["I like jazz", "The user lives in Munich."]
+        assert reconciliations() == reconciled  # 重放原样用到了它：没有重新请求
+        _consistent(system)
 
 
 def test_sdk_delete_says_so_when_nothing_was_deleted(

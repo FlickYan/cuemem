@@ -171,6 +171,17 @@ class ResponseCache:
                 self._checkpoint()
             return deleted
 
+    def release(self, scope: str) -> None:
+        """去掉本对象 hold 的标记，条目全部留下（遗忘在删日志之前出错：日志与派生层都没动，这些
+        条目照常可用；原样重试时重新标记、核对）。"""
+        with self._lock:
+            lock = self._holds.pop(scope, None)
+            if lock is None:
+                return
+            self._conn.execute("DELETE FROM llm_cache_held WHERE owner = ?", (lock.token,))
+            self._conn.commit()
+            lock.release()
+
     def _drop_held(self) -> None:
         """删掉还标记着、标记它的那次遗忘已经不在了的条目：上次遗忘重放到一半时进程退出了，没来得及
         核对。别的进程（评测、CLI、另一个服务）或同一进程里别的缓存对象正在核对的不动：以前打开

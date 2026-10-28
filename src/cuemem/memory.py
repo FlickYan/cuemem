@@ -737,7 +737,9 @@ class MemorySystem:
         - 再在一个事务里换上新的"轮"、删发言（连同图片记录、溯源与附加信息）、清空派生层、按原来的
           任务重新登记（Consolidator.requeue）。以前这几步各自提交、夹着联网的向量化：中途出错时
           发言删了，由它们抽出的事实却还是当前有效的、还检索得到，剩下的发言没有"轮"，重试找不到
-          要删的发言，按事实 ID 再删也回"已删除"。
+          要删的发言，按事实 ID 再删也回"已删除"。事务出错（例如磁盘满）时一起撤销，日志与派生层
+          都没动，标记的对账与消歧条目原样留下；在它之前已经删掉的（受影响会话的抽取与这个空间的
+          回答缓存、派生记忆的向量）在原样重试的重放里补上，在那之前检索不到这些派生记忆。
         - 提交之后删原图文件、从剩下的日志重放派生记忆，再清理 trace、向量缓存与 LLM 缓存。重放失败
           （例如对账时余额不足）时照样清理（标记的条目只留下重放已经用到的），再把异常抛出去：原始
           日志已经删了，重试时找不到要删的发言。没做完的巩固任务留着：有后台线程时交给它，按退避
@@ -838,8 +840,10 @@ class MemorySystem:
                         embed_purged += self.embedder.purge([*texts, *questions], "query")
                     self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
             finally:  # 中途出错时重放用到的更少，删得更多
-                if cache is not None:
+                if cache is not None and committed:
                     llm_purged += cache.settle(held, reused)
+                elif cache is not None:  # 事务没提交：日志与派生层都没动，标记的条目原样留下
+                    cache.release(held)
                 if committed:  # 重放没做完（抛出了，或有会话抽取失败）：交给后台线程
                     self._hand_over(space_id)
             if images_left:
