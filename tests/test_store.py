@@ -197,6 +197,47 @@ def test_point_reads_agree_with_the_whole_space_reads(tmp_path: Path) -> None:
     assert db.enqueue_jobs("demo", rows) == 0
 
 
+def test_requeue_after_clearing_grows_linearly_with_the_sessions(tmp_path: Path) -> None:
+    """遗忘、重建与重放清空派生层之后按会话重新登记任务：每登记一个都把同一会话还没执行的旧
+    任务标记为 superseded。以前这一步只能走 (space_id, status) 的索引，扫一遍已经登记的全部
+    任务，耗时随会话数的平方增长（2 万个会话约 20 秒，一直拿着整个库的锁）；现在有
+    (space_id, session_id) 的索引，已有的库打开时自动补上。数 SQLite 执行的指令，不计时。"""
+    import sqlite3
+
+    path = tmp_path / "memory.sqlite"
+    db = MemoryDB(path)
+    db.close()
+    conn = sqlite3.connect(path)  # 模拟升级前的库：没有这个索引
+    conn.execute("DROP INDEX IF EXISTS idx_jobs_session")
+    conn.close()
+
+    def steps(space: str, n: int) -> int:
+        db.ensure_space(space)
+        db.enqueue_jobs(space, [(f"{space}-old{i}", f"s{i}", "v", "h") for i in range(n)])
+        db.clear_derived(space)
+        ticks = [0]
+
+        def tick() -> int:
+            ticks[0] += 1
+            return 0
+
+        db._conn.set_progress_handler(tick, 100)
+        try:
+            new = [(f"{space}-{i}", f"s{i}", "v", "h") for i in range(n)]
+            assert db.enqueue_jobs(space, new) == n
+        finally:
+            db._conn.set_progress_handler(None, 0)
+        assert {j["status"] for j in db.get_jobs(space)} == {"pending"}
+        return ticks[0]
+
+    db = MemoryDB(path)
+    names = {row[1] for row in db._conn.execute("PRAGMA index_list(jobs)")}
+    assert "idx_jobs_session" in names
+    small, large = steps("a", 600), steps("b", 1200)
+    assert large < 2.5 * small  # 线性：会话翻倍，指令数约翻倍（以前约是 4 倍）
+    db.close()
+
+
 def _one_turn(db: MemoryDB, space: str, session_id: str) -> Turn:
     session = SessionIn(
         session_id=session_id,

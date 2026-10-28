@@ -46,7 +46,9 @@ SCHEMA_VERSION = 6
 
 # 新增的索引不用升版本：每次打开都执行 _SCHEMA，已有的库自动补上。facts 的
 # (space_id, superseded_by) 与 (space_id, invalidated_at) 每次读取都用得到：沿版本链找被取代的
-# 旧版本（choose_facts）、数当前有效的事实（space_stats）
+# 旧版本（choose_facts）、数当前有效的事实（space_stats）。jobs 的 (space_id, session_id)：
+# 登记任务时找同一会话还没执行的旧任务（enqueue_jobs），清空派生层之后按会话重新登记时，
+# 没有它每登记一个都要扫一遍已经登记的任务
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -182,6 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts (space_id, superseded_b
 CREATE INDEX IF NOT EXISTS idx_facts_current ON facts (space_id, invalidated_at);
 CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (space_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_media_space ON media (space_id, source_turn_id);
 """
 
