@@ -1267,6 +1267,39 @@ def test_delete_all_and_reset_leave_nothing_naming_the_user(memory: Memory, how:
         assert [t.idx for t in system.db.get_turns("bob", "r")] == [0, 1]
 
 
+def test_a_reset_that_fails_partway_still_purges_the_traces_of_what_it_deleted(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reset 删到一半出错（向量库在第二个空间连不上）：已经删掉的空间的 trace 也删掉。以前 trace
+    放到全部空间删完之后一起删，中途出错就一条都没删；删掉了的空间不在空间列表里，重试的 reset
+    看不到它们，用户 ID 与问过的话一直留在 trace 里。"""
+    users = ["alice@example.com", "bob@example.com", "carol@example.com"]
+    for user in users:
+        memory.add("I live in Berlin", user_id=user, wait=True)
+        memory.search("hello there, what is the weather?", user_id=user, min_level="l0")
+    assert all(naming(memory, user)[2] for user in users)
+    real = memory.system.vectors.delete_space
+    calls: list[str] = []
+
+    def flaky(space_id: str) -> None:
+        calls.append(space_id)
+        if len(calls) == 2:
+            raise ConnectionError("qdrant unreachable")
+        real(space_id)
+
+    monkeypatch.setattr(memory.system.vectors, "delete_space", flaky)
+    with pytest.raises(ConnectionError):
+        memory.reset()
+    monkeypatch.undo()
+    first, failed, untouched = calls[0], calls[1], next(u for u in users if u not in calls)
+    left = [s["space_id"] for s in memory.spaces()]
+    assert first not in left and failed in left and untouched in left
+    assert naming(memory, first)[2] == 0
+    assert naming(memory, untouched)[2] > 0  # 还没开始删的空间不动
+    memory.reset()  # 重试删掉剩下的
+    assert memory.spaces() == [] and all(naming(memory, u)[2] == 0 for u in users)
+
+
 def test_delete_all_keeps_the_mark_of_a_run_still_open(memory: Memory) -> None:
     """delete_all 删掉崩溃时留下的进行中会话的标记，本进程里还开着的 run 的标记留着：进程随后
     崩溃时，它之后写的发言还有人接手（adopt_open）。"""

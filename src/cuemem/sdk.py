@@ -868,9 +868,16 @@ class Memory:
         for space, rid in runs:
             self.system.close_session(space, rid, submit=False)
         spaces = [s["space_id"] for s in self.system.db.list_spaces() if chosen(s["space_id"])]
-        # 这些空间的 trace 最后一起删：每个空间删一遍要把 trace 文件读一遍
-        reports = [self.system.delete_space(space, purge_traces=False) for space in spaces]
-        self.system.purge_space_traces(spaces)
+        # 这些空间的 trace 最后一起删：每个空间删一遍要把 trace 文件读一遍。中途出错（例如向量库
+        # 连不上）时也删掉已经开始删的空间的 trace：删完了的不在空间列表里，重试时没人再删它们
+        reports: list[ForgetReport] = []
+        started: list[str] = []
+        try:
+            for space in spaces:
+                started.append(space)
+                reports.append(self.system.delete_space(space, purge_traces=False))
+        finally:
+            self.system.purge_space_traces(started)
         return {
             "message": "All memories deleted",
             "spaces_deleted": spaces,
