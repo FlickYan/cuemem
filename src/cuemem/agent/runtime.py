@@ -48,6 +48,7 @@ from cuemem.read.agent import SearchSession
 from cuemem.read.controller import Router
 from cuemem.read.facts import fact_status
 from cuemem.read.l1 import L1Config
+from cuemem.store.media import check_image
 from cuemem.write.consolidate import ConsolidationReport, scope
 from cuemem.write.online import media_id
 
@@ -260,6 +261,11 @@ class Agent:
         with session.lock:
             if session.closed:
                 raise ValueError(f"会话 {session.session_id} 已经结束")
+            # 像素太多的图片（解压炸弹）在召回、解码与调用模型之前就拒绝（ValueError，/api 是
+            # 409）。以前先解码、发给模型，写进记忆时才被拒绝：回答丢了、钱照付；超过两倍上限的是
+            # Pillow 的 DecompressionBombError（500）
+            for path in images:
+                check_image(path)
             return self._chat(session, text, [str(p) for p in images], at, mode, router, lam)
 
     def _chat(

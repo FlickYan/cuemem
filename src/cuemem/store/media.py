@@ -112,6 +112,12 @@ def _checked_size(data: bytes) -> tuple[int, int]:
     return width, height
 
 
+def check_image(path: Path | str) -> tuple[int, int]:
+    """图片文件的尺寸（只读文件头，不解码），像素数的规则与 put 相同（_checked_size）：超过上限时
+    ValueError。对话（Agent.chat）在召回、解码与调用模型之前先查上传的图片。"""
+    return _checked_size(Path(path).read_bytes())
+
+
 @contextmanager
 def decoding(image: Image.Image) -> Iterator[None]:
     """解码 image（已经打开、只读了文件头）的期间：像素数超过 LARGE_PIXELS 时占一个大图解码的

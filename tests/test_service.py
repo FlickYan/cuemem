@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import re
 import threading
@@ -693,6 +694,36 @@ def test_http_photo_stays_in_the_conversation(
         if b.get("type") == "image_url"
     ]
     assert urls == [image_data_url(picture)]
+
+
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+def test_http_chat_refuses_oversized_images_before_calling_the_model(
+    service: ChatService, fake_api: FakeAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """对话里上传的图片像素数超过 Image.MAX_IMAGE_PIXELS（解压炸弹）：409，在召回、解码与调用
+    模型之前，什么都不写、不存原图。以前一到两倍之间的先解码、发给模型，写进记忆时才 409（回答
+    丢了、钱照付）；超过两倍的是 Pillow 的 DecompressionBombError，500。"""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10_000)
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False)
+    client = TestClient(app, raise_server_exceptions=False)
+    sid = client.post("/api/sessions", json={"space": "shop"}).json()["session_id"]
+    for side in (200, 120):  # 两倍以上；一到两倍之间
+        photo = io.BytesIO()
+        Image.new("RGB", (side, side), "white").save(photo, format="PNG")
+        seen = len(fake_api.chat_requests)
+        response = client.post(
+            f"/api/sessions/{sid}/messages",
+            data={"text": "Look at this", "mode": "l0"},
+            files=[("images", ("big.png", photo.getvalue(), "image/png"))],
+        )
+        assert response.status_code == 409, (side, response.text)
+        assert "Image too large" in response.json()["detail"]
+        assert len(fake_api.chat_requests) == seen  # 没有调用模型
+    db = service.system.db
+    assert db.get_turns("shop") == [] and db.get_media("shop") == []
+    assert not list(service.system.settings.paths.media.rglob("*.png"))
+    again = client.post(f"/api/sessions/{sid}/messages", data={"text": "Hi", "mode": "l0"})
+    assert again.status_code == 200, again.text  # 会话照常
 
 
 def test_http_api_token(service: ChatService, tmp_path: Path) -> None:
