@@ -34,6 +34,9 @@ jobs:
             packages: >-
               --with mem0ai==2.2.1 --with spacy --with fastembed
               --with "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+            # Mem0 的混合检索在测试里加载 fastembed 的 Qdrant/bm25，从 huggingface.co 下载进 fastembed
+            # 的缓存（默认在临时目录）：新的机器上没有，网络守卫让 4 个测试失败。先在守卫之外下载好
+            prepare: from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')
           - name: LangMem
             test: tests/test_baseline_langmem.py
             packages: >-
@@ -58,6 +61,9 @@ jobs:
           enable-cache: false
       - name: 安装依赖
         run: uv sync --locked
+      - name: 预先下载测试里要用的模型（在网络守卫之外）
+        if: matrix.prepare
+        run: uv run ${{ matrix.packages }} python -c "${{ matrix.prepare }}"
       - name: 适配层的测试（不许跳过：跳过说明包没装上）
         shell: bash
         run: |

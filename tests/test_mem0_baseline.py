@@ -7,7 +7,11 @@ mem0ai 不是 CueMem 的依赖，平时只跑写入记录（协议、会话 ID �
     uv run --with mem0ai==2.2.1 --with spacy --with fastembed \\
         --with "en_core_web_sm @ $SM/en_core_web_sm-3.8.0-py3-none-any.whl" \\
         pytest tests/test_mem0_baseline.py
-CI 的"外部基线"（.github/workflows/baselines.yml）照这个命令跑。
+Mem0 的混合检索还要 fastembed 的 Qdrant/bm25 模型，第一次用时从 huggingface.co 下载进 fastembed 的
+缓存（默认 <临时目录>/fastembed_cache，环境变量 FASTEMBED_CACHE_PATH）：缓存里没有时网络守卫让 4 个
+测试失败，先在测试之外下载一次（同样的 --with，把 pytest … 换成
+python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"）。
+CI 的"外部基线"（.github/workflows/baselines.yml）照这些命令跑。
 """
 
 from __future__ import annotations
