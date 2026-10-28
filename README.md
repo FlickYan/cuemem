@@ -292,8 +292,8 @@ For Docker, put a token in `.env` first (for example from `openssl rand -hex 32`
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1
 uv run cuemem migrate-vectors --to http://localhost:6333   # copy existing local vectors first
 export CUEMEM_VECTOR_STORE__URL=http://localhost:6333     # or put it in .env
-CUEMEM_API_TOKEN=your-token uv run cuemem serve --host 0.0.0.0   # Bearer token for /api, /api/v1 and /v1, sign-in for the UI
-uv run python scripts/n11_latency.py                       # offline latency benchmark, no API calls
+CUEMEM_API_TOKEN=your-token uv run cuemem serve --host 0.0.0.0   # Bearer token for /api, /api/v1, /v1 and /mcp, sign-in for the UI
+uv run python scripts/n11_latency.py --out runs/n11-latency   # offline latency benchmark, no API calls
 ```
 
 ## Repository layout

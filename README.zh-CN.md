@@ -248,8 +248,8 @@ uv run ruff check . && uv run mypy       # 代码风格与类型检查
 docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1        # Qdrant 服务端（本地模式同一时间只允许一个进程打开数据目录）
 uv run cuemem migrate-vectors --to http://localhost:6333  # 已有的本地向量原样复制过去
 export CUEMEM_VECTOR_STORE__URL=http://localhost:6333    # 之后都用服务端（也可以写进 .env）
-CUEMEM_API_TOKEN=换成你的令牌 uv run cuemem serve --host 0.0.0.0   # /api、/api/v1 与 /v1 要带 Bearer 令牌，界面先登录
-uv run python scripts/n11_latency.py                      # 离线延迟基准（不调用 API）
+CUEMEM_API_TOKEN=换成你的令牌 uv run cuemem serve --host 0.0.0.0   # /api、/api/v1、/v1 与 /mcp 要带 Bearer 令牌，界面先登录
+uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基准（不调用 API，不覆盖发表的表）
 ```
 
 ## 文档
