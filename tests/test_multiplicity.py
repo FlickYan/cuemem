@@ -194,6 +194,10 @@ def test_n12_leak_writes_its_holm_file(
             for m, s, c in results
         ]
         (runs / run / "results.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for arms in leak.ARMS.values():  # 别的运行都在、没有行（缺了运行时脚本不写）
+        for run in (r for runs_ in arms.values() for r in runs_ if r not in leak.NOT_RUN):
+            (runs / run).mkdir(exist_ok=True)
+            (runs / run / "results.jsonl").touch()
     monkeypatch.setattr(leak, "RUNS", runs)
     monkeypatch.setattr(leak, "ROOT", tmp_path)
     monkeypatch.setattr(leak, "OUT", tmp_path / "out" / "summary.json")

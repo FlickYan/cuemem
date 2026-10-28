@@ -28,7 +28,8 @@ API Key，全部重跑的名义成本约 $150（各节点的花费见路线图�
   --fail-on-error，有题出错就停下（混合流脚本同样）：之后的分析会悄悄略过没有探针特征的题；
 - 续跑没有新答的题时不复制 run.json（续跑只在里面追加时间与环境）；
 - 读别的运行的分析步骤写明要哪些运行（Step.requires）：执行到这一步时缺了就跳过，不拿缺了的
-  数据重写结果（N11 的方差分析要两个可选的重跑，以前没跑时把 variance.json 写成 {}）；
+  数据重写结果（N11 的方差分析要两个可选的重跑，以前没跑时把 variance.json 写成 {}；Mem0 对比
+  与第二判分要 N9 的运行）。这些分析脚本自己缺了输入也退出码 1、不写；
 - 结果随机器而变的步骤写到 runs/ 下，不写 docs/results：N11 的延迟基准（发表的表是另一台
   机器测的）与 N8 的演示摘要（从缓存回放时花费与模型耗时都接近 0）；
 - --cache-only 让每一步的 LLM 请求都只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：未命中
@@ -263,8 +264,10 @@ STEPS: list[Step] = [
     Step("N11", [*MEM0, "cuemem", "eval", "run", "--dataset", "longmemeval_s", "--split",
                  "test100r", "--methods", "M0", "--name", "test100r-mem0", "--workers", "16",
                  "--max-cost", "5", FAIL_ON_ERROR]),
-    script("N11", "scripts/n11_mem0.py"),
-    script("N11", "scripts/n11_second_judge.py", "run"),
+    script("N11", "scripts/n11_mem0.py", requires=(
+        "locomo-test200r-mem0", "test100r-mem0", "locomo-test7-n9", "test400-n9")),
+    script("N11", "scripts/n11_second_judge.py", "run", requires=(
+        "test400-n9", "locomo-test7-n9", "memlens32-test-n9", "memlens128-test-n9")),
     Step("N11", ["uv", "run", "cuemem", "data", "download", "wildchat"]),
     Step("N11", ["uv", "run", "--with", "pyarrow", "python", "scripts/n11_wildchat.py", "prepare"]),
     script("N11", "scripts/n11_wildchat.py", "probe"),

@@ -75,14 +75,22 @@ def write_cost(settings: Any, dataset: str, original: str, keys: set[str]) -> di
 
 def main() -> None:
     settings = load_settings()
+    rows = {
+        name: latest(load_rows(settings.paths.eval_runs / name, "results.jsonl"))
+        for run, (_, original) in RUNS.items()
+        for name in (run, original)
+    }
+    if missing := [name for name, found in rows.items() if not found]:
+        # 缺一个就不写：以前跳过缺的 Mem0 运行、把缺的 N9 运行当作空的，照样重写 mem0.json 与
+        # mem0-holm.json（没有 runs/eval 的机器上把发表的结果清空）
+        raise SystemExit(
+            f"还没有结果：{'、'.join(missing)}（运行的命令见脚本说明）；没有写 {OUT.name}"
+        )
     result: dict[str, Any] = {"labels": LABELS}
     for run, (dataset, original) in RUNS.items():
-        mem0 = latest(load_rows(settings.paths.eval_runs / run, "results.jsonl"))
-        if not mem0:
-            print(f"{run}：还没有结果，跳过")
-            continue
+        mem0 = rows[run]
         ids = sorted({sid for sid, _ in mem0})
-        base = latest(load_rows(settings.paths.eval_runs / original, "results.jsonl"))
+        base = rows[original]
         cells = {**mem0, **{k: v for k, v in base.items() if k[0] in set(ids)}}
         methods: dict[str, Any] = {}
         for method in ["M0", *CUEMEM]:

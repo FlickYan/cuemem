@@ -65,6 +65,10 @@ ARMS: dict[str, dict[str, list[str]]] = {
         "label": ["pq-lme-label-cuemem", "pq-lme-label-mem0"],
     },
 }
+# Mem0 不是每臂都有（README §3.3）：原协议只跑了 anon 与 label（raw 的参照是 N11 发表的那次运行），
+# pq 只跑了 raw。这三个运行没有跑过，缺了照常；别的缺一个就不写（以前缺的当作空的，照样重写
+# summary.json 与 summary-holm.json，没有 runs/eval 的机器上把发表的结果写成几百字节）
+NOT_RUN = {"orig-lme-raw-mem0", "pq-lme-mem0", "pq-lme-label-mem0"}
 RETRIEVAL = ["B2", "B4-nobm25", "B5", "B6", "M0"]
 LABELS = {
     "B1": "Full context",
@@ -162,7 +166,20 @@ def vs_mem0(by_arm: dict[str, dict[tuple[str, str], dict[str, Any]]]) -> dict[st
     return out
 
 
+def missing() -> list[str]:
+    """ARMS 里还没有结果（results.jsonl）的运行，NOT_RUN 除外。"""
+    return [
+        run
+        for arms in ARMS.values()
+        for runs in arms.values()
+        for run in runs
+        if run not in NOT_RUN and not (RUNS / run / "results.jsonl").exists()
+    ]
+
+
 def main() -> None:
+    if gone := missing():
+        raise SystemExit(f"还没有结果：{'、'.join(gone)}（见脚本说明）；没有写 {OUT.name}")
     summary: dict[str, Any] = {}
     for protocol, arms in ARMS.items():
         by_arm = {

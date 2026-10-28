@@ -171,12 +171,17 @@ def kendall_tau(x: list[float], y: list[float]) -> float:
 def report(settings: Settings) -> None:
     verdicts = load_rows(settings.paths.eval_runs / "n11-judge2", "verdicts.jsonl")
     latest = {(v["dataset"], v["sample_id"], v["method"]): v for v in verdicts}
+    if missing := [dataset for dataset in RUNS if not any(k[0] == dataset for k in latest)]:
+        # 缺一个数据集就不写：以前跳过它照样重写 second_judge.json 与 -holm.json（没有
+        # runs/eval 的机器上把发表的结果清空成只剩判分模型的名字）
+        raise SystemExit(
+            f"还没有 {'、'.join(missing)} 的重判（先 run，要 N9 的运行 "
+            f"{'、'.join(RUNS[d][0] for d in missing)}）；没有写 {OUT.name}"
+        )
     result: dict[str, Any] = {"judge": {"primary": "qwen3.8-max", "second": JUDGE2}}
     disagreements: list[dict[str, Any]] = []
     for dataset in RUNS:
         rows = [v for (d, _, _), v in latest.items() if d == dataset]
-        if not rows:
-            continue
         pairs = [(bool(v["primary"]), bool(v["second"])) for v in rows]
         by_method: dict[str, list[tuple[bool, bool]]] = defaultdict(list)
         cell = {(v["sample_id"], v["method"]): v for v in rows}

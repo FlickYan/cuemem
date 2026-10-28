@@ -944,6 +944,97 @@ def test_n11_variance_does_not_write_without_every_run(
     assert out.read_text("utf-8") == "published\n"
 
 
+def _published(tmp_path: Path, module: Any, name: str) -> Path:
+    """脚本要写的结果换成 tmp_path 下一份"发表的"文件（只有一行 published），连同 Holm 那份。"""
+    out = tmp_path / "results" / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("published\n", "utf-8")
+    module.OUT = out
+    return out
+
+
+def _run_rows(runs: Path, name: str, *rows: dict[str, Any]) -> None:
+    (runs / name).mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(row) + "\n" for row in rows)
+    (runs / name / "results.jsonl").write_text(text, "utf-8")
+
+
+def test_reproduce_analyses_require_the_runs_they_read() -> None:
+    """复现脚本里 Mem0 对比与第二判分这两步写明要读的运行（Step.requires），与脚本自己读的
+    运行一致：以前没写，缺了 N9 的运行（只拷了缓存的机器、--only N11）照样执行、重写发表的结果。"""
+    module = _reproduce()
+    for script in ("n11_mem0", "n11_second_judge"):
+        (step,) = [s for s in module.STEPS if f"scripts/{script}.py" in s.command]
+        reads = _script_module(script).RUNS
+        if script == "n11_mem0":  # Mem0 的运行 → （数据集，N9 的运行）
+            wanted = {*reads, *(original for _, original in reads.values())}
+        else:  # 数据集 → （N9 的运行，划分）
+            wanted = {run for run, _ in reads.values()}
+        assert set(step.requires) == wanted, script
+
+
+def test_n11_mem0_does_not_write_without_every_run(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缺一个 Mem0 的运行或 N9 的运行就退出码非零、不写 mem0.json 与 mem0-holm.json：以前跳过缺
+    的 Mem0 运行、把缺的 N9 运行当作空的，照样重写（只有 Mem0 的准确率，配对都是 +0 / −0）。"""
+    module = _script_module("n11_mem0")
+    out = _published(tmp_path, module, "mem0.json")
+    runs = tmp_path / "eval"
+    row = {"sample_id": "q1", "method": "M0", "correct": True, "question_type": "single"}
+    _run_rows(runs, "locomo-test200r-mem0", row)
+    monkeypatch.setenv("CUEMEM_PATHS__EVAL_RUNS", str(runs))
+    with pytest.raises(SystemExit, match="test100r-mem0") as raised:
+        module.main()
+    assert "locomo-test7-n9" in str(raised.value) and "test400-n9" in str(raised.value)
+    assert out.read_text("utf-8") == "published\n"
+    assert [p.name for p in out.parent.iterdir()] == ["mem0.json"]
+
+
+def test_n11_second_judge_does_not_write_without_every_dataset(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """report 缺一个数据集的重判就退出码非零、不写：以前跳过它照样重写 second_judge.json（没有
+    runs/eval 时只剩判分模型的名字）。"""
+    from cuemem.config import load_settings
+
+    module = _script_module("n11_second_judge")
+    out = _published(tmp_path, module, "second_judge.json")
+    runs = tmp_path / "eval"
+    (runs / "n11-judge2").mkdir(parents=True)
+    verdict = {"dataset": "longmemeval_s", "sample_id": "q1", "method": "B6"}
+    line = json.dumps({**verdict, "primary": True, "second": True}) + "\n"
+    (runs / "n11-judge2" / "verdicts.jsonl").write_text(line, "utf-8")
+    monkeypatch.setenv("CUEMEM_PATHS__EVAL_RUNS", str(runs))
+    with pytest.raises(SystemExit, match="locomo") as raised:
+        module.report(load_settings())
+    assert "memlens32-test-n9" in str(raised.value)
+    assert out.read_text("utf-8") == "published\n"
+    assert [p.name for p in out.parent.iterdir()] == ["second_judge.json"]
+
+
+def test_n12_leak_does_not_write_without_every_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缺一个运行就退出码非零、不写 summary.json 与 summary-holm.json：以前缺的当作空的，没有
+    runs/eval 时把发表的 summary.json 从 1.6 万字节写成几百字节。没有跑过的三个 Mem0 运行
+    （NOT_RUN，README §3.3）不算缺。"""
+    module = _script_module("n12_leak")
+    out = _published(tmp_path, module, "summary.json")
+    monkeypatch.setattr(module, "RUNS", tmp_path / "eval")
+    every = [run for arms in module.ARMS.values() for runs in arms.values() for run in runs]
+    assert set(every) > module.NOT_RUN
+    for run in every:
+        if run not in module.NOT_RUN:
+            _run_rows(module.RUNS, run, {"sample_id": "q1", "method": "B1", "correct": True})
+    assert module.missing() == []
+    (module.RUNS / "orig-lme-label-cuemem" / "results.jsonl").unlink()
+    with pytest.raises(SystemExit, match="orig-lme-label-cuemem"):
+        module.main()
+    assert out.read_text("utf-8") == "published\n"
+    assert [p.name for p in out.parent.iterdir()] == ["summary.json"]
+
+
 def test_n8_summary_does_not_publish_a_cached_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
