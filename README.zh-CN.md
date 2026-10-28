@@ -5,7 +5,7 @@
 
 [English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [接口参考](docs/api.md) · [与 Mem0、Letta、Zep 等的对比](docs/landscape.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
-> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 <a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
 
@@ -13,7 +13,7 @@
 
 ## 用法
 
-当作库用，方法名与 Mem0 相同（N12）：
+当作库用，方法名与调用方式照 Mem0（N12；不同之处见下）：
 
 ```python
 from cuemem import Memory
@@ -47,17 +47,18 @@ m.add(
     expiration_date="2026-12-31",
 )
 m.search("座位偏好？", user_id="alice", filters={"source": {"in": ["crm", "app"]}})
-# 记进日志的一句更正；history() 两个版本都在
-m.update(events[0]["id"], "我搬到的是柏林，不是慕尼黑。")
+# 记进日志的一句更正（Mem0 的 text=，也可以按位置传）；history() 两个版本都在
+m.update(events[0]["id"], text="我搬到的是柏林，不是慕尼黑。")
 m.delete_all(user_id="alice", run_id=run_id)  # 只遗忘这段对话；reset() 清空所有空间
 ```
 
 - **metadata 与过期**：metadata 随原始发言存下（不给抽取模型看），由这些发言得来的事实与对话片段都带上它，`filters` 可以按它筛，照 Mem0 的运算（`eq`、`ne`、`gt`、`in`、`contains`、`AND` / `OR` / `NOT`……）。过期的记忆不再出现在 `search`、`get_all` 与画像里，`get` 与 `history` 照样取得到。
 - **`update`** 在原始日志里记一句 "Correction: …"，由它抽出的事实以"说错了"（corrected）取代原来那条（不需要对账的调用）；遗忘这句更正时原来那条恢复。
 - **`search` 不会因为控制器选了 L0 而返回空列表**：调用它就是已经决定要查记忆，L0 改走 L1（`min_level="l0"` 时照控制器的决定）。`answer()` 仍由控制器决定要不要想起。
-- **写入可以放心重试**：向量化或向量库出错时什么都不存，同样的调用可以原样再来一次；发言存下之后抽取出错时，`add(wait=True)` 不抛出，返回 `status: "queued"` 与 `error`，下次巩固时补上。
+- **写入可以放心重试**：向量化或向量库出错时什么都不存，同样的调用可以原样再来一次；发言存下之后抽取出错时，`add(wait=True)` 不抛出，返回 `status: "queued"` 与 `error`，下次巩固时补上。`m.status(user_id="alice")` 列出待抽取与抽取失败的会话、出错与自动重试的时间，后台失败也记警告日志。
+- **与 Mem0 不同的地方**：配置字典是 CueMem 的，不是 Mem0 的（不认识的键报 ValueError，Mem0 格式的配置给出改写提示）；分数只用来排序（L1 是排名融合，所以没有 `threshold`；Mem0 的 `rerank` 是 `mode="l2"`）；删一条事实遗忘的是它出自的整轮对话，同一轮的别的 ID 之后报 KeyError；`limit` 与 `top_k` 要是正数；`show_expired=True` 列出过期的记忆。`search` 给出的每个 ID 都能 `get`、`delete`，`media(id)` 取图片原文件。详见[接口参考](docs/api.md#从-mem0-迁过来)。
 
-连着运行中的 `cuemem serve` 时，`MemoryClient` 的方法与签名完全相同，本地与远程之间只换一行，几个进程也能共用一个服务（本地模式的 Qdrant 一个数据目录只允许一个进程）。底下是 Mem0 形状的 HTTP 接口 `/api/v1/memories`，任何语言都能调用：
+连着运行中的 `cuemem serve` 时，`MemoryClient` 的方法与签名完全相同，本地与远程之间只换一行，几个进程也能共用一个服务（本地模式的 Qdrant 一个数据目录只允许一个进程）。下面的框架集成仍要本地的 `Memory`（传 `MemoryClient` 时抛 TypeError）。底下是 Mem0 形状的 HTTP 接口 `/api/v1/memories`，任何语言都能调用；它的 OpenAPI 快照（[docs/openapi-v1.json](docs/openapi-v1.json)）可以生成 TypeScript 的类型（`npx openapi-typescript docs/openapi-v1.json`），Python 包带着类型标注（`py.typed`）：
 
 ```python
 from cuemem import MemoryClient
@@ -96,7 +97,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 
 也可以接进 Agent 框架：OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool，每次调用模型之前由控制器决定要不要想起（见[框架集成](docs/integrations.md)）。
 
-另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server、记忆的导出与导入（`cuemem export / import`）、按用户与 Agent 限定作用域的访问令牌，以及 Docker 镜像（`docker compose up`，要设访问令牌）。见[快速开始](#快速开始)、[部署](#部署)与 [examples/](examples/)。
+另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server（stdio，或 `cuemem serve` 的 `/mcp`）、记忆的导出与导入（`cuemem export / import`）、按用户与 Agent 限定作用域的访问令牌，以及 Docker 镜像（`docker compose up`，要设访问令牌）。见[快速开始](#快速开始)、[部署](#部署)与 [examples/](examples/)。
 
 ## 它要解决什么
 
@@ -228,11 +229,16 @@ uv run pytest -m live                    # 联网冒烟测试，需要 Key，费
 uv run ruff check . && uv run mypy       # 代码风格与类型检查
 ```
 
+离线测试在网络守卫（`tests/netguard.py`）之下跑：去掉代理变量与供应商的 Key，设 `GRADIO_ANALYTICS_ENABLED=False`，哪个测试想连非本机地址或环境变量里的代理就让它失败（`-m live` 不受影响）。本机跳过的 22 个测试在 CI 里跑：外部基线适配层的测试在每周一次的"外部基线"工作流里（固定版本、离线，命令写在各测试文件的说明里；Mem0 的还要 spaCy 的模型 wheel，并先下载 fastembed 的 `Qdrant/bm25` 模型：`uv run --with ... python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"`），Qdrant 服务端的测试在 `qdrant-server` 任务里（本机：`docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1`，再 `CUEMEM_TEST_QDRANT_URL=http://localhost:6333 uv run pytest tests/test_qdrant_server.py`）。
+
 ### 部署
 
-默认用嵌入式的 SQLite 与 Qdrant 本地模式，一个数据目录同时只允许一个进程：几个应用要共用一份记忆时，经 `MemoryClient` 或 `/api/v1` 连同一个 `cuemem serve`。pip 安装后数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）。
+默认用嵌入式的 SQLite 与 Qdrant 本地模式，一个数据目录同时只允许一个进程：几个应用要共用一份记忆时，经 `MemoryClient` 或 `/api/v1` 连同一个 `cuemem serve`。pip 安装后数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）。本地模式每个用户空间一直开着一个文件（有图的两个），所有向量都载入内存，用户多的共用服务要换 Qdrant 服务端（`cuemem migrate-vectors --to URL`，再设 `CUEMEM_VECTOR_STORE__URL`，见下）。每个 `cuemem` 命令都把打开文件数的软上限调到硬上限，`cuemem doctor` 列出集合数与上限。
 
-- **访问令牌**：`cuemem serve` 与 `cuemem proxy` 监听非本机地址又没有令牌时拒绝启动（只在可信的网络里不鉴权时加 `--insecure-no-auth`）。`CUEMEM_API_TOKEN` 是管理令牌。限定作用域的令牌写在 `CUEMEM_API_KEYS_FILE` 指向的 YAML 文件里（或直接写在 `CUEMEM_API_KEYS` 里），每个令牌只能访问列出的用户与 Agent，例如 `{name: alice-app, sha256: <printf %s "$TOKEN" | sha256sum>, scopes: [{user: alice}]}`。点名了作用域之外的用户、Agent 或空间时 403（`/api`、`/api/v1`、界面与记忆代理都一样），别人的记忆 ID 与不存在的一样（404）。MCP 仍只有 stdio，一个进程一个空间，不在这些令牌后面。格式与规则见[接口参考](docs/api.md#鉴权与限定作用域的令牌)。
+- **访问令牌**：`cuemem serve` 与 `cuemem proxy` 监听非本机地址又没有令牌时拒绝启动（只在可信的网络里不鉴权时加 `--insecure-no-auth`）。`CUEMEM_API_TOKEN` 是管理令牌。限定作用域的令牌写在 `CUEMEM_API_KEYS_FILE` 指向的 YAML 文件里（或直接写在 `CUEMEM_API_KEYS` 里），每个令牌只能访问列出的用户与 Agent，例如 `{name: alice-app, sha256: <printf %s "$TOKEN" | sha256sum>, scopes: [{user: alice}]}`。点名了作用域之外的用户、Agent 或空间时 403（`/api`、`/api/v1`、`/mcp`、界面与记忆代理都一样），别人的记忆 ID 与不存在的一样（404），`POST /api/v1/reset` 只删这个令牌自己的空间。格式与规则见[接口参考](docs/api.md#鉴权与限定作用域的令牌)。
+- **HTTP 上的 MCP**：`cuemem serve` 也在 `/mcp`（Streamable HTTP）提供 MCP 工具，令牌同上；`X-CueMem-User` 选用户，`--no-mcp` 关掉。注册：`claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp --header "Authorization: Bearer $KEY" --header "X-CueMem-User: alice"`。stdio 的 `cuemem mcp` 不能与运行中的 serve 共用本地数据目录。
+- **请求的上限**：请求体在读之前就以 413 拒绝：`/api`、`/v1` 与界面上传 64 MiB（`CUEMEM_MAX_BODY_BYTES`），导入 1 GiB（`CUEMEM_MAX_IMPORT_BYTES`；导出的文件很大时调高），别处 8 MiB。限定作用域的令牌导入也按请求体上限，同时在处理的请求体加起来也不超过它（429，带 `Retry-After: 1`）：解析出来的 JSON 约是请求体的 24 倍，共用的服务要按令牌数留内存，或者调小上限。像素超过 Pillow 上限（约 8,900 万）的图片在调用模型之前就拒绝。
+- **长时间运行**：对话会话、`/api/v1` 的 run 与记忆代理的会话闲置 30 分钟后结束、交给抽取（`--idle-minutes`）。trace（`runs/traces/*.jsonl`，里面有用户的提问）在遗忘之前一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`。最多同时抽取 4 个用户的记忆（`CUEMEM_CONSOLIDATION__BACKGROUND_WORKERS`）。界面缺省会发 Gradio 的使用统计，设 `GRADIO_ANALYTICS_ENABLED=False` 关掉。
 - **供应商出错**在 HTTP 接口上各有状态码，不再是没有说明的 500：限流 429（带 `Retry-After`）、余额不足 402、暂时不可用 503（带 `Retry-After`）、超时 504、内容审核拒绝 422、其余 502。
 - **浏览器**：别的网站发来的浏览器请求一律 403；监听本机地址时只接受 Host 为 127.0.0.1、localhost、[::1] 的请求，经反向代理或别的主机名访问时把这些主机名写进 `CUEMEM_ALLOWED_HOSTS`（逗号分隔，可以写在 `.env` 里）。
 
@@ -289,6 +295,7 @@ uv run python scripts/n11_latency.py                      # 离线延迟基准�
 | N12 | 对标开源同类项目：SDK、记忆代理、预设、导出导入、Docker | 已完成 |
 | N12 后续 | 全面体检：七个视角找问题，修掉 24 处，评测请求不变 | 已完成 |
 | N12 后续 | 第二轮体检：留到以后的 17 条做了 14 条（原子写入、供应商出错、对账与遗忘的代价、启动与依赖、数据集与显著性、Mem0 接口与 `MemoryClient`、多租户、记忆代理），评测请求不变 | 已完成 |
+| N12 后续 | 第三轮体检：七个视角从头再查，修掉核实为真的 22 处（遗忘与锁、提交之后的出错、删除的残留、`status()`、闲置结束、规模与打开的文件、界面与输入的上限、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现与说法），评测请求不变 | 已完成 |
 
 ## 结果
 

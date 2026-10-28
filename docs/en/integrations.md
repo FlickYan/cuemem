@@ -7,12 +7,12 @@ There are five ways to plug CueMem into an existing agent stack, from least to m
 | Way in | Good for | Who decides whether to recall | Where |
 |---|---|---|---|
 | OpenAI-compatible memory proxy | Any app on the OpenAI SDK, with no code changes: Chat Completions, embeddings, and non-streaming text Responses calls | The controller, every turn | `cuemem proxy`, README |
-| MCP server | Claude Code, Claude Desktop and other MCP clients | The model calls `recall`; the controller only picks the depth | `cuemem mcp` |
+| MCP server | Claude Code, Claude Desktop and other MCP clients | The model calls `recall`; the controller only picks the depth | `cuemem mcp` (stdio), or `/mcp` of `cuemem serve` (HTTP, behind the same tokens) |
 | Framework integrations (this page) | OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | The controller, before every model call; the model can also search with tools | `cuemem.integrations.*` |
 | Python SDK | Your own agent loop | You | `from cuemem import Memory` |
 | Memory API over HTTP | Apps in other languages, or several processes sharing one server | You | `/api/v1/memories` of `cuemem serve`; `from cuemem import MemoryClient` |
 
-Every method, route and error code of the last two is in the [API reference](api.md). `MemoryClient` has exactly the methods and signatures of `Memory`, so code moves between a local data directory and a shared server by changing one line; the integrations below still need a local `Memory` or `AsyncMemory`.
+Every method, route and error code of the last two is in the [API reference](api.md). `MemoryClient` has exactly the methods and signatures of `Memory`, so code moves between a local data directory and a shared server by changing one line; the integrations below still need a local `Memory` or `AsyncMemory`, and passing them a `MemoryClient` raises TypeError at construction (before, an AttributeError came later; `claude.with_recall` now raises instead of warning).
 
 All three integrations share `cuemem/evidence.py`.
 - **Controller first:** the controller picks a level (L0 recalls nothing and gives only the profile).
@@ -22,7 +22,8 @@ All three integrations share `cuemem/evidence.py`.
 - **Memories are framed as data:** the evidence block and the recall tools' listing say that their content is quoted from past conversations, information and not instructions, and a stored `<memory` or `</memory` is escaped so it cannot close the block early. This reduces prompt injection from stored memories but cannot prevent it.
 - **Nothing twice:** in OpenAI Agents and LangGraph, rounds of the current conversation that are still in the request are left out of the evidence, photo rounds included (`evidence.stored_text` and `in_context_rounds`, shared with the proxy).
 - **Forgetting says what happened:** when the deletion is done but rebuilding the derived memory from the rest of the log fails (say, the provider is out of balance), the forget tools of MCP, Agents and LangGraph answer "Deleted N conversation turn(s). Rebuilding the memory derived from the rest failed (…); it finishes on the next consolidation…" instead of an error, so the model does not tell the user nothing was deleted.
-- **Writes are all or nothing:** when embedding or the vector store fails, nothing is written, so a write can be retried without duplicating turns.
+- **Writes are all or nothing:** when embedding or the vector store fails, nothing is written, so a write can be retried without duplicating turns. Once the turns are committed nothing raises: a trace that cannot be written is only a warning on the `cuemem.core.trace` logger.
+- **A forget waits for a whole recall:** automatic recall and the recall tools that raise L0 to L1 read under one hold, so a forget in the same space runs before or after them, never in between.
 
 Install with `pip install "cuemem[integrations]"` (from GitHub, as in the README) or, in a checkout, `uv sync --extra integrations`; one framework alone is `openai-agents`, `langgraph` or `anthropic`. With only a DeepSeek key, add the `local` extra and use `Memory(preset="deepseek")`.
 
@@ -78,7 +79,7 @@ close_sessions(memory)  # at shutdown, before memory.close()
   - Messages removed with `pop_item` or `clear_session` are also forgotten in long-term memory.
   - Turns deleted with the forget tool are pruned from the inner session the next time history is read.
 - **Unanswered messages:** user messages the model never answered (for example, blocked by an input guardrail) are not stored.
-- **Write-backs that fail are retried:** when a batch cannot be written (an embedding or Qdrant outage), `CueMemSession` keeps it and writes it, with its original time, before the next batch or in `end()`. A batch is dropped (trace event `agents_mirror_dropped`) when retrying cannot help (most 4xx errors, a content-filter refusal, invalid input) or when the space has forgotten turns in the meantime, so messages from before a forget are never written back. Kept batches live only in process memory.
+- **Write-backs that fail are retried:** when a batch cannot be written (an embedding or Qdrant outage), `CueMemSession` keeps it and writes it, with its original time, before the next batch or in `end()`. A batch is dropped (trace event `agents_mirror_dropped`) when retrying cannot help (most 4xx errors, a content-filter refusal, invalid input such as an image above Pillow's pixel limit, which is dropped alone) or when the space has forgotten turns in the meantime, so messages from before a forget are never written back. Kept batches live only in process memory.
 - **Through the memory proxy instead:** the Agents SDK's default model class calls the Responses API, usually with tools or streaming, and the proxy answers those with 501. Use this integration, or point `OpenAIChatCompletionsModel` at the proxy.
 
 ## LangGraph / LangChain
@@ -167,4 +168,4 @@ delete_all(memory, user_id="alice")  # memories and Claude's files, together
 - **Images:** the integrations inject text evidence only. When the controller wants to look at the original photo (`see`), the photo is not attached to the model call (the same as the proxy).
 - **Async:** CueMem itself is synchronous and runs in threads. In async frameworks use `AsyncMemory` or each integration's async variants.
 - **Provider errors and expiry:** the integrations' own memory tools do not turn provider errors (rate limits, an empty balance, timeouts) into explanations the way MCP does; the provider client's error comes through. Memories with an `expiration_date` are excluded only by the SDK's `search`, `get_all` and profile, so the integrations still see them until they are deleted.
-- **Traces:** every automatic recall and recall tool call writes a `retrieve` trace (the question, the retrieval mode and the IDs it retrieved) to `runs/traces/*.jsonl` in the data directory. Forgetting deletes the traces that list a deleted memory, together with the cached query vectors of their questions.
+- **Traces:** every automatic recall and recall tool call writes a `retrieve` trace (the question, the retrieval mode and the IDs it retrieved) to `runs/traces/*.jsonl` in the data directory. Forgetting deletes the traces that list a deleted memory, together with the cached query vectors of their questions (also when the question contains U+2028, U+2029 or U+0085), and `delete_all` deletes every trace of the space. Traces are kept until then unless `CUEMEM_TRACES_RETENTION_DAYS` is set: `cuemem serve` and `cuemem proxy` apply it daily, and an app that only uses the SDK can call `memory.system.prune_traces(days)`.

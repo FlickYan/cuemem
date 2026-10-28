@@ -14,7 +14,7 @@
   - 模型只有 DeepSeek 与通义（向量还是通义的原生接口），没有 OpenAI、没有本地模型；
   - 只能通过命令行、HTTP 接口和 MCP 用，没有 Python SDK，也没有"改个 base_url 就接上"的方式；
   - 不能导出、导入，遗忘没有预演，抽取记什么不能按场景调整，没有容器镜像。
-- **N12 照着主流项目把这一层补上了**（§5），同时保住 CueMem 自己的语义：事实不就地改写、检索先过控制器、遗忘走完整的级联。N12 之后的第二轮体检（D-069）又补上 Mem0 的其余接口（`metadata`、过期时间、`update()`、`reset()`）、HTTP 记忆接口与远程的 `MemoryClient`、限定作用域的令牌，以及记忆代理的 `/v1/embeddings` 与 `/v1/responses` 子集。
+- **N12 照着主流项目把这一层补上了**（§5），同时保住 CueMem 自己的语义：事实不就地改写、检索先过控制器、遗忘走完整的级联。N12 之后的第二轮体检（D-069）又补上 Mem0 的其余接口（`metadata`、过期时间、`update()`、`reset()`）、HTTP 记忆接口与远程的 `MemoryClient`、限定作用域的令牌，以及记忆代理的 `/v1/embeddings` 与 `/v1/responses` 子集。第三轮（D-070）补上 Mem0 其余的写法（`update(text=)`、`show_expired`、配置写错时报错并给出改写提示）、`status()`、令牌之后的 HTTP 上的 MCP、带类型的 OpenAPI 约定与带类型的异步客户端，以及一个服务给很多用户用时的各种上限。
 - 刻意没有照搬的：让 LLM 自己改记忆作为默认（Letta）、只增不改（Mem0 v3）、图数据库与二十几种向量库后端（§6）。
 
 ## 2. 同类项目一览
@@ -39,11 +39,11 @@
 
 ## 3. 能力对照
 
-"未见"指在核对的源码与文档里没有找到，不代表一定没有。CueMem 一列按第二轮体检（D-069）之后的代码更新。
+"未见"指在核对的源码与文档里没有找到，不代表一定没有。CueMem 一列按第三轮体检（D-070）之后的代码更新。
 
-| 能力 | CueMem（N12 与第二轮体检） | Mem0 | Letta | Graphiti / Zep | Cognee | Supermemory |
+| 能力 | CueMem（N12 与几轮体检） | Mem0 | Letta | Graphiti / Zep | Cognee | Supermemory |
 |---|---|---|---|---|---|---|
-| Python SDK | `Memory` / `AsyncMemory`，方法名照 Mem0（含 `update`、`reset`、`metadata` 与 filters 的运算）；远程的 `MemoryClient` 连自己部署的 `cuemem serve` | `Memory` / `AsyncMemory`；`MemoryClient` 连托管平台 | 弃用（主力是 TS） | 全异步的 `Graphiti` | `remember` / `recall` 等 | `supermemory` 客户端 |
+| Python SDK | `Memory` / `AsyncMemory`，方法名与调用方式照 Mem0（含 `update(text=)`、`reset`、`metadata`、filters 的运算与 `show_expired`），另有 `status()`；远程的 `MemoryClient` 连自己部署的 `cuemem serve`；带类型（`py.typed`） | `Memory` / `AsyncMemory`；`MemoryClient` 连托管平台 | 弃用（主力是 TS） | 全异步的 `Graphiti` | `remember` / `recall` 等 | `supermemory` 客户端 |
 | 零代码接入 | OpenAI 兼容的 HTTP 代理（`/v1/chat/completions`，流式；`/v1/embeddings`；`/v1/responses` 的非流式纯文字子集） | 客户端包装（`Mem0().chat.completions.create`） | — | — | — | Memory Router（改 base URL；文档已重定向，现状未核实） |
 | 每轮都检索吗 | 否：控制器先判断，L0 不检索（SDK 的 `search` 缺省不低于 L1） | 包装里每轮检索 | LLM 决定 | 应用决定 | 规则路由 | 每轮 |
 | 知识更新 | 失效而不删除，版本链 `history()`；`update()` 在日志里记一句更正，取代原来那条 | v3 只增不改；`update()` 就地改写；`history()` | LLM 改写 | 失效而不删除 | 矛盾检测（默认关） | `isLatest` 版本链 |
@@ -53,10 +53,10 @@
 | 导出 / 导入 | `export` / `load`（原始日志 + 原图，派生记忆重建） | 只在付费平台 | Agent File（已从 Letta Code 去掉） | 未见 | COGX，可导入 Mem0 / Zep / Letta | 未见 |
 | 自定义抽取 | `consolidation.instructions` | `custom_instructions` | 记忆块的标签与上限 | Pydantic 实体 / 边类型、`custom_extraction_instructions` | 自定义数据模型、本体 | 未见 |
 | 本地模型、不要 Key | 预设 `ollama` | Ollama、LM Studio、vLLM | 未核实 | Ollama 等兼容接口 | Ollama、llama.cpp，本地抽取器 | 本地模式 |
-| 部署 | Docker 镜像、compose（+ Qdrant 服务端）、MCP（stdio）、HTTP（`/api` 与 Mem0 形状的 `/api/v1`）；管理令牌与限定作用域的令牌 | docker compose、托管平台、托管 MCP | `letta server` | REST、MCP 镜像 | Docker、云服务 | 本地模式、Docker、托管 MCP |
+| 部署 | Docker 镜像、compose（+ Qdrant 服务端）、MCP（stdio，以及 HTTP 上的 `/mcp`）、HTTP（`/api` 与 Mem0 形状的 `/api/v1`）；管理令牌与限定作用域的令牌；请求的大小上限与闲置结束 | docker compose、托管平台、托管 MCP | `letta server` | REST、MCP 镜像 | Docker、云服务 | 本地模式、Docker、托管 MCP |
 | 存储后端 | SQLite + Qdrant（本地或服务端） | 约 26 种向量库 | Postgres 等 | Neo4j、FalkorDB、Neptune | LanceDB、pgvector、Kuzu、Neo4j…… | 托管 / 本地 |
 | 公开评测 | 测试集上只做一遍冻结的评测、方法事先冻结；三个基准、三种回答模型、消融、人工抽检、第二判分 | `memory-benchmarks` 仓库（平台版的模型未公开） | 博客 | 论文 | 自有评测 | 自有评测 |
-| 其他语言 / 框架集成 | 只有 Python 的客户端；别的语言经 HTTP 的 `/api/v1`、记忆代理与 MCP，没有 TypeScript 客户端；OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool（[框架集成](integrations.md)） | TS、十几个框架 | TS、Vercel AI SDK | 十几个框架 | TS、Rust、Claude Code 插件 | TS、Vercel AI SDK 中间件、多个框架 |
+| 其他语言 / 框架集成 | 只有 Python 的客户端；别的语言经 HTTP 的 `/api/v1`（TypeScript 的类型可以从它的 OpenAPI 快照生成，没有手写的客户端）、记忆代理与 MCP；OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool（[框架集成](integrations.md)） | TS、十几个框架 | TS、Vercel AI SDK | 十几个框架 | TS、Rust、Claude Code 插件 | TS、Vercel AI SDK 中间件、多个框架 |
 
 ## 4. 分数：各家公开的（不能直接比较）与同一协议下的
 
@@ -152,8 +152,18 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 | `metadata`、过期时间与 filters 的运算 | Mem0 的 `metadata`、`expiration_date` 与 v3 的 filters | 存在原始层（新表 `turn_meta`），不进抽取提示与会话的内容指纹，请求与缓存键不变；事实与片段带上出处的 metadata 与最晚的过期时间；过期只在 SDK 读取时排除，不改写派生记忆 | `sdk.py`、`store/sqlite.py` | D-069 |
 | `update()` 与 `reset()` | Mem0 | Mem0 的 `update()` 就地改写；CueMem 在日志里记一句 "Correction: …"，对账按 `edit_of` 取代原来那条（不问 LLM），经得起重建与遗忘；`reset()` 删除数据目录里的每个空间 | `sdk.py`、`write/reconcile.py` | D-069 |
 | HTTP 记忆接口与远程客户端 | Mem0 的 REST 接口与 `MemoryClient` | `cuemem serve` 的 `/api/v1` 与 SDK 一一对应，出错是 `{"error": {code, type, message}}`；`MemoryClient` 的签名与 `Memory` 逐一相同、抛出同样的异常，代码在本地与共用的服务之间只换一行 | `api/memories.py`、`client.py` | D-069 |
-| 按用户鉴权 | Mem0 的空间划分（user_id、agent_id） | 限定作用域的令牌：每个令牌列出能访问的用户与 Agent；点名作用域之外的空间回 403，按 ID 找的记忆在作用域之外时与不存在的一样（404）；`/api`、`/api/v1`、界面与记忆代理都检查，MCP 不在其中 | `api/auth.py` | D-069 |
+| 按用户鉴权 | Mem0 的空间划分（user_id、agent_id） | 限定作用域的令牌：每个令牌列出能访问的用户与 Agent；点名作用域之外的空间回 403，按 ID 找的记忆在作用域之外时与不存在的一样（404）；`/api`、`/api/v1`、界面与记忆代理都检查（第三轮之后还有 `/mcp`） | `api/auth.py` | D-069 |
 | 记忆代理的覆盖面 | OpenAI 的 Embeddings 与 Responses API | `/v1/embeddings`；`/v1/responses` 的非流式纯文字子集，其余回 501；每个响应写明实际转发的模型（`X-CueMem-Model`），不认识的模型可以拒绝（`unknown_model: reject`） | `api/proxy.py` | D-069 |
+
+第三轮体检补上了用过这些项目的人最先会碰到的缺口（D-070）：
+
+| 补上的能力 | 照着谁 | CueMem 的做法与不同 | 位置 | 决策 |
+|---|---|---|---|---|
+| Mem0 的写法与配置报错 | Mem0 2.x | `update(memory_id, text=...)`（`data=` 留作别名）、`show_expired`、`limit` / `top_k` 要是正数、`MemoryClient(host=...)`。Mem0 格式的配置字典报 ValueError 并给出改写提示，不再悄悄忽略；分数只用来排序，所以没有 `threshold` | `sdk.py`、`config.py`、`client.py` | D-070 |
+| 每个 ID 都能按 ID 用 | Mem0 对 `search` 给出的任何 ID 都能 `get` / `delete` | `search` 给出的对话片段与图片的 ID 也能 `get`、`delete`；`media(id)` 与 `GET /api/v1/media/{id}` 返回图片原文件。删除遗忘的是整轮对话 | `sdk.py`、`api/memories.py` | D-070 |
+| 抽取状态的查询 | — | `status()`：待抽取与抽取失败的会话、出错与重试时间，`/api/v1/status` 也有；后台失败记警告日志 | `sdk.py`、`write/consolidate.py` | D-070 |
+| 令牌之后的 HTTP 上的 MCP | Mem0 与 Graphiti 的托管 MCP | `cuemem serve` 的 `/mcp`（Streamable HTTP），令牌与作用域同 `/api`；`X-CueMem-User` 选空间 | `api/mcp.py` | D-070 |
+| 带类型的约定 | Mem0 与 Supermemory 的 TypeScript SDK | `/api/v1` 带类型的 OpenAPI 快照（`docs/openapi-v1.json`），可以生成 TypeScript 的类型；`py.typed` 与带类型的异步类。没有手写的 TypeScript 包 | `api/memories.py`、`_async.py` | D-070 |
 
 ## 6. 刻意没有照搬的
 
@@ -166,8 +176,8 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 
 按"用户最先会碰到"的顺序：
 
-1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺 TypeScript 客户端（别的语言现在经 HTTP 的 `/api/v1`）与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
-2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。还缺：MCP 只有 stdio、一个进程一个空间，不在这些令牌后面；令牌文件只在启动时读，`/api/v1/reset` 只有管理令牌能用；多实例部署需要把 SQLite 换成 Postgres。
+1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺手写的 TypeScript 客户端（别的语言经 HTTP 的 `/api/v1`，它的 OpenAPI 快照可以生成 TypeScript 的类型）与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
+2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070）。还缺：令牌文件只在启动时读，没有生成令牌的命令；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
 3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；过期只在 SDK 的 `search`、`get_all` 与画像里生效，记忆代理、MCP、`/api` 与各集成在删除之前仍看得到；Supermemory 那样自动认出临时事实、让它过期的还没有。
