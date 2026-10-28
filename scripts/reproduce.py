@@ -11,7 +11,8 @@ API Key，全部重跑的名义成本约 $150（各节点的花费见路线图�
 - N2、N3 的数字用的是 N1 选的向量模型 text-embedding-v4（N4 起换成 qwen3.7-text-embedding），
   这两步会自动切换向量模型（评测记忆空间按向量模型分目录存放，互不干扰）；
 - N8 的上下文布局实验（scripts/n8_context.py）关掉了本地缓存、每次真实调用，不在这里重跑；
-- 测试集（test400、LoCoMo 后 7 段对话、MemLens 官方 195 题）只在 N9 使用；
+- 测试集（test400、LoCoMo 后 7 段对话）在 N9 首次使用，MemLens 官方 195 题 N6 也用过（方法同样
+  事先定好）；N11、N12 另在它们的分层子集上做过标明为事后的分析；
 - 标了"可选"的步骤还没有真正跑过、没有缓存，默认跳过，加 --with-optional 才执行
   （N9 的大模型回答档 deepseek-v4-pro，名义成本约 $17）；
 - 这里的 LongMemEval / MemLens 数字都是 N12 修复会话 ID 泄漏之前跑的：证据会话的原始 ID

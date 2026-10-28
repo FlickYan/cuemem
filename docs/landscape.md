@@ -8,7 +8,7 @@
 
 ## 1. 结论
 
-- **研究部分在同类项目里少见**：把"要不要想起、想多深"做成可训练、可单独评测的控制器；双时间轴、失效而不删除；回答时取回原图再看一眼；测试集只用一次、方法事先冻结的评测，外部基线（Mem0；N12 加上 Graphiti、LangMem、Cognee、A-MEM）在同样的模型与判分下对比。这些在下面的项目里大多没有，或者没有公开的消融。
+- **研究部分在同类项目里少见**：把"要不要想起、想多深"做成可训练、可单独评测的控制器；双时间轴、失效而不删除；回答时取回原图再看一眼；方法事先冻结、在测试集上只做一遍的评测，外部基线（Mem0；N12 加上 Graphiti、LangMem、Cognee、A-MEM）在同样的模型与判分下对比。这些在下面的项目里大多没有，或者没有公开的消融。
 - **N12 之前缺的是"能拿来用"的那一层**。用过 Mem0 的人第一反应是 `pip install` 之后三行代码，CueMem 当时做不到：
   - 配置文件放在仓库里、数据写在仓库目录下，pip 安装后跑不起来；
   - 模型只有 DeepSeek 与通义（向量还是通义的原生接口），没有 OpenAI、没有本地模型；
@@ -55,7 +55,7 @@
 | 本地模型、不要 Key | 预设 `ollama` | Ollama、LM Studio、vLLM | 未核实 | Ollama 等兼容接口 | Ollama、llama.cpp，本地抽取器 | 本地模式 |
 | 部署 | Docker 镜像、compose（+ Qdrant 服务端）、MCP（stdio）、HTTP（`/api` 与 Mem0 形状的 `/api/v1`）；管理令牌与限定作用域的令牌 | docker compose、托管平台、托管 MCP | `letta server` | REST、MCP 镜像 | Docker、云服务 | 本地模式、Docker、托管 MCP |
 | 存储后端 | SQLite + Qdrant（本地或服务端） | 约 26 种向量库 | Postgres 等 | Neo4j、FalkorDB、Neptune | LanceDB、pgvector、Kuzu、Neo4j…… | 托管 / 本地 |
-| 公开评测 | 测试集只用一次、方法事先冻结；三个基准、三种回答模型、消融、人工抽检、第二判分 | `memory-benchmarks` 仓库（平台版的模型未公开） | 博客 | 论文 | 自有评测 | 自有评测 |
+| 公开评测 | 测试集上只做一遍冻结的评测、方法事先冻结；三个基准、三种回答模型、消融、人工抽检、第二判分 | `memory-benchmarks` 仓库（平台版的模型未公开） | 博客 | 论文 | 自有评测 | 自有评测 |
 | 其他语言 / 框架集成 | 只有 Python 的客户端；别的语言经 HTTP 的 `/api/v1`、记忆代理与 MCP，没有 TypeScript 客户端；OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool（[框架集成](integrations.md)） | TS、十几个框架 | TS、Vercel AI SDK | 十几个框架 | TS、Rust、Claude Code 插件 | TS、Vercel AI SDK 中间件、多个框架 |
 
 ## 4. 分数：各家公开的（不能直接比较）与同一协议下的
@@ -74,7 +74,7 @@
 | MIRIX | 85.4 | gpt-4.1-mini / GPT-4.1 | arXiv 2507.07957（摘要） | |
 | Hindsight | 89.6 / 85.7 / 83.2 | Gemini-3 / OSS-120B / OSS-20B | vectorize-io/hindsight-benchmarks | 说明里称有独立复现 |
 | Mem0 平台 v3 | 92.5 | 未公开 | mem0ai/memory-benchmarks | 托管平台、检索 top-200，开源版没有这些优化 |
-| **CueMem** L1 / L2 / 控制器 | 79.7 / 84.5 / 82.2 | deepseek-flash / qwen3.8-max | [技术报告](report.md) | 后 7 段对话 1,155 题，测试集只用一次 |
+| **CueMem** L1 / L2 / 控制器 | 79.7 / 84.5 / 82.2 | deepseek-flash / qwen3.8-max | [技术报告](report.md) | 后 7 段对话 1,155 题，N9 首次使用；下面 N12 的对比又在其中 200 题上跑过 |
 
 **LongMemEval_S**（500 题；CueMem 是事先划出的 400 题测试集）
 
@@ -126,9 +126,9 @@
 - **换模型的影响**：CueMem、Mem0、Cognee、A-MEM（k = 10）从 pds 换到 pq 只差 0–3.5 个点，Graphiti 与 LangMem 大幅掉分。
   - Graphiti：用它自己的提示词，qwen3.8-flash 抽出的实体少得多（7 段对话 1,253 → 462 个，事实 3,426 → 1,774 条）；pq 下每段对话记下 118–270 条 "Target entity not found" 警告，这些事实被丢掉。pq 下的发言召回 0.545（朴素检索 0.845，CueMem L1 0.95）。
   - LangMem：qwen3.8-flash 用 PatchDoc 把新信息并进少数几条长记忆（705 → 123 条），丢了写入的会话 2 / 202 → 23 / 202。
-  - 这两家的提示词与阈值都没有为通义重调。反过来，CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调出来的（N3–N7），pq 对它是主场；pds 下没有哪个系统为模型调过提示词，L2 同样领先（对 Mem0 只是名义显著）。
+  - 这两家的提示词与阈值都没有为通义重调。反过来，CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调出来的（N3–N7），pq 对它是主场；pds 下没有哪个系统的抽取提示是对着 deepseek-flash 调的，但 deepseek-flash 是 CueMem 在 N2–N9 的回答模型（共用的回答提示与控制器的各档准确率表都是用它定的），所以两个协议都不完全中立；pds 下 L2 同样领先（对 Mem0 只是名义显著）。
 
-N11 在原协议下（抽取与向量用通义、回答 deepseek-flash、判分 qwen3.8-max）对比过开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（名义 p = 0.049，多重比较校正后 0.147），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。N2–N11 发布的 LongMemEval 上检索类方法的数字（包括这一组和上面 LongMemEval 表里 CueMem 的 L1 / L2 / 控制器；全上下文不受影响）都带着会话 ID 泄漏，已修复并做了对照（D-067，[泄漏对照](results/n12-leak/README.md)）：test100r 的消融里 L1、L2 与控制器没有可测的虚高（一两个点排除不了）；修复后同样设置下 L1 90% 对 Mem0 79%，Mem0 发布的 83% 可能高了几个点。
+N11 在原协议下（抽取与向量用通义、回答 deepseek-flash、判分 qwen3.8-max）对比过开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（名义 p = 0.049，多重比较校正后 0.147），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。N2–N11 发布的 LongMemEval 上检索类方法的数字（包括这一组和上面 LongMemEval 表里 CueMem 的 L1 / L2 / 控制器；全上下文不受影响）都带着会话 ID 泄漏，已修复并做了对照（D-067，[泄漏对照](results/n12-leak/README.md)）：test100r 的消融里 L1、L2 与控制器没有可测的虚高，但 95% 区间仍容许单个方法虚高约 8 个点（L1 +2.0，区间 −3.7 到 +8.1）、L1、L2 与控制器平均约 3–4 个点，这 100 题里只有 5 道拒答题，`_abs` 那部分泄漏几乎测不到；修复后同样设置下 L1 90% 对 Mem0 79%，Mem0 发布的 83% 可能高了几个点。
 
 这里测的 mem0ai 2.2.1 就是只增不改的 v3 算法：PyPI 上的包版本号是 2.x，源码里的抽取提示写的是 "V3 Additive Extraction Prompt (ADD-only with memory linking)"，`add` 不再让 LLM 决定 UPDATE / DELETE。
 
