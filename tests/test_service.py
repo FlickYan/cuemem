@@ -860,6 +860,35 @@ def test_http_api_trusted_hosts(service: ChatService, tmp_path: Path) -> None:
         assert client.get(path, headers={"Host": "attacker.example:7860"}).status_code == 400
 
 
+def test_v1_host_and_origin_refusals_have_the_v1_error_shape(
+    service: ChatService, tmp_path: Path
+) -> None:
+    """OpenAPI 写着 /api/v1 的每个出错都是 V1ErrorBody，按它生成的客户端据此解析：Host 不对（400）
+    与别的网站发来的浏览器请求（403）也是。以前是纯文本的 "Invalid host header" 与中文的
+    {"detail": …}。/api 与界面照旧。"""
+    from cuemem.api.memories import V1ErrorBody
+
+    app_ = create_app(
+        service, upload_dir=tmp_path / "uploads", ui=False, allowed_hosts=["127.0.0.1"]
+    )
+    client = TestClient(app_, base_url="http://127.0.0.1:7860")
+    attacker, evil = {"Host": "attacker.example:7860"}, {"Origin": "https://evil.example"}
+    refused = client.get("/api/v1/spaces", headers=attacker)
+    assert refused.status_code == 400
+    error = V1ErrorBody.model_validate(refused.json()).error
+    assert error.code == "invalid_request" and "CUEMEM_ALLOWED_HOSTS" in error.message
+    body = {"messages": "I like tea", "user_id": "alice", "infer": False}
+    refused = client.post("/api/v1/memories", json=body, headers=evil)
+    assert refused.status_code == 403
+    error = V1ErrorBody.model_validate(refused.json()).error
+    assert error.code == "forbidden" and "Cross-site" in error.message
+    assert service.system.db.get_turns("alice") == []
+    assert client.get("/api/v1/spaces").status_code == 200
+    assert client.get("/api/spaces", headers=attacker).text == "Invalid host header"
+    started = client.post("/api/sessions", json={}, headers=evil)
+    assert started.json() == {"detail": "不接受别的网站发来的浏览器请求"}
+
+
 def test_http_import_rejects_bad_attachments(service: ChatService, tmp_path: Path) -> None:
     """导入的附件不是图片、或 sha256 是一条路径：409（不是 500），什么都不写。"""
     client = TestClient(create_app(service, upload_dir=tmp_path / "uploads", ui=False))

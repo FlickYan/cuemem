@@ -46,14 +46,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
 from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of, ui_login
 from cuemem.api.failures import provider_failure
-from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, BodyLimit
-from cuemem.api.memories import install_error_format, memories_router
+from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, BodyLimit, _v1
+from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError
@@ -95,7 +95,11 @@ class SameOriginOnly:
             headers = Headers(scope=scope)
             origin = headers.get("origin")
             if origin is not None and not self._allowed(origin, headers.get("host", "")):
-                response = JSONResponse({"detail": "不接受别的网站发来的浏览器请求"}, 403)
+                response = (  # /api/v1 下是它的出错格式（V1ErrorBody），英文
+                    _error(403, "Cross-site browser requests are not accepted.", None)
+                    if _v1(scope["path"])
+                    else JSONResponse({"detail": "不接受别的网站发来的浏览器请求"}, 403)
+                )
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
@@ -112,6 +116,42 @@ class SameOriginOnly:
             return False
         name = f"[{name}]" if ":" in name else name
         return parts.netloc.lower() == host.lower() or name in self.hosts
+
+
+_HOST_OK = "cuemem.host_ok"  # scope 里的记号：TrustedHostMiddleware 放行了这个请求
+
+
+class TrustedHosts(TrustedHostMiddleware):
+    """Starlette 的 TrustedHostMiddleware（规则不变）；只是 /api/v1 下拒绝时回它的出错格式
+    （V1ErrorBody，400），不是纯文本的 "Invalid host header"：按 OpenAPI 生成的客户端解析得了。
+    放行时内层的应用在 scope 里留个记号，没有记号就是被拒绝了，换掉它的响应。"""
+
+    def __init__(self, app: ASGIApp, allowed_hosts: Sequence[str]) -> None:
+        async def accepted(scope: Scope, receive: Receive, send: Send) -> None:
+            scope[_HOST_OK] = True
+            await app(scope, receive, send)
+
+        super().__init__(accepted, allowed_hosts=allowed_hosts)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _v1(scope["path"]):
+            await super().__call__(scope, receive, send)
+            return
+        refused = False
+
+        async def checked(message: Message) -> None:
+            nonlocal refused
+            if scope.get(_HOST_OK):
+                await send(message)
+            elif not refused:  # 被拒绝了：只发一次 /api/v1 的出错
+                refused = True
+                text = (
+                    f"Invalid host header: this server accepts only the host names it listens "
+                    f"on and those in {HOSTS_ENV}."
+                )
+                await _error(400, text, None)(scope, receive, send)
+
+        await super().__call__(scope, receive, checked)
 
 
 def _guard(
@@ -131,7 +171,7 @@ def _guard(
     )
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
+        app.add_middleware(TrustedHosts, allowed_hosts=list(allowed_hosts))
 
 
 class StartRequest(BaseModel):
