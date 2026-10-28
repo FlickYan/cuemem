@@ -703,6 +703,42 @@ def test_background_extraction_failure_is_logged(
         assert len(warnings()) == 2
 
 
+def test_forgetting_a_session_whose_extraction_failed_leaves_no_trace_of_its_words(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """后台抽取失败时 trace 里记一条 consolidate_failed。结构化输出不合格时出错的后几行引着模型
+    的输出（pydantic 的 input_value=...），也就是用户的原话；以前这条事件记出错的前 200 个字符，
+    遗忘这段会话（delete_all(run_id=...)、按 ID 删除、/api 的遗忘）删不到它：它只有会话 ID 与
+    出错，遗忘按属性里的原话、按记忆 ID 找。现在与日志、worker.errors 一样只记第一行。"""
+    secret = "My bank PIN is 4711-SECRET"
+
+    def quoting(prompt: str) -> dict[str, Any]:  # 不合格的输出（facts 不是列表），引着原话
+        if "PIN" in prompt or "does not match the schema" in prompt:
+            return {"summary": "", "facts": {"statement": secret}, "entities": []}
+        return where_i_live(prompt)
+
+    fake_api.chat_replies = [ScriptedModel(quoting)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=True) as m:
+        m.add("I like tea", user_id="bob", run_id="keep")
+        m.add(secret, user_id="bob", run_id="r1")
+        m.wait()
+        assert [f["session_id"] for f in m.status(user_id="bob")["failed"]] == ["r1"]
+        events = [
+            event
+            for path in Path(n3_settings.paths.traces).glob("*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+            for event in json.loads(line)["events"]
+            if event["kind"] == "consolidate_failed"
+        ]
+        assert events and all(e["sessions"] == ["r1"] for e in events)
+        assert all("StructuredOutputError" in e["error"] for e in events)
+        assert all("\n" not in e["error"] for e in events)
+        m.delete_all(user_id="bob", run_id="r1")
+        assert m.system.db.get_turns("bob", "r1") == []
+        for path in Path(n3_settings.paths.traces).glob("*.jsonl"):
+            assert "4711-SECRET" not in path.read_text(encoding="utf-8")
+
+
 def test_a_delete_whose_rebuild_fails_still_reports_the_deletion(
     memory: Memory, model: ScriptedModel, fake_api: FakeAPI
 ) -> None:

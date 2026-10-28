@@ -1044,10 +1044,13 @@ class ConsolidationWorker:
                 failed = set(report.failed)
                 jobs = consolidator.db.get_jobs(space_id, status="failed")
                 error = next((j["error"] or "" for j in jobs if j["session_id"] in failed), "")
-                record_event("consolidate_failed", sessions=report.failed, error=error[:200])
+                # 只记第一行（与 _fail 相同）：结构化输出不合格时之后几行引着模型的输出，也就是
+                # 用户的原话；这条事件只有会话 ID 与出错，遗忘这段会话时找不到它、删不掉
+                first = (error.splitlines() or [""])[0][:200]
+                record_event("consolidate_failed", sessions=report.failed, error=first)
                 # 任务记下的出错是 "<类型>: <说明>"（Consolidator._run 的 fail_job）
                 kind = error.split(":", 1)[0]
-                self._fail(space_id, kind, f"{len(failed)} 个会话抽取失败：{error[:200]}")
+                self._fail(space_id, kind, f"{len(failed)} 个会话抽取失败：{first}")
             elif report.sessions:  # 顺利做完了：这个空间之后同样的出错再记警告
                 with self._failures_lock:
                     self._warned = {key for key in self._warned if key[0] != space_id}
