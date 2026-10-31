@@ -260,7 +260,7 @@ uv run pytest -m live                    # 联网冒烟测试，需要 Key，费
 uv run ruff check . && uv run mypy       # 代码风格与类型检查
 ```
 
-离线测试在网络守卫（`tests/netguard.py`）之下跑：去掉代理变量与供应商的 Key，设 `GRADIO_ANALYTICS_ENABLED=False`，哪个测试想连非本机地址或环境变量里的代理就让它失败（`-m live` 不受影响）。本机跳过的 22 个测试在 CI 里跑：外部基线适配层的测试在每周一次的"外部基线"工作流里（固定版本、离线，命令写在各测试文件的说明里；Mem0 的还要 spaCy 的模型 wheel，并先下载 fastembed 的 `Qdrant/bm25` 模型：`uv run --with ... python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"`），Qdrant 服务端的测试在 `qdrant-server` 任务里（本机：`docker run -d -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.19.1`，再 `CUEMEM_TEST_QDRANT_URL=http://localhost:6333 uv run pytest tests/test_qdrant_server.py`；服务端设了 API Key 时另设 `CUEMEM_TEST_QDRANT_API_KEY`，CI 就是这样）。参与开发请用 uv 0.12.24，CI 与 Docker 镜像固定的就是这个版本。
+离线测试在网络守卫（`tests/netguard.py`）之下跑：去掉代理变量与供应商的 Key，设 `GRADIO_ANALYTICS_ENABLED=False`，哪个测试想连非本机地址或环境变量里的代理就让它失败（`-m live` 不受影响）。本机跳过的 23 个测试在 CI 里跑：外部基线适配层的测试在每周一次的"外部基线"工作流里（固定版本、离线，命令写在各测试文件的说明里；Mem0 的还要 spaCy 的模型 wheel，并先下载 fastembed 的 `Qdrant/bm25` 模型：`uv run --with ... python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"`），Qdrant 服务端的测试在 `qdrant-server` 任务里（本机：`docker run -d -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.19.1`，再 `CUEMEM_TEST_QDRANT_URL=http://localhost:6333 uv run pytest tests/test_qdrant_server.py`；服务端设了 API Key 时另设 `CUEMEM_TEST_QDRANT_API_KEY`，CI 就是这样）。参与开发请用 uv 0.12.24，CI 与 Docker 镜像固定的就是这个版本。
 
 ### 部署
 

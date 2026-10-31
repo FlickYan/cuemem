@@ -63,21 +63,22 @@
 | D-053 | 对账提示分清"范围不同""现实变了""说错了"，并附上原话；不改流水线版本号 | 已采纳（N11） |
 | D-054 | Agent 的回答缓存按会话归属 | 已采纳（N11） |
 | D-055 | 外部基线 Mem0：同样的模型、同样的回答与判分，按它自己的流程写入与检索 | 已采纳（N11） |
-| D-056 | 部署：本地向量库被占用时明确报错；服务端建 payload 索引；迁移命令；可选访问令牌 | 已采纳（N11；第二轮体检：限定作用域的令牌，D-069；N12 之后修订：非本机地址必须有令牌，D-068） |
+| D-056 | 部署：本地向量库被占用时明确报错；服务端建 payload 索引；迁移命令；可选访问令牌 | 已采纳（N11；第二轮体检：限定作用域的令牌，D-069；N12 之后修订：非本机地址必须有令牌，D-068；第四轮体检：令牌至少 16 个字符、Qdrant 的 API Key，D-071） |
 | D-057 | 门控在真实流量上的检验：WildChat 里真实用户消息的第一句 | 已采纳（N11） |
 | D-058 | 控制器 v3：有图的空间里，只在问到图时才看图 | 已采纳（N11 之后） |
 | D-059 | 遗忘留下的空缺在重新抽取时标出来；挨着空缺的代词不套到别人身上 | 已采纳（N11 之后） |
 | D-060 | 换模型供应商：配置随包发布、数据目录、预设（openai、ollama）与 OpenAI 兼容的向量接口；Docker | 已采纳（N12） |
 | D-061 | Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义（版本链、控制器、遗忘） | 已采纳（N12；第二轮体检：metadata、update、reset 与远程的 MemoryClient，D-069） |
-| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12；第二轮体检：/v1/embeddings、/v1/responses 的子集，D-069） |
+| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12；第二轮体检：/v1/embeddings、/v1/responses 的子集，D-069；第四轮体检：可选的按令牌上限，D-071） |
 | D-063 | 导出与导入只搬原始日志；遗忘可以预演 | 已采纳（N12；第二轮体检：导出格式 2，D-069） |
 | D-064 | 抽取的补充说明（custom instructions） | 已采纳（N12） |
 | D-065 | 同一协议下对比更多外部基线：Graphiti、LangMem、Cognee、A-MEM；只用 DeepSeek（pds）与只用通义（pq）两个协议 | 已采纳（N12；Holm 校正后 pds 下 L2 对 Mem0 不再显著，D-069） |
 | D-066 | 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份 | 已采纳（N12） |
 | D-067 | LongMemEval 的会话 ID 泄漏：修复、量影响、照实披露 | 已采纳（N12） |
-| D-068 | 全面体检：七个视角找问题，离线复现、对抗式核实，修掉 24 处；评测请求与发表的数字不变 | 已采纳（N12 之后；留到以后的 17 条有 14 条由 D-069 做了；D-070 补记） |
-| D-069 | 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变 | 已采纳（N12 之后；D-070 补记） |
-| D-070 | 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变 | 已采纳（N12 之后） |
+| D-068 | 全面体检：七个视角找问题，离线复现、对抗式核实，修掉 24 处；评测请求与发表的数字不变 | 已采纳（N12 之后；留到以后的 17 条有 14 条由 D-069 做了；D-070、D-071 补记） |
+| D-069 | 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变 | 已采纳（N12 之后；D-070、D-071 补记） |
+| D-070 | 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变 | 已采纳（N12 之后；D-071 补记） |
+| D-071 | 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后） |
 
 ## D-001 检索时机与深度由解耦的控制器决定，而不是由 LLM 自主决定
 
@@ -182,6 +183,7 @@
 - **更新（D-024）**：估算花费现在也计入 DeepSeek 的错峰价（非高峰 = 标价 × 0.5），名义成本不变。
 - **第二轮体检之后（D-069）**：仍没有做到"名义成本与运行时间无关"的一处：向量的名义成本只在真的调用向量接口时记，命中向量缓存的不记，所以写入的名义成本随向量缓存的状态变（pq 下 B2 的写入成本少算约 57%，绝对值约 $0.008）。修正要按 token 数记命中，而向量缓存从没存过 token 数，补上要付费重新向量化；留到以后。
 - **第三轮体检之后（D-070）**：README、报告与 N9 记录里每题的成本是回答成本；旁边现在写明一次性的写入（向量化与巩固，每千份历史 LongMemEval / MemLens 32K / 128K 约 $43 / $15 / $54）：每份历史只问一题的基准上，算上它 L1 每题是全上下文的 1.4–2.1 倍。`tables.md` 开头的说明仍只写"名义成本"（留到以后）。
+- **第四轮体检之后（D-071）**：`tables.md` 的表头现在写明成本只算回答（一次性的写入，每千份历史 LongMemEval / LoCoMo / MemLens 32K / 128K 约 $43 / $35 / $15 / $54，不在内），并加了 Holm 校正后的一列；Pareto 图的横轴写明"名义回答成本……不含一次性的写入"。只剩摊销写入成本的一列，要 N9 的运行。
 
 ## D-011 结构化输出：JSON 模式 + Schema 提示 + 校验重试
 
@@ -365,6 +367,7 @@
   - **加锁顺序**：先巩固锁、再读写门，遗忘等后台巩固时这个空间的读取照常进行；在持有读取时遗忘抛 RuntimeError。
   - **不留下写着用户的东西**：`delete_all` 与 `reset` 还删这个空间的 trace 及其查询向量、会话序号、巩固指纹与崩溃留下的会话标记。
   - **重放的规则**：遗忘的重放不再抽取从来没有任务的会话，也不再重发内容审核拒绝过的会话。
+- **第四轮体检之后（D-071）**：遗忘、`delete_all` / `reset` 与 trace 的过期还删 L2 的子查询与追加查询、Agent 自己的检索与导购演示的商品检索的查询向量，用多模态向量器时还删以文搜图的查询向量与别的记忆不再用的被删图片的向量（第 2 点本来就要求，D-070 留到了以后）。提交之后的清理从不抛出：重写不了的 trace 文件整个删掉，清理向量缓存出错时记警告、写成 `embed_cache_left`，遗忘照常成功。记一行待清理的做法没有采用：会把被删的原文再存一遍。
 
 ## D-022 核心记忆是事实表的物化视图，由规则生成，不用 LLM 改写
 
@@ -803,6 +806,7 @@
   - **进行中的标记**（补第 2 条）：`open_session` 在元信息里留一个标记，`close_session` 删掉。进程崩溃时还开着的会话，由下一个进程第一次碰到这个空间时交给抽取（`MemorySystem.adopt_open`；SDK、HTTP 服务与记忆代理都这样做），调用方马上要接着写的会话除外。这假定同一个数据库同时只有一个进程在写。
 - **第二轮体检之后（D-069）**：Agent 的一问一答与它的溯源在一个事务里写，提交之后才推进发言序号（以前写到一半出错时序号已经往前走了）；第 1 条的在线写入要么全写、要么不留（D-012）。
 - **第三轮体检之后（D-070）**：`cuemem serve` 下，界面与 `/api` 的对话会话、`/api/v1` 的 run 与挂着的记忆代理的会话闲置 30 分钟（`--idle-minutes`）后结束、交给抽取；闲置结束的 run 再 add 时重新打开。会话变长（或遗忘）之后的重放只按空间原来的任务重新登记（第 3 点照旧成立）。
+- **第四轮体检之后（D-071）**：`cuemem serve` 正常停止或崩溃时，`/api/v1` 的 run 跨过重启：用同一个 run_id 的下一次 add 接着写（`MemorySystem.resume_left_open`），结束时只抽取一次；`cuemem serve` 与 `cuemem proxy` 在启动后第一个闲置期里不让别的请求接手之前的进程留下的会话，在启动一个闲置期（`--idle-minutes`，默认 30）之后把没人接着写的交给抽取一次。以前要等有人再写这个空间才接手，重启之后接着写的 run 每次 add 都整段再抽取、把整个空间重放一遍（3 次 add：以前抽取 4 次、重放 3 次，现在 1 次与 0 次）。重启之后仍算普通会话的：之前的进程已经因闲置结束的 run，之后每次 add 都再抽取、重放（第 3 点的代价）；长时间停顿的客户端应该在自然的段落处结束 run。
 
 ## D-046 遗忘以整轮为单位并沿引用扩散；画像可引用；trace 一并清理
 
@@ -818,6 +822,7 @@
 - **验证**：`tests/test_agent.py` 的 `test_forget_follows_citations`、`test_forget_removes_traces_with_the_text`、`test_forget_inside_open_session`，`tests/test_service.py` 的 `test_forget_fact_removes_whole_round`。
 - **N12 之后（D-068）**：第 4 条扩大：检索记录（spans、events）里列着被删的轮、事实或图片 ID 的 trace 也删，被删 trace 里提问的查询向量一并清掉。按 ID 宁多勿漏：空间小的时候，遗忘一段会话可能删掉大部分回答的 trace（trace 只是排查用的 JSONL，产品里不读它）。在别的 trace 之外调用的检索（SDK 的 search、记忆代理、集成、MCP 与 HTTP 的 recall）现在也记一条 retrieve trace，遗忘照样找得到。
 - **第三轮体检之后（D-070）**：第 4 点现在找得全：trace 只按 `\n` 分行（以前提问里有 U+2028、U+2029 或 U+0085 时，遗忘找不到那条 trace 与查询向量，重写还会弄坏别的空间的行），只重写有删除的文件。trace 里的 `consolidate_failed` 事件只记出错的第一行（以前引着模型输出里用户的原话）。可选的保留期 `traces_retention_days` 连同查询向量删掉过期的 trace 文件。
+- **第四轮体检之后（D-071）**：第 3 点现在对每个入口都成立。共用的记忆系统上无论从哪里遗忘、`delete_all` 或 reset（`/api/v1`、SDK、MCP、各集成、管理令牌或限定作用域的令牌），进行中的会话都在下一轮去掉被删的轮、作废被删图片的编号、重取画像。以前只有 `/api/spaces/{space}/forget`、界面与 MCP 会同步：`/api/v1` 删除之后，界面会话的画像里还留着被删的事实，下一轮照样发给模型，回复复述了还写回日志。第 4 点：重写不了的 trace 文件整个删掉（同一天别的空间的调试 trace 也没了），不是 UTF-8 的行原样留着，对话的 trace 记下 Agent 自己的检索（`agent` 事件），遗忘找得到它们的查询向量。
 
 ## D-047 演示：虚构商店 + 生成的图片；界面英文；剧本可回放核对；MCP 只检索不回答
 
@@ -830,6 +835,7 @@
 - **后果**：演示能离线复现、能自动核对；生成的图片风格统一但不是真实照片，"按图找同款"的相似度只在这个小目录上有意义。
 - **第二轮体检之后（D-069）**：MCP 的 remember、recall 与 forget 遇到模型或向量供应商出错时回英文的 ToolError（限流、余额不足、暂时不可用、超时、内容审核拒绝，知道时带 "in about N s"），以前只有 "Error executing tool"；forget 删完之后重建出错时照实说已经删了。MCP 仍只有 stdio、一个进程一个空间，限定作用域的访问令牌（D-069）管不到它。
 - **第三轮体检之后（D-070）**：除了 stdio，`cuemem serve` 在 `/mcp` 用 Streamable HTTP 提供同样的四个工具，令牌与限定作用域同 `/api`；`X-CueMem-User` / `X-CueMem-Agent` 选空间（`--no-mcp` 关掉）。
+- **第四轮体检之后（D-071）**：`/mcp` 的 `X-CueMem-User` 与 `X-CueMem-Agent` 认不是 ASCII 的 ID：`utf-8''<UTF-8 的百分号编码>`（RFC 8187，Node 的客户端包括 Claude Code 只能这样发）或原样的 UTF-8；以前原样的 UTF-8 写进乱码的空间。写错时 400。
 
 ## D-048 最终评测：测试集只用一次，方法与配置事先冻结；LoCoMo 后 7 段对话作测试集
 
@@ -842,6 +848,7 @@
 - **后果**：测试集上的数字可以当作"没调过参"的估计；代价是测试集上发现的问题（例如某个方法在某个数据集上明显不好）在这个项目里不再回头修，只记录。
 - **N12 之后（D-068）**：冻结的东西有了离线守护：`tests/test_eval_leak.py` 按缓存键逐方法钉住 B1、B2、B2F、B4、B5、B6、B3、B6a 的请求（LoCoMo 迷你数据与原始 ID 的 LongMemEval 夹具），`tests/test_frozen_config.py` 钉住 L1 / L2 配置、冻结方法的参数与三个控制器文件的 sha256。`scripts/reproduce.py` 只核对、不再覆盖控制器文件（训练脚本带 `--no-export --check`），出错或提前停止的报告不复制进 docs/results。
 - **第三轮体检之后（D-070）**：标题里的"测试集只用一次"说重了：LongMemEval test400 与 LoCoMo 后 7 段对话在 N9 首次使用，MemLens 的 195 题 N6 也用过（第 1 点），N11、N12 又在测试集的分层子集上做过标明为事后的分析（Mem0、重跑、外部基线、泄漏对照、每个适配层 3–4 题的试跑）。冻结的方法都没有改。文档改成"测试集上冻结的一遍"。
+- **第四轮体检之后（D-071）**：60 秒视频的源文件（`demo/video/cuemem-60s.html`）不再说"test sets used once"与"1/20 of the cost"；上传的视频在重新渲染、重新上传之前仍是旧的说法，README 在它的封面下面写明视频里的成本只算回答。
 
 ## D-049 换回答模型：小、中、大三档，在分层子集上评测
 
@@ -965,6 +972,7 @@
 - **N12 之后（D-068）**：`scripts/reproduce.py` 里的 Mem0 也固定为 mem0ai 2.2.1（以前不带版本号）。
 - **第二轮体检之后（D-069）**：适配层的主调用超时一次就换备用模型（`retry_timeouts=False`，与 `structured()` 相同）；备用模型就是抽取模型本身时当作没有备用（以前同一个模型发 1 次、再重试 4 次）。发表的协议都没有走到这两条路。按每次运行的"对 Mem0"一族（3 个检验）做 Holm 校正后，LongMemEval 上 L1 对 Mem0 +13 / −4（p = 0.049）校正后是 0.147，不再显著；LoCoMo 上的结论（L1 与 Mem0 打平）不变。
 - **第三轮体检之后（D-070）**：只读重放时适配层也按备用模型缓存的回复重放（与 `structured()` 相同）；`scripts/n11_mem0.py` 缺了 Mem0 或 N9 的运行时退出码 1、不写；CI 的"外部基线"工作流离线跑适配层的测试（mem0ai 2.2.1、spaCy 的模型 wheel 与 fastembed 的 `Qdrant/bm25` 模型）。
+- **第四轮体检之后（D-071）**：装 Mem0 的命令固定另装的包（`--with spacy==3.8.16 --with fastembed==0.9.0`，发表的写入用的版本；不固定时现在已经解析到 fastembed 0.9.1），新的写入在 `build.json` 里记下装着的包（`environment`）。
 
 ## D-056 部署：本地向量库被占用时明确报错；服务端建 payload 索引；可选访问令牌
 
@@ -998,6 +1006,11 @@
   - **界面**打开 Gradio 自己的路径检查（以前登录的用户能读出服务器上的 `.env` 等文件）。
   - **长时间运行**：闲置 30 分钟的会话与 run 结束（`--idle-minutes`）；`traces_retention_days` 让 trace 过期。
   - **补上的局限**：MCP 不再只有 stdio（`/mcp`，同样的令牌）。
+- **第四轮体检之后（D-071）**：
+  - **非本机地址的令牌**至少 16 个字符（否则退出码 2，除非加 `--insecure-weak-token`）；设了令牌又监听非本机地址时提示服务是明文 HTTP，README 的"公网部署"在前面放 TLS 反向代理。限定作用域的令牌可以另写 `rate_per_minute`、`models` 与 `max_output_tokens`：作用域管的是能访问谁的记忆，不是能花多少。
+  - **不鉴权**又监听非本机地址时也查 Host（IP 地址、localhost、监听的主机名、`CUEMEM_ALLOWED_HOSTS`），防 DNS 重绑定；界面的 `/login` 只接受同源的请求。
+  - **Qdrant 服务端**：`CUEMEM_VECTOR_STORE__API_KEY`（`vector_store.api_key`，密钥；空表示没有）由每个 CueMem 进程与 `cuemem migrate-vectors` 作为 `api-key` 请求头发出；没有命令行参数，Key 不留在 shell 的历史里。docker compose 用同一个变量设 qdrant 服务的 `QDRANT__SERVICE__API_KEY`，文档里的 `docker run` 只在 127.0.0.1 上公开 Qdrant、数据放在命名的卷里。以前这个 Key 被悄悄忽略，要 Key 的服务端与 Qdrant Cloud 一律 401，README 里的 Qdrant 在所有网卡上不鉴权地开着，绕过 CueMem 的令牌与作用域。
+  - **文件**：命令行写的文件 0600、目录 0700，新建的数据目录 0700，`cuemem doctor` 提醒别人能读的数据目录、`.env` 与令牌文件。
 
 ## D-057 门控在真实流量上的检验：WildChat 里真实用户消息的第一句
 
@@ -1076,6 +1089,7 @@
   - **可选依赖 `ui` 与 `eval`**：`pip install cuemem` 只装 SDK、命令行、HTTP 接口、记忆代理与 MCP（87 → 54 个包）；界面（Gradio）要 `pip install "cuemem[ui]"`，评测的图与训练脚本（matplotlib、scikit-learn）要 `cuemem[eval]`，可以合起来写 `"cuemem[ui,local]"`。仓库里的 `uv sync` 照旧装上 ui 与 eval（开发依赖组带着 `cuemem[ui,eval]`），`uv sync --no-dev` 要加 `--extra ui --extra eval`。没装 ui 时 `cuemem serve` 只提供接口与代理，并说明怎么装。
   - **Docker**：缺省的 `EXTRAS` 是 `--extra ui --extra local`，`--build-arg EXTRAS=` 构建只有接口与代理的镜像（不带 Gradio、fastembed 与 onnxruntime）。
   - **启动**：包的 `__init__` 与命令行按需导入，`cuemem --help` 3.8 → 0.42 秒，`import cuemem.sdk` 2.7 → 0.30 秒。
+- **第四轮体检之后（D-071）**：CueMem 没有发布到 PyPI，源码仓库之外每个安装提示都是 `pip install "cuemem[<extra>] @ git+https://github.com/FlickYan/cuemem"`（`cuemem.config.INSTALL_URL`），Docker 镜像里是用 `--build-arg EXTRAS=…` 重新构建；配置写错（预设名不对、`CUEMEM_*` 的值不合法）只打印一行"错误：配置有误：…"并以 1 退出，不再打印调用栈；命令行收紧 umask，数据目录、`.env` 与它写的每个文件都只给本人；`.env.example` 的注释单独成行，因为 `docker run --env-file` 把行尾注释算进值里。
 
 ## D-061 Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义
 
@@ -1112,6 +1126,7 @@
   - **状态**：`Memory.status()` 列出待抽取与抽取失败的会话、出错与重试时间；`add(wait=True)` 自己的会话抽取失败时回 `queued` 与 `error`。
   - **类型**：包带上 `py.typed`，`AsyncMemory` / `AsyncMemoryClient` 的每个方法都声明了与同步类相同的签名。
   - 一句发言都没删、事实却还在时，`delete` 回 "Nothing deleted" 与重建的提示。
+- **第四轮体检之后（D-071）**："进程崩溃时还开着的 run，下一个进程第一次碰到这个用户时交给抽取"现在只对本地的 SDK 与命令行成立，而且不包括 run 本身：之前的进程留下的 run 上 `add(run_id=X)` 接着写（与 `open_run(X)` 相同），`cuemem serve` 与 `cuemem proxy` 下启动后第一个闲置期里别的请求不接手它，之后才交给抽取。普通脚本应该关掉 `Memory`（`m.close()` 或 `with Memory(...) as m:`），否则解释器退出时打印一段无害的 Qdrant 调用栈（退出时自动关掉的做法没有采用）。
 
 ## D-062 OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面
 
@@ -1146,6 +1161,10 @@
   - **写不进去的写回**（第 5 条）：留在进程内存里，这个会话下一次写回之前、或者结束之前按原来的时间再写，还写不进去才丢掉、记警告；这个空间遗忘过发言之后不再写。
   - **限定作用域的令牌**：user 字段、`X-CueMem-User`、`X-CueMem-Agent` 与配置的缺省用户都要在令牌的作用域里，否则在检索与转发之前回 OpenAI 格式的 403。
 - **第三轮体检之后（D-070）**：带着超过 Pillow 像素上限的图片的写回只丢这一条（以前挡住这个会话之后的写回，最后全丢了）；请求体上限 64 MiB（`CUEMEM_MAX_BODY_BYTES`）；挂在 `cuemem serve` 里的代理每分钟结束闲置的会话，不再等下一个请求；单独运行的代理的清理线程出错之后照样跑，设了 `traces_retention_days` 时也删过期的 trace。
+- **第四轮体检之后（D-071）**：
+  - **按令牌的上限**：限定作用域的令牌可以写 `rate_per_minute`（每分钟写的请求数，超过 429，带 `Retry-After`）、`models`（别的模型在检索之前回 OpenAI 格式的 403；这种令牌的请求里目录的 `extra_body` 盖过调用方的开关）与 `max_output_tokens`（截住；`n` 不是 1 时 400）。不写时转发的请求体不变。
+  - **等上游时被遗忘**：记忆代理在检索之前记下这个空间删过几次；写回之前发生过遗忘时，照注入的证据写的回答不写（`proxy_write_dropped`，part `answer`）。用户的话照写，是 D-069"遗忘之前说的话不再写进来"的一个例外。
+  - **身份的请求头**：`X-CueMem-User` 与 `X-CueMem-Agent` 认 `utf-8''<百分号编码>` 或原样 UTF-8 的非 ASCII ID；写错时回 OpenAI 格式的 400（param `user`）。
 
 ## D-063 导出与导入只搬原始日志；遗忘可以预演
 
@@ -1288,6 +1307,7 @@
   - **显著性**：按"L1、L2 对外部系统"一族（每个协议 10 个检验）做 Holm 校正（[pds-locomo-holm.json](results/n12-baselines/pds-locomo-holm.json)、[pq-locomo-holm.json](results/n12-baselines/pq-locomo-holm.json)）：pds 下 L2 对 Mem0 +17 / −5 校正后 p = 0.068，不再显著，"两个协议下 L2 都显著高于五个外部系统"对 Mem0 只在 pq 下成立（0.014 → 0.041，在 20 个检验的"全文"一族里也不成立）；pds 下 L2 对 LangMem、Cognee（0.011）、Graphiti 与 A-MEM 仍显著。pq 下 L1 对 Cognee（0.017 → 0.041）在族内成立、在"全文"里不成立；pds 下 L1 对 k = 40 的 A-MEM（0.024）在敏感性一族里成立、在"全文"里不成立（0.19）；"CueMem 与参照"一族里 pds 下 L2 对控制器 +7 / −0（0.016 → 0.078）不再显著。这些检验都以每个系统只有一次写入为条件。
   - **评测网关**：主调用超时一次就换备用模型（与 `structured()` 相同），只在缓存未命中、主模型超时时与以前不同。
 - **第三轮体检之后（D-070）**："pds 下没有哪个系统的提示针对 deepseek-flash 调过，比较更公平"要加限定：没有系统的抽取提示是对着 deepseek-flash 调的，但它是 CueMem 在 N2–N9 的回答模型（共用的回答提示与控制器的各档准确率表都是用它定的），所以两个协议都不完全中立。五个适配层的测试现在由 CI 的"外部基线"工作流按固定版本离线跑。
+- **第四轮体检之后（D-071）**："L1、L2 对 k = 40 的 A-MEM 仍显著更高"对 L2 成立（+32 / −8，p < 0.001）；L1 的 +27 / −12（p = 0.024）只是名义显著（在 3 个检验的敏感性一族里没被校正，"全文"一族里 0.19），D-069 也已经这样列出。Graphiti 与 LangMem 在通义下的下降主要在写入一侧，但共用评测框架在读的一侧的影响没有单独量过（Graphiti 的 0.6 阈值没有按通义向量重调；LangMem 超过向量器 6000 个字符输入的记忆）；pds 下 Graphiti 走基础检索，也不是 Zep 的配方。报告列出每个适配层偏离上游的地方。对比 JSON 补上文档引用的召回与写入规模（只多了新键），Mem0 与 A-MEM 另装的包固定版本，新的写入记下装着的包。
 
 ## D-066 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份
 
@@ -1320,6 +1340,7 @@
   - **forget 工具**：删完之后重建出错时说 "Deleted N conversation turn(s). Rebuilding the memory derived from the rest failed (…)"，不再报成遗忘失败（`evidence.forget_summary`，与 MCP 共用）。
   - 集成在进程里直接用记忆系统，要传本地的 `Memory`；远程的 `MemoryClient` 不能代替它。
 - **第三轮体检之后（D-070）**：把 `MemoryClient` 传给任何一个集成都在构造时抛 TypeError（以前之后才 AttributeError），`claude.with_recall` 抛出而不是只警告。
+- **第四轮体检之后（D-071）**：记忆代理现在丢掉照等上游回答期间被遗忘的记忆写的回答；各集成同样是"召回 → 模型 → 写回"，没有这项检查（没有复现过），仍是局限。
 
 ## D-067 LongMemEval 的会话 ID 泄漏：修复、量影响、照实披露
 
@@ -1373,6 +1394,7 @@
   - 原始数据在 [summary.json](results/n12-leak/summary.json)（`scripts/n12_leak.py` 重新生成）。
 - **N12 之后（D-068）**：两个协议的写入分放在两个目录，原来只是约定；现在复用的评测空间巩固指纹对不上时报错、不重建，`CUEMEM_PATHS__EVAL_SPACES` 设错一次不会再改写另一个协议的空间。复现脚本有了 `--cache-only`（LLM 只读本地缓存，未命中即报错），可以核对第 4 条说的"有当时的响应缓存时照样复现"。
 - **第三轮体检之后（D-070）**："几个点的效应分辨不出"现在有了数：`summary.json` 给每个配对比较 95% 区间（`ci95`，Newcombe），另有合并的区间（`pooled_cuemem`，按题 bootstrap）。raw 对 anon（发表的数字虚高多少）：L1 +2.0 [−3.7, +8.1]、L2 −3.0 [−8.5, +1.5]、控制器 −1.0 [−6.6, +4.4]，合并 −0.67 [−4.00, +2.67]；label 对 anon：L1 +2.0 [−3.0, +7.5]、L2 −1.0 [−6.9, +4.7]、控制器 +1.0 [−4.4, +6.6]、Mem0 +6.0 [−1.1, +13.4]，合并 +0.67 [−2.33, +3.67]。所以单个方法虚高约 8 个点、平均 3–4 个点都排除不了；每臂只有 5 道拒答题，`_abs` 那部分泄漏几乎测不到。`scripts/n12_leak.py` 缺了 `ARMS` 里的运行时退出码 1、不写（从来没跑的三臂记为 `NOT_RUN`）。
+- **第四轮体检之后（D-071）**：披露不再只到 README 与报告为止：手写的 N3、N4、N5、N7、N9、N11 记录与中文 README 的结果都加了泄漏说明（N7：控制器的各档准确率表与 λ 是用泄漏期间的结果拟合的；N11：修复后同样 100 题 L1 90.0%、Mem0 79.0%），N9 的 `tables.md` 表头写明哪些 LongMemEval 方法在修复之前，README 在视频下面也写明。生成的 `report.md` 不改，`reproduce.py` 会覆盖它们。
 
 ## D-068 全面体检：七个视角找问题，离线复现、对抗式核实，修掉 24 处；评测请求与发表的数字不变
 
@@ -1488,6 +1510,11 @@
   - **第 2 组**：加锁顺序改成先巩固锁、再读写门，"读取要等进行中的后台巩固做完"不再成立；在持有读取时遗忘抛 RuntimeError。`delete_all` 与 `reset` 也删这个空间的 trace 与元信息行。
   - **第 3 组**：后台失败也记警告日志（同一空间、同一类出错一次），`/api/spaces/{space}/status` 只给这个空间的出错，重放只按空间原来的任务重新登记。
   - **仍有的局限**："按 ID 匹配 trace 会多删"照旧；提问里有 U+2028 / U+2029 / U+0085 的 trace 现在也找得到。
+- **第四轮体检之后（D-071）**：
+  - **第 3 组（"重启后接着做"）**：`cuemem serve` 正常停止或重启时 `/api/v1` 的 run 跨过重启，用同一个 run_id 的下一次 add 重新打开它（`MemorySystem.resume_left_open`）。`cuemem serve` 与 `cuemem proxy` 在启动一个闲置期（`--idle-minutes`，默认 30）之后，把崩溃或停止留下的其余会话（v1 的 run、界面与 `/api` 的会话、记忆代理的会话）交给抽取一次（`MemorySystem.adopt_left_open`，经 `api.app._adopt_after`），在那之前别的请求不接手它们。以前要等有人再写这个空间才接手，没人回来就一直不抽取。不在启动时接手：那样部署之后接着写的 run 每次 add 都整段再抽取、把整个空间重放一遍（3 次 add：以前抽取 4 次、重放 3 次，现在 1 次与 0 次）。本地的 SDK 与命令行仍在第一次碰到时接手。
+  - **第 4 组的缺省值变化**：加了 `--insecure-no-auth` 又监听非本机地址时也查 Host。以前这种情况不查，因为理由假定了有令牌。接受任何 IP 地址、localhost、监听的主机名与 `CUEMEM_ALLOWED_HOSTS`，别的主机名 400。界面的登录（`/login`）也在同源检查之内，非本机地址的令牌至少 16 个字符。
+  - **第 7 组**：一行的错误没有改变退出码（调用栈也是退出码 1），所以 compose 的 `restart: unless-stopped` 对配置错误照样反复重启。重启策略不变（崩溃与重启机器之后能自己起来）；README、`.env.example` 与 `docker-compose.yml` 现在写明怎么看原因（`docker compose ps` 显示 Restarting，`docker compose logs cuemem` 里是一行原因），每个命令对配置写错也只打印一行。
+  - **仍有的局限**："遗忘还清不到 L2 规划的子查询与 Agent 检索时的查询向量，图片向量的缓存也不清"已经修好。仍留着：`cuemem search --image` 的查询图片向量（按查询图片的 sha256）除非同一张图存下了，否则不删；在线写入回滚了的图片的缓存条目留着没人管；Gradio 的临时副本最多比遗忘晚约 2 小时删。"记忆代理在上游回答之后的写回不在读写门里"对记忆代理已修好（照期间被遗忘的记忆写的回答丢掉，用户的话照写）；`integrations/openai_agents.py`、`langgraph.py` 与 `claude.py` 里仍是同样的"召回 → 模型 → 写回"，没有复现过。"B6a 的看图路径仍没有离线的请求快照"已经补上：`tests/test_store.py` 在 768 与 512 像素上钉住全部 24 张演示图与 15 张不经重采样做出来的图的 `image_data_url` 摘要（手机形状的高图，以及 L、LA、RGBA、P、1、I;16 与 CMYK 各种模式，PNG、JPEG、GIF、TIFF、BMP 与 WEBP）。
 
 ## D-069 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变
 
@@ -1607,6 +1634,11 @@
   - **留到以后的**：第 4 条按缩小的范围做了（带类型的 OpenAPI 快照，可以生成 TypeScript 的类型；没有手写的 npm 包），限定作用域的 HTTP 上的 MCP 在 `/mcp`；第 5 条里，删了发言之后遗忘出错的缺口补上了（`reindex_sessions` 去掉了），远程的 run 闲置 30 分钟后结束，`/api/v1/reset` 能 reset 限定作用域的令牌自己的空间；令牌文件仍只在启动时读，本地 `search(mode="l9")` 仍走 L2，只在 README 里的结论只剩 N5 与 N6。
   - **后果**：因为没装外部基线的包而跳过的 18 个测试，现在由 CI 的"外部基线"工作流跑；"N2–N12 的数字照样能从 data/cache 重放"应是：请求的字节与缓存键钉住了，N12 的空间只读重放过，N2–N11 因为没有原来的缓存没有重跑。
   - **仍有的局限**：两个不能重放的空间里，默认配置下的 853b0a1d 现在能只读重放（查 87 次缓存、1 次换到 deepseek-flash 的命中，214 条事实相同）；qwen 预设下的 853b0a1d 构建时两个模型都拒绝了，拒绝不进缓存；qwen 预设下的 7527f7e2 被缓存里后来的主模型回复挡住（要按协议分开缓存键才能修）。
+- **第四轮体检之后（D-071）**：
+  - **第 1 组**："遗忘之前说的话不再写进来"对记忆代理有一个例外：遗忘与上游的调用撞在一起的那一轮，用户的话照写，只丢掉回答。
+  - **第 3 组（R7）**："并说明怎么装（`uv sync --extra ui` 或 `pip install "cuemem[ui]"`）"：源码仓库之外的提示现在是 `pip install "cuemem[ui] @ git+https://github.com/FlickYan/cuemem"`，因为 CueMem 不在 PyPI 上，只写名字会装到谁先注册的包；Docker 镜像里是用 `--build-arg EXTRAS=…` 重新构建。
+  - **第 6 组**：限定作用域的令牌不是花费上限：它管的是能访问谁的记忆，不是能花多少（可选的按令牌上限 `rate_per_minute`、`models` 与 `max_output_tokens` 见 D-071）。
+  - **留到以后的第 5 条**："远程开的 run 一直没有 end_run 时，要等服务重启由 adopt_open 接手"不准确：光是重启什么都不接手。D-070 起闲置 30 分钟的 run 会结束；D-071 起服务停止时还开着的 run 跨过重启（带它的 run_id 的下一次 add 接着写），没人接着写的由 `cuemem serve` 在启动一个闲置期之后交给抽取。
 
 ## D-070 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变
 
@@ -1696,3 +1728,105 @@
     - Qdrant 本地模式仍是每个集合一个打开的文件、每个点都占内存，每建一个集合都重写 `meta.json`；
     - 写失败的 trace 留下的半行不截掉；
     - 接手崩溃前的会话、按会话分配序号、删除孤立的向量，仍假定同一个数据库同时只有一个进程在写（同 D-068）。
+- **第四轮体检之后（D-071）**：
+  - **第 2 组（T5）**："提交之后不再抛出"现在也包括遗忘的 trace 重写与向量缓存的清理；D-071 之前，遗忘提交之后重写 trace 失败（磁盘满，或某一行不是 UTF-8）仍会抛出。
+  - **第 2 组（T14）**："以前远程的 run 要等服务重启才结束"应该是：以前服务从不结束远程的 run，重启也不结束、不接手它。D-071 起 run 跨过重启，serve 在启动一个闲置期之后交接留下的；闲置结束之后再 add 仍会重新打开，结束时照 D-045 整段再抽取、重放整个空间。
+  - **第 4 组（T12）**：除了像素上限，入口处图片只收 JPEG、PNG、WEBP、GIF、BMP 与 TIFF（Pillow 12 上一个 XBM 文件头就能让一个限定作用域的令牌卡住整个进程）；`image_data_url` 不限格式，在 Pillow 13 上字节不变。
+  - **第 7 组（T15）**：`qdrant-server` 任务改对要 API Key 的 Qdrant 服务端跑（`CUEMEM_TEST_QDRANT_API_KEY`，与 `CUEMEM_TEST_QDRANT_URL` 并列）；"外部基线"工作流仍没在 GitHub 上跑过。
+  - **留到以后**：第 1 条做完了（`tables.md` 开头的说明与 Holm 校正后的一列，D-071 第 6 组），只剩摊销写入成本的一列，要 N9 的运行；第 3 条使用统计的一半做完了（界面不发 Gradio 的使用统计与版本检查，除非 `GRADIO_ANALYTICS_ENABLED=True`，也不再从 Google 取字体：有意改变的缺省值，不碰任何模型请求），测试的子进程仍不受网络守卫；第 6 条做完了（遗忘删多模态的查询向量与不再有人用的被删图片的向量）。
+  - **仍有的局限**："写失败的 trace 留下的半行不截掉"已经修好（追加写失败时截回去；以前的版本写断的行原样留着，不再让遗忘与过期出错）。
+
+## D-071 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变
+
+- **状态**：已采纳（N12 之后）
+- **背景**：
+  - 仓库在 GitHub 上公开了。公开之前历史重写过一次，所以以前的记录里引用的提交号变了：文档与结果记录里的提交号都已更新，本机 `runs/` 目录里的 `run.json` 仍是旧的。
+  - 公开之后读代码、跑代码的人变了：陌生人照 README 安装、在服务器上跑 Docker 镜像、把限定作用域的令牌交给别人，外部基线的作者也会读这些对比。所以第四轮按这些人的视角定了六个视角：开源就绪与许可；CI 与供应链；第三轮新加的代码；公网部署的安全；外人看文档、第一次运行；评测的说法与研究的呈现。规矩与 D-068 相同：只读代码，每个候选都离线复现（FakeAPI、ScriptedModel、TestClient 上的攻击、数据库与缓存的只读副本），量一量多常见，说明修复会不会改变评测请求。
+  - 每个候选都经过对抗式核实：另一位审查者重跑复现、找反例、收窄说法，必要时重写修法（"改定的修法"），并对照不变量判断。留下 22 处（P1–P22：高 11 处、中 10 处、低 1 处），去掉 3 个提议。其中 3 处是要主人决定的问题，下面照主人的决定做（P5：漏洞只经 GitHub 的私下报告；P15：暂不发布到 PyPI）；第三处主人在这一轮之前已经处理，这里不用改。
+  - 修复分两条线实现，用一个合并提交合在一起（一行的配置错误不回显 Qdrant 的 Key 这类密钥，Docker 的说明写上令牌长度的检查，SECURITY.md 的范围跟上新的令牌上限）。合并之后按三个视角（核心、安全、供应链）复审，又找出 14 处：11 处修掉，每个行为修复都有在修正之前失败的测试；1 处作为剩下的局限写明（之前的进程因闲置结束的 run，第 3 组）；2 处是文档（普通脚本里关掉 `Memory`；N12 记录里的版本），在这次的文档里补上。下面按领域写的是复审之后的结果。
+  - 不变量与 D-068 相同，并把图片的字节写明：默认配置与评测发出的 LLM、向量请求逐字节不变，缓存键不变，发给模型的图片字节也不变；冻结的方法（B1、B2、B4-nobm25 即 L1、B5 即 L2、B6，以及三个控制器文件）行为不变；每个行为修复都有在修复之前失败的回归测试；有意改变的缺省值都在各组里写明。没有调用付费 API，没有跑评测。
+- **决策**：
+  1. **依赖与供应链**（P1、P18、P5；修订 D-068 第 4、7 组、D-069 第 3 组、D-070 第 4 组）：
+     - **Pillow 13，图片字节不变**（P1）：锁文件里是 Pillow 12.3.0（41 条安全公告，5 条严重）、certifi 2026.7.22 与 brotli 1.2.0（各一条严重的）、filelock 4.1.1，Docker 镜像装的正是这些版本；gradio 6.30/6.31 与 fastembed 0.9.0 都声明 `pillow<13`，单纯升级不动。`[tool.uv] override-dependencies = ["pillow>=13.0.0"]` 给 uv 与镜像解除这个上限，核心依赖的下限仍是 `pillow>=12.3.0`，pip 装 `cuemem[ui]` 照旧解到 12.x；锁文件升级恰好变了五个包（Pillow 13.0.0、certifi 2026.10.23、brotli 1.2.1、filelock 4.2.5、virtualenv 21.15.2，最后一个只在开发环境）。Pillow 13 在高度缩得比宽度多两倍以上时先缩高度（发布说明的 "Resizing vertically first"），高的照片像素会变，图片描述、多模态向量与回答请求的缓存键跟着变：`image_data_url` 改成分两次缩放（先宽后高），在 12.3.0 上与原来的一次缩放逐字节相同，在 13.0.0 上还原 12.3.0 的字节。这个覆盖对在源码仓库里运行的 `uv pip install` 同样生效，所以对比 Pillow 12 的环境要在仓库之外建，或者用 `uv run --with pillow==12.3.0`。
+     - **只收常见的图片格式**（P1）：`ACCEPTED_FORMATS`（JPEG，含 MPO，PNG、WEBP、GIF、BMP 与 TIFF）只在不可信的入口传给 `Image.open`（`MediaStore.put` 与 `check_image`，覆盖 `/api/v1`、`/api`、界面、记忆代理与 MCP 的写回；导入；`/api/v1/media` 的 Content-Type），从不放进 `image_data_url`（它要重新读存下的评测图片）。以前一个限定作用域的令牌发 512 字节的 XBM 文件头，在 12.3.0 上占住 GIL 约 16 秒（k = 28）之后回 500，所有租户、所有接口都跟着停；现在别的格式与不是图片的文件在一秒之内报 ValueError "Not a valid image (accepted formats: …)"，`/api/v1` 400（以前 500）、`/api` 409，留在 Pillow 12 的 pip 用户也一样挡住。以前能打开的 AVIF 现在不收。
+     - **CI**（P18）：每个 action 都按提交号固定并注明版本（checkout v7.0.1，`persist-credentials: false`；setup-uv v10.3.3；都在 node24 上）；CI 与 Dockerfile 都用 uv 0.12.24（Dockerfile 按镜像摘要固定），在 `uv_build` 的范围里，构建 wheel 用自带的后端，不从 PyPI 现取一份没有哈希的 `uv-build`（以前 CI 装的是没有校验的最新 uv）；工作流声明只读的令牌、每个任务的超时（test 20、qdrant-server 10、package 10、docker 20、外部基线 90 分钟），concurrency 只取消同一个 PR 的旧运行。`tests/test_ci_pins.py` 离线核对这些。
+     - **安全策略与依赖的公告**（P5；主人的决定）：`SECURITY.md` 写明只经 GitHub 的私下报告（没有邮箱），7 天内确认收到，列出范围（serve 与它的令牌和新的令牌上限、MCP、记忆代理、导入导出、遗忘的残留、镜像与 compose），以及只有管理员能做的几步（私下报告、Dependabot 提醒与安全更新、推送保护，导入 `.github/rulesets/protect-main.json`：规则集不变、不设绕过者）。`.github/dependabot.yml` 管 GitHub Actions、`uv.lock`（小版本与补丁合成一个 PR，冷却 7 天）与 Dockerfile 的基础镜像；`FROM python:3.12-slim` 没有摘要时 docker 这一项不会开 PR（Dependabot 只提议同样精度的标签，又不升 Python 的小版本），镜像靠每次构建重新拉取 3.12-slim 跟上，`COPY --from` 的 uv 与 CI 的 setup-uv 一起手工升级。新的"依赖审计"工作流（有意不作为必需的检查）对镜像的依赖与全部依赖带哈希的导出跑 `pip-audit` 2.10.1（push、PR、每周）：在这一轮开始时的锁文件上，镜像那一步报 60 条公告、4 个包，新的锁文件上没有。README 写一行指向 SECURITY.md。
+     - **缺省值的变化**：锁文件与镜像装 Pillow 13 与修好的 certifi、brotli、filelock；六种格式之外的图片在入口拒绝（已经存下的照常可用，`GET /api/v1/media` 按 `application/octet-stream` 返回）；CI 与镜像用 uv 0.12.24。新的 `cuemem.store.media.ACCEPTED_FORMATS`。
+     - **评测与图片**：`tests/test_store.py::test_image_bytes_sent_to_models_are_unchanged` 现在钉住 `sha256(image_data_url(...))`（前 16 位十六进制；P01 是完整摘要），最长边 768 与 512 各一次，覆盖演示的全部 24 张图与 15 张不经重采样做出来的图（手机形状的高 RGB 图，L、LA、RGBA、P、1、I;16 与 CMYK 各种模式，PNG、JPEG、GIF、TIFF、BMP 与 WEBP，外加一张横图对照），在 Pillow 12.3.0 上算出；在 13.0.0 上照样通过，换回一次缩放时 14 张高图全部对不上。核对者在 12.3.0 上量的 62 个参考摘要在 13.0.0 上全部相同。这补上了 D-068 记下的"B6a 的看图路径仍没有离线的请求快照"。MemLens 与 N6 的照片不在体检的机器上，在 12.3.0 与 13.0.0 上比它们的摘要留给主人，预期全部相同。
+  2. **公网部署的安全**（P7、P13、P10、P4、P6、P22；修订 D-056、D-062、D-068 第 4 组、D-069 第 6 组、D-070 第 4、6 组）：
+     - **不鉴权时的 DNS 重绑定**（P7）：`cuemem serve --insecure-no-auth` 与 `cuemem proxy --insecure-no-auth` 监听非本机地址时（每个不设令牌的 Docker 容器都是），Host 只接受 IP 地址、localhost、监听的主机名与 `CUEMEM_ALLOWED_HOSTS` 里的名字，别的主机名 400（"Invalid host header"，`/api/v1` 下是 `V1ErrorBody`）。以前这种情况不查 Host，因为 D-068 的理由假定非本机地址都有令牌：重绑定的域名上的网页能读出、导出、遗忘记忆，花上游的额度，调用界面的 `/gradio_api`（复现：0.0.0.0 与 192.168.1.5 上回 200 和存下的 PIN，127.0.0.1 上 400）。启动时写明接受哪些 Host。设了令牌的部署、用 IP 访问、localhost、镜像的 HEALTHCHECK 与 `CUEMEM_ALLOWED_HOSTS=*` 不变。
+     - **登录的 CSRF**（P7）：`SameOriginOnly` 也管 `/login`（按前缀，也管 `/login/`，不管 `/logout`）。以前别的网站的表单能让访问者用攻击者的限定作用域令牌登录，之后访问者在界面里说的话写进攻击者的空间。跨站与 `Origin: null` 的登录 403，同源与不带 Origin 的照常。
+     - **太短的令牌与明文 HTTP**（P13）：监听非本机地址时，`serve` 与 `proxy` 拒绝短于 16 个字符的令牌（`cuemem.api.auth.MIN_TOKEN_CHARS`），管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是：在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项（从不写令牌本身）、16 个字符的下限、`openssl rand -hex 32` 与 `--insecure-weak-token`。短令牌在读令牌时按名字记下（`Keys.weak`）；`sha256:` 量不出长度，不查。README 自己的例子（`CUEMEM_API_TOKEN=your-token … --host 0.0.0.0`）以前就能起一个公网的服务。下限定 16 而不是 24、也不设占位符的黑名单：`secrets.token_urlsafe(16)` 是 22 个字符，仓库里的占位符都短于 16。设了令牌又监听非本机地址时启动时多一行提示：令牌（也是界面的密码）与记忆都不加密地经过网络，可信网络之外要在前面放 TLS 反向代理。README 新增"公网部署"一节（Caddy 与 nginx 的设置、`CUEMEM_ALLOWED_HOSTS`、在反向代理里限流），令牌的例子改成把 `openssl rand -hex 32` 写进 `.env`，不进 shell 的历史。CI 的 docker 任务的令牌加长到 19 个字符，否则容器拒绝启动。
+     - **按令牌的上限**（P10）：作用域管的是能访问谁的记忆，不是能花多少，任何有效的令牌都能让服务器不受限地调用运营者的模型供应商（复现：只能访问一个用户的令牌发 50 个 `qwen3.8-max`、`n=16`、`max_tokens=32768`、`enable_thinking=true` 的请求，全部转发；不带 user 的同样转发）。`CUEMEM_API_KEYS_FILE` / `CUEMEM_API_KEYS` 里的令牌现在可以另写 `rate_per_minute`（`/api/`、`/v1/` 与 `/mcp` 下写的请求，GET、HEAD、OPTIONS 之外的方法都算；容量为这个数、每秒补 rate/60 个的令牌桶，在读请求体之前查；超过时 429，带 `Retry-After`，`/api/v1` 下 code 是 `rate_limited`）、`models`（记忆代理在检索、开会话与转发之前拒绝别的模型，回 OpenAI 格式的 403，type `permission_error`，param `model`；列出的别名只放行它自己，列出的模型 ID 本身不是别名时放行它的各个别名；这种令牌的请求里目录的 `extra_body` 盖过调用方给的，例如 `enable_thinking`）与 `max_output_tokens`（记忆代理截住或补上 `max_tokens` / `max_completion_tokens`，`n` 不是 1 时 400；只写它管不住 `enable_thinking` 与 `thinking`，只有 `models` 会换成目录里的值）。不写这几个字段时什么都不变，转发的请求体与管理令牌的逐字节相同。复审发现第一版只数 POST（PUT `/api/v1/memories/{id}` 当场抽取一次、DELETE 重新抽取，都不算），`models: [deepseek-flash]` 还放行了同一个模型 ID 打开思考的别名 `deepseek-flash-thinking`；两处都已修好。
+     - **Qdrant 的 API Key**（P4）：`vector_store.api_key`（`CUEMEM_VECTOR_STORE__API_KEY`，密钥；空字符串表示没有；只从环境变量或 `.env` 读，没有命令行参数，不留在 shell 的历史里）由每个 CueMem 进程（serve、proxy、SDK、命令行）与 `cuemem migrate-vectors` 作为 `api-key` 请求头发出；`Memory(config=...)` 也认。以前这个 Key 被悄悄忽略，要 Key 的服务端与 Qdrant Cloud 一律 401；README 里的 Qdrant（`docker run -p 6333:6333`）在所有网卡上不鉴权地开着，绕过 CueMem 的令牌与作用域。docker compose 用同一个变量设 qdrant 服务的 `QDRANT__SERVICE__API_KEY`（不设或为空时两边都不鉴权，与以前相同；这个服务不映射端口）；文档里的 `docker run` 只映射到 127.0.0.1，数据放在命名的卷里。`cuemem doctor` 写明设了没有；URL 是 `http://` 时 qdrant-client 每个客户端警告一次。CI 的 `qdrant-server` 任务改对要 Key 的服务端跑，新的只给测试用的 `CUEMEM_TEST_QDRANT_API_KEY` 与 D-070 的 `CUEMEM_TEST_QDRANT_URL` 并列。
+     - **界面不联系第三方**（P6）：主题的字体从 Google 托管的 Inter 换成 Gradio 自带的 IBM Plex Sans（400、600、700 三种字重，由本服务提供），`gr.Blocks(analytics_enabled=…)` 按 `GRADIO_ANALYTICS_ENABLED == "True"`，在读过 `.env` 之后取。以前每个访客的浏览器都去 fonts.googleapis.com 取字体，挂载的界面一构造就向 api.gradio.app 查版本、向 huggingface.co 报告使用统计。单设 `HF_HUB_DISABLE_TELEMETRY` 挡不住 Gradio 的调用，所以 Dockerfile 不设任何变量。
+     - **请求头里不是 ASCII 的 ID**（P22）：Starlette 按 Latin-1 解请求头，curl 原样发的 UTF-8 `张三` 以前悄悄写进 `å¼\xa0ä¸\x89` 这个空间（管理令牌 200，只能访问张三的令牌 403），Node 的客户端（Claude Code 的 `--header`）与 httpx 根本发不出。`auth.header_id` 现在在 `/mcp` 与记忆代理上解 `X-CueMem-User` 与 `X-CueMem-Agent`：以 `utf-8'` 开头（不分大小写）的按 RFC 8187 的 ext-value 解，ASCII 原样，别的字节是合法 UTF-8 就按 UTF-8，不是就按 Latin-1（Node 的 fetch 与 requests 发的 Latin-1 `José` 照旧可用；"不是 UTF-8 就 400"考虑过，因此没有采用）。`utf-8''` 写错、不是 UTF-8 或带控制字符时 400（`/mcp` 是 `{"detail"}`，记忆代理是 OpenAI 格式的 `invalid_request_error`，param `user`）。ASCII 的值只有一处变化：以 `utf-8'` 开头的会被解码。这些接口还没进 main，没有数据要迁移。
+     - **缺省值的变化**：不鉴权又监听非本机地址的服务，用主机名访问（`nas.local`、别的容器用的 compose 服务名）时要把它写进 `CUEMEM_ALLOWED_HOSTS`；跨站发到 `/login` 的 POST 403；令牌短于 16 个字符的公网监听与 Docker 容器在换令牌或加 `--insecure-weak-token`（compose 里加进 `command:`）之前不启动；设了令牌又监听非本机地址时多一行明文 HTTP 的提示；界面不发 Gradio 的使用统计与版本检查，除非 `GRADIO_ANALYTICS_ENABLED=True`，字体从 Google 托管的 Inter 换成本地的 IBM Plex Sans；`.env` 里设了 `CUEMEM_VECTOR_STORE__API_KEY` 时 compose 里的 Qdrant 要这个 Key。新增：`serve` 与 `proxy` 的 `--insecure-weak-token`；配置项 `vector_store.api_key`；令牌的字段 `rate_per_minute`、`models` 与 `max_output_tokens`（以及 `Principal` 上对应的字段）；`MIN_TOKEN_CHARS`、`Keys.weak`、`auth.header_id` 与 `identity_headers`；`create_app(allow_ip_hosts=)`、`create_proxy_app(allow_ip_hosts=)` 与 `TrustedHosts(ip_literals=)`；`BodyLimit(clock=)`、`cuemem.api.limits.RATE_PATHS` 与 `READ_METHODS`；`cli._host_policy` 返回三个字段的 `HostPolicy`。
+     - **留着的**：界面（cookie）的会话不受按令牌的上限管（用 agent 角色的模型，`max_tokens` 1200）；一次写入的大小只由 `CUEMEM_MAX_BODY_BYTES` 管；调用方加的供应商字段（`enable_search` 等）原样转发；按令牌的每日花费预算（账本按令牌记）要单独决定。CueMem 不限制登录与令牌出错的次数（见备选）。
+     - **评测**：评测不经过这些接口；不写新字段时记忆代理转发的请求体逐字节相同（测试与管理令牌的比对）。
+  3. **会话、run 与遗忘的残留**（P3、P16、P12、P20；修订 D-021、D-045、D-046、D-061、D-062、D-068 第 2、3 组、D-069 第 1、5 组、D-070 第 1、2 组）：
+     - **删除传到进行中的会话**（P3）：以前只有 `ChatService.forget`（`/api/spaces/{space}/forget`、界面、MCP）同步进行中的会话。`/api/v1` 的 delete、`delete_all` 与 reset（管理令牌或限定作用域的令牌）、SDK 与各集成删了之后，界面与 `/api` 会话的画像快照里还留着被删的事实，下一轮照样发给模型，回复复述了还写回日志。现在每个空间记着遗忘过几次（`MemorySystem.forget_epoch`）：遗忘提交之后、重放做完或失败之后（复审补上）、`delete_space` 之后各加一次，都在独占里；每一轮对话在自己的读取里比一下会话记着的与空间的，变了就先同步（`Agent._prune_locked`：去掉被删的轮、作废被删图片的编号、重取画像）。所以排在遗忘后面的一轮，以及遗忘重建画像期间开始或同步的会话，都会取回重建好的画像。`ChatService.forget` 仍然立即同步，界面马上更新。
+     - **run 跨过重启**（P16）：`cuemem serve` 停止或崩溃时还开着的 run 跨过重启：`add(run_id=X)` 接着写（`MemorySystem.resume_left_open`，与以前的 `open_run(X)` 相同），结束时整段只抽取一次，而不是之后每次 add 都整段再抽取、把整个空间重放一遍（重启之后 3 次 add：以前抽取 4 次、重放 3 次，现在 1 次与 0 次）；在这样的 run 上 `add(wait=True)` 与重启之前一样报 "still open"。`cuemem serve` 与 `cuemem proxy` 下，启动后第一个闲置期里别的请求不接手之前的进程留下的会话（`MemorySystem.defer_adoption`：另一个 run 的 add、界面与 `/api` 开会话、记忆代理的请求；`consolidate()` 与 `ingest()` 也跳过它们，复审补上），`api.app._adopt_after` 在启动一个闲置期（`--idle-minutes`，默认 30）之后把没人接着写的交给抽取一次，即使再也没人碰这个空间（以前光是重启什么都不接手）。本进程交接过、调用方又回来接着写的 run，像闲置结束的 run 一样重新打开（结束时再抽取一次、重放一次）；这些记录在内存里，最多 `HANDED_OVER_KEPT` = 10,000 个，`delete_all` 与 `reset` 忘掉它们。本地的 SDK 与命令行仍在第一次碰到时接手。`cuemem serve` 正常停止时 `/api/v1` 的 run 留着，现在是有意的。
+     - **遗忘提交之后的清理从不抛出**（P12）：重写某天的 trace 文件要先有这个文件那么大的空间，提交遗忘只要几 KB，所以磁盘满时 OSError 以前跳过了清理向量缓存与 WAL 的 scrub；`DELETE /api/v1/memories/{id}` 回 500，重试找不到要删的发言，被删的原话留在 `traces/` 里，提问与文档的向量留在 `embed.sqlite` 里。一行断在汉字中间的 trace（追加写到一半失败，下一次追加接在后面）让这个服务上之后每次遗忘都在提交之后报错（HTTP 400），过期的 trace 也删不掉。现在重写不了的某天的文件整个删掉（删除不要空间）：同一天别的空间的调试 trace 也没了（trace 只用于调试，D-046），`cuemem.core.trace` 记一条警告，这个文件里每个提问的查询向量一起删（下次用到时重算）。重写不了也删不掉、或读不了的文件记警告，名字写进遗忘 trace 的 `traces_left`（清理本身出错时是 `["*"]`）。不是 UTF-8 的行逐字节原样留着、不解析；`TraceSink.write` 追加失败时把文件截回之前的长度。复审补上：提交之后清理向量缓存出错时（"database or disk is full"，或源码仓库里与评测共用的 `embed.sqlite` 报 "database is locked"），`cuemem.memory` 记一条警告，遗忘的 trace 记 `embed_cache_left: true`；遗忘或删除照样成功（HTTP 200），这次清理不再重试；`delete_all` 与 `reset` 之后清理查询向量（`purge_space_traces`）同样，WAL 的 scrub 也一样保护。
+     - **遗忘漏掉的查询向量**（P20）：遗忘、`delete_all` / `reset` 与 trace 的过期现在还删 L2 规划的子查询、检查证据够不够之后追加的查询（检查的模型看过记忆，会复述被删的内容，例如 "bank card PIN 4321 Commerzbank"）、Agent 自己的检索（ToolReader，以及 `Agent.chat` 的 `memory_search`，现在在对话的 trace 里记成一个 `agent` 事件 `{searches, queries}`）与（复审补上）导购演示的商品检索（`search_products`；`searches` 仍只数记忆的检索）的查询向量。这些文字取自 trace 里本来就记着的（`trace_queries`：`plan.sub_queries`、`check.queries`、`agent.queries`），以前写下的 trace 也覆盖。用 DashScope 多模态向量器时，这些查询的多模态文字向量（`mm|…|text|…`）一起删；遗忘还在没有媒体记录再用这个 sha256 时删掉被删图片的向量（`mm|…|image|…`），与删原图同一个规则（`DashScopeMultimodalEmbedder.purge`；算进 `ForgetReport.embed_cache_purged`）。
+     - **记忆代理写回的竞争**（P20）：记忆代理在检索之前记下这个空间删过几次；写回之前发生过遗忘时（例如等上游回答期间别的调用方删除，流式时更久），照注入的证据写的回答不写进日志，有 trace 时记一个 `proxy_write_dropped`（reason `forgotten`，part `answer`）。用户的话照写。
+     - **缺省值的变化**：进行中的对话会话在任何遗忘之后的下一轮同步；serve 与 proxy 在启动一个闲置期之后交接之前的进程留下的会话（那时可能发出抽取请求），所以崩溃留下的界面、`/api` 与记忆代理的会话在启动加一个闲置期时抽取，而不是在重启之后用户第一次请求时；之前的进程留下的 run 上 `add(run_id=X)` 重新打开它，而不是接手；遗忘在提交之后不再因 trace 或缓存的清理抛出，重写不了的某天的 trace 文件整个删掉；遗忘与过期删更多的查询向量；记忆代理丢掉照期间被遗忘的记忆写的回答。新的内部接口：`MemorySystem.forget_epoch`、`resume_left_open`、`adopt_left_open` 与 `defer_adoption`，`api.app._adopt_after`，`TraceSink.remove(..., dropped=, left=)`，`cuemem.core.trace.trace_queries`，`DashScopeMultimodalEmbedder.purge`，`ToolContext.queries`。没有新的命令行参数、环境变量或接口。
+     - **留着的**：之前的进程已经因闲置结束的 run（只记在那个进程的内存里），或交接过、超过 10,000 个之后不再记得的 run，重启之后算普通会话：之后每次 add 都整段再抽取、重放这个用户的整个空间（D-045），每次重放期间这个用户的事实在 search 与 `get_all` 里暂时没有；长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。可选的 `cuemem serve --run-idle-minutes` 要主人决定。`cuemem search --image` 的查询图片向量，除非同一张图存下了，否则不删；在线写入回滚了的图片的缓存条目留着没人管；Gradio 的临时副本最多比遗忘晚约 2 小时删（现在放在只给本人的目录里，第 4 组）。记忆代理修好的"召回 → 模型 → 写回"在三个集成里仍是同样的形状，没有复现过。
+     - **接受的代价**：源码仓库里产品与评测共用 `data/cache/embed.sqlite`，遗忘或打开了的过期可能删掉评测里逐字相同的子查询或多模态查询向量，重放时要重新算（要联网），与 `prune_traces` 对提问的做法相同。
+     - **评测**：评测从不遗忘、不开对话会话与 run、不启动后台线程、不经 serve 与记忆代理，用 `tracer=None`；新的 `agent` 事件只进 trace，`n8_context` 只按 `llm` 与 `embedding` 事件统计。遗忘的次数只在进程的内存里。
+  4. **文件权限**（P14；修订 D-056、D-060、D-068 第 2 组）：
+     - 以前在常见的 umask 022 下，`data`、`data/cache`、`data/qdrant` 与 `runs/traces` 是 0755，每个数据库、缓存与当天的 trace 是 0644（源码仓库的数据目录就是仓库根目录，服务器上常见的是 `/opt/cuemem`），同一台机器上别的账户能读对话原文、完整的抽取提示、提问、导出与照片；媒体库把 0600 的上传复制成 0644，界面的图库再复制进整台机器共用、0755 的 `/tmp/gradio`；`cuemem configure` 先就地重写 0644 的 `.env` 再 chmod，之前打开的文件描述符读得到新的 Key。
+     - 现在 `cuemem` 命令行把 umask 收紧到至少 077、从不放宽，它写的文件都是 0600、目录都是 0700（数据库、缓存、trace、`export -o`、评测结果、上传、下载的模型）。`MemorySystem.from_settings`（因此 SDK 也一样）从上往下把缺的存储目录建成 0700（`cuemem.store.files.private_dirs` 与 `storage_dirs`：数据库、账本、两个缓存、trace、原图与本地向量库）；建不了时不报错，已经存在的目录一律不 chmod。带界面的 `cuemem serve` 每次启动用自己的 Gradio 临时目录（`mkdtemp`，0700），停下时删掉，除非设了 `GRADIO_TEMP_DIR`。`cuemem configure` 经一个 0600 的临时文件与 `os.replace` 写 `.env`（符号链接的 `.env` 链接留着；它所在的目录要可写）。POSIX 上 `cuemem doctor` 提醒组或其他用户有权限的数据目录（`chmod 700 <目录>`，只看最上一级）、`.env` 与 `CUEMEM_API_KEYS_FILE`（`chmod 600 <文件>`），`serve` 与 `proxy` 启动时提醒这两个密钥文件；都只提醒，不替运营者改。
+     - **缺省值的变化**：命令行建的文件 0600、新建的目录 0700，靠组读权限的运营者（比如备份用户）要另外授权；每次 `configure` 之后 `.env` 是新的 inode；认 `GRADIO_TEMP_DIR`，写成可以覆盖的设置；compose 与 `.env.example` 改成 `install -m 600 .env.example .env`。没有新的命令行参数。
+     - **评测**：只改权限；请求、缓存键与文件内容都不变。
+  5. **安装与第一次运行**（P15、P19；修订 D-060、D-068 第 7 组、D-069 第 3 组）：
+     - **从 GitHub 安装**（P15；主人的决定：暂不发布到 PyPI）：PyPI 上 `cuemem` 这个名字没人注册，命令行的提示与文档的四行却写着 `pip install "cuemem[…]"`，它按名字向 PyPI 要包，新环境、`-U`、pipx 或 uv tool 安装与镜像里的系统 pip 都可能装到别人抢注的包（离线用两个索引模拟过）。`cuemem.config.INSTALL_URL = "git+https://github.com/FlickYan/cuemem"`（发布到 PyPI 之后改成 None）；源码仓库之外 `extra_remedy()` 给 `pip install "cuemem[<extra>] @ git+https://github.com/FlickYan/cuemem"`，缺 fastembed 的报错用同一个提示；在仓库的 Docker 镜像里（复审：`/opt/venv` 里没有 pip，也没有 git）给 `docker build --build-arg EXTRAS="--extra ui --extra local[ --extra <x>]" -t cuemem .`。文档写明 CueMem 还没有发布到 PyPI。`pyproject.toml` 加 keywords 与 `[project.urls]`。之前的 ADR 与路线图里记历史的那几行不改，D-069 的那句补一条说明。
+     - **配置写错只打印一行**（P19）：命令行里每处 `load_settings`（15 处，包括 `_open_system` 与 `_service`）都经过 `_settings()`，预设名写错或 `CUEMEM_*` 的值不合法时打印"错误：配置有误：<字段>：<原因>（收到 <值>）"并以 1 退出（`cuemem mcp` 写到 stderr），不再是 49 行、72 行的调用栈；名字像密钥的字段与一整段配置不回显收到的值（合并时补上，写错的 Qdrant Key 不会进日志）。SDK 照旧抛 ValueError 或 ValidationError。D-068 第 7 组的一行错误没有改退出码（调用栈也是退出码 1），所以 compose 的 `restart: unless-stopped` 对配置错误照样反复重启。重启策略不变（崩溃与重启机器之后能自己起来）；README、`.env.example` 与 `docker-compose.yml` 写明怎么看原因（`docker compose ps` 显示 Restarting，`docker compose logs cuemem` 里是一行原因）。
+     - **`.env` 与 Docker**（P19）：`.env.example` 里写在值后面的注释移到单独一行，因为 `docker run --env-file` 把 ` # …` 也算进值里（compose 与 python-dotenv 会去掉）；README、`.env.example`、compose 与 Dockerfile 写明每种配置要哪些 Key、Docker 还要 `CUEMEM_API_TOKEN`。
+     - **不要 Key 的试用**（P19）：缺向量 Key 的提示改成指向单独的 `CUEMEM_HOME`，因为数据目录会记住向量模型，命令失败了也一样；`examples/keyless.py` 在临时目录里用哈希向量写入一句、再检索出来，用 `with`，因为不关 `Memory` 的普通脚本退出时会打印一段无害的 Qdrant "Exception ignored" 调用栈；README 写出它与离线的 curl 两步；英文的 `examples/README.md` 列出每个示例要的 Key 与命令，OpenAI Agents 的示例改在 `CUEMEM_HOME=$(mktemp -d)` 里跑。
+     - **缺省值的变化**：源码仓库之外每个缺可选依赖的提示都是从 GitHub 装，镜像里是重新构建；配置写错只打印一行；缺向量 Key 的提示换了文字（只给人看）。新增 `cuemem.config.INSTALL_URL` 与 `docker_image()`、`examples/keyless.py` 与 `examples/README.md`；wheel 的元数据多了 Keywords 与 Project-URL。没有新的命令行参数与环境变量；`restart: unless-stopped` 不变。
+     - **留给主人的**：`authors` 与 `CITATION.cff` 用什么署名；可选的 CONTRIBUTING、PR 与 issue 模板；这一轮合并之后打 `v0.1.0` 标签；仓库的简介、主题与主页。
+  6. **许可、声明与说法**（P8、P9、P11、P17；修订 D-010、D-048、D-065、D-067、D-069 第 4 组、D-070 第 7 组）：
+     - **第三方声明**（P8）：`THIRD_PARTY_NOTICES.md` 以前说 `evals/mixed/` 里生成的同话题问题不复制基准的原文。其实测试集有 4 条与原题逐字相同（LoCoMo conv-43-q71 与 conv-47-q36，LongMemEval gpt4_1a1dc16d 与 e493bb7c），开发集 7 条、测试集 33 条是近似的副本（difflib 相似度 ≥ 0.8；MemLens 的 295 条本地没有原题，没查）。声明现在写明 `evals/mixed/` 不在 CueMem 的 MIT 许可之内，按 CC 4.0 第 3(a)(1) 条逐个来源署名：LoCoMo（Maharana 等，ACL 2024，snap-research/locomo 提交 3eb6f2c，CC BY-NC 4.0，按原样，由 LLM 改写，仅限非商业用途）、MemLens（Ren 等 2026，CC BY 4.0）与 LongMemEval（MIT）；三行的 `evals/mixed/README.md` 也这样写。A-MEM 的关键词提示（`amem.py` 的 `QUERY_PROMPT`，取自 WujiangXu/AgenticMemory 提交 f9a173d，MIT）补上声明与版权行；MemLens 的判分提示写明照搬自上游的 `judge_prompts/`（MIT，另按 CC BY 4.0 署名）；LongMemEval 的测试副本写明经 ruff 改过格式。数据文件与提示逐字节不变。报告写上这个已知的缺陷：这几条标成不需要记忆，每一条最多让同话题的 AUC（0.984）与误召回率变动 1/1,750。
+     - **N9 的表与图**（P9）：`tables.md` 的表头现在写明成本只算回答（一次性的写入，每千份历史 LongMemEval / LoCoMo / MemLens 32K / 128K 约 $43 / $35 / $15 / $54，不在内）、LongMemEval 上 B0、L0、B1 与 ORACLE 之外的方法都在 D-067 的修复之前测的，并加了按 `results-holm.json` 的"Holm 校正后"一列，21 个只是名义显著的比较一眼可见（249 行有 p，228 行有校正后的 p，21 行 +0 / −0 写"—"）。Pareto 图的横轴写明"名义回答成本……不含一次性的写入"，以前在 LongMemEval（$31.88）与 MemLens 128K（$40.60）上悄悄画不出来的全上下文，现在画在右边缘并标上它的数；图用 matplotlib 的默认样式与 DejaVu Sans，不再随本机的 matplotlibrc 变。`scripts/n9_report.py` 以前在没有 N9 运行的机器上改写发表的 `results.json`（127,088 → 138 字节）、`results-holm.json` 与 `tables.md`；现在退出码 1、什么都不写，`--figures-only` 按发表的 JSON 重画图，`reproduce.py` 写明这一步要的运行。JSON 逐字节不变。
+     - **外部基线**（P11）：摘要以前说 L1、L2 对 k = 40 的 A-MEM 仍显著更高。L2 是（+32 / −8，p < 0.001），L1 的 +27 / −12（p = 0.024）只是名义显著：它是 3 个检验的敏感性一族里最大的 p，在那里根本没被校正，在"全文"一族里是 0.19（把 k = 40 换进 10 个检验的一族、用 `routing.holm` 按发表的胜负重算是 0.095）。族的定义没有改：改了会把引用过的 pds 下 L2 对 Mem0 的校正后 p 从 0.068 移到 0.085。摘要以前把 Graphiti 与 LangMem 在通义下的下降只归于写入；现在另写明共用评测框架在读的一侧、没有单独量过的因素（Graphiti 的 0.6 阈值没有按通义向量重调；LangMem 的长记忆超过向量器读的 6000 个字符，pq 123 条里 12 条、pds 705 条里 2 条），写明 pds 下 Graphiti 走基础检索（没有重排、不走 BFS），并列出各适配层偏离上游的地方（报告 §13.4，中英）。核对者认为 Mem0 与 LangMem 放宽的检索条数、A-MEM 的补丁与 pds 下判分就是回答模型都不是不利条件，只是中性地列出。
+     - **视频与各节点的记录**（P17）：60 秒视频的源文件不再说 "1/20 of the cost" 与 "test sets used once"（改成 "1/20 the answer-time cost" 与 "one frozen pass over the test sets"）；上传的视频在主人重新渲染、作为新视频上传（YouTube 不能原地替换）、更新 8 处链接之前仍是旧的，README 在封面下面写明视频里的成本只算回答、LongMemEval 的数字在泄漏修复之前。手写的 N3、N4、N5、N7、N9、N11 记录与中文 README 的结果都补上 D-067 的泄漏说明（N7：控制器的各档准确率表与 λ 是用泄漏期间的结果拟合的，没有重新拟合；N11：修复后同样 100 题 L1 90.0%、Mem0 79.0%）。生成的 `report.md` 不改，`reproduce.py` 会覆盖它们。
+     - **评测**：改的是文档、声明、一张生成的表、两张图与生成它们的脚本；准确率、胜负、原始与校正后的 p 与 JSON 都没有变。
+  7. **外部基线的可复现**（P21；修订 D-055、D-065、D-070 第 7 组）：
+     - Mem0 另装的包固定版本（`--with spacy==3.8.16 --with fastembed==0.9.0`，N12 构建机 uv 缓存里的版本；不固定时现在已经解析到 fastembed 0.9.1），A-MEM 的评测命令补上 `--with chromadb==1.5.9`：工作流、`reproduce.py`、各脚本、说明与 N12 的记录都改。
+     - `pds-locomo.json` 与 `pq-locomo.json` 只多了新键（其余逐字节相同，两个 `-holm.json` 比对相同）：`methods.<方法>.retrieval`（会话召回与发言召回；M0、ML 的检索结果不带发言 ID，发言召回是 null；B1 没有这个键），以及外部系统的 `methods.<方法>.build`（Graphiti 的实体、事实与警告条数，LangMem 的空会话与超长记忆，Cognee 的节点与边，A-MEM 的链接与演化，Mem0 的失败会话），文档引用的召回与写入规模的数字都有了出处。
+     - `evals.external.installed_environment()` 作为 `environment` 写进每次新的外部写入的 `build.json`。发表的写入没有记下间接依赖的版本：`docs/results/n12-baselines/environments/<系统>.txt` 留下构建机 uv 缓存里找到的环境，可以看到构建期间就有间接依赖变过（langchain 1.4.6 / 1.4.3、neo4j 6.4.0 / 6.4.1、transformers 5.19.0 / 5.20.0）。它们只是记录，不是锁文件。
+     - **留着的**："外部基线"工作流（D-070）还没在 GitHub 上跑过，第一次预计在合并这一轮的 PR 上跑，结果要补进这条记录。CI 里完整锁定外部基线的安装留给以后，要按这些清单定，而不是按今天的解析。
+     - **评测**：固定版本只改外部基线的 `uv run --with` 叠加环境，`environment` 在写入完成之后才记；默认配置与评测的请求、缓存键与冻结的方法不变。
+- **备选与取舍**：
+  - **升到 Pillow 13 而不分两次缩放**：每张高比宽多两倍左右、要缩放的照片字节都会变（核对者随机试的 305 个尺寸里 127 个），MemLens 与 N6 里这种照片的图片描述、多模态与回答请求的缓存键跟着变。**在 `image_data_url` 里也限格式**：存下的别的格式的评测图片就重放不了。
+  - **现在就按摘要固定基础镜像**（P5、P18）：没法核对的摘要会让必需的 docker 检查失败，没有 Dependabot 提议新摘要时镜像也收不到安全补丁。**`[tool.uv] required-version`**：还在用 uv 0.11.32 的机器上每个 uv 命令都会报错；先升级再加。
+  - **按 IP 限制登录失败**（P13）：经 Docker 端口映射或容器里的反向代理时所有访问者是同一个 IP，谁都能把所有人挡在门外；令牌够长时在线猜不出来，限流交给反向代理。
+  - **花费方面**（P10）：限定作用域的令牌必须带 user（同一个令牌带自己的 user 照样花得了这么多，D-069 第 6 组有意让没有 user 的请求原样转发）；拒绝 `n`、`store`、`service_tier` 等字段（取决于供应商，弄坏现成的客户端）；全局的 `CUEMEM_RATE_PER_MINUTE`；这一轮就做每日预算（要账本按令牌记）。
+  - **请求头的值不是 UTF-8 就 400**（P22）：Node 的 fetch 与 requests 现在按 Latin-1 发 `José`。
+  - **在 `forget()` 里直接同步会话**（P3）：`delete_space` 重入遗忘，同步要等会话锁，而拿着会话锁的这一轮在等读取的门（复现过死锁；换成这种写法时回归测试超时失败）。
+  - **启动时就接手留下的 run**（P16）：部署之后接着写的 run 又回到每句都整段抽取、重放。**把闲置结束的交接写进库里**，以覆盖之前的进程闲置结束的 run：多一种带用户 ID 的元信息，每条遗忘的路都要清理，只为一个窄的情形。
+  - **清理缓存失败时记一行待清理**（P12）：会把被删的原文再存一遍（D-021）。
+  - **记忆代理的竞争里连用户的话也丢**（P20）：与 D-069 的"遗忘之前说的话不再写进来"一致，也挡得住与一次 `delete_all` 同时到的话，但每次删掉一条无关的记忆都会丢一句正常的话。
+  - **镜像里 `chmod 700 /data`**（P14）：卷在 0710 的 `/var/lib/docker` 下，容器里只有一个用户，绑定挂载不看镜像里目录的权限。
+  - **解释器退出时自动关掉 `Memory`**（P19）：退出时结束 run 与后台线程，在供应商的调用还没回来时可能拖住甚至卡住退出，关闭的路径也不是幂等的，`Memory.from_system` 包着的系统不该由它关。**`restart: on-failure`**：翻倍重试几秒就放弃，而 `unless-stopped` 还能在崩溃与重启机器之后自己起来。
+  - **重新定义 Holm 的族**，把 k = 40 的 A-MEM 放进 10 个检验的一族（P11）：会移动已经引用的校正后的 p。
+- **后果**：
+  - 代码与测试：改了 77 个文件（不计文档），新增 78 个测试函数；共收集 1,225 个测试，去掉 6 个联网的，离线跑 1,219 个，其中 23 个在没装外部基线的包（18 个）或没有 Qdrant 服务端（5 个，比 D-070 多一个：确认要 Key 的服务端拒绝不带 Key 的连接）时跳过，改由 CI 跑；ruff 与 mypy 通过。每个行为修复都在修复之前的代码上确认过失败。
+  - **评测请求、图片请求与发表的数字不变**：`tests/test_eval_leak.py` 的 `FROZEN_REQUESTS`、`tests/test_frozen_config.py`，以及 `tests/test_llm_client.py`、`tests/test_embedding.py` 里缓存键的金标测试，与这一轮开始时的文件逐字节相同、照常通过，没有重新钉；默认的巩固指纹仍是 `2f0adc7890b6a52e`；发给模型的图片字节由 `tests/test_store.py` 新的金标钉住，在 Pillow 12.3.0 与 13.0.0 上都通过。与 D-070 相同，钉住的是请求的字节与缓存键；N2–N11 的重放没有重跑。
+  - **有意改变的请求**：默认配置与评测的路径上没有。记忆代理只对写了 `models` 或 `max_output_tokens` 的令牌改变转发的请求体；serve 与 proxy 可能在启动一个闲置期之后为之前的进程留下的会话发出抽取请求。
+  - **历史**：仓库公开之前历史重写过一次，以前的记录里引用的提交号变了；文档与结果记录里的提交号都已更新，本机 `runs/` 目录里的 `run.json` 仍是旧的。
+  - **留到以后或只做了一部分**：
+    1. P1：在有 MemLens 与 N6 照片的机器上，比较 Pillow 12.3.0（一次缩放）与 13.0.0（两次缩放）下 `image_data_url` 的摘要，预期全部相同；gradio 与 fastembed 放开上限之前，pip 装的 `cuemem[ui]` 与 `cuemem[local]` 停在 Pillow 12；
+    2. P5 与 P18：仓库设置（私下报告、提醒、安全更新、推送保护、导入规则集）由主人打开；配合 Dependabot 按摘要固定基础镜像、`required-version`、push 只在 main 上触发，由主人决定；
+    3. P10 与 P13：按令牌的每日花费预算；界面的会话、一次写入的大小与调用方加的供应商字段不受按令牌的上限管；CueMem 不限制登录的次数；
+    4. P15：`authors` 与 `CITATION.cff` 的署名、给贡献者的模板、`v0.1.0` 标签与仓库的简介设置；
+    5. P16：之前的进程因闲置结束的 run（第 3 组）；`--run-idle-minutes`；
+    6. P17：重新渲染、上传视频，更新链接；
+    7. P20 与 D-068：`cuemem search --image` 的查询图片向量、回滚了的图片写入留下的缓存条目、Gradio 的临时副本最多约 2 小时，以及三个集成里的"召回 → 模型 → 写回"；
+    8. P21："外部基线"工作流的第一次运行，外部基线完整锁定的安装；
+    9. D-070 的第 1、3、6 条做完了，只剩 `tables.md` 摊销写入成本的一列（要 N9 的运行）与测试的子进程不受网络守卫；它的第 2、4、5、7、8 条不变。
+  - **仍有的局限**：
+    - 不鉴权又监听非本机地址时，任何 IP 地址都算合法的 Host（这正是 `--insecure-no-auth` 所说的可信网络），服务仍是明文 HTTP；
+    - 接手留下的会话、按会话分配序号、删除孤立的向量，仍假定同一个数据库同时只有一个进程在写（同 D-068）；
+    - 回滚照样增加数据库的发言删除计数（D-070），保守地让记忆代理与 Agents 待重试的写回、以及现在记忆代理对回答的检查以为发生过遗忘。
