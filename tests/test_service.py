@@ -326,7 +326,7 @@ def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedMo
     assert not any("Ana" in f["statement"] for f in service.facts("shop"))
     assert live.window == []
     # 已经同步过、记下了遗忘的次数：下一轮不再同步一遍（不再重取画像）
-    assert live.forget_epoch == service.system.forget_epoch("shop") == 1
+    assert live.forget_epoch == service.system.forget_epoch("shop") > 0
 
 
 def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
@@ -457,6 +457,54 @@ def test_a_turn_waiting_behind_a_forget_does_not_send_what_it_deleted(
     assert model.calls["agent"] == asked + 1
     assert "4321" not in _sent_since(fake_api, n)
     assert live.profile == []
+
+
+def test_sessions_synced_during_a_replay_take_the_rebuilt_profile(
+    service: ChatService, model: ScriptedModel, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/api/v1 的删除提交之后、重放还没做完时（画像清空了还没重建）开的会话与同步的会话（另一次
+    遗忘之后的 prune）：以前它们取到空的画像，记下的却已经是提交时加过的遗忘次数，之后每一轮都
+    认为同步过，整个会话没有用户剩下的画像。现在重放之后再加一次，下一轮在读取里重取重建好的
+    画像（第四轮复审）。"""
+    model.agent = lambda body: "Noted."
+    for text in (SECRET, "I always drink green tea."):
+        done = service.start("eve", at=DAY)
+        service.chat(done.session_id, text, mode="l0")
+        service.end(done.session_id, wait=True)
+    live = service.start("eve", at=datetime(2026, 9, 1))
+
+    def profile(session: ChatSession) -> str:
+        return " | ".join(statement for _, _, statement in session.profile)
+
+    assert "4321" in profile(live) and "green tea" in profile(live)
+    fact = next(f["id"] for f in service.facts("eve") if "4321" in f["statement"])
+    inside, release = threading.Event(), threading.Event()
+    replay = service.system.consolidator.run
+
+    def held(space_id: str) -> Any:  # 提交之后、重放之前停下（还独占着这个空间）
+        if threading.current_thread() is forgetting:
+            inside.set()
+            release.wait(10)
+        return replay(space_id)
+
+    monkeypatch.setattr(service.system.consolidator, "run", held)
+    v1 = Memory.from_system(service.system)
+    forgetting = threading.Thread(target=v1.delete, args=(fact,))
+    forgetting.start()
+    assert inside.wait(10)
+    fresh = service.start("eve", at=datetime(2026, 9, 2))
+    service.agent.prune(live)
+    assert fresh.profile == [] and live.profile == []  # 画像还没重建
+    release.set()
+    forgetting.join(10)
+    assert not forgetting.is_alive()
+    sent = len(fake_api.chat_requests)
+    for session in (fresh, live):
+        n = len(model.agent_requests)
+        service.chat(session.session_id, "Hi again", mode="l0")
+        assert "green tea" in profile(session) and "4321" not in profile(session)
+        assert "green tea" in str(model.agent_requests[n]["messages"][0]["content"])
+    assert "4321" not in _sent_since(fake_api, sent)
 
 
 def test_a_v1_delete_all_does_not_deadlock_with_a_waiting_turn(

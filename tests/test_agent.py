@@ -365,7 +365,7 @@ def test_the_next_turn_drops_what_a_forget_deleted(
     history = model.agent_requests[-1]["messages"]
     assert not any("Ana" in str(m["content"]) for m in history)
     assert [e.user_idx for e in session.window] == [2, 4]
-    assert session.forget_epoch == system.forget_epoch("demo") == 1
+    assert session.forget_epoch == system.forget_epoch("demo") > 0
 
 
 def test_turns_without_a_forget_do_not_resync(

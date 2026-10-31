@@ -646,7 +646,8 @@ class MemorySystem:
     def forget_epoch(self, space_id: str) -> int:
         """这个空间在本进程里遗忘过几次（forget 提交了删除、删除空间）。进行中的会话（Agent）记着
         开始或上次同步时的值，每轮在读取（reading）里比一下，变了就先去掉被删的内容再回答（见
-        Agent._chat）：不论遗忘经哪个入口（/api/v1、SDK、MCP、reset、集成）、在哪个线程里做。"""
+        Agent._chat）：不论遗忘经哪个入口（/api/v1、SDK、MCP、reset、集成）、在哪个线程里做。
+        只比相等与否：一次遗忘加不止一次（提交时与重放之后各一次，见 forget）。"""
         with self._gates_guard:
             return self._forget_epochs.get(space_id, 0)
 
@@ -866,7 +867,7 @@ class MemorySystem:
                         self.consolidator.requeue(space_id, before, skip)
                 committed = True
                 # 还在独占里：之后的读取（进行中的会话的下一轮）都看得到这次遗忘。之后重建出错
-                # 抛出时也已经加过：日志已经删了
+                # 抛出时也已经加过：日志已经删了。重放之后再加一次（见下面的 finally）
                 self._bump_forget_epoch(space_id)
                 if self.worker is not None:  # 后台巩固记下的出错可能引着被删的内容
                     self.worker.drop(space_id)
@@ -921,7 +922,13 @@ class MemorySystem:
                     llm_purged += cache.settle(held, reused)
                 elif cache is not None:  # 事务没提交：日志与派生层都没动，标记的条目原样留下
                     cache.release(held)
-                if committed:  # 重放没做完（抛出了，或有会话抽取失败）：交给后台线程
+                if committed:
+                    # 重放之后再加一次（还在独占里）：提交时加过的那次之后、重放做完之前，不在
+                    # 读取里的同步（Agent.start、ChatService.forget 之后的 prune）取到的是清空的
+                    # 画像，记下的却已经是新的次数，下一轮不会再同步。再加一次，它们的下一轮在
+                    # 读取里重取重建好的画像（第四轮复审）
+                    self._bump_forget_epoch(space_id)
+                    # 重放没做完（抛出了，或有会话抽取失败）：交给后台线程
                     self._hand_over(space_id)
             if images_left:
                 trace.attrs.update(images_left=images_left)
