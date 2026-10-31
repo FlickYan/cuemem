@@ -152,6 +152,8 @@ def test_figures_only_redraws_from_the_published_results(
         shutil.copy(N9 / name, out / name)
     before = {p.name: p.read_bytes() for p in out.iterdir()}
     monkeypatch.setattr(n9_report, "OUT", out)
+    # 万一 --figures-only 退化成跑全部（n9_tables.write），也只写进临时目录，不改仓库里发表的表
+    monkeypatch.setattr(n9_report.n9_tables, "OUT", out)
     monkeypatch.setattr(n9_report, "RUNS_DIR", tmp_path / "eval")
     monkeypatch.setattr(n9_report, "CACHE", tmp_path / "eval" / "n9-final")
     monkeypatch.setattr(sys, "argv", ["n9_report.py", "--figures-only"])
