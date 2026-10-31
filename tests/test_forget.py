@@ -456,6 +456,54 @@ def test_a_trace_file_that_cannot_be_rewritten_does_not_stop_the_forget(
     assert system.embedder.cached(s4_texts, "document") == set()
 
 
+def embed_cache_full_once(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> None:
+    """向量缓存第一次删除时磁盘满（sqlite3 的 database or disk is full），之后照常。"""
+    assert isinstance(system.embedder, CachedEmbedder)
+    cache = system.embedder.cache
+    real, calls = cache.delete_many, []
+
+    def full(keys: Sequence[str]) -> int:
+        calls.append(len(keys))
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(keys)
+
+    monkeypatch.setattr(cache, "delete_many", full)
+
+
+def test_an_embedding_cache_that_cannot_be_purged_does_not_stop_the_forget(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """遗忘提交之后清理向量缓存出错（磁盘满，或与评测共用的 embed.sqlite 被锁住）：以前从提交
+    之后抛出，跳过了 scrub；重试找不到要删的发言，trace 又已经删了（提问只记在那里），提问的查询
+    向量再也清不掉。现在记一条警告、在遗忘的 trace 里记下 embed_cache_left，遗忘照常返回。"""
+    system.retrieve("demo", SECRET_QUESTION, mode="l1")
+    embed_cache_full_once(system, monkeypatch)
+    with caplog.at_level("WARNING", "cuemem.memory"):
+        report = system.forget_memories("demo", session_ids=["s4"], report_rebuild_errors=True)
+    assert report.turns_deleted == 4 and system.db.get_turns("demo", "s4") == []
+    assert [r.name for r in caplog.records if r.levelname == "WARNING"] == ["cuemem.memory"]
+    records = [json.loads(line) for line in _traces(system).splitlines()]
+    [forget] = [r for r in records if r["name"] == "forget"]
+    assert forget["attrs"]["embed_cache_left"] is True
+    assert SECRET not in _traces(system)
+
+
+def test_an_embedding_cache_failure_after_delete_space_does_not_raise(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """删除空间删掉 trace 之后清理其中提问的查询向量出错：同样只记警告（以前抛出，delete_all 与
+    reset 的重试找不到这些 trace）。"""
+    assert isinstance(system.embedder, CachedEmbedder)
+    system.retrieve("demo", SECRET_QUESTION, mode="l1")
+    embed_cache_full_once(system, monkeypatch)
+    with caplog.at_level("WARNING", "cuemem.memory"):
+        assert system.purge_space_traces(["demo"]) >= 1
+    assert [r.name for r in caplog.records if r.levelname == "WARNING"] == ["cuemem.memory"]
+    assert SECRET_QUESTION not in _traces(system)
+    assert system.embedder.cached([SECRET_QUESTION], "query") == {SECRET_QUESTION}  # 不重试
+
+
 def test_a_trace_line_that_is_not_utf8_does_not_stop_the_forget(system: MemorySystem) -> None:
     """trace 文件里一行不是 UTF-8（这一版之前追加写到一半，断在一个汉字中间，下一次追加接在它
     后面）：以前遗忘读到它就抛 UnicodeDecodeError，从此这个服务上每次遗忘都在提交之后报错

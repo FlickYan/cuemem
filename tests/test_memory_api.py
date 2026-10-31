@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import BaseModel, TypeAdapter
 from scripted import ScriptedModel
-from test_forget import no_space_for_trace_rewrites
+from test_forget import embed_cache_full_once, no_space_for_trace_rewrites
 from test_sdk import (
     AUG,
     SEP,
@@ -642,13 +642,14 @@ def test_concurrent_write_conflicts_are_409(
     assert [t.text for t in system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
 
 
-@pytest.mark.parametrize("broken", ["disk full", "cut line"])
+@pytest.mark.parametrize("broken", ["disk full", "cut line", "embed cache full"])
 def test_a_delete_succeeds_when_the_traces_are_broken(
     system: MemorySystem, monkeypatch: pytest.MonkeyPatch, broken: str
 ) -> None:
     """遗忘提交之后 trace 出问题，/api/v1 的删除照常回 200：重写 trace 文件时磁盘满（以前 500，
     调用方重试得到 404，被删的内容留在 trace 与向量缓存里），trace 文件里一行不是 UTF-8（以前
-    400 invalid_request，从此每次删除都这样）。两种情况下删除都已经做了。"""
+    400 invalid_request，从此每次删除都这样）。两种情况下删除都已经做了。清理向量缓存时磁盘满
+    也一样（第四轮复审，以前 500）。"""
     memory = Memory.from_system(system)
     memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
     memory.search("Do I live in Berlin?", user_id="alice")
@@ -658,6 +659,8 @@ def test_a_delete_succeeds_when_the_traces_are_broken(
     assert b"I live in Berlin" in day.read_bytes()
     if broken == "disk full":
         no_space_for_trace_rewrites(monkeypatch)
+    elif broken == "embed cache full":
+        embed_cache_full_once(system, monkeypatch)
     else:
         with day.open("ab") as f:
             f.write(b'{"attrs": {"space": "bob", "question": "\xe6\x88{"attrs": {}}\n')

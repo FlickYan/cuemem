@@ -906,17 +906,35 @@ class MemorySystem:
                     # 6. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面
                     #    那些 trace 里的查询（代理与 Agent 拿用户的原话做检索查询）的查询向量，连同
                     #    以文搜图的；没有别的记录再用的被删图片的向量（与删原图同一个规则）。重放
-                    #    失败时派生记忆只重建了一部分，多删的向量下次巩固时重新算
-                    gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
+                    #    失败时派生记忆只重建了一部分，多删的向量下次巩固时重新算。出错时（磁盘满、
+                    #    与评测共用的 embed.sqlite 被锁住）同样记警告、不抛出（第四轮复审）：以前
+                    #    从提交之后抛出，跳过了 scrub，重试找不到要删的发言，第 5 步又已经删了 trace
+                    #    （提问只记在那里），这些向量再也清不掉。没清理的不重试
                     embed_purged = 0
-                    if isinstance(self.embedder, CachedEmbedder):
-                        embed_purged = self.embedder.purge(gone)
-                    embed_purged += self._purge_queries([*texts, *questions])
-                    if isinstance(self.image_embedder, DashScopeMultimodalEmbedder):
-                        unused = {m.sha256 for m in doomed_media}
-                        unused = {d for d in unused if not self.db.media_sha_in_use(d)}
-                        embed_purged += self.image_embedder.purge(image_digests=sorted(unused))
-                    self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
+                    try:
+                        units_after = {u.text for u in self.db.list_units(space_id)}
+                        if isinstance(self.embedder, CachedEmbedder):
+                            embed_purged = self.embedder.purge(sorted(texts_before - units_after))
+                        embed_purged += self._purge_queries([*texts, *questions])
+                        if isinstance(self.image_embedder, DashScopeMultimodalEmbedder):
+                            unused = {m.sha256 for m in doomed_media}
+                            unused = {d for d in unused if not self.db.media_sha_in_use(d)}
+                            embed_purged += self.image_embedder.purge(image_digests=sorted(unused))
+                    except Exception:
+                        logger.warning(
+                            "遗忘 %s：向量缓存没能清理，里面可能还有被删内容的向量",
+                            space_id,
+                            exc_info=True,
+                        )
+                        trace.attrs.update(embed_cache_left=True)
+                    try:  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
+                        self.db.scrub()
+                    except Exception:
+                        logger.warning(
+                            "遗忘 %s：记忆库的 WAL 没能截断，被删的内容暂时还在 WAL 里",
+                            space_id,
+                            exc_info=True,
+                        )
             finally:  # 中途出错时重放用到的更少，删得更多
                 if cache is not None and committed:
                     llm_purged += cache.settle(held, reused)
@@ -1346,7 +1364,16 @@ class MemorySystem:
         removed = self.tracer.remove(gone, contains=needle, dropped=dropped)
         questions += _text_only(dropped)
         if questions:
-            self._purge_queries(questions)
+            # trace 已经删了：这里抛出的话，重试（delete_all、reset）找不到这些提问。与遗忘的
+            # 第 6 步一样记警告、不抛出（第四轮复审）
+            try:
+                self._purge_queries(questions)
+            except Exception:
+                logger.warning(
+                    "删除空间的 trace 之后，提问的查询向量没能清理（%d 条）",
+                    len(questions),
+                    exc_info=True,
+                )
         return removed
 
     def _purge_queries(self, texts: Sequence[str]) -> int:
