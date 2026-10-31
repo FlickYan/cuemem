@@ -150,6 +150,7 @@ class Turn:
     reasons: list[str] = field(default_factory=list)
     recalled: int = 0  # 注入的记忆条数（画像、事实、对话片段）
     block: str = ""  # 注入的证据块
+    epoch: int | None = None  # 想起之前这个空间删过几次发言（MemoryDB.turn_epoch，见 _write_back）
 
 
 class MemoryProxy:
@@ -418,6 +419,7 @@ class MemoryProxy:
         query = message_text(last.get("content"))
         if not query.strip() or not self.system.db.has_sessions(space):
             return turn
+        turn.epoch = self.system.db.turn_epoch(space)  # 在想起之前记：之后的遗忘都比得出来
         try:
             evidence = recall_evidence(
                 self.system,
@@ -495,16 +497,31 @@ class MemoryProxy:
             )
 
     def _write_back(self, turn: Turn, answer: str | None) -> None:
+        """把这一轮写进记忆：用户的话与回答。
+
+        想起之后、写回之前这个空间遗忘过（等上游回答的时候别的调用方删了这个用户的记忆）时，注入了
+        记忆的回答不写：它是照想起的记忆写的，可能复述了刚删的内容，写回去下次抽取时又长出来。以前
+        写回时才记遗忘次数，比不出这段时间里的遗忘（D-068 记下的剩余限制，流式时这段时间更长）。
+        用户的话照写：它不是从记忆来的，与这次遗忘无关时丢掉就再也没有了（之后的请求只写各自最后
+        一句用户消息）。没有注入记忆的回答（工具调用的后续、想起失败、空间里还没有记忆）照写。"""
         if turn.space is None or turn.run is None:
             return
-        messages = [_storable(turn.write_user)] if turn.write_user is not None else []
-        if answer and answer.strip():
-            messages.append({"role": "assistant", "content": answer})
-        if not messages:
+        user = [_storable(turn.write_user)] if turn.write_user is not None else []
+        answered = bool(answer and answer.strip())
+        if not user and not answered:
             return
         run = turn.run
         with run.lock:  # 同一会话的写回按顺序进行（发言序号只增不减）
             epoch = self.system.db.turn_epoch(run.space)
+            messages = list(user)
+            if answered and turn.block and turn.epoch is not None and turn.epoch != epoch:
+                record_event(
+                    "proxy_write_dropped", space=run.space, reason="forgotten", part="answer"
+                )
+            elif answered:
+                messages.append({"role": "assistant", "content": answer})
+            if not messages:
+                return
             run.unsaved.append(Unsaved(messages, datetime.now(), epoch))
             self._save(run)
 

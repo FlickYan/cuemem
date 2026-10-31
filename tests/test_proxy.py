@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import logging
+import threading
 import time
 from collections.abc import Iterator
 from datetime import datetime
@@ -228,6 +229,59 @@ def test_forget_purges_the_query_vector_of_a_deleted_message(
     assert not embedder.cached([secret], "query")
     traces = system.settings.paths.traces.glob("*.jsonl")
     assert not any("Ana" in p.read_text("utf-8") for p in traces)  # 代理的检索 trace 也删了
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_answer_built_on_memory_forgotten_meanwhile_is_not_written_back(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    fake_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """等上游回答的时候别的调用方删了注入的那条记忆（DELETE /api/v1/memories/{id}）：回答是照
+    被删的记忆写的，以前照样写回日志，下次抽取时被删的事实又长了回来（D-068 记下的剩余限制；
+    以前写回时才记遗忘次数）。现在想起之前记下，写回时变了就不写回答、记一个 proxy_write_dropped
+    事件；用户的话照写（它不是从记忆来的）。流式与非流式一样。"""
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
+    )
+    chat(client, "I live in Berlin", user="alice")
+    clock.now += 31 * 60
+    proxy.close_idle()
+    assert system.worker is not None
+    system.worker.wait()
+    [fact] = [f for f in system.facts("alice") if "Berlin" in f.statement]
+    memory = Memory.from_system(system)
+    injected: list[bool] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        if body["messages"][0].get("content") != SYSTEM["content"]:
+            return upstream.model(body)
+        injected.append("lives in Berlin" in json.dumps(body["messages"]))
+        forget = threading.Thread(target=memory.delete, args=(fact.id,))  # 另一个调用方
+        forget.start()
+        forget.join()
+        return "You live in Berlin, so a warm coat."
+
+    fake_api.chat_replies = [reply]
+    response = chat(client, "What coat do I need?", user="alice", stream=stream)
+    assert response.status_code == 200 and "Berlin" in response.text  # 调用方照样拿到回答
+    assert injected == [True]
+    turns = system.db.get_turns("alice")
+    assert [(t.role, t.text) for t in turns] == [("user", "What coat do I need?")]
+    dropped = [data for kind, data in events if kind == "proxy_write_dropped"]
+    assert dropped == [{"space": "alice", "reason": "forgotten", "part": "answer"}]
+
+    fake_api.chat_replies = [upstream]  # 之后没有遗忘：回答照常写回
+    history = [{"role": "user", "content": "What coat do I need?"}]
+    chat(client, "And boots?", history, user="alice", stream=stream)
+    texts = [t.text for t in system.db.get_turns("alice")]
+    assert texts == ["What coat do I need?", "And boots?", "Happy to help, Alice!"]
 
 
 def test_streaming_is_relayed_and_written_back(
