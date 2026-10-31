@@ -42,8 +42,15 @@ class VectorHit:
 
 
 class VectorStore:
-    def __init__(self, path: Path | None, dim: int, *, url: str | None = None) -> None:
+    def __init__(
+        self, path: Path | None, dim: int, *, url: str | None = None, api_key: str | None = None
+    ) -> None:
         """url 非空时连接 Qdrant 服务端；否则用本地模式（path 为空则只放在内存里）。
+
+        api_key：服务端的 API Key（放在 api-key 请求头里，本地模式不用）。url 要写明 http:// 或
+        https://：不写时 qdrant-client 在有 Key 时改用 https。经 http:// 发 Key 时 qdrant-client
+        每个客户端警告一次 "Api key is used with an insecure connection."（本机与 docker compose
+        的内部网络上无妨）。
 
         owned_units：空间 → 数据库里这个空间的几个记忆单元 ID（MemorySystem 设为
         MemoryDB.some_unit_ids），用来确认旧名字的集合是不是这个空间的（见 collection_name）；
@@ -54,7 +61,7 @@ class VectorStore:
         self._names: dict[str, str] = {}  # 空间 → 集合名（解析一次）
         self._path = path if url is None else None  # 本地模式的目录（出错时的说明用）
         if url is not None:
-            self._client = QdrantClient(url=url)
+            self._client = QdrantClient(url=url, api_key=api_key)
         elif path is None:
             self._client = QdrantClient(location=":memory:")
         else:

@@ -28,11 +28,14 @@ jobs:
   qdrant-server:
     # Qdrant 服务端模式（vector_store.url，docker-compose 推荐的部署）：只在服务端才走的分支——
     # payload 索引、indexed()、迁到服务端——在别的任务里从不运行（测试都用本地模式）。版本与
-    # docker-compose.yml 相同
+    # docker-compose.yml 相同。服务端要 API Key（vector_store.api_key 每个请求都带上，另有一个
+    # 测试确认不带的被拒绝）；/readyz 不查 Key
     runs-on: ubuntu-latest
     services:
       qdrant:
         image: qdrant/qdrant:v1.19.1
+        env:
+          QDRANT__SERVICE__API_KEY: ci-test-key
         ports:
           - 6333:6333
     steps:
@@ -50,6 +53,7 @@ jobs:
         shell: bash
         env:
           CUEMEM_TEST_QDRANT_URL: http://localhost:6333
+          CUEMEM_TEST_QDRANT_API_KEY: ci-test-key
         run: |
           set -o pipefail
           uv run pytest tests/test_qdrant_server.py -rs | tee pytest.log

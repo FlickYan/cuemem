@@ -64,6 +64,25 @@ def test_trace_retention_is_off_unless_set(
         load_settings()
 
 
+def test_vector_store_api_key_comes_from_the_environment(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qdrant 服务端的 API Key：CUEMEM_VECTOR_STORE__API_KEY（或 .env）读进 vector_store.api_key，
+    空字符串当没设，repr 里看不到。以前没有这个字段，Key 被悄悄丢掉，连不上要 Key 的服务端。"""
+    assert load_settings().vector_store.api_key is None
+    monkeypatch.setenv("CUEMEM_VECTOR_STORE__URL", "http://qdrant:6333")
+    monkeypatch.setenv("CUEMEM_VECTOR_STORE__API_KEY", "k-secret-value")
+    loaded = load_settings()
+    assert loaded.vector_store.api_key is not None
+    assert loaded.vector_store.api_key.get_secret_value() == "k-secret-value"
+    assert loaded.vector_store.secret() == "k-secret-value"
+    assert loaded.vector_store.url == "http://qdrant:6333"
+    assert "k-secret-value" not in repr(loaded) and "k-secret-value" not in str(loaded)
+    monkeypatch.setenv("CUEMEM_VECTOR_STORE__API_KEY", "")
+    assert load_settings().vector_store.api_key is None
+    assert load_settings().vector_store.secret() is None
+
+
 def test_unknown_model_reference_is_rejected(
     clean_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -8,6 +8,11 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.19.1
     restart: unless-stopped
+    # 不映射端口：只有 compose 内部网络上的 cuemem 连得到。另加一层：.env 里设了
+    # CUEMEM_VECTOR_STORE__API_KEY（openssl rand -hex 32）时 Qdrant 要这个 Key，cuemem 经 env_file
+    # 拿到同一个（只在这里引用这一个变量，两边不会不一致）；不设或为空时两边都不鉴权
+    environment:
+      QDRANT__SERVICE__API_KEY: ${CUEMEM_VECTOR_STORE__API_KEY:-}
     volumes:
       - qdrant-storage:/qdrant/storage
 

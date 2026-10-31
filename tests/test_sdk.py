@@ -1660,6 +1660,20 @@ def test_unknown_config_keys_are_refused(
 HASH = {"embedding": {"backend": "hash", "dim": 64}}
 
 
+def test_config_dict_takes_the_vector_store_api_key(
+    clean_env: None, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """配置字典可以给 Qdrant 服务端的 API Key（vector_store.api_key）：以前这个键不认识，被
+    _check_config 拒绝；本地模式不用它。"""
+    config = {**HASH, "vector_store": {"api_key": "k-secret"}}
+    memory = Memory(config, home=tmp_path / "home", http_client=fake_api.client(), background=False)
+    try:
+        assert memory.settings.vector_store.secret() == "k-secret"
+        assert "k-secret" not in repr(memory.settings)
+    finally:
+        memory.close()
+
+
 def test_sdk_does_not_inherit_the_batch_peak_policy(
     settings: Settings, fake_api: FakeAPI, tmp_path: Path
 ) -> None:

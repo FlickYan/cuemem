@@ -1037,7 +1037,9 @@ def migrate_vectors(
 ) -> None:
     """把本地模式的向量库原样复制到 Qdrant 服务端（改用服务端之前运行一次）。
 
-    数据库里已有的记忆不会被重新写入向量库，所以直接切换会得到一个空的向量库。
+    数据库里已有的记忆不会被重新写入向量库，所以直接切换会得到一个空的向量库。服务端要 API Key
+    时先在环境变量或 .env 里设 CUEMEM_VECTOR_STORE__API_KEY（不做成参数：会留在 shell 历史与进程
+    列表里）。
     """
     from cuemem.store.vector import VectorStore
 
@@ -1052,7 +1054,8 @@ def migrate_vectors(
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{exc}")
         raise typer.Exit(1) from exc
-    target = VectorStore(None, dim=settings.embedding.dim, url=to)
+    api_key = settings.vector_store.secret()
+    target = VectorStore(None, dim=settings.embedding.dim, url=to, api_key=api_key)
     try:
         counts = source.copy_into(target)
     except Exception as exc:  # 命令行的边界：连不上服务端、版本不兼容……都给一句能看懂的话
@@ -1070,7 +1073,15 @@ def migrate_vectors(
     for name, count in counts.items():
         table.add_row(name, str(count))
     console.print(table)
-    console.print(f"下一步：在 .env 里加上 [bold]CUEMEM_VECTOR_STORE__URL={to}[/bold]")
+    console.print(
+        f"下一步：在 .env 里加上 [bold]CUEMEM_VECTOR_STORE__URL={to}[/bold]"
+        + (
+            "，CUEMEM_VECTOR_STORE__API_KEY 也写进 .env"
+            if api_key
+            else "（这个服务端没要 API Key；给 Qdrant 设了 QDRANT__SERVICE__API_KEY 之后，"
+            "同一个 Key 写成 CUEMEM_VECTOR_STORE__API_KEY）"
+        )
+    )
 
 
 @app.command("mcp")
@@ -1706,7 +1717,10 @@ def _print_config(settings: Settings) -> None:
         f"sparse={'开' if emb.sparse and emb.backend == 'dashscope' else '关'}"
     )
     console.print(f"向量：{detail}")
-    vector_store = settings.vector_store.url or f"本地模式 {settings.paths.qdrant}"
+    vector_store = f"本地模式 {settings.paths.qdrant}"
+    if settings.vector_store.url:
+        has_key = settings.vector_store.api_key is not None
+        vector_store = f"{settings.vector_store.url}（API Key {'已设' if has_key else '未设'}）"
     console.print(f"数据库：{settings.paths.db}")
     console.print(f"向量库：{vector_store}")
     for line in _peak_status(settings):

@@ -125,6 +125,43 @@ def test_doctor_counts_local_collections(
     assert "migrate-vectors--toURL" in flat and "CUEMEM_VECTOR_STORE__URL" in flat
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Api key is used with an insecure connection", "ignore:Failed to obtain server version"
+)
+def test_migrate_vectors_sends_the_api_key(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """migrate-vectors 连目标服务端时带上 CUEMEM_VECTOR_STORE__API_KEY（不做成参数：会留在 shell
+    历史里）。以前目标只拿到 URL，要 Key 的服务端（Qdrant Cloud）一律 401、迁不过去。doctor 写明
+    服务端的 Key 设了没有。"""
+    import numpy as np
+    from fakes import KeyedQdrant
+
+    from cuemem.embed.base import l2_normalize
+    from cuemem.store.vector import VectorStore
+
+    local = VectorStore(tmp_path / "qdrant", dim=4)
+    vector = l2_normalize(np.ones((1, 4), dtype=np.float32))
+    local.upsert("alice", ["u1"], vector, None, [{"kind": "round", "ts": 0.0}])
+    name = local.collection_name("alice")
+    local.close()
+    monkeypatch.setenv("CUEMEM_VECTOR_STORE__API_KEY", "k")
+    with KeyedQdrant("k") as qdrant:
+        result = runner.invoke(app, ["migrate-vectors", "--to", qdrant.url])
+        assert result.exit_code == 0, result.output
+        calls = [(method, path, key) for method, path, key in qdrant.seen if path != "/"]
+    assert ("PUT", f"/collections/{name}/points", "k") in calls
+    assert all(key == "k" for _, _, key in calls)
+    flat = _flat(result.output)
+    assert f"CUEMEM_VECTOR_STORE__URL={qdrant.url}" in flat
+    assert "CUEMEM_VECTOR_STORE__API_KEY也写进.env" in flat
+
+    monkeypatch.setenv("CUEMEM_VECTOR_STORE__URL", "http://qdrant:6333")
+    assert "http://qdrant:6333（APIKey已设）" in _flat(runner.invoke(app, ["doctor"]).output)
+    monkeypatch.setenv("CUEMEM_VECTOR_STORE__API_KEY", "")
+    assert "http://qdrant:6333（APIKey未设）" in _flat(runner.invoke(app, ["doctor"]).output)
+
+
 def test_missing_key_gives_friendly_error(isolated_paths: None) -> None:
     result = runner.invoke(app, ["ingest", str(TOY_CONVERSATION)])
     assert result.exit_code == 1

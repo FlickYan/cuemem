@@ -19,7 +19,7 @@ latency-extended.json，不覆盖 latency.json。
 
 用法：
     uv run python scripts/n11_latency.py                     # Qdrant 本地模式
-    docker run -d --name cuemem-qdrant -p 6333:6333 qdrant/qdrant:v1.19.1
+    docker run -d --name cuemem-qdrant -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.19.1
     uv run python scripts/n11_latency.py --qdrant-url http://localhost:6333
     uv run python scripts/n11_latency.py --entities-per-round 0.6 --photos 30
 """

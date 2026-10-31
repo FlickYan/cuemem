@@ -12,8 +12,9 @@ from typing import Any
 
 import numpy as np
 import pytest
-from fakes import TOY_CONVERSATION
+from fakes import TOY_CONVERSATION, KeyedQdrant
 from PIL import Image
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.embed import SparseVector
@@ -461,6 +462,62 @@ def test_local_store_errors_say_what_to_check(
     store.close()
     with pytest.raises(VectorStoreOpenError, match="unable to open database file"):
         VectorStore(tmp_path / "qdrant", dim=4)
+
+
+# qdrant-client 经 http:// 发 Key 时警告；它在后台线程里向 "/" 核对版本，替身先关掉时也警告
+QDRANT_WARNINGS = (
+    "ignore:Api key is used with an insecure connection",
+    "ignore:Failed to obtain server version",
+)
+
+
+@pytest.mark.filterwarnings(*QDRANT_WARNINGS)
+def test_server_mode_sends_the_api_key() -> None:
+    """要 API Key 的 Qdrant 服务端（QDRANT__SERVICE__API_KEY、Qdrant Cloud）：每个请求都带着
+    api-key 头。以前 VectorStore 只把 URL 交给 QdrantClient，发不了 Key（401）；不给 Key 时照旧。"""
+    with KeyedQdrant("k") as qdrant:
+        store = VectorStore(None, dim=4, url=qdrant.url, api_key="k")
+        try:
+            assert store.count("alice") == 0
+            store.ensure_space("alice")
+        finally:
+            store.close()
+        calls = [(method, key) for method, path, key in qdrant.seen if path != "/"]
+        assert calls and all(key == "k" for _, key in calls)
+        assert ("PUT", "k") in calls  # 建集合与 payload 索引也带着
+
+        keyless = VectorStore(None, dim=4, url=qdrant.url)
+        try:
+            with pytest.raises(UnexpectedResponse, match="401"):
+                keyless.count("alice")
+        finally:
+            keyless.close()
+
+
+@pytest.mark.filterwarnings(*QDRANT_WARNINGS)
+def test_memory_system_passes_the_configured_api_key(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MemorySystem.from_settings 把 CUEMEM_VECTOR_STORE__API_KEY 交给服务端模式的向量库（以前设了
+    也被丢掉，第一次访问集合就 401）。"""
+    from cuemem.config import load_settings
+    from cuemem.memory import MemorySystem
+
+    for name in ("DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY"):
+        monkeypatch.setenv(name, "sk-test")
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "16")
+    with KeyedQdrant("k") as qdrant:
+        monkeypatch.setenv("CUEMEM_VECTOR_STORE__URL", qdrant.url)
+        monkeypatch.setenv("CUEMEM_VECTOR_STORE__API_KEY", "k")
+        system = MemorySystem.from_settings(load_settings())
+        try:
+            assert system.vectors.count("alice") == 0
+        finally:
+            system.close()
+        assert [key for _, path, key in qdrant.seen if path != "/"][:1] == ["k"]
+    assert not (tmp_path / "data" / "qdrant").exists()  # 服务端模式不建本地向量库
 
 
 def test_copy_into_moves_every_collection(tmp_path: Path) -> None:

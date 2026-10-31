@@ -1,9 +1,12 @@
-"""测试替身：模拟 OpenAI 兼容的聊天与向量接口、DashScope 原生向量接口，并记录收到的请求。"""
+"""测试替身：模拟 OpenAI 兼容的聊天与向量接口、DashScope 原生向量接口，并记录收到的请求；
+要 API Key 的 Qdrant 服务端（KeyedQdrant，本机回环上的真 HTTP）。"""
 
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -252,3 +255,62 @@ class FakeAPI:
                 },
             )
         return httpx2.Response(404, json={"error": "not found"})
+
+
+class KeyedQdrant:
+    """本机回环上的 Qdrant 服务端替身：像设了 QDRANT__SERVICE__API_KEY 的 Qdrant 一样，api-key
+    请求头不对时 401（"/" 不查，qdrant-client 用它核对版本）。seen 记下每个请求的（方法，路径，
+    api-key）。只答 CueMem 用到的几个接口：没有集合，建集合、建索引与写入都成功。
+
+        with KeyedQdrant("k") as qdrant:
+            VectorStore(None, dim=4, url=qdrant.url, api_key="k")
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.seen: list[tuple[str, str, str | None]] = []
+        self.url = ""
+
+    def __enter__(self) -> KeyedQdrant:
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def _reply(self) -> None:
+                self.rfile.read(int(self.headers.get("content-length") or 0))
+                path = self.path.split("?")[0]
+                key = self.headers.get("api-key")
+                stub.seen.append((self.command, path, key))
+                status, body = stub.answer(self.command, path, key)
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_PUT = do_DELETE = _reply
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def answer(self, method: str, path: str, key: str | None) -> tuple[int, bytes]:
+        if path == "/":
+            return 200, json.dumps({"title": "qdrant", "version": "1.19.1"}).encode()
+        if key != self.key:
+            return 401, b"Must provide an API key or an Authorization bearer token"
+        result: Any = {"operation_id": 0, "status": "completed"}  # 建索引、写入点
+        if path == "/collections":
+            result = {"collections": []}
+        elif path.endswith("/exists"):
+            result = {"exists": False}
+        elif method == "PUT" and path.count("/") == 2:  # 建集合
+            result = True
+        return 200, json.dumps({"result": result, "status": "ok", "time": 0.0}).encode()

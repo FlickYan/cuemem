@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -193,6 +193,19 @@ class PathsConfig(BaseModel):
 
 class VectorStoreConfig(BaseModel):
     url: str | None = None  # 为空用本地模式（paths.qdrant）；填 http://localhost:6333 改用服务端
+    # 服务端的 API Key（Qdrant 的 QDRANT__SERVICE__API_KEY、Qdrant Cloud 的 Key）：写在环境变量
+    # CUEMEM_VECTOR_STORE__API_KEY 或 .env 里，空字符串当没设；本地模式不用。以前没有这个字段，
+    # 设了也被悄悄丢掉，连不上要 Key 的服务端（第四轮体检）
+    api_key: SecretStr | None = None
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _empty_key(cls, value: Any) -> Any:
+        return None if value == "" else value
+
+    def secret(self) -> str | None:
+        """API Key 的明文（交给 QdrantClient）；没设时为 None。"""
+        return self.api_key.get_secret_value() if self.api_key is not None else None
 
 
 class RetrievalConfig(BaseModel):

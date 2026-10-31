@@ -418,7 +418,12 @@ class MemorySystem:
         return cls(
             settings,
             db=db,
-            vectors=VectorStore(paths.qdrant, dim=embedder.dim, url=settings.vector_store.url),
+            vectors=VectorStore(
+                paths.qdrant,
+                dim=embedder.dim,
+                url=settings.vector_store.url,
+                api_key=settings.vector_store.secret(),
+            ),
             embedder=embedder,
             llm=llm,
             ledger=ledger,

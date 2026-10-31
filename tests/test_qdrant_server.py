@@ -2,9 +2,11 @@
 时的 payload 索引、indexed()、迁到服务端时给目标建索引——以及服务端上的过滤检索、删除空间与旧名字
 集合的归属核对。别的测试都用本地模式，这些分支以前从没跑过。
 
-设了 CUEMEM_TEST_QDRANT_URL 才跑（CI 的 qdrant-server 任务起一个 qdrant/qdrant:v1.19.1）：
-    docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1
+设了 CUEMEM_TEST_QDRANT_URL 才跑（CI 的 qdrant-server 任务起一个要 Key 的 qdrant/qdrant:v1.19.1）：
+    docker run -d -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.19.1
     CUEMEM_TEST_QDRANT_URL=http://localhost:6333 uv run pytest tests/test_qdrant_server.py
+服务端设了 QDRANT__SERVICE__API_KEY 时把同一个 Key 设成 CUEMEM_TEST_QDRANT_API_KEY：每个连接都带上
+它，另有一个测试确认不带 Key 的连接被拒绝（服务端真的在查 Key）。
 
 不整份重跑别的测试文件：它们的空间名相同会互相撞上，还有只对本地模式成立的断言（存储锁、同分时
 的先后）。每个测试用自己的空间名，结束时删掉名字里带它的集合。
@@ -26,7 +28,12 @@ from cuemem.embed.base import l2_normalize
 from cuemem.store.vector import IMAGE_SUFFIX, PAYLOAD_INDEXES, VectorStore
 
 URL = os.environ.get("CUEMEM_TEST_QDRANT_URL")
-pytestmark = pytest.mark.skipif(not URL, reason="需要 Qdrant 服务端：设 CUEMEM_TEST_QDRANT_URL")
+KEY = os.environ.get("CUEMEM_TEST_QDRANT_API_KEY") or None
+pytestmark = [
+    pytest.mark.skipif(not URL, reason="需要 Qdrant 服务端：设 CUEMEM_TEST_QDRANT_URL"),
+    # 经 http:// 发 Key 时 qdrant-client 每个客户端警告一次（CI 与本机上无妨）
+    pytest.mark.filterwarnings("ignore:Api key is used with an insecure connection"),
+]
 
 DENSE = l2_normalize(np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0.9, 0.1, 0, 0]], dtype=np.float32))
 SPARSE = [
@@ -49,7 +56,7 @@ def token() -> str:
 
 @pytest.fixture
 def server(token: str) -> Iterator[VectorStore]:
-    store = VectorStore(None, dim=4, url=URL)
+    store = VectorStore(None, dim=4, url=URL, api_key=KEY)
     try:
         yield store
     finally:
@@ -111,9 +118,9 @@ def test_old_collection_names_need_proof_of_ownership(server: VectorStore, token
     server.upsert(space, ["u1"], DENSE[:1], SPARSE[:1], PAYLOADS[:1])
     assert server._client.collection_exists(legacy)
 
-    owner = VectorStore(None, dim=4, url=URL)  # 升级之后的新进程
+    owner = VectorStore(None, dim=4, url=URL, api_key=KEY)  # 升级之后的新进程
     owner.owned_units = lambda s: ["u1"] if s == space else []
-    stranger = VectorStore(None, dim=4, url=URL)
+    stranger = VectorStore(None, dim=4, url=URL, api_key=KEY)
     stranger.owned_units = lambda s: ["someone-else"]
     try:
         assert owner.collection_name(space) == legacy and owner.count(space) == 1
@@ -146,3 +153,21 @@ def test_local_vectors_migrate_into_the_server(
         ]
     finally:
         source.close()
+
+
+@pytest.mark.skipif(not KEY, reason="服务端没设 API Key：设 CUEMEM_TEST_QDRANT_API_KEY")
+def test_a_keyed_server_refuses_a_store_without_the_key(server: VectorStore, token: str) -> None:
+    """服务端真的在查 Key（CI 给 Qdrant 设了 QDRANT__SERVICE__API_KEY）：带 Key 的连接照常，不带的
+    401。以前 VectorStore 发不了 Key，连不上这样的服务端（Qdrant Cloud 也一样）。"""
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    space = f"{token}/erin"
+    server.upsert(space, ["a"], DENSE[:1], SPARSE[:1], PAYLOADS[:1])
+    assert server.count(space) == 1
+    keyless = VectorStore(None, dim=4, url=URL)
+    try:
+        with pytest.raises(UnexpectedResponse) as refused:
+            keyless.count(space)
+        assert refused.value.status_code == 401
+    finally:
+        keyless.close()
