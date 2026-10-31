@@ -35,7 +35,8 @@ the private advisory, and the published advisory credits you unless you ask othe
 In scope:
 
 - `cuemem serve`: the HTTP API (`/api`, `/api/v1`), its authentication (the admin token and scoped
-  keys) and the memory browser UI;
+  keys, including a scoped key's optional `rate_per_minute`, `models` and `max_output_tokens`
+  limits), the Host and same-origin checks, and the memory browser UI;
 - MCP over HTTP (`/mcp` in `cuemem serve`) and `cuemem mcp` (stdio);
 - the OpenAI-compatible memory proxy (`cuemem proxy`, and `/v1` in `cuemem serve`);
 - import and export (`cuemem import` / `export`, `/api/spaces/import`,
@@ -49,8 +50,10 @@ Known and accepted limits are listed in the decision records
 "Left for later or partial", item 4, and "Remaining limits", plus later rounds). A report showing
 that one of them is worse than described, for example that it crosses tenants, is still welcome.
 
-Out of scope: deployments that switch authentication off (`--insecure-no-auth`) outside a trusted
-network, and advisories in third-party packages that CueMem does not make exploitable (report those
+Out of scope: deployments that switch authentication off (`--insecure-no-auth`) or accept short
+tokens (`--insecure-weak-token`) outside a trusted network; traffic read off the wire when the
+plain-HTTP server is reached from outside a trusted network without a TLS reverse proxy in front;
+and advisories in third-party packages that CueMem does not make exploitable (report those
 upstream; Dependabot and the dependency audit below track them).
 
 ## For maintainers

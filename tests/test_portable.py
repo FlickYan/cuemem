@@ -383,8 +383,8 @@ def test_cli_export_import_and_preset(
             ["proxy"],
             ["embedding.backend：Inputshouldbe", "收到'hash#行尾注释'"],
         ),
-        (
-            {"CUEMEM_API_TOKEN": "t", "CUEMEM_PRESET": "opneai"},
+        (  # 令牌够长（至少 16 个字符），拦下它的只是配置
+            {"CUEMEM_API_TOKEN": "t" * 16, "CUEMEM_PRESET": "opneai"},
             ["serve", "--host", "0.0.0.0"],
             ["没有预设opneai"],
         ),
@@ -416,6 +416,44 @@ def test_config_errors_are_one_line_not_a_traceback(
     assert "errors.pydantic.dev" not in result.output and served == []
     if command == ["mcp"]:  # stdout 是 MCP 的通道
         assert "配置有误" in result.stderr and result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("variable", "yaml", "expected"),
+    [
+        (  # 取值不合法：Key 写成了数字
+            "CUEMEM_PRESET",
+            "vector_store:\n  api_key: 4815162342\n",
+            "vector_store.api_key：Inputshouldbeavalidstring",
+        ),
+        (  # 整份配置的引用检查：收到的是整份配置，里面带着 Key
+            "CUEMEM_CONFIG",
+            "vector_store:\n  api_key: qdrant-secret-0123456789\n"
+            "roles:\n  agent:\n    model: nope\n",
+            "角色agent引用了未定义的模型nope",
+        ),
+    ],
+)
+def test_config_errors_do_not_echo_the_vector_store_key(
+    clean_env: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    yaml: str,
+    expected: str,
+) -> None:
+    """配置写错时的一行原因不回显 Key：vector_store.api_key（Qdrant 服务端的 Key）是配置里的
+    密钥，这一行会进 docker compose logs。以前名字像密钥的字段与整份配置都照样回显收到的值。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_PRESET", "")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml, encoding="utf-8")
+    monkeypatch.setenv(variable, str(config))
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    assert expected in _flat(result.output), result.output
+    assert "4815162342" not in result.output and "qdrant-secret" not in result.output
+    assert "收到" not in result.output
 
 
 ENV_ASSIGNMENT = re.compile(r"^#?\s*([A-Z][A-Z0-9_]*)=(.*)$")

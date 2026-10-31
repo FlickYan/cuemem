@@ -147,6 +147,7 @@ PROVIDER_LABELS = {
     "ollama": "Ollama（本地）",
 }
 KEY_HINTS = {"qwen": "以 sk-ws- 开头"}  # 帮助区分同一平台上的其他 Key
+SECRET_WORDS = ("key", "token", "secret", "password")  # 配置写错时不回显这些字段收到的值
 
 
 def _settings(*, stderr: bool = False, **overrides: Any) -> Settings:
@@ -166,12 +167,20 @@ def _settings(*, stderr: bool = False, **overrides: Any) -> Settings:
 
 def _config_problem(exc: Exception) -> str:
     """配置错误的一行说明：pydantic 的 ValidationError 每个字段一句（字段、原因、收到的值，过长时
-    截断），不要它多行的格式与文档链接；别的错误原样。"""
+    截断），不要它多行的格式与文档链接；别的错误原样。
+
+    配置里有密钥（vector_store.api_key，Qdrant 服务端的 Key）：名字像密钥的字段不回显收到的值，
+    收到的是一整段配置（字典，例如整份配置的引用检查）时也不回显，里面可能带着密钥；与
+    api/auth.py 写错令牌时一样。这一行会进 docker compose logs。"""
     if not isinstance(exc, ValidationError):
         return str(exc)
     parts = []
     for error in exc.errors(include_url=False):
         where = ".".join(str(part) for part in error["loc"]) or "配置"
+        secret = any(word in str(part).lower() for part in error["loc"] for word in SECRET_WORDS)
+        if secret or isinstance(error.get("input"), dict):
+            parts.append(f"{where}：{error['msg']}")
+            continue
         got = repr(error.get("input"))
         got = got if len(got) <= 60 else got[:57] + "…"
         parts.append(f"{where}：{error['msg']}（收到 {got}）")

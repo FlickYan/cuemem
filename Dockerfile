@@ -4,7 +4,7 @@
 # .env 里要有 CUEMEM_API_TOKEN（至少 16 个字符，openssl rand -hex 32）：容器里监听 0.0.0.0，没有
 # 访问令牌或令牌太短时拒绝启动。别的机器要访问时在前面放 TLS 反向代理（README 的 Public deployment）。
 # 还要有所用配置的 Key（install -m 600 .env.example .env，那里写着默认配置与各预设要哪些）；起不来
-# 时 docker logs 里有一行原因。.env 里的注释要单独一行：--env-file 不认行尾注释，会把它算进值里。
+# 时 docker logs 里写着原因。.env 里的注释要单独一行：--env-file 不认行尾注释，会把它算进值里。
 # 多进程 / 大规模部署见 docker-compose.yml（Qdrant 服务端）。
 # 默认带上可选依赖 ui（记忆浏览界面，Gradio）与 local（本机向量 fastembed，预设 deepseek 要用）；
 # 只要接口与记忆代理时
