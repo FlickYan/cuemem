@@ -5,7 +5,8 @@
 - 记忆：用户画像、事实时间线（含被取代的旧版本）、实体图、图库、会话，以及遗忘；
 - 原理：一页说明。
 
-界面文字用英文；与接口共用服务对象（api/service.py）。
+界面文字用英文；与接口共用服务对象（api/service.py）。默认不联系第三方：字体是 Gradio 自带的，
+Gradio 的使用统计与版本检查要设 GRADIO_ANALYTICS_ENABLED=True 才打开（第四轮体检）。
 
 访问令牌（api/auth.py）：用限定作用域的令牌登录时，每个事件（经界面或 /gradio_api 直接调用）都
 先检查记忆空间在不在它的作用域里，不在时报错、什么都不读不写；页面打开时，默认的记忆空间不在
@@ -18,6 +19,7 @@ import base64
 import html
 import io
 import math
+import os
 import re
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -35,10 +37,18 @@ from cuemem.memory import RecallMode
 from cuemem.read.controller import Router, english_reason
 from cuemem.store.media import decoding
 
+# 字体用 Gradio 自带的 IBM Plex Sans（三种粗细的文件都在包里，由本服务提供）。以前是
+# GoogleFont("Inter")：Gradio 没带它，登录之后每个访客的浏览器都去 fonts.googleapis.com 取，访客的
+# IP 发给了 Google（第四轮体检）。等宽字体 Soft 本来就用自带的 IBM Plex Mono
 THEME = gr.themes.Soft(
     primary_hue="teal",
     neutral_hue="slate",
-    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
+    font=[
+        gr.themes.LocalFont("IBM Plex Sans", weights=(400, 600, 700)),
+        "ui-sans-serif",
+        "system-ui",
+        "sans-serif",
+    ],
 )
 
 CSS = """
@@ -177,8 +187,14 @@ def build_ui(
         return sid if who(request).allows(space) else None
 
     # Gradio 把上传的照片、对话与图库里显示的图都复制进自己的临时目录，遗忘时没法删到：每小时清掉
-    # 一小时以前的副本（会话读的是记忆里存的那份，不受影响；更早的对话里的图不再显示）
-    with gr.Blocks(title="CueMem demo", delete_cache=(3600, 3600)) as demo:
+    # 一小时以前的副本（会话读的是记忆里存的那份，不受影响；更早的对话里的图不再显示）。
+    # 使用统计默认关：gr.Blocks 一建好（挂载、从不 launch 的也一样）就向 api.gradio.app 查版本、经
+    # huggingface_hub 向 huggingface.co 报告；运营者设 GRADIO_ANALYTICS_ENABLED=True（.env 里也行，
+    # 这时已经读过）才打开
+    analytics = os.environ.get("GRADIO_ANALYTICS_ENABLED") == "True"
+    with gr.Blocks(
+        title="CueMem demo", delete_cache=(3600, 3600), analytics_enabled=analytics
+    ) as demo:
         session_id = gr.State(None)
         gr.HTML(
             '<div class="cm-header"><h1>CueMem</h1><p>A shopping assistant with long-term '

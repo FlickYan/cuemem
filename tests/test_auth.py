@@ -984,6 +984,53 @@ def ui_alice(
         service.close()
 
 
+def test_ui_contacts_no_third_party_by_default(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """界面默认不联系第三方：不发 Gradio 的使用统计与版本检查（以前 gr.Blocks 一建好就向
+    api.gradio.app 查版本、经 huggingface_hub 向 huggingface.co 报告，挂载、从不 launch 的也一样），
+    也不让浏览器去 fonts.googleapis.com 取字体（以前 Inter 是 GoogleFont，登录之后每个访客的 IP
+    都发给 Google）。GRADIO_ANALYTICS_ENABLED=True 时照旧打开统计。发送的函数换成记录器，测试
+    本身不联网。"""
+    import gradio.analytics
+
+    from cuemem.api.ui import build_ui
+
+    monkeypatch.delenv("GRADIO_ANALYTICS_ENABLED", raising=False)  # 真的 serve 没有这个变量
+    calls: list[str] = []
+    monkeypatch.setattr(gradio.analytics, "version_check", lambda: calls.append("version_check"))
+    monkeypatch.setattr(
+        gradio.analytics, "initiated_analytics", lambda data: calls.append("initiated_analytics")
+    )
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "gradio"))
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="alice")
+    app = create_app(
+        service, upload_dir=tmp_path / "uploads", ui=True, keys=Keys.parse(KEYS, ADMIN_TOKEN)
+    )
+    try:
+        with TestClient(app) as http:
+            login = {"username": "alice-app", "password": ALICE_TOKEN}
+            assert http.post("/login", data=login).status_code == 200
+            config = http.get("/config").json()
+            page = http.get("/").text
+            theme = http.get("/theme.css").text
+            fonts = re.findall(r"url\('?(static/fonts/IBMPlexSans/[^')]+)", theme)
+            assert len(set(fonts)) == 3  # 400、600、700 三种粗细，本服务自己提供
+            assert all(http.get(f"/{font}").status_code == 200 for font in fonts)
+        assert calls == []
+        assert config["analytics_enabled"] is False
+        assert [s for s in config["stylesheets"] if s.startswith(("http://", "https://"))] == []
+        assert "fonts.googleapis.com" not in page and "fonts.gstatic.com" not in page
+
+        monkeypatch.setenv("GRADIO_ANALYTICS_ENABLED", "True")  # 运营者自己打开
+        assert build_ui(service).analytics_enabled is True
+        assert calls  # 打开时照旧发送（这里发给记录器）
+    finally:
+        service.close()
+
+
 def _png(color: tuple[int, int, int]) -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (8, 8), color).save(buffer, format="PNG")
