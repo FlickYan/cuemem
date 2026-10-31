@@ -17,11 +17,15 @@
 - **写入记录**：每份对话历史写完留下 build.json，记下协议（"抽取模型|向量模型:维度"，与其他外部
   基线同一写法，见 evals/external.py）。写入目录（paths.eval_spaces / mem0）不分协议：另一个
   协议的写入不删也不复用，直接报 ConfigMismatchError（pq 协议的写入在 data/eval-spaces-qwen，
-  用 CUEMEM_PATHS__EVAL_SPACES 指过去）；没记协议的旧记录按当前协议处理。
+  用 CUEMEM_PATHS__EVAL_SPACES 指过去）；没记协议的旧记录按当前协议处理。build.json 另记
+  写入时装着的全部包（environment，同 evals/external.py），不进结果。
 
-mem0ai 不是 CueMem 的依赖，评测时用 uv 临时装上（遥测在导入前关闭）：
+mem0ai 不是 CueMem 的依赖，评测时用 uv 临时装上（遥测在导入前关闭）。spaCy 与 fastembed 固定在
+N12 期间构建机 uv 缓存里 Mem0 环境的版本（2026-10-14 起建的几个都是这两个版本；发表的 M0 写入，
+包括 N11 的，用的是哪个版本没有记录）：
 
-    uv run --with mem0ai==2.2.1 --with spacy --with fastembed --with "en_core_web_sm @ $SPACY_SM" \\
+    uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
+        --with "en_core_web_sm @ $SPACY_SM" \\
         cuemem eval run --dataset locomo --split test200r --methods M0 --name locomo-test200r-mem0
 
 其中 SPACY_SM 是 spaCy 英文小模型的地址（与 spaCy 3.8 配套）：
@@ -54,7 +58,7 @@ from cuemem.evals.datasets import (
     build_matches_session_ids,
     storage_space_id,
 )
-from cuemem.evals.external import check_protocol, protocol_of
+from cuemem.evals.external import check_protocol, installed_environment, protocol_of
 from cuemem.evals.methods import MethodContext, MethodOutput
 from cuemem.llm.client import LLMClient, Message, fallback_errors, replay_miss
 
@@ -265,7 +269,10 @@ class Mem0Baseline:
         stats["protocol"] = self.protocol
         if session_ids != "native":  # LoCoMo 的写入记录不变
             stats["session_ids"] = session_ids
-        record.write_text(json.dumps(stats, indent=2), "utf-8")
+        # 装着的包只记进文件，不进返回的统计（那份记进这道题的 details，即 results.jsonl）
+        record.write_text(
+            json.dumps({**stats, "environment": installed_environment()}, indent=2), "utf-8"
+        )
         with self._lock:
             self._build_spent += float(stats.get("spent", 0.0))
         return stats

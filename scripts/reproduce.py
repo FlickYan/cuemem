@@ -76,13 +76,14 @@ CACHE_ONLY = {"CUEMEM_LLM_CACHE_MODE": "read_only"}  # --cache-only
 # 文档里的数字都是修复会话 ID 泄漏之前的（见模块说明）：每一步都用原始会话 ID
 LEAK_ERA = {"CUEMEM_EVAL_RAW_SESSION_IDS": "1"}
 # 外部基线 Mem0（N11）：mem0ai 不是依赖，临时装上（N11、N12 用的都是 2.2.1，各版本的算法不同）；
-# spaCy 与 fastembed 让它的混合检索完整生效
+# spaCy 与 fastembed 让它的混合检索完整生效，固定在 N12 期间构建机 uv 缓存里 Mem0 环境的版本
+# （发表的 M0 写入用的是哪个版本没有记录，见 docs/results/n12-baselines/environments/）
 SPACY_SM = (
     "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/"
     "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
 )
-MEM0 = ["uv", "run", "--with", "mem0ai==2.2.1", "--with", "spacy", "--with", "fastembed",
-        "--with", SPACY_SM]  # fmt: skip
+MEM0 = ["uv", "run", "--with", "mem0ai==2.2.1", "--with", "spacy==3.8.16",
+        "--with", "fastembed==0.9.0", "--with", SPACY_SM]  # fmt: skip
 # 评测运行有组合出错（退出码 3）或达到花费上限提前停止（4）时退出码非零：脚本停下，不复制
 # 不完整的报告（cuemem eval run --fail-on-error）
 FAIL_ON_ERROR = "--fail-on-error"

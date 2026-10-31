@@ -21,6 +21,10 @@
     记协议之前的 Graphiti、LangMem 写入记了 extractor 与 embedder，照样核对。
   - 写入标记（build_tag，子类设，如外部系统的版本与写入格式）：变了就清掉旧写入重建（同一协议，
     换的只是写法）。有这个字段之前，A-MEM 与 Cognee 把它接在 protocol 后面，照样认得出来。
+- **写入时的环境**：build.json 另记 environment（installed_environment：当时装着的全部包与版本）。
+  命令里只固定了外部系统本身与少数几个包，间接依赖每次重新解析，同一个版本的外部系统在几天里
+  就装出过不同的 langchain、neo4j、transformers；这份记录只在文件里，不进结果（results.jsonl）。
+  N11、N12 发表的写入早于这一项，没有记。
 - **检索**：子类返回一组证据（Hit），交给同一个回答模型、同一套提示
   （与 B2 朴素检索、M0 的格式相同）。检索时经网关的请求（`<系统>.search.<空间>` 桶，如 LangMem
   与 Cognee 向量化问题）在网关的服务线程里执行，不在这道题的 trace 里：网关把检索期间开始的
@@ -44,6 +48,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -218,9 +223,9 @@ class ExternalBaseline(ABC):
             stats["replaced"] = replaced
         if scheme != "native":  # LoCoMo 的写入记录不变
             stats["session_ids"] = scheme
-        (directory / "build.json").write_text(
-            json.dumps(stats, indent=2, ensure_ascii=False), "utf-8"
-        )
+        # 装着的包只记进文件，不进返回的统计（那份记进这道题的 details，即 results.jsonl）
+        written = {**stats, "environment": installed_environment()}
+        record.write_text(json.dumps(written, indent=2, ensure_ascii=False), "utf-8")
         with self._lock:
             self._build_spent += float(usage.get("spent", 0.0))
         return stats
@@ -233,6 +238,17 @@ class ExternalBaseline(ABC):
 def space_key(space_id: str) -> str:
     """评测空间 ID → 目录名（如 locomo:conv-42 → locomo_conv-42）。"""
     return re.sub(r"[^A-Za-z0-9_.-]", "_", space_id)
+
+
+def installed_environment() -> dict[str, str]:
+    """当前装着的全部包：{规范化的包名（PEP 503）: 版本}，按包名排序。同一个包装了几份时取
+    importlib.metadata.distributions() 里的第一份，即 sys.path 上靠前、导入得到的那份（uv run
+    --with 的叠加环境在项目环境之前）。外部基线与 M0 写进 build.json 的 environment。"""
+    found: dict[str, str] = {}
+    for dist in metadata.distributions():
+        if name := dist.name:
+            found.setdefault(re.sub(r"[-_.]+", "-", name).lower(), dist.version)
+    return dict(sorted(found.items()))
 
 
 # ---------- 写入的协议（外部基线与 M0 共用） ----------

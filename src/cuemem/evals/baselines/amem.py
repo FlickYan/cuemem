@@ -101,20 +101,23 @@ evals/external.py），只换"记忆从哪来"：
 
 A-MEM 不是 CueMem 的依赖，评测时用 uv 临时装上（--extra local 只在用本机向量时需要，如
 deepseek 预设）。它依赖 sentence-transformers，会顺带装上 torch（约 5 GB，这里用不到，但
-`uv run --with` 没法只跳过某个依赖）。N12 对比脚本按 `<协议>-<数据集>-<系统>` 归组：
+`uv run --with` 没法只跳过某个依赖）。A-MEM 只要求 chromadb>=0.4.22，这里固定在试过的 1.5.9
+（与测试、CI 相同）。N12 对比脚本按 `<协议>-<数据集>-<系统>` 归组：
 
     AMEM=git+https://github.com/agiresearch/A-mem@ceffb860f0712bbae97b184d440df62bc910ca8d
     # pds 协议（只用 DeepSeek）
     CUEMEM_PRESET=deepseek uv run --extra local --with "agentic-memory @ $AMEM" \\
+        --with chromadb==1.5.9 \\
         cuemem eval run --dataset locomo --split test200r --methods MA --name pds-locomo-amem
     # 作者给 GPT-4o 级模型的 k（敏感性运行，复用上面的写入）。运行名不能以 pds-locomo- 开头：
     # 对比脚本会把它归进来，按名字排在 pds-locomo-amem 之后，覆盖 k=10 的结果
     CUEMEM_PRESET=deepseek CUEMEM_AMEM_K=40 uv run --extra local --with "agentic-memory @ $AMEM" \\
+        --with chromadb==1.5.9 \\
         cuemem eval run --dataset locomo --split test200r --methods MA --name k40-pds-locomo-amem
     # pq 协议（只用通义，要 DASHSCOPE_API_KEY）：写入放在另一个目录，不碰 pds 的写入
     CUEMEM_PRESET=qwen CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen \\
-        uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \\
-        --split test200r --methods MA --peak warn --name pq-locomo-amem
+        uv run --with "agentic-memory @ $AMEM" --with chromadb==1.5.9 cuemem eval run \\
+        --dataset locomo --split test200r --methods MA --peak warn --name pq-locomo-amem
 
 试过的版本：agiresearch/A-mem@ceffb86、chromadb 1.5.9（Python 3.12）。conv-42（29 个会话、
 629 句）的写入：deepseek 预设、回复上限 2000（第一版）1257 次调用、77 分钟，名义 $1.44（错峰
@@ -747,8 +750,8 @@ class AMemBaseline(ExternalBaseline):
             import agentic_memory.memory_system as amem  # type: ignore[import-not-found, unused-ignore]
         except ImportError as exc:  # pragma: no cover - 取决于运行环境
             raise RuntimeError(
-                f'MA 需要 A-MEM：用 uv run --with "agentic-memory @ {REPO}@{COMMIT}" ... 运行'
-                "（见模块说明）"
+                f'MA 需要 A-MEM：用 uv run --with "agentic-memory @ {REPO}@{COMMIT}" '
+                "--with chromadb==1.5.9 ... 运行（见模块说明）"
             ) from exc
         amem.ChromaRetriever = _Detached
         self.amem = amem

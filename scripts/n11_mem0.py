@@ -4,7 +4,8 @@ Mem0 在 LoCoMo test200r 与 LongMemEval test100r 上各跑一次（方法 M0，
 CueMem 各方法取 N9 测试集运行里同一批题的结果（同一个回答模型、同一个判分模型、同一套提示）。
 每个运行里对 Mem0 的几个配对检验是一族，做 Holm 校正，写到 mem0-holm.json。
 
-    MEM0="--with mem0ai==2.2.1 --with spacy --with fastembed --with en_core_web_sm@$SPACY_SM"
+    MEM0="--with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
+        --with en_core_web_sm@$SPACY_SM"
     uv run $MEM0 cuemem eval run --dataset locomo --split test200r --methods M0 \\
         --name locomo-test200r-mem0
     uv run $MEM0 cuemem eval run --dataset longmemeval_s --split test100r --methods M0 \\

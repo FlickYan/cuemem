@@ -7,6 +7,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -485,6 +486,10 @@ def test_external_baseline_builds_once_and_records_usage(
         assert "toy_build" not in second.details and toy.builds == 1
         assert stored["protocol"] == f"qwen3.8-flash|{toy.embedder.name}:{toy.embedder.dim}"
         assert stored["build_tag"] == ""
+        # 写入时装着的全部包只记进 build.json，不进这道题的 details（results.jsonl 不变）
+        assert stored["environment"]["openai"] == metadata.version("openai")
+        assert stored["environment"]["pydantic-core"] == metadata.version("pydantic_core")
+        assert "environment" not in build
     finally:
         toy.gateway.stop()
     assert space_key("locomo:conv-42") == "locomo_conv-42"

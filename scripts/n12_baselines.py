@@ -2,9 +2,15 @@
 
 同一个协议下的运行按名字归到一起：`<协议>-<数据集>-<系统>`，例如 pds-locomo-cuemem、
 pds-locomo-mem0、pds-locomo-graphiti。脚本把这些运行里同一批题的结果放在一起：准确率与
-95% 置信区间、各题型、与 CueMem L1 / L2 的配对符号检验、回答成本，以及每个系统写入的成本、
-调用次数与耗时。配对检验另按族做 Holm 校正（"L1、L2 对外部系统"等，见 scripts/multiplicity.py），
-写到 <协议>-<数据集>-holm.json。
+95% 置信区间、各题型、检索的召回（retrieval）、与 CueMem L1 / L2 的配对符号检验、回答成本，
+以及每个系统写入的成本、调用次数与耗时，外部系统另有写入的规模与问题（build：图谱的实体与事实、
+丢掉的会话等，见 build_stats）。配对检验另按族做 Holm 校正（"L1、L2 对外部系统"等，见
+scripts/multiplicity.py），写到 <协议>-<数据集>-holm.json。
+
+外部系统按命令里固定的版本装（mem0ai 另固定 spaCy 3.8.16 与 fastembed 0.9.0，A-MEM 另固定
+chromadb 1.5.9：N12 期间构建机 uv 缓存里的环境就是这几个版本）。发表的写入没有记下间接依赖的
+版本，构建机缓存里当时的环境列在 docs/results/n12-baselines/environments/；之后的写入在
+build.json 里记下当时装着的全部包（environment，见 evals/external.py）。
 
 协议（D-065）：
 - pds：只用 DeepSeek。抽取、规划、回答、判分与外部系统内部的调用都是 deepseek-flash；
@@ -29,7 +35,7 @@ evals/mem0_baseline.py，--methods M0 / MG / ML / MC / MA，运行名 `<协议>-
     export CUEMEM_PRESET=deepseek
     uv run --extra local cuemem eval run --dataset locomo --split test200r \\
         --methods B1,B2,B4-nobm25,B5,B6 --name pds-locomo-cuemem
-    uv run --extra local --with mem0ai==2.2.1 --with spacy --with fastembed \\
+    uv run --extra local --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
         --with "en_core_web_sm @ $SPACY_SM" cuemem eval run --dataset locomo --split test200r \\
         --methods M0 --name pds-locomo-mem0
     uv run python scripts/n12_baselines.py --protocol pds --dataset locomo
@@ -38,7 +44,7 @@ evals/mem0_baseline.py，--methods M0 / MG / ML / MC / MA，运行名 `<协议>-
     export CUEMEM_PRESET=qwen CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen
     uv run cuemem eval run --dataset locomo --split test200r --peak warn \\
         --methods B1,B2,B4-nobm25,B5,B6 --name pq-locomo-cuemem
-    uv run --with mem0ai==2.2.1 --with spacy --with fastembed \\
+    uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
         --with "en_core_web_sm @ $SPACY_SM" cuemem eval run --dataset locomo --split test200r \\
         --peak warn --methods M0 --name pq-locomo-mem0
     uv run python scripts/n12_baselines.py --protocol pq --dataset locomo
@@ -101,6 +107,9 @@ SENSITIVITY = {"MA-k40": ("k40", "MA", "MA")}  # A-MEM 作者给 GPT-4o 级模�
 # 各协议的写入目录（相对数据目录）：PROTOCOL_SPACES，与报告共用（报告给没记写入目录的旧运行
 # 按运行名推断）；pq 与 qwen 的抽取模型、向量模型相同，共用一份写入
 REFERENCES = ("B4-nobm25", "B5")
+# 检索召回（retrieval_stats）取哪几项；Graphiti 的写入警告里数哪一条（build_stats）
+RETRIEVAL_KEYS = ("session_recall_any", "session_recall_all", "turn_recall_any", "turn_recall_all")
+TARGET_NOT_FOUND = "WARNING: Target entity not found in nodes for edge relation: %s"
 
 
 def paired(
@@ -134,6 +143,68 @@ def accuracy_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for t, v in sorted(by_type.items())
         },
     }
+
+
+def retrieval_stats(rows: list[dict[str, Any]]) -> dict[str, float | None] | None:
+    """检索的召回：会话召回与发言召回（任一、全部）的均值，与 report.md 同一口径（只算记了
+    retrieval 的题）。检索结果不指向原文发言的方法（M0、ML：记忆不带发言 ID，召回按构造是 0）
+    发言召回记 null，不写误导人的 0；没有检索的方法（B1 全上下文）返回 None，不写这个键。"""
+    scored = [row["retrieval"] for row in rows if row.get("retrieval")]
+    if not scored:
+        return None
+    # retrieved 的每一项是（会话 ID，发言 ID 列表，分数）
+    has_turns = any(len(hit) > 1 and hit[1] for row in rows for hit in row.get("retrieved") or [])
+    out: dict[str, float | None] = {}
+    for key in RETRIEVAL_KEYS:
+        values = [s[key] for s in scored if s.get(key) is not None]
+        usable = bool(values) and (has_turns or not key.startswith("turn_"))
+        out[key] = round(sum(values) / len(values), 4) if usable else None
+    return out
+
+
+def build_stats(method: str, builds: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """外部系统写入的规模与问题，固定的几项，从写入成本算进去的同一批写入记录里汇总（write_cost
+    的 picked，空间 → 记录）：
+
+    - MG：实体、事实、失败的片段，以及每个空间 "Target entity not found" 警告的条数（最少、最多）；
+    - ML：会话、空会话（一条记忆也没写出）、超过向量模型长度上限的记忆、最长的一条（字符）；
+    - MC：节点、边；MA：链接、演化过的记忆；M0：失败的会话。
+
+    没有写入记录时返回 None，不写这个键。"""
+    records = [builds[key] for key in sorted(builds)]
+    if not records or method not in SYSTEMS:
+        return None
+
+    def total(field: str) -> int:
+        return sum(_count(record.get(field)) for record in records)
+
+    if method == "MG":
+        warned = [
+            _count(w.get(TARGET_NOT_FOUND)) if isinstance(w := r.get("warnings"), dict) else 0
+            for r in records
+        ]
+        return {
+            "entities": total("entities"),
+            "facts": total("facts"),
+            "failed_episodes": total("failed_episodes"),
+            "target_entity_not_found_per_space": [min(warned), max(warned)],
+        }
+    if method == "ML":
+        return {
+            "sessions": total("sessions"),
+            "empty_sessions": total("empty_sessions"),
+            "memories_over_embed_limit": total("memories_over_embed_limit"),
+            "longest_memory_chars": max(_count(r.get("longest_memory_chars")) for r in records),
+        }
+    fields = {"MC": ("nodes", "edges"), "MA": ("links", "evolved"), "M0": ("failed_sessions",)}
+    return {field: total(field) for field in fields[method]}
+
+
+def _count(value: Any) -> int:
+    """写入记录里的条目（列表，如失败的会话）或条数（整数）→ 条数。"""
+    if isinstance(value, list | dict):
+        return len(value)
+    return int(value or 0)
 
 
 def wilson(correct: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -205,10 +276,12 @@ def write_stats(
     eval_spaces: Path | None = None,
     protocol: str | None = None,
     rows: list[dict[str, Any]] | None = None,
+    picked: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """写入的成本，与 report.md 同一口径（cuemem.evals.report.write_cost）：外部系统取 rows 里
     触发写入的那道题记下的统计或各空间的 build.json（eval_spaces 下，默认是当前配置的
     paths.eval_spaces；协议对得上的优先，对不上的不算）；CueMem 取这些运行里的写入与巩固统计。
+    给了 picked 时，算进成本的写入记录按空间填进去（build_stats 从同一批记录汇总）。
 
     全上下文（B1）不写入；朴素检索（B2）只建索引（向量化，不调用 LLM）；L1 / L2 / 控制器用同一份
     巩固后的记忆，写入成本相同。scheme 是这些运行的会话 ID 写法（runs_session_ids；None 时按
@@ -225,6 +298,7 @@ def write_stats(
         protocol=protocol,
         rows=rows or [],
         session_ids=scheme,
+        picked=picked,
     )
     if method in SYSTEMS:
         missing = len(keys) - stats.get("spaces", 0) - stats.get("mismatched", 0)
@@ -285,21 +359,26 @@ def main() -> None:
     for method in methods_present:
         rows = [cells[(sid, method)] for sid in common]
         keys = {r["space_key"] for r in rows}
-        out["methods"][method] = {
-            **accuracy_stats(rows),
-            "write": write_stats(
-                settings,
-                datasets.get(sources[method], args.dataset),
-                method,
-                keys,
-                runs_dir,
-                runs,
-                scheme,
-                eval_spaces=eval_spaces,
-                protocol=protocols.get(sources[method]),
-                rows=[r for (_, m), r in cells.items() if m == method],
-            ),
-        }
+        entry = accuracy_stats(rows)
+        if (retrieval := retrieval_stats(rows)) is not None:
+            entry["retrieval"] = retrieval
+        picked: dict[str, dict[str, Any]] = {}
+        entry["write"] = write_stats(
+            settings,
+            datasets.get(sources[method], args.dataset),
+            method,
+            keys,
+            runs_dir,
+            runs,
+            scheme,
+            eval_spaces=eval_spaces,
+            protocol=protocols.get(sources[method]),
+            rows=[r for (_, m), r in cells.items() if m == method],
+            picked=picked,
+        )
+        if (build := build_stats(method, picked)) is not None:
+            entry["build"] = build
+        out["methods"][method] = entry
     for ref in REFERENCES:
         if ref not in methods_present:
             continue

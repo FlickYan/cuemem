@@ -40,9 +40,11 @@ jobs:
         include:
           - name: Mem0
             test: tests/test_mem0_baseline.py
-            # 带上 spaCy 的模型：没有它时 Mem0 在测试里去 GitHub 下载（网络守卫让测试失败）
+            # 带上 spaCy 的模型：没有它时 Mem0 在测试里去 GitHub 下载（网络守卫让测试失败）。
+            # spaCy 与 fastembed 固定在 N12 期间构建机 uv 缓存里 Mem0 环境的版本（不固定时每周
+            # 重新解析，已经解析到 fastembed 0.9.1）
             packages: >-
-              --with mem0ai==2.2.1 --with spacy --with fastembed
+              --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0
               --with "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
             # Mem0 的混合检索在测试里加载 fastembed 的 Qdrant/bm25，从 huggingface.co 下载进 fastembed
             # 的缓存（默认在临时目录）：新的机器上没有，网络守卫让 4 个测试失败。先在守卫之外下载好

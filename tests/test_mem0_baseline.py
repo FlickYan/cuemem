@@ -4,7 +4,7 @@ mem0ai 不是 CueMem 的依赖，平时只跑写入记录（协议、会话 ID �
 时临时装上（与 scripts/reproduce.py 相同，带上 spaCy 的模型：没有它时 Mem0 在测试里去 GitHub
 下载，网络守卫让测试失败）：
     SM=https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0
-    uv run --with mem0ai==2.2.1 --with spacy --with fastembed \\
+    uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
         --with "en_core_web_sm @ $SM/en_core_web_sm-3.8.0-py3-none-any.whl" \\
         pytest tests/test_mem0_baseline.py
 Mem0 的混合检索还要 fastembed 的 Qdrant/bm25 模型，第一次用时从 huggingface.co 下载进 fastembed 的
@@ -21,6 +21,7 @@ import json
 import re
 from collections.abc import Sequence
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -297,7 +298,11 @@ def test_mem0_records_and_checks_the_protocol(
     record = tmp_path / key / "build.json"
     stats = method._ensure_built(key, _sessions())
     assert stats is not None and stats["protocol"] == PQ and built == [key]
-    assert json.loads(record.read_text("utf-8"))["protocol"] == PQ
+    stored = json.loads(record.read_text("utf-8"))
+    assert stored["protocol"] == PQ
+    # 写入时装着的全部包只记进 build.json，不进触发写入那道题的 details（results.jsonl）
+    assert stored["environment"]["openai"] == metadata.version("openai")
+    assert "environment" not in stats
     assert method._ensure_built(key, _sessions()) is None and built == [key]
 
     method.protocol = PDS  # 忘了设 CUEMEM_PATHS__EVAL_SPACES

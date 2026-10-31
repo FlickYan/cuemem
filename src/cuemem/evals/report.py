@@ -297,9 +297,12 @@ def write_cost(
     protocol: str | None = None,
     rows: Sequence[dict[str, Any]] = (),
     session_ids: SessionIds | None = None,
+    picked: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, float]:
     """一个方法写入这些对话历史（结果里的 space_key）的一次性成本：名义成本 cost、实际花费 spent、
     LLM 调用、耗时（秒）等。report.md 与 scripts/n12_baselines.py 用的都是它。
+    给了 picked（空字典）时，外部基线算进成本的每条写入记录按 space_key 填进去（N12 对比脚本从
+    同一批记录里汇总图谱规模等统计）。
 
     - CueMem：运行里的写入与巩固记录（ingests，即 ingest.jsonl；同一份历史的同一阶段只取最后
       一次），用到哪些阶段见 write_stages。L1 / L2 / 控制器共用一份巩固后的记忆，写入成本相同；
@@ -324,6 +327,7 @@ def write_cost(
         protocol=protocol,
         rows=rows,
         session_ids=session_ids,
+        picked=picked,
     )[0]
 
 
@@ -337,8 +341,10 @@ def _write_cost(
     protocol: str | None,
     rows: Sequence[dict[str, Any]],
     session_ids: SessionIds | None = None,
+    picked: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, float], int]:
-    """write_cost 的实现，另外返回找到了写入记录的对话历史数（报告里显示"几份里有几份"）。"""
+    """write_cost 的实现，另外返回找到了写入记录的对话历史数（报告里显示"几份里有几份"）。
+    picked 见 write_cost。"""
     total: dict[str, float] = defaultdict(float)
     system = EXTERNAL_SYSTEMS.get(method)
     if system is not None:
@@ -359,6 +365,8 @@ def _write_cost(
                 if found:
                     total["mismatched"] += 1
                 continue
+            if picked is not None:
+                picked[key] = build
             total["spaces"] += 1
             total["cost"] += float(build.get("cost", 0) or 0)
             total["spent"] += float(build.get("spent", 0) or 0)
