@@ -233,6 +233,11 @@ def _without_images(text: str) -> str:
     return " ".join(text.replace("<image>", " ").split())
 
 
+def _text_only(questions: Sequence[str]) -> list[str]:
+    """要删查询向量的提问，带图的另外加上去掉图片标记的文字（见 _without_images）。"""
+    return [*questions, *(_without_images(q) for q in questions if "<image>" in q)]
+
+
 def _space_needle(space_id: str) -> str:
     """trace 的一行属于这个空间时必定含有的文字（TraceSink.remove 的 contains）：属性里的
     "space": "<空间 ID>"。要与 TraceSink.write 的 json.dumps(…, ensure_ascii=False) 写法
@@ -871,10 +876,22 @@ class MemorySystem:
                 finally:
                     # 5. trace：属性里有被删原话的条目（提问、回答原文），以及检索时给回答模型
                     #    看过被删记忆的条目（回答可能复述了它，trace 里却没有原话）。带图的发言
-                    #    另外按去掉图片标记的文字找：记忆代理拿消息里的文字部分做检索查询
+                    #    另外按去掉图片标记的文字找：记忆代理拿消息里的文字部分做检索查询。
+                    #    出错时记警告、不抛出（D-070 T5）：以前这里的 OSError 跳过了下面清理向量
+                    #    缓存的一步，调用方以为没删，重试又找不到要删的发言，再也清不掉
                     texts = [t.text for t in targets]
                     texts += [_without_images(t) for t in texts if "<image>" in t]
-                    traces_removed, questions = self._remove_traces(space_id, texts, refs)
+                    try:
+                        traces_removed, questions, traces_left = self._remove_traces(
+                            space_id, texts, refs
+                        )
+                    except Exception:
+                        logger.warning(
+                            "遗忘 %s：trace 没能清理，里面可能还有被删的内容",
+                            space_id,
+                            exc_info=True,
+                        )
+                        traces_removed, questions, traces_left = 0, [], ["*"]
 
                     # 6. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面
                     #    那些提问的查询向量（代理与 Agent 拿用户的原话做检索查询）。重放失败时派生
@@ -894,6 +911,8 @@ class MemorySystem:
                     self._hand_over(space_id)
             if images_left:
                 trace.attrs.update(images_left=images_left)
+            if traces_left:  # 还有该删的 trace 的文件（"*"：没清理完、不知道是哪些）
+                trace.attrs.update(traces_left=traces_left)
             if failed is not None and not report_rebuild_errors:
                 raise failed
             report = ForgetReport(
@@ -968,17 +987,18 @@ class MemorySystem:
 
     def _remove_traces(
         self, space_id: str, texts: Sequence[str], refs: Collection[str] = ()
-    ) -> tuple[int, list[str]]:
+    ) -> tuple[int, list[str], list[str]]:
         """删除这个空间里的 trace：属性中含有被删原话的（太短的话不作依据，免得误删），以及
         检索记录（spans、events）里有被删记忆 ID 的——回答模型看过它，回答可能复述了它。
-        返回删除的条数与这些 trace 的提问（提问的查询向量也要清掉）。
+        返回删除的条数、这些 trace 的提问（提问的查询向量也要清掉；重写不了、整个删掉的 trace
+        文件里别的 trace 的提问也在内，见 TraceSink.remove）与没能清理的 trace 文件名。
 
         按 ID 宁多勿漏（D-046、D-051）：检索总会带上前几名候选，空间小的时候，遗忘一段会话
         可能删掉大部分回答的 trace。trace 只是排查用的 JSONL，产品里没有地方读它。"""
         wanted = [t for t in texts if len(t.strip()) >= 12]
         ids = set(refs)
         if self.tracer is None or not (wanted or ids):
-            return 0, []
+            return 0, [], []
         questions: list[str] = []
 
         def doomed(record: dict[str, Any]) -> bool:
@@ -993,7 +1013,11 @@ class MemorySystem:
                 questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
             return hit
 
-        return self.tracer.remove(doomed, contains=_space_needle(space_id)), questions
+        dropped: list[str] = []
+        left: list[str] = []
+        needle = _space_needle(space_id)
+        removed = self.tracer.remove(doomed, contains=needle, dropped=dropped, left=left)
+        return removed, [*questions, *_text_only(dropped)], left
 
     def _follow_citations(self, space_id: str, turns: set[str]) -> set[str]:
         """沿引用扩散：要删的发言所在的轮、由它们抽取的事实、其中的图片，凡是被后来的回复
@@ -1294,7 +1318,10 @@ class MemorySystem:
 
         # 一个空间（delete_all）时先按空间 ID 筛；reset 删的是全部空间，筛不掉几行
         only = next(iter(wanted)) if len(wanted) == 1 else None
-        removed = self.tracer.remove(gone, contains=None if only is None else _space_needle(only))
+        needle = None if only is None else _space_needle(only)
+        dropped: list[str] = []  # 重写不了、整个删掉的文件里别的 trace 的提问（TraceSink.remove）
+        removed = self.tracer.remove(gone, contains=needle, dropped=dropped)
+        questions += _text_only(dropped)
         if questions and isinstance(self.embedder, CachedEmbedder):
             self.embedder.purge(questions, "query")
         return removed
@@ -1314,8 +1341,7 @@ class MemorySystem:
         files, questions = self.tracer.prune((today or date.today()) - timedelta(days=days))
         purged = 0
         if questions and isinstance(self.embedder, CachedEmbedder):
-            texts = [*questions, *(_without_images(q) for q in questions if "<image>" in q)]
-            purged = self.embedder.purge(texts, "query")
+            purged = self.embedder.purge(_text_only(questions), "query")
         return files, purged
 
     def expire_traces(self, *, today: date | None = None) -> tuple[int, int]:

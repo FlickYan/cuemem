@@ -11,8 +11,10 @@ LLM 客户端与向量化模块会自动往当前 trace 里记事件；不在 tr
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -80,7 +82,12 @@ class TraceSink:
         self._lock = threading.Lock()
 
     def remove(
-        self, predicate: Callable[[dict[str, Any]], bool], *, contains: str | None = None
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        contains: str | None = None,
+        dropped: list[str] | None = None,
+        left: list[str] | None = None,
     ) -> int:
         """删除满足条件的 trace（遗忘时用：trace 的属性里有提问与回答的原文）。返回删除的条数。
 
@@ -98,7 +105,14 @@ class TraceSink:
         只重写有删除的文件（以前第一处删除之后的文件都重写一遍）。按 "\\n" 分行（逐行读文件）：
         splitlines 还在 U+2028、U+2029、U+0085 处断开，ensure_ascii=False 写出的 JSON 里这几个
         字符不转义，含有它们的 trace 断成几段解析不了的行、原样留下（遗忘删不掉提问里有它们的
-        trace），重写时还把别的空间的这种行写成了几行。"""
+        trace），重写时还把别的空间的这种行写成了几行。
+
+        不抛出 OSError（遗忘已经提交了，以前这里的 OSError 跳过了之后清理向量缓存的一步，重试又
+        找不到要删的发言）：重写不了的文件（磁盘满：重写要先有这个文件那么大的空间，提交遗忘只要
+        几 KB）整个删掉，删除不要空间。同一天别的空间的 trace 也一起没了（trace 只是排查用的，
+        D-046），记一条警告；这个文件里每条 trace 拿去检索过的文字（trace_queries）放进 dropped：
+        调用方要删它们的查询向量，否则之后遗忘与过期都再也找不到它们（与 prune 相同）。删也删不掉
+        的、读不了的文件记一条警告，名字放进 left，接着处理别的文件。"""
         removed = 0
         for path in sorted(self.directory.glob("*.jsonl")):
             try:
@@ -107,27 +121,77 @@ class TraceSink:
                         continue
                 with self._lock:
                     kept: list[str] = []
-                    here = 0
+                    gone: list[str] = []
                     for line, doomed in _judged(path, predicate, contains):
-                        if doomed:
-                            here += 1
-                        else:
-                            kept.append(line)
-                    if here:
-                        partial = path.with_suffix(".jsonl.part")
-                        partial.write_text("".join(f"{k}\n" for k in kept), encoding="utf-8")
-                        partial.replace(path)
-                        removed += here
+                        (gone if doomed else kept).append(line)
+                    if gone:
+                        removed += self._rewrite(path, kept, gone, dropped, left)
             except FileNotFoundError:  # 刚过期删掉了（见 prune）
                 continue
+            except OSError as exc:
+                logger.warning("trace 文件 %s 读不了，其中要删的 trace 没删：%s", path, exc)
+                if left is not None:
+                    left.append(path.name)
         return removed
 
+    def _rewrite(
+        self,
+        path: Path,
+        kept: list[str],
+        gone: list[str],
+        dropped: list[str] | None,
+        left: list[str] | None,
+    ) -> int:
+        """把 path 换成只有 kept 这些行的文件，返回删掉的条数（调用方持有锁）。写不了时整个删掉
+        path（见 remove）。不是 UTF-8 的行按 surrogateescape 原样写回（见 _judged）。"""
+        partial = path.with_suffix(".jsonl.part")
+        try:
+            text = "".join(f"{k}\n" for k in kept)
+            partial.write_text(text, encoding="utf-8", errors="surrogateescape", newline="")
+            partial.replace(path)
+            return len(gone)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                partial.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "trace 文件 %s 重写不了（%s）也删不掉：其中 %d 条该删的 trace 还在，请手动删",
+                    path,
+                    exc,
+                    len(gone),
+                )
+                if left is not None:
+                    left.append(path.name)
+                return 0
+            logger.warning(
+                "trace 文件 %s 重写不了（%s），整个删掉了：这一天别的空间的 trace 也一起删了",
+                path,
+                exc,
+            )
+        if dropped is not None:
+            dropped.extend(q for line in [*kept, *gone] for q in _line_queries(line))
+        return len(gone)
+
     def write(self, trace: Trace) -> Path:
+        """追加一行。写到一半失败（磁盘满）时把文件截回追加之前的长度再抛出：以前半行留在文件
+        里，下一次追加接在它后面，两条都解析不了；断在一个汉字中间时这一行还不是 UTF-8。"""
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / f"{trace.started_at:%Y%m%d}.jsonl"
         line = json.dumps(trace.to_dict(), ensure_ascii=False, default=str)
-        with self._lock, path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        with self._lock:
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                size = 0
+            try:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.truncate(path, size)
+                raise
         return path
 
     def prune(self, before: date) -> tuple[int, list[str]]:
@@ -141,9 +205,7 @@ class TraceSink:
         questions: list[str] = []
 
         def collect(record: dict[str, Any]) -> bool:
-            attrs = record.get("attrs")
-            if isinstance(attrs, dict):
-                questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
+            questions.extend(trace_queries(record))
             return False
 
         files = 0
@@ -163,14 +225,43 @@ class TraceSink:
         return files, questions
 
 
+def trace_queries(record: dict[str, Any]) -> list[str]:
+    """一条 trace 里拿去检索过的文字：属性里的提问与消息（question、message）。trace 删掉时
+    它们的查询向量也要删（见 MemorySystem.prune_traces 与 TraceSink.remove 的 dropped）。"""
+    attrs = record.get("attrs")
+    if not isinstance(attrs, dict):
+        return []
+    return [str(attrs[k]) for k in ("question", "message") if attrs.get(k)]
+
+
+def _line_queries(line: str) -> list[str]:
+    """一行 trace 的 trace_queries；解析不了的行没有。"""
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return []
+    return trace_queries(record) if isinstance(record, dict) else []
+
+
 def _judged(
     path: Path, predicate: Callable[[dict[str, Any]], bool], contains: str | None
 ) -> Generator[tuple[str, bool], None, None]:
     """逐行读一个 trace 文件，给出（行，要不要删）。只按 "\\n" 分行（见 TraceSink.remove）；
-    不含 contains 的行与解析不了的行都不删，也不交给 predicate。"""
-    with path.open(encoding="utf-8") as f:
+    不含 contains 的行、解析不了的行与不是 UTF-8 的行都不删，也不交给 predicate。
+
+    按字节读、逐行解码：写到一半失败的追加（这一版之前的 write，或者别的程序）可能断在一个
+    汉字中间，下一次追加接在它后面，这一行就不是 UTF-8 了。以前整个文件按 UTF-8 读，读到它就
+    抛 UnicodeDecodeError：之后每次遗忘都在提交之后报错，过期的 trace 也删不掉。这样的行按
+    surrogateescape 解出来，重写时原样写回（见 TraceSink._rewrite）；合法的文件读出来再写回去
+    逐字节相同。"""
+    with path.open("rb") as f:
         for raw in f:
-            line = raw.rstrip("\n")
+            data = raw.removesuffix(b"\n")
+            try:
+                line = data.decode("utf-8")
+            except UnicodeDecodeError:
+                yield data.decode("utf-8", "surrogateescape"), False
+                continue
             if contains is not None and contains not in line:
                 yield line, False
                 continue

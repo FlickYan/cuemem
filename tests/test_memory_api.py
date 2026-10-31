@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import BaseModel, TypeAdapter
 from scripted import ScriptedModel
+from test_forget import no_space_for_trace_rewrites
 from test_sdk import (
     AUG,
     SEP,
@@ -639,6 +640,35 @@ def test_concurrent_write_conflicts_are_409(
         with pytest.raises(ConcurrentWriteError, match="chat"):
             client.add("I like jazz", user_id="alice", run_id="chat", infer=False)
     assert [t.text for t in system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
+
+
+@pytest.mark.parametrize("broken", ["disk full", "cut line"])
+def test_a_delete_succeeds_when_the_traces_are_broken(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch, broken: str
+) -> None:
+    """遗忘提交之后 trace 出问题，/api/v1 的删除照常回 200：重写 trace 文件时磁盘满（以前 500，
+    调用方重试得到 404，被删的内容留在 trace 与向量缓存里），trace 文件里一行不是 UTF-8（以前
+    400 invalid_request，从此每次删除都这样）。两种情况下删除都已经做了。"""
+    memory = Memory.from_system(system)
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    memory.search("Do I live in Berlin?", user_id="alice")
+    [fact] = memory.get_all(user_id="alice")["results"]
+    traces = system.settings.paths.traces
+    [day] = traces.glob("*.jsonl")
+    assert b"I live in Berlin" in day.read_bytes()
+    if broken == "disk full":
+        no_space_for_trace_rewrites(monkeypatch)
+    else:
+        with day.open("ab") as f:
+            f.write(b'{"attrs": {"space": "bob", "question": "\xe6\x88{"attrs": {}}\n')
+    with TestClient(v1_app(system), raise_server_exceptions=False) as http:
+        response = http.delete(f"/api/v1/memories/{fact['id']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["turns_deleted"] == 1
+    assert system.db.get_turns("alice") == []
+    raw = b"".join(p.read_bytes() for p in traces.glob("*.jsonl"))
+    assert b"I live in Berlin" not in raw and list(traces.glob("*.part")) == []
+    assert (b"\xe6\x88{" in raw) == (broken == "cut line")  # 这一行原样留着
 
 
 def test_the_client_explains_a_wrong_base_url(system: MemorySystem) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
@@ -146,3 +147,114 @@ def test_prune_deletes_only_days_before_the_cutoff(tmp_path: Path) -> None:
     left = sorted(p.name for p in directory.iterdir())
     assert left == ["20251230.txt", "20260102.jsonl", "20260103.jsonl", "notes.jsonl"]
     assert sink.prune(date(2026, 1, 2)) == (0, [])
+
+
+class _ShortWrite:
+    """追加时只写进去一半（断在 "我" 这个字中间）就抛 ENOSPC 的文件，与磁盘满时的短写相同。"""
+
+    def __init__(self, f: Any) -> None:
+        self.f = f
+
+    def __enter__(self) -> _ShortWrite:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.f.close()
+
+    def write(self, text: str) -> int:
+        data = text.encode("utf-8")
+        self.f.buffer.write(data[: data.index("我".encode()) + 1])
+        self.f.flush()
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_a_failed_append_leaves_the_file_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """追加一行写到一半失败（磁盘满）：文件截回追加之前的样子，再把错误抛给 start_trace（它记一条
+    警告）。以前半行留在文件里，下一次追加接在它后面：两条都解析不了，断在一个汉字中间时这一行
+    还不是 UTF-8，之后遗忘与过期读到它就抛 UnicodeDecodeError。"""
+    sink = TraceSink(tmp_path / "traces")
+    path = sink.write(Trace("retrieve", space="alice", question="hello"))
+    before = path.read_bytes()
+    real_open = Path.open
+
+    def short(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        f = real_open(self, mode, *args, **kwargs)
+        return _ShortWrite(f) if "a" in mode else f
+
+    monkeypatch.setattr(Path, "open", short)
+    with pytest.raises(OSError, match="No space"):
+        sink.write(Trace("retrieve", space="bob", question="我住在哪里"))
+    monkeypatch.undo()
+    assert path.read_bytes() == before
+
+    sink.write(Trace("retrieve", space="carol", question="你好"))
+    lines = path.read_bytes().decode("utf-8").splitlines()
+    assert [json.loads(x)["attrs"]["space"] for x in lines] == ["alice", "carol"]
+
+
+def test_lines_that_are_not_utf8_are_kept_byte_for_byte(tmp_path: Path) -> None:
+    """不是 UTF-8 的行（这一版之前的写入断在一个汉字中间，下一次追加接在它后面）不解析、原样
+    留着；以前整个文件按 UTF-8 读，remove 与 prune 都抛 UnicodeDecodeError（遗忘在提交之后
+    报错，过期的 trace 删不掉）。合法的行写回去逐字节相同。"""
+    directory = tmp_path / "traces"
+    _write_days(directory, {"20260101": [_line("victim", "秘密"), _line("other", "留着")]})
+    path = directory / "20260101.jsonl"
+    glued = b'{"attrs": {"space": "victim", "question": "\xe6\x88' + _line("other", "x").encode()
+    with path.open("ab") as f:
+        f.write(glued + b"\n")
+    sink = TraceSink(directory)
+
+    assert sink.remove(_victim) == 1
+    assert path.read_bytes() == (_line("other", "留着") + "\n").encode() + glued + b"\n"
+    files, questions = sink.prune(date(2026, 1, 2))
+    assert files == 1 and questions == ["留着"]
+    assert not path.exists()
+
+
+def test_remove_deletes_a_file_it_cannot_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """重写不了的文件（磁盘满：重写要先有这个文件那么大的空间）整个删掉，删除不要空间：同一天
+    别的 trace 也没了，记一条警告，其中每条 trace 的提问放进 dropped（它们的查询向量要一起删）。
+    以前 OSError 从这里抛出，遗忘已经提交了却跳过了清理向量缓存，还留下一个 .part。删也删不掉、
+    读不了的文件记警告、名字放进 left，接着处理别的文件，不抛出。"""
+    directory = tmp_path / "traces"
+    _write_days(
+        directory,
+        {
+            "20260101": [_line("victim", "secret"), _line("other", "a"), "not json"],
+            "20260102": [_line("victim", "stuck"), _line("other", "b")],
+            "20260103": [_line("other", "c")],
+        },
+    )
+    (directory / "20260104.jsonl").mkdir()  # 读不了
+    real_write, real_unlink = Path.write_text, Path.unlink
+
+    def full(self: Path, *args: Any, **kwargs: Any) -> int:
+        if self.name.endswith(".jsonl.part"):
+            real_write(self, "partial", encoding="utf-8")
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(self, *args, **kwargs)
+
+    def stuck(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self.name == "20260102.jsonl":
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", full)
+    monkeypatch.setattr(Path, "unlink", stuck)
+    dropped: list[str] = []
+    left: list[str] = []
+    with caplog.at_level("WARNING", "cuemem.core.trace"):
+        assert TraceSink(directory).remove(_victim, dropped=dropped, left=left) == 1
+    assert sorted(dropped) == ["a", "secret"]
+    assert left == ["20260102.jsonl", "20260104.jsonl"]
+    assert len(caplog.records) == 3
+    assert sorted(p.name for p in directory.iterdir()) == [
+        "20260102.jsonl",
+        "20260103.jsonl",
+        "20260104.jsonl",
+    ]
+    assert "stuck" in (directory / "20260102.jsonl").read_text("utf-8")

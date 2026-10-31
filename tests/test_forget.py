@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 import sqlite3
 import threading
 import time
 from collections.abc import Iterator, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ import cuemem.llm.client as llm_client
 from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.models import Conversation, SessionIn, TurnIn
+from cuemem.core.trace import Trace
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
@@ -399,6 +401,77 @@ def test_forget_cleans_up_even_when_replay_fails(
         assert all(j["status"] == "done" for j in system.db.get_jobs("demo"))
         core = system.core_memory("demo")
         assert core is not None and "新加坡" in core.text
+
+
+SECRET_QUESTION = "我在新加坡哪家电商公司工作来着？"
+
+
+def no_space_for_trace_rewrites(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重写 trace 文件时磁盘满：.part 写了一点就抛 ENOSPC。重写要先有这个文件那么大的空间，
+    提交遗忘只要几 KB、追加一行 trace 只要一行，它们照常成功。"""
+    real = Path.write_text
+
+    def full(self: Path, *args: Any, **kwargs: Any) -> int:
+        if self.name.endswith(".jsonl.part"):
+            real(self, "partial", encoding="utf-8")
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", full)
+
+
+def test_a_trace_file_that_cannot_be_rewritten_does_not_stop_the_forget(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """遗忘提交之后重写 trace 文件失败（磁盘满）：以前 OSError 从提交之后抛出（HTTP 回 500），
+    跳过了清理向量缓存，还留下一个 .part；重试找不到要删的发言，提问的查询向量、被删文本的向量与
+    trace 里的原话都再也清不掉。现在整个文件删掉（删除不要空间），记一条警告，遗忘照常做完；同一
+    天别的空间的 trace 也没了，它们提问的查询向量一起删（否则之后它们的遗忘再也找不到）。"""
+    assert system.tracer is not None and isinstance(system.embedder, CachedEmbedder)
+    traces = system.settings.paths.traces
+    system.retrieve("demo", SECRET_QUESTION, mode="l1")
+    other = Trace("retrieve", space="bob", question="Where did I park the car?")
+    system.tracer.write(other)
+    system.embedder.embed(["Where did I park the car?"], "query")
+    s4_texts = [u.text for u in system.db.list_units("demo") if SECRET in u.text]
+    assert system.embedder.cached(s4_texts, "document") == set(s4_texts)
+    assert SECRET in _traces(system)
+
+    no_space_for_trace_rewrites(monkeypatch)
+    with caplog.at_level("WARNING", "cuemem.core.trace"):
+        report = system.forget_memories("demo", session_ids=["s4"], report_rebuild_errors=True)
+    monkeypatch.undo()
+
+    assert report.turns_deleted == 4 and report.traces_removed >= 1
+    assert [r.name for r in caplog.records] == ["cuemem.core.trace"]
+    assert list(traces.glob("*.part")) == []
+    assert SECRET not in _traces(system) and "park the car" not in _traces(system)
+    assert system.embedder.cached([SECRET_QUESTION, "Where did I park the car?"], "query") == set()
+    assert system.embedder.cached(s4_texts, "document") == set()
+
+
+def test_a_trace_line_that_is_not_utf8_does_not_stop_the_forget(system: MemorySystem) -> None:
+    """trace 文件里一行不是 UTF-8（这一版之前追加写到一半，断在一个汉字中间，下一次追加接在它
+    后面）：以前遗忘读到它就抛 UnicodeDecodeError，从此这个服务上每次遗忘都在提交之后报错
+    （HTTP 400），过期的 trace 也删不掉。现在这一行原样留着，遗忘照常删掉该删的，过期时整个文件
+    照常删掉。"""
+    assert system.tracer is not None and isinstance(system.embedder, CachedEmbedder)
+    traces = system.settings.paths.traces
+    system.retrieve("demo", SECRET_QUESTION, mode="l1")
+    [day] = traces.glob("*.jsonl")
+    with day.open("ab") as f:
+        f.write(b'{"attrs": {"space": "bob", "question": "\xe6\x88')
+        f.write(b'{"attrs": {"space": "carol", "question": "hi"}}\n')
+
+    report = system.forget_memories("demo", session_ids=["s4"], report_rebuild_errors=True)
+    assert report.turns_deleted == 4 and report.traces_removed >= 1
+    raw = day.read_bytes()
+    assert SECRET.encode() not in raw and b"\xe6\x88{" in raw
+    assert system.embedder.cached([SECRET_QUESTION], "query") == set()
+    report = system.forget_memories("demo", session_ids=["s1"], report_rebuild_errors=True)
+    assert report.turns_deleted > 0
+    files, _ = system.tracer.prune(date.today() + timedelta(days=2))
+    assert files >= 1 and list(traces.glob("*.jsonl")) == []
 
 
 def _sdk(settings: Settings, fake_api: FakeAPI, reply: Any = None, **kwargs: Any) -> Memory:
