@@ -973,6 +973,14 @@ def test_reproduce_analyses_require_the_runs_they_read() -> None:
         assert set(step.requires) == wanted, script
 
 
+def test_reproduce_n9_report_requires_the_test_runs() -> None:
+    """复现脚本里 N9 汇总这一步写明要四个测试集的运行（Step.requires），与脚本自己读的
+    TEST_RUNS 一致：以前没写，只拷了缓存、缺了运行的机器上照样执行，重写发表的结果。"""
+    module = _reproduce()
+    (step,) = [s for s in module.STEPS if "scripts/n9_report.py" in s.command]
+    assert set(step.requires) == set(_script_module("n9_report").TEST_RUNS.values())
+
+
 def test_n11_mem0_does_not_write_without_every_run(
     clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1033,6 +1041,41 @@ def test_n12_leak_does_not_write_without_every_run(
         module.main()
     assert out.read_text("utf-8") == "published\n"
     assert [p.name for p in out.parent.iterdir()] == ["summary.json"]
+
+
+def test_n9_report_does_not_write_without_every_test_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缺 N9 四个测试集的任何一个运行就退出码非零、什么都不写，也不建缓存目录：runs/ 不在仓库
+    里，以前在没有运行的克隆里照着结果页的命令运行，退出码 0，把发表的 results.json 从 12.7 万
+    字节写成 138 字节，results-holm.json 与 tables.md 也几乎清空。"""
+    import sys
+
+    module = _script_module("n9_report")
+    out = tmp_path / "results" / "n9-final"
+    out.mkdir(parents=True)
+    published = {name: f"published {name}\n" for name in ("results.json", "results-holm.json")}
+    published["tables.md"] = "published tables\n"
+    for name, text in published.items():
+        (out / name).write_text(text, "utf-8")
+    runs = tmp_path / "eval"
+    monkeypatch.setattr(module, "OUT", out)
+    monkeypatch.setattr(module, "RUNS_DIR", runs)
+    monkeypatch.setattr(module, "CACHE", runs / "n9-final")
+    monkeypatch.setattr(module.n9_tables, "OUT", out)
+    monkeypatch.setattr(sys, "argv", ["n9_report.py"])
+    test_runs = list(module.TEST_RUNS.values())
+    with pytest.raises(SystemExit, match="什么都没有写") as raised:
+        module.main()
+    assert all(run in str(raised.value) for run in test_runs)
+    assert not runs.exists()
+    for run in test_runs[:-1]:
+        _run_rows(runs, run, {"sample_id": "q1", "method": "B1", "correct": True})
+    with pytest.raises(SystemExit, match=test_runs[-1]) as raised:
+        module.main()
+    assert test_runs[0] not in str(raised.value)
+    assert {p.name: p.read_text("utf-8") for p in out.iterdir()} == published
+    assert sorted(p.name for p in runs.iterdir()) == sorted(test_runs[:-1])
 
 
 def test_n8_summary_does_not_publish_a_cached_replay(

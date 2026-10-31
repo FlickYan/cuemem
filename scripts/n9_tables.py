@@ -1,7 +1,8 @@
 """N9：把 docs/results/n9-final/results.json 与 errors.json（人工错误标注的汇总）渲染成表格。
 
-结果页与技术报告里的数字都从这里来，避免手抄出错。由 scripts/n9_report.py 在最后调用，
-也可以单独运行：
+结果页与技术报告里的数字都从这里来，避免手抄出错。配对比较旁边的"Holm 校正后"取自同目录的
+results-holm.json（scripts/multiplicity.py）。由 scripts/n9_report.py 在最后调用，也可以单独
+运行（只读这三个 JSON、只写 tables.md，不需要评测运行）：
     uv run python scripts/n9_tables.py
 """
 
@@ -98,6 +99,23 @@ def p_value(p: float) -> str:
     return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
 
 
+def holm_families() -> dict[str, Any]:
+    """results-holm.json 里的族；还没有这个文件时为空（表里的校正列都写"—"）。"""
+    path = OUT / "results-holm.json"
+    if not path.exists():
+        return {}
+    families: dict[str, Any] = json.loads(path.read_text("utf-8"))["families"]
+    return families
+
+
+def holm_cell(families: dict[str, Any], family: str, key: str, mirror: str | None = None) -> str:
+    """一个比较在族内 Holm 校正后的 p。族里同一对方法只留一个方向（Families 跳过镜像），所以
+    表里反过来写的那一行要用 mirror 查；+0 / −0 不算检验、不在族里，写"—"。"""
+    tests = families.get(family, {}).get("tests", {})
+    test = tests.get(key) or (tests.get(mirror) if mirror is not None else None)
+    return "—" if test is None else p_value(test["p_holm"])
+
+
 def main_tables(results: dict[str, Any]) -> list[str]:
     out = ["## 主表", ""]
     for dataset, label in DATASETS.items():
@@ -149,6 +167,7 @@ def main_tables(results: dict[str, Any]) -> list[str]:
 
 def controller_tables(results: dict[str, Any]) -> list[str]:
     out = ["## 冻结的控制器", ""]
+    holm = holm_families()
     for dataset, label in DATASETS.items():
         sec = results["controller"].get(dataset)
         if not sec:
@@ -182,8 +201,15 @@ def controller_tables(results: dict[str, Any]) -> list[str]:
         rows = []
         for a, tests in sec["tests"].items():
             for b, t in tests.items():
-                rows.append([f"{a} 对 {b}", f"+{t['wins']} / −{t['losses']}", p_value(t["p"])])
-        out += table(["配对比较", "胜 / 负", "符号检验"], rows)
+                rows.append(
+                    [
+                        f"{a} 对 {b}",
+                        f"+{t['wins']} / −{t['losses']}",
+                        p_value(t["p"]),
+                        holm_cell(holm, f"{dataset}：控制器", f"{a} vs {b}", f"{b} vs {a}"),
+                    ]
+                )
+        out += table(["配对比较", "胜 / 负", "符号检验", "Holm 校正后"], rows)
     return out
 
 
@@ -256,6 +282,7 @@ def mixed_tables(results: dict[str, Any]) -> list[str]:
 
 def comparison_tables(results: dict[str, Any]) -> list[str]:
     out = ["## 配对比较", ""]
+    holm = holm_families()
     for dataset, label in DATASETS.items():
         comps = results["comparisons"].get(dataset)
         if not comps:
@@ -276,9 +303,12 @@ def comparison_tables(results: dict[str, Any]) -> list[str]:
                         f"{g[a]:.1f}% / {g[b]:.1f}%",
                         f"+{g['wins']} / −{g['losses']}",
                         p_value(g["p"]),
+                        holm_cell(holm, f"{dataset}：方法对比（总体）", name)
+                        if group == "all"
+                        else holm_cell(holm, f"{dataset}：{name}（分题型）", group),
                     ]
                 )
-        out += table(["比较", "题型", "题数", "准确率", "胜 / 负", "符号检验"], rows)
+        out += table(["比较", "题型", "题数", "准确率", "胜 / 负", "符号检验", "Holm 校正后"], rows)
     return out
 
 
@@ -288,6 +318,7 @@ def reader_tables(results: dict[str, Any]) -> list[str]:
         return []
     out = ["## 换回答模型（H3）", ""]
     methods = ("L0", "B4-nobm25", "B5", "B6r", "B6", "B3", "B6a")
+    holm = holm_families()
     for dataset, sec in readers.items():
         out += [f"### {DATASETS[dataset]}（{sec['n']} 题）", ""]
         rows = []
@@ -306,8 +337,16 @@ def reader_tables(results: dict[str, Any]) -> list[str]:
         rows = []
         for reader in [r for r in READER_ORDER if r in sec["readers"]]:
             for name, t in sec["readers"][reader]["tests"].items():
-                rows.append([reader, name, f"+{t['wins']} / −{t['losses']}", p_value(t["p"])])
-        out += table(["回答模型", "配对比较", "胜 / 负", "符号检验"], rows)
+                rows.append(
+                    [
+                        reader,
+                        name,
+                        f"+{t['wins']} / −{t['losses']}",
+                        p_value(t["p"]),
+                        holm_cell(holm, f"{dataset}：换回答模型（{reader}）", name),
+                    ]
+                )
+        out += table(["回答模型", "配对比较", "胜 / 负", "符号检验", "Holm 校正后"], rows)
     return out
 
 
@@ -388,15 +427,25 @@ def error_tables(results: dict[str, Any]) -> list[str]:
     return out
 
 
-def write(results: dict[str, Any] | None = None) -> Path:
+def render(results: dict[str, Any] | None = None) -> str:
+    """tables.md 的全文；results 为 None 时读 OUT 里的 results.json。"""
     if results is None:
         results = json.loads((OUT / "results.json").read_text("utf-8"))
     lines = [
         "# N9 结果表（自动生成）",
         "",
         "由 `scripts/n9_report.py`（调用 `scripts/n9_tables.py`）"
-        "从 [results.json](results.json) 生成，"
-        "不要手改。成本是名义成本（高峰标价、未命中缓存，D-010）。",
+        "从 [results.json](results.json) 与 [results-holm.json](results-holm.json) 生成，"
+        "不要手改。",
+        "",
+        "- 成本是名义成本（高峰标价、未命中缓存，D-010），每题只算回答。一次性的写入（向量化与"
+        "巩固；每千份历史 LongMemEval 约 $43、LoCoMo 约 $35、MemLens 32K 约 $15、128K 约 $54）"
+        "不在内，写入的成本表与算上写入之后的对比见 [N9 结果](README.md) 主结果表后的说明"
+        "（D-070）。",
+        '- "符号检验"是单个比较的 p；"Holm 校正后"是按 [results-holm.json](results-holm.json) '
+        '的族（`scripts/multiplicity.py`）做 Holm 校正之后的 p。+0 / −0 不算检验，写"—"。',
+        "- LongMemEval 的各节里，B0、L0、B1 与 ORACLE 之外的方法都是在 N12 修好会话 ID 泄漏"
+        "（D-067）之前测的，见 [泄漏对照](../n12-leak/README.md)；数字照原样保留。",
         "",
     ]
     for part in (
@@ -409,8 +458,12 @@ def write(results: dict[str, Any] | None = None) -> Path:
         error_tables,
     ):
         lines += part(results)
+    return "\n".join(lines)
+
+
+def write(results: dict[str, Any] | None = None) -> Path:
     path = OUT / "tables.md"
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text(render(results), encoding="utf-8")
     return path
 
 
