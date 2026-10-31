@@ -1,7 +1,8 @@
 # CueMem + Qdrant 服务端（N12）。本地模式的向量库同一时间只能被一个进程打开、规模大了会变慢（D-005、
 # D-056）；这里改用 Qdrant 服务端。
-#   cp .env.example .env    # 填 Key（或者 CUEMEM_PRESET=ollama，不要 Key），并设置 CUEMEM_API_TOKEN
-#   docker compose up -d    # 没有 CUEMEM_API_TOKEN 时拒绝启动
+#   install -m 600 .env.example .env   # 只给本人读写；填 Key（或者 CUEMEM_PRESET=ollama，不要 Key），
+#                                      # 并设置 CUEMEM_API_TOKEN
+#   docker compose up -d               # 没有 CUEMEM_API_TOKEN 时拒绝启动
 #   界面 http://localhost:7860/ · 接口文档 /docs · OpenAI 兼容的记忆代理 http://localhost:7860/v1
 services:
   qdrant:

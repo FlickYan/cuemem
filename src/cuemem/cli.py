@@ -29,6 +29,9 @@ import importlib.util
 import ipaddress
 import json
 import os
+import shutil
+import stat
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -87,6 +90,7 @@ def main(
 ) -> None:
     """CueMem：线索驱动的多模态 Agent 长期记忆系统"""
     _raise_open_file_limit()
+    _private_umask()
     if preset:  # 各命令都通过 load_settings 读配置，它看这个环境变量（N12）
         os.environ["CUEMEM_PRESET"] = preset
 
@@ -119,6 +123,18 @@ def _raise_open_file_limit() -> tuple[int, int] | None:
             continue
         break
     return resource.getrlimit(resource.RLIMIT_NOFILE)
+
+
+def _private_umask() -> int:
+    """把这个进程的 umask 收紧到至少 077，返回收紧之后的值；从不放宽（已经更严的照旧）。
+
+    命令行写的文件里有对话原文、提问与图片：数据库、缓存、trace、export -o 的导出、评测结果、
+    上传的图片、下载的模型，以及经 .part 换名的重写。以前按常见的 umask 022 建成 0644，同一台
+    机器上别的账户都能读（第四轮体检）。与 _raise_open_file_limit 一样只在命令行里调：库与 SDK
+    不改进程级别的设置，它们新建的数据目录是 0700（store/files.py）。"""
+    mask = os.umask(0o077) | 0o077
+    os.umask(mask)
+    return mask
 
 
 DATETIME_FORMATS = ["%Y-%m-%d", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"]
@@ -202,10 +218,12 @@ def doctor(
         bool, typer.Option("--live", help="实际调用每个模型与向量接口做连通性测试（费用极低）")
     ] = False,
 ) -> None:
-    """检查配置、API Key，以及（可选）各模型的连通性。"""
+    """检查配置、API Key、数据目录与密钥文件的权限，以及（可选）各模型的连通性。"""
     settings = load_settings()
     _print_config(settings)
     _print_local_store(settings)
+    for line in _loose_modes(settings):
+        console.print(line)
     if live:
         _live_check(settings)
     else:
@@ -539,6 +557,7 @@ INSECURE_HELP = (
     "读写、删除记忆，用你的上游 Key）。只在可信的网络里用"
 )
 WEAK_TOKEN_HELP = "监听非本机地址时也接受短于 16 个字符的访问令牌"
+GRADIO_TEMP_ENV = "GRADIO_TEMP_DIR"
 PLAIN_HTTP_NOTE = (
     "[yellow]注意：[/yellow]服务是明文 HTTP：访问令牌（也是界面的密码）与记忆都不加密地经过网络。"
     "可信的网络之外请在前面放 TLS 反向代理（README 的 Public deployment / 公网部署）"
@@ -670,6 +689,31 @@ def _no_auth_hosts_note(hosts: HostPolicy) -> None:
     )
 
 
+@contextmanager
+def _gradio_temp_dir(ui: bool) -> Iterator[None]:
+    """界面（Gradio）放上传与图库副本的目录（第四轮体检）：运营者没设 GRADIO_TEMP_DIR 时换成这次
+    启动自己的目录（mkdtemp：0700、名字随机，别的账户不能先建好），停下时删掉。
+
+    Gradio 默认用 /tmp/gradio：整台机器的 Gradio 应用共用、目录是 0755，界面的图库把媒体库里的
+    原图复制进去（copy2，权限照旧），别的本地用户能读；那个目录被别的账户先建好时，上传要么失败、
+    要么交给了它。不放在数据目录下：进程崩溃时照片的副本不留在 /data 卷上。Gradio 在 create_app
+    里才第一次导入，建 Blocks 与 App 时读这个变量。"""
+    previous = os.environ.get(GRADIO_TEMP_ENV)
+    if not ui or previous:
+        yield
+        return
+    directory = tempfile.mkdtemp(prefix="cuemem-gradio-")
+    os.environ[GRADIO_TEMP_ENV] = directory
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(GRADIO_TEMP_ENV, None)
+        else:
+            os.environ[GRADIO_TEMP_ENV] = previous
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
@@ -732,41 +776,46 @@ def serve(
     # 同一个记忆系统：经代理写入的对话在界面里也能看到
     proxy = MemoryProxy(service.system, unknown_model=unknown, idle_minutes=idle_minutes)
     try:
-        app_ = create_app(
-            service,
-            upload_dir=settings.paths.media.parent / "uploads",
-            ui=ui,
-            keys=keys,
-            proxy=proxy,
-            allowed_hosts=hosts.allowed,
-            origin_hosts=hosts.origins,
-            allow_ip_hosts=hosts.ip_literals,
-            idle_minutes=idle_minutes,
-            max_body_bytes=limits[0],
-            max_import_bytes=limits[1],
-            mcp=not no_mcp,
-        )
-        where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
-        console.print(
-            f"{where}接口文档：http://{host}:{port}/docs"
-            f" · OpenAI 兼容的记忆代理：http://{host}:{port}/v1"
-        )
-        if not no_mcp:
-            console.print(
-                f"MCP（Streamable HTTP）：http://{host}:{port}/mcp"
-                "（请求头 X-CueMem-User 选用户，令牌同 /api；--no-mcp 关掉）"
+        with _gradio_temp_dir(ui):
+            app_ = create_app(
+                service,
+                upload_dir=settings.paths.media.parent / "uploads",
+                ui=ui,
+                keys=keys,
+                proxy=proxy,
+                allowed_hosts=hosts.allowed,
+                origin_hosts=hosts.origins,
+                allow_ip_hosts=hosts.ip_literals,
+                idle_minutes=idle_minutes,
+                max_body_bytes=limits[0],
+                max_import_bytes=limits[1],
+                mcp=not no_mcp,
             )
-        if keys.enabled:
-            console.print(f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录")
-            if not _is_loopback(host):  # 容器里总是 0.0.0.0：Docker 也提示
-                console.print(PLAIN_HTTP_NOTE)
-        elif not _is_loopback(host):  # 加了 --insecure-no-auth
+            where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
             console.print(
-                f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
-                "（--insecure-no-auth），能连到这台机器的人都能读写、删除记忆"
+                f"{where}接口文档：http://{host}:{port}/docs"
+                f" · OpenAI 兼容的记忆代理：http://{host}:{port}/v1"
             )
-            _no_auth_hosts_note(hosts)
-        uvicorn.run(app_, host=host, port=port, log_level="warning")
+            if not no_mcp:
+                console.print(
+                    f"MCP（Streamable HTTP）：http://{host}:{port}/mcp"
+                    "（请求头 X-CueMem-User 选用户，令牌同 /api；--no-mcp 关掉）"
+                )
+            if keys.enabled:
+                console.print(
+                    f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录"
+                )
+                if not _is_loopback(host):  # 容器里总是 0.0.0.0：Docker 也提示
+                    console.print(PLAIN_HTTP_NOTE)
+            elif not _is_loopback(host):  # 加了 --insecure-no-auth
+                console.print(
+                    f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
+                    "（--insecure-no-auth），能连到这台机器的人都能读写、删除记忆"
+                )
+                _no_auth_hosts_note(hosts)
+            for line in _loose_modes():
+                console.print(line)
+            uvicorn.run(app_, host=host, port=port, log_level="warning")
     finally:
         proxy.close_all()
         service.close()
@@ -844,6 +893,8 @@ def proxy(
                 "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
             )
             _no_auth_hosts_note(hosts)
+        for line in _loose_modes():
+            console.print(line)
         app_ = create_proxy_app(
             memory_proxy,
             keys=keys,
@@ -1689,6 +1740,52 @@ def _print_local_store(settings: Settings) -> None:
         f"[yellow]{line}：集合再多就打不开、建不了新的空间。用户多时改用 Qdrant 服务端："
         f"{cli_command('migrate-vectors --to URL')}，再设置 CUEMEM_VECTOR_STORE__URL[/yellow]"
     )
+
+
+def _loose_modes(settings: Settings | None = None) -> list[str]:
+    """同一台机器上别的用户能读的数据目录（给了 settings 时）与密钥文件（.env、
+    CUEMEM_API_KEYS_FILE）：每个一行黄字与收紧的命令（第四轮体检）。只提醒、不改：已经存在的
+    目录与文件可能有意给备份用户留了读权限。数据目录只看最上一级（里面的目录由它管着：上一级是
+    0700 时别人进不去）。Windows 没有这些权限位，不查。"""
+    if os.name != "posix":
+        return []
+    from cuemem.api.auth import KEYS_FILE_ENV
+
+    lines: list[str] = []
+    if settings is not None:
+        from cuemem.store.files import storage_dirs
+
+        dirs = storage_dirs(settings)
+        for d in dirs:
+            if any(d != top and d.is_relative_to(top) for top in dirs):
+                continue  # 上一级不存在时它也不存在
+            if mode := _shared_mode(d, directory=True):
+                lines.append(
+                    f"[yellow]注意：[/yellow]数据目录 {escape(str(d))} 的权限是 {mode:o}，别的用户"
+                    f"也能读里面的对话、缓存与 trace：chmod 700 {escape(str(d))}"
+                )
+    secrets = [env_file_path()]
+    if keys_file := os.environ.get(KEYS_FILE_ENV):
+        secrets.append(Path(keys_file).expanduser())
+    for path in dict.fromkeys(secrets):
+        if mode := _shared_mode(path, directory=False):
+            lines.append(
+                f"[yellow]注意：[/yellow]{escape(str(path))} 的权限是 {mode:o}，别的用户也能读"
+                f"里面的 Key 与令牌：chmod 600 {escape(str(path))}"
+            )
+    return lines
+
+
+def _shared_mode(path: Path, *, directory: bool) -> int:
+    """path 是目录（directory）或普通文件、组或其他用户有任何权限时返回权限位；不是、不存在或
+    读不出时返回 0。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return 0
+    kind = stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)
+    mode = stat.S_IMODE(st.st_mode)
+    return mode if kind and mode & 0o077 else 0
 
 
 def _live_check(settings: Settings) -> None:

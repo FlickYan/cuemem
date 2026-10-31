@@ -27,7 +27,8 @@ def _flat(text: str) -> str:
 
 @pytest.fixture
 def isolated_paths(clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("db", "qdrant", "llm_cache", "embed_cache", "ledger", "traces"):
+    # 媒体库也要：MemorySystem.from_settings 一打开就建好所有数据目录（第四轮体检），不能落到仓库里
+    for name in ("db", "qdrant", "llm_cache", "embed_cache", "ledger", "traces", "media"):
         monkeypatch.setenv(f"CUEMEM_PATHS__{name.upper()}", str(tmp_path / name))
 
 

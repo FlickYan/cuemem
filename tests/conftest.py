@@ -72,6 +72,16 @@ def no_network(offline: None) -> Iterator[None]:
         pytest.fail(f"测试试图访问网络：{attempts}")
 
 
+@pytest.fixture(autouse=True)
+def restore_umask() -> Iterator[None]:
+    """命令行一启动就收紧 umask（cli._private_umask）：CliRunner 在测试进程里运行它，测试结束时
+    还原，不影响后面的测试。"""
+    mask = os.umask(0o022)
+    os.umask(mask)
+    yield
+    os.umask(mask)
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """最后一个测试结束之后（后台线程）才有的尝试：整个会话算失败。"""
     late = netguard.unreported()

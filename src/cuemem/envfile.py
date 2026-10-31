@@ -1,9 +1,10 @@
-""".env 文件的读写：只替换指定的键，保留其余内容与注释；写入后把权限设为仅本人可读写。"""
+""".env 文件的读写：只替换指定的键，保留其余内容与注释；新内容只在仅本人可读写的文件里。"""
 
 from __future__ import annotations
 
 import os
 import re
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -35,9 +36,26 @@ def update_env(path: Path, updates: Mapping[str, str | None]) -> None:
             continue
         output.append(line)
     output.extend(f"{key}={_quote(value)}" for key, value in pending.items() if value is not None)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(output) + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
+    _replace_private(path, "\n".join(output) + "\n")
+
+
+def _replace_private(path: Path, text: str) -> None:
+    """把 text 写进同一目录下 0600 的临时文件，再换名替换 path（第四轮体检）。
+
+    以前就地重写之后才 chmod 0600：cp .env.example .env 得到的是 0644，别的本地用户在这之前打开
+    的文件描述符照样读到新写的 Key。换名之后 Key 从来不在别人能读的 inode 里，之前打开的描述符
+    只看得到旧内容。path 是符号链接时替换它指向的文件，链接留着。"""
+    target = path.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    os.chmod(target, 0o600)
 
 
 def mask(secret: str) -> str:

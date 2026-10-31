@@ -62,6 +62,7 @@ from cuemem.read.plan import QueryPlan, rule_plan
 from cuemem.read.probe import Probe
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
+from cuemem.store.files import private_dirs, storage_dirs
 from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
@@ -394,7 +395,10 @@ class MemorySystem:
         on_peak_wait: Callable[[str, datetime], None] | None = None,
     ) -> MemorySystem:
         """按配置组装各组件。http_client 用于测试时注入模拟的网络层；on_peak_wait：wait 策略下
-        遇到高峰、开始暂停时通知调用方（每段高峰每个供应商一次）。"""
+        遇到高峰、开始暂停时通知调用方（每段高峰每个供应商一次）。
+
+        新建的数据目录只给本人（0700，第四轮体检），已经存在的不改：见 store/files.py。"""
+        private_dirs(*storage_dirs(settings))
         paths = settings.paths
         ledger = Ledger(paths.ledger)
         embedder = build_embedder(settings, ledger=ledger, http_client=http_client)
