@@ -245,10 +245,11 @@ def test_a_scoped_key_has_a_budget_for_bodies_in_flight(
 
 
 def test_scoped_key_rate_per_minute(served: Served, fake_api: FakeAPI) -> None:
-    """限定作用域的令牌可以写 rate_per_minute：/api、/api/v1、/v1 与 /mcp 的 POST 每分钟最多这么
+    """限定作用域的令牌可以写 rate_per_minute：/api、/api/v1、/v1 与 /mcp 写的请求每分钟最多这么
     多个（令牌桶，容量就是这个数），超过时 429 带 Retry-After（等到下一个名额的秒数），不转发、
     不调用模型。没写的令牌与管理令牌不限；GET 不算。以前没有任何按令牌的次数或花费上限：一个只能
-    访问自己用户的令牌，也能无限地经代理花运营者的额度。"""
+    访问自己用户的令牌，也能无限地经代理花运营者的额度。第四轮复审：PUT 与 DELETE 也算（更正当场
+    抽取一次，删除重新抽取碰到的会话），以前只算 POST，名额用完之后照样 200、调用模型。"""
     from starlette.middleware import Middleware
 
     from cuemem.api.limits import BodyLimit
@@ -280,6 +281,11 @@ keys:
         return http.post("/v1/chat/completions", json=body, headers=headers)
 
     with TestClient(app) as http:
+        turns = [{"role": "user", "content": "I live in Lisbon."}]
+        added = {"messages": turns, "user_id": "alice", "wait": True}
+        assert http.post("/api/v1/memories", json=added, headers=AUTH).is_success
+        listed = http.get("/api/v1/memories", params={"user_id": "alice"}, headers=AUTH)
+        fact = listed.json()["results"][0]["id"]
         assert [chat(ALICE).status_code for _ in range(2)] == [200, 200]
         refused = chat(ALICE)
         assert refused.status_code == 429 and refused.headers["retry-after"] == "30"
@@ -292,6 +298,16 @@ keys:
         api = http.post("/api/sessions", json={"space": "alice"}, headers=ALICE)
         assert api.status_code == 429 and "每分钟最多 2 个" in api.json()["detail"]
         assert http.post("/mcp", json={}, headers=ALICE).status_code == 429
+        calls = len(fake_api.chat_requests)
+        correction = {"text": "I live in Porto."}
+        for refused in (
+            http.put(f"/api/v1/memories/{fact}", json=correction, headers=ALICE),
+            http.delete(f"/api/v1/memories/{fact}", headers=ALICE),
+            http.delete("/api/v1/memories", params={"user_id": "alice"}, headers=ALICE),
+        ):
+            assert refused.status_code == 429 and refused.json()["error"]["code"] == "rate_limited"
+            assert refused.headers["retry-after"] == "30"
+        assert len(fake_api.chat_requests) == calls  # 更正与删除都没有调用模型
         assert http.get("/api/v1/memories", params={"user_id": "alice"}, headers=ALICE).is_success
         for headers in (BOB, AUTH):  # 没写的令牌、管理令牌：不限
             assert [chat(headers).status_code for _ in range(5)] == [200] * 5

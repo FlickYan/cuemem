@@ -26,11 +26,13 @@ api.auth.authenticated_route），界面（Gradio）的登录与事件接口也�
 8 MiB 那一档）。共用的服务要按令牌数与这个倍数留内存，或者调小 CUEMEM_MAX_BODY_BYTES。
 
 请求的次数（第四轮体检）：限定作用域的令牌写了 rate_per_minute 时（api/auth.py），它在 /api/、
-/v1/ 与 /mcp 的 POST 每分钟最多这么多个：令牌桶，容量就是 rate_per_minute，每秒补
-rate_per_minute / 60 个。超过时 429，Retry-After 是等到下一个名额的秒数（/api/v1 下 code 为
-rate_limited）。不写的令牌、管理令牌不限；GET 不算。管不到界面（登录的会话不带 Bearer 令牌，用
-agent 角色固定的模型与 max_tokens）；一次写入有多大（抽取约按每字节两个字符发给上游）由
-CUEMEM_MAX_BODY_BYTES 管。
+/v1/ 与 /mcp 写的请求（POST、PUT、PATCH、DELETE：GET、HEAD、OPTIONS 之外的方法）每分钟最多这么
+多个：令牌桶，容量就是 rate_per_minute，每秒补 rate_per_minute / 60 个。超过时 429，Retry-After
+是等到下一个名额的秒数（/api/v1 下 code 为 rate_limited）。不写的令牌、管理令牌不限；只读的请求
+不算。PUT /api/v1/memories/{id}（追加一轮更正，当场抽取）与 DELETE /api/v1/memories[/{id}]（重新
+抽取碰到的会话）同样调用上游，第四轮复审之前只算 POST，它们不受限。管不到界面（登录的会话不带
+Bearer 令牌，用 agent 角色固定的模型与 max_tokens）；一次写入有多大（抽取约按每字节两个字符发给
+上游）由 CUEMEM_MAX_BODY_BYTES 管。
 """
 
 from __future__ import annotations
@@ -56,7 +58,8 @@ MAX_IMPORT_BYTES = 1 << 30
 OTHER_BODY_BYTES = 8 << 20  # 界面的登录与事件（不可配置）
 IMPORT_PATHS = ("/api/spaces/import", "/api/v1/import")
 BODY_PATHS = ("/api/", "/v1/", "/gradio_api/upload")
-RATE_PATHS = ("/api/", "/v1/", "/mcp")  # rate_per_minute 管的路径（只算 POST）
+RATE_PATHS = ("/api/", "/v1/", "/mcp")  # rate_per_minute 管的路径（只读的方法不算）
+READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 class BodyLimit:
@@ -65,8 +68,9 @@ class BodyLimit:
     时遇到 HTTPException 原样抛出，由应用（或挂载的 Gradio）的出错处理写成响应。
 
     keys：配置的令牌（cuemem serve 与 proxy 传入）。给了时按 Bearer 令牌认出限定作用域的令牌：导入
-    不用 max_import_bytes，同时在处理的请求体加起来有上限，写了 rate_per_minute 的还有次数的上限
-    （见模块说明）。令牌不对的请求不算：接口在读请求体之前就 401（auth.authenticated_route）。
+    不用 max_import_bytes，同时在处理的请求体加起来有上限，写了 rate_per_minute 的写的请求（GET、
+    HEAD、OPTIONS 之外的方法）还有次数的上限（见模块说明）。令牌不对的请求不算：接口在读请求体
+    之前就 401（auth.authenticated_route）。
     clock：次数上限用的时钟（秒，测试里换掉）。"""
 
     def __init__(
@@ -130,7 +134,7 @@ class BodyLimit:
         if (
             principal is not None
             and principal.rate_per_minute is not None
-            and scope["method"] == "POST"
+            and scope["method"] not in READ_METHODS
             and path.startswith(RATE_PATHS)
         ):
             wait = self._wait(principal)

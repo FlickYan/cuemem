@@ -27,7 +27,8 @@
   供应商（记忆代理、/api 的对话、/api/v1/answer、/mcp、每次写入之后的抽取）。每个令牌可以另外写
   （第四轮体检，都可选，不写时与以前完全相同）：
 
-        rate_per_minute: 60          # /api、/api/v1、/v1、/mcp 的 POST 每分钟最多这么多个（429）
+        rate_per_minute: 60          # /api、/api/v1、/v1、/mcp 写的请求（POST、PUT、DELETE）
+                                     # 每分钟最多这么多个（429）；GET 不算
         models: [qwen3.8-flash]      # 记忆代理只能用这些模型（目录里的别名或模型 ID，之外 403）
         max_output_tokens: 2000      # 记忆代理转发的 max_tokens 不超过它，n 只能是 1
 
