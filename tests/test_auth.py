@@ -222,6 +222,30 @@ def test_keys_from_the_environment(tmp_path: Path) -> None:
         Keys.from_env({"CUEMEM_API_KEYS_FILE": str(tmp_path / "missing.yaml")})
 
 
+def test_short_plaintext_tokens_are_recorded_by_name() -> None:
+    """Keys.weak：短于 16 个字符的令牌（管理令牌记作 CUEMEM_API_TOKEN，限定作用域的记它的名字）。
+    cuemem serve / proxy 监听非本机地址时据此拒绝启动；Keys 只存摘要，量不出长度，所以在读令牌时
+    记下。sha256: 量不出长度，不记；不带令牌本身，也不参与相等比较。"""
+    keys = Keys.parse(_keys("name: k, token: x, scopes: [{user: a}]"))
+    assert keys.weak == ("k",)
+    assert Keys.from_token("a").weak == ("CUEMEM_API_TOKEN",)
+    assert Keys.from_token("a" * 16).weak == () and Keys.from_token(None).weak == ()
+    assert Keys.parse(KEYS, ADMIN_TOKEN).weak == ()  # 摘要与 16 个字符以上的令牌
+    mixed = Keys.parse(
+        _keys(
+            "name: alice-app, token: 换成你的令牌, scopes: [{user: alice}]",
+            f"name: hashed, sha256: '{_sha256('x')}', scopes: [{{user: bob}}]",
+            f"name: long, token: {'b' * 16}, scopes: [{{user: carol}}]",
+        ),
+        "your-token",
+    )
+    assert mixed.weak == ("CUEMEM_API_TOKEN", "alice-app")
+    assert "your-token" not in repr(mixed) and "换成你的令牌" not in repr(mixed)
+    assert mixed == Keys(mixed.admin, mixed.scoped)
+    env = Keys.from_env({"CUEMEM_API_KEYS": _keys("name: k, token: x, scopes: [{user: a}]")})
+    assert env.weak == ("k",)
+
+
 def test_ui_login_binds_a_scoped_key_to_its_name() -> None:
     """界面登录：限定作用域的令牌要用它的名字做用户名（登录后只知道用户名），管理令牌用户名任意。
     用户名对不上令牌的名字时，不会被当成管理令牌。"""

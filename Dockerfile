@@ -1,7 +1,8 @@
 # CueMem 的容器镜像（N12）：HTTP 接口 + 记忆浏览界面 + OpenAI 兼容的记忆代理（/v1），一个进程。
 #   docker build -t cuemem .
 #   docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem
-# .env 里要有 CUEMEM_API_TOKEN：容器里监听 0.0.0.0，没有访问令牌时拒绝启动。
+# .env 里要有 CUEMEM_API_TOKEN（至少 16 个字符，openssl rand -hex 32）：容器里监听 0.0.0.0，没有
+# 访问令牌或令牌太短时拒绝启动。别的机器要访问时在前面放 TLS 反向代理（README 的 Public deployment）。
 # 多进程 / 大规模部署见 docker-compose.yml（Qdrant 服务端）。
 # 默认带上可选依赖 ui（记忆浏览界面，Gradio）与 local（本机向量 fastembed，预设 deepseek 要用）；
 # 只要接口与记忆代理时

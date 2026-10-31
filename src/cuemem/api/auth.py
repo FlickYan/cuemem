@@ -36,6 +36,9 @@ Streamable HTTP，api/mcp.py）也按这两个头判断，不给时是令牌作�
 
 令牌只比较 sha256 摘要：secrets.compare_digest 与每个令牌都比一遍，不提前返回。没有配任何令牌时
 不鉴权（只适合本机演示，见 api/app.py）。cuemem mcp（stdio）一个进程一个空间，不经过这里。
+
+令牌的长度（第四轮体检）：读令牌时记下短于 MIN_TOKEN_CHARS 个字符的（Keys.weak，只记名字），
+cuemem serve / proxy 监听非本机地址时拒绝启动（cli._require_token）。sha256: 量不出长度，不记。
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ import os
 import re
 import secrets
 from collections.abc import Callable, Coroutine, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -65,6 +68,9 @@ KEYS_ENV = "CUEMEM_API_KEYS"
 # 放在模块级：注解是字符串（from __future__ import annotations），FastAPI 解析不到函数里的局部变量
 _BEARER = HTTPBearer(auto_error=False)
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}")
+# 监听非本机地址时令牌至少这么多个字符：仓库与文档里的占位符（your-token、fake-token、
+# 换成你的令牌）都更短；secrets.token_urlsafe(16) 是 22 个，openssl rand -hex 32 是 64 个
+MIN_TOKEN_CHARS = 16
 
 
 def _matches(value: str, patterns: Sequence[str]) -> bool:
@@ -127,12 +133,21 @@ def _digest(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
+def _short(name: str, token: str | None) -> tuple[str, ...]:
+    """直接给出的令牌短于 MIN_TOKEN_CHARS 个字符时 (name,)，否则（包括没有）空。"""
+    return (name,) if token and len(token) < MIN_TOKEN_CHARS else ()
+
+
 @dataclass(frozen=True)
 class Keys:
-    """配置的令牌：管理令牌与限定作用域的令牌，都只存 sha256 摘要。一个都没有时不鉴权。"""
+    """配置的令牌：管理令牌与限定作用域的令牌，都只存 sha256 摘要。一个都没有时不鉴权。
+
+    weak：直接给出、短于 MIN_TOKEN_CHARS 个字符的令牌的名字（管理令牌记作 CUEMEM_API_TOKEN），
+    由 from_token、parse 记下；不带令牌本身，不参与相等比较。"""
 
     admin: bytes | None = None
     scoped: tuple[tuple[bytes, Principal], ...] = ()
+    weak: tuple[str, ...] = field(default=(), compare=False, repr=False)
 
     def __post_init__(self) -> None:
         digests = [key for key, _ in self.scoped]
@@ -155,7 +170,7 @@ class Keys:
     @classmethod
     def from_token(cls, token: str | None) -> Keys:
         """只有管理令牌（以前的 CUEMEM_API_TOKEN）；None 或空字符串时不鉴权。"""
-        return cls(_digest(token) if token else None)
+        return cls(_digest(token) if token else None, weak=_short(TOKEN_ENV, token))
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Keys:
@@ -196,7 +211,10 @@ class Keys:
             )
             raise AccessKeysError(f"{source} 的格式不对：{problems}") from None
         scoped = tuple(_key(entry, f"{source}: keys[{i}]") for i, entry in enumerate(parsed.keys))
-        return cls(_digest(admin_token) if admin_token else None, scoped)
+        weak = _short(TOKEN_ENV, admin_token) + tuple(
+            name for entry in parsed.keys for name in _short(entry.name, entry.token)
+        )
+        return cls(_digest(admin_token) if admin_token else None, scoped, weak)
 
     def resolve(self, token: str) -> Principal | None:
         """令牌 → Principal；不认识时 None。与每个令牌都比一遍（常数时间比较，不提前返回）。"""

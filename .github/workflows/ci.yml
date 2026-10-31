@@ -119,9 +119,9 @@ jobs:
         run: docker build -t cuemem:ci .
       - name: 界面与本机向量的可选依赖在镜像里
         run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed, gradio"
-      - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设访问令牌）
+      - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设至少 16 个字符的访问令牌）
         run: |
           docker run -d --name cuemem -p 127.0.0.1:7860:7860 \
-            -e CUEMEM_API_TOKEN=ci-token -e CUEMEM_EMBEDDING__BACKEND=hash cuemem:ci
+            -e CUEMEM_API_TOKEN=ci-token-0123456789 -e CUEMEM_EMBEDDING__BACKEND=hash cuemem:ci
           for _ in $(seq 90); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 2; done
           curl -fsS http://127.0.0.1:7860/api/health || { docker logs cuemem; exit 1; }

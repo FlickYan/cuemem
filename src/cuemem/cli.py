@@ -538,6 +538,11 @@ INSECURE_HELP = (
     "监听非本机地址又没有设置 CUEMEM_API_TOKEN 时也照常启动（不鉴权：能连到这台机器的人都能"
     "读写、删除记忆，用你的上游 Key）。只在可信的网络里用"
 )
+WEAK_TOKEN_HELP = "监听非本机地址时也接受短于 16 个字符的访问令牌"
+PLAIN_HTTP_NOTE = (
+    "[yellow]注意：[/yellow]服务是明文 HTTP：访问令牌（也是界面的密码）与记忆都不加密地经过网络。"
+    "可信的网络之外请在前面放 TLS 反向代理（README 的 Public deployment / 公网部署）"
+)
 
 
 def _is_loopback(host: str) -> bool:
@@ -566,21 +571,33 @@ def _keys_note(keys: Keys) -> str:
     return "、".join(parts)
 
 
-def _require_token(host: str, keys: Keys, insecure: bool) -> None:
+def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = False) -> None:
     """监听非本机地址时必须设访问令牌：没有令牌时拒绝启动，除非显式加 --insecure-no-auth。
     容器里总是监听 0.0.0.0（看不出宿主机只映射到了本机），所以镜像也要设令牌。只有限定作用域的
-    令牌、没有管理令牌也算设了。"""
-    from cuemem.api.auth import KEYS_FILE_ENV, TOKEN_ENV
+    令牌、没有管理令牌也算设了。
 
-    if keys.enabled or insecure or _is_loopback(host):
+    令牌也要够长（第四轮体检）：直接给出的令牌短于 16 个字符（Keys.weak；以前 README 的例子就是
+    your-token）时同样拒绝启动，除非加 --insecure-weak-token（allow_weak）。信息里只有令牌的名字。
+    sha256: 给出的量不出长度，不查。"""
+    from cuemem.api.auth import KEYS_FILE_ENV, MIN_TOKEN_CHARS, TOKEN_ENV
+
+    if insecure or _is_loopback(host):
         return
-    console.print(
-        f"[red]监听 {escape(host)} 但没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
-        f"读写、删除记忆，用你的上游 Key。[/red]\n在 .env 里设置 {TOKEN_ENV}（例如用 openssl rand"
-        f" -hex 32 生成），或用 {KEYS_FILE_ENV} 给出限定作用域的令牌；只在可信的网络里使用时"
-        "也可以加 --insecure-no-auth。"
-    )
-    raise typer.Exit(2)
+    if not keys.enabled:
+        console.print(
+            f"[red]监听 {escape(host)} 但没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
+            f"读写、删除记忆，用你的上游 Key。[/red]\n在 .env 里设置 {TOKEN_ENV}（例如用 openssl "
+            f"rand -hex 32 生成），或用 {KEYS_FILE_ENV} 给出限定作用域的令牌；只在可信的网络里"
+            "使用时也可以加 --insecure-no-auth。"
+        )
+        raise typer.Exit(2)
+    if keys.weak and not allow_weak:
+        console.print(
+            f"[red]监听 {escape(host)} 但这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
+            f"{escape('、'.join(keys.weak))}。[/red]\n换成随机生成的长令牌（例如 openssl rand "
+            f"-hex 32）；sha256: 给出的令牌不查长度。确实要用短令牌时加 --insecure-weak-token。"
+        )
+        raise typer.Exit(2)
 
 
 UNKNOWN_MODEL_HELP = (
@@ -671,6 +688,9 @@ def serve(
     insecure_no_auth: Annotated[
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
+    insecure_weak_token: Annotated[
+        bool, typer.Option("--insecure-weak-token", help=WEAK_TOKEN_HELP)
+    ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
     idle_minutes: Annotated[float, typer.Option(help=IDLE_HELP)] = 30.0,
 ) -> None:
@@ -705,7 +725,7 @@ def serve(
         nonlocal keys, limits
         keys = _access_keys()
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
-        _require_token(host, keys, insecure_no_auth)
+        _require_token(host, keys, insecure_no_auth, insecure_weak_token)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
     hosts = _host_policy(host, authenticated=keys.enabled)
@@ -738,6 +758,8 @@ def serve(
             )
         if keys.enabled:
             console.print(f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录")
+            if not _is_loopback(host):  # 容器里总是 0.0.0.0：Docker 也提示
+                console.print(PLAIN_HTTP_NOTE)
         elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
@@ -765,6 +787,9 @@ def proxy(
     insecure_no_auth: Annotated[
         bool, typer.Option("--insecure-no-auth", help=INSECURE_HELP)
     ] = False,
+    insecure_weak_token: Annotated[
+        bool, typer.Option("--insecure-weak-token", help=WEAK_TOKEN_HELP)
+    ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
 ) -> None:
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
@@ -786,7 +811,7 @@ def proxy(
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
-    _require_token(host, keys, insecure_no_auth)
+    _require_token(host, keys, insecure_no_auth, insecure_weak_token)
     hosts = _host_policy(host, authenticated=keys.enabled)
     try:
         system = MemorySystem.from_settings(settings)
@@ -811,6 +836,8 @@ def proxy(
         )
         if keys.enabled:
             console.print(f"已启用访问令牌：{_keys_note(keys)}。OpenAI SDK 的 api_key 填令牌")
+            if not _is_loopback(host):
+                console.print(PLAIN_HTTP_NOTE)
         elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"

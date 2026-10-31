@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -287,21 +288,30 @@ def test_demo_and_chat_commands(
 
 
 @pytest.mark.parametrize(
-    ("host", "token", "insecure", "starts"),
+    ("host", "token", "insecure", "weak_ok", "starts"),
     [
-        ("0.0.0.0", None, False, False),
-        ("192.168.1.10", None, False, False),
-        ("::", None, False, False),
-        ("", None, False, False),
-        ("127.0.0.1", None, False, True),
-        ("127.0.0.2", None, False, True),
-        ("::1", None, False, True),
-        ("localhost", None, False, True),
-        ("0.0.0.0", "fake-token", False, True),
-        ("0.0.0.0", None, True, True),
+        ("0.0.0.0", None, False, False, False),
+        ("192.168.1.10", None, False, False, False),
+        ("::", None, False, False, False),
+        ("", None, False, False, False),
+        ("127.0.0.1", None, False, False, True),
+        ("127.0.0.2", None, False, False, True),
+        ("::1", None, False, False, True),
+        ("localhost", None, False, False, True),
+        ("0.0.0.0", "fake-token-0123456789", False, False, True),
+        ("0.0.0.0", None, True, False, True),
+        # 监听非本机地址时令牌至少 16 个字符（README 里的 your-token 之类的占位符都更短）
+        ("0.0.0.0", "your-token", False, False, False),
+        ("0.0.0.0", "a" * 15, False, False, False),
+        ("0.0.0.0", "a" * 16, False, False, True),
+        ("127.0.0.1", "your-token", False, False, True),
+        ("0.0.0.0", "your-token", True, False, True),
+        ("0.0.0.0", "your-token", False, True, True),
     ],
 )
-def test_require_token(host: str, token: str | None, insecure: bool, starts: bool) -> None:
+def test_require_token(
+    host: str, token: str | None, insecure: bool, weak_ok: bool, starts: bool
+) -> None:
     import typer
 
     from cuemem.api.auth import Keys
@@ -309,10 +319,38 @@ def test_require_token(host: str, token: str | None, insecure: bool, starts: boo
 
     keys = Keys.from_token(token)
     if starts:
-        _require_token(host, keys, insecure)
+        _require_token(host, keys, insecure, allow_weak=weak_ok)
     else:
-        with pytest.raises(typer.Exit):
-            _require_token(host, keys, insecure)
+        with pytest.raises(typer.Exit) as refused:
+            _require_token(host, keys, insecure, allow_weak=weak_ok)
+        assert refused.value.exit_code == 2
+
+
+def test_require_token_names_short_scoped_tokens(capsys: pytest.CaptureFixture[str]) -> None:
+    """限定作用域的令牌直接写 token: 时同样要够长（按名字说是哪几个，不带令牌本身）；sha256:
+    量不出长度，不查。"""
+    import typer
+
+    from cuemem.api.auth import Keys
+    from cuemem.cli import _require_token
+
+    long = "b" * 16
+    digest = hashlib.sha256(b"x").hexdigest()
+    keys = Keys.parse(
+        "keys:\n"
+        "  - {name: alice-app, token: short-tok, scopes: [{user: alice}]}\n"
+        f"  - {{name: bob-app, token: {long}, scopes: [{{user: bob}}]}}\n"
+        f"  - {{name: hashed, sha256: {digest}, scopes: [{{user: carol}}]}}\n",
+        "admin-short",
+    )
+    with pytest.raises(typer.Exit) as refused:
+        _require_token("0.0.0.0", keys, False)
+    assert refused.value.exit_code == 2
+    out = _flat(capsys.readouterr().out)
+    assert "CUEMEM_API_TOKEN、alice-app" in out and "bob-app" not in out and "hashed" not in out
+    assert "16" in out and "--insecure-weak-token" in out and "opensslrand-hex32" in out
+    assert "short-tok" not in out and "admin-short" not in out
+    _require_token("0.0.0.0", keys, False, allow_weak=True)
 
 
 @pytest.fixture
@@ -331,8 +369,9 @@ def test_non_loopback_bind_needs_a_token(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
     """监听非本机地址又没有访问令牌：拒绝启动（Docker 镜像监听 0.0.0.0），
-    除非加 --insecure-no-auth。被拒绝时不打开记忆系统：不接着做上次没做完的抽取（缺 Key 时
-    也不白白记一次失败）。"""
+    除非加 --insecure-no-auth。令牌短于 16 个字符（以前 README 里的 your-token）同样拒绝，除非加
+    --insecure-weak-token；出错信息不带令牌本身。被拒绝时不打开记忆系统：不接着做上次没做完的
+    抽取（缺 Key 时也不白白记一次失败）。设了令牌又监听非本机地址时提示服务是明文 HTTP。"""
     import sqlite3
 
     def jobs() -> list[tuple[Any, ...]]:
@@ -351,9 +390,21 @@ def test_non_loopback_bind_needs_a_token(
     result = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"])
     assert result.exit_code == 0, result.output
     assert runner.invoke(app, [*command, "--host", "127.0.0.1"]).exit_code == 0
-    monkeypatch.setenv("CUEMEM_API_TOKEN", "fake-token")
-    assert runner.invoke(app, [*command, "--host", "0.0.0.0"]).exit_code == 0
-    assert len(served) == 3
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "your-token")
+    before = jobs()
+    weak = runner.invoke(app, [*command, "--host", "0.0.0.0"])
+    assert weak.exit_code == 2 and len(served) == 2 and jobs() == before
+    flat = _flat(weak.output)
+    assert "CUEMEM_API_TOKEN" in flat and "--insecure-weak-token" in flat
+    assert "your-token" not in weak.output
+    local = runner.invoke(app, [*command, "--host", "127.0.0.1"])  # 本机地址不查长度
+    assert local.exit_code == 0 and "TLS" not in local.output
+    allowed = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-weak-token"])
+    assert allowed.exit_code == 0, allowed.output
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "fake-token-0123456789")
+    strong = runner.invoke(app, [*command, "--host", "0.0.0.0"])
+    assert strong.exit_code == 0 and "TLS" in _flat(strong.output)
+    assert len(served) == 5
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])

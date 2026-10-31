@@ -17,7 +17,9 @@ services:
     depends_on:
       - qdrant
     ports:
-      # 只映射到宿主机的本机地址；要让局域网或公网访问，改成 "7860:7860"（或放在反向代理后面）
+      # 只映射到宿主机的本机地址。别的机器要访问时在前面放 TLS 反向代理（README 的 Public
+      # deployment）；改成 "7860:7860" 会在所有网卡上公开明文 HTTP（令牌与记忆都不加密），
+      # 只适合可信的局域网
       - "127.0.0.1:7860:7860"
     env_file:
       - path: .env
@@ -25,7 +27,10 @@ services:
     environment:
       CUEMEM_VECTOR_STORE__URL: http://qdrant:6333
       CUEMEM_PRESET: ${CUEMEM_PRESET:-}
-      # 必填：接口、界面与记忆代理的访问令牌（容器里监听 0.0.0.0，没有令牌时 cuemem 拒绝启动）
+      # 必填：接口、界面与记忆代理的访问令牌（容器里监听 0.0.0.0，没有令牌或令牌短于 16 个字符时
+      # cuemem 拒绝启动；确实要用短令牌时加上
+      # command: [serve, --host, 0.0.0.0, --port, "7860", --scenario, plain, --space, default,
+      #           --insecure-weak-token]）
       CUEMEM_API_TOKEN: ${CUEMEM_API_TOKEN:?在 .env 里设置 CUEMEM_API_TOKEN（openssl rand -hex 32）}
       # 用宿主机上的 Ollama 时：
       # CUEMEM_PROVIDERS__OLLAMA__BASE_URL: http://host.docker.internal:11434/v1
