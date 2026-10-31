@@ -638,7 +638,8 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
 
     令牌也要够长（第四轮体检）：直接给出的令牌短于 16 个字符（Keys.weak；以前 README 的例子就是
     your-token）时同样拒绝启动，除非加 --insecure-weak-token（allow_weak）。信息里只有令牌的名字。
-    sha256: 给出的量不出长度，不查。"""
+    sha256: 给出的量不出长度，不查。加了 --insecure-no-auth（insecure）时两项都不查：设了令牌时
+    照样鉴权，短的令牌也放过。"""
     from cuemem.api.auth import KEYS_FILE_ENV, MIN_TOKEN_CHARS, TOKEN_ENV
 
     if insecure or _is_loopback(host):

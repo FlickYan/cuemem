@@ -377,7 +377,8 @@ def header_id(value: str | None) -> str | None:
     - 别的按 UTF-8 重新解；不是 UTF-8 时原样（Node 的 fetch 与 requests 按 Latin-1 发的 'José'，
       以前就对，不能变成 400）。
 
-    以 utf-8' 开头却写错、解出来不是 UTF-8 或带控制字符时 ValueError。"""
+    以 utf-8' 开头却写错、百分号编码的字节不是 UTF-8，或者解出来的值（utf-8'' 与不是 ASCII 的）
+    带控制字符时 ValueError；ASCII 的值原样返回，不查控制字符。"""
     if not value:
         return None
     if value[:6].lower() == "utf-8'":

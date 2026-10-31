@@ -489,7 +489,7 @@ User: 告诉你个消息：上个月我跳槽了，现在在新加坡一家电�
 - **FastAPI**：会话与对话（可带图）、记忆浏览（画像、事实时间线、实体图、图片、会话）、遗忘、巩固，以及只检索、不回答的 `recall`；接口文档在 `/docs`。N12 之后加上与 SDK 一一对应、Mem0 形状的 `/api/v1`（`MemoryClient` 调用它）与限定作用域的令牌（第二轮体检，D-069；见[接口参考](api.md)）。
 - **Gradio 界面**（挂在同一个应用上；第二轮体检起是可选依赖 `ui`，没装时只提供接口与记忆代理）：对话 + 记忆轨迹面板 + 记忆浏览器（可以遗忘一条事实、一张图或一个会话）。
 - **MCP Server**（stdio；第三轮体检起另有 `cuemem serve` 的 `/mcp`，Streamable HTTP，令牌与作用域同 `/api`）：`remember` / `recall` / `forget` / `profile`，让其他 Agent 直接使用这套记忆；`recall` 由控制器选档，把带编号与日期的记忆原样返回，不调用回答模型（D-047、D-070）。
-- **应用前面的几道检查**（D-068、D-070、D-071），按这个顺序：Host 白名单（加了 `--insecure-no-auth` 又监听非本机地址时：IP 地址、localhost 与监听的主机名）、只收同源的浏览器请求（包括界面的 `/login`）、再是请求体的上限与限定作用域的令牌可选的 `rate_per_minute`（`api/limits.py`：导入 1 GiB，`/api`、`/v1` 与上传 64 MiB，别处 8 MiB；限定作用域的令牌导入按请求体上限，同时在处理的请求体有总量，超过 429）。`/api` 与 `/api/v1` 在读请求体之前就认令牌。`/api/v1` 下的每种拒绝都是 `V1ErrorBody` 的格式。像素超过 Pillow 上限的图片在存下、交给模型之前就拒绝，1,600 万像素以上的解码最多同时 2 个。挂载的界面打开 Gradio 自己的文件路径检查（`demo.has_launched`）。
+- **应用前面的几道检查**（D-068、D-070、D-071），按这个顺序：Host 白名单（没有令牌、加了 `--insecure-no-auth` 又监听非本机地址时：IP 地址、localhost 与监听的主机名）、只收同源的浏览器请求（包括界面的 `/login`）、再是请求体的上限与限定作用域的令牌可选的 `rate_per_minute`（`api/limits.py`：导入 1 GiB，`/api`、`/v1` 与上传 64 MiB，别处 8 MiB；限定作用域的令牌导入按请求体上限，同时在处理的请求体有总量，超过 429）。`/api` 与 `/api/v1` 在读请求体之前就认令牌。`/api/v1` 下的每种拒绝都是 `V1ErrorBody` 的格式。像素超过 Pillow 上限的图片在存下、交给模型之前就拒绝，1,600 万像素以上的解码最多同时 2 个。挂载的界面打开 Gradio 自己的文件路径检查（`demo.has_launched`）。
 - **闲置结束**：`cuemem serve` 下，对话会话、`/api/v1` 的 run 与挂着的记忆代理的会话闲置 `--idle-minutes`（30）分钟后结束、交给抽取；清理线程每分钟查一次，设了 `traces_retention_days` 时还删过期的 trace 文件与其中的查询向量。
 - **演示剧本**：`demo/shop/script.json`，可以回放并核对回答（`cuemem demo`）。
 

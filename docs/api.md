@@ -181,7 +181,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 **run**。`open_run` 开始一段对话：之后 `add(run_id=...)` 照常在线写入、立即可检索，但到 `end_run` 才抽取，那时整段交给抽取（`wait=True` 当场抽取并返回报告，否则 `consolidation` 是 `"queued"`）。`with m.run(user_id="alice") as run_id:` 两步都做。本地的 SDK 自己不结束 run；`cuemem serve` 下闲置 30 分钟的 `/api/v1` run 会被结束（`close_idle_runs`），同一个 `run_id` 的下一次 `add` 重新打开它：它结束时整段再抽取一次、从日志把这个用户的整个空间重放一遍（D-045），重放期间这个用户的事实在 `search` 与 `get_all` 里暂时没有，约为一次抽取的时间。
 
 - **跨过重启**：服务停止或崩溃时还开着的 run 跨过重启，用同一个 `run_id` 的下一次 `add`（或 `open_run`）接着写。`cuemem serve` 与 `cuemem proxy` 下，启动后第一个闲置期里别的请求不接手它，没人接着写的在启动一个闲置期（`--idle-minutes`）之后交给抽取；本进程交接过、调用方又回来接着写的 run，像闲置结束的 run 一样重新打开。本地的 SDK 与命令行第一次碰到这个空间时，就把调用方不接着写的 run 交给抽取。
-- **接不上的**：之前的进程已经因闲置结束的 run（或交接过、超过 10,000 个之后不再记得的）重启之后算普通会话：之后每次 `add` 都整段再抽取、重放这个用户的整个空间（D-045），每次重放期间这个用户的事实在 `search` 与 `get_all` 里暂时没有。长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。
+- **接不上的**：之前的进程已经因闲置结束或交给抽取的 run，重启之后算普通会话，因为那个进程只把这两种记在自己的内存里；本进程交接过、超过 10,000 个之后不再记得的 run 也一样：之后每次 `add` 都整段再抽取、重放这个用户的整个空间（D-045），每次重放期间这个用户的事实在 `search` 与 `get_all` 里暂时没有。长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。
 
 **导出与导入**。`export` 返回 `cuemem.space` 格式的版本 2：会话、发言（有 `metadata`、`expires_at`、`edit_of` 时带上）与 base64 的原图，另可附上事实与画像的快照（导入时不用）。`load` 把原始日志写回去，再重新抽取派生记忆（`wait=True` 时当场做）。不给 `user_id`、`agent_id` 时导入到文件里原来的空间，这时文件里没有 `space_id` 就报 ValueError。版本 1 的文件照样能导入；文件里有任何一张图或一处 metadata 不对时，什么都不写，格式坏了（缺键、类型不对）的文件报 `ValueError("Malformed export: …")`。
 
@@ -255,7 +255,7 @@ MemoryClient(
 | `--no-ui` | 关 | 只启动接口、记忆代理与 MCP |
 | `--no-mcp` | 关 | 不在 `/mcp` 提供 MCP |
 | `--idle-minutes` | `30` | 对话会话、`/api/v1` 的 run 与记忆代理的会话闲置这么久后结束、交给抽取（要大于 0）；也是启动之后过多久把之前的进程留下的会话交给抽取 |
-| `--insecure-no-auth` | 关 | 没有任何令牌也在非本机地址上启动；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字 |
+| `--insecure-no-auth` | 关 | 没有任何令牌也在非本机地址上启动；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字。设了令牌时只是不查令牌是否够 16 个字符 |
 | `--insecure-weak-token` | 关 | 监听非本机地址时也允许短于 16 个字符的令牌 |
 | `--unknown-model` | `proxy.unknown_model`（`remap`） | 记忆代理收到不认识的模型时：`remap` 或 `reject` |
 
@@ -264,7 +264,7 @@ MemoryClient(
 ### 鉴权与限定作用域的令牌
 
 - 没有配任何令牌时不鉴权，只能监听本机地址：监听非本机地址又没有令牌时拒绝启动，除非加 `--insecure-no-auth`；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字（否则 400，防 DNS 重绑定）。
-- 监听非本机地址时每个令牌至少 16 个字符（`cuemem.api.auth.MIN_TOKEN_CHARS`）：管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是。更短的让 `cuemem serve` 与 `cuemem proxy` 在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项、从不打印令牌本身，除非加 `--insecure-weak-token`（compose 里加进 `command:`）。用 `openssl rand -hex 32` 生成令牌。`sha256:` 的条目量不出长度，不查。
+- 监听非本机地址时每个令牌至少 16 个字符（`cuemem.api.auth.MIN_TOKEN_CHARS`）：管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是。更短的让 `cuemem serve` 与 `cuemem proxy` 在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项、从不打印令牌本身，除非加 `--insecure-weak-token`（compose 里加进 `command:`）。`--insecure-no-auth` 也跳过这项检查：设了令牌时服务带着这个短令牌启动，请求仍要带它，并且与任何设了令牌的监听一样不查 Host。用 `openssl rand -hex 32` 生成令牌。`sha256:` 的条目量不出长度，不查。
 - 服务说的是明文 HTTP。设了令牌又监听非本机地址时，启动时提示令牌（也是界面的密码）与记忆都不加密地经过网络；可信网络之外要在前面放 TLS 反向代理，见 README 的[公网部署](../README.zh-CN.md#公网部署)。CueMem 不限制登录与令牌出错的次数，在反向代理里做。
 - `CUEMEM_API_TOKEN` 是管理令牌，请求带 `Authorization: Bearer <令牌>`。`GET /api/health` 不要令牌。`/api` 与 `/api/v1` 在读请求体之前就认令牌，没认上的请求不论请求体是什么都回 401。
 - 限定作用域的令牌（`CUEMEM_API_KEYS_FILE` 是 YAML 文件的路径，`CUEMEM_API_KEYS` 是同样内容的 YAML 或 JSON 文本，只能设一个）给每个令牌列出它能访问的用户与 Agent：
@@ -283,7 +283,7 @@ MemoryClient(
     - name: alice-app-limited         # 可选的按令牌上限（三项都可以不写）
       sha256: <64 位十六进制>
       scopes: [{user: alice}]
-      rate_per_minute: 60             # 每分钟写的请求（POST、PUT、DELETE）
+      rate_per_minute: 60             # 每分钟 POST、PUT、DELETE 的请求数
       models: [qwen3.8-flash]         # 这个令牌经记忆代理能用的模型
       max_output_tokens: 2000         # 这个令牌经记忆代理的输出上限
   ```
@@ -291,7 +291,7 @@ MemoryClient(
   值是一个 ID 或 ID 的列表；`*` 是任何 ID，`acme:*` 是前缀。`{agent: A}` 只是 Agent A 自己的记忆。`agent/x` 一律算 Agent x 自己的记忆，所以限定作用域的令牌用不了名字就叫 `agent` 的 Agent。不是由 user_id、agent_id 得来的空间（评测空间、名字里有两个以上的 `/`）只有管理令牌能访问；`{user: "*"}` 包括 `shop-demo` 这类普通名字的空间。未知字段报错。令牌在启动时读一次；文件写错时 `cuemem serve` 与 `cuemem proxy` 打印 `错误：…`、退出 1。令牌只按 sha256 摘要做常数时间比较，与每个令牌都比一遍。
 - **作用域管的是能访问谁的记忆，不是能花多少。** 任何有效的令牌都能让服务器调用运营者的模型供应商：`/v1/chat/completions` 与 `/v1/responses`（带不带 user 都行；`model`、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发）、`/v1/embeddings`（最多 2,048 条）、`/api` 的对话、`POST /api/v1/answer`、`/mcp`，以及每一次写入（之后的抽取每写入一个字节约向上游发 2 个字符）。只把令牌给你愿意让它花这笔钱的人，在供应商那里设花费上限，在反向代理里按 `Authorization` 头限流（例如 nginx 的 `limit_req_zone $http_authorization ...`），调小 `CUEMEM_MAX_BODY_BYTES` 限住一次写入的花费。
 - **可选的按令牌上限**（正整数或非空的列表；不写时什么都不变，转发的请求体逐字节相同）：
-  - `rate_per_minute`：在 `/api`、`/api/v1`、`/v1` 与 `/mcp` 上每分钟最多这么多个写的请求（POST、PUT、DELETE）；读的请求（GET）不算。做法是容量为这个数、每秒补 `rate_per_minute / 60` 个的令牌桶。超过时 429，带 `Retry-After`（等到下一个名额的秒数）；`/api/v1` 下 code 是 `rate_limited`，`/api` 下是中文的 `{"detail"}`，`/v1` 与 `/mcp` 下是 `{"detail": "Too many requests for this access key: ..."}`。
+  - `rate_per_minute`：在 `/api`、`/api/v1`、`/v1` 与 `/mcp` 上每分钟最多这么多个除 GET、HEAD、OPTIONS 之外的请求（POST、PUT、DELETE）；经 POST 的检索与回答、`/v1/embeddings` 与每次 MCP 调用（Streamable HTTP 用 POST）也算，GET 请求不算。做法是容量为这个数、每秒补 `rate_per_minute / 60` 个的令牌桶。超过时 429，带 `Retry-After`（等到下一个名额的秒数）；`/api/v1` 下 code 是 `rate_limited`，`/api` 下是中文的 `{"detail"}`，`/v1` 与 `/mcp` 下是 `{"detail": "Too many requests for this access key: ..."}`。
   - `models`：记忆代理（`/v1/chat/completions`，含流式，与 `/v1/responses`）在检索、开会话与转发之前拒绝别的模型，回 OpenAI 格式的 403（type `permission_error`，param `model`，code `forbidden`）。列出的别名只放行这个别名与它在目录里的设置：`models: [deepseek-flash]` 不放行 `deepseek-flash-thinking`；列出的模型 ID 本身不是别名时，放行这个 ID 的每个别名。这种令牌的请求里目录的 `extra_body` 盖过调用方给的，便宜的模型不能借开关变成思考模式。`/v1/embeddings` 不受 `models` 管。
   - `max_output_tokens`：记忆代理把 `max_tokens` 与 `max_completion_tokens` 截到这个数（两个都没给时补上），`n` 不是 1 时 400（param `n`）。只写它管不住调用方的开关（`enable_thinking`、`thinking` 原样转发），要固定它们得写 `models`。
   - 管不到的：界面的会话（agent 角色的模型，`max_tokens` 1200）、一次写入的大小（只由 `CUEMEM_MAX_BODY_BYTES` 管）、调用方加的供应商字段（`enable_search` 等）。按日的花费预算没有做。
@@ -439,7 +439,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice
 | `GET /v1/models` | 配置里的模型别名与向量模型 |
 
 - **身份**：请求头 `X-CueMem-User` 或请求体的 `user` 字段（请求头优先），可加 `X-CueMem-Agent`；都没有时用 `--user`。限定作用域的令牌要覆盖这个用户与 Agent，否则在检索、开会话与转发之前回 OpenAI 格式的 403（type `permission_error`，code `forbidden`）。没有点名用户的请求原样转发、不碰记忆。`/v1/models` 与 `/v1/embeddings` 任何有效的令牌都能用。
-- **不是 ASCII 的用户或 Agent ID** 在这两个请求头里写成 RFC 8187 的 UTF-8 百分号编码，例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`；Node 的客户端（包括 Claude Code）只能这样发，curl 原样发的 UTF-8 也认，记忆代理也可以把 ID 放进请求体的 `user` 字段。`utf-8''` 写错、不是 UTF-8 或带控制字符时 400（记忆代理是 OpenAI 格式的 `invalid_request_error`，param `user`）。
+- **不是 ASCII 的用户或 Agent ID** 在这两个请求头里写成 RFC 8187 的 UTF-8 百分号编码，例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`；Node 的客户端（包括 Claude Code）只能这样发，curl 原样发的 UTF-8 也认，记忆代理也可以把 ID 放进请求体的 `user` 字段。`utf-8''` 写错、百分号编码的字节不是 UTF-8，或者 `utf-8''` 与非 ASCII 的值里带控制字符时 400（记忆代理是 OpenAI 格式的 `invalid_request_error`，param `user`）；原样发来、不是 UTF-8 的字节按 Latin-1 读，ASCII 的值原样。
 - **花费**：作用域管的是能访问谁的记忆，不是能花多少；`model`、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发，除非令牌写了 `models` 或 `max_output_tokens`（见[鉴权与限定作用域的令牌](#鉴权与限定作用域的令牌)）。不在令牌 `models` 里的模型回 OpenAI 格式的 403（type `permission_error`，param `model`），写了 `max_output_tokens` 时 `n` 不是 1 回 400（param `n`）。
 - **会话**：`X-CueMem-Session` 指定会话。不给时，请求里没有之前的消息、或空闲超过 `--idle-minutes` 之后，开一段新的会话；并行的几段对话要各带自己的会话头。闲置的会话另由每分钟一次的清理结束，`cuemem proxy` 与 `cuemem serve` 挂着的代理都是。
 - **响应头**：`X-CueMem-Level`（`L0`、`L1`、`L2`；没有用记忆时是 `none`，检索出错、照常不带记忆转发时是 `error`）、`X-CueMem-Recalled`、`X-CueMem-Reasons`、`X-CueMem-Session`，以及每个响应都有的 `X-CueMem-Model`：实际转发给上游的模型。响应体是供应商的原样。
@@ -458,7 +458,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 同样的四个工具有两种提供方式：
 
-- **HTTP：`cuemem serve` 的 `/mcp`**（Streamable HTTP，无状态，JSON 响应），与服务共用记忆系统。令牌同 `/api`（不对时 401，带 `WWW-Authenticate: Bearer`）。`X-CueMem-User` 与 `X-CueMem-Agent` 请求头选空间，与记忆代理相同；不带时限定作用域的令牌用它自己的第一个用户，管理令牌、不鉴权与只有通配的令牌要带 `X-CueMem-User`（否则 400）。作用域之外的用户或 Agent 回 403、什么都不写；别的网站的 Origin 回 403。不是 ASCII 的 ID 在这两个请求头里写成 `utf-8''<UTF-8 的百分号编码>`（RFC 8187），例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`，Node 的客户端（包括 Claude Code）只能这样发；原样的 UTF-8 也认，写错、不是 UTF-8 或带控制字符时 400（`{"detail"}`）。请求体按固定 8 MiB 那一档，MCP SDK 自己另有 4 MiB 的上限。应用的 lifespan 还没启动时（uvicorn 总会启动它）`/mcp` 回 503。`cuemem serve --no-mcp` 关掉它。注册的例子：
+- **HTTP：`cuemem serve` 的 `/mcp`**（Streamable HTTP，无状态，JSON 响应），与服务共用记忆系统。令牌同 `/api`（不对时 401，带 `WWW-Authenticate: Bearer`）。`X-CueMem-User` 与 `X-CueMem-Agent` 请求头选空间，与记忆代理相同；不带时限定作用域的令牌用它自己的第一个用户，管理令牌、不鉴权与只有通配的令牌要带 `X-CueMem-User`（否则 400）。作用域之外的用户或 Agent 回 403、什么都不写；别的网站的 Origin 回 403。不是 ASCII 的 ID 在这两个请求头里写成 `utf-8''<UTF-8 的百分号编码>`（RFC 8187），例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`，Node 的客户端（包括 Claude Code）只能这样发；原样的 UTF-8 也认（别的原样字节按 Latin-1 读，ASCII 的值原样）；`utf-8''` 写错、百分号编码的字节不是 UTF-8，或者 `utf-8''` 与非 ASCII 的值里带控制字符时 400（`{"detail"}`）。请求体按固定 8 MiB 那一档，MCP SDK 自己另有 4 MiB 的上限。应用的 lifespan 还没启动时（uvicorn 总会启动它）`/mcp` 回 503。`cuemem serve --no-mcp` 关掉它。注册的例子：
 
   ```bash
   claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp \
