@@ -37,7 +37,8 @@ N11 只有一个外部基线：开源的 Mem0 2.2（D-055），用的还是 CueM
 6. **A-MEM 对检索条数很敏感**：
    - 论文的主要设置 k = 10 时，pds 58.0%、pq 59.5%，与朴素检索相当（B2 59.5%、64.0%）；检索结果里含证据发言的题 pds 67.5%、pq 73.0%（L1 92.5%、95.0%）。两个协议之间差得不多，不像 Graphiti 与 LangMem。
    - 换成作者给 GPT-4o 级模型的 k = 40（复用同一份写入）：pds 升到 75.0%（对 k = 10 +40 / −6，p < 0.001），pq 65.0%（+26 / −15，p = 0.1173）；每题输入 29,550 / 16,323 tokens，是 L2 的 2.4 倍 / 1.2 倍。
-   - L1 与 L2 对 k = 40 的 A-MEM 仍显著更好：pds L1 +27 / −12（p = 0.0237；敏感性一族里校正后仍是 0.0237，"全文"一族里 0.1896）、L2 +32 / −8（p = 0.0002）；pq 都是 p < 0.001。
+   - 对 k = 40 的 A-MEM，pds 下 L2 仍显著更好（+32 / −8，p = 0.0002）；L1 只是名义显著（+27 / −12，p = 0.0237：敏感性一族的 3 个检验里另两个都是 p < 0.001，它的 p 最大、乘数是 1，等于没有校正；"全文"一族里 0.1896）。pq 下 L1、L2 都是 p < 0.001。
+   - 第四轮体检（D-071）补记：如果把 k = 40 的 A-MEM 换进"L1、L2 对外部系统"那 10 个检验的一族，用 `routing.holm` 按上面发表的胜负重算，L1 校正后是 0.0948、L2 是 0.0015；族的定义没有改，这个数不在任何 JSON 里。
 
 ## 1. 比较了什么、怎么比
 
@@ -363,6 +364,8 @@ A-MEM 的 k = 40 对 k = 10：pds +40 / −6（p < 0.001），pq +26 / −15（p
 
 外部系统都不是 CueMem 的依赖，评测时用 `uv run --with` 临时装上。重跑时如果 `data/` 下的写入与响应缓存还在，会直接复用、几乎不花钱。从头跑时，服务端的回答不完全确定，数字会有小的波动（N11 §5.2）。
 
+版本（第四轮体检之后补记，D-071）：发表的写入没有记下间接依赖的版本。构建机的 uv 缓存（2026-10-14/15）里是下面固定的顶层版本，外加 spacy 3.8.16、fastembed 0.9.0 与 chromadb 1.5.9（下面的命令现在都固定了这几个）；同一个版本的外部系统在构建期间就装出过不同的间接依赖（langchain 1.4.6 / 1.4.3、neo4j 6.4.0 / 6.4.1、transformers 5.19.0 / 5.20.0）。留下来的包清单在 [environments/](environments/)`<系统>.txt`，只是记录、不是锁文件。从现在起的写入在 build.json 里记下 `environment`（装着的全部包与版本）。[pds-locomo.json](pds-locomo.json) 与 [pq-locomo.json](pq-locomo.json) 新增 `methods.<方法>.retrieval`（会话召回与发言召回，与上面的口径相同；M0、ML 的检索结果不带发言 ID，发言召回是 null；B1 没有检索，没有这个键）与外部系统的 `methods.<方法>.build`（实体、事实、警告条数、空会话、超长记忆等写入规模），文档引用的这些数字以前不在任何 JSON 里；只多了新键，其余与之前逐字节相同。
+
 ```bash
 uv run cuemem data download locomo     # 划分 evals/splits/locomo_test200r.json 已在仓库里
 export SPACY_SM=https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
@@ -376,7 +379,7 @@ pds（要 `DEEPSEEK_API_KEY`；`--extra local` 装上本机向量）：
 export CUEMEM_PRESET=deepseek
 uv run --extra local cuemem eval run --dataset locomo --split test200r --peak wait \
     --max-cost 15 --methods B1,B2,B4-nobm25,B5,B6 --name pds-locomo-cuemem
-uv run --extra local --with mem0ai==2.2.1 --with spacy --with fastembed \
+uv run --extra local --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \
     --with "en_core_web_sm @ $SPACY_SM" cuemem eval run --dataset locomo --split test200r \
     --peak wait --max-cost 5 --methods M0 --name pds-locomo-mem0
 uv run --extra local --with "graphiti-core[kuzu]==0.30.2" cuemem eval run \
@@ -389,9 +392,9 @@ uv run --extra local --with langmem==0.0.30 --with langchain-openai==1.7.2 \
     --methods ML --name pds-locomo-langmem
 uv run --extra local --with cognee==1.6.4 cuemem eval run --dataset locomo --split test200r \
     --peak wait --workers 7 --max-cost 8 --methods MC --name pds-locomo-cognee
-uv run --extra local --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \
+uv run --extra local --with "agentic-memory @ $AMEM" --with chromadb==1.5.9 cuemem eval run --dataset locomo \
     --split test200r --peak wait --workers 7 --max-cost 15 --methods MA --name pds-locomo-amem
-CUEMEM_AMEM_K=40 uv run --extra local --with "agentic-memory @ $AMEM" cuemem eval run \
+CUEMEM_AMEM_K=40 uv run --extra local --with "agentic-memory @ $AMEM" --with chromadb==1.5.9 cuemem eval run \
     --dataset locomo --split test200r --peak wait --workers 7 --max-cost 6 --methods MA \
     --name k40-pds-locomo-amem
 uv run python scripts/n12_baselines.py --protocol pds --dataset locomo
@@ -403,7 +406,7 @@ pq（要 `DASHSCOPE_API_KEY`；写入放在另一个目录，不碰 pds 的写�
 export CUEMEM_PRESET=qwen CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen
 uv run cuemem eval run --dataset locomo --split test200r --peak warn \
     --max-cost 15 --methods B1,B2,B4-nobm25,B5,B6 --name pq-locomo-cuemem
-uv run --with mem0ai==2.2.1 --with spacy --with fastembed \
+uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \
     --with "en_core_web_sm @ $SPACY_SM" cuemem eval run --dataset locomo --split test200r \
     --peak warn --max-cost 8 --methods M0 --name pq-locomo-mem0
 uv run --with "graphiti-core[kuzu]==0.30.2" cuemem eval run \
@@ -416,9 +419,9 @@ uv run --with langmem==0.0.30 --with langchain-openai==1.7.2 \
     --methods ML --name pq-locomo-langmem
 uv run --with cognee==1.6.4 cuemem eval run --dataset locomo --split test200r \
     --peak warn --workers 7 --max-cost 6 --methods MC --name pq-locomo-cognee
-uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \
+uv run --with "agentic-memory @ $AMEM" --with chromadb==1.5.9 cuemem eval run --dataset locomo \
     --split test200r --peak warn --workers 7 --max-cost 6 --methods MA --name pq-locomo-amem
-CUEMEM_AMEM_K=40 uv run --with "agentic-memory @ $AMEM" cuemem eval run --dataset locomo \
+CUEMEM_AMEM_K=40 uv run --with "agentic-memory @ $AMEM" --with chromadb==1.5.9 cuemem eval run --dataset locomo \
     --split test200r --peak warn --workers 7 --max-cost 3 --methods MA --name k40-pq-locomo-amem
 uv run python scripts/n12_baselines.py --protocol pq --dataset locomo
 ```

@@ -6,9 +6,11 @@
 - **回答与判分**：主回答模型 deepseek-flash，判分 qwen3.8-max。另有三个回答模型在分层子集上复测（D-049）。
 - **成本**：名义成本（D-010），每题只算回答；一次性的写入（向量化与巩固）不在内，见下面主结果表后的说明。
 
-完整的表格在 [tables.md](tables.md)（由脚本生成），原始数字在 [results.json](results.json)，人工错误标注在 [error_labels.json](error_labels.json)。综合起来的结论与讨论见[技术报告](../../report.md)。
+完整的表格在 [tables.md](tables.md)（由脚本生成；第四轮体检之后表头写明成本只算回答与泄漏，配对比较多一列"Holm 校正后"，D-071），原始数字在 [results.json](results.json)，人工错误标注在 [error_labels.json](error_labels.json)。综合起来的结论与讨论见[技术报告](../../report.md)。
 
 显著性（第二轮体检之后补记，D-069）：这里的 p 都是单个比较的配对符号检验。[results-holm.json](results-holm.json) 按族做了 Holm 校正（`scripts/multiplicity.py`，族的定义在它的说明里：每个数据集的总体方法对比、每个对比的分题型、控制器、每个回答模型下的对比各是一族）。校正后不再显著的结论在下面标成"名义显著"，括号里写校正后的 p；准确率、胜负与原始 p 都没有改。
+
+会话 ID 泄漏（N12 补记，D-067）：本页 LongMemEval 上检索类方法（朴素检索、L1、L2、控制器、模型自主检索等）的数字都是在泄漏修复之前测的；无记忆、L0、全上下文与 ORACLE 不受影响，LoCoMo 与 MemLens 也不受影响。[泄漏对照](../n12-leak/README.md)在 test100r 上没测出 L1、L2 与控制器的虚高，但 95% 区间仍容许单个方法约 8 个点；数字照原样保留。
 
 ## 结论
 
@@ -69,7 +71,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="pareto-dark.png">
-  <img alt="四个测试集上各方法的准确率与每千题名义成本；曲线是冻结的控制器在不同 λ 下的取舍" src="pareto-light.png" width="900">
+  <img alt="四个测试集上各方法的准确率与每千题名义回答成本（不含一次性的写入；全上下文在 LongMemEval 与 MemLens 128K 上超出横轴，画在右边缘并标着真实的数）；曲线是冻结的控制器在不同 λ 下的取舍" src="pareto-light.png" width="900">
 </picture>
 
 - ORACLE 在 LongMemEval 与 MemLens 上低于 L2：它只给原始的证据会话，没有结构化的事实、日期标注和笔记。
@@ -168,6 +170,7 @@
 2. **门控对"指代已分享图片"、没有第一人称线索的问题加少量标注**（N7 里 20 条目标数据就能补回 LoCoMo 的迁移）。
 3. **"各档准确率"表随回答模型重新标定。**
 4. **L1 默认先记笔记**：LoCoMo 上 +3.1 个点（+49 / −13，p < 0.001），LongMemEval 上 +1.3 个点（n.s.），成本 +16–18%。
+5. **混合流的同话题问题有几条不该算无关查询**（第四轮体检之后补记，D-071）：1,750 条生成的同话题问题里有 4 条与对应的记忆题逐字相同（gpt4_1a1dc16d、e493bb7c、conv-43-q71、conv-47-q36），另有几条近似的副本仍在问那段对话（如 gpt4_0b2f1d21、conv-50-q12/q51/q100、conv-42-q79），却都标成不需要记忆；每一条最多让同话题的 AUC（0.984）与误召回率变动 1/1,750；冻结的文件保持原样。
 
 ## 花费
 
@@ -189,8 +192,11 @@ DeepSeek 账户当天实际扣款 ¥122.71。按账本里的 token 数核算（�
 
 ```bash
 uv run python scripts/reproduce.py --only N9     # 全部 N9 运行 + 分析（有本地缓存时几乎不花钱；跳过没跑过的大模型档）
-uv run python scripts/n9_report.py               # 只重新生成 results.json、tables.md 与图
+uv run python scripts/n9_tables.py               # 只按发表的 JSON 重新生成 tables.md（不需要运行）
+uv run python scripts/n9_report.py --figures-only  # 只按发表的 results.json 重画图（不需要运行）
 uv run python scripts/n9_errors.py summarize     # 汇总人工标注（errors.json）
 ```
+
+完整的 `uv run python scripts/n9_report.py` 要 N9 的四个测试集运行（runs/eval/，不在仓库里）；缺一个就停下、什么都不写。
 
 人工标注的错题清单（含对话原文）用 `scripts/n9_errors.py dump` 导出到 `runs/eval/n9-final/`。它不提交：LoCoMo 是 CC BY-NC。

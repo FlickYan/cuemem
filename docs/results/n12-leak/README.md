@@ -219,7 +219,7 @@ CUEMEM_EVAL_RAW_SESSION_IDS=label uv run cuemem eval run $LME \
 
 # Mem0：mem0ai 不是依赖，临时装上。与 scripts/reproduce.py 相同，只是这里固定了版本（N11、N12 用的是 2.2.1）
 SPACY_SM="en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
-MEM0=(uv run --with mem0ai==2.2.1 --with spacy --with fastembed --with "$SPACY_SM")
+MEM0=(uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 --with "$SPACY_SM")
 "${MEM0[@]}" cuemem eval run $LME --methods M0 --name orig-lme-mem0
 CUEMEM_EVAL_RAW_SESSION_IDS=label "${MEM0[@]}" cuemem eval run $LME \
     --methods M0 --name orig-lme-label-mem0

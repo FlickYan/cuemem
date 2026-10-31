@@ -99,6 +99,7 @@
   - pds（只用 DeepSeek）：所有角色都是 deepseek-flash，判分也是（与回答模型相同，有给自己打分的风险）；向量是本机的 BAAI/bge-small-en-v1.5；没有重排。
   - pq（只用通义）：抽取、回答与外部系统内部的调用都是 qwen3.8-flash，判分 qwen3.8-max（与回答模型同一家族）；向量 qwen3.7-text-embedding，重排 qwen3-rerank。
 - 每个配置只跑一次；配对比较用同一批题上的精确符号检验。
+- 每个适配层都有偏离上游的地方（Mem0 与 LangMem 放宽了检索条数，pds 下 Graphiti 没有重排、不走 BFS，A-MEM 修了上游的错，共用的向量器只读前 6000 个字符），逐条列表与各适配层的链接见技术报告的 [§13.4](report.md#134-局限)。
 
 | 方法 | pds | pq | 写入的名义成本 pds / pq |
 |---|---|---|---|
@@ -121,11 +122,12 @@
   - pq：对 Mem0 +24 / −9（p = 0.014，校正后 0.041），Cognee +30 / −8（p < 0.001），LangMem、Graphiti 与 A-MEM 都是 p < 0.001；
   - 对 k = 40 的 A-MEM 也显著（pds +32 / −8，p < 0.001）；
   - 比全上下文高，但不显著（pds +12 / −7，p = 0.36；pq +19 / −9，p = 0.087）。
-- **检索时不调用 LLM 的 L1，在 pds 下与 Mem0、LangMem、Cognee 没有显著差别**：对 Mem0 +14 / −11（p = 0.69），LangMem +24 / −15（p = 0.20），Cognee +20 / −10（p = 0.10）；对 Graphiti +55 / −8、A-MEM +56 / −7（p < 0.001），对 k = 40 的 A-MEM +27 / −12（p = 0.024）。pq 下显著高于 Cognee（+25 / −10，p = 0.017，校正后 0.041）与 A-MEM（p < 0.001），与 Mem0 没有显著差别（+19 / −11，p = 0.20）。这些检验都以每个系统的一次写入为条件。
+- **检索时不调用 LLM 的 L1，在 pds 下与 Mem0、LangMem、Cognee 没有显著差别**：对 Mem0 +14 / −11（p = 0.69），LangMem +24 / −15（p = 0.20），Cognee +20 / −10（p = 0.10）；对 Graphiti +55 / −8、A-MEM +56 / −7（p < 0.001），对 k = 40 的 A-MEM +27 / −12（p = 0.024；只是名义显著，"全文"一族里校正后 0.19）。pq 下显著高于 Cognee（+25 / −10，p = 0.017，校正后 0.041）与 A-MEM（p < 0.001），与 Mem0 没有显著差别（+19 / −11，p = 0.20）。这些检验都以每个系统的一次写入为条件。
 - **A-MEM 对检索条数很敏感**：论文的主要设置 k = 10 时与朴素检索相当；作者给 GPT-4o 级模型的 k = 40 在 pds 下高出 17 个点（对 k = 10 +40 / −6，p < 0.001），但每题输入 29,550 tokens，是 L2 的 2.4 倍。
 - **换模型的影响**：CueMem、Mem0、Cognee、A-MEM（k = 10）从 pds 换到 pq 只差 0–3.5 个点，Graphiti 与 LangMem 大幅掉分。
   - Graphiti：用它自己的提示词，qwen3.8-flash 抽出的实体少得多（7 段对话 1,253 → 462 个，事实 3,426 → 1,774 条）；pq 下每段对话记下 118–270 条 "Target entity not found" 警告，这些事实被丢掉。pq 下的发言召回 0.545（朴素检索 0.845，CueMem L1 0.95）。
   - LangMem：qwen3.8-flash 用 PatchDoc 把新信息并进少数几条长记忆（705 → 123 条），丢了写入的会话 2 / 202 → 23 / 202。
+  - 下降主要在写入一侧（qwen3.8-flash 用它们自己的提示抽出 462 个实体而不是 1,253 个，LangMem 202 个会话里有 23 个没写进去）；共用评测框架在读的一侧的影响（Graphiti 的 0.6 阈值没有按通义向量重调，LangMem 的长记忆在向量器 6000 个字符的输入处被截断）没有单独量过。
   - 这两家的提示词与阈值都没有为通义重调。反过来，CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调出来的（N3–N7），pq 对它是主场；pds 下没有哪个系统的抽取提示是对着 deepseek-flash 调的，但 deepseek-flash 是 CueMem 在 N2–N9 的回答模型（共用的回答提示与控制器的各档准确率表都是用它定的），所以两个协议都不完全中立；pds 下 L2 同样领先（对 Mem0 只是名义显著）。
 
 N11 在原协议下（抽取与向量用通义、回答 deepseek-flash、判分 qwen3.8-max）对比过开源 Mem0 2.2（D-055）：LoCoMo 200 题 80.5% 对 CueMem L1 81.0%（持平），LongMemEval 100 题 83.0% 对 92.0%（名义 p = 0.049，多重比较校正后 0.147），Mem0 的写入成本是 2.3–2.9 倍，丢分在时间推理、知识更新与助手说过的细节。N2–N11 发布的 LongMemEval 上检索类方法的数字（包括这一组和上面 LongMemEval 表里 CueMem 的 L1 / L2 / 控制器；全上下文不受影响）都带着会话 ID 泄漏，已修复并做了对照（D-067，[泄漏对照](results/n12-leak/README.md)）：test100r 的消融里 L1、L2 与控制器没有可测的虚高，但 95% 区间仍容许单个方法虚高约 8 个点（L1 +2.0，区间 −3.7 到 +8.1）、L1、L2 与控制器平均约 3–4 个点，这 100 题里只有 5 道拒答题，`_abs` 那部分泄漏几乎测不到；修复后同样设置下 L1 90% 对 Mem0 79%，Mem0 发布的 83% 可能高了几个点。
@@ -177,8 +179,9 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 按"用户最先会碰到"的顺序：
 
 1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺手写的 TypeScript 客户端（别的语言经 HTTP 的 `/api/v1`，它的 OpenAPI 快照可以生成 TypeScript 的类型）与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
-2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070）。还缺：令牌文件只在启动时读，没有生成令牌的命令；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
+2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070），可选的按令牌上限（`rate_per_minute`、`models`、`max_output_tokens`）是第四轮（D-071）。还缺：按令牌的每日花费预算；令牌文件只在启动时读，没有生成令牌的命令；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
 3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；过期只在 SDK 的 `search`、`get_all` 与画像里生效，记忆代理、MCP、`/api` 与各集成在删除之前仍看得到；Supermemory 那样自动认出临时事实、让它过期的还没有。
 6. **面向开发者的英文文字**：命令行的提示、核心模块抛出的大部分异常（包括 `/api` 的报错）与 SDK 的大部分文档字符串是中文，这一点有意不改；另写了一份英文的接口参考（[docs/en/api.md](en/api.md)，中文版 [docs/api.md](api.md)，D-069）。SDK 自己的报错、`/api/v1`、记忆代理、MCP 工具与界面是英文（N12 之后的体检，D-068）。
+7. **正式发布**：CueMem 还没有发布到 PyPI，也没有打版本标签，从 GitHub 安装（`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"`）；PyPI 上名叫 cuemem 的包不是这个项目（D-071）。
