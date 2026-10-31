@@ -77,7 +77,9 @@ dev = [
 # Pillow 12.x 有 41 条安全公告，只在 13.0.0 修好；gradio 6.30/6.31 与 fastembed 0.9.0 声明了
 # pillow<13，不覆盖时锁文件（Docker 镜像与 uv sync）停在 12.x。整套离线测试在 13 上通过，发给
 # 模型的图片字节不变（store/media.py 的 image_data_url 分两次缩放；tests/test_store.py 钉着摘要）。
-# 只管 uv：pip 装 cuemem[ui] 照旧解到 Pillow<13，所以核心依赖的下限仍是 12.3.0
+# 只管 uv：pip 装 cuemem[ui] 照旧解到 Pillow<13，所以核心依赖的下限仍是 12.3.0。在这个目录里
+# 运行的 uv pip install 同样被覆盖（uv pip install pillow==12.3.0 装上的是 13.0.0）：要拿 12.x 对比
+# 图片字节，在仓库之外建环境，或者用 uv run --with pillow==12.3.0（--with 不受覆盖）
 override-dependencies = ["pillow>=13.0.0"]
 
 [tool.ruff]
