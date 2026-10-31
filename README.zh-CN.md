@@ -5,9 +5,11 @@
 
 [English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [接口参考](docs/api.md) · [与 Mem0、Letta、Zep 等的对比](docs/landscape.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
-> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变；仓库公开之后第四轮从六个视角再查，修掉核实为真的 22 处（D-071）：有安全公告的依赖与 CI 的供应链、安全策略、公网部署（不鉴权时的 DNS 重绑定、太短的令牌、按令牌的花费上限、Qdrant 的 API Key、只给本人读写的文件、界面不联系第三方）、删除传到进行中的会话并且不留残留、跨过重启的 run、从 GitHub 安装与更顺的第一次运行、许可声明，以及与外部基线比较的说法，评测请求、图片请求与发表的数字都不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 <a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
+
+*视频里的成本只算回答（写入另有一次性的成本，见下面的结果）；LongMemEval 的数字是在会话 ID 泄漏修复之前测的（D-067）。*
 
 ![演示：跨会话回忆、尺码的更新、按八月的照片找同款、预算的变化与遗忘](docs/assets/demo.gif)
 
@@ -35,7 +37,7 @@ with m.run(user_id="alice") as run_id:
     m.add("算了，还是 150 吧。", user_id="alice", run_id=run_id)
 ```
 
-每轮 add 一次同一个 `run_id` 也可以，但每次都要把整段对话重新抽取一遍、重放派生记忆；一段对话分多次写入时用 `with m.run(...)` 包起来。SDK 缺省 `peak_policy="warn"`：DeepSeek 工作日的高峰时段里照常按高峰价调用，不会停下来等高峰结束；批量写入想拿错峰价时传 `Memory(peak_policy="wait")`。
+每轮 add 一次同一个 `run_id` 也可以，但每次都要把整段对话重新抽取一遍、重放派生记忆；一段对话分多次写入时用 `with m.run(...)` 包起来。SDK 缺省 `peak_policy="warn"`：DeepSeek 工作日的高峰时段里照常按高峰价调用，不会停下来等高峰结束；批量写入想拿错峰价时传 `Memory(peak_policy="wait")`。用完要关掉：`m.close()`，或者用 `with Memory(...) as m:` 打开；不关就退出的脚本会打印一段无害的 Qdrant "Exception ignored" 调用栈。
 
 Mem0 的其余接口也有，语义按 CueMem 的来：
 
@@ -97,7 +99,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 
 也可以接进 Agent 框架：OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool，每次调用模型之前由控制器决定要不要想起（见[框架集成](docs/integrations.md)）。
 
-另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server（stdio，或 `cuemem serve` 的 `/mcp`）、记忆的导出与导入（`cuemem export / import`）、按用户与 Agent 限定作用域的访问令牌，以及 Docker 镜像（`docker compose up`，要设访问令牌）。见[快速开始](#快速开始)、[部署](#部署)与 [examples/](examples/)。
+另有带记忆浏览器的 HTTP 接口（`cuemem serve`）、MCP Server（stdio，或 `cuemem serve` 的 `/mcp`）、记忆的导出与导入（`cuemem export / import`）、按用户与 Agent 限定作用域的访问令牌，以及 Docker 镜像（`docker compose up`，要设访问令牌）。见[快速开始](#快速开始)、[部署](#部署)与 [examples/](examples/)（英文的示例索引，写着每个示例要的 Key 与命令）。
 
 ## 它要解决什么
 
@@ -145,7 +147,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | 遗忘 | 删出处的对话、沿引用扩散、找没有引用的转述；可预演 | `delete` | 编辑记忆 | `remove_episode` | `forget_matching`，可预演 |
 | 评测 | 方法事先冻结、测试集上只做一遍冻结的评测、同样的模型与判分下对比外部基线 | 自己的基准仓库 | 博客 | 论文 | 自有 |
 
-**同一协议下的对比（N12）**：我们自己在 LoCoMo 200 题上跑了 5 个开源记忆系统，各用自己的写入与检索流程，抽取模型、向量、回答模型与判分都和 CueMem 相同；只用 DeepSeek、只用通义两个协议，每个配置跑一次。
+**同一协议下的对比（N12）**：我们自己在 LoCoMo 200 题上跑了 5 个开源记忆系统，各用自己的写入与检索流程，抽取模型、向量、回答模型与判分都和 CueMem 相同（只用 DeepSeek 时判分就是回答模型本身）；只用 DeepSeek、只用通义两个协议，每个配置跑一次。
 
 | LoCoMo test200r | 只用 DeepSeek | 只用通义 |
 |---|---|---|
@@ -157,7 +159,7 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=messages, user="al
 | A-MEM（k = 10 / k = 40） | 58.0% / 75.0% | 59.5% / 65.0% |
 | 全上下文 | 84.5% | 80.0% |
 
-L2 在两个协议下都高于这 5 个系统（配对符号检验名义 p ≤ 0.017，k = 40 的 A-MEM 也在内）；每个协议里 L1、L2 对 5 个系统的 10 个检验一起做 Holm 校正后，只有只用 DeepSeek 时 L2 对 Mem0（+17 / −5，校正后 p = 0.068）不再显著，其余的领先都仍显著。检索时不调用 LLM 的 L1 在只用 DeepSeek 时与 Mem0、LangMem、Cognee 没有显著差别，显著高于 Graphiti 与 A-MEM。A-MEM 列了论文的主要设置（k = 10）与作者给 GPT-4o 级模型的设置（k = 40），后者每题的输入是 L2 的 2.4 倍。Graphiti 与 LangMem 在通义下大幅掉分：用它们自己的提示词，qwen3.8-flash 抽出的实体与记忆少得多。CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调的（N3–N7），只用通义对它是主场。只用 DeepSeek 时没有哪个系统的抽取提示是对着 deepseek-flash 调的，但 deepseek-flash 是 CueMem 在 N2–N9 的回答模型（各系统共用的回答提示与控制器的各档准确率表都是用它定的），所以两个协议都不完全中立；只用 DeepSeek 时 L2 同样领先（对 Mem0 只是名义显著）。这些检验都以每个系统的一次写入为条件，写入路径的随机性没有测。详见 [N12 外部基线](docs/results/n12-baselines/README.md)与[对比文档](docs/landscape.md#同一协议下的对比n12)。
+L2 在两个协议下都高于这 5 个系统（配对符号检验名义 p ≤ 0.017，k = 40 的 A-MEM 也在内）；每个协议里 L1、L2 对 5 个系统的 10 个检验一起做 Holm 校正后，只有只用 DeepSeek 时 L2 对 Mem0（+17 / −5，校正后 p = 0.068）不再显著，其余的领先都仍显著。检索时不调用 LLM 的 L1 在只用 DeepSeek 时与 Mem0、LangMem、Cognee 没有显著差别，显著高于 Graphiti 与 A-MEM。A-MEM 列了论文的主要设置（k = 10）与作者给 GPT-4o 级模型的设置（k = 40），后者每题的输入是 L2 的 2.4 倍。Graphiti 与 LangMem 在通义下大幅掉分：下降主要在写入一侧（qwen3.8-flash 用它们自己的提示抽出 462 个实体而不是 1,253 个，LangMem 202 个会话里有 23 个没写进去）；共用评测框架在读的一侧的影响（Graphiti 的 0.6 阈值没有按通义向量重调，LangMem 的长记忆在向量器 6000 个字符的输入处被截断）没有单独量过。CueMem 的抽取提示与阈值是在 qwen3.8-flash 和通义向量上调的（N3–N7），只用通义对它是主场。只用 DeepSeek 时没有哪个系统的抽取提示是对着 deepseek-flash 调的，但 deepseek-flash 是 CueMem 在 N2–N9 的回答模型（各系统共用的回答提示与控制器的各档准确率表都是用它定的），所以两个协议都不完全中立；只用 DeepSeek 时 L2 同样领先（对 Mem0 只是名义显著）。这些检验都以每个系统的一次写入为条件，写入路径的随机性没有测。各适配层偏离上游的地方（检索条数、只用 DeepSeek 时 Graphiti 没有重排、A-MEM 修的上游错误）列在[技术报告 §13.4](docs/report.md#134-局限)。详见 [N12 外部基线](docs/results/n12-baselines/README.md)与[对比文档](docs/landscape.md#同一协议下的对比n12)。
 
 CueMem 的短板在产品层：只有 Python 的 SDK（别的语言走 HTTP 接口，TypeScript 的类型可以从它的 OpenAPI 快照生成，但没有手写的 TypeScript 客户端）、只支持 SQLite + Qdrant（不能多实例部署；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端）、框架集成目前只有三个（见[还差什么](docs/landscape.md#7-还差什么)）。
 
@@ -184,7 +186,7 @@ uv run cuemem data download              # 下载评测数据集（LongMemEval_S
 uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4）；dev100 为正式开发集
 ```
 
-不克隆仓库时从 GitHub 安装：`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"` 装的是核心：SDK、`MemoryClient`、命令行、HTTP 接口、记忆代理与 MCP。其余是可选依赖，可以叠加（`cuemem[ui,local]`）：
+不克隆仓库时从 GitHub 安装：`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"` 装的是核心：SDK、`MemoryClient`、命令行、HTTP 接口、记忆代理与 MCP。其余是可选依赖，可以叠加，例如 `pip install "cuemem[ui,local] @ git+https://github.com/FlickYan/cuemem"`。CueMem 还没有发布到 PyPI，PyPI 上名叫 cuemem 的包不是这个项目；请照上面从 GitHub 安装。
 
 | 可选依赖 | 加上什么 |
 |---|---|
@@ -193,9 +195,38 @@ uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4�
 | `eval` | 评测的图，以及控制器与门控的训练脚本（matplotlib、scikit-learn）。没装时 `cuemem eval run` 与 `eval report` 说明要装哪个、退出 1 |
 | `integrations` | OpenAI Agents SDK、LangGraph / LangChain 与 Anthropic 的集成（也可以只装 `openai-agents`、`langgraph`、`anthropic` 之一） |
 
-源码仓库里 `uv sync` 经开发依赖组装上 `ui` 与 `eval`，需要时再加 `--extra local` 或 `--extra integrations`。pip 安装后命令是 `cuemem …`（不是 `uv run cuemem …`），数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`cuemem serve` 启动通用助手，因为导购演示的商品目录只在仓库里（`cuemem demo` 读剧本旁边的 `catalog.json`）。开发机上 `cuemem --help` 与 `import cuemem.sdk` 约 0.3–0.4 秒。CI 每次推送都在仓库外装 wheel，跑命令行、SDK 与服务。
+源码仓库里 `uv sync` 经开发依赖组装上 `ui` 与 `eval`，需要时再加 `--extra local` 或 `--extra integrations`。用 pip 装 `cuemem[ui]` 或 `cuemem[local]` 时 Pillow 仍解到 13 以下：gradio 与 fastembed 声明了 `pillow<13`，而 Pillow 12 有只在 13 修好的安全公告；接收别人图片的服务请用 Docker 镜像，或在源码仓库里 `uv sync --locked`，它们装的是 Pillow 13。pip 安装后命令是 `cuemem …`（不是 `uv run cuemem …`），数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`cuemem serve` 启动通用助手，因为导购演示的商品目录只在仓库里（`cuemem demo` 读剧本旁边的 `catalog.json`）。开发机上 `cuemem --help` 与 `import cuemem.sdk` 约 0.3–0.4 秒。CI 每次推送都在仓库外装 wheel，跑命令行、SDK 与服务。
 
-没有 Key 时也可以离线体验写入与检索，向量改用哈希近似：在命令前加 `CUEMEM_EMBEDDING__BACKEND=hash`，回答仍然需要 LLM。
+命令行的提示是中文；Agent、网页界面、演示、`/api/v1`、记忆代理与 MCP 工具是英文，SDK 的返回值与它自己的报错也是英文；更深处的核心抛出的错误（缺 Key、向量库被占用、配置写错）是中文。预设名写错或 `CUEMEM_*` 的值不合法时，任何命令都只打印一行"错误：配置有误：…"并以 1 退出。
+
+没有任何 API Key 时也能试写入与检索：运行 `uv run python examples/keyless.py`，它在临时的数据目录里用哈希向量：
+
+```python
+import tempfile
+from cuemem import Memory
+
+with (
+    tempfile.TemporaryDirectory() as home,
+    Memory(home=home, config={"embedding": {"backend": "hash"}}, background=False) as m,
+):
+    m.add(
+        [{"role": "user", "content": "I just started a new job at Acme in Berlin."}],
+        user_id="alice",
+        infer=False,
+    )
+    print(m.search("Where do I work?", user_id="alice")["results"][0]["memory"])
+```
+
+经 HTTP：先 `CUEMEM_HOME=$(mktemp -d) CUEMEM_EMBEDDING__BACKEND=hash uv run cuemem serve`，再
+
+```bash
+curl -X POST http://127.0.0.1:7860/api/v1/memories -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "I just started a new job at Acme in Berlin."}], "user_id": "alice", "infer": false}'
+curl -X POST http://127.0.0.1:7860/api/v1/memories/search -H 'Content-Type: application/json' \
+  -d '{"query": "Where do I work?", "user_id": "alice"}'
+```
+
+抽取、回答（`cuemem ask`、`Memory.answer`）与 `--consolidate` 要 LLM 的 Key。数据目录会记住它的向量模型（命令失败了也一样），所以试用不要放在 `./data`、`~/.cuemem` 或 Docker 的卷里。
 
 对话 Agent 与演示（N8，只用通义）：
 
@@ -229,28 +260,53 @@ uv run pytest -m live                    # 联网冒烟测试，需要 Key，费
 uv run ruff check . && uv run mypy       # 代码风格与类型检查
 ```
 
-离线测试在网络守卫（`tests/netguard.py`）之下跑：去掉代理变量与供应商的 Key，设 `GRADIO_ANALYTICS_ENABLED=False`，哪个测试想连非本机地址或环境变量里的代理就让它失败（`-m live` 不受影响）。本机跳过的 22 个测试在 CI 里跑：外部基线适配层的测试在每周一次的"外部基线"工作流里（固定版本、离线，命令写在各测试文件的说明里；Mem0 的还要 spaCy 的模型 wheel，并先下载 fastembed 的 `Qdrant/bm25` 模型：`uv run --with ... python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"`），Qdrant 服务端的测试在 `qdrant-server` 任务里（本机：`docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1`，再 `CUEMEM_TEST_QDRANT_URL=http://localhost:6333 uv run pytest tests/test_qdrant_server.py`）。
+离线测试在网络守卫（`tests/netguard.py`）之下跑：去掉代理变量与供应商的 Key，设 `GRADIO_ANALYTICS_ENABLED=False`，哪个测试想连非本机地址或环境变量里的代理就让它失败（`-m live` 不受影响）。本机跳过的 22 个测试在 CI 里跑：外部基线适配层的测试在每周一次的"外部基线"工作流里（固定版本、离线，命令写在各测试文件的说明里；Mem0 的还要 spaCy 的模型 wheel，并先下载 fastembed 的 `Qdrant/bm25` 模型：`uv run --with ... python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"`），Qdrant 服务端的测试在 `qdrant-server` 任务里（本机：`docker run -d -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.19.1`，再 `CUEMEM_TEST_QDRANT_URL=http://localhost:6333 uv run pytest tests/test_qdrant_server.py`；服务端设了 API Key 时另设 `CUEMEM_TEST_QDRANT_API_KEY`，CI 就是这样）。参与开发请用 uv 0.12.24，CI 与 Docker 镜像固定的就是这个版本。
 
 ### 部署
 
 默认用嵌入式的 SQLite 与 Qdrant 本地模式，一个数据目录同时只允许一个进程：几个应用要共用一份记忆时，经 `MemoryClient` 或 `/api/v1` 连同一个 `cuemem serve`。pip 安装后数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）。本地模式每个用户空间一直开着一个文件（有图的两个），所有向量都载入内存，用户多的共用服务要换 Qdrant 服务端（`cuemem migrate-vectors --to URL`，再设 `CUEMEM_VECTOR_STORE__URL`，见下）。每个 `cuemem` 命令都把打开文件数的软上限调到硬上限，`cuemem doctor` 列出集合数与上限。
 
-- **访问令牌**：`cuemem serve` 与 `cuemem proxy` 监听非本机地址又没有令牌时拒绝启动（只在可信的网络里不鉴权时加 `--insecure-no-auth`）。`CUEMEM_API_TOKEN` 是管理令牌。限定作用域的令牌写在 `CUEMEM_API_KEYS_FILE` 指向的 YAML 文件里（或直接写在 `CUEMEM_API_KEYS` 里），每个令牌只能访问列出的用户与 Agent，例如 `{name: alice-app, sha256: <printf %s "$TOKEN" | sha256sum>, scopes: [{user: alice}]}`。点名了作用域之外的用户、Agent 或空间时 403（`/api`、`/api/v1`、`/mcp`、界面与记忆代理都一样），别人的记忆 ID 与不存在的一样（404），`POST /api/v1/reset` 只删这个令牌自己的空间。格式与规则见[接口参考](docs/api.md#鉴权与限定作用域的令牌)。
-- **HTTP 上的 MCP**：`cuemem serve` 也在 `/mcp`（Streamable HTTP）提供 MCP 工具，令牌同上；`X-CueMem-User` 选用户，`--no-mcp` 关掉。注册：`claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp --header "Authorization: Bearer $KEY" --header "X-CueMem-User: alice"`。stdio 的 `cuemem mcp` 不能与运行中的 serve 共用本地数据目录。
-- **请求的上限**：请求体在读之前就以 413 拒绝：`/api`、`/v1` 与界面上传 64 MiB（`CUEMEM_MAX_BODY_BYTES`），导入 1 GiB（`CUEMEM_MAX_IMPORT_BYTES`；导出的文件很大时调高），别处 8 MiB。限定作用域的令牌导入也按请求体上限，同时在处理的请求体加起来也不超过它（429，带 `Retry-After: 1`）：解析出来的 JSON 约是请求体的 24 倍，共用的服务要按令牌数留内存，或者调小上限。像素超过 Pillow 上限（约 8,900 万）的图片在调用模型之前就拒绝。
-- **长时间运行**：对话会话、`/api/v1` 的 run 与记忆代理的会话闲置 30 分钟后结束、交给抽取（`--idle-minutes`）。trace（`runs/traces/*.jsonl`，里面有用户的提问）在遗忘之前一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`。最多同时抽取 4 个用户的记忆（`CUEMEM_CONSOLIDATION__BACKGROUND_WORKERS`）。界面缺省会发 Gradio 的使用统计，设 `GRADIO_ANALYTICS_ENABLED=False` 关掉。
+- **访问令牌**：`cuemem serve` 与 `cuemem proxy` 监听非本机地址又没有令牌时拒绝启动（只在可信的网络里不鉴权时加 `--insecure-no-auth`；不鉴权时只接受 IP 地址、localhost、监听的主机名与 `CUEMEM_ALLOWED_HOSTS` 里的名字作为 Host）。监听非本机地址时令牌至少 16 个字符（用 `openssl rand -hex 32` 生成）；更短的拒绝启动（退出码 2），除非加 `--insecure-weak-token`（compose 里加进 `command:`）；`sha256:` 的条目量不出长度，不查。`CUEMEM_API_TOKEN` 是管理令牌。限定作用域的令牌写在 `CUEMEM_API_KEYS_FILE` 指向的 YAML 文件里（或直接写在 `CUEMEM_API_KEYS` 里），每个令牌只能访问列出的用户与 Agent，例如 `{name: alice-app, sha256: <printf %s "$TOKEN" | sha256sum>, scopes: [{user: alice}]}`。点名了作用域之外的用户、Agent 或空间时 403（`/api`、`/api/v1`、`/mcp`、界面与记忆代理都一样），别人的记忆 ID 与不存在的一样（404），`POST /api/v1/reset` 只删这个令牌自己的空间。格式与规则见[接口参考](docs/api.md#鉴权与限定作用域的令牌)。
+- **令牌能花多少**：作用域管的是能访问谁的记忆，不是能花多少。任何有效的令牌都能让服务器调用运营者的模型供应商：`/v1/chat/completions` 与 `/v1/responses`（带不带 user 都行；model、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发）、`/v1/embeddings`（最多 2,048 条）、`/api` 的对话、`POST /api/v1/answer`、`/mcp`，以及每一次写入（之后的抽取每写入一个字节约向上游发 2 个字符）。只把令牌给你愿意让它花这笔钱的人，在供应商那里设花费上限，在反向代理里按 `Authorization` 头限流（例如 nginx 的 `limit_req_zone $http_authorization ...`），调小 `CUEMEM_MAX_BODY_BYTES` 限住一次写入的花费。每个令牌还可以另写可选的上限，例如 `{name: alice-app, sha256: ..., scopes: [{user: alice}], rate_per_minute: 60, models: [qwen3.8-flash], max_output_tokens: 2000}`：`rate_per_minute` 数它在 `/api`、`/api/v1`、`/v1` 与 `/mcp` 上写的请求（POST、PUT、DELETE；读的请求不算），超过时 429，带 `Retry-After`；`models` 让记忆代理只接受列出的别名或模型 ID（别的 403），并用目录里的设置（如 `enable_thinking`）盖过调用方给的；`max_output_tokens` 截住或补上记忆代理的 `max_tokens`，`n` 不是 1 时拒绝。不写这几个字段时什么都不变；界面的会话不受它们管。
+- **HTTP 上的 MCP**：`cuemem serve` 也在 `/mcp`（Streamable HTTP）提供 MCP 工具，令牌同上；`X-CueMem-User` 选用户，`--no-mcp` 关掉。注册：`claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp --header "Authorization: Bearer $KEY" --header "X-CueMem-User: alice"`。不是 ASCII 的 ID 写成 `utf-8''%E5%BC%A0%E4%B8%89`（UTF-8 的百分号编码，这里是张三；curl 原样发的 UTF-8 也认）。stdio 的 `cuemem mcp` 不能与运行中的 serve 共用本地数据目录。
+- **请求的上限**：请求体在读之前就以 413 拒绝：`/api`、`/v1` 与界面上传 64 MiB（`CUEMEM_MAX_BODY_BYTES`），导入 1 GiB（`CUEMEM_MAX_IMPORT_BYTES`；导出的文件很大时调高），别处 8 MiB。限定作用域的令牌导入也按请求体上限，同时在处理的请求体加起来也不超过它（429，带 `Retry-After: 1`）：解析出来的 JSON 约是请求体的 24 倍，共用的服务要按令牌数留内存，或者调小上限。图片只收 JPEG、PNG、WEBP、GIF、BMP 与 TIFF，像素超过 Pillow 上限（约 8,900 万）的也拒绝；这两项检查都在任何解码与模型调用之前。
+- **长时间运行**：对话会话、`/api/v1` 的 run 与记忆代理的会话闲置 30 分钟后结束、交给抽取（`--idle-minutes`）。之后用同一个 `run_id` 再 add 会重新打开闲置结束的 run，它结束时整段再抽取一次、从日志把这个用户的整个空间重放一遍（D-045），重放期间这个用户的事实在 search 与 `get_all` 里暂时没有，约为一次抽取的时间。`cuemem serve` 停止或崩溃时还开着的 run 跨过重启：用同一个 `run_id` 再 add 就接着写，启动后第一个闲置期里别的请求不接手它，没人接着写的由 serve 与 proxy 在启动一个闲置期之后交给抽取。之前的进程已经因闲置结束的 run（或交接过、超过 10,000 个之后不再记得的）重启之后算普通会话：之后每次 add 都整段再抽取、重放这个用户的整个空间。长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。trace（`runs/traces/*.jsonl`，里面有用户的提问）在遗忘之前一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`。最多同时抽取 4 个用户的记忆（`CUEMEM_CONSOLIDATION__BACKGROUND_WORKERS`）。
+- **界面默认不联系第三方**：字体用 Gradio 自带的 IBM Plex Sans，Gradio 的使用统计与版本检查（api.gradio.app、huggingface.co）要设 `GRADIO_ANALYTICS_ENABLED=True` 才打开。
 - **供应商出错**在 HTTP 接口上各有状态码，不再是没有说明的 500：限流 429（带 `Retry-After`）、余额不足 402、暂时不可用 503（带 `Retry-After`）、超时 504、内容审核拒绝 422、其余 502。
-- **浏览器**：别的网站发来的浏览器请求一律 403；监听本机地址时只接受 Host 为 127.0.0.1、localhost、[::1] 的请求，经反向代理或别的主机名访问时把这些主机名写进 `CUEMEM_ALLOWED_HOSTS`（逗号分隔，可以写在 `.env` 里）。
+- **浏览器**：别的网站发来的浏览器请求在 `/api`、`/v1`、`/mcp`、界面的 `/gradio_api` 与登录的 `/login` 上一律 403。监听本机地址时只接受 Host 为 127.0.0.1、localhost、[::1] 的请求；加了 `--insecure-no-auth` 又监听别的地址时只接受 IP 地址、localhost 与监听的主机名。经反向代理或别的主机名访问时把这些主机名写进 `CUEMEM_ALLOWED_HOSTS`（逗号分隔，可以写在 `.env` 里）。
+- **磁盘上的文件**：CueMem 建的数据文件只给本人读写（文件 0600、新建的目录 0700），已经存在的目录不改；现有的源码仓库里运行 `cuemem doctor`，它会列出别人能读的目录与文件和要运行的 `chmod 700 <目录>` / `chmod 600 <文件>`（例如 `chmod 700 data runs/traces`），也查 `.env` 与 `CUEMEM_API_KEYS_FILE`。界面的上传与图库副本放在这次启动自己的临时目录里，停下时删掉；设 `GRADIO_TEMP_DIR` 可以换成自己的目录。
 
-用 Docker 时先在 `.env` 里设好令牌（例如 `openssl rand -hex 32` 生成）。`docker compose up -d` 在宿主机的 127.0.0.1:7860 同时提供界面、接口与记忆代理，并带一个 Qdrant 服务端，没有令牌时直接报错；单个容器：`docker build -t cuemem .` 之后 `docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem`。镜像默认带界面与本机向量（可选依赖 ui 与 local），`--build-arg EXTRAS=` 构建只有接口的镜像。容器里用限定作用域的令牌时，把令牌文件放进数据卷（`/data`）、用 `CUEMEM_API_KEYS_FILE` 指向它，或者直接写在 `CUEMEM_API_KEYS` 里；compose 仍然要求 `CUEMEM_API_TOKEN`。不用 Docker 时：
+用 Docker 时先 `install -m 600 .env.example .env`（源码仓库里 `uv run cuemem configure` 写的 `.env` 就是 compose 读的那个文件），再设 `CUEMEM_API_TOKEN`（例如用 `openssl rand -hex 32` 生成）与所用配置的 Key：
+
+- 默认配置：`DEEPSEEK_API_KEY` 与 `DASHSCOPE_API_KEY`；
+- 或者 `CUEMEM_PRESET=openai` 加 `OPENAI_API_KEY`；
+- 或者 `CUEMEM_PRESET=deepseek` 加 `DEEPSEEK_API_KEY`（镜像里带着本机向量）；
+- 或者 `CUEMEM_PRESET=ollama` 加 `CUEMEM_PROVIDERS__OLLAMA__BASE_URL=http://host.docker.internal:11434/v1`（宿主机上的 Ollama 要监听容器连得到的地址，不能只听 127.0.0.1）。
+
+`.env` 里的注释要单独一行：`docker run --env-file` 把 `=` 之后的全部算作值。之后 `docker compose up -d` 在宿主机的 127.0.0.1:7860 同时提供界面、接口与记忆代理，并带一个 Qdrant 服务端，没有令牌时直接报错。它在容器启动之后就返回：http://127.0.0.1:7860/ 没有响应时，`docker compose ps` 显示 cuemem 容器在 Restarting，`docker compose logs cuemem` 里有一行原因（多半是缺 Key，或令牌短于 16 个字符）；改好 `.env` 再 `docker compose up -d`。`.env` 里设了 `CUEMEM_VECTOR_STORE__API_KEY` 时 compose 里的 Qdrant 要这个 Key、cuemem 带上它；不设时内部的 Qdrant（不映射端口）照旧不鉴权。单个容器：`docker build -t cuemem .` 之后 `docker run -p 127.0.0.1:7860:7860 -v cuemem-data:/data --env-file .env cuemem`。镜像默认带界面与本机向量（可选依赖 ui 与 local），`--build-arg EXTRAS=` 构建只有接口的镜像；缺可选依赖时重新构建镜像（例如 `docker build --build-arg EXTRAS="--extra ui --extra local --extra eval" -t cuemem .`），不在容器里用 pip 装。容器里用限定作用域的令牌时，把令牌文件放进数据卷（`/data`）、用 `CUEMEM_API_KEYS_FILE` 指向它，或者直接写在 `CUEMEM_API_KEYS` 里；compose 仍然要求 `CUEMEM_API_TOKEN`。不用 Docker 时，起一个带 API Key 的 Qdrant 服务端，接口用令牌保护：
 
 ```bash
-docker run -d -p 6333:6333 qdrant/qdrant:v1.19.1        # Qdrant 服务端（本地模式同一时间只允许一个进程打开数据目录）
+export CUEMEM_VECTOR_STORE__API_KEY=$(openssl rand -hex 32)   # 也写进 .env
+docker run -d --name cuemem-qdrant -p 127.0.0.1:6333:6333 -v cuemem-qdrant:/qdrant/storage \
+  -e QDRANT__SERVICE__API_KEY="$CUEMEM_VECTOR_STORE__API_KEY" qdrant/qdrant:v1.19.1
 uv run cuemem migrate-vectors --to http://localhost:6333  # 已有的本地向量原样复制过去
-export CUEMEM_VECTOR_STORE__URL=http://localhost:6333    # 之后都用服务端（也可以写进 .env）
-CUEMEM_API_TOKEN=换成你的令牌 uv run cuemem serve --host 0.0.0.0   # /api、/api/v1、/v1 与 /mcp 要带 Bearer 令牌，界面先登录
+export CUEMEM_VECTOR_STORE__URL=http://localhost:6333    # 之后都用服务端（也写进 .env）
+echo "CUEMEM_API_TOKEN=$(openssl rand -hex 32)" >> .env   # 令牌不出现在 shell 的历史里
+uv run cuemem serve --host 0.0.0.0   # /api、/api/v1、/v1 与 /mcp 要带 Bearer 令牌，界面先登录
 uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基准（不调用 API，不覆盖发表的表）
 ```
+
+不写 127.0.0.1 时 Docker 在所有网卡上公开这个端口并绕过 ufw；不加 -v 时 docker rm（比如升级镜像）会删掉所有向量，CueMem 没有重建索引的命令。CueMem 把 `CUEMEM_VECTOR_STORE__API_KEY`（只从环境变量或 `.env` 读，没有命令行参数）作为 Qdrant 的 `api-key` 请求头发出，`cuemem migrate-vectors` 也一样，`cuemem doctor` 写明设了没有。URL 是 `http://` 时 qdrant-client 每个客户端警告一次 Key 经不加密的连接发送：本机与 compose 的内部网络上无妨；远处的服务端与 Qdrant Cloud 用 `https://`。
+
+#### 公网部署
+
+`cuemem serve` 说的是明文 HTTP。Bearer 令牌与界面的密码是同一个秘密，没有 TLS 时它们连同每条记忆都以明文经过网络。要从可信网络之外访问时：
+
+- 不用 Docker 时让 `cuemem serve` 监听 127.0.0.1；用 compose 时保留 `127.0.0.1:7860:7860` 的映射。
+- 在前面放 TLS 反向代理。Caddy 默认转发 Host 与 `X-Forwarded-Proto`：`mem.example.com { reverse_proxy 127.0.0.1:7860 }`。nginx 在做 `proxy_pass http://127.0.0.1:7860;` 的 `location` 里设 `proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_buffering off;`（后几项让界面的流式输出照常工作）。
+- 在 `.env` 里设 `CUEMEM_ALLOWED_HOSTS=mem.example.com`，Host 与 Origin 的检查才认这个名字。
+- `.env` 只给本人读写（`chmod 600 .env`；`cuemem configure` 与 `install -m 600` 建出来就是这样），令牌用 `openssl rand -hex 32` 生成。
+- CueMem 不限制登录与令牌出错的次数，在反向代理里做，例如 nginx 的 `limit_req`：`/login` 按客户端地址，接口按 `Authorization` 头。
 
 ## 文档
 
@@ -272,9 +328,13 @@ uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基�
 
 代码与文档以 [MIT 许可证](LICENSE) 发布。
 
-- 仓库里照搬的 LongMemEval 与 MemLens 判分提示词同样是 MIT 许可，原作者的声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 仓库里照搬的 LongMemEval 与 MemLens 判分提示词、A-MEM 的关键词提示同样是 MIT 许可（MemLens 的可能还适用 CC BY 4.0，见第三方声明），原作者的声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 - 评测数据集由 `cuemem data download` 从发布方下载、不随仓库分发，各自的许可不变：LongMemEval_S（MIT）、LoCoMo（CC BY-NC 4.0）、MemLens（CC BY 4.0，图片沿用来源站点的许可）、databricks-dolly-15k（CC BY-SA 3.0）；WildChat-1M（只取一个分片、点名才下载，ODC-BY，N11）。
-- 仓库只存划分用的题号、Dolly 的行号、WildChat 的会话哈希，以及由基准题目生成的同话题问题。这些文件的归属在第三方声明里写明。
+- 仓库只存划分用的题号、Dolly 的行号、WildChat 的会话哈希，以及由基准题目生成的同话题问题；其中有几条生成的问题与基准原题逐字相同；由 LoCoMo 生成的那些是 CC BY-NC 4.0，仅限非商业用途（`evals/mixed/` 不在 MIT 许可之内）。这些文件的归属在第三方声明里写明。
+
+## 安全
+
+发现漏洞请经 GitHub 私下报告，见 [SECURITY.md](SECURITY.md)。
 
 ## 进度
 
@@ -296,10 +356,13 @@ uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基�
 | N12 后续 | 全面体检：七个视角找问题，修掉 24 处，评测请求不变 | 已完成 |
 | N12 后续 | 第二轮体检：留到以后的 17 条做了 14 条（原子写入、供应商出错、对账与遗忘的代价、启动与依赖、数据集与显著性、Mem0 接口与 `MemoryClient`、多租户、记忆代理），评测请求不变 | 已完成 |
 | N12 后续 | 第三轮体检：七个视角从头再查，修掉核实为真的 22 处（遗忘与锁、提交之后的出错、删除的残留、`status()`、闲置结束、规模与打开的文件、界面与输入的上限、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现与说法），评测请求不变 | 已完成 |
+| N12 后续 | 第四轮体检（仓库公开之后）：六个视角，修掉核实为真的 22 处（依赖的安全公告与 CI 供应链、安全策略、公网部署、删除传到进行中的会话、跨过重启的 run、遗忘的残留、文件权限、从 GitHub 安装与第一次运行、许可声明、与外部基线比较的说法），评测请求、图片请求与发表的数字不变 | 已完成 |
 
 ## 结果
 
 主线是统一评测框架下的**准确率–成本帕累托曲线**。所有方法共用同一个回答模型（deepseek-flash）与同一个判分模型（qwen3.8-max，LongMemEval 官方判分模板）。
+
+会话 ID 泄漏（N12 补记，D-067）：下面 N2–N11 各节里 LongMemEval 上检索类方法的数字都是在泄漏修复之前测的；无记忆、L0、全上下文与 ORACLE 不受影响，LoCoMo 与 MemLens 也不受影响；泄漏对照见 [docs/results/n12-leak/README.md](docs/results/n12-leak/README.md)，数字照原样保留。
 
 ### N11 测试集之后的补做（事后，不再用测试集做选择）
 
@@ -337,7 +400,7 @@ LongMemEval 一列里，除全上下文外的各行都是在 N12 修复会话 ID
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/n9-final/pareto-dark.png">
-  <img alt="N9：四个测试集上各方法的准确率与每千题名义成本" src="docs/results/n9-final/pareto-light.png" width="900">
+  <img alt="N9：四个测试集上各方法的准确率与每千题名义回答成本（不含一次性的写入；全上下文在 LongMemEval 与 MemLens 128K 上超出横轴，画在右边缘并标着真实的数）；曲线是冻结的控制器在不同 λ 下的取舍" src="docs/results/n9-final/pareto-light.png" width="900">
 </picture>
 
 1. **记忆系统比全上下文更准、回答成本更低**：LongMemEval 上 L1 高 17.5 个点、回答成本约 1/20（每份历史写入一次的成本约等于 1.4 次全上下文的回答，见表下的说明）；MemLens 上全上下文从 32K 到 128K 掉 5.6 个点，L2 + 再感知几乎不变。

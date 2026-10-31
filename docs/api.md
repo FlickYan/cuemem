@@ -2,7 +2,7 @@
 
 [English](en/api.md) · 中文
 
-程序使用 CueMem 的各种方式：Python SDK（`Memory`、`AsyncMemory`）、远程客户端（`MemoryClient`、`AsyncMemoryClient`）、`cuemem serve` 的 HTTP 接口（`/api` 与 Mem0 形状的 `/api/v1`）、OpenAI 兼容的记忆代理（`/v1`）、MCP Server（stdio 与 HTTP）、环境变量与可选依赖。签名以 CueMem 0.1.0 为准（`src/cuemem/sdk.py`、`client.py`、`api/`）。背后的决定见[决策记录](decisions.md)：D-061（SDK）、D-062（记忆代理）、D-063（导出）、D-056（部署与令牌）、D-069（第二轮体检，`/api/v1` 的大部分、`MemoryClient`、限定作用域的令牌、metadata、`update` 与 `reset` 都是这一轮加的）、D-070（第三轮体检，加了 `status`、HTTP 上的 MCP、请求的大小上限、闲置结束、带类型的客户端与下面 Mem0 的写法）。
+程序使用 CueMem 的各种方式：Python SDK（`Memory`、`AsyncMemory`）、远程客户端（`MemoryClient`、`AsyncMemoryClient`）、`cuemem serve` 的 HTTP 接口（`/api` 与 Mem0 形状的 `/api/v1`）、OpenAI 兼容的记忆代理（`/v1`）、MCP Server（stdio 与 HTTP）、环境变量与可选依赖。签名以 CueMem 0.1.0 为准（`src/cuemem/sdk.py`、`client.py`、`api/`）。背后的决定见[决策记录](decisions.md)：D-061（SDK）、D-062（记忆代理）、D-063（导出）、D-056（部署与令牌）、D-069（第二轮体检，`/api/v1` 的大部分、`MemoryClient`、限定作用域的令牌、metadata、`update` 与 `reset` 都是这一轮加的）、D-070（第三轮体检，加了 `status`、HTTP 上的 MCP、请求的大小上限、闲置结束、带类型的客户端与下面 Mem0 的写法）、D-071（仓库公开之后的第四轮体检：按令牌的上限、Qdrant 的 API Key、公网监听更严的检查、请求头里不是 ASCII 的 ID、跨过重启的 run）。
 
 语言：SDK 的返回值与它自己的报错、`/api/v1`、记忆代理与 MCP 工具是英文；命令行、较早的 `/api` 接口、401 的说明，以及核心模块更深处抛出的报错（缺 Key、向量库被占用、配置写错）是中文。
 
@@ -16,11 +16,12 @@
 | + 评测的图，以及控制器与门控的训练脚本（matplotlib、scikit-learn） | 可选依赖 `eval` |
 | + 框架集成 | 可选依赖 `openai-agents`、`langgraph`、`anthropic`，三个都要时 `integrations` |
 
-可选依赖可以叠加：`pip install "cuemem[ui,local] @ git+https://github.com/FlickYan/cuemem"`。需要 Python 3.12 或更新的版本。源码仓库里 `uv sync` 经开发依赖组装上 `ui` 与 `eval`；`uv sync --no-dev` 时要加 `--extra ui --extra eval`。
+可选依赖可以叠加：`pip install "cuemem[ui,local] @ git+https://github.com/FlickYan/cuemem"`。CueMem 还没有发布到 PyPI，PyPI 上名叫 cuemem 的包不是这个项目：一律从 GitHub 安装。需要 Python 3.12 或更新的版本。源码仓库里 `uv sync` 经开发依赖组装上 `ui` 与 `eval`；`uv sync --no-dev` 时要加 `--extra ui --extra eval`。
 
-- 没装 `ui` 时，`cuemem serve` 只提供 `/api`、`/api/v1`、`/mcp`、`/docs` 与 `/v1`，并说明怎么装界面（`pip install "cuemem[ui]"`，源码仓库里是 `uv sync --extra ui`）。
+- 没装 `ui` 时，`cuemem serve` 只提供 `/api`、`/api/v1`、`/mcp`、`/docs` 与 `/v1`，并说明怎么装界面（`pip install "cuemem[ui] @ git+https://github.com/FlickYan/cuemem"`，源码仓库里是 `uv sync --extra ui`）。
 - 没装 `eval` 时，`cuemem eval run`（`--build-only` 除外）与 `cuemem eval report` 给出同样的安装提示、退出码 1；`eval split`、`eval probe`、`eval audit` 与 `data download` 照常。
-- Docker 镜像缺省装 `ui` 与 `local`；`docker build --build-arg EXTRAS= .` 构建只有接口的镜像。
+- Docker 镜像缺省装 `ui` 与 `local`；`docker build --build-arg EXTRAS= .` 构建只有接口的镜像。镜像里缺可选依赖时办法是重新构建，例如 `docker build --build-arg EXTRAS="--extra ui --extra local" -t cuemem .`（再加 `--extra eval` 等），镜像里的提示也这样说：容器里的 pip 装进别的环境，镜像里也没有 git。
+- 用 pip 装 `cuemem[ui]`（与 `cuemem[local]`）时 Pillow 仍解到 13 以下：gradio 与 fastembed 声明了 `pillow<13`，而 Pillow 12 有只在 13 修好的安全公告。接收别人图片的服务请用 Docker 镜像，或在源码仓库里 `uv sync --locked`，它们装的是 Pillow 13。两者发给模型的图片字节相同。
 - 包带着 `py.typed`，mypy 与 pyright 会检查对 CueMem 的调用（升级之后可能报出新的、正确的错误）。
 
 ## 记忆空间与身份
@@ -166,6 +167,9 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 - 报告里有 `message`、`turns_deleted`、`sessions_affected`、`facts_before`、`facts_after`、`images_deleted`、`restated`；删除做完、用剩下的日志重建出错时另有 `warning`（下次巩固时补上）。
 - 还没删任何东西就出错的遗忘（向量接口不可用、向量库或数据库出错）照常抛出、什么都不删，可以原样重试。
+- 删除提交之后的清理从不抛出。某天的 trace 文件重写不了时（例如磁盘满了），CueMem 把那一天的文件整个删掉：同一天别的用户的调试 trace 也没了，`cuemem.core.trace` 记一条警告，这些 trace 的查询向量一起删掉。重写不了也删不掉的文件写在遗忘 trace 的 `traces_left` 属性里，要手工删。清理向量缓存出错时（例如 "database or disk is full"，或源码仓库里与评测共用的 `embed.sqlite` 报 "database is locked"），`cuemem.memory` 记一条警告，遗忘的 trace 记 `embed_cache_left: true`；删除照样成功，这次清理不再重试。`delete_all` 与 `reset` 之后同样。
+- 除了提问的查询向量，遗忘还删掉 L2 的子查询与追加查询、Agent 自己的记忆检索与导购演示的商品检索的查询向量，用 DashScope 多模态向量器时还删以文搜图的查询向量，以及别的记忆不再用的被删图片的向量。
+- 同一个记忆系统上开着的对话会话（界面、`/api`）在任何一次删除之后的下一轮去掉被删的内容，不管删除从哪里来（包括 `/api/v1` 的 delete、`delete_all` 与 `reset`）；删除重建期间开始的会话，下一轮取回重建好的画像。
 - 一句发言都没删、事实却还在时（它出处的发言已经不在日志里，旧版本可能留下这种情况），`message` 是 `"Nothing deleted"`，`warning` 让调用方 `consolidate(rebuild=True)`。
 - 删一条事实或一段对话片段遗忘的是整轮对话，同一轮的别的 ID 之后报 KeyError，与不存在的 ID 一样。照 Mem0 写的 `for r in results: m.delete(r["id"])` 要接住 KeyError。
 - 不要在 `m.system.reading(space)` 里调用 `m.system` 的 `forget`、`delete_space` 或 `consolidate`：会抛 RuntimeError，而不是死锁。
@@ -174,7 +178,10 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 **`status`**。一个用户（或 Agent）的记忆的抽取状态：`pending`（等着抽取的会话数）；`failed`，每个抽取失败的会话一项，带 `session_id`、`attempts`、`error`（出错的第一行）与 `retry_at`（后台线程什么时候重试，ISO 时间；失败到 3 次、流水线版本不同、或没有后台线程时是 `null`，这时要 `consolidate()`）；`background`（有没有后台线程）；`errors`，后台线程在这个空间最近的 3 条出错。后台抽取失败时还在 `cuemem.write.consolidate` 日志里记一条警告，同一空间、同一类出错只记一次。
 
-**run**。`open_run` 开始一段对话：之后 `add(run_id=...)` 照常在线写入、立即可检索，但到 `end_run` 才抽取，那时整段交给抽取（`wait=True` 当场抽取并返回报告，否则 `consolidation` 是 `"queued"`）。`with m.run(user_id="alice") as run_id:` 两步都做。崩溃的进程留下的 run，由下一个进程第一次碰到这个空间时交给抽取。本地的 SDK 自己不结束 run；`cuemem serve` 下闲置 30 分钟的 `/api/v1` run 会被结束（`close_idle_runs`），同一个 `run_id` 的下一次 `add` 重新打开它。
+**run**。`open_run` 开始一段对话：之后 `add(run_id=...)` 照常在线写入、立即可检索，但到 `end_run` 才抽取，那时整段交给抽取（`wait=True` 当场抽取并返回报告，否则 `consolidation` 是 `"queued"`）。`with m.run(user_id="alice") as run_id:` 两步都做。本地的 SDK 自己不结束 run；`cuemem serve` 下闲置 30 分钟的 `/api/v1` run 会被结束（`close_idle_runs`），同一个 `run_id` 的下一次 `add` 重新打开它：它结束时整段再抽取一次、从日志把这个用户的整个空间重放一遍（D-045），重放期间这个用户的事实在 `search` 与 `get_all` 里暂时没有，约为一次抽取的时间。
+
+- **跨过重启**：服务停止或崩溃时还开着的 run 跨过重启，用同一个 `run_id` 的下一次 `add`（或 `open_run`）接着写。`cuemem serve` 与 `cuemem proxy` 下，启动后第一个闲置期里别的请求不接手它，没人接着写的在启动一个闲置期（`--idle-minutes`）之后交给抽取；本进程交接过、调用方又回来接着写的 run，像闲置结束的 run 一样重新打开。本地的 SDK 与命令行第一次碰到这个空间时，就把调用方不接着写的 run 交给抽取。
+- **接不上的**：之前的进程已经因闲置结束的 run（或交接过、超过 10,000 个之后不再记得的）重启之后算普通会话：之后每次 `add` 都整段再抽取、重放这个用户的整个空间（D-045），每次重放期间这个用户的事实在 `search` 与 `get_all` 里暂时没有。长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。
 
 **导出与导入**。`export` 返回 `cuemem.space` 格式的版本 2：会话、发言（有 `metadata`、`expires_at`、`edit_of` 时带上）与 base64 的原图，另可附上事实与画像的快照（导入时不用）。`load` 把原始日志写回去，再重新抽取派生记忆（`wait=True` 时当场做）。不给 `user_id`、`agent_id` 时导入到文件里原来的空间，这时文件里没有 `space_id` 就报 ValueError。版本 1 的文件照样能导入；文件里有任何一张图或一处 metadata 不对时，什么都不写，格式坏了（缺键、类型不对）的文件报 `ValueError("Malformed export: …")`。
 
@@ -199,7 +206,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 `cuemem.errors` 定义了 `CueMemError` 与它的子类：`MissingAPIKeyError`、`CacheMissError`、`StructuredOutputError`、`EmbeddingAPIError`（带 `status` 与 `retry_after`）、`DatasetChecksumError`、`ConfigMismatchError`、`ConsolidationError`、`ContentFilteredError`、`ConcurrentWriteError`、`StorageLockedError`、`VectorStoreOpenError`（本地模式的 Qdrant 打不开或建不了集合，多半是打开的文件太多；说明里写着集合数、上限与办法）、`AccessKeysError` 与 `MemoryAPIError`（带 `status`、`code`、`type` 与 `retry_after`）。SDK 还会按上面说的抛 KeyError、ValueError、TypeError 与 RuntimeError；OpenAI 客户端库的异常在 CueMem 自己的重试之后原样抛出。
 
-日志：`cuemem.write.consolidate`（后台抽取失败，英文）、`cuemem.core.trace`（trace 写不进去）、`cuemem.memory`（遗忘的发言的图片文件删不掉）、`cuemem.sdk`（高峰时段的等待）与 `cuemem.api.proxy`。
+日志：`cuemem.write.consolidate`（后台抽取失败，英文）、`cuemem.core.trace`（trace 写不进去，或遗忘时只好整个删掉某天的 trace 文件）、`cuemem.memory`（遗忘的发言的图片文件删不掉，或遗忘提交之后的清理出错）、`cuemem.sdk`（高峰时段的等待）与 `cuemem.api.proxy`。
 
 ## 远程客户端：`MemoryClient`
 
@@ -229,7 +236,7 @@ MemoryClient(
 - `metadata` 发送之前照 SDK 的规则检查（JSON 会悄悄把非字符串的键变成字符串），`limit` 与 `top_k` 也是（JSON 的 `true` 会变成 1）。
 - 时间参数（`timestamp`、`at`、`known_at`、`expiration_date`）按 ISO 格式发送。不带时区的时间按服务器的本机时间理解，客户端与服务器不在一个时区时请带上时区。
 - 抛出与 `Memory` 相同的异常：KeyError、ValueError、TypeError 与 `cuemem.errors` 里的类型；`EmbeddingAPIError` 带着 `status` 与 `retry_after`。别的 HTTP 出错（令牌不对、连不上服务、超出令牌作用域的 403、其他供应商出错）是 `MemoryAPIError`，带 `status`（连不上时为 None）、`code`（错误码见下）、`type`（服务端的异常类，例如 `RateLimitError`）与 `retry_after`（响应的 Retry-After，429 与 503 时有）。没有异常类型的 404 另外说明 `base_url` 要是 `cuemem serve` 的根地址；连不上时问那里是不是在运行 `cuemem serve`。客户端不自动重试：重试 POST 可能写两遍。别的租户的 ID 与不存在的一样，`get()` 返回 `None`。
-- `close()`（或 `with MemoryClient(...) as m:`）结束这个客户端开的 run。远程开了、一直没结束的 run，`cuemem serve` 在闲置 30 分钟（`--idle-minutes`）后结束它，同一个 `run_id` 的下一次 `add` 重新打开。
+- `close()`（或 `with MemoryClient(...) as m:`）结束这个客户端开的 run。远程开了、一直没结束的 run，`cuemem serve` 在闲置 30 分钟（`--idle-minutes`）后结束它，同一个 `run_id` 的下一次 `add` 重新打开；服务重启时还开着的 run，由带它的 `run_id` 的下一次 `add` 接着写（见上面的 run）。
 - 框架集成要本地的 `Memory` 或 `AsyncMemory`：传 `MemoryClient` 时在构造时就抛 TypeError。
 - 这个模块只导入 httpx2 与 `cuemem._async`，不加载记忆系统。
 
@@ -247,15 +254,18 @@ MemoryClient(
 | `--router` / `--lam` | `learned` / 控制器模型里的值 | 对话用的检索控制器 |
 | `--no-ui` | 关 | 只启动接口、记忆代理与 MCP |
 | `--no-mcp` | 关 | 不在 `/mcp` 提供 MCP |
-| `--idle-minutes` | `30` | 对话会话、`/api/v1` 的 run 与记忆代理的会话闲置这么久后结束、交给抽取（要大于 0） |
-| `--insecure-no-auth` | 关 | 没有任何令牌也在非本机地址上启动 |
+| `--idle-minutes` | `30` | 对话会话、`/api/v1` 的 run 与记忆代理的会话闲置这么久后结束、交给抽取（要大于 0）；也是启动之后过多久把之前的进程留下的会话交给抽取 |
+| `--insecure-no-auth` | 关 | 没有任何令牌也在非本机地址上启动；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字 |
+| `--insecure-weak-token` | 关 | 监听非本机地址时也允许短于 16 个字符的令牌 |
 | `--unknown-model` | `proxy.unknown_model`（`remap`） | 记忆代理收到不认识的模型时：`remap` 或 `reject` |
 
 每个 `cuemem` 命令都先把进程打开文件数的软上限调到硬上限（最多 65,536）。Qdrant 本地模式每个集合（每个记忆空间一个，有图的两个）一直开着一个文件、启动时全部打开，用户多的服务器请用 Qdrant 服务端（`cuemem migrate-vectors --to URL`，再设 `CUEMEM_VECTOR_STORE__URL`）。`cuemem doctor` 列出集合数与上限。
 
 ### 鉴权与限定作用域的令牌
 
-- 没有配任何令牌时不鉴权，只能监听本机地址：监听非本机地址又没有令牌时拒绝启动，除非加 `--insecure-no-auth`。
+- 没有配任何令牌时不鉴权，只能监听本机地址：监听非本机地址又没有令牌时拒绝启动，除非加 `--insecure-no-auth`；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字（否则 400，防 DNS 重绑定）。
+- 监听非本机地址时每个令牌至少 16 个字符（`cuemem.api.auth.MIN_TOKEN_CHARS`）：管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是。更短的让 `cuemem serve` 与 `cuemem proxy` 在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项、从不打印令牌本身，除非加 `--insecure-weak-token`（compose 里加进 `command:`）。用 `openssl rand -hex 32` 生成令牌。`sha256:` 的条目量不出长度，不查。
+- 服务说的是明文 HTTP。设了令牌又监听非本机地址时，启动时提示令牌（也是界面的密码）与记忆都不加密地经过网络；可信网络之外要在前面放 TLS 反向代理，见 README 的[公网部署](../README.zh-CN.md#公网部署)。CueMem 不限制登录与令牌出错的次数，在反向代理里做。
 - `CUEMEM_API_TOKEN` 是管理令牌，请求带 `Authorization: Bearer <令牌>`。`GET /api/health` 不要令牌。`/api` 与 `/api/v1` 在读请求体之前就认令牌，没认上的请求不论请求体是什么都回 401。
 - 限定作用域的令牌（`CUEMEM_API_KEYS_FILE` 是 YAML 文件的路径，`CUEMEM_API_KEYS` 是同样内容的 YAML 或 JSON 文本，只能设一个）给每个令牌列出它能访问的用户与 Agent：
 
@@ -270,12 +280,24 @@ MemoryClient(
       scopes:
         - {user: "*", agent: shop}    # 每个用户在 Agent shop 下的记忆（shop/<用户>）
         - {agent: shop}               # shop 自己的记忆（agent/shop）
+    - name: alice-app-limited         # 可选的按令牌上限（三项都可以不写）
+      sha256: <64 位十六进制>
+      scopes: [{user: alice}]
+      rate_per_minute: 60             # 每分钟写的请求（POST、PUT、DELETE）
+      models: [qwen3.8-flash]         # 这个令牌经记忆代理能用的模型
+      max_output_tokens: 2000         # 这个令牌经记忆代理的输出上限
   ```
 
   值是一个 ID 或 ID 的列表；`*` 是任何 ID，`acme:*` 是前缀。`{agent: A}` 只是 Agent A 自己的记忆。`agent/x` 一律算 Agent x 自己的记忆，所以限定作用域的令牌用不了名字就叫 `agent` 的 Agent。不是由 user_id、agent_id 得来的空间（评测空间、名字里有两个以上的 `/`）只有管理令牌能访问；`{user: "*"}` 包括 `shop-demo` 这类普通名字的空间。未知字段报错。令牌在启动时读一次；文件写错时 `cuemem serve` 与 `cuemem proxy` 打印 `错误：…`、退出 1。令牌只按 sha256 摘要做常数时间比较，与每个令牌都比一遍。
+- **作用域管的是能访问谁的记忆，不是能花多少。** 任何有效的令牌都能让服务器调用运营者的模型供应商：`/v1/chat/completions` 与 `/v1/responses`（带不带 user 都行；`model`、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发）、`/v1/embeddings`（最多 2,048 条）、`/api` 的对话、`POST /api/v1/answer`、`/mcp`，以及每一次写入（之后的抽取每写入一个字节约向上游发 2 个字符）。只把令牌给你愿意让它花这笔钱的人，在供应商那里设花费上限，在反向代理里按 `Authorization` 头限流（例如 nginx 的 `limit_req_zone $http_authorization ...`），调小 `CUEMEM_MAX_BODY_BYTES` 限住一次写入的花费。
+- **可选的按令牌上限**（正整数或非空的列表；不写时什么都不变，转发的请求体逐字节相同）：
+  - `rate_per_minute`：在 `/api`、`/api/v1`、`/v1` 与 `/mcp` 上每分钟最多这么多个写的请求（POST、PUT、DELETE）；读的请求（GET）不算。做法是容量为这个数、每秒补 `rate_per_minute / 60` 个的令牌桶。超过时 429，带 `Retry-After`（等到下一个名额的秒数）；`/api/v1` 下 code 是 `rate_limited`，`/api` 下是中文的 `{"detail"}`，`/v1` 与 `/mcp` 下是 `{"detail": "Too many requests for this access key: ..."}`。
+  - `models`：记忆代理（`/v1/chat/completions`，含流式，与 `/v1/responses`）在检索、开会话与转发之前拒绝别的模型，回 OpenAI 格式的 403（type `permission_error`，param `model`，code `forbidden`）。列出的别名只放行这个别名与它在目录里的设置：`models: [deepseek-flash]` 不放行 `deepseek-flash-thinking`；列出的模型 ID 本身不是别名时，放行这个 ID 的每个别名。这种令牌的请求里目录的 `extra_body` 盖过调用方给的，便宜的模型不能借开关变成思考模式。`/v1/embeddings` 不受 `models` 管。
+  - `max_output_tokens`：记忆代理把 `max_tokens` 与 `max_completion_tokens` 截到这个数（两个都没给时补上），`n` 不是 1 时 400（param `n`）。只写它管不住调用方的开关（`enable_thinking`、`thinking` 原样转发），要固定它们得写 `models`。
+  - 管不到的：界面的会话（agent 角色的模型，`max_tokens` 1200）、一次写入的大小（只由 `CUEMEM_MAX_BODY_BYTES` 管）、调用方加的供应商字段（`enable_search` 等）。按日的花费预算没有做。
 - 令牌在作用域之外时：请求点名了用户、Agent 或空间（包括 `filters` 里的用户、`POST /api/sessions` 的缺省空间与导入的目标空间）回 **403**；按 ID 找的记忆与会话回 **404**（history 是 `[]`），与不存在的一样。`/api/spaces` 与 `/api/v1/spaces` 只列出这个令牌的空间。限定作用域的令牌 `POST /api/v1/reset` 只删它作用域里的空间（通配的租户令牌会清空整个租户）。
 - 界面先要求登录：密码是令牌。限定作用域的令牌用它的名字做用户名；管理令牌的用户名任意。经界面发送的文件必须是经界面上传的：指向服务器上别的文件的路径一律拒绝。
-- `/api`、`/v1`、`/mcp` 与 `/gradio_api` 不接受别的网站发来的浏览器请求（403）。监听本机地址时只接受 Host 为 127.0.0.1、localhost、[::1] 与监听地址本身的请求（否则 400）；经反向代理或别的主机名访问时，把主机名写进 `CUEMEM_ALLOWED_HOSTS`。
+- `/api`、`/v1`、`/mcp`、`/gradio_api` 与界面的登录 `/login` 不接受别的网站发来的浏览器请求（403，`Origin: null` 也是；同源与不带 Origin 的登录照常）。监听本机地址时只接受 Host 为 127.0.0.1、localhost、[::1] 与监听地址本身的请求；加了 `--insecure-no-auth` 又监听非本机地址时，接受任何 IP 地址、localhost 与监听的主机名。别的回 400；别的主机名（反向代理的、`nas.local`、别的容器用的 compose 服务名）写进 `CUEMEM_ALLOWED_HOSTS`。设了令牌又监听非本机地址时不查 Host。
 - `/mcp` 上的 MCP 用同样的令牌与作用域（见下）；stdio 的 `cuemem mcp` 不经过 HTTP，没有令牌。
 
 ### 请求的大小上限
@@ -291,6 +313,7 @@ MemoryClient(
 - 超过时回 413（`/api/v1` 下 code 是 `payload_too_large`）；限定作用域的令牌导入时，说明里写着更大的导入要用管理令牌。两个变量都是正整数的字节数（`67108864`，不是 `64MB`）；写成别的时 serve 与 proxy 打印 `错误：…`、退出 1。
 - 解析出来的 JSON 约是请求体的 24 倍，所以一个限定作用域的令牌同时在处理的请求体加起来也不超过 `CUEMEM_MAX_BODY_BYTES`：超过时 429、带 `Retry-After: 1`（`/api/v1` 下 code 是 `rate_limited`；`MemoryClient` 抛 `retry_after="1"` 的 `MemoryAPIError`，OpenAI SDK 会自己重试）。一个令牌因此最多占约 25 倍的上限（缺省约 1.6 GB）。好几个令牌一起来、界面的事件接口不按令牌算：按这个给服务器留内存，或者调小 `CUEMEM_MAX_BODY_BYTES`。管理令牌与不鉴权的部署没有这个总量。
 - 像素超过 Pillow 的 `Image.MAX_IMAGE_PIXELS`（缺省 89,478,485）的图片拒绝：`/api/v1` 400，`/api` 409（对话在召回、调用模型之前先查每张上传的图），记忆代理带着这样的图片的写回只丢这一条。1,600 万像素以上的解码最多同时 2 个。
+- 图片只收 JPEG、PNG、WEBP、GIF、BMP 与 TIFF（手机拍的 MPO 算 JPEG）。别的格式（AVIF、XBM、ICO……）与不是图片的文件在任何解码器运行之前就拒绝：`/api/v1` 400，message 是 `Not a valid image (accepted formats: JPEG, PNG, WEBP, GIF, BMP, TIFF).`（以前是 500），`/api` 409，SDK 报 ValueError（以前是 `PIL.UnidentifiedImageError`），带着这样附件的导入整个失败。记忆代理与 MCP 带着这样的图片的写回只丢这一条。已经存下的别的格式的图照常可用。
 
 ### `/api/v1`：记忆接口
 
@@ -325,7 +348,7 @@ SDK 的每个方法一个接口。请求体与查询参数的名字、缺省值�
 
 | 状态码 | `code` | 什么时候 |
 |---|---|---|
-| 400 | `invalid_request` | ValueError 或 TypeError：没给 user_id 与 agent_id、filters 写错、`limit` 小于 1、图片给了路径或太大、导出文件不对……；不接受的 Host（说明里写着 `CUEMEM_ALLOWED_HOSTS`） |
+| 400 | `invalid_request` | ValueError 或 TypeError：没给 user_id 与 agent_id、filters 写错、`limit` 小于 1、图片给了路径、太大、格式不收或不是图片，导出文件不对……；不接受的 Host（说明里写着 `CUEMEM_ALLOWED_HOSTS`） |
 | 401 | `unauthorized` | 没带令牌或令牌不对 |
 | 402 | `no_balance` | 模型供应商的账户余额不足 |
 | 403 | `forbidden` | 超出令牌的作用域；别的网站发来的浏览器请求 |
@@ -333,7 +356,7 @@ SDK 的每个方法一个接口。请求体与查询参数的名字、缺省值�
 | 409 | `conflict` | `ConcurrentWriteError` |
 | 413 | `payload_too_large` | 请求体超过上限 |
 | 422 | `invalid_request` 或 `content_filtered` | 请求体不合格式（type 是 `ValueError`）；供应商的内容审核拒绝了这次请求 |
-| 429 | `rate_limited` | 重试之后仍被限流，或限定作用域的令牌同时在处理的请求体超过上限；带 `Retry-After` |
+| 429 | `rate_limited` | 重试之后仍被限流、限定作用域的令牌同时在处理的请求体超过上限，或用完了令牌的 `rate_per_minute`；带 `Retry-After` |
 | 502 | `upstream_error` | 其余供应商出错（5xx、连不上、鉴权失败）与 CueMem 的其他出错 |
 | 503 | `unavailable` | 供应商暂时不可用，带 `Retry-After` |
 | 504 | `timeout` | 供应商超时 |
@@ -405,8 +428,8 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice
 | `--host` / `--port` | `127.0.0.1` / `8787` | 监听地址 |
 | `--user` | 无 | 请求没有点名用户时用的用户（不填时这类请求原样转发、不碰记忆） |
 | `--mode` | `auto` | 检索档位：`auto`（控制器）、`l0`、`l1`、`l2` |
-| `--idle-minutes` | `30` | 会话空闲多久后结束并抽取 |
-| `--insecure-no-auth`、`--unknown-model` | | 同 `cuemem serve` |
+| `--idle-minutes` | `30` | 会话空闲多久后结束并抽取；也是启动之后过多久把之前的进程留下的会话交给抽取 |
+| `--insecure-no-auth`、`--insecure-weak-token`、`--unknown-model` | | 同 `cuemem serve` |
 
 | 接口 | 做什么 |
 |---|---|
@@ -416,10 +439,12 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice
 | `GET /v1/models` | 配置里的模型别名与向量模型 |
 
 - **身份**：请求头 `X-CueMem-User` 或请求体的 `user` 字段（请求头优先），可加 `X-CueMem-Agent`；都没有时用 `--user`。限定作用域的令牌要覆盖这个用户与 Agent，否则在检索、开会话与转发之前回 OpenAI 格式的 403（type `permission_error`，code `forbidden`）。没有点名用户的请求原样转发、不碰记忆。`/v1/models` 与 `/v1/embeddings` 任何有效的令牌都能用。
+- **不是 ASCII 的用户或 Agent ID** 在这两个请求头里写成 RFC 8187 的 UTF-8 百分号编码，例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`；Node 的客户端（包括 Claude Code）只能这样发，curl 原样发的 UTF-8 也认，记忆代理也可以把 ID 放进请求体的 `user` 字段。`utf-8''` 写错、不是 UTF-8 或带控制字符时 400（记忆代理是 OpenAI 格式的 `invalid_request_error`，param `user`）。
+- **花费**：作用域管的是能访问谁的记忆，不是能花多少；`model`、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发，除非令牌写了 `models` 或 `max_output_tokens`（见[鉴权与限定作用域的令牌](#鉴权与限定作用域的令牌)）。不在令牌 `models` 里的模型回 OpenAI 格式的 403（type `permission_error`，param `model`），写了 `max_output_tokens` 时 `n` 不是 1 回 400（param `n`）。
 - **会话**：`X-CueMem-Session` 指定会话。不给时，请求里没有之前的消息、或空闲超过 `--idle-minutes` 之后，开一段新的会话；并行的几段对话要各带自己的会话头。闲置的会话另由每分钟一次的清理结束，`cuemem proxy` 与 `cuemem serve` 挂着的代理都是。
 - **响应头**：`X-CueMem-Level`（`L0`、`L1`、`L2`；没有用记忆时是 `none`，检索出错、照常不带记忆转发时是 `error`）、`X-CueMem-Recalled`、`X-CueMem-Reasons`、`X-CueMem-Session`，以及每个响应都有的 `X-CueMem-Model`：实际转发给上游的模型。响应体是供应商的原样。
 - **模型**：`model` 是配置里的别名或模型 ID；不带 `model` 的请求用 agent 角色的模型。不认识的模型也改用 agent 角色的模型，每个模型名在日志里警告一次（`proxy.unknown_model: remap`，缺省）；设成 `reject`（配置项、`CUEMEM_PROXY__UNKNOWN_MODEL` 或 `--unknown-model reject`）时在检索之前回 400，code `model_not_found`。
-- **出错**：上游的出错原样返回，带上 `retry-after`、`retry-after-ms` 与 `x-should-retry`，什么都不写。连不上上游时回 OpenAI 格式的 502，超时 504。写回失败（例如向量接口暂时不可用）时留在进程内存里，这个会话下一次写回之前先写它，会话结束之前再试一次；进程退出就丢了。带着超过像素上限的图片的写回只丢这一条。
+- **出错**：上游的出错原样返回，带上 `retry-after`、`retry-after-ms` 与 `x-should-retry`，什么都不写。连不上上游时回 OpenAI 格式的 502，超时 504。写回失败（例如向量接口暂时不可用）时留在进程内存里，这个会话下一次写回之前先写它，会话结束之前再试一次；进程退出就丢了。带着超过像素上限或格式不收的图片的写回只丢这一条。等上游回答期间（例如长的流式回答时别的调用方删除），注入的记忆被遗忘了的话，回答照样返回给调用方，但不存下；用户的话照样存下。
 - 请求体必须是 JSON（`Content-Type: application/json`，否则 415），上限是 `CUEMEM_MAX_BODY_BYTES`（413）。
 
 ```bash
@@ -433,7 +458,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 同样的四个工具有两种提供方式：
 
-- **HTTP：`cuemem serve` 的 `/mcp`**（Streamable HTTP，无状态，JSON 响应），与服务共用记忆系统。令牌同 `/api`（不对时 401，带 `WWW-Authenticate: Bearer`）。`X-CueMem-User` 与 `X-CueMem-Agent` 请求头选空间，与记忆代理相同；不带时限定作用域的令牌用它自己的第一个用户，管理令牌、不鉴权与只有通配的令牌要带 `X-CueMem-User`（否则 400）。作用域之外的用户或 Agent 回 403、什么都不写；别的网站的 Origin 回 403。请求体按固定 8 MiB 那一档，MCP SDK 自己另有 4 MiB 的上限。应用的 lifespan 还没启动时（uvicorn 总会启动它）`/mcp` 回 503。`cuemem serve --no-mcp` 关掉它。注册的例子：
+- **HTTP：`cuemem serve` 的 `/mcp`**（Streamable HTTP，无状态，JSON 响应），与服务共用记忆系统。令牌同 `/api`（不对时 401，带 `WWW-Authenticate: Bearer`）。`X-CueMem-User` 与 `X-CueMem-Agent` 请求头选空间，与记忆代理相同；不带时限定作用域的令牌用它自己的第一个用户，管理令牌、不鉴权与只有通配的令牌要带 `X-CueMem-User`（否则 400）。作用域之外的用户或 Agent 回 403、什么都不写；别的网站的 Origin 回 403。不是 ASCII 的 ID 在这两个请求头里写成 `utf-8''<UTF-8 的百分号编码>`（RFC 8187），例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`，Node 的客户端（包括 Claude Code）只能这样发；原样的 UTF-8 也认，写错、不是 UTF-8 或带控制字符时 400（`{"detail"}`）。请求体按固定 8 MiB 那一档，MCP SDK 自己另有 4 MiB 的上限。应用的 lifespan 还没启动时（uvicorn 总会启动它）`/mcp` 回 503。`cuemem serve --no-mcp` 关掉它。注册的例子：
 
   ```bash
   claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp \
@@ -465,19 +490,25 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 | `CUEMEM_PEAK_POLICY` | 评测等批量任务的高峰策略：`wait`、`warn` 或 `allow`；SDK 与交互式的命令（`ask`、`serve`、`proxy`、`mcp`）一律用 `warn`，SDK 的 `peak_policy` 参数优先于它 |
 | `CUEMEM_API_TOKEN` | `cuemem serve` 与 `cuemem proxy` 的管理令牌；`MemoryClient` 缺省的 `api_key` |
 | `CUEMEM_API_KEYS_FILE` / `CUEMEM_API_KEYS` | 限定作用域的令牌：YAML 文件的路径，或同样内容的文本（只能设一个） |
-| `CUEMEM_ALLOWED_HOSTS` | 额外接受的 Host 与 Origin 主机名（逗号分隔；`*` 表示两项都不检查） |
+| `CUEMEM_ALLOWED_HOSTS` | 额外接受的 Host 与 Origin 主机名（逗号分隔；`*` 表示两项都不检查）；不鉴权又监听非本机地址时用主机名访问也要写在这里 |
 | `CUEMEM_MAX_BODY_BYTES` | `/api`、`/v1` 与界面上传的请求体上限（字节），也是一个限定作用域的令牌同时在处理的请求体的总量（缺省 67108864，即 64 MiB） |
 | `CUEMEM_MAX_IMPORT_BYTES` | 管理令牌或不鉴权时导入的请求体上限（字节；缺省 1073741824，即 1 GiB） |
 | `CUEMEM_TRACES_RETENTION_DAYS` | 按天的 trace 文件留几天（≥ 1 的整数；不设就一直留着）。`cuemem serve` 与 `cuemem proxy` 启动时与之后每天删一遍更早的文件，连同其中提问的查询向量；只用 SDK 的应用可以调 `memory.system.prune_traces(days)` |
 | `CUEMEM_CONSOLIDATION__BACKGROUND_WORKERS` | 后台同时巩固几个空间（缺省 4；同一空间仍一次一个） |
-| `CUEMEM_VECTOR_STORE__URL` | 用 Qdrant 服务端代替本地模式 |
+| `CUEMEM_VECTOR_STORE__URL` | 用 Qdrant 服务端代替本地模式（带 `http://` 或 `https://`） |
+| `CUEMEM_VECTOR_STORE__API_KEY` | Qdrant 服务端的 API Key（作为 `api-key` 请求头发出；服务端的 `QDRANT__SERVICE__API_KEY` 或 Qdrant Cloud 的 Key），`cuemem migrate-vectors` 也带上。空或不设表示没有 Key。只从环境变量或 `.env` 读，没有命令行参数。URL 是 `http://` 时 qdrant-client 每个客户端警告一次 "Api key is used with an insecure connection."：本机与 compose 的内部网络上无妨，远处的服务端与 Cloud 用 `https://`。`Memory(config={"vector_store": {"url": ..., "api_key": ...}})` 也认 |
 | `CUEMEM_EMBEDDING__BACKEND` | 例如 `hash`：离线的哈希向量（只用于测试与演示） |
 | `CUEMEM_PROXY__UNKNOWN_MODEL` | `remap`（缺省）或 `reject` |
 | `CUEMEM_RETRIEVAL__CONTROLLER` | 换一个控制器模型文件 |
-| `GRADIO_ANALYTICS_ENABLED` | Gradio 自己的开关：设成 `False` 时界面不再发 Gradio 的使用统计（缺省会发） |
+| `GRADIO_ANALYTICS_ENABLED` | 设成 `True` 才打开 Gradio 的使用统计与版本检查（缺省关；界面不联系第三方，字体 IBM Plex Sans 是 Gradio 自带的） |
+| `GRADIO_TEMP_DIR` | 界面放上传与图库副本的目录；缺省时 `cuemem serve` 每次启动建一个只给本人的目录（0700），停下时删掉 |
 | `CUEMEM_EVAL_RAW_SESSION_IDS`、`CUEMEM_LANGMEM_MAX_LOST_SHARE`、`CUEMEM_AMEM_K` | 只用于评测（见 D-067 与 D-065） |
-| `CUEMEM_TEST_QDRANT_URL` | 只用于测试：对这个 Qdrant 服务端跑 `tests/test_qdrant_server.py` |
+| `CUEMEM_TEST_QDRANT_URL`、`CUEMEM_TEST_QDRANT_API_KEY` | 只用于测试：对这个 Qdrant 服务端跑 `tests/test_qdrant_server.py`，服务端要 Key 时带上这个 Key |
 
 ## 命令行
 
 `cuemem --help` 列出全部命令：`configure`、`doctor`、`ingest`、`export`、`import`、`consolidate`、`forget`、`ask`、`search-image`、`spaces`、`usage`、`serve`、`proxy`、`chat`、`demo`、`migrate-vectors`、`mcp`、`inspect`、`data` 与 `eval`。`cuemem <命令> --help` 说明各自的开关；帮助与提示都是中文。`cuemem --preset <名字> <命令>` 对任何命令换预设。每个命令都先把进程打开文件数的软上限调到硬上限（最多 65,536；从不调低；macOS 上依次退到 10,240 与 4,096）；库与 SDK 不改它，本地空间很多的应用要自己调（`ulimit -n`）。`cuemem doctor` 列出本地向量库的集合数与这个上限，超过一半时标黄并写明办法。
+
+- 预设名写错或 `CUEMEM_*` 的值不合法时，任何命令都只打印一行"错误：配置有误：…"（字段、原因与收到的值，密钥类的值不回显）并以 1 退出，不再打印调用栈；`cuemem mcp` 写到 stderr。SDK 照旧抛 ValueError 或 pydantic 的 ValidationError。
+- 文件权限：命令行把 umask 收紧到至少 077（从不放宽），写的文件都是 0600、目录 0700；SDK 与 `MemorySystem.from_settings` 新建缺的数据目录时也是 0700。已经存在的目录一律不改。POSIX 上 `cuemem doctor` 还查数据目录、`.env` 与 `CUEMEM_API_KEYS_FILE` 的权限，别人能读时写出要运行的 `chmod 700` / `chmod 600`；`serve` 与 `proxy` 启动时提醒这两个密钥文件。`cuemem configure` 经一个 0600 的临时文件替换 `.env`（符号链接的 `.env` 链接留着；它所在的目录要可写）。
+- 用 Qdrant 服务端时 `cuemem doctor` 写 `向量库：<url>（API Key 已设/未设）`；`cuemem migrate-vectors` 给目标带上 `CUEMEM_VECTOR_STORE__API_KEY`。

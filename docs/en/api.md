@@ -2,7 +2,7 @@
 
 English · [中文](../api.md)
 
-Every way a program talks to CueMem: the Python SDK (`Memory`, `AsyncMemory`), the remote client (`MemoryClient`, `AsyncMemoryClient`), the HTTP API of `cuemem serve` (`/api` and the Mem0-shaped `/api/v1`), the OpenAI-compatible memory proxy (`/v1`), the MCP server (stdio and HTTP), the environment variables and the install extras. Signatures are those of CueMem 0.1.0 (`src/cuemem/sdk.py`, `client.py`, `api/`). The decisions behind them are in the [decision records](decisions.md): D-061 (SDK), D-062 (proxy), D-063 (export), D-056 (deployment and tokens), D-069 (the second audit round, which added most of `/api/v1`, `MemoryClient`, scoped keys, metadata, `update` and `reset`) and D-070 (the third, which added `status`, MCP over HTTP, request size limits, idle timeouts, typed clients and the Mem0 call shapes below).
+Every way a program talks to CueMem: the Python SDK (`Memory`, `AsyncMemory`), the remote client (`MemoryClient`, `AsyncMemoryClient`), the HTTP API of `cuemem serve` (`/api` and the Mem0-shaped `/api/v1`), the OpenAI-compatible memory proxy (`/v1`), the MCP server (stdio and HTTP), the environment variables and the install extras. Signatures are those of CueMem 0.1.0 (`src/cuemem/sdk.py`, `client.py`, `api/`). The decisions behind them are in the [decision records](decisions.md): D-061 (SDK), D-062 (proxy), D-063 (export), D-056 (deployment and tokens), D-069 (the second audit round, which added most of `/api/v1`, `MemoryClient`, scoped keys, metadata, `update` and `reset`) D-070 (the third, which added `status`, MCP over HTTP, request size limits, idle timeouts, typed clients and the Mem0 call shapes below) and D-071 (the fourth, after the repository went public: per-key limits, the Qdrant API key, stricter checks for public binds, non-ASCII identity headers and runs that survive a restart).
 
 Language: the SDK's return values and its own errors, `/api/v1`, the proxy and the MCP tools are in English. The command line, the older `/api` routes, the 401 message and errors raised deeper in the core (a missing key, a locked vector store, a configuration mistake) are in Chinese.
 
@@ -16,11 +16,12 @@ Language: the SDK's return values and its own errors, `/api/v1`, the proxy and t
 | + evaluation charts and the controller and gate training scripts (matplotlib, scikit-learn) | extra `eval` |
 | + framework integrations | extras `openai-agents`, `langgraph`, `anthropic`, or all three: `integrations` |
 
-Extras combine: `pip install "cuemem[ui,local] @ git+https://github.com/FlickYan/cuemem"`. Python 3.12 or later. In a source checkout, `uv sync` installs `ui` and `eval` through the dev group; `uv sync --no-dev` needs `--extra ui --extra eval`.
+Extras combine: `pip install "cuemem[ui,local] @ git+https://github.com/FlickYan/cuemem"`. CueMem is not on PyPI yet, and a package named `cuemem` on PyPI is not this project: always install from GitHub. Python 3.12 or later. In a source checkout, `uv sync` installs `ui` and `eval` through the dev group; `uv sync --no-dev` needs `--extra ui --extra eval`.
 
-- Without `ui`, `cuemem serve` serves `/api`, `/api/v1`, `/mcp`, `/docs` and `/v1` only and prints how to install the UI (`pip install "cuemem[ui]"`, or `uv sync --extra ui` in a checkout).
+- Without `ui`, `cuemem serve` serves `/api`, `/api/v1`, `/mcp`, `/docs` and `/v1` only and prints how to install the UI (`pip install "cuemem[ui] @ git+https://github.com/FlickYan/cuemem"`, or `uv sync --extra ui` in a checkout).
 - Without `eval`, `cuemem eval run` (except `--build-only`) and `cuemem eval report` exit with code 1 and the same kind of hint; `eval split`, `eval probe`, `eval audit` and `data download` work.
-- The Docker image installs `ui` and `local` by default; `docker build --build-arg EXTRAS= .` builds an API-only image.
+- The Docker image installs `ui` and `local` by default; `docker build --build-arg EXTRAS= .` builds an API-only image. In the Docker image the remedy for a missing extra is to rebuild, e.g. `docker build --build-arg EXTRAS="--extra ui --extra local" -t cuemem .` (with `--extra eval` and so on added), and that is what the hint says there: pip inside the container installs elsewhere and the image has no git.
+- pip installs of `cuemem[ui]` (and `cuemem[local]`) still resolve Pillow < 13, because gradio and fastembed declare `pillow<13`; Pillow 12 has known security advisories that are fixed only in 13. Servers that accept images from other people should use the Docker image or `uv sync --locked` from a checkout, which install Pillow 13. Image bytes sent to models are the same under both.
 - The package ships `py.typed`, so mypy and pyright check your calls into CueMem (and may report new, correct errors after an upgrade).
 
 ## Memory spaces and identity
@@ -166,6 +167,9 @@ Result items carry a `type`:
 
 - The report has `message`, `turns_deleted`, `sessions_affected`, `facts_before`, `facts_after`, `images_deleted` and `restated`, plus `warning` when the deletion happened but rebuilding from the rest failed (it finishes on the next consolidation).
 - A forget that fails before anything is deleted (the embedding provider is down, a vector-store or database error) raises and deletes nothing, so it can be retried as is.
+- After the deletion commits, cleanup never raises. If a daily trace file cannot be rewritten (for example the disk is full), CueMem deletes that whole day's file instead: other users' debug traces of that day are lost, a warning is logged on `cuemem.core.trace`, and the query vectors of those traces are purged. Files that can be neither rewritten nor deleted are named in the forget trace's `traces_left` attribute and must be removed by hand. If purging the embedding cache fails (for example "database or disk is full", or "database is locked" on the `embed.sqlite` a source checkout shares with evaluations), CueMem logs one warning on `cuemem.memory` and records `embed_cache_left: true` on the forget trace; the delete still succeeds and the purge is not retried. The same holds after `delete_all` and `reset`.
+- Besides the questions' query vectors, forgetting purges the query vectors of L2's sub-queries and follow-up queries, of the agent's own memory searches and of the shop demo's catalogue searches, and (with the DashScope multimodal embedder) the text-to-image query vectors and the vectors of deleted images that no other memory uses.
+- Open chat sessions on the same memory system (the UI, `/api`) drop deleted content on their next turn after any deletion, whichever entry point made it (`/api/v1` delete, `delete_all` and `reset` included); a session started while the deletion was rebuilding takes the rebuilt profile on its next turn.
 - `message` is `"Nothing deleted"`, with a `warning` to run `consolidate(rebuild=True)`, when no turn was deleted but the fact still exists (its source turns are no longer in the log, as an older version could leave behind).
 - Deleting a fact or an excerpt forgets the whole round, so other ids from that round then raise KeyError, like any unknown id. A Mem0-style loop `for r in results: m.delete(r["id"])` should catch KeyError.
 - Do not call `forget`, `delete_space` or `consolidate` on `m.system` from inside `m.system.reading(space)`: it raises RuntimeError instead of deadlocking.
@@ -174,7 +178,10 @@ Result items carry a `type`:
 
 **`status`.** The extraction state of one user's (or agent's) memory: `pending` (sessions waiting for extraction); `failed`, one entry per failed session with `session_id`, `attempts`, `error` (its first line) and `retry_at` (when the background worker retries it, as an ISO time; `null` once attempts reach 3, when the pipeline version differs, or without a background worker: run `consolidate()` then); `background` (whether a worker runs); and `errors`, the worker's last 3 errors for this space. Background extraction failures are also logged as a warning on the `cuemem.write.consolidate` logger, once per space and kind of error.
 
-**Runs.** `open_run` starts a conversation: `add(run_id=...)` writes online and is searchable at once, but nothing is extracted until `end_run`, which hands the whole run to extraction (`wait=True` extracts now and returns the report; otherwise `consolidation` is `"queued"`). `with m.run(user_id="alice") as run_id:` does both. A run left open by a crashed process is handed to extraction the first time the next process touches that space. The local SDK never ends a run by itself; under `cuemem serve`, `/api/v1` runs idle for 30 minutes are ended (`close_idle_runs`), and the next `add` with the same `run_id` reopens the run.
+**Runs.** `open_run` starts a conversation: `add(run_id=...)` writes online and is searchable at once, but nothing is extracted until `end_run`, which hands the whole run to extraction (`wait=True` extracts now and returns the report; otherwise `consolidation` is `"queued"`). `with m.run(user_id="alice") as run_id:` does both. The local SDK never ends a run by itself; under `cuemem serve`, `/api/v1` runs idle for 30 minutes are ended (`close_idle_runs`), and the next `add` with the same `run_id` reopens the run: when it ends, the run is extracted again in full and the user's whole space is replayed from the log (D-045), and while that replay runs the user's facts are missing from `search` and `get_all`, for about the extraction latency.
+
+- **Across a restart.** A run left open when the server stops or crashes survives the restart: the next `add` (or `open_run`) with the same `run_id` continues it. Under `cuemem serve` and `cuemem proxy`, nothing else adopts it during the first idle period after start-up, and any that nobody continues are handed to extraction one idle period (`--idle-minutes`) after start-up. A run this process handed over and the client then continues is reopened like an idle-closed run. In the local SDK and the CLI, the first touch of the space hands over runs the caller is not continuing.
+- **What is not resumed.** A run that the previous process had already closed for idleness (or one handed over that is no longer remembered, beyond 10,000 runs) is treated as a plain session after the restart: each later `add` re-extracts it and replays the user's whole space (D-045), and the user's facts are missing from `search` and `get_all` during each replay. Clients that pause for long should call `end_run` at natural breaks and open a new run.
 
 **Export and import.** `export` returns format `cuemem.space` version 2: sessions, turns (with `metadata`, `expires_at` and `edit_of` when set) and the original images in base64, plus an optional snapshot of facts and the profile that import ignores. `load` writes the raw log back and extracts derived memory again (`wait=True` does it now). Without `user_id` or `agent_id` it imports into the file's own space, and a file without `space_id` then raises ValueError. Version-1 files still import; if any image or metadata in the file is invalid, nothing is written, and a malformed file (missing keys, wrong types) raises `ValueError("Malformed export: …")`.
 
@@ -199,7 +206,7 @@ Result items carry a `type`:
 
 `cuemem.errors` defines `CueMemError` and its subclasses `MissingAPIKeyError`, `CacheMissError`, `StructuredOutputError`, `EmbeddingAPIError` (with `status` and `retry_after`), `DatasetChecksumError`, `ConfigMismatchError`, `ConsolidationError`, `ContentFilteredError`, `ConcurrentWriteError`, `StorageLockedError`, `VectorStoreOpenError` (local-mode Qdrant cannot open or create a collection, usually because of too many open files; the message names the collection count, the limits and what to do), `AccessKeysError` and `MemoryAPIError` (with `status`, `code`, `type` and `retry_after`). The SDK also raises KeyError, ValueError, TypeError and RuntimeError as described above, and errors of the OpenAI client library pass through after CueMem's own retries.
 
-Loggers: `cuemem.write.consolidate` (background extraction failures, in English), `cuemem.core.trace` (a trace that cannot be written), `cuemem.memory` (an image file of a forgotten turn that cannot be deleted), `cuemem.sdk` (peak-hour waits) and `cuemem.api.proxy`.
+Loggers: `cuemem.write.consolidate` (background extraction failures, in English), `cuemem.core.trace` (a trace that cannot be written, or a daily trace file that a forget had to delete whole), `cuemem.memory` (an image file of a forgotten turn that cannot be deleted, or cleanup after a forget's commit that failed), `cuemem.sdk` (peak-hour waits) and `cuemem.api.proxy`.
 
 ## Remote client: `MemoryClient`
 
@@ -229,7 +236,7 @@ MemoryClient(
 - `metadata` is checked as in the SDK before it is sent (JSON would silently turn non-string keys into strings), and so are `limit` and `top_k` (JSON `true` would become 1).
 - Times (`timestamp`, `at`, `known_at`, `expiration_date`) are sent in ISO format. Naive times are read in the server's local time, so include a time zone when client and server differ.
 - It raises the same exceptions as `Memory`: KeyError, ValueError, TypeError and the `cuemem.errors` types; an `EmbeddingAPIError` keeps `status` and `retry_after`. Other HTTP failures (a wrong token, an unreachable server, 403 outside a key's scope, other provider errors) raise `MemoryAPIError` with `status` (None when the server is unreachable), `code` (see the error codes below), `type` (the server's exception class, such as `RateLimitError`) and `retry_after` (the Retry-After header, for 429 and 503). A 404 without an error type adds that `base_url` must be the root of `cuemem serve`; a refused connection asks whether `cuemem serve` runs there. There is no client-side retry: retrying a POST can write twice. `get()` of another tenant's id returns `None`, as for a missing id.
-- `close()` (or `with MemoryClient(...) as m:`) ends the runs this client opened. A run opened remotely and never ended is ended by `cuemem serve` after 30 idle minutes (`--idle-minutes`) and reopened by the next `add` with the same `run_id`.
+- `close()` (or `with MemoryClient(...) as m:`) ends the runs this client opened. A run opened remotely and never ended is ended by `cuemem serve` after 30 idle minutes (`--idle-minutes`) and reopened by the next `add` with the same `run_id`; a run still open when the server restarts is continued by the next `add` with its `run_id` (see Runs above).
 - The framework integrations need a local `Memory` or `AsyncMemory`: passing a `MemoryClient` raises TypeError at construction.
 - The module imports only httpx2 and `cuemem._async`, not the memory stack.
 
@@ -247,15 +254,18 @@ MemoryClient(
 | `--router` / `--lam` | `learned` / the controller model's | The controller used by chat |
 | `--no-ui` | off | API, proxy and MCP only |
 | `--no-mcp` | off | Do not serve MCP at `/mcp` |
-| `--idle-minutes` | `30` | Chat sessions, `/api/v1` runs and proxy sessions idle this long end and go to extraction (must be > 0) |
-| `--insecure-no-auth` | off | Start on a non-loopback address without any token |
+| `--idle-minutes` | `30` | Chat sessions, `/api/v1` runs and proxy sessions idle this long end and go to extraction (must be > 0); also the delay after start-up before sessions left open by an earlier process are handed to extraction |
+| `--insecure-no-auth` | off | Start on a non-loopback address without any token; the Host must then be an IP address, localhost, the bind hostname or a name in `CUEMEM_ALLOWED_HOSTS` |
+| `--insecure-weak-token` | off | Allow tokens shorter than 16 characters on a non-loopback address |
 | `--unknown-model` | `proxy.unknown_model` (`remap`) | What the proxy does with an unknown model: `remap` or `reject` |
 
 Every `cuemem` command raises its process's soft limit on open files to the hard limit (at most 65,536). Local-mode Qdrant keeps one file open per collection (one per memory space, two with photos) and opens all of them at start-up, so on a server with many users use a Qdrant server (`cuemem migrate-vectors --to URL`, then `CUEMEM_VECTOR_STORE__URL`). `cuemem doctor` prints the collection count against the limit.
 
 ### Authentication and scoped keys
 
-- With no token configured there is no authentication. That is allowed only on a loopback address: a non-loopback bind without a token refuses to start unless `--insecure-no-auth` is given.
+- With no token configured there is no authentication. That is allowed only on a loopback address: a non-loopback bind without a token refuses to start unless `--insecure-no-auth` is given; the Host must then be an IP address, localhost, the bind hostname or a name in `CUEMEM_ALLOWED_HOSTS` (400 otherwise, against DNS rebinding).
+- On a non-loopback address every token must be at least 16 characters (`cuemem.api.auth.MIN_TOKEN_CHARS`): the admin token and plaintext `token:` entries alike, every Docker container included. A shorter one makes `cuemem serve` and `cuemem proxy` exit with code 2 before the memory system opens, naming the entry but never printing the token, unless `--insecure-weak-token` is given (in compose, add it to `command:`). Generate tokens with `openssl rand -hex 32`. `sha256:` entries cannot be measured and are not checked.
+- The server speaks plain HTTP. On a non-loopback bind with tokens, start-up prints a notice that the token (which is also the UI password) and the memories cross the network unencrypted; outside a trusted network put a TLS reverse proxy in front, as described in the README's [Public deployment](../../README.md#public-deployment). CueMem does not rate-limit sign-ins or failed tokens; do that in the reverse proxy.
 - `CUEMEM_API_TOKEN` is the admin token. Send `Authorization: Bearer <token>`. `GET /api/health` needs no token. `/api` and `/api/v1` check the token before reading the request body, so an unauthenticated request gets 401 whatever its body.
 - Scoped keys (`CUEMEM_API_KEYS_FILE`, the path of a YAML file, or `CUEMEM_API_KEYS`, the same content inline as YAML or JSON; set only one) give each key a list of users and agents:
 
@@ -270,12 +280,24 @@ Every `cuemem` command raises its process's soft limit on open files to the hard
       scopes:
         - {user: "*", agent: shop}    # every user's memory under agent shop (shop/<user>)
         - {agent: shop}               # shop's own memory (agent/shop)
+    - name: alice-app-limited         # optional per-key limits (all three are optional)
+      sha256: <64 hex digits>
+      scopes: [{user: alice}]
+      rate_per_minute: 60             # write requests (POST, PUT, DELETE) per minute
+      models: [qwen3.8-flash]         # the models the proxy may use for this key
+      max_output_tokens: 2000         # the proxy's output cap for this key
   ```
 
   A value is an id or a list of ids; `*` matches any id and `acme:*` is a prefix. `{agent: A}` covers only agent A's own memory. `agent/x` always counts as agent x's own memory, so scoped keys cannot use an agent literally named `agent`. Spaces not made from user_id and agent_id (evaluation spaces, names with two or more `/`) are admin-only; `{user: "*"}` covers plain-named spaces such as `shop-demo`. Unknown fields are rejected. The keys are read once at startup; a broken file makes `cuemem serve` and `cuemem proxy` print `错误：…` and exit 1. Tokens are compared as sha256 digests in constant time against every key.
+- **A scoped key limits whose memory a caller reaches, not what it spends.** Any valid key makes the server call the operator's providers: `/v1/chat/completions` and `/v1/responses` (with or without a user; `model`, `n`, `max_tokens` and switches such as `enable_thinking` are forwarded as sent), `/v1/embeddings` (up to 2,048 inputs), chat on `/api`, `POST /api/v1/answer`, `/mcp`, and every write (extraction later sends about 2 characters upstream per byte written). Give keys only to parties you would trust with that budget, set spend limits at the provider, rate-limit by the `Authorization` header in a reverse proxy (for example nginx `limit_req_zone $http_authorization ...`), and lower `CUEMEM_MAX_BODY_BYTES` to bound what one write can cost.
+- **Optional per-key limits** (all positive integers or a non-empty list; without them nothing changes and forwarded bodies are byte-identical):
+  - `rate_per_minute`: at most this many write requests (POST, PUT, DELETE) per minute on `/api`, `/api/v1`, `/v1` and `/mcp`; reads (GET) are not counted. It is a token bucket of that capacity, refilled at `rate_per_minute / 60` per second. Beyond it: 429 with `Retry-After` (the seconds until the next request is allowed), code `rate_limited` under `/api/v1`, a Chinese `{"detail"}` under `/api`, and `{"detail": "Too many requests for this access key: ..."}` under `/v1` and `/mcp`.
+  - `models`: the memory proxy (`/v1/chat/completions`, streaming included, and `/v1/responses`) refuses other models with an OpenAI-format 403 (type `permission_error`, param `model`, code `forbidden`) before any recall, session or forwarding. A listed alias admits only that alias, with its catalogue settings: `models: [deepseek-flash]` does not admit `deepseek-flash-thinking`. A listed model id that is not itself an alias admits every alias of that id. For such keys the catalogue's `extra_body` replaces the caller's values, so a cheap model cannot be switched to thinking. `/v1/embeddings` is not restricted by `models`.
+  - `max_output_tokens`: the proxy caps `max_tokens` and `max_completion_tokens` at this value (and sets it when the request gives neither), and an `n` other than 1 gets 400 (param `n`). On its own it does not pin caller switches such as `enable_thinking` or `thinking`, which are forwarded as sent; only `models` replaces them with the catalogue's values.
+  - Not covered: UI sessions (the agent role's model, `max_tokens` 1200), the size of one write (bounded only by `CUEMEM_MAX_BODY_BYTES`) and provider fields a caller adds (`enable_search` and the like). A daily spending budget per key is not implemented.
 - Outside its scope a key gets **403** when the request names the user, agent or space (users inside `filters`, the default space of `POST /api/sessions` and the target of an import included), and **404** (or `[]` for history) for memory ids and session ids, exactly as if they did not exist. `/api/spaces` and `/api/v1/spaces` list only the key's spaces. `POST /api/v1/reset` with a scoped key deletes only the spaces in its scope (a wildcard tenant key wipes the whole tenant).
 - The UI asks to sign in: the password is the token. A scoped key signs in with its name as the username; the admin token accepts any username. Files sent through the UI must have been uploaded through it: paths to other files on the server are refused.
-- Browser requests from other origins get 403 on `/api`, `/v1`, `/mcp` and `/gradio_api`. On a loopback bind, only the Hosts 127.0.0.1, localhost, [::1] and the bind address itself are accepted (400 otherwise); list a reverse proxy's hostnames in `CUEMEM_ALLOWED_HOSTS`.
+- Browser requests from other origins get 403 on `/api`, `/v1`, `/mcp`, `/gradio_api` and the UI's sign-in `/login` (including `Origin: null`; same-origin and Origin-less sign-ins work as before). On a loopback bind, only the Hosts 127.0.0.1, localhost, [::1] and the bind address itself are accepted. With `--insecure-no-auth` on a non-loopback bind, any IP-literal Host, localhost and the bind hostname are accepted. Otherwise 400; list other hostnames (a reverse proxy's, `nas.local`, a compose service name used by another container) in `CUEMEM_ALLOWED_HOSTS`. Authenticated non-loopback binds do not check the Host.
 - MCP at `/mcp` uses the same tokens and scopes (see below); the stdio `cuemem mcp` does not go through HTTP and has no tokens.
 
 ### Request size limits
@@ -291,6 +313,7 @@ Request bodies are checked before they are read, on `cuemem serve` and on `cueme
 - Above the limit the answer is 413 (code `payload_too_large` under `/api/v1`); for a scoped key's import the message says that larger imports need the admin token. Both variables take a positive number of bytes (`67108864`, not `64MB`); any other value makes serve and proxy print `错误：…` and exit 1.
 - A parsed JSON body takes about 24 times its size in memory, so the request bodies one scoped key has in flight together are capped at `CUEMEM_MAX_BODY_BYTES` too: above that, 429 with `Retry-After: 1` (code `rate_limited` under `/api/v1`; `MemoryClient` raises `MemoryAPIError` with `retry_after="1"`, and the OpenAI SDK retries by itself). One key can then hold about 25 × the body limit (about 1.6 GB at the default). Many keys at once and the UI's event routes are not counted per key: size the server's memory for them, or lower `CUEMEM_MAX_BODY_BYTES`. Admin and no-auth deployments are not budgeted.
 - Images with more pixels than Pillow's `Image.MAX_IMAGE_PIXELS` (89,478,485 by default) are refused: 400 on `/api/v1`, 409 on `/api` (chat checks every upload before recall or any model call), and a proxy write-back that carries one is dropped alone. Decodes above 16 million pixels run two at a time.
+- Images must be JPEG, PNG, WEBP, GIF, BMP or TIFF (phone MPO photos count as JPEG). Other formats (AVIF, XBM, ICO, …) and files that are not images are refused before any decoder runs: 400 on `/api/v1` with the message `Not a valid image (accepted formats: JPEG, PNG, WEBP, GIF, BMP, TIFF).` (it used to be 500), 409 on `/api`, a ValueError from the SDK (it used to be `PIL.UnidentifiedImageError`), and an import with such an attachment fails as a whole. A proxy or MCP write-back carrying such an image is dropped alone. Images already stored in another format keep working.
 
 ### `/api/v1`: the memory API
 
@@ -325,7 +348,7 @@ Every `/api/v1` error has the shape `{"error": {"code", "type", "message"}}` (`V
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | ValueError or TypeError: no user_id or agent_id, a bad filter, `limit` below 1, an image path or an image too large, a malformed export…; a Host header that is not accepted (the message names `CUEMEM_ALLOWED_HOSTS`) |
+| 400 | `invalid_request` | ValueError or TypeError: no user_id or agent_id, a bad filter, `limit` below 1, an image path, an image too large, in an unsupported format or not an image, a malformed export…; a Host header that is not accepted (the message names `CUEMEM_ALLOWED_HOSTS`) |
 | 401 | `unauthorized` | Missing or wrong token |
 | 402 | `no_balance` | The model provider's account is out of balance |
 | 403 | `forbidden` | Outside the key's scope; a cross-site browser request |
@@ -333,7 +356,7 @@ Every `/api/v1` error has the shape `{"error": {"code", "type", "message"}}` (`V
 | 409 | `conflict` | `ConcurrentWriteError` |
 | 413 | `payload_too_large` | The request body is above the size limit |
 | 422 | `invalid_request` or `content_filtered` | A malformed request body (type `ValueError`); the provider's content filter rejected the request |
-| 429 | `rate_limited` | Still rate-limited after retries, or a scoped key's bodies in flight above the limit; with `Retry-After` |
+| 429 | `rate_limited` | Still rate-limited after retries, a scoped key's bodies in flight above the limit, or a scoped key's `rate_per_minute` used up; with `Retry-After` |
 | 502 | `upstream_error` | Other provider errors (5xx, connection, authentication) and other CueMem errors |
 | 503 | `unavailable` | The provider is unavailable, with `Retry-After` |
 | 504 | `timeout` | The provider timed out |
@@ -405,8 +428,8 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice
 | `--host` / `--port` | `127.0.0.1` / `8787` | Bind address |
 | `--user` | none | The user for requests that name none (otherwise they pass through without memory) |
 | `--mode` | `auto` | Recall level: `auto` (the controller), `l0`, `l1` or `l2` |
-| `--idle-minutes` | `30` | A session idle this long ends and is extracted |
-| `--insecure-no-auth`, `--unknown-model` | | As for `cuemem serve` |
+| `--idle-minutes` | `30` | A session idle this long ends and is extracted; also the delay after start-up before sessions left open by an earlier process are handed to extraction |
+| `--insecure-no-auth`, `--insecure-weak-token`, `--unknown-model` | | As for `cuemem serve` |
 
 | Route | What it does |
 |---|---|
@@ -416,10 +439,12 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice
 | `GET /v1/models` | The configured model aliases and the embedding model |
 
 - **Identity:** the `X-CueMem-User` header or the request's `user` field (the header wins), optionally `X-CueMem-Agent`; `--user` is the fallback. A scoped key must cover that user and agent, otherwise an OpenAI-format 403 (type `permission_error`, code `forbidden`) comes before any recall, session or forwarding. Requests that name no user pass through without memory. `/v1/models` and `/v1/embeddings` accept any valid key.
+- **Non-ASCII user or agent IDs** go in these headers percent-encoded as UTF-8 in the RFC 8187 form, e.g. `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89` for 张三. This is the only form Node clients such as Claude Code can send; raw UTF-8 bytes (curl) are accepted too, and the proxy can also take the ID in the body `user` field. A malformed `utf-8''` value, bytes that are not UTF-8, or a control character gets 400 (on the proxy an OpenAI-format `invalid_request_error` with param `user`).
+- **Spending:** a scoped key limits whose memory a caller reaches, not what it spends; `model`, `n`, `max_tokens` and switches such as `enable_thinking` are forwarded as sent unless the key sets `models` or `max_output_tokens` (see [Authentication and scoped keys](#authentication-and-scoped-keys)). A model outside a key's `models` gets an OpenAI-format 403 (type `permission_error`, param `model`), and an `n` other than 1 under `max_output_tokens` gets 400 (param `n`).
 - **Sessions:** `X-CueMem-Session` names one. Without it, a request with no earlier messages, or one after `--idle-minutes` of silence, starts a new session; parallel conversations need their own session headers. Idle sessions are also ended by a sweep every minute, in `cuemem proxy` and in the proxy mounted by `cuemem serve`.
 - **Response headers:** `X-CueMem-Level` (`L0`, `L1`, `L2`; `none` when memory was not used, `error` when recall failed and the request went ahead without memory), `X-CueMem-Recalled`, `X-CueMem-Reasons`, `X-CueMem-Session`, and on every response `X-CueMem-Model`, the upstream model actually used. The body is the provider's, unchanged.
 - **Models:** `model` is a configured alias or model id; a request without `model` uses the agent role's model. An unknown model also goes to the agent role's model, with a warning logged once per name (`proxy.unknown_model: remap`, the default). With `reject` (the config key, `CUEMEM_PROXY__UNKNOWN_MODEL` or `--unknown-model reject`) it gets 400 with code `model_not_found`, before any recall.
-- **Failures:** upstream errors come back as they are, with `retry-after`, `retry-after-ms` and `x-should-retry`, and nothing is written. An unreachable upstream gives an OpenAI-format 502 and a timeout 504. A write-back that fails (say, during an embedding outage) is kept in process memory and written before that session's next write-back, or tried once more before the session ends; it is lost if the process exits. A write-back that carries an image above the pixel limit is dropped alone.
+- **Failures:** upstream errors come back as they are, with `retry-after`, `retry-after-ms` and `x-should-retry`, and nothing is written. An unreachable upstream gives an OpenAI-format 502 and a timeout 504. A write-back that fails (say, during an embedding outage) is kept in process memory and written before that session's next write-back, or tried once more before the session ends; it is lost if the process exits. A write-back that carries an image above the pixel limit, or in an unsupported format, is dropped alone. If a memory the proxy injected is forgotten while the upstream model is still answering (for example another client's DELETE during a long stream), the answer is returned to the caller but not stored; the user's message is stored.
 - Requests must be JSON (`Content-Type: application/json`; 415 otherwise), and bodies are capped at `CUEMEM_MAX_BODY_BYTES` (413).
 
 ```bash
@@ -433,7 +458,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 The same four tools are served two ways:
 
-- **Over HTTP, by `cuemem serve` at `/mcp`** (Streamable HTTP, stateless, JSON responses), sharing the server's memory system. It takes the `/api` token (401 with `WWW-Authenticate: Bearer` otherwise). The `X-CueMem-User` and `X-CueMem-Agent` headers choose the space, as in the proxy; without them a scoped key uses its own first user, while the admin token, no-auth mode and wildcard-only keys must send `X-CueMem-User` (400). A user or agent outside the key's scope gets 403 and nothing is written; a cross-site Origin gets 403. The body limit is the fixed 8 MiB tier, and the MCP SDK has its own 4 MiB limit. If the app's lifespan has not started (uvicorn always starts it), `/mcp` answers 503. `cuemem serve --no-mcp` turns it off. Register it with, for example:
+- **Over HTTP, by `cuemem serve` at `/mcp`** (Streamable HTTP, stateless, JSON responses), sharing the server's memory system. It takes the `/api` token (401 with `WWW-Authenticate: Bearer` otherwise). The `X-CueMem-User` and `X-CueMem-Agent` headers choose the space, as in the proxy; without them a scoped key uses its own first user, while the admin token, no-auth mode and wildcard-only keys must send `X-CueMem-User` (400). A user or agent outside the key's scope gets 403 and nothing is written; a cross-site Origin gets 403. Non-ASCII IDs go in these headers as `utf-8''<percent-encoded UTF-8>` (RFC 8187), e.g. `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89` for 张三, the only form Node clients such as Claude Code can send; raw UTF-8 bytes are accepted too, and a malformed value, bytes that are not UTF-8 or a control character get 400 (`{"detail"}`). The body limit is the fixed 8 MiB tier, and the MCP SDK has its own 4 MiB limit. If the app's lifespan has not started (uvicorn always starts it), `/mcp` answers 503. `cuemem serve --no-mcp` turns it off. Register it with, for example:
 
   ```bash
   claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp \
@@ -465,19 +490,25 @@ Any configuration field can be set as `CUEMEM_<SECTION>__<FIELD>` (nested with d
 | `CUEMEM_PEAK_POLICY` | `wait`, `warn` or `allow` for batch jobs such as evaluations; the SDK and the interactive commands (`ask`, `serve`, `proxy`, `mcp`) use `warn` regardless, and the SDK's `peak_policy` argument overrides it |
 | `CUEMEM_API_TOKEN` | The admin token of `cuemem serve` and `cuemem proxy`; `MemoryClient`'s default `api_key` |
 | `CUEMEM_API_KEYS_FILE` / `CUEMEM_API_KEYS` | Scoped keys: the path of a YAML file, or the same content inline (set only one) |
-| `CUEMEM_ALLOWED_HOSTS` | Extra hostnames accepted as Host and Origin (comma-separated; `*` turns both checks off) |
+| `CUEMEM_ALLOWED_HOSTS` | Extra hostnames accepted as Host and Origin (comma-separated; `*` turns both checks off); also needed for DNS names of a token-less non-loopback server |
 | `CUEMEM_MAX_BODY_BYTES` | Body limit in bytes for `/api`, `/v1` and UI uploads, and a scoped key's bodies in flight (default 67108864, 64 MiB) |
 | `CUEMEM_MAX_IMPORT_BYTES` | Body limit in bytes for imports with the admin token or without authentication (default 1073741824, 1 GiB) |
 | `CUEMEM_TRACES_RETENTION_DAYS` | Keep daily trace files this many days (an integer ≥ 1; unset keeps them forever). `cuemem serve` and `cuemem proxy` delete older files at start-up and then daily, with the query vectors of their questions; SDK-only apps can call `memory.system.prune_traces(days)` |
 | `CUEMEM_CONSOLIDATION__BACKGROUND_WORKERS` | How many spaces the background worker consolidates at once (default 4; one space is still one at a time) |
-| `CUEMEM_VECTOR_STORE__URL` | A Qdrant server instead of local mode |
+| `CUEMEM_VECTOR_STORE__URL` | A Qdrant server instead of local mode (with `http://` or `https://`) |
+| `CUEMEM_VECTOR_STORE__API_KEY` | API key of the Qdrant server (sent as the `api-key` header; the server's `QDRANT__SERVICE__API_KEY` or a Qdrant Cloud key), also by `cuemem migrate-vectors`. Empty or unset = no key. Read from the environment or `.env` only; there is no command-line flag. With an `http://` URL, qdrant-client warns once per client "Api key is used with an insecure connection.": harmless on loopback and on the compose network; use `https://` for a remote or Cloud server. `Memory(config={"vector_store": {"url": ..., "api_key": ...}})` takes it too |
 | `CUEMEM_EMBEDDING__BACKEND` | For example `hash`: offline hash embeddings (tests and demos only) |
 | `CUEMEM_PROXY__UNKNOWN_MODEL` | `remap` (default) or `reject` |
 | `CUEMEM_RETRIEVAL__CONTROLLER` | Another controller model file |
-| `GRADIO_ANALYTICS_ENABLED` | Gradio's own switch: `False` stops the UI from sending Gradio's usage analytics, which it does by default |
+| `GRADIO_ANALYTICS_ENABLED` | `True` opts in to Gradio's usage analytics and version check (off by default; the UI contacts no third party, and its font, IBM Plex Sans, ships with Gradio) |
+| `GRADIO_TEMP_DIR` | Where the UI keeps uploads and gallery copies; by default `cuemem serve` makes a private directory for each start (0700) and deletes it on exit |
 | `CUEMEM_EVAL_RAW_SESSION_IDS`, `CUEMEM_LANGMEM_MAX_LOST_SHARE`, `CUEMEM_AMEM_K` | Evaluation only (see D-067 and D-065) |
-| `CUEMEM_TEST_QDRANT_URL` | Tests only: runs `tests/test_qdrant_server.py` against that Qdrant server |
+| `CUEMEM_TEST_QDRANT_URL`, `CUEMEM_TEST_QDRANT_API_KEY` | Tests only: run `tests/test_qdrant_server.py` against that Qdrant server, with that API key when the server requires one |
 
 ## Command line
 
 `cuemem --help` lists the commands: `configure`, `doctor`, `ingest`, `export`, `import`, `consolidate`, `forget`, `ask`, `search-image`, `spaces`, `usage`, `serve`, `proxy`, `chat`, `demo`, `migrate-vectors`, `mcp`, `inspect`, `data` and `eval`. `cuemem <command> --help` describes the options; help and messages are in Chinese. `cuemem --preset <name> <command>` applies a preset to any command. Every command first raises the process's soft open-file limit to the hard limit (at most 65,536; never lowered; on macOS it falls back to 10,240 and 4,096); the library and the SDK leave the limit alone, so an app with many local spaces raises it itself (`ulimit -n`). `cuemem doctor` prints the local vector store's collection count against that limit, in yellow with the remedy when it passes half of it.
+
+- A configuration mistake (an unknown preset, or an invalid `CUEMEM_*` value) makes any command print one line, `错误：配置有误：…` (field, reason and the value received, except for secrets), and exit 1, instead of a traceback; `cuemem mcp` prints it on stderr. The SDK still raises ValueError or pydantic's ValidationError.
+- File modes: the command line tightens its umask to at least 077 (never loosening it), so every file it writes is 0600 and every directory 0700; the SDK and `MemorySystem.from_settings` create missing data directories at 0700. Existing directories are never changed. On POSIX, `cuemem doctor` also checks the permissions of the data directories, `.env` and `CUEMEM_API_KEYS_FILE` and prints the `chmod 700` / `chmod 600` commands for anything others can read; `serve` and `proxy` warn about the two secret files at start-up. `cuemem configure` replaces `.env` through a 0600 temporary file (a symlinked `.env` keeps its link; the directory holding it must be writable).
+- `cuemem doctor` shows `向量库：<url>（API Key 已设/未设）` with a Qdrant server; `cuemem migrate-vectors` sends `CUEMEM_VECTOR_STORE__API_KEY` to the target.

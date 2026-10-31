@@ -22,7 +22,7 @@ CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 - 写入要么全写、要么不留：向量化或向量库出错时什么都不写，重试不会写出重复的发言。发言提交之后不再抛出：写不进去的 trace 只在 `cuemem.core.trace` 日志里记一条警告。
 - 遗忘等整次召回做完：自动召回与把 L0 改走 L1 的 recall 工具在一次读取里做完，同一空间的遗忘排在它们之前或之后，不会插在中间。
 
-安装：`pip install "cuemem[integrations]"`（从 GitHub 装，见 README），源码仓库里 `uv sync --extra integrations`；只要一个框架时用 `openai-agents`、`langgraph` 或 `anthropic`。只有 DeepSeek 的 Key 时加上可选依赖 `local` 并用 `Memory(preset="deepseek")`。
+安装：`pip install "cuemem[integrations] @ git+https://github.com/FlickYan/cuemem"`（CueMem 还没有发布到 PyPI，PyPI 上名叫 cuemem 的包不是这个项目），源码仓库里 `uv sync --extra integrations`；只要一个框架时用 `openai-agents`、`langgraph` 或 `anthropic`。只有 DeepSeek 的 Key 时加上可选依赖 `local` 并用 `Memory(preset="deepseek")`。可运行的示例及各自要的 Key 与命令见 [examples/README.md](../examples/README.md)（英文）。
 
 **高峰时段**：SDK，以及包在 `Memory` 外面的各个集成，缺省 `peak_policy="warn"`：DeepSeek 工作日的高峰时段（北京时间）里照常按高峰价调用模型，不会停下来等高峰结束。不用预设时也一样，默认配置的回答模型就是 DeepSeek。批量任务想等错峰价时用 `Memory(peak_policy="wait")`，开始等待时 SDK 在 `cuemem.sdk` 日志上记一条警告。评测与 `cuemem eval run --peak` 不受影响。
 
@@ -142,7 +142,8 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
 ## 局限
 
 - 进行中的会话按进程记在内存里：多个进程共用一个数据目录（Qdrant 服务端）时，一个进程可能提前交出另一个进程还在进行的会话。
+- 模型回答期间的遗忘：注入的记忆在模型还在回答时被遗忘了，记忆代理照样返回回答，但不存下（用户的话照样存下）。三个集成同样是"召回 → 模型 → 写回"，没有这项检查，这样的回答在那里仍可能写回（没有复现过）。
 - 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
 - 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。
 - 供应商出错与过期：各集成自己的记忆工具不像 MCP 那样把供应商的出错（限流、余额不足、超时）换成说明，出来的是供应商客户端的异常。带 `expiration_date` 的记忆只在 SDK 的 `search`、`get_all` 与画像里排除，各集成在删除之前仍看得到。
-- 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉（提问里有 U+2028、U+2029、U+0085 时也一样），`delete_all` 删掉这个空间的全部 trace。在那之前 trace 一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`：`cuemem serve` 与 `cuemem proxy` 每天按它删一遍，只用 SDK 的应用可以调 `memory.system.prune_traces(days)`。
+- 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉（提问里有 U+2028、U+2029、U+0085 时也一样），其中记着的子查询、追加查询与 Agent 自己检索的查询向量也删，`delete_all` 删掉这个空间的全部 trace。遗忘时重写不了的 trace 文件（磁盘满）整个删掉，记一条警告，遗忘照常成功。在那之前 trace 一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`：`cuemem serve` 与 `cuemem proxy` 每天按它删一遍，只用 SDK 的应用可以调 `memory.system.prune_traces(days)`。
