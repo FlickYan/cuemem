@@ -483,7 +483,7 @@ def test_resume_refuses_other_settings_while_questions_remain(
 def test_resume_infers_what_old_runs_did_not_record(
     eval_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """旧的 run.json 没记题号的哈希时比题数；没记控制器（3d4e3ad 之前，只有 v1）时按 v1 比，记的是
+    """旧的 run.json 没记题号的哈希时比题数；没记控制器（ad56fb0 之前，只有 v1）时按 v1 比，记的是
     带版本号的文件名时读那个文件，记的是 controller_model.json（先后指过 v2、v3）时提醒、不比；
     没有用控制器的方法时不比控制器。"""
     from cuemem.errors import ConfigMismatchError

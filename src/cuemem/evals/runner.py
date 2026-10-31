@@ -752,7 +752,7 @@ ROLE_LABELS = {
     "agent": "Agent 模型",
 }
 CONTROLLER_METHODS = {"B6", "B6h", "B6a"}  # 用学到的控制器（retrieval.controller）选档的方法
-# 3d4e3ad（N11）之前 run.json 不记控制器的文件名，那时只有 N7 导出的 v1 这一个文件
+# ad56fb0（N11）之前 run.json 不记控制器的文件名，那时只有 N7 导出的 v1 这一个文件
 LEGACY_CONTROLLER = "n7-two-stage-v1"
 AMEM_K_ENV = "CUEMEM_AMEM_K"  # A-MEM（MA）的检索条数（evals/baselines/amem.py）
 # 写进 run.json 的环境变量去掉密钥类的（与 evals/baselines/cognee.py 的 SECRET_ENV 相同）
@@ -771,7 +771,7 @@ def _check_resume_extended(
       有用到 CueMem 自己的事实记忆（或检索）的方法时比，外部基线与 B0、B1 不受它们影响；
     - 控制器（只在记下的或这次的方法里有 B6、B6h、B6a 时）：比模型文件里的版本，记了内容的
       sha256 时也比（同一个版本号的文件可能被重新导出过）。旧运行没记版本：
-      没有控制器这一项的是 3d4e3ad 之前建的，那时只有 v1；记的是带版本号的文件名就读那个文件；
+      没有控制器这一项的是 ad56fb0 之前建的，那时只有 v1；记的是带版本号的文件名就读那个文件；
       记的是 controller_model.json（N11 之后先后指过 v2、v3）的无从判断，提醒一声、不比；
     - A-MEM（MA）的检索条数 CUEMEM_AMEM_K（只在 run.json 记了环境变量时）。
     """

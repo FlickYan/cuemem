@@ -935,7 +935,7 @@
 - **理由**：改版本号会让所有评测空间重建（全部重新抽取、对账），既贵又让 N9 的数字无法从现有空间复现。提示的修订只影响之后新写入的记忆。
 - **后果**：
   - 新增联网测试 `tests/live/test_reconcile_live.py`：一段新编的小对话（不用测试集原题），检查周五与工作日两条都保留、上海 → 新加坡是 `changed`、年龄说错了是 `corrected`。同一段对话重复 5 次，三类都是 5 / 5；N9 的提示是 3 / 5、5 / 5、0 / 5。提示是对着这段对话改了两轮的（过程见 N11 结果记录），它只说明这两类错误修好了。
-  - 删掉评测空间、从零复现 N3–N9 时，对账那部分请求的提示变了，不会命中缓存，重建的记忆会与当时略有不同；要逐字复现，检出 N11 之前的提交（a8b8f07）。
+  - 删掉评测空间、从零复现 N3–N9 时，对账那部分请求的提示变了，不会命中缓存，重建的记忆会与当时略有不同；要逐字复现，检出 N11 之前的提交（dbc082c）。
 - **N12 之后（D-068）**：评测空间的指纹对不上时不再重建，而是报错（D-028）。以后真要改 `PIPELINE_VERSION`，已有的评测空间会先报 ConfigMismatchError，要 `--rebuild-spaces` 或换目录，不会悄悄重建。
 
 ## D-054 Agent 的回答缓存按会话归属
@@ -1428,7 +1428,7 @@
   6. **评测规范与复现**（修订 D-016、D-028、D-048、D-052、D-053、D-055、D-058、D-067）：
      - **空间按另一套配置建的**：复用的评测空间的巩固指纹或流水线版本对不上时，不再悄悄清空重建（以前 `CUEMEM_PATHS__EVAL_SPACES` 设错一次，就把另一个协议发表过的空间按这次的配置改写）：需要事实记忆的方法报 ConfigMismatchError，写明两个协议各自的目录；B0、B1 与外部基线照常回答；`cuemem eval run --rebuild-spaces` 才重建。
      - **续跑**：还有没答完的题时，判分、抽取、规划等角色的模型、`--k`、`--limit`、题目集合、巩固与检索配置、控制器的版本与文件内容也要一致。run.json 另记题号的哈希、控制器的版本与 sha256、命令行与 CUEMEM_* 环境变量（去掉密钥），每次续跑追加一条。已答完的运行不核对，复现脚本照常重新生成报告。
-     - **冻结请求的守护**：以前只在 LoCoMo 上哈希 B1、B2、B4 请求里的 messages，审计的漂移插件（提示多一句、工具说明多一个空格、L1 预算 4000 → 3900、缓存键的规范化变了）全部漏过。现在按缓存键逐方法钉住 LoCoMo 迷你数据上的 B1、B2、B2F、B4、B5、B6、B3、B6a 与原始 ID 的 LongMemEval 夹具上的 B1、B2、B4、B5、B6、B3、B6a（`tests/test_eval_leak.py` 的 `FROZEN_REQUESTS`）；`tests/test_frozen_config.py` 钉住 L1、L2 与 N4 的默认配置、八个冻结方法的参数与三个控制器文件的 sha256；`tests/test_llm_client.py`、`tests/test_embedding.py` 钉住 request_key 与向量缓存键的写法。这些值都在体检之前的提交 e7064ef 上重算过，逐一相同。
+     - **冻结请求的守护**：以前只在 LoCoMo 上哈希 B1、B2、B4 请求里的 messages，审计的漂移插件（提示多一句、工具说明多一个空格、L1 预算 4000 → 3900、缓存键的规范化变了）全部漏过。现在按缓存键逐方法钉住 LoCoMo 迷你数据上的 B1、B2、B2F、B4、B5、B6、B3、B6a 与原始 ID 的 LongMemEval 夹具上的 B1、B2、B4、B5、B6、B3、B6a（`tests/test_eval_leak.py` 的 `FROZEN_REQUESTS`）；`tests/test_frozen_config.py` 钉住 L1、L2 与 N4 的默认配置、八个冻结方法的参数与三个控制器文件的 sha256；`tests/test_llm_client.py`、`tests/test_embedding.py` 钉住 request_key 与向量缓存键的写法。这些值都在体检之前的提交 67226a8 上重算过，逐一相同。
      - **复现脚本**：`scripts/reproduce.py` 不再改写冻结的控制器：三个训练脚本只核对（`--no-export --check`），重新训练的结果与仓库里的文件对不上就停下、什么都不写。评测运行与探针都加 `--fail-on-error`（有出错时退出码 3，达到花费上限 4），出错或提前停止的报告不再复制进 docs/results；不复制报告的步骤只容许与之前完全相同的出错（例如 N9 里每次都被内容审核拒绝的那道题）。新的 `--cache-only` 让 LLM 请求只读本地缓存、未命中即报错，跑完用 `git diff docs/results src/cuemem/read` 核对。Mem0 固定 2.2.1。
      - **缺省行为的变化**：指纹对不上的评测空间不再自动重建；以后升流水线版本号或给巩固配置加字段，已有的评测空间也会先报这个错，要 `--rebuild-spaces` 或换目录。续跑多核对上面几项。新的开关 `--rebuild-spaces`、`--fail-on-error`（`eval run` 与 `eval probe`）、`--check`、`--no-export`、`--cache-only` 都默认关，两个评测命令的默认退出码不变；直接运行训练脚本仍默认导出。
      - **评测**：这些都是守护与记录，不改任何请求；`scripts/reproduce.py` 对已答完的运行照常重新生成报告。审计时用只读方式核对过：本机 414 个发表用的 CueMem 评测空间在各自的配置下都被接受，docs/results 里的 10 份 run.json 都通过新的续跑核对。

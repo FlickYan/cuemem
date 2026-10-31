@@ -26,7 +26,7 @@ N12 查出一处评测泄漏：LongMemEval 证据会话的 ID 都以 `answer_` �
   ```
 
   回答模型因此能直接看出哪几条证据来自证据会话；拒答题的抬头还写着 `_abs`，等于告诉它"这题该拒答"。
-- 修复提交于 2026-10-15（`6bcf5c3`）。
+- 修复提交于 2026-10-15（`00f676a`）。
 
 ### 1.2 影响了哪些数字
 
@@ -50,7 +50,7 @@ N12 查出一处评测泄漏：LongMemEval 证据会话的 ID 都以 `answer_` �
   - `=1`：恢复原始 ID，提示与修复之前逐字节相同；
   - `=label`：会话 ID 照常改写、共用改写后的空间，只在证据抬头里显示原始 ID（消融用，见 §3）。
 - **历史数字照旧复现。** `scripts/reproduce.py` 的每一步都设 `=1`：文档里修复之前的数字照旧复现，提示与缓存都对得上；修复后的数字要另起运行名重跑。分析已有运行的脚本（`n9_errors`、`n12_baselines`）按 `run.json` 记下的写法加载，不看当前的环境变量。
-- **LoCoMo 逐字节不变。** 测试把一次小评测的全部请求与修复之前的提交（e7064ef）比对哈希。
+- **LoCoMo 逐字节不变。** 测试把一次小评测的全部请求与修复之前的提交（67226a8）比对哈希。
 
 ### 2.2 审计：还有哪些路会把 ID 交给模型
 
@@ -97,10 +97,10 @@ N12 查出一处评测泄漏：LongMemEval 证据会话的 ID 都以 `answer_` �
 
 - **原协议（orig）**：N9 / N11 发表数字的配置，即默认配置。抽取与规划 qwen3.8-flash，向量 qwen3.7-text-embedding，回答 deepseek-flash，判分 qwen3.8-max，巩固的备用模型 deepseek-flash。
   - 写入放在 `data/eval-spaces-default`：巩固指纹含备用模型。pq 的 LongMemEval 空间抽取模型与向量相同，备用模型却是 qwen3.7-plus，放在一起会被判为过期、重建。
-  - 三臂都在同一份代码（`131f2f2`）上跑。raw 一臂是在 `data/eval-spaces-default` 里重新写入、重新回答的，不是 N11 那次运行（见 §4.1 的说明）。
+  - 三臂都在同一份代码（`2b276f9`）上跑。raw 一臂是在 `data/eval-spaces-default` 里重新写入、重新回答的，不是 N11 那次运行（见 §4.1 的说明）。
 - **只用通义（pq）**：`CUEMEM_PRESET=qwen`，回答 qwen3.8-flash，判分 qwen3.8-max，其余见 [N12 外部基线记录](../n12-baselines/README.md)（D-065）。
   - 写入放在 `data/eval-spaces-qwen`。
-  - anon 与 label 在 `131f2f2` 上跑；raw 一臂用修复之前的代码（全上下文 `774dda7`，其余 `463964d`）。按设计它与 `=1` 等价：`src/cuemem/evals/datasets.py` 的模块说明写明 `=1`"恢复原始 ID，与修复之前逐字节相同"；测试只对 LoCoMo 的请求做了逐字节快照，LongMemEval 上测的是 `=1` 恢复原始 ID。
+  - anon 与 label 在 `2b276f9` 上跑；raw 一臂用修复之前的代码（全上下文 `5bc8fd2`，其余 `4775454`）。按设计它与 `=1` 等价：`src/cuemem/evals/datasets.py` 的模块说明写明 `=1`"恢复原始 ID，与修复之前逐字节相同"；测试只对 LoCoMo 的请求做了逐字节快照，LongMemEval 上测的是 `=1` 恢复原始 ID。
 
 两个协议的回答模型来自两家，可以看泄漏的效应是否依赖回答模型。
 

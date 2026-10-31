@@ -122,7 +122,7 @@ class NamedEmbedder:
 
 
 def test_embedding_cache_keys_are_frozen(tmp_path: Path) -> None:
-    """文本与图片向量的缓存键钉死（与基线提交 e7064ef 上相同）：键变了，data/cache 里已有的
+    """文本与图片向量的缓存键钉死（与基线提交 67226a8 上相同）：键变了，data/cache 里已有的
     向量全部失效，重放发表的数字时要重新向量化。"""
     cached = CachedEmbedder(
         NamedEmbedder(),

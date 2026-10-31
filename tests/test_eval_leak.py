@@ -571,7 +571,7 @@ def test_reproduce_keeps_the_leak_era_ids() -> None:
 
 # ---------- LoCoMo 逐字节不变 ----------
 
-# 基线提交 e7064ef 上同样跑一遍（B1、B2、B4，单线程）得到的全部请求消息的哈希：抽取、对账、
+# 基线提交 67226a8 上同样跑一遍（B1、B2、B4，单线程）得到的全部请求消息的哈希：抽取、对账、
 # 回答与判分的提示都与改写之前逐字相同，已有的响应缓存与评测空间照常命中。
 # 有意修改提示词时（不是会话 ID 的事）重新生成这个快照。
 LOCOMO_REQUESTS = "5766d428fa04c25a7cf5f755264da6f0f8b78925c898c7f24c96c1a888ce0d4d"
@@ -639,7 +639,7 @@ def test_locomo_is_byte_for_byte_unchanged(
 # response_format、工具与 tool_choice）与 extra_body，正是已有缓存能否命中、发表的数字能否从
 # data/cache 重放的依据：抽取、对账、规划与充分性检查、控制器、Agent 的工具调用（检索、算日期、
 # 交卷，以及一道题一直不交卷、步数用完后由 reader 兜底）、回答与判分都在里面。LongMemEval 用
-# 原始会话 ID（=1），与修复泄漏之前逐字节相同（D-067）。基线提交 e7064ef 上用同一份代码
+# 原始会话 ID（=1），与修复泄漏之前逐字节相同（D-067）。基线提交 67226a8 上用同一份代码
 # （tests/frozen_requests.py）跑出的值与这里完全相同。
 # L1（B4-nobm25）与 B6r 在这么小的数据上与 B4 的请求相同（整段历史都在预算里），它们的检索配置
 # 在 test_frozen_config.py 里钉住。有意修改提示词或参数时（在 decisions 里写明），跑

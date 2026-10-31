@@ -492,7 +492,7 @@ def test_bad_json_replay_is_unchanged_without_opt_in(settings: Settings, fake_ap
     assert len(fake_api.chat_requests) == 1
 
 
-# 默认配置下 extractor 角色、JSON 模式请求 "good" 与 "bad" 的缓存键：在基线提交 e7064ef 上用同样
+# 默认配置下 extractor 角色、JSON 模式请求 "good" 与 "bad" 的缓存键：在基线提交 67226a8 上用同样
 # 的请求算出的值。键变了，data/cache 里已有的条目就全部失效（发表的数字无法重放）
 GOOD_KEY = "50b048885429ba7f73b63789fc8cd63b92703fee37e77b179b505443498d6748"
 BAD_KEY = "b6006d3aa735cf3c9bd8a1f429b3dcc084268bbc4509c5d93d07e08e347e8e91"
@@ -524,7 +524,7 @@ def test_existing_cache_entries_still_hit(settings: Settings, fake_api: FakeAPI)
 
 def test_request_key_canonicalisation_is_frozen() -> None:
     """request_key 的规范化（排序、不转义非 ASCII、紧凑分隔符）钉死：非 ASCII 的消息、嵌套的
-    参数（response_format、工具）与 extra_body 一起算出的键与基线提交 e7064ef 上相同，字段顺序
+    参数（response_format、工具）与 extra_body 一起算出的键与基线提交 67226a8 上相同，字段顺序
     不影响结果。"""
     request: dict[str, Any] = {
         "provider": "qwen",
