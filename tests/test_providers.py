@@ -131,6 +131,31 @@ def test_install_hints_point_at_github_not_pypi(
         embedder.embed(["x"], "document")
 
 
+def test_install_hints_in_the_docker_image_rebuild_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """仓库的 Docker 镜像里（依赖在 /opt/venv，没有 pip，镜像里也没有 git）缺可选依赖时，提示带上
+    它重新构建镜像（默认的 ui、local 照样带上）。以前提示从 GitHub pip install，在容器里走不通：
+    系统的 pip 装进别的环境，也没有 git（第四轮复审）。"""
+    import importlib.util
+    import sys
+
+    from cuemem import config
+
+    monkeypatch.setattr(config, "source_checkout", lambda: False)
+    monkeypatch.setattr(sys, "prefix", "/opt/venv")
+    real = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a: None if name == "pip" else real(name, *a)
+    )
+    assert config.docker_image()
+    rebuild = 'docker build --build-arg EXTRAS="--extra ui --extra local'
+    assert config.extra_remedy("ui").startswith(rebuild + '" -t cuemem .')
+    assert config.extra_remedy("local").startswith(rebuild + '" -t cuemem .')
+    assert config.extra_remedy("eval").startswith(rebuild + ' --extra eval" -t cuemem .')
+    monkeypatch.setattr(sys, "prefix", "/home/me/.venv")  # 别处的虚拟环境照旧从 GitHub 装
+    assert not config.docker_image()
+    assert config.extra_remedy("ui").startswith('pip install "cuemem[ui] @ ')
+
+
 @pytest.fixture
 def openai_settings(clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")

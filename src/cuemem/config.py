@@ -11,7 +11,9 @@ API Key 不写进配置文件，而是从环境变量或数据目录的 .env 中
 from __future__ import annotations
 
 import difflib
+import importlib.util
 import os
+import sys
 import types
 import typing
 from collections.abc import Mapping
@@ -394,11 +396,25 @@ def cli_command(args: str) -> str:
 INSTALL_URL: str | None = "git+https://github.com/FlickYan/cuemem"
 
 
+# 仓库的 Dockerfile 把依赖装进的环境（UV_PROJECT_ENVIRONMENT）
+DOCKER_VENV = "/opt/venv"
+
+
+def docker_image() -> bool:
+    """是否在仓库的 Docker 镜像里运行：依赖由 uv sync 装进 /opt/venv，里面没有 pip，镜像里也
+    没有 git。容器里的 pip 是系统 Python 的，装不进这个环境。"""
+    return sys.prefix == DOCKER_VENV and importlib.util.find_spec("pip") is None
+
+
 def extra_remedy(extra: str) -> str:
-    """缺可选依赖时的安装命令：源码仓库里用 uv sync --extra，pip 安装后用 pip install（从
-    INSTALL_URL 装，不从 PyPI 按名字找）。"""
+    """缺可选依赖时的安装命令：源码仓库里用 uv sync --extra，仓库的 Docker 镜像里是带上它重新
+    构建镜像（默认的 ui、local 照样带上），pip 安装后用 pip install（从 INSTALL_URL 装，不从
+    PyPI 按名字找）。"""
     if source_checkout():
         return f"uv sync --extra {extra}"
+    if docker_image():
+        extras = " ".join(f"--extra {name}" for name in dict.fromkeys(("ui", "local", extra)))
+        return f'docker build --build-arg EXTRAS="{extras}" -t cuemem .（在源码仓库里重新构建镜像）'
     if INSTALL_URL is None:
         return f'pip install "cuemem[{extra}]"'
     return f'pip install "cuemem[{extra}] @ {INSTALL_URL}"'
