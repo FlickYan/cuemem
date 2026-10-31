@@ -9,7 +9,9 @@
 #   docker build --build-arg EXTRAS= -t cuemem .   # 镜像小得多（不装 Gradio、fastembed 与 onnxruntime）
 FROM python:3.12-slim AS build
 ARG EXTRAS="--extra ui --extra local"
-COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /bin/uv
+# uv 按版本与镜像摘要固定，与 CI 相同、在 pyproject.toml 的 uv_build 范围里：构建用 uv 自带的
+# uv_build，不从 PyPI 现取一份（tests/test_ci_pins.py 核对）
+COPY --from=ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv UV_PYTHON_DOWNLOADS=never
 WORKDIR /src
 # 先只装依赖（锁定版本），源码改动时这一层可以复用

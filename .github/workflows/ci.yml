@@ -4,14 +4,29 @@ on:
   push:
   pull_request:
 
+# 令牌只读（以前只靠仓库设置）。第三方 Action 按提交号固定、注释着版本；uv 与 Dockerfile 同一个
+# 版本，在 build-system 的 uv_build 范围里（tests/test_ci_pins.py 核对）
+permissions:
+  contents: read
+
+# 同一个 PR 的新推送取消还在跑的旧运行；push 各跑各的（run_id 兜底，不按分支排队）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
           enable-cache: true
+          prune-cache: true
       - name: 安装依赖
         # 界面与评测的测试要 ui、eval（开发依赖组里也有）；框架集成的测试与类型检查也要跑（N12）
         run: uv sync --locked --extra ui --extra eval --extra integrations
@@ -31,6 +46,7 @@ jobs:
     # docker-compose.yml 相同。服务端要 API Key（vector_store.api_key 每个请求都带上，另有一个
     # 测试确认不带的被拒绝）；/readyz 不查 Key
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       qdrant:
         image: qdrant/qdrant:v1.19.1
@@ -39,10 +55,14 @@ jobs:
         ports:
           - 6333:6333
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
           enable-cache: true
+          prune-cache: true
       - name: 安装依赖
         run: uv sync --locked
       - name: 等 Qdrant 起来
@@ -63,11 +83,16 @@ jobs:
     # pip 安装的路径：在仓库外装上构建出的 wheel（只有核心依赖，不带可选依赖），跑命令行、SDK、
     # HTTP 接口与记忆代理（离线，不需要 API Key）
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
           enable-cache: true
+          prune-cache: true
       - name: 构建 wheel
         run: uv build --wheel
       - name: wheel 里有配置、预设、控制器与类型标记（py.typed）
@@ -117,8 +142,11 @@ jobs:
   docker:
     # 镜像能构建、带着界面与本机向量的可选依赖（预设 deepseek 要用），启动后 /api/health 正常
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: 构建镜像
         run: docker build -t cuemem:ci .
       - name: 界面与本机向量的可选依赖在镜像里

@@ -20,10 +20,20 @@ on:
       - "uv.lock"
       - ".github/workflows/baselines.yml"
 
+# 令牌只读；第三方 Action 按提交号固定（同 ci.yml，tests/test_ci_pins.py 核对）
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   adapters:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    # 还没在 GitHub 上跑过：90 分钟是上限，不是量出来的
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -54,9 +64,12 @@ jobs:
               --with "agentic-memory @ git+https://github.com/agiresearch/A-mem@ceffb860f0712bbae97b184d440df62bc910ca8d"
               --with chromadb==1.5.9
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
           # 临时装的包（torch 就有几 GB）不进 GitHub 的缓存，免得挤掉 CI 任务的缓存
           enable-cache: false
       - name: 安装依赖
