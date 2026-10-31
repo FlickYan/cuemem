@@ -59,7 +59,11 @@ upstream; Dependabot and the dependency audit below track them).
 ## For maintainers
 
 The repository files do part of the work: `.github/dependabot.yml` (weekly version updates for the
-GitHub Actions, `uv.lock` and the Dockerfile's base image) and the `依赖审计` workflow
+GitHub Actions and `uv.lock`; its entry for the Dockerfile's base image stays dormant while the two
+`FROM python:3.12-slim` lines carry a tag without a digest, because Dependabot only offers tags as
+precise as `3.12-slim` and Python minor upgrades are ignored, so each image build pulls the current
+`3.12-slim` instead; pin the `FROM` lines by digest to have it propose new digests weekly. The uv
+image in `COPY --from` is bumped by hand together with CI's `setup-uv`) and the `依赖审计` workflow
 (`.github/workflows/audit.yml`: `pip-audit` on the locked dependencies on every push and pull
 request and weekly; deliberately not a required check, since new advisories appear without code
 changes). The rest are repository settings that only an admin can change:
