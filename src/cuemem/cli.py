@@ -743,7 +743,8 @@ def serve(
 
     界面要用可选依赖 ui（Gradio）；没装时只启动 HTTP 接口与记忆代理，并说明怎么装。/mcp 与
     cuemem mcp 的工具相同，共用这个进程的记忆系统（cuemem mcp 不能与 serve 同时打开数据目录），
-    请求头 X-CueMem-User 选用户，令牌同 /api。"""
+    请求头 X-CueMem-User 选用户（不是 ASCII 的 ID 写成 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8
+    百分号编码），令牌同 /api。"""
     import uvicorn
 
     from cuemem.api.app import create_app
@@ -799,7 +800,8 @@ def serve(
             if not no_mcp:
                 console.print(
                     f"MCP（Streamable HTTP）：http://{host}:{port}/mcp"
-                    "（请求头 X-CueMem-User 选用户，令牌同 /api；--no-mcp 关掉）"
+                    "（请求头 X-CueMem-User 选用户，不是 ASCII 的写成 utf-8''<百分号编码>；"
+                    "令牌同 /api；--no-mcp 关掉）"
                 )
             if keys.enabled:
                 console.print(
@@ -881,6 +883,7 @@ def proxy(
         )
         console.print(
             "用户：请求体的 user 字段，或请求头 X-CueMem-User"
+            "（不是 ASCII 的写成 utf-8''<百分号编码>）"
             + (f"；默认 {user}" if user else "；没有时原样转发、不碰记忆")
         )
         if keys.enabled:

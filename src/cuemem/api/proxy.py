@@ -19,9 +19,10 @@
    下一次写回或结束之前再写（见 Run）。会话进行中不抽取事实，
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-045）。
 
-身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent）；会话：请求头
-X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）或者空闲
-超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
+身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent；不是 ASCII 的 ID 写成
+utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id，或者放进 user 字段）；
+会话：请求头 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）
+或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
@@ -68,7 +69,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
-from cuemem.api.auth import Keys, Principal, guard, principal_of
+from cuemem.api.auth import Keys, Principal, guard, identity_headers, principal_of
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import MAX_BODY_BYTES
 from cuemem.config import ModelSpec, UnknownModel
@@ -393,8 +394,11 @@ class MemoryProxy:
     def _recall(
         self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
     ) -> Turn:
-        user_id = headers.get("x-cuemem-user") or body.get("user") or self.default_user
-        agent_id = headers.get("x-cuemem-agent") or None
+        try:  # 不是 ASCII 的 ID：原样的 UTF-8 或 utf-8''<百分号编码>（auth.header_id）
+            header_user, agent_id = identity_headers(headers)
+        except ValueError as exc:
+            raise ProxyError(400, str(exc), param="user") from None
+        user_id = header_user or body.get("user") or self.default_user
         if (  # 在开会话、检索之前；管理令牌不限制
             user_id is not None
             and principal is not None

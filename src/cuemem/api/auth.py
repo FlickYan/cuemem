@@ -38,6 +38,8 @@
 只列出作用域里的空间，/api/v1/reset 只删作用域里的空间（管理令牌删全部）。记忆代理按 user 字段与
 X-CueMem-User、X-CueMem-Agent 头判断；没有用户、原样转发的请求不碰记忆，照常转发。/mcp（MCP 的
 Streamable HTTP，api/mcp.py）也按这两个头判断，不给时是令牌作用域里的第一个用户（Principal.home）。
+这两个头里不是 ASCII 的 ID 由 header_id 解（UTF-8 的百分号编码 utf-8''%E5%BC%A0%E4%B8%89，或原样
+的 UTF-8）。
 
 判断按记忆空间（sdk.space_for 的结果）解回的用户与 Agent（sdk.space_owner），不按请求里的 ID：
 "agent/x" 一律算 Agent x 自己的记忆——用户 x 在名叫 agent 的 Agent 下的记忆也落在这个空间，只能
@@ -61,6 +63,7 @@ from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import unquote_to_bytes
 
 import yaml
 from fastapi import Depends, HTTPException, Request, Response
@@ -351,6 +354,61 @@ def bearer_principal(keys: Keys, authorization: str | None) -> Principal | None:
         return ADMIN
     scheme, token = get_authorization_scheme_param(authorization)
     return keys.resolve(token) if scheme.lower() == "bearer" and token else None
+
+
+# RFC 8187 的 ext-value（charset'language'百分号编码）当作整个请求头的值
+_EXT_VALUE = re.compile(r"(?i)utf-8'[A-Za-z0-9-]*'((?:[A-Za-z0-9!#$&+.^_`|~-]|%[0-9A-Fa-f]{2})*)")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def header_id(value: str | None) -> str | None:
+    """请求头 X-CueMem-User、X-CueMem-Agent 里的 ID（第四轮体检）；没有或是空的时 None。
+
+    Starlette 按 Latin-1 解请求头：curl、Go、aiohttp 原样发的 UTF-8 '张三' 以前成了
+    'å¼\\xa0ä¸\\x89'，悄悄落进另一个空间；Node 的 fetch（Claude Code 的 --header）与 httpx 根本
+    发不出 Latin-1 之外的字符。依次：
+
+    - utf-8'<语言>'<百分号编码>（RFC 8187，不分大小写）：按 UTF-8 解，Node 的客户端只能这样发；
+    - ASCII：原样；
+    - 别的按 UTF-8 重新解；不是 UTF-8 时原样（Node 的 fetch 与 requests 按 Latin-1 发的 'José'，
+      以前就对，不能变成 400）。
+
+    以 utf-8' 开头却写错、解出来不是 UTF-8 或带控制字符时 ValueError。"""
+    if not value:
+        return None
+    if value[:6].lower() == "utf-8'":
+        match = _EXT_VALUE.fullmatch(value)
+        if match is None:
+            raise ValueError("malformed utf-8'' value")
+        try:
+            decoded = unquote_to_bytes(match.group(1)).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("the percent-encoded bytes are not UTF-8") from None
+    elif value.isascii():
+        return value
+    else:
+        try:
+            decoded = value.encode("latin-1").decode("utf-8")
+        except UnicodeDecodeError:  # 真的是 Latin-1 的字节
+            decoded = value
+    if _CONTROL.search(decoded):
+        raise ValueError("control character")
+    return decoded or None
+
+
+def identity_headers(headers: Mapping[str, str]) -> tuple[str | None, str | None]:
+    """X-CueMem-User 与 X-CueMem-Agent 的 ID（header_id；headers 的键是小写，Starlette 的 Headers
+    也行）。写错时 ValueError，英文的说明写着是哪个头、非 ASCII 的 ID 怎么发。"""
+    ids: list[str | None] = []
+    for name in ("X-CueMem-User", "X-CueMem-Agent"):
+        try:
+            ids.append(header_id(headers.get(name.lower())))
+        except ValueError as exc:
+            raise ValueError(
+                f"The {name} header is not a valid ID ({exc}): send IDs that are not ASCII as "
+                f"UTF-8 percent-encoded, e.g. {name}: utf-8''%E5%BC%A0%E4%B8%89 for 张三."
+            ) from None
+    return ids[0], ids[1]
 
 
 def authenticate(keys: Keys, request: Request) -> Principal:

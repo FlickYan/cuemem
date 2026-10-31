@@ -17,11 +17,12 @@ from fakes import FakeAPI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from scripted import ScriptedModel, echo_extraction
+from starlette.datastructures import Headers
 
 from cuemem.agent import Agent
 from cuemem.api.app import LOOPBACK_HOSTS, create_app
 from cuemem.api.auth import Keys
-from cuemem.api.mcp import build_server
+from cuemem.api.mcp import McpEndpoint, build_server
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
 from cuemem.memory import MemorySystem
@@ -137,6 +138,56 @@ def test_tokens_and_scopes_are_checked_before_mcp(app: FastAPI, service: ChatSer
             "dave": ["I like juice"],
         }
         assert "tea" in said(http.post("/mcp", json=call("recall", query="tea"), headers=alice))
+
+
+def test_non_ascii_user_ids_in_the_headers(service: ChatService, tmp_path: Path) -> None:
+    """X-CueMem-User 里不是 ASCII 的 ID（第四轮体检）：Starlette 按 Latin-1 解请求头，curl 发的
+    UTF-8 '张三' 以前悄悄写进 'å¼\\xa0ä¸\\x89' 这个空间（只能访问张三的令牌是 403）；Node 的 fetch
+    （Claude Code 的 --header）与 httpx 根本发不出 '张三'。现在原样的 UTF-8 字节与 RFC 8187 的
+    utf-8''%E5%BC%A0%E4%B8%89 都是 '张三'；不是 UTF-8、带控制字符或写错的 utf-8'' 是 400。"""
+    zhang = "zhang-token-0123456789"
+    keys = Keys.parse(
+        f"keys: [{{name: zhang, token: {zhang}, scopes: [{{user: 张三}}]}}]", ADMIN_TOKEN
+    )
+    app = create_app(
+        service, upload_dir=tmp_path / "u", ui=False, keys=keys, allowed_hosts=list(LOOPBACK_HOSTS)
+    )
+
+    def raw(token: str, **ids: bytes) -> list[tuple[bytes, bytes]]:
+        out = [(k.encode(), v.encode()) for k, v in headers(token).items()]
+        return out + [(f"x-cuemem-{name}".encode(), value) for name, value in ids.items()]
+
+    utf8 = "张三".encode()
+    encoded = b"utf-8''%E5%BC%A0%E4%B8%89"
+    with TestClient(app, base_url=URL) as http:
+        for token, text, user in (
+            (ADMIN_TOKEN, "raw UTF-8", utf8),
+            (ADMIN_TOKEN, "percent-encoded", encoded),
+            (zhang, "scoped raw", utf8),
+            (zhang, "scoped encoded", encoded.upper().replace(b"UTF-8''", b"UTF-8'zh'")),
+        ):
+            said(http.post("/mcp", json=call("remember", text=text), headers=raw(token, user=user)))
+        agent = raw(ADMIN_TOKEN, user=b"bob", agent=b"utf-8''caf%C3%A9")
+        said(http.post("/mcp", json=call("remember", text="agent"), headers=agent))
+        for bad in (b"utf-8''%FF", b"utf-8''%0Abob", b"utf-8''%E5%BC", b"utf-8''a b"):
+            response = http.post("/mcp", json=call("profile"), headers=raw(ADMIN_TOKEN, user=bad))
+            assert response.status_code == 400, bad
+            detail = response.json()["detail"]
+            assert "X-CueMem-User" in detail and "utf-8''" in detail
+        response = http.post("/mcp", json=call("profile"), headers=raw(zhang, user=b"bob"))
+        assert response.status_code == 403
+    assert turns(service) == {
+        "张三": ["raw UTF-8", "percent-encoded", "scoped raw", "scoped encoded"],
+        "café/bob": ["agent"],
+    }
+    # Node 的 fetch 与 requests 把 'José' 按 Latin-1 发：不是 UTF-8 的字节照旧按 Latin-1 解，以前
+    # 就对（TestClient 会把请求头重新编码成 UTF-8，带不了 Latin-1 的字节，所以直接调用）
+    endpoint = McpEndpoint(service, keys)
+    latin1 = Headers(
+        raw=[(b"authorization", f"Bearer {ADMIN_TOKEN}".encode()), (b"x-cuemem-user", b"Jos\xe9")]
+    )
+    assert endpoint._space(latin1) == "José"
+    assert endpoint._space(Headers(raw=[*latin1.raw[:1], (b"x-cuemem-user", b"alice")])) == "alice"
 
 
 def test_the_browser_and_host_checks_cover_mcp(app: FastAPI) -> None:

@@ -16,6 +16,9 @@
   相同（McpEndpoint）；请求头 X-CueMem-User（可加 X-CueMem-Agent）选用户：
     claude mcp add --transport http cuemem http://127.0.0.1:7860/mcp \\
         --header "Authorization: Bearer $KEY" --header "X-CueMem-User: alice"
+  不是 ASCII 的 ID 写成 UTF-8 的百分号编码（RFC 8187，第四轮体检）：X-CueMem-User:
+  utf-8''%E5%BC%A0%E4%B8%89 是张三。Node 的客户端（包括 Claude Code）只能这样发；curl 原样发的
+  UTF-8 也认。
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
-from cuemem.api.auth import UNAUTHORIZED, Keys, bearer_principal
+from cuemem.api.auth import UNAUTHORIZED, Keys, bearer_principal, identity_headers
 from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
 from cuemem.evidence import forget_summary, format_listing
@@ -95,8 +98,9 @@ class McpEndpoint:
 
     每个请求在交给 MCP 之前：
     - 认令牌（与 /api 相同的 Bearer 令牌，auth.bearer_principal），不对时 401；
-    - 定空间：X-CueMem-User、X-CueMem-Agent 头（与记忆代理相同，sdk.space_for）；都没给时是
-      令牌作用域里的第一个用户（Principal.home），管理令牌、不鉴权与全是通配的令牌没有，400；
+    - 定空间：X-CueMem-User、X-CueMem-Agent 头（与记忆代理相同，auth.identity_headers 解出 ID，
+      sdk.space_for）；都没给时是令牌作用域里的第一个用户（Principal.home），管理令牌、不鉴权与
+      全是通配的令牌没有，400；utf-8'' 写错、不是 UTF-8 时也是 400；
     - 空间在令牌的作用域之外时 403，什么都不做；
     - 空间放进 _SPACE，工具读它。
 
@@ -147,8 +151,10 @@ class McpEndpoint:
         principal = bearer_principal(self.keys, headers.get("authorization"))
         if principal is None:
             return JSONResponse({"detail": UNAUTHORIZED}, 401, {"WWW-Authenticate": "Bearer"})
-        user_id = headers.get("x-cuemem-user") or None
-        agent_id = headers.get("x-cuemem-agent") or None
+        try:  # 不是 ASCII 的 ID：原样的 UTF-8 或 utf-8''<百分号编码>（auth.header_id）
+            user_id, agent_id = identity_headers(headers)
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, 400)
         space = space_for(user_id, agent_id) if user_id or agent_id else principal.home()
         if space is None:
             message = (

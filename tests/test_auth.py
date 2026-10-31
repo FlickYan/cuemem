@@ -246,6 +246,38 @@ def test_short_plaintext_tokens_are_recorded_by_name() -> None:
     assert env.weak == ("k",)
 
 
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("alice", "alice"),
+        ("a%2Fb", "a%2Fb"),  # 不以 utf-8' 开头的 ASCII 原样
+        ("张三".encode().decode("latin-1"), "张三"),  # curl 原样发的 UTF-8，Starlette 按 Latin-1 解
+        ("José".encode().decode("latin-1"), "José"),
+        ("José", "José"),  # Node 的 fetch、requests 发的 Latin-1：不是 UTF-8，原样（以前就对）
+        ("utf-8''%E5%BC%A0%E4%B8%89", "张三"),
+        ("UTF-8'zh-CN'%e5%bc%a0%e4%b8%89", "张三"),
+        ("utf-8''alice", "alice"),
+        ("utf-8''", None),
+    ],
+)
+def test_header_ids(wire: str | None, expected: str | None) -> None:
+    """请求头 X-CueMem-User、X-CueMem-Agent 里的 ID（第四轮体检，见 auth.header_id）。"""
+    assert auth.header_id(wire) == expected
+
+
+@pytest.mark.parametrize(
+    "wire", ["utf-8''%FF", "utf-8''%E5%BC", "utf-8''%0Abob", "utf-8''a b", "utf-8'", "utf-8''%zz"]
+)
+def test_bad_header_ids(wire: str) -> None:
+    """utf-8' 开头却写错、解出来不是 UTF-8 或带控制字符：400，说明是哪个头、该怎么发。"""
+    with pytest.raises(ValueError):
+        auth.header_id(wire)
+    with pytest.raises(ValueError, match=r"X-CueMem-Agent .*utf-8''%E5%BC%A0%E4%B8%89"):
+        auth.identity_headers({"x-cuemem-user": "alice", "x-cuemem-agent": wire})
+
+
 def test_ui_login_binds_a_scoped_key_to_its_name() -> None:
     """界面登录：限定作用域的令牌要用它的名字做用户名（登录后只知道用户名），管理令牌用户名任意。
     用户名对不上令牌的名字时，不会被当成管理令牌。"""

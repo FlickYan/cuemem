@@ -312,6 +312,31 @@ def test_streaming_is_relayed_and_written_back(
     assert [t.text for t in turns] == ["I live in Berlin", "Berlin has great coffee"]
 
 
+def test_non_ascii_user_ids_in_the_headers(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """X-CueMem-User 里不是 ASCII 的 ID（第四轮体检）：原样的 UTF-8 字节（curl）与 RFC 8187 的
+    utf-8''%E5%BC%A0%E4%B8%89 都写进 '张三'（以前 Starlette 按 Latin-1 解成 'å¼\\xa0ä¸\\x89'）；
+    不是 UTF-8 的 400（OpenAI 格式，param user），不转发、不开会话。请求体的 user 字段照旧。"""
+    for text, user in (("raw", "张三".encode()), ("encoded", b"utf-8''%E5%BC%A0%E4%B8%89")):
+        response = chat(client, text, headers=[(b"x-cuemem-user", user)])
+        assert response.status_code == 200, response.text
+    assert chat(client, "body", user="张三").status_code == 200
+    assert [t.text for t in system.db.get_turns("张三") if t.role == "user"] == [
+        "raw",
+        "encoded",
+        "body",
+    ]
+    proxied = len(upstream.proxied)
+    refused = chat(client, "bad", headers=[(b"x-cuemem-user", b"utf-8''%FF")], user="张三")
+    assert refused.status_code == 400
+    error = refused.json()["error"]
+    assert error["type"] == "invalid_request_error" and error["param"] == "user"
+    assert "X-CueMem-User" in error["message"] and "utf-8''" in error["message"]
+    assert len(upstream.proxied) == proxied
+    assert {s["space_id"] for s in system.db.list_spaces()} == {"张三"}
+
+
 def _sse(text: str) -> bytes:
     chunk = {"choices": [{"index": 0, "delta": {"content": text}}]}
     return f"data: {json.dumps(chunk)}\n\n".encode()
