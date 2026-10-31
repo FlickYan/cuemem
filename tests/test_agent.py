@@ -19,6 +19,7 @@ from cuemem.agent import Agent, ContextBudget, Tool, ToolResult
 from cuemem.agent.context import Exchange, citations, evict, strip_citations
 from cuemem.config import Settings
 from cuemem.core.models import Conversation
+from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
@@ -192,6 +193,34 @@ def test_memory_search_escape_hatch(system: MemorySystem, model: ScriptedModel) 
     assert out.citations and out.trace.recalled
     assert all(item.via == "memory_search" for item in out.trace.recalled)
     assert steps[0]["tool_choice"] == "auto"
+
+
+def test_forget_purges_the_query_vectors_of_the_agents_own_searches(
+    system: MemorySystem, model: ScriptedModel
+) -> None:
+    """模型用 memory_search 自己查的话（看过记忆之后写的，可能复述了被删的内容）也向量化成查询
+    向量。以前 chat 的 trace 里没记它们（tool 阶段不记参数），遗忘找不到这些查询向量；现在记成
+    agent 事件（与 ToolReader 的同一个样子），遗忘时一起删。"""
+    query = "新加坡 电商公司 AI 产品经理"
+    steps: list[dict[str, Any]] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": query}, ensure_ascii=False)
+            return {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": args}]}
+        return "你在新加坡做 AI 产品经理。"
+
+    model.agent = reply
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "我现在做什么工作？", mode="l0")
+    assert isinstance(system.embedder, CachedEmbedder)
+    assert system.embedder.cached([query], "query") == {query}
+
+    report = system.forget("demo", session_ids=["s4"])
+    assert report.traces_removed >= 1
+    assert system.embedder.cached([query], "query") == set()
 
 
 def test_tool_loop_stops_and_reports_errors(system: MemorySystem, model: ScriptedModel) -> None:

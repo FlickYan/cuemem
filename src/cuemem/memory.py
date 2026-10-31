@@ -34,7 +34,7 @@ from cuemem.core.models import (
     TurnMeta,
 )
 from cuemem.core.timeutil import naive_local
-from cuemem.core.trace import TraceSink, current_trace, start_trace
+from cuemem.core.trace import TraceSink, current_trace, start_trace, trace_queries
 from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
@@ -894,13 +894,18 @@ class MemorySystem:
                         traces_removed, questions, traces_left = 0, [], ["*"]
 
                     # 6. 向量缓存（向量本身也可能泄露原文）：已不在记忆里的文本；被删发言与上面
-                    #    那些提问的查询向量（代理与 Agent 拿用户的原话做检索查询）。重放失败时派生
-                    #    记忆只重建了一部分，多删的向量下次巩固时重新算
+                    #    那些 trace 里的查询（代理与 Agent 拿用户的原话做检索查询）的查询向量，连同
+                    #    以文搜图的；没有别的记录再用的被删图片的向量（与删原图同一个规则）。重放
+                    #    失败时派生记忆只重建了一部分，多删的向量下次巩固时重新算
                     gone = sorted(texts_before - {u.text for u in self.db.list_units(space_id)})
                     embed_purged = 0
                     if isinstance(self.embedder, CachedEmbedder):
                         embed_purged = self.embedder.purge(gone)
-                        embed_purged += self.embedder.purge([*texts, *questions], "query")
+                    embed_purged += self._purge_queries([*texts, *questions])
+                    if isinstance(self.image_embedder, DashScopeMultimodalEmbedder):
+                        unused = {m.sha256 for m in doomed_media}
+                        unused = {d for d in unused if not self.db.media_sha_in_use(d)}
+                        embed_purged += self.image_embedder.purge(image_digests=sorted(unused))
                     self.db.scrub()  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
             finally:  # 中途出错时重放用到的更少，删得更多
                 if cache is not None and committed:
@@ -990,8 +995,9 @@ class MemorySystem:
     ) -> tuple[int, list[str], list[str]]:
         """删除这个空间里的 trace：属性中含有被删原话的（太短的话不作依据，免得误删），以及
         检索记录（spans、events）里有被删记忆 ID 的——回答模型看过它，回答可能复述了它。
-        返回删除的条数、这些 trace 的提问（提问的查询向量也要清掉；重写不了、整个删掉的 trace
-        文件里别的 trace 的提问也在内，见 TraceSink.remove）与没能清理的 trace 文件名。
+        返回删除的条数、这些 trace 里的查询（trace_queries：提问、L2 的子查询与追加的查询、Agent
+        自己的检索，它们的查询向量也要清掉；重写不了、整个删掉的 trace 文件里别的 trace 的也在内，
+        见 TraceSink.remove）与没能清理的 trace 文件名。
 
         按 ID 宁多勿漏（D-046、D-051）：检索总会带上前几名候选，空间小的时候，遗忘一段会话
         可能删掉大部分回答的 trace。trace 只是排查用的 JSONL，产品里没有地方读它。"""
@@ -1010,7 +1016,7 @@ class MemorySystem:
             if not hit and ids:
                 hit = not ids.isdisjoint(_strings([record.get("spans"), record.get("events")]))
             if hit:
-                questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
+                questions.extend(trace_queries(record))
             return hit
 
         dropped: list[str] = []
@@ -1302,7 +1308,8 @@ class MemorySystem:
         return report
 
     def purge_space_traces(self, space_ids: Collection[str]) -> int:
-        """删掉这些空间的全部 trace（删除空间之后），连同其中提问的查询向量。返回删除的条数。"""
+        """删掉这些空间的全部 trace（删除空间之后），连同其中查询（trace_queries）的查询向量。
+        返回删除的条数。"""
         wanted = set(space_ids)
         if self.tracer is None or not wanted:
             return 0
@@ -1313,7 +1320,7 @@ class MemorySystem:
             space = attrs.get("space")
             if not isinstance(space, str) or space not in wanted:
                 return False
-            questions.extend(str(attrs[k]) for k in ("question", "message") if attrs.get(k))
+            questions.extend(trace_queries(record))
             return True
 
         # 一个空间（delete_all）时先按空间 ID 筛；reset 删的是全部空间，筛不掉几行
@@ -1322,13 +1329,24 @@ class MemorySystem:
         dropped: list[str] = []  # 重写不了、整个删掉的文件里别的 trace 的提问（TraceSink.remove）
         removed = self.tracer.remove(gone, contains=needle, dropped=dropped)
         questions += _text_only(dropped)
-        if questions and isinstance(self.embedder, CachedEmbedder):
-            self.embedder.purge(questions, "query")
+        if questions:
+            self._purge_queries(questions)
         return removed
 
+    def _purge_queries(self, texts: Sequence[str]) -> int:
+        """删掉这些文字的查询向量，返回删掉的条数：文本向量器的，以及以文搜图时图片向量器算的
+        （有图的空间里 L1 把提问、L2 的子查询与追加的查询都另算一个图片空间里的文字向量，与文本
+        向量在同一个缓存文件里）。以前只删文本向量器的（D-070 留待以后的第 6 项）。"""
+        purged = 0
+        if isinstance(self.embedder, CachedEmbedder):
+            purged += self.embedder.purge(texts, "query")
+        if isinstance(self.image_embedder, DashScopeMultimodalEmbedder):
+            purged += self.image_embedder.purge(texts)
+        return purged
+
     def prune_traces(self, days: int, *, today: date | None = None) -> tuple[int, int]:
-        """删掉 days 天之前的 trace 文件（traces_retention_days，见 expire_traces），连同其中提问的
-        查询向量。返回删掉的文件数与查询向量数。
+        """删掉 days 天之前的 trace 文件（traces_retention_days，见 expire_traces），连同其中查询
+        （trace_queries）的查询向量（见 _purge_queries）。返回删掉的文件数与查询向量数。
 
         查询向量跟着 trace 一起删：遗忘只能从 trace 里找到问过被删内容的提问（见 _remove_traces），
         trace 过期了、查询向量还在的话，之后遗忘就清不掉它。带图的提问另外按去掉图片标记的文字删
@@ -1339,9 +1357,7 @@ class MemorySystem:
         if self.tracer is None:
             return 0, 0
         files, questions = self.tracer.prune((today or date.today()) - timedelta(days=days))
-        purged = 0
-        if questions and isinstance(self.embedder, CachedEmbedder):
-            purged = self.embedder.purge(_text_only(questions), "query")
+        purged = self._purge_queries(_text_only(questions)) if questions else 0
         return files, purged
 
     def expire_traces(self, *, today: date | None = None) -> tuple[int, int]:

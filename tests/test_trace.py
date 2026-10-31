@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from cuemem.core.trace import Trace, TraceSink
+from cuemem.core.trace import Trace, TraceSink, trace_queries
 
 
 def _line(space: str, question: str, trace_id: str = "t") -> str:
@@ -147,6 +147,29 @@ def test_prune_deletes_only_days_before_the_cutoff(tmp_path: Path) -> None:
     left = sorted(p.name for p in directory.iterdir())
     assert left == ["20251230.txt", "20260102.jsonl", "20260103.jsonl", "notes.jsonl"]
     assert sink.prune(date(2026, 1, 2)) == (0, [])
+
+
+def test_trace_queries_finds_every_retrieval_query(tmp_path: Path) -> None:
+    """trace 里拿去检索过的文字：提问与消息、L2 规划的子查询（plan 阶段）、检查之后追加的查询
+    （check 阶段）、Agent 自己的检索（agent 事件）。只认这几个阶段与事件，别的、不是字典的跳过。
+    过期删文件时据此删它们的查询向量（以前只有提问与消息）。"""
+    record = {
+        "attrs": {"space": "u", "question": "q", "message": ""},
+        "spans": [
+            {"name": "plan", "sub_queries": ["sub"]},
+            {"name": "check", "queries": ["follow"]},
+            {"name": "check", "queries": []},
+            {"name": "pack", "queries": ["not a query"]},
+            "junk",
+        ],
+        "events": [{"kind": "agent", "queries": ["tool"]}, {"kind": "llm", "queries": ["x"]}, 3],
+    }
+    assert trace_queries(record) == ["q", "sub", "follow", "tool"]
+    assert trace_queries({"attrs": ["odd"], "spans": "odd", "events": None}) == []
+
+    directory = tmp_path / "traces"
+    _write_days(directory, {"20260101": [json.dumps(record)]})
+    assert TraceSink(directory).prune(date(2026, 1, 2)) == (1, ["q", "sub", "follow", "tool"])
 
 
 class _ShortWrite:

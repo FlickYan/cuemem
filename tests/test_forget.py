@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import re
 import sqlite3
@@ -14,14 +15,17 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import openai
 import pytest
 from fakes import NO_BALANCE, REJECT, TOY_CONVERSATION, FakeAPI
+from PIL import Image
 from scripted import (
     EMPTY_EXTRACTION,
     TOY_EXTRACTIONS,
     TOY_UPDATE_KEYWORDS,
     ScriptedModel,
+    echo_extraction,
     reconcile_by_keyword,
 )
 from scripted import _fact as fact_reply
@@ -30,9 +34,11 @@ from test_sdk import AUG, SEP, moved, where_i_live
 import cuemem.llm.client as llm_client
 from cuemem import Memory
 from cuemem.config import Settings
+from cuemem.core.ids import content_hash
 from cuemem.core.models import Conversation, SessionIn, TurnIn
 from cuemem.core.trace import Trace
 from cuemem.embed import CachedEmbedder
+from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
 from cuemem.write.consolidate import scope
@@ -472,6 +478,106 @@ def test_a_trace_line_that_is_not_utf8_does_not_stop_the_forget(system: MemorySy
     assert report.turns_deleted > 0
     files, _ = system.tracer.prune(date.today() + timedelta(days=2))
     assert files >= 1 and list(traces.glob("*.jsonl")) == []
+
+
+PIN_QUESTION = "what is my card PIN?"
+SUB_QUERY = "user's bank card PIN"
+FOLLOW_UP = "bank card PIN 4321 Commerzbank"  # 检查的模型看过记忆，追加的查询复述了被删的 PIN
+
+
+def _l2_model() -> ScriptedModel:
+    """L2：规划给一个子查询；检查证据够不够的模型说不够，追加一个查询（第二次检查时它已经查过，
+    没有新的查询，检查结束）。"""
+    return ScriptedModel(
+        echo_extraction,
+        planner=lambda prompt: {"answer_type": "fact", "sub_queries": [SUB_QUERY]},
+        checker=lambda prompt: {"sufficient": False, "missing": "bank", "queries": [FOLLOW_UP]},
+    )
+
+
+def _pin_and_ask(system: MemorySystem, space: str, text: str, images: Sequence[str] = ()) -> None:
+    turn = TurnIn(role="user", text=text, ts=AUG, images=list(images))
+    system.append(space, SessionIn(session_id="s1", started_at=AUG, turns=[turn]), 0)
+    system.consolidate(space)
+    system.retrieve(space, PIN_QUESTION, mode="l2")
+
+
+def test_forget_purges_the_query_vectors_of_l2_sub_queries_and_follow_ups(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """L2 的子查询与检查之后追加的查询同样向量化成查询向量，追加的查询还可能复述被删的内容
+    （检查的模型看过记忆）。以前遗忘、删除空间与过期只删提问的查询向量，这些谁也找不到；它们本来
+    就记在 trace 里（plan 的 sub_queries、check 的 queries），现在按 trace 一起删。"""
+    fake_api.chat_replies = [_l2_model()]
+    queries = [PIN_QUESTION, SUB_QUERY, FOLLOW_UP]
+    pin = "My Commerzbank card PIN is 4321, keep it safe"
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        assert isinstance(system.embedder, CachedEmbedder)
+        _pin_and_ask(system, "eve", pin)
+        assert system.embedder.cached(queries, "query") == set(queries)
+        system.forget("eve", session_ids=["s1"])
+        assert system.embedder.cached(queries, "query") == set()
+
+        _pin_and_ask(system, "eve", pin)
+        system.delete_space("eve")
+        assert system.embedder.cached(queries, "query") == set()
+
+        _pin_and_ask(system, "eve", pin)  # 过期：trace 文件改成很久以前的日期
+        for n, path in enumerate(sorted(system.settings.paths.traces.glob("*.jsonl")), 1):
+            path.rename(path.with_name(f"200001{n:02d}.jsonl"))
+        files, purged = system.prune_traces(30)
+        assert files >= 1 and purged == 3
+        assert system.embedder.cached(queries, "query") == set()
+
+
+def _shared_image_cache(system: MemorySystem) -> DashScopeMultimodalEmbedder:
+    """换上 QwenCloud 的图片向量器（MockTransport 回假的向量），与文本向量共用一个缓存，与
+    from_settings 相同（离线测试的哈希向量器没有缓存）。"""
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        contents = json.loads(request.content)["input"]["contents"]
+        rows = [[float(len(json.dumps(c)) % 7 + 1)] + [0.5] * 15 for c in contents]
+        embeddings = [{"index": i, "embedding": row} for i, row in enumerate(rows)]
+        return httpx2.Response(
+            200, json={"output": {"embeddings": embeddings}, "usage": {"input_tokens": 3}}
+        )
+
+    assert isinstance(system.embedder, CachedEmbedder)
+    cfg = system.settings.multimodal_embedding.model_copy(update={"dim": 16})
+    transport = httpx2.Client(transport=httpx2.MockTransport(handle))
+    mm = DashScopeMultimodalEmbedder(
+        cfg, "sk-test", http_client=transport, cache=system.embedder.cache
+    )
+    system.image_embedder = system.writer.image_embedder = system.l1.image_embedder = mm
+    return mm
+
+
+def test_forget_purges_the_multimodal_query_and_image_vectors(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """有图的空间里 L1 把提问、子查询与追加的查询另外向量化成图片空间里的文字向量，写入时图片
+    按内容向量化，都在同一个缓存文件里。以前遗忘、删除空间与过期只删文本向量器的（D-070 留待
+    以后的第 6 项）。图片的向量与原图文件同一个规则：别的空间还有同一张图时留着，那个空间也删了
+    才删。"""
+    fake_api.chat_replies = [_l2_model()]
+    card = tmp_path / "card.png"
+    Image.new("RGB", (40, 30), "blue").save(card)
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        mm = _shared_image_cache(system)
+        cache = mm.cache
+        assert cache is not None
+        text = "My bank card, PIN 4321 <image>"
+        _pin_and_ask(system, "bob", text, [str(card)])  # 同一张图在两个空间里
+        _pin_and_ask(system, "eve", text, [str(card)])
+        texts = [mm._key("text", content_hash(q)) for q in (PIN_QUESTION, SUB_QUERY, FOLLOW_UP)]
+        image = mm._key("image", hashlib.sha256(card.read_bytes()).hexdigest())
+        assert set(cache.get_many([*texts, image])) == {*texts, image}
+
+        report = system.forget("eve", session_ids=["s1"])
+        assert set(cache.get_many([*texts, image])) == {image}  # bob 的还在
+        assert report.embed_cache_purged >= 3
+        system.delete_space("bob")
+        assert cache.get_many([*texts, image]) == {}
 
 
 def _sdk(settings: Settings, fake_api: FakeAPI, reply: Any = None, **kwargs: Any) -> Memory:

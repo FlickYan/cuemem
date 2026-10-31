@@ -41,7 +41,7 @@ from cuemem.agent.tools import Tool, ToolContext, ToolResult, memory_tools
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import SessionIn, TurnIn
 from cuemem.core.timeutil import naive_local
-from cuemem.core.trace import Trace, span, start_trace
+from cuemem.core.trace import Trace, record_event, span, start_trace
 from cuemem.llm.client import Message
 from cuemem.memory import MemorySystem, Recall, RecallMode
 from cuemem.read.agent import SearchSession
@@ -364,7 +364,14 @@ class Agent:
                 uploads={**session.uploads, **dict(uploads)},
             )
             llm_started = time.perf_counter()
-            answer, records = self._loop(ctx.messages, schemas, tool_ctx, cache_scope)
+            try:
+                answer, records = self._loop(ctx.messages, schemas, tool_ctx, cache_scope)
+            finally:
+                # 工具里的检索（memory_search）记进 trace，与 ToolReader 的 agent 事件同一个样子：
+                # 遗忘、删除空间与过期按它找到这些查询向量（trace_queries）。以前没记，模型看过
+                # 记忆之后写的查询（可能复述了被删的内容）的向量谁也找不到
+                if memory.queries:
+                    record_event("agent", searches=len(memory.queries), queries=memory.queries)
             timings["llm"] = _ms(llm_started)
             cited = citations(answer, memory.refs)
             plain = strip_citations(answer)

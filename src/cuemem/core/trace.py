@@ -226,12 +226,33 @@ class TraceSink:
 
 
 def trace_queries(record: dict[str, Any]) -> list[str]:
-    """一条 trace 里拿去检索过的文字：属性里的提问与消息（question、message）。trace 删掉时
-    它们的查询向量也要删（见 MemorySystem.prune_traces 与 TraceSink.remove 的 dropped）。"""
+    """一条 trace 里拿去检索过的文字，trace 删掉时它们的查询向量也要删（见 MemorySystem.
+    prune_traces、_remove_traces 与 TraceSink.remove 的 dropped）：属性里的提问与消息（question、
+    message），L2 规划的子查询（plan 阶段的 sub_queries），检查证据够不够之后追加的查询（check
+    阶段的 queries，检查的模型看过记忆，可能把被删的内容写进查询），Agent 自己的检索（agent 事件
+    的 queries）。以前只删提问与消息的，别的查询向量遗忘、删除空间与过期都找不到。这些文字本来
+    就记在 trace 里，按它们找也覆盖以前写下的 trace。"""
+    found: list[str] = []
     attrs = record.get("attrs")
-    if not isinstance(attrs, dict):
-        return []
-    return [str(attrs[k]) for k in ("question", "message") if attrs.get(k)]
+    if isinstance(attrs, dict):
+        found += [str(attrs[k]) for k in ("question", "message") if attrs.get(k)]
+    for item in _dicts(record.get("spans")):
+        if item.get("name") == "plan":
+            found += _texts(item.get("sub_queries"))
+        elif item.get("name") == "check":
+            found += _texts(item.get("queries"))
+    for item in _dicts(record.get("events")):
+        if item.get("kind") == "agent":
+            found += _texts(item.get("queries"))
+    return found
+
+
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def _texts(value: Any) -> list[str]:
+    return [str(v) for v in value if v] if isinstance(value, list) else []
 
 
 def _line_queries(line: str) -> list[str]:

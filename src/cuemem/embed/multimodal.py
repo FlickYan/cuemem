@@ -73,6 +73,15 @@ class DashScopeMultimodalEmbedder:
         keys = [self._key("text", content_hash(t)) for t in texts]
         return self._embed(keys, [{"text": t or " "} for t in texts])
 
+    def purge(self, texts: Sequence[str] = (), image_digests: Sequence[str] = ()) -> int:
+        """从缓存里删掉这些文字（以文搜图的查询）与图片（按内容的 sha256）的向量，返回删掉的
+        条数。遗忘、删除空间与过期时用：向量本身也可能泄露原文（D-021）。没有缓存时什么都不做。"""
+        if self.cache is None:
+            return 0
+        keys = [self._key("text", content_hash(t)) for t in texts]
+        keys += [self._key("image", d) for d in image_digests]
+        return self.cache.delete_many(keys)
+
     def _embed(self, keys: list[str], contents: list[dict[str, str]]) -> FloatArray:
         found: dict[str, FloatArray] = {}
         if self.cache is not None:
