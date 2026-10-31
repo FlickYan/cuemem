@@ -325,6 +325,17 @@ def _open_mark(space_id: str, session_id: str = "") -> str:
     return f"{_OPEN_MARKS}{len(space_id)}:{space_id}:{session_id}"
 
 
+def _parse_open_mark(key: str) -> tuple[str, str] | None:
+    """_open_mark 的反过来：（空间，会话）；不是这个格式时 None。"""
+    size, _, rest = key.removeprefix(_OPEN_MARKS).partition(":")
+    if not size.isdigit() or len(rest) <= int(size) or rest[int(size)] != ":":
+        return None
+    return rest[: int(size)], rest[int(size) + 1 :]
+
+
+HANDED_OVER_KEPT = 10_000  # 记着本进程接手过的多少个会话（见 adopt_open、resume_left_open）
+
+
 class MemorySystem:
     def __init__(
         self,
@@ -378,6 +389,12 @@ class MemorySystem:
         # 进行中的会话（Agent 正在对话，N8）：暂不巩固，会话结束后再整体抽取一次
         self._open: set[tuple[str, str]] = set()
         self._open_lock = threading.Lock()
+        # 下面两个同上一把锁。cuemem serve / proxy 启动时之前的进程留下的会话（defer_adoption）：
+        # 第一次碰到它们的空间时不接手，启动一个闲置期之后由 adopt_left_open 一起接手
+        self._deferred: set[tuple[str, str]] = set()
+        # 本进程接手（交给抽取）的会话，按接手的先后最多 HANDED_OVER_KEPT 个：调用方之后又往这个
+        # run 里写时重新打开（resume_left_open），与闲置结束的 run 一样
+        self._handed_over: dict[tuple[str, str], None] = {}
         # 同一会话的写入按顺序进行（SDK 的 add 在锁里分配发言序号）。按（空间，会话）分到固定的
         # 几十把锁上，不为每个会话建一把：不给 run_id 的 add 每次都是一个新会话
         self._session_locks = [threading.Lock() for _ in range(64)]
@@ -505,7 +522,7 @@ class MemorySystem:
         """
         space_id = conversation.space_id
         sessions = [(s, 0) for s in conversation.sessions]
-        skip = self.open_sessions(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
+        skip = self._held(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
         with start_trace("ingest", self.tracer, space=space_id) as trace:
             # 巩固任务与发言在同一个事务里提交：向量化出错时什么都不留（见 OnlineWriter.writing）
             with self.writer.writing(space_id, [sessions]) as report:
@@ -605,6 +622,14 @@ class MemorySystem:
         with self._open_lock:
             return {sid for space, sid in self._open if space == space_id}
 
+    def _held(self, space_id: str) -> set[str]:
+        """为整个空间登记巩固任务时跳过的会话：进行中的，以及留给调用方接着写、还没接手的
+        （defer_adoption）。否则这期间一次巩固（add(wait=True)、end_run(wait=True)）就把后者抽取
+        半段，调用方接着写完时又整段再抽取、重放一遍。没有 defer_adoption 时与 open_sessions
+        相同。"""
+        with self._open_lock:
+            return {sid for space, sid in self._open | self._deferred if space == space_id}
+
     def session_lock(self, space_id: str, session_id: str) -> threading.Lock:
         """往这个会话里写入时持有的锁：从分配发言序号到写完为止。放在系统上而不是 SDK 的
         Memory 上：HTTP 服务、记忆代理与各个集成用 Memory.from_system 包住的是同一个系统。"""
@@ -665,45 +690,78 @@ class MemorySystem:
         只认标记，不碰没有任务的其他会话：SDK 的 infer=False 写入的会话本来就不该抽取。
         记忆代理、SDK 与 HTTP 服务第一次碰到一个空间时各调用一次（同一个数据库同时只有一个
         进程在写时，本进程里不在进行中的就是之前的进程留下的）；cuemem serve 与 cuemem proxy
-        启动一个闲置期之后再对全部空间调用一次（adopt_left_open）。"""
+        启动一个闲置期之后再对全部空间调用一次（adopt_left_open），在那之前不接手启动时就留着的
+        （defer_adoption）。接手的记下来：调用方之后又往里写时重新打开（resume_left_open）。"""
         prefix = _open_mark(space_id)
         with self._open_lock:
             live = {sid for space, sid in self._open if space == space_id} | set(keep)
             marked = [key.removeprefix(prefix) for key in self.db.meta_keys(prefix)]
-            leftover = [sid for sid in marked if sid not in live]
+            leftover = [
+                sid for sid in marked if sid not in live and (space_id, sid) not in self._deferred
+            ]
             if not leftover:
                 return 0
             self.consolidator.enqueue(space_id, leftover)
             for sid in leftover:
                 self.db.delete_meta(_open_mark(space_id, sid))
+                self._handed_over[(space_id, sid)] = None
+            while len(self._handed_over) > HANDED_OVER_KEPT:  # 最早接手的不再记着
+                del self._handed_over[next(iter(self._handed_over))]
         if start or self.worker is not None:
             self.start_worker().submit(space_id)
         return len(leftover)
 
+    def defer_adoption(self) -> int:
+        """cuemem serve 与 cuemem proxy 启动时调用（api.app._adopt_after）：现在有标记、本进程里
+        却不在进行中的会话（之前的进程留下的），第一次碰到它们的空间时（adopt_open）不接手，留给
+        调用方在一个闲置期里接着写（Memory._resume），之后由 adopt_left_open 一起接手。以前只有
+        重启之后第一个碰到这个空间的 add 写的那个 run 留着：同一个用户的另一个 run、界面开的会话、
+        记忆代理的请求都先 adopt_open，把这个用户别的 run 交给抽取，调用方接着写时每一句又要整段
+        再抽取、把整个空间重放一遍（第四轮复审）。本地的 SDK 与命令行不调用，照旧第一次碰到时
+        接手。返回记下的会话数。"""
+        with self._open_lock:
+            for key in self.db.meta_keys(_OPEN_MARKS):
+                parsed = _parse_open_mark(key)
+                if parsed is not None and parsed not in self._open:
+                    self._deferred.add(parsed)
+            return len(self._deferred)
+
     def adopt_left_open(self) -> int:
         """接手全部空间里之前的进程留下的进行中的会话（每个有标记的空间各 adopt_open 一次），
         返回接手的会话数。cuemem serve 与 cuemem proxy 启动之后过一个闲置期调用一次（见
-        api.app._adopt_after）：以前只在 SDK、HTTP 服务与记忆代理第一次碰到一个空间时接手，
-        /api/v1 的 search、MCP 与界面的浏览都不接手，之后没人再写的空间里的会话一直不抽取。
-        与 adopt_open 一样，只在同一个数据库同时只有一个进程在写时才对。"""
+        api.app._adopt_after），连同 defer_adoption 留着的：以前只在 SDK、HTTP 服务与记忆代理第一次
+        碰到一个空间时接手，/api/v1 的 search、MCP 与界面的浏览都不接手，之后没人再写的空间里的
+        会话一直不抽取。与 adopt_open 一样，只在同一个数据库同时只有一个进程在写时才对。"""
+        with self._open_lock:
+            self._deferred.clear()
         spaces: set[str] = set()
         for key in self.db.meta_keys(_OPEN_MARKS):
-            size, _, rest = key.removeprefix(_OPEN_MARKS).partition(":")
-            if size.isdigit() and len(rest) > int(size):
-                spaces.add(rest[: int(size)])
+            parsed = _parse_open_mark(key)
+            if parsed is not None:
+                spaces.add(parsed[0])
         return sum(self.adopt_open(space) for space in sorted(spaces))
 
     def resume_left_open(self, space_id: str, session_id: str) -> bool:
         """接着写之前的进程留下、还开着的会话（cuemem serve 停止或崩溃时没有结束的 /api/v1 的
         run）：数据库里有它的标记、本进程里却不在进行中时，在本进程里重新算作进行中（标记留着），
         返回 True；已经在进行中或没有标记时 False。不接手（adopt_open）：接手就是交给抽取，调用方
-        接着写的每一句又要把整段重新抽取、把整个空间重放一遍（见 Memory._resume）。"""
+        接着写的每一句又要把整段重新抽取、把整个空间重放一遍（见 Memory._resume）。
+
+        本进程接手过、标记已经去掉的（启动一个闲置期之后调用方才回来，或者第一次碰到这个空间时
+        接手的）同样重新打开（重新写上标记），与闲置结束的 run 一样：结束时整段再抽取一次、重放
+        一次，不是每写一句都这样（第四轮复审）。"""
+        key = (space_id, session_id)
         with self._open_lock:
-            if (space_id, session_id) in self._open:
+            if key in self._open:
                 return False
-            if self.db.get_meta(_open_mark(space_id, session_id)) is None:
-                return False
-            self._open.add((space_id, session_id))
+            mark = _open_mark(space_id, session_id)
+            if self.db.get_meta(mark) is None:
+                if key not in self._handed_over:
+                    return False
+                self.db.set_meta(mark, datetime.now().isoformat())
+            self._handed_over.pop(key, None)
+            self._deferred.discard(key)
+            self._open.add(key)
             return True
 
     def consolidate(
@@ -726,7 +784,7 @@ class MemorySystem:
             if rebuild or self.consolidator.stale(space_id):
                 self.consolidator.rebuild(space_id)
             self.db.retry_failed_jobs(space_id)
-            self.consolidator.enqueue(space_id, skip=self.open_sessions(space_id))
+            self.consolidator.enqueue(space_id, skip=self._held(space_id))
             report = self.consolidator.run(space_id)
             trace.attrs.update(report.as_dict())
         if strict and report.failed:
@@ -1334,6 +1392,9 @@ class MemorySystem:
                 for key in self.db.meta_keys(prefix):
                     if key.removeprefix(prefix) not in live:
                         self.db.delete_meta(key)
+                # 接手过的、留着待接手的也忘掉：之后同名的 add 是一个普通的会话，不重新打开
+                self._handed_over = {k: v for k, v in self._handed_over.items() if k[0] != space_id}
+                self._deferred = {k for k in self._deferred if k[0] != space_id}
             if purge_traces:  # 在遗忘之后：遗忘自己的 trace 也删掉
                 self.purge_space_traces([space_id])
             if self.worker is not None:  # 遗忘里删过一遍；期间后台线程又记下的也删

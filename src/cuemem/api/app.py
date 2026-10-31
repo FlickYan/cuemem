@@ -326,9 +326,11 @@ def _adopt_after(
     /api/v1 的 run 留着，崩溃时界面、/api 与记忆代理的会话也来不及结束；以前只在有人再碰这个空间
     时接手，没人再碰的一直不抽取。调用方在这个闲置期里接着写的照常接着写（Memory._resume、指定了
     会话的 /api 与代理请求），之后才接手的是没人接着写的。不在启动时就接手：那会接手调用方马上要
-    接着写的 run，它之后每写一句都要整段再抽取一遍、把整个空间重放一遍。"""
+    接着写的 run，它之后每写一句都要整段再抽取一遍、把整个空间重放一遍。这个闲置期里别的请求
+    第一次碰到这个空间时也不接手它们（MemorySystem.defer_adoption，第四轮复审）。"""
     due = clock() + idle_s
     done = False
+    system.defer_adoption()
 
     def adopt() -> None:
         nonlocal done

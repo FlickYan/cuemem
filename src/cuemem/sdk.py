@@ -343,8 +343,10 @@ class Memory:
 
         进程崩溃时还开着的 run 由下一个进程第一次碰到这个用户时交给抽取（见 _adopt）；用同一个
         run_id 再 open_run 或 add 就是接着这段对话写，它不被接手（见 _resume）。cuemem serve 停止时
-        /api/v1 的 run 留着，重启之后接着写；没人接着写的，启动一个闲置期之后交给抽取。/api/v1 上
-        闲置（默认 30 分钟没有 add）的 run 先交给抽取，之后再 add 时重新打开（close_idle_runs）。"""
+        /api/v1 的 run 留着，重启之后接着写；没人接着写的，启动一个闲置期之后交给抽取，在那之前
+        别的请求第一次碰到这个用户时也不接手（MemorySystem.defer_adoption）。/api/v1 上闲置（默认
+        30 分钟没有 add）的 run 先交给抽取，之后再 add 时重新打开（close_idle_runs）；本进程接手过
+        的 run 同样（MemorySystem.resume_left_open）。"""
         space = space_for(user_id, agent_id)
         rid = run_id or sortable_session_id("run", datetime.now())
         self._adopt(space, keep=[rid])
@@ -434,7 +436,9 @@ class Memory:
 
         之前的进程留下、还开着的 run（cuemem serve 停止时不结束 /api/v1 的 run，崩溃时也来不及
         结束）同样接着写（MemorySystem.resume_left_open），与用同一个 run_id 再 open_run 相同。
-        以前 add 里的 _adopt 把它交给抽取：跨过一次部署的 run 每写一句都要再抽取、重放一遍。"""
+        以前 add 里的 _adopt 把它交给抽取：跨过一次部署的 run 每写一句都要再抽取、重放一遍。本进程
+        已经接手（交给抽取）了的也重新打开，与闲置结束的一样。没记着的（之前的进程闲置结束的，或者
+        接手的记录超过了 HANDED_OVER_KEPT 个）照旧当作普通的会话，每次 add 都抽取一遍。"""
         key = (space, run_id)
         with self._runs_lock:
             if key in self._runs:

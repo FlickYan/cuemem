@@ -40,7 +40,7 @@ from test_sdk import (
 
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
-from cuemem.api.app import create_app
+from cuemem.api.app import _adopt_after, create_app
 from cuemem.api.auth import Keys, guard
 from cuemem.api.memories import (
     PREFIX,
@@ -855,6 +855,93 @@ def test_a_run_left_open_by_an_earlier_process_is_continued(
             assert after.db.meta_keys("open-session:") == []
         traces = after.settings.paths.traces.glob("*.jsonl")
         assert not any("consolidate_regrown_replay" in p.read_text("utf-8") for p in traces)
+    finally:
+        after.close()
+
+
+def _regrown_replays(system: MemorySystem) -> int:
+    """会话又长了、从原始日志重放整个空间的次数（trace 里的 consolidate_regrown_replay）。"""
+    traces = system.settings.paths.traces.glob("*.jsonl")
+    return sum(p.read_text("utf-8").count("consolidate_regrown_replay") for p in traces)
+
+
+def _left_open_runs(n3_settings: Settings, fake_api: FakeAPI, *runs: str) -> None:
+    """之前的进程（cuemem serve，停止时 /api/v1 的 run 留着）在 eve 里开了这几个 run、各写一句。"""
+    before = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    server = Memory.from_system(before)
+    for rid in runs:
+        server.open_run(rid, user_id="eve")
+        server.add(f"I like {rid}", user_id="eve", run_id=rid)
+    before.close()
+
+
+@pytest.mark.parametrize("first", ["other_run", "chat_session"])
+def test_left_open_runs_survive_other_first_touches_under_serve(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, first: str
+) -> None:
+    """cuemem serve 重启之后（lifespan 里建 _adopt_after，记下之前留下的会话）：这个用户的另一个
+    run 先写、或者界面先开了一个会话，都不再把这个用户别的 run 交给抽取；调用方接着写时结束才
+    抽取一次、不重放。以前它们第一次碰到这个空间就 adopt_open，接着写的 run 每写一句都要整段再
+    抽取、把整个空间重放一遍（第四轮复审）。一个闲置期之后没人接着写的照样交给抽取。"""
+    fake_api.chat_replies = [model]
+    _left_open_runs(n3_settings, fake_api, "r1", "r2")
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    worker = after.start_worker()
+    now = [0.0]
+    adopt = _adopt_after(after, 60, clock=lambda: now[0])
+    try:
+        mem = Memory.from_system(after)
+        if first == "other_run":
+            mem.add("I like jazz", user_id="eve", run_id="r1")
+        else:
+            ChatService(after, Agent(after, router="rule")).start("eve")
+        worker.wait()
+        assert after.db.get_jobs("eve") == [] and len(after.db.meta_keys("open-session:")) >= 2
+        extracted, replays = model.calls["extract"], _regrown_replays(after)
+        for text in ("I like rain", "I like snow", "I like hail"):
+            mem.add(text, user_id="eve", run_id="r2")
+            worker.wait()
+        assert mem.end_run("r2", user_id="eve", wait=True)["turns"] == 4
+        assert model.calls["extract"] - extracted == 1
+        assert _regrown_replays(after) == replays
+        now[0] += 60
+        adopt()  # 一个闲置期之后：没人接着写的 r1 交给抽取，接着写着的不动
+        worker.wait()
+        jobs = {j["session_id"] for j in after.db.get_jobs("eve")}
+        assert ("r1" in jobs) == (first == "chat_session")
+    finally:
+        after.close()
+
+
+def test_a_run_handed_over_after_the_idle_period_is_reopened_when_the_client_returns(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """重启之后一个闲置期里调用方没回来，run 由 _adopt_after 交给抽取；之后调用方又接着写：以前
+    每写一句都要整段再抽取、把整个空间重放一遍。现在与同一个进程里闲置结束的 run 一样重新打开，
+    结束时整段再抽取一次、重放一次（第四轮复审）。delete_all 之后同名的 add 是一个普通的会话。"""
+    fake_api.chat_replies = [model]
+    _left_open_runs(n3_settings, fake_api, "r2", "r3")
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    worker = after.start_worker()
+    now = [0.0]
+    adopt = _adopt_after(after, 60, clock=lambda: now[0])
+    try:
+        now[0] += 60
+        adopt()
+        worker.wait()
+        assert after.db.meta_keys("open-session:") == []
+        mem = Memory.from_system(after)
+        extracted, replays = model.calls["extract"], _regrown_replays(after)
+        for text in ("I like rain", "I like snow", "I like hail"):
+            mem.add(text, user_id="eve", run_id="r2")
+            worker.wait()
+        assert after.open_sessions("eve") == {"r2"}
+        assert mem.end_run("r2", user_id="eve", wait=True)["turns"] == 4
+        assert model.calls["extract"] - extracted == 1
+        assert _regrown_replays(after) - replays == 1
+        mem.delete_all(user_id="eve")
+        mem.add("I like fog", user_id="eve", run_id="r3")
+        assert after.open_sessions("eve") == set()
     finally:
         after.close()
 
