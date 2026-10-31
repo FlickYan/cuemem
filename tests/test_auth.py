@@ -743,6 +743,138 @@ def test_proxy_default_user_is_checked_too(n3_settings: Settings, fake_api: Fake
         system.close()
 
 
+LIMITED_TOKEN = "limited-token-0123456789"
+CAPPED_TOKEN = "capped-token-0123456789"
+PLAIN_TOKEN = "plain-token-0123456789"
+LIMITS = f"""
+keys:
+  - name: limited
+    token: {LIMITED_TOKEN}
+    scopes: [{{user: alice}}]
+    models: [qwen3.8-flash]
+  - name: capped
+    token: {CAPPED_TOKEN}
+    scopes: [{{user: alice}}]
+    max_output_tokens: 1000
+  - name: plain
+    token: {PLAIN_TOKEN}
+    scopes: [{{user: alice}}]
+"""
+# 贵的请求：最贵的模型、16 个回答、长输出，还打开目录里关掉的思考模式
+EXPENSIVE = {"model": "qwen3.8-max", "n": 16, "max_tokens": 32768, "enable_thinking": True}
+
+
+@pytest.fixture
+def limited(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> Iterator[tuple[TestClient, MemoryProxy, FakeAPI]]:
+    fake_api.chat_replies = ["Hi!"]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    app = create_proxy_app(proxy, keys=Keys.parse(LIMITS, ADMIN_TOKEN))
+    try:
+        with TestClient(app) as http:
+            yield http, proxy, fake_api
+    finally:
+        proxy.close_all()
+        system.close()
+
+
+def test_scoped_key_model_allowlist(limited: tuple[TestClient, MemoryProxy, FakeAPI]) -> None:
+    """限定作用域的令牌可以写 models：只能用列出的模型（别名或模型 ID，按改用默认模型之后的算），
+    之外的 403（OpenAI 格式，param model），在检索、开会话与转发之前；流式与 /v1/responses 一样。
+    这种令牌的请求里，目录给的供应商参数（extra_body，例如关掉思考模式）盖过调用方给的。"""
+    http, proxy, fake_api = limited
+    for extra in ({"user": "alice"}, {}, {"user": "alice", "stream": True}):
+        refused = _chat(http, LIMITED_TOKEN, **{**EXPENSIVE, **extra})
+        assert refused.status_code == 403, refused.text
+        error = refused.json()["error"]
+        assert error["type"] == "permission_error" and error["param"] == "model"
+        assert "qwen3.8-flash" in error["message"]
+    responses = _chat(http, LIMITED_TOKEN, path="/v1/responses", model="qwen3.8-max", user="alice")
+    assert responses.status_code == 403
+    assert fake_api.chat_requests == [] and proxy.open_runs() == 0
+
+    ok = _chat(http, LIMITED_TOKEN, user="alice", model="qwen3.8-flash", enable_thinking=True)
+    assert ok.status_code == 200, ok.text
+    assert fake_api.chat_requests[-1]["enable_thinking"] is False
+    for model in (None, "gpt-4o"):  # 没给模型、不认识的模型：都是 agent 角色的 qwen3.8-flash
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        if model:
+            body["model"] = model
+        sent = http.post("/v1/chat/completions", json=body, headers=bearer(LIMITED_TOKEN))
+        assert sent.status_code == 200, (model, sent.text)
+    assert _chat(http, PLAIN_TOKEN, **EXPENSIVE).status_code == 200  # 没写 models 的照旧
+    assert fake_api.chat_requests[-1]["enable_thinking"] is True
+    assert _chat(http, ADMIN_TOKEN, **EXPENSIVE).status_code == 200
+
+
+def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI]) -> None:
+    """max_output_tokens：转发的 max_tokens（max_completion_tokens）不超过它，没给时补上；n > 1
+    的 400（param n），不转发。/v1/responses 的 max_output_tokens 同样。"""
+    http, _, fake_api = limited
+    assert _chat(http, CAPPED_TOKEN, max_tokens=32768).status_code == 200
+    assert fake_api.chat_requests[-1]["max_tokens"] == 1000
+    assert _chat(http, CAPPED_TOKEN, max_tokens=200).status_code == 200
+    assert fake_api.chat_requests[-1]["max_tokens"] == 200
+    assert _chat(http, CAPPED_TOKEN, user="alice").status_code == 200
+    assert fake_api.chat_requests[-1]["max_tokens"] == 1000
+    reasoning = _chat(http, CAPPED_TOKEN, max_completion_tokens=5000, max_tokens=4000)
+    assert reasoning.status_code == 200
+    sent = fake_api.chat_requests[-1]
+    assert sent["max_completion_tokens"] == 1000 and sent["max_tokens"] == 1000
+    responses = _chat(http, CAPPED_TOKEN, path="/v1/responses", max_output_tokens=9000)
+    assert responses.status_code == 200 and fake_api.chat_requests[-1]["max_tokens"] == 1000
+    seen = len(fake_api.chat_requests)
+    for n in (2, 16):
+        refused = _chat(http, CAPPED_TOKEN, n=n)
+        assert refused.status_code == 400 and refused.json()["error"]["param"] == "n"
+    assert _chat(http, CAPPED_TOKEN, n=1).status_code == 200
+    assert len(fake_api.chat_requests) == seen + 1
+    assert _chat(http, PLAIN_TOKEN, **EXPENSIVE).status_code == 200  # 没写的照旧
+    assert fake_api.chat_requests[-1]["max_tokens"] == 32768
+    assert fake_api.chat_requests[-1]["n"] == 16
+
+
+def test_scoped_keys_without_limits_forward_the_same_bytes(
+    limited: tuple[TestClient, MemoryProxy, FakeAPI],
+) -> None:
+    """没写这几个字段的限定作用域的令牌，转发给上游的请求体与管理令牌的逐字节相同。"""
+    http, _, fake_api = limited
+    body = {**EXPENSIVE, "temperature": 0.3, "tools": [{"type": "function", "function": {}}]}
+    sent = []
+    for token in (ADMIN_TOKEN, PLAIN_TOKEN):
+        assert _chat(http, token, **body).status_code == 200
+        sent.append(json.dumps(fake_api.chat_requests[-1], sort_keys=True))
+    assert sent[0] == sent[1]
+
+
+def test_key_limits_are_validated() -> None:
+    """rate_per_minute、max_output_tokens 是正整数；models 不能是空列表，也不能有空的名字。"""
+    for entry, problem in (
+        ("rate_per_minute: 0", "rate_per_minute"),
+        ("rate_per_minute: '5'", "rate_per_minute"),
+        ("max_output_tokens: -1", "max_output_tokens"),
+        ("models: []", "models"),
+        ("models: ['']", "models"),
+        ("models: qwen3.8-flash", "models"),
+    ):
+        with pytest.raises(AccessKeysError) as caught:
+            Keys.parse(_keys(f"name: a, token: t, scopes: [{{user: a}}], {entry}"))
+        assert problem in str(caught.value), entry
+    keys = Keys.parse(
+        _keys(
+            "name: a, token: t, scopes: [{user: a}], rate_per_minute: 60, "
+            "models: [qwen3.8-flash, deepseek-flash], max_output_tokens: 2000"
+        )
+    )
+    principal = keys.resolve("t")
+    assert principal is not None and principal.rate_per_minute == 60
+    assert principal.models == ("qwen3.8-flash", "deepseek-flash")
+    assert principal.max_output_tokens == 2000
+    assert ADMIN.rate_per_minute is None and ADMIN.models is None
+
+
 # ---------- 界面 ----------
 
 

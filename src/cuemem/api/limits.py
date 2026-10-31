@@ -24,19 +24,28 @@ api.auth.authenticated_route），界面（Gradio）的登录与事件接口也�
 
 管不到的：好几个令牌一起来（每个各算各的）；界面的事件接口（登录的会话不带 Bearer 令牌，固定
 8 MiB 那一档）。共用的服务要按令牌数与这个倍数留内存，或者调小 CUEMEM_MAX_BODY_BYTES。
+
+请求的次数（第四轮体检）：限定作用域的令牌写了 rate_per_minute 时（api/auth.py），它在 /api/、
+/v1/ 与 /mcp 的 POST 每分钟最多这么多个：令牌桶，容量就是 rate_per_minute，每秒补
+rate_per_minute / 60 个。超过时 429，Retry-After 是等到下一个名额的秒数（/api/v1 下 code 为
+rate_limited）。不写的令牌、管理令牌不限；GET 不算。管不到界面（登录的会话不带 Bearer 令牌，用
+agent 角色固定的模型与 max_tokens）；一次写入有多大（抽取约按每字节两个字符发给上游）由
+CUEMEM_MAX_BODY_BYTES 管。
 """
 
 from __future__ import annotations
 
+import math
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from cuemem.api.auth import Keys, bearer_principal
+from cuemem.api.auth import Keys, Principal, bearer_principal
 from cuemem.api.memories import PREFIX, _error
 from cuemem.errors import CueMemError
 
@@ -47,6 +56,7 @@ MAX_IMPORT_BYTES = 1 << 30
 OTHER_BODY_BYTES = 8 << 20  # 界面的登录与事件（不可配置）
 IMPORT_PATHS = ("/api/spaces/import", "/api/v1/import")
 BODY_PATHS = ("/api/", "/v1/", "/gradio_api/upload")
+RATE_PATHS = ("/api/", "/v1/", "/mcp")  # rate_per_minute 管的路径（只算 POST）
 
 
 class BodyLimit:
@@ -55,8 +65,9 @@ class BodyLimit:
     时遇到 HTTPException 原样抛出，由应用（或挂载的 Gradio）的出错处理写成响应。
 
     keys：配置的令牌（cuemem serve 与 proxy 传入）。给了时按 Bearer 令牌认出限定作用域的令牌：导入
-    不用 max_import_bytes，同时在处理的请求体加起来有上限（见模块说明）。令牌不对的请求不算：接口
-    在读请求体之前就 401（auth.authenticated_route）。"""
+    不用 max_import_bytes，同时在处理的请求体加起来有上限，写了 rate_per_minute 的还有次数的上限
+    （见模块说明）。令牌不对的请求不算：接口在读请求体之前就 401（auth.authenticated_route）。
+    clock：次数上限用的时钟（秒，测试里换掉）。"""
 
     def __init__(
         self,
@@ -65,13 +76,17 @@ class BodyLimit:
         max_body_bytes: int = MAX_BODY_BYTES,
         max_import_bytes: int = MAX_IMPORT_BYTES,
         keys: Keys | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.max_import_bytes = max_import_bytes
         self.keys = keys
+        self.clock = clock
         # 限定作用域的令牌（名字）→ 正在读、在处理的请求体的字节数。只在事件循环里读写
         self.in_flight: dict[str, int] = {}
+        # 写了 rate_per_minute 的令牌（名字）→ 令牌桶记下的时间（见 _wait）。只在事件循环里读写
+        self.next_free: dict[str, float] = {}
 
     def limit(self, path: str, tenant: str | None = None) -> tuple[int, str | None]:
         """这个路径的（上限，设置它的环境变量）；固定的那一档没有环境变量。tenant：限定作用域的
@@ -82,19 +97,53 @@ class BodyLimit:
             return self.max_body_bytes, MAX_BODY_ENV
         return OTHER_BODY_BYTES, None
 
-    def _tenant(self, scope: Scope) -> str | None:
-        """请求带的是哪个限定作用域的令牌（名字）；管理令牌、令牌不对、没有配令牌时 None。"""
+    def _tenant(self, scope: Scope) -> Principal | None:
+        """请求带的是哪个限定作用域的令牌；管理令牌、令牌不对、没有配令牌时 None。"""
         if self.keys is None or not self.keys.scoped:
             return None
         principal = bearer_principal(self.keys, Headers(scope=scope).get("authorization"))
-        return None if principal is None or principal.admin else principal.name
+        return None if principal is None or principal.admin else principal
+
+    def _wait(self, principal: Principal) -> float:
+        """令牌桶（容量 rate_per_minute，每秒补 rate_per_minute / 60 个）：这个请求能不能过。能过
+        时拿走一个名额、返回 0；不能过时返回等到下一个名额的秒数（不拿）。写法是 GCRA：每个令牌
+        只记一个时刻 next_free，桶到这个时刻才重新装满（每用一个名额推后 60 / rate 秒）；它比现在
+        晚出 rate - 1 个间隔以上时桶里不到一个名额。与记着桶里还剩几个等价，不用累加浮点数。"""
+        rate = principal.rate_per_minute
+        assert rate is not None
+        interval = 60.0 / rate
+        now = self.clock()
+        due = max(self.next_free.get(principal.name, now), now)
+        wait = due - now - (rate - 1) * interval  # 等到下一个名额的秒数；<= 0 时有名额
+        if wait > 1e-9:
+            return wait
+        self.next_free[principal.name] = due + interval
+        return 0.0
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         path: str = scope["path"]
-        tenant = self._tenant(scope)
+        principal = self._tenant(scope)
+        tenant = principal.name if principal is not None else None
+        if (
+            principal is not None
+            and principal.rate_per_minute is not None
+            and scope["method"] == "POST"
+            and path.startswith(RATE_PATHS)
+        ):
+            wait = self._wait(principal)
+            if wait:
+                message = _too_often(path, principal.rate_per_minute, wait)
+                retry = {"Retry-After": str(max(1, math.ceil(wait - 1e-6)))}
+                response = (
+                    _error(429, message, None, retry)
+                    if _v1(path)
+                    else JSONResponse({"detail": message}, 429, retry)
+                )
+                await response(scope, receive, send)
+                return
         cap, env = self.limit(path, tenant)
         length = Headers(scope=scope).get("content-length", "")
         declared = int(length) if length.isascii() and length.isdigit() else 0
@@ -181,6 +230,17 @@ def _too_many(path: str, budget: int) -> str:
     return (
         f"Too many request bodies in flight for this access key: at most {budget} bytes at "
         f"once (set with {MAX_BODY_ENV}); retry shortly."
+    )
+
+
+def _too_often(path: str, rate: int, wait: float) -> str:
+    """一个限定作用域的令牌超过了 rate_per_minute（429）。"""
+    seconds = max(1, math.ceil(wait - 1e-6))
+    if path.startswith("/api/") and not _v1(path):
+        return f"这个访问令牌的请求太频繁：每分钟最多 {rate} 个，请 {seconds} 秒后重试"
+    return (
+        f"Too many requests for this access key: at most {rate} requests per minute; "
+        f"retry in {seconds} s."
     )
 
 

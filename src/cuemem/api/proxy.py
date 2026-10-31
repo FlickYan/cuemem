@@ -26,6 +26,12 @@ X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调�
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
 
+作用域不是花费的上限：请求里的 model、n、max_tokens 与供应商的开关（enable_thinking 等）原样
+转发。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求逐字节不变）：
+models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的）与 max_output_tokens
+（max_tokens、max_completion_tokens 不超过它，没给时补上；n 只能是 1，否则 400）。都在检索、
+开会话与转发之前查。
+
 另外两个 OpenAI 兼容的接口：
 - /v1/responses：Responses API 的一个子集——非流式、纯文字输入（字符串或 input_text 的消息），
   instructions、max_output_tokens、temperature、top_p。换成 Chat Completions 走上面同样的想起、
@@ -377,7 +383,8 @@ class MemoryProxy:
     def _prepare(
         self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
     ) -> tuple[Turn, dict[str, Any], str, dict[str, str]]:
-        upstream, url, auth = self._upstream(body)  # 先认模型：被拒绝的请求不开会话、不检索
+        # 先认模型与令牌的用量限制：被拒绝的请求不开会话、不检索
+        upstream, url, auth = self._upstream(body, principal)
         turn = self._recall(body, headers, principal)
         if turn.write_user is not None and turn.block:
             upstream["messages"] = inject_evidence(upstream["messages"], turn.block)
@@ -443,14 +450,34 @@ class MemoryProxy:
         present = {stored_text(_storable(m)).strip() for m in earlier}
         return in_context_rounds(self.system, space, [session_id], present)
 
-    def _upstream(self, body: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, str]]:
-        """请求体 → 上游的请求体、地址与鉴权头。"""
+    def _upstream(
+        self, body: dict[str, Any], principal: Principal | None = None
+    ) -> tuple[dict[str, Any], str, dict[str, str]]:
+        """请求体 → 上游的请求体、地址与鉴权头。principal 写了 models、max_output_tokens 时按它们
+        查、改（见模块说明）；没写时与以前逐字节相同。"""
         settings = self.system.settings
-        spec = self._model(body.get("model"))
+        spec = self._model(body.get("model"))  # 改用默认模型之后的
+        models = principal.models if principal is not None else None
+        cap = principal.max_output_tokens if principal is not None else None
+        if models is not None:
+            names = {alias for alias, s in settings.models.items() if s == spec} | {spec.model_id}
+            if names.isdisjoint(models):
+                raise ProxyError(
+                    403,
+                    f"This API key may use only these models: {', '.join(models)} "
+                    f"(the request resolves to {spec.model_id!r}).",
+                    kind="permission_error",
+                    param="model",
+                    code="forbidden",
+                )
+        if cap is not None and body.get("n") not in (None, 1):
+            raise ProxyError(400, "This API key may request one choice only (n = 1).", param="n")
         provider = settings.providers[spec.provider]
         upstream = {k: v for k, v in body.items() if k != "user"}
         upstream["model"] = spec.model_id
-        _adapt(upstream, spec)
+        _adapt(upstream, spec, override=models is not None)
+        if cap is not None:
+            _cap_output(upstream, spec, cap)
         key = provider.api_key()
         auth = {"Authorization": f"Bearer {key}"} if key else {}
         return upstream, provider.base_url.rstrip("/") + "/chat/completions", auth
@@ -641,15 +668,32 @@ class _RelayResponse(StreamingResponse):
                     await anyio.to_thread.run_sync(close)
 
 
-def _adapt(upstream: dict[str, Any], spec: ModelSpec) -> None:
-    """按模型目录补上供应商特有的参数（例如关掉思考模式），并处理推理模型的参数差异。"""
+def _adapt(upstream: dict[str, Any], spec: ModelSpec, *, override: bool = False) -> None:
+    """按模型目录补上供应商特有的参数（例如关掉思考模式），并处理推理模型的参数差异。调用方给了
+    同名参数时用调用方的；override（令牌限定了 models）时用目录的：限定模型就是限定花费，调用方
+    不能借 enable_thinking 之类的开关把便宜的模型变贵。"""
     for key, value in spec.extra_body.items():
-        upstream.setdefault(key, value)
+        if override:
+            upstream[key] = value
+        else:
+            upstream.setdefault(key, value)
     if spec.fixed_temperature:
         upstream.pop("temperature", None)
         upstream.pop("top_p", None)
     if spec.max_tokens_param == "max_completion_tokens" and "max_tokens" in upstream:
         upstream.setdefault("max_completion_tokens", upstream.pop("max_tokens"))
+
+
+def _cap_output(upstream: dict[str, Any], spec: ModelSpec, cap: int) -> None:
+    """令牌的 max_output_tokens：max_tokens 与 max_completion_tokens 不超过它（不是整数的也换成
+    它），两个都没给时按这个模型的写法（max_tokens_param）补上。"""
+    given = [key for key in ("max_tokens", "max_completion_tokens") if key in upstream]
+    for key in given:
+        value = upstream[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value > cap:
+            upstream[key] = cap
+    if not given:
+        upstream[spec.max_tokens_param] = cap
 
 
 def _storable(message: dict[str, Any]) -> dict[str, Any]:

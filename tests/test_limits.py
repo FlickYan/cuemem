@@ -244,6 +244,68 @@ def test_a_scoped_key_has_a_budget_for_bodies_in_flight(
         assert again.status_code == 200, again.text
 
 
+def test_scoped_key_rate_per_minute(served: Served, fake_api: FakeAPI) -> None:
+    """限定作用域的令牌可以写 rate_per_minute：/api、/api/v1、/v1 与 /mcp 的 POST 每分钟最多这么
+    多个（令牌桶，容量就是这个数），超过时 429 带 Retry-After（等到下一个名额的秒数），不转发、
+    不调用模型。没写的令牌与管理令牌不限；GET 不算。以前没有任何按令牌的次数或花费上限：一个只能
+    访问自己用户的令牌，也能无限地经代理花运营者的额度。"""
+    from starlette.middleware import Middleware
+
+    from cuemem.api.limits import BodyLimit
+
+    keys = Keys.parse(
+        f"""
+keys:
+  - {{name: alice-app, token: {ALICE_TOKEN}, scopes: [{{user: alice}}], rate_per_minute: 2}}
+  - {{name: bob-app, token: {BOB_TOKEN}, scopes: [{{user: bob}}]}}
+""",
+        TOKEN,
+    )
+    now = [1000.0]
+    app = create_app(
+        served.service,
+        upload_dir=served.tmp_path / "uploads",
+        proxy=served.proxy,
+        ui=False,
+        keys=keys,
+    )
+    (limit,) = (m for m in app.user_middleware if isinstance(m, Middleware) and m.cls is BodyLimit)
+    limit.kwargs["clock"] = lambda: now[0]  # 中间件在第一个请求时才建
+    body = {"model": "qwen3.8-flash", "messages": [{"role": "user", "content": "rate-test"}]}
+
+    def forwarded() -> int:  # 只数代理转发的请求（后台抽取的不算）
+        return sum("rate-test" in str(r["messages"]) for r in fake_api.chat_requests)
+
+    def chat(headers: dict[str, str]) -> Any:
+        return http.post("/v1/chat/completions", json=body, headers=headers)
+
+    with TestClient(app) as http:
+        assert [chat(ALICE).status_code for _ in range(2)] == [200, 200]
+        refused = chat(ALICE)
+        assert refused.status_code == 429 and refused.headers["retry-after"] == "30"
+        assert "2 requests per minute" in refused.json()["detail"]
+        assert forwarded() == 2
+        search = {"query": "x", "user_id": "alice"}
+        v1 = http.post("/api/v1/memories/search", json=search, headers=ALICE)
+        assert v1.status_code == 429 and v1.json()["error"]["code"] == "rate_limited"
+        assert v1.headers["retry-after"] == "30"
+        api = http.post("/api/sessions", json={"space": "alice"}, headers=ALICE)
+        assert api.status_code == 429 and "每分钟最多 2 个" in api.json()["detail"]
+        assert http.post("/mcp", json={}, headers=ALICE).status_code == 429
+        assert http.get("/api/v1/memories", params={"user_id": "alice"}, headers=ALICE).is_success
+        for headers in (BOB, AUTH):  # 没写的令牌、管理令牌：不限
+            assert [chat(headers).status_code for _ in range(5)] == [200] * 5
+        now[0] += 29
+        assert chat(ALICE).status_code == 429
+        assert chat(ALICE).headers["retry-after"] == "1"
+        now[0] += 1
+        assert chat(ALICE).status_code == 200
+        assert chat(ALICE).status_code == 429
+        now[0] += 3600  # 攒不下超过 rate_per_minute 个
+        assert [chat(ALICE).status_code for _ in range(3)] == [200, 200, 429]
+    assert forwarded() == 2 + 10 + 1 + 2
+
+
 def test_the_standalone_proxy_has_the_limit_too(
     served: Served, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -23,6 +23,16 @@
   user、agent 是一个 ID 或 ID 的列表；"*" 是任何 ID，以 "*" 结尾的是前缀（"acme:*"）。只写 user
   时不限 Agent；只写 agent 时只是这个 Agent 自己的记忆，不含用户在它下面的记忆。
 
+  作用域管的是能访问谁的记忆，不是能花多少：任何有效的令牌都能让服务器调用运营者的模型与向量
+  供应商（记忆代理、/api 的对话、/api/v1/answer、/mcp、每次写入之后的抽取）。每个令牌可以另外写
+  （第四轮体检，都可选，不写时与以前完全相同）：
+
+        rate_per_minute: 60          # /api、/api/v1、/v1、/mcp 的 POST 每分钟最多这么多个（429）
+        models: [qwen3.8-flash]      # 记忆代理只能用这些模型（目录里的别名或模型 ID，之外 403）
+        max_output_tokens: 2000      # 记忆代理转发的 max_tokens 不超过它，n 只能是 1
+
+  后两项只管记忆代理（/v1/chat/completions、/v1/responses）；别的接口用配置里的角色与模型。
+
 作用域之外：请求里点名了空间（user_id、agent_id、空间 ID）时 403；按 ID 找的记忆与会话当作不存在
 （404，history 是空列表），不让 ID 成为探测别人有没有某条记忆的途径。/api/spaces 与 /api/v1/spaces
 只列出作用域里的空间，/api/v1/reset 只删作用域里的空间（管理令牌删全部）。记忆代理按 user 字段与
@@ -57,7 +67,7 @@ from fastapi import Depends, HTTPException, Request, Response
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.security.utils import get_authorization_scheme_param
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cuemem.errors import AccessKeysError
 from cuemem.sdk import space_for, space_owner
@@ -100,11 +110,17 @@ class Scope:
 
 @dataclass(frozen=True)
 class Principal:
-    """一个令牌是谁、能访问什么。admin：不受作用域限制（管理令牌；没配令牌时的本机演示）。"""
+    """一个令牌是谁、能访问什么。admin：不受作用域限制（管理令牌；没配令牌时的本机演示）。
+
+    rate_per_minute、models、max_output_tokens：限定作用域的令牌可选的用量限制（见模块说明），
+    None 是不限。"""
 
     name: str
     admin: bool = False
     scopes: tuple[Scope, ...] = ()
+    rate_per_minute: int | None = None
+    models: tuple[str, ...] | None = None
+    max_output_tokens: int | None = None
 
     def allows(self, space: str | None) -> bool:
         """能不能访问这个记忆空间：空间解回的（user_id，agent_id）要在作用域里。"""
@@ -255,6 +271,10 @@ class _ScopeIn(BaseModel):
     agent: str | list[str] | None = None
 
 
+# 正整数，不收 "5" 与 true 这样的写法（YAML 里写错了引号不该悄悄变成别的限制）
+_PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+
+
 class _KeyIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -262,6 +282,9 @@ class _KeyIn(BaseModel):
     sha256: str | None = None
     token: str | None = None
     scopes: list[_ScopeIn]
+    rate_per_minute: _PositiveInt | None = None
+    models: list[str] | None = None
+    max_output_tokens: _PositiveInt | None = None
 
 
 class _KeysIn(BaseModel):
@@ -282,9 +305,17 @@ def _key(entry: _KeyIn, where: str) -> tuple[bytes, Principal]:
         raise AccessKeysError(f"{where}: token 不能为空")
     if not entry.scopes:
         raise AccessKeysError(f"{where}: scopes 不能为空")
+    if entry.models is not None and (not entry.models or not all(entry.models)):
+        raise AccessKeysError(f"{where}: models 要列出至少一个模型，不能有空的名字")
     scopes = tuple(_scope(scope, f"{where}.scopes[{i}]") for i, scope in enumerate(entry.scopes))
     digest = bytes.fromhex(entry.sha256) if entry.sha256 is not None else _digest(entry.token or "")
-    return digest, Principal(entry.name, scopes=scopes)
+    return digest, Principal(
+        entry.name,
+        scopes=scopes,
+        rate_per_minute=entry.rate_per_minute,
+        models=tuple(entry.models) if entry.models is not None else None,
+        max_output_tokens=entry.max_output_tokens,
+    )
 
 
 def _scope(scope: _ScopeIn, where: str) -> Scope:
