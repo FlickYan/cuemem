@@ -8,6 +8,7 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_
 requires-python = ">=3.12"
 # 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用
 classifiers = ["Typing :: Typed"]
+keywords = ["llm", "agents", "agent-memory", "long-term-memory", "multimodal", "rag", "mcp"]
 # 核心依赖：SDK、命令行、HTTP 接口、记忆代理与 MCP。界面、评测与本机向量是可选依赖
 dependencies = [
     "fastapi>=0.143",
@@ -27,6 +28,13 @@ dependencies = [
     "typer>=0.27.3",
     "uvicorn>=0.54",
 ]
+
+# 还没有发布到 PyPI：从 GitHub 安装（pip install "cuemem @ git+https://github.com/FlickYan/cuemem"）
+[project.urls]
+Homepage = "https://github.com/FlickYan/cuemem"
+Source = "https://github.com/FlickYan/cuemem"
+Issues = "https://github.com/FlickYan/cuemem/issues"
+Documentation = "https://github.com/FlickYan/cuemem/blob/main/docs/en/api.md"
 
 [project.optional-dependencies]
 # 演示界面（cuemem serve 的 Gradio 界面）：不装时 serve 只启动 HTTP 接口与记忆代理

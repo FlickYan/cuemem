@@ -389,9 +389,19 @@ def cli_command(args: str) -> str:
     return f"{'uv run ' if source_checkout() else ''}cuemem {args}"
 
 
+# 不克隆仓库时从哪里装：CueMem 还没有发布到 PyPI，PyPI 上名叫 cuemem 的包（如果有人注册了）不是
+# 这个项目，所以提示里的 pip install 都写明从 GitHub 装。发布到 PyPI 之后改成 None
+INSTALL_URL: str | None = "git+https://github.com/FlickYan/cuemem"
+
+
 def extra_remedy(extra: str) -> str:
-    """缺可选依赖时的安装命令：源码仓库里用 uv sync --extra，pip 安装后用 pip install。"""
-    return f"uv sync --extra {extra}" if source_checkout() else f'pip install "cuemem[{extra}]"'
+    """缺可选依赖时的安装命令：源码仓库里用 uv sync --extra，pip 安装后用 pip install（从
+    INSTALL_URL 装，不从 PyPI 按名字找）。"""
+    if source_checkout():
+        return f"uv sync --extra {extra}"
+    if INSTALL_URL is None:
+        return f'pip install "cuemem[{extra}]"'
+    return f'pip install "cuemem[{extra}] @ {INSTALL_URL}"'
 
 
 def missing_key_remedy(provider: str) -> str:

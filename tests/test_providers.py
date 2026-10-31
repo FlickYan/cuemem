@@ -102,6 +102,33 @@ def test_missing_key_errors_name_the_right_remedy(
         build_embedder(settings)
 
 
+def test_install_hints_point_at_github_not_pypi(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CueMem 还没有发布到 PyPI：pip 安装后缺可选依赖时的提示从 GitHub 装（"cuemem[x] @ git+…"），
+    不按名字到 PyPI 上找，那里的 cuemem 不是这个项目（谁都能注册）。源码仓库里照旧是 uv sync。
+    本机向量缺 fastembed 时的报错用同一个提示（以前写死了 pip install "cuemem[local]"）。"""
+    import sys
+
+    from cuemem import config
+
+    monkeypatch.setattr(config, "source_checkout", lambda: False)
+    for extra in ("ui", "eval", "local", "integrations"):
+        hint = config.extra_remedy(extra)
+        assert hint == f'pip install "cuemem[{extra}] @ git+https://github.com/FlickYan/cuemem"'
+    monkeypatch.setitem(sys.modules, "fastembed", None)  # 当作没装
+    embedder = build_embedder(load_settings(preset="deepseek", home=tmp_path), use_cache=False)
+    with pytest.raises(EmbeddingAPIError) as caught:
+        embedder.embed(["x"], "document")
+    assert config.extra_remedy("local") in str(caught.value)
+    monkeypatch.setattr(config, "INSTALL_URL", None)  # 发布到 PyPI 之后
+    assert config.extra_remedy("ui") == 'pip install "cuemem[ui]"'
+    monkeypatch.setattr(config, "source_checkout", lambda: True)
+    assert config.extra_remedy("local") == "uv sync --extra local"
+    with pytest.raises(EmbeddingAPIError, match=r"fastembed：uv sync --extra local$"):
+        embedder.embed(["x"], "document")
+
+
 @pytest.fixture
 def openai_settings(clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")

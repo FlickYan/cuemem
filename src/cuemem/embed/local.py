@@ -1,6 +1,7 @@
 """本机向量（fastembed，ONNX 推理，N12）：不要 Key、不要 Ollama，pip 装上就能用。
 
-    uv sync --extra local          # 或 pip install "cuemem[local]"
+    uv sync --extra local          # 源码仓库里；不克隆仓库时从 GitHub 装（还没有发布到 PyPI）：
+    pip install "cuemem[local] @ git+https://github.com/FlickYan/cuemem"
     CUEMEM_PRESET=deepseek         # 只有 DeepSeek 的 Key 时：向量在本机算
 
 模型第一次用到时从 Hugging Face 下载（bge-small-en-v1.5 约 130 MB），缓存在数据目录下。
@@ -19,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from cuemem.config import EmbeddingConfig
+from cuemem.config import EmbeddingConfig, extra_remedy
 from cuemem.core.trace import record_event
 from cuemem.embed.base import EmbeddingBatch, EmbedKind, l2_normalize
 from cuemem.errors import EmbeddingAPIError
@@ -68,10 +69,9 @@ class FastEmbedTextEmbedder:
         if self._model is None:
             try:
                 from fastembed import TextEmbedding  # type: ignore[import-not-found, unused-ignore]
-            except ImportError as exc:  # pragma: no cover - 取决于是否装了可选依赖
+            except ImportError as exc:  # 没装可选依赖 local
                 raise EmbeddingAPIError(
-                    "本机向量需要可选依赖 fastembed：uv sync --extra local（或 pip install "
-                    '"cuemem[local]"）'
+                    f"本机向量需要可选依赖 fastembed：{extra_remedy('local')}"
                 ) from exc
             self._model = TextEmbedding(
                 self.cfg.model,

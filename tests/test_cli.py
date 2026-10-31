@@ -721,7 +721,9 @@ def test_eval_commands_say_which_extra_to_install(
         assert "uvsync--extraeval" in _flat(result.output), result.output
     monkeypatch.setattr("cuemem.config.source_checkout", lambda: False)
     result = runner.invoke(app, ["eval", "report", "x"])
-    assert 'pipinstall"cuemem[eval]"' in _flat(result.output), result.output
+    # 还没有发布到 PyPI：从 GitHub 装，不按名字到 PyPI 上找（那里的 cuemem 不是这个项目）
+    git = 'pipinstall"cuemem[eval]@git+https://github.com/FlickYan/cuemem"'
+    assert git in _flat(result.output), result.output
     result = runner.invoke(app, ["eval", "run", "--name", "x", "--build-only"])
     assert "cuemem[eval]" not in result.output and "缺少数据文件" in result.output
     row = {
