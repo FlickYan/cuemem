@@ -31,5 +31,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/health')"
 ENTRYPOINT ["cuemem"]
 # 演示的导购场景要用仓库里的商品目录，镜像里用通用助手；访问令牌 CUEMEM_API_TOKEN 必须设置
-# （不鉴权在可信网络里跑：命令后面加 --insecure-no-auth）
+# （不鉴权在可信网络里跑：命令后面加 --insecure-no-auth。这时防 DNS 重绑定，只接受 IP 地址与
+# localhost 作为 Host；用主机名访问时，例如别的容器用 compose 的服务名，把它加进 CUEMEM_ALLOWED_HOSTS）
 CMD ["serve", "--host", "0.0.0.0", "--port", "7860", "--scenario", "plain", "--space", "default"]

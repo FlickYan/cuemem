@@ -16,10 +16,11 @@ Authorization: Bearer <令牌>，界面先要求登录（用户名任意，密�
 MCP（第三轮体检）：/mcp 是 MCP 的 Streamable HTTP，工具与 cuemem mcp（stdio）相同，令牌与作用域
 同 /api，请求头 X-CueMem-User、X-CueMem-Agent 选用户（api/mcp.py）。
 
-浏览器（N12）：/api、/v1、/mcp 与界面的 /gradio_api 不接受别的网站发来的请求（SameOriginOnly），否则
-任何网页都能借访问者的浏览器读写本机上不鉴权的记忆、花上游的额度；allowed_hosts 给出时只接受
-这些 Host（cuemem serve / proxy 监听本机地址时设置，防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，
-它的网页就算同源）。
+浏览器（N12）：/api、/v1、/mcp、界面的 /gradio_api 与登录（/login）不接受别的网站发来的请求
+（SameOriginOnly），否则任何网页都能借访问者的浏览器读写本机上不鉴权的记忆、花上游的额度；
+allowed_hosts 给出时只接受这些 Host（cuemem serve / proxy 监听本机地址时设置，防 DNS 重绑定：恶意
+域名解析到 127.0.0.1 后，它的网页就算同源）。不鉴权又监听别的地址时（--insecure-no-auth）同样
+设置，另外接受任何 IP 地址作为 Host（allow_ip_hosts，第四轮体检）。
 
 请求体的上限（第三轮体检，api/limits.py）：/api、/v1 与界面的上传默认 64 MiB，导入 1 GiB，界面
 别的接口 8 MiB，超过时 413，在读请求体之前；/api 与 /api/v1 也先认令牌再读请求体
@@ -30,6 +31,7 @@ MCP（第三轮体检）：/mcp 是 MCP 的 Streamable HTTP，工具与 cuemem m
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import logging
 import shutil
 import threading
@@ -75,17 +77,21 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")  # Host 头里的 IPv6 地�
 
 
 class SameOriginOnly:
-    """/api、/v1、/mcp 与界面自己的接口（/gradio_api）不接受别的网站发来的浏览器请求：带 Origin
-    头时，Origin 的主机与端口要与 Host 头相同（同源，例如 /docs 的 Try it out、界面本身），或者
-    Origin 的主机名在 hosts 里（反向代理改写了 Host 时）；Origin: null 一律拒绝。不带 Origin 的
-    请求（SDK、curl、gradio_client、MCP 的客户端）不受影响。
+    """/api、/v1、/mcp、界面自己的接口（/gradio_api）与界面的登录（/login）不接受别的网站发来的
+    浏览器请求：带 Origin 头时，Origin 的主机与端口要与 Host 头相同（同源，例如 /docs 的 Try it
+    out、界面本身），或者 Origin 的主机名在 hosts 里（反向代理改写了 Host 时）；Origin: null 一律
+    拒绝。不带 Origin 的请求（SDK、curl、gradio_client、MCP 的客户端）不受影响。
 
     是整个应用的中间件，不是接口的依赖：预检请求（OPTIONS）匹配不到接口，会落到根路径上的
     Gradio。Gradio 只在 Host 正好是 localhost、127.0.0.1、0.0.0.0 时限制来源，别的 Host（监听
     ::1、127.0.0.2 等本机地址，Docker、局域网）放行任何来源并允许带凭据：它的 /gradio_api 能读出
-    任何空间的记忆、遗忘、对话，上传接口不经预检就会写文件。"""
+    任何空间的记忆、遗忘、对话，上传接口不经预检就会写文件。
 
-    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp")
+    /login（第四轮体检）是 Gradio 在 /gradio_api 之外唯一改状态的接口：以前别的网站的网页自动提交
+    一个表单，就能让访问者用攻击者（另一个租户）的令牌登录，之后访问者在界面里说的话都写进攻击者
+    的空间。按前缀匹配，也管 /login/；/logout 不在里面。"""
+
+    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp", "/login")
 
     def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
         self.app = app
@@ -122,19 +128,45 @@ class SameOriginOnly:
 _HOST_OK = "cuemem.host_ok"  # scope 里的记号：TrustedHostMiddleware 放行了这个请求
 
 
+def _ip_host(host: str) -> bool:
+    """Host 头（可以带端口）的主机是不是一个 IP 地址（IPv6 带方括号）。不是 host[:port] 的
+    （带 @、路径等）一律不算。"""
+    try:
+        parts = urlsplit("//" + host)
+        name, _ = parts.hostname, parts.port  # 端口不是数字时 ValueError
+        ipaddress.ip_address(name or "")
+    except ValueError:
+        return False
+    return parts.netloc == host and "@" not in host
+
+
 class TrustedHosts(TrustedHostMiddleware):
     """Starlette 的 TrustedHostMiddleware（规则不变）；只是 /api/v1 下拒绝时回它的出错格式
     （V1ErrorBody，400），不是纯文本的 "Invalid host header"：按 OpenAPI 生成的客户端解析得了。
-    放行时内层的应用在 scope 里留个记号，没有记号就是被拒绝了，换掉它的响应。"""
+    放行时内层的应用在 scope 里留个记号，没有记号就是被拒绝了，换掉它的响应。
 
-    def __init__(self, app: ASGIApp, allowed_hosts: Sequence[str]) -> None:
+    ip_literals（第四轮体检）：另外接受任何 IP 地址作为 Host（不鉴权又监听非本机地址时：局域网、
+    Docker 里用什么 IP 访问都行）。DNS 重绑定要靠一个域名，IP 地址做不到；TrustedHostMiddleware
+    写不出"任何 IP 地址"，在它之前查。"""
+
+    def __init__(
+        self, app: ASGIApp, allowed_hosts: Sequence[str], *, ip_literals: bool = False
+    ) -> None:
         async def accepted(scope: Scope, receive: Receive, send: Send) -> None:
             scope[_HOST_OK] = True
             await app(scope, receive, send)
 
         super().__init__(accepted, allowed_hosts=allowed_hosts)
+        self.ip_literals = ip_literals
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            self.ip_literals
+            and scope["type"] in ("http", "websocket")
+            and _ip_host(Headers(scope=scope).get("host", ""))
+        ):
+            await self.app(scope, receive, send)  # 即 accepted：留下记号
+            return
         if scope["type"] != "http" or not _v1(scope["path"]):
             await super().__call__(scope, receive, send)
             return
@@ -163,16 +195,20 @@ def _guard(
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
     keys: Keys | None = None,
+    allow_ip_hosts: bool = False,
 ) -> None:
     """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
     先于 Origin，再是请求体的上限（api/limits.py；keys：限定作用域的令牌导入也用 max_body_bytes，
-    同时在处理的请求体加起来有上限）。这三项都不读请求体。"""
+    同时在处理的请求体加起来有上限）。这三项都不读请求体。allow_ip_hosts：allowed_hosts 之外
+    另外接受任何 IP 地址作为 Host（TrustedHosts 的 ip_literals）。"""
     app.add_middleware(
         BodyLimit, max_body_bytes=max_body_bytes, max_import_bytes=max_import_bytes, keys=keys
     )
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:
-        app.add_middleware(TrustedHosts, allowed_hosts=list(allowed_hosts))
+        app.add_middleware(
+            TrustedHosts, allowed_hosts=list(allowed_hosts), ip_literals=allow_ip_hosts
+        )
 
 
 class StartRequest(BaseModel):
@@ -314,6 +350,7 @@ def create_app(
     proxy: MemoryProxy | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
+    allow_ip_hosts: bool = False,
     idle_minutes: float | None = 30.0,
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
@@ -331,7 +368,8 @@ def create_app(
     cuemem serve --no-mcp 时不提供。
 
     allowed_hosts：只接受这些 Host（接口与界面；None 不检查）。origin_hosts：除同源外放行的
-    Origin 主机名（"*" 不限）。见模块说明。
+    Origin 主机名（"*" 不限）。allow_ip_hosts：给了 allowed_hosts 时另外接受任何 IP 地址作为
+    Host（cuemem serve 不鉴权又监听非本机地址时）。见模块说明。
 
     max_body_bytes、max_import_bytes：请求体的上限（字节，超过时 413；导入用后者，/api、/v1 与
     界面的上传用前者，界面别的接口固定 8 MiB，见 api/limits.py）。cuemem serve 从环境变量
@@ -617,6 +655,7 @@ def create_app(
         max_body_bytes=max_body_bytes,
         max_import_bytes=max_import_bytes,
         keys=keys,
+        allow_ip_hosts=allow_ip_hosts,
     )
     return app
 

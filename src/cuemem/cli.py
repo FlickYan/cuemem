@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast, get_args
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args
 
 import typer
 from rich.console import Console
@@ -603,18 +603,54 @@ def _unknown_model(value: str | None) -> UnknownModel | None:
     raise typer.Exit(1)
 
 
-def _host_policy(host: str) -> tuple[list[str] | None, list[str]]:
-    """（Host 白名单，除同源外放行的 Origin 主机名）。监听本机地址时只接受 Host 为本机的请求
-    （防 DNS 重绑定：恶意域名解析到 127.0.0.1 后，它的网页就算同源）；监听别的地址时不查 Host
-    （Docker、局域网用什么地址访问都行，靠访问令牌）。CUEMEM_ALLOWED_HOSTS 列出的主机名两边都放行，
-    含 "*" 时不查 Host、不限 Origin。"""
+class HostPolicy(NamedTuple):
+    """create_app / create_proxy_app 的 allowed_hosts、origin_hosts 与 allow_ip_hosts。"""
+
+    allowed: list[str] | None  # Host 白名单；None 不查
+    origins: list[str]  # 除同源外放行的 Origin 主机名
+    ip_literals: bool  # 另外接受任何 IP 地址作为 Host
+
+
+def _host_policy(host: str, *, authenticated: bool = True) -> HostPolicy:
+    """防 DNS 重绑定（恶意域名解析到这台机器后，它的网页就算同源）的 Host 检查：
+
+    - 监听本机地址：只接受 Host 为本机的请求；
+    - 监听别的地址又设了访问令牌（authenticated）：不查 Host（Docker、局域网用什么地址访问都行，
+      别的网页拿不到令牌）；
+    - 监听别的地址又不鉴权（--insecure-no-auth，第四轮体检）：接受任何 IP 地址、localhost 与
+      监听的主机名，别的主机名（局域网的 nas.local、compose 里的服务名）要列在
+      CUEMEM_ALLOWED_HOSTS 里。以前也不查：没有令牌，任何网页都能经重绑定读写记忆、花上游的额度。
+
+    CUEMEM_ALLOWED_HOSTS 列出的主机名两边都放行，含 "*" 时不查 Host、不限 Origin。"""
     from cuemem.api.app import HOSTS_ENV, LOOPBACK_HOSTS
 
     extra = [h.strip().lower() for h in os.environ.get(HOSTS_ENV, "").split(",") if h.strip()]
-    if "*" in extra or not _is_loopback(host):
-        return None, extra
-    bind = f"[{host}]" if ":" in host else host.lower()  # 例如 127.0.0.2
-    return list(dict.fromkeys([*LOOPBACK_HOSTS, bind, *extra])), extra
+    if "*" in extra:
+        return HostPolicy(None, extra, False)
+    if _is_loopback(host):
+        bind = f"[{host}]" if ":" in host else host.lower()  # 例如 127.0.0.2
+        return HostPolicy(list(dict.fromkeys([*LOOPBACK_HOSTS, bind, *extra])), extra, False)
+    if authenticated:
+        return HostPolicy(None, extra, False)
+    try:
+        ipaddress.ip_address(host)
+        named = []  # 0.0.0.0、::、局域网地址：IP 地址都接受
+    except ValueError:
+        named = [host.lower()] if host else []
+    return HostPolicy(list(dict.fromkeys(["localhost", *named, *extra])), extra, True)
+
+
+def _no_auth_hosts_note(hosts: HostPolicy) -> None:
+    """--insecure-no-auth 监听非本机地址时的启动提示：只接受哪些 Host（别的回 400
+    "Invalid host header"，局域网里用主机名访问的人不知道为什么）。"""
+    from cuemem.api.app import HOSTS_ENV
+
+    if not hosts.ip_literals:  # CUEMEM_ALLOWED_HOSTS 含 "*"：不查 Host
+        return
+    console.print(
+        f"只接受 IP 地址、{escape('、'.join(hosts.allowed or []))} 作为 Host（防 DNS 重绑定）；"
+        f"用别的主机名访问时把它加进 {HOSTS_ENV}（逗号分隔）"
+    )
 
 
 @app.command()
@@ -672,7 +708,7 @@ def serve(
         _require_token(host, keys, insecure_no_auth)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
-    allowed_hosts, origin_hosts = _host_policy(host)
+    hosts = _host_policy(host, authenticated=keys.enabled)
     # 同一个记忆系统：经代理写入的对话在界面里也能看到
     proxy = MemoryProxy(service.system, unknown_model=unknown, idle_minutes=idle_minutes)
     try:
@@ -682,8 +718,9 @@ def serve(
             ui=ui,
             keys=keys,
             proxy=proxy,
-            allowed_hosts=allowed_hosts,
-            origin_hosts=origin_hosts,
+            allowed_hosts=hosts.allowed,
+            origin_hosts=hosts.origins,
+            allow_ip_hosts=hosts.ip_literals,
             idle_minutes=idle_minutes,
             max_body_bytes=limits[0],
             max_import_bytes=limits[1],
@@ -706,6 +743,7 @@ def serve(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
                 "（--insecure-no-auth），能连到这台机器的人都能读写、删除记忆"
             )
+            _no_auth_hosts_note(hosts)
         uvicorn.run(app_, host=host, port=port, log_level="warning")
     finally:
         proxy.close_all()
@@ -749,7 +787,7 @@ def proxy(
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
     _require_token(host, keys, insecure_no_auth)
-    allowed_hosts, origin_hosts = _host_policy(host)
+    hosts = _host_policy(host, authenticated=keys.enabled)
     try:
         system = MemorySystem.from_settings(settings)
     except CueMemError as exc:  # 缺 Key、换了向量模型等：提示原因，不打印调用栈
@@ -778,11 +816,13 @@ def proxy(
                 f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
                 "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
             )
+            _no_auth_hosts_note(hosts)
         app_ = create_proxy_app(
             memory_proxy,
             keys=keys,
-            allowed_hosts=allowed_hosts,
-            origin_hosts=origin_hosts,
+            allowed_hosts=hosts.allowed,
+            origin_hosts=hosts.origins,
+            allow_ip_hosts=hosts.ip_literals,
             max_body_bytes=max_body_bytes,
         )
         uvicorn.run(app_, host=host, port=port)

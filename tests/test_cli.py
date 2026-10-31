@@ -360,24 +360,77 @@ def test_non_loopback_bind_needs_a_token(
 def test_loopback_bind_checks_the_host(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
-    """监听本机地址时只接受 Host 为本机的请求（DNS 重绑定）；监听别的地址时不查 Host（Docker、
-    局域网）。CUEMEM_ALLOWED_HOSTS 追加的主机名作为 Host 与 Origin 都放行。"""
+    """监听本机地址时只接受 Host 为本机的请求（DNS 重绑定）。监听别的地址又不鉴权时
+    （--insecure-no-auth：Docker、局域网）只接受 IP 地址与 localhost 作为 Host：以前不查，恶意域名
+    重绑定到这台机器之后，它的网页就能读写记忆、花上游的额度。设了令牌时不查 Host（靠令牌）。
+    CUEMEM_ALLOWED_HOSTS 追加的主机名作为 Host 与 Origin 都放行。"""
     from fastapi.testclient import TestClient
 
     assert runner.invoke(app, command).exit_code == 0
     assert runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"]).exit_code == 0
     monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", "mem.example, cuemem.lan")
     assert runner.invoke(app, command).exit_code == 0
-    local, lan, extended = (TestClient(app_) for app_ in served)
+    named = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"])
+    assert named.exit_code == 0 and "CUEMEM_ALLOWED_HOSTS" in named.output
+    monkeypatch.delenv("CUEMEM_ALLOWED_HOSTS")
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "fake-token-0123456789")
+    assert runner.invoke(app, [*command, "--host", "0.0.0.0"]).exit_code == 0
+    local, lan, extended, lan_named, authed = (TestClient(app_) for app_ in served)
     for host in ("127.0.0.1:7860", "localhost:7860", "[::1]:7860"):
         assert local.get("/v1/models", headers={"Host": host}).status_code == 200
     rebound = {"Host": "attacker.example:7860", "Origin": "http://attacker.example:7860"}
     assert local.get("/v1/models", headers=rebound).status_code == 400
-    assert lan.get("/v1/models", headers={"Host": "192.168.1.10:7860"}).status_code == 200
+    for host in ("192.168.1.10:7860", "[fe80::1]:7860", "localhost:7860"):
+        assert lan.get("/v1/models", headers={"Host": host}).status_code == 200
+    assert lan.get("/v1/models", headers=rebound).status_code == 400
+    assert lan_named.get("/v1/models", headers={"Host": "cuemem.lan"}).status_code == 200
+    assert lan_named.get("/v1/models", headers=rebound).status_code == 400
     assert extended.get("/v1/models", headers={"Host": "cuemem.lan"}).status_code == 200
     proxied = {"Host": "127.0.0.1:7860", "Origin": "https://mem.example"}
     assert extended.get("/v1/models", headers=proxied).status_code == 200
     assert local.get("/v1/models", headers=proxied).status_code == 403
+    bearer = {"Host": "cuemem:7860", "Authorization": "Bearer fake-token-0123456789"}
+    assert authed.get("/v1/models", headers=bearer).status_code == 200
+
+
+LOCAL = ("127.0.0.1", "localhost", "[::1]")
+
+
+@pytest.mark.parametrize(
+    ("host", "authenticated", "env", "expected"),
+    [
+        ("127.0.0.1", False, "", ([*LOCAL], [], False)),
+        ("127.0.0.1", True, "", ([*LOCAL], [], False)),
+        (
+            "127.0.0.2",
+            False,
+            "Mem.example",
+            ([*LOCAL, "127.0.0.2", "mem.example"], ["mem.example"], False),
+        ),
+        ("::1", False, "", ([*LOCAL], [], False)),
+        ("0.0.0.0", True, "mem.example", (None, ["mem.example"], False)),
+        ("0.0.0.0", False, "", (["localhost"], [], True)),
+        ("::", False, "cuemem.lan", (["localhost", "cuemem.lan"], ["cuemem.lan"], True)),
+        ("192.168.1.5", False, "", (["localhost"], [], True)),
+        ("NAS.local", False, "", (["localhost", "nas.local"], [], True)),
+        ("0.0.0.0", False, "*", (None, ["*"], False)),
+        ("127.0.0.1", False, "*", (None, ["*"], False)),
+    ],
+)
+def test_host_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    host: str,
+    authenticated: bool,
+    env: str,
+    expected: tuple[list[str] | None, list[str], bool],
+) -> None:
+    """（Host 白名单，放行的 Origin 主机名，是否另外接受任何 IP 地址作为 Host）：本机地址只接受
+    本机；不鉴权的别的地址接受 IP 地址、localhost、监听的主机名与 CUEMEM_ALLOWED_HOSTS；鉴权时
+    与 "*" 时不查。"""
+    from cuemem.cli import _host_policy
+
+    monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", env)
+    assert tuple(_host_policy(host, authenticated=authenticated)) == expected
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])

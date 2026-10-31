@@ -1051,7 +1051,7 @@ def test_ui_api_refuses_cross_origin_requests(
 
     service.remember("alice", "My PIN is 4321")
     service.consolidate("alice")
-    allowed, origins = _host_policy(bind)
+    allowed, origins, _ = _host_policy(bind)
     app_ = create_app(
         service,
         upload_dir=tmp_path / "uploads",
@@ -1087,6 +1087,82 @@ def test_ui_api_refuses_cross_origin_requests(
         event = posted.json()["event_id"]
         assert "4321" in client.get(f"{call}/{event}", headers=same).text
         assert client.get("/", headers={"Host": host}).status_code == 200
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")  # Gradio 的队列里调用 pandas
+def test_no_auth_lan_bind_refuses_rebound_hosts(service: ChatService, tmp_path: Path) -> None:
+    """不鉴权又监听非本机地址（--insecure-no-auth：Docker 的 0.0.0.0、局域网）：以前不查 Host，
+    恶意域名重绑定到这台机器之后，它的网页（Origin 与 Host 相同，算同源）就能读出、导出、遗忘
+    记忆，经代理花上游的额度。allow_ip_hosts：任何 IP 地址作为 Host 都接受（局域网、Docker 用 IP
+    访问），别的主机名要在 allowed_hosts 里；/api/v1 下是它的出错格式。"""
+    from cuemem.api.memories import V1ErrorBody
+
+    service.remember("alice", "My bank PIN is 4321")
+    service.consolidate("alice")
+    app_ = create_app(
+        service,
+        upload_dir=tmp_path / "uploads",
+        ui=True,
+        proxy=MemoryProxy(service.system),
+        allowed_hosts=["localhost", "nas.local"],
+        allow_ip_hosts=True,
+    )
+    with TestClient(app_) as client:
+        for host in ("rebind.attacker.example:7860", "192.168.1.5.nip.example", "x@192.168.1.5"):
+            rebound = {"Host": host, "Origin": f"http://{host}"}
+            assert client.get("/", headers=rebound).status_code == 400, host
+            for path in ("/api/spaces", "/api/spaces/alice/facts", "/api/spaces/alice/export"):
+                refused = client.get(path, headers=rebound)
+                assert refused.status_code == 400 and "4321" not in refused.text, (host, path)
+            assert client.get("/v1/models", headers=rebound).status_code == 400
+            call = client.post(
+                "/gradio_api/call/load_memory",
+                json={"data": ["alice", False, "fact"]},
+                headers=rebound,
+            )
+            assert call.status_code == 400
+            v1 = client.get("/api/v1/memories", params={"user_id": "alice"}, headers=rebound)
+            assert v1.status_code == 400
+            assert V1ErrorBody.model_validate(v1.json()).error.code == "invalid_request"
+        for host in (
+            "192.168.1.5:7860",
+            "10.0.0.2",
+            "0.0.0.0:7860",
+            "[::1]:7860",
+            "[fe80::1]",
+            "localhost:7860",
+            "nas.local:7860",
+        ):
+            facts = client.get("/api/spaces/alice/facts", headers={"Host": host})
+            assert facts.status_code == 200 and "4321" in facts.text, host
+            assert client.get("/", headers={"Host": host}).status_code == 200, host
+            v1 = client.get("/api/v1/memories", params={"user_id": "alice"}, headers={"Host": host})
+            assert v1.status_code == 200, host
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_ui_login_refuses_cross_origin_posts(service: ChatService, tmp_path: Path) -> None:
+    """界面的登录（/login，在 /gradio_api 之外）同样只接受同源的浏览器请求：以前别的网站的网页
+    自动提交一个表单，就能让访问者用攻击者（另一个租户）的令牌登录，之后访问者在界面里说的话都
+    写进攻击者的空间。同源（界面本身）与不带 Origin 的登录照常。"""
+    token = "mallory-token-0123456789"
+    keys = Keys.parse(f"keys: [{{name: mallory, token: {token}, scopes: [{{user: mallory}}]}}]")
+    app_ = create_app(service, upload_dir=tmp_path / "uploads", ui=True, keys=keys)
+    form = {"username": "mallory", "password": token}
+    host = "mem.example.com"
+    with TestClient(app_, base_url=f"https://{host}") as client:
+        for path in ("/login", "/login/"):
+            refused = client.post(
+                path, data=form, headers={"Origin": "https://evil.example"}, follow_redirects=False
+            )
+            assert refused.status_code == 403, path
+            assert "set-cookie" not in refused.headers and not client.cookies
+        same = client.post("/login", data=form, headers={"Origin": f"https://{host}"})
+        assert same.status_code == 200 and "set-cookie" in same.headers
+        client.cookies.clear()
+        bare = client.post("/login", data=form)
+        assert bare.status_code == 200 and "set-cookie" in bare.headers
+        assert client.get("/logout", follow_redirects=False).status_code != 403
 
 
 def test_http_api_trusted_hosts(service: ChatService, tmp_path: Path) -> None:

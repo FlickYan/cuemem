@@ -979,13 +979,15 @@ def create_proxy_app(
     keys: Keys | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
+    allow_ip_hosts: bool = False,
     max_body_bytes: int = MAX_BODY_BYTES,
 ) -> FastAPI:
     """单独运行的记忆代理（cuemem proxy）。token 非空时要求 Authorization: Bearer <token>：
     OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。keys：另有限定作用域
     的令牌（Keys.from_env；给了时不看 token），每个令牌只能用作用域里的用户。
 
-    不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。
+    不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts、allow_ip_hosts 同
+    api.app.create_app。
     max_body_bytes：请求体的上限（字节，超过时 413，见 api/limits.py），cuemem proxy 从环境变量
     CUEMEM_MAX_BODY_BYTES 读。"""
     from cuemem.api.app import SWEEP_INTERVAL_S, _adopt_after, _guard, _sweep, _sweep_jobs
@@ -1023,5 +1025,12 @@ def create_proxy_app(
 
     keys = keys if keys is not None else Keys.from_token(token)
     app.include_router(proxy_router(proxy, dependencies=guard(keys)))
-    _guard(app, allowed_hosts, origin_hosts, max_body_bytes=max_body_bytes, keys=keys)
+    _guard(
+        app,
+        allowed_hosts,
+        origin_hosts,
+        max_body_bytes=max_body_bytes,
+        keys=keys,
+        allow_ip_hosts=allow_ip_hosts,
+    )
     return app
