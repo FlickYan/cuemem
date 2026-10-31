@@ -11,6 +11,9 @@
 解压炸弹（第三轮体检）：几十 KB 的 PNG 可以有一亿多像素，解码时要几百 MB。像素数超过 Pillow 的
 Image.MAX_IMAGE_PIXELS（默认约 8950 万）的图片不进媒体库（put 报 ValueError）；同时解码的大图
 （超过 LARGE_PIXELS）最多 LARGE_DECODES 张，几个请求一起解码也撑不爆共用的服务。
+
+图片格式（第四轮体检）：进媒体库、导入的图片只认 ACCEPTED_FORMATS，别的格式不交给 Pillow 的
+解码器去试；认不出时 put 报 ValueError（/api/v1 是 400）。
 """
 
 from __future__ import annotations
@@ -26,7 +29,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+
+# 收进来的图片（/api/v1、界面、记忆代理与 MCP 的写回、导入，都是不可信的字节）只试这几种格式的
+# 解码器。Pillow 默认挨个试四十来种格式，冷门格式的文件头解析出过不少安全问题：Pillow 12 的 XBM
+# 正则 512 字节就能占住 GIL 几分钟，整个服务（所有令牌、所有接口）跟着停住。手机拍的 MPO 经 JPEG
+# 的解码器打开；与 portable._FORMAT_SUFFIX 相同。只用在入口：image_data_url 不限，存下的图照常读
+ACCEPTED_FORMATS = ("JPEG", "PNG", "WEBP", "GIF", "BMP", "TIFF")
 
 # 像素数超过这个数的图片，解码、转换与缩放要排队，同时最多 LARGE_DECODES 张（一张 1600 万像素的
 # RGB 图解码约 50 MB，8900 万像素的约 270 MB）；小图不受限制
@@ -97,15 +106,19 @@ class MediaStore:
 
 
 def _checked_size(data: bytes) -> tuple[int, int]:
-    """图片的尺寸（只读文件头，不解码）。不是图片时照常抛出 PIL 的错误；像素数超过 Pillow 的
+    """图片的尺寸（只读文件头，不解码）。认不出、不是 ACCEPTED_FORMATS 里的格式时 ValueError（以前
+    是 PIL 的 UnidentifiedImageError，/api/v1 回 500，冷门格式照样收下）；像素数超过 Pillow 的
     Image.MAX_IMAGE_PIXELS 时 ValueError。上限在调用时读、不改它：它是整个进程的设置，SDK 用户的
     程序也在用；为 None（关掉了）时不查。Pillow 自己只在超过两倍时报 DecompressionBombError（不是
     ValueError：记忆代理会当成值得重试，挡住这个会话之后的写回），一到两倍之间只警告、照样解码。"""
     try:
-        with Image.open(io.BytesIO(data)) as image:
+        with Image.open(io.BytesIO(data), formats=ACCEPTED_FORMATS) as image:
             width, height = image.size
     except Image.DecompressionBombError as exc:
         raise ValueError(f"Image too large: {exc}") from exc
+    except UnidentifiedImageError as exc:
+        accepted = ", ".join(ACCEPTED_FORMATS)
+        raise ValueError(f"Not a valid image (accepted formats: {accepted}).") from exc
     limit = Image.MAX_IMAGE_PIXELS
     if limit is not None and width * height > limit:
         raise ValueError(f"Image too large: {width}x{height} pixels (limit {limit}).")
@@ -132,13 +145,21 @@ def decoding(image: Image.Image) -> Iterator[None]:
 def image_data_url(path: Path | str, *, max_side: int = 768, quality: int = 85) -> str:
     """读图、缩放、编码成 data URL（OpenAI 兼容接口的图片输入格式）。大图的解码与缩放排队
     （decoding），输出的字节与不排队时相同；不用 draft()、thumbnail() 之类的捷径，它们会改变
-    发给模型的字节（以及缓存的键）。"""
+    发给模型的字节（以及缓存的键）。
+
+    缩放分两次（先宽后高），钉住 Pillow 12 一次 resize 时的顺序：Pillow 13 起高度缩得比宽度多
+    两倍以上时先缩高度（13.0.0 发布说明的 "Resizing vertically first"），手机截图之类的高图
+    像素会变、缓存的键跟着变。两次缩放在 Pillow 12 上与一次 resize 逐字节相同，在 13 上
+    还原 12 的字节（tests/test_store.py 钉着各种高图的摘要）。"""
     with Image.open(path) as source, decoding(source):
         image = source.convert("RGB")
         scale = max_side / max(image.size)
         if scale < 1:
             size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
-            image = image.resize(size, Image.Resampling.LANCZOS)
+            if size[0] != image.width:
+                image = image.resize((size[0], image.height), Image.Resampling.LANCZOS)
+            if size[1] != image.height:
+                image = image.resize(size, Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=quality)
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")

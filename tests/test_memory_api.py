@@ -1119,6 +1119,46 @@ def test_oversized_images_are_refused(
     assert embedded == [] and not list(system.settings.paths.media.rglob("*.png"))
 
 
+def _xbm_stall(k: int) -> bytes:
+    """512 字节的 XBM 文件头（GHSA-xgh8-jp6q-p5x8）：Pillow 12 认 XBM 的正则在这里回溯，k=28 时
+    占住 GIL 十几秒，整个进程的别的请求跟着等。"""
+    data = b"#define" + b" " * k + b"_width 1\r" + b"#define" + b" " * k + b"_height 1\r"
+    data += b"#define" + b" " * k + b"_x_hot 1\r" + b"#define" + b" " * k + b"_y_hot 1"
+    data += b"\r" * k + b"_bits"
+    return data + b"A" * (512 - len(data))
+
+
+def test_uncommon_image_formats_are_refused_at_once(system: MemorySystem) -> None:
+    """不是 JPEG、PNG、WEBP、GIF、BMP、TIFF 的图片（store/media.py 的 ACCEPTED_FORMATS）：400
+    ValueError，不交给 Pillow 别的格式的解码器去试，什么都不写、不存原图。以前一个只能写自己空间
+    的令牌发 512 字节的 XBM 文件头，Pillow 12 上卡住整个服务十几秒之后回 500；认不出的文件也是
+    500（UnidentifiedImageError 没有算成请求的错）。"""
+    keys = Keys.parse(
+        "keys:\n  - name: m-app\n    token: m-token-0123456789\n    scopes:\n"
+        "      - user: mallory\n"
+    )
+    xbm = io.BytesIO()
+    Image.new("1", (8, 8)).save(xbm, format="XBM")  # 一张正常的 XBM：以前照样存下
+    with TestClient(v1_app(system, keys), raise_server_exceptions=False) as http:
+        for data in (_xbm_stall(28), xbm.getvalue(), b"hello, not an image"):
+            url = "data:image/png;base64," + base64.b64encode(data).decode()
+            block = {"type": "image_url", "image_url": {"url": url}}
+            message = {"role": "user", "content": [{"type": "text", "text": "look"}, block]}
+            body = {"messages": message, "user_id": "mallory", "infer": False}
+            started = time.perf_counter()
+            response = http.post(
+                "/api/v1/memories",
+                json=body,
+                headers={"Authorization": "Bearer m-token-0123456789"},
+            )
+            assert time.perf_counter() - started < 1.0
+            assert response.status_code == 400, response.text
+            error = response.json()["error"]
+            assert error["type"] == "ValueError" and "Not a valid image" in error["message"]
+    assert system.db.list_spaces() == [] and system.db.get_media("mallory") == []
+    assert not [p for p in system.settings.paths.media.rglob("*") if p.is_file()]
+
+
 def test_v1_explains_provider_errors(
     system: MemorySystem, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:

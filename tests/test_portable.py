@@ -284,10 +284,14 @@ def test_import_never_writes_outside_its_scratch_dir(memory: Memory, tmp_path: P
 
 
 def test_import_rejects_non_images_before_writing_anything(memory: Memory) -> None:
-    """不是图片的附件：整个导入报 ValueError（HTTP 是 409），一条发言也不写，也不进媒体库。"""
+    """不是图片的附件：整个导入报 ValueError（HTTP 是 409），一条发言也不写，也不进媒体库。媒体库
+    不收的格式（store/media.py 的 ACCEPTED_FORMATS 之外，比如 XBM）也算：以前照样导进来。"""
     media_root = memory.system.settings.paths.media
     png = _png()
+    xbm = io.BytesIO()
+    Image.new("1", (8, 8)).save(xbm, format="XBM")
     for bad in (
+        _image(xbm.getvalue(), "image/x-xbitmap"),
         _image(b"<script>alert(1)</script>", "text/html"),
         _image(b"not a png at all", "image/png"),
         _image(png[:-20] + bytes([png[-20] ^ 0xFF]) + png[-19:]),  # 校验和不对（SyntaxError）

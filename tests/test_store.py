@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import pytest
 from fakes import TOY_CONVERSATION, KeyedQdrant
-from PIL import Image
+from PIL import Image, ImageChops
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn, TurnMeta
@@ -801,6 +801,31 @@ def test_media_store_refuses_images_with_too_many_pixels(
     assert Image.MAX_IMAGE_PIXELS is None
 
 
+def test_media_store_takes_only_common_image_formats(tmp_path: Path) -> None:
+    """媒体库只收 ACCEPTED_FORMATS（手机拍的 MPO 经 JPEG 的解码器打开），别的格式不交给 Pillow 的
+    解码器去试，ValueError（/api/v1 是 400，记忆代理不重试）。以前 XBM、ICO 之类照样存下，认不出的
+    文件是 PIL 的 UnidentifiedImageError。"""
+    store = MediaStore(tmp_path / "media")
+    image = Image.new("RGB", (16, 16), "red")
+    for fmt in ("JPEG", "MPO", "PNG", "WEBP", "GIF", "BMP", "TIFF"):
+        path = tmp_path / f"ok.{fmt.lower()}"
+        image.save(path, format=fmt)
+        assert store.put(path).width == 16, fmt
+    for fmt in ("XBM", "ICO", "PCX", "TGA"):
+        path = tmp_path / f"odd.{fmt.lower()}"
+        image.convert("1" if fmt == "XBM" else "RGB").save(path, format=fmt)
+        with Image.open(path) as opened:
+            assert opened.format == fmt  # Pillow 本身认得
+        with pytest.raises(ValueError, match="Not a valid image"):
+            store.put(path)
+        with pytest.raises(ValueError, match="Not a valid image"):
+            media.check_image(path)
+    (tmp_path / "note.png").write_text("not an image")
+    with pytest.raises(ValueError, match="Not a valid image"):
+        store.put(tmp_path / "note.png")
+    assert len([p for p in (tmp_path / "media").rglob("*") if p.is_file()]) == 7
+
+
 @pytest.mark.parametrize("thumbnail", [False, True], ids=["data-url", "ui-thumbnail"])
 def test_large_images_are_decoded_two_at_a_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, thumbnail: bool
@@ -845,20 +870,126 @@ def test_large_images_are_decoded_two_at_a_time(
     assert peak == 6
 
 
+def _striped(width: int, height: int) -> Image.Image:
+    """确定的测试图，不经过任何重采样：256 像素见方的渐变平铺，每 37 像素一道 3 像素宽的红色
+    竖条（锐利的边缘让缩放的取整更敏感）。在任何 Pillow 版本上逐像素相同。"""
+    gradient = Image.linear_gradient("L")
+    turned = gradient.transpose(Image.Transpose.ROTATE_90)
+    tile = Image.merge("RGB", (gradient, turned, ImageChops.invert(gradient)))
+    image = Image.new("RGB", (width, height))
+    for x in range(0, width, 256):
+        for y in range(0, height, 256):
+            image.paste(tile, (x, y))
+    for x in range(0, width, 37):
+        image.paste((255, 0, 0), (x, 0, x + 3, height))
+    return image
+
+
+def _unusual_photos(folder: Path) -> Path:
+    """高比宽多两倍以上的图（手机截图之类），各种模式与格式各一张，外加一张横图对照。全部只用
+    整数运算（取通道、合并、查表）做出来，不用 convert、quantize 之类可能随版本变的算法。"""
+    _striped(900, 2000).save(folder / "tall-900x2000.png")
+    _striped(1080, 2400).save(folder / "phone-1080x2400.jpg", quality=90)
+    _striped(700, 3000).save(folder / "strip-700x3000.png")
+    _striped(2000, 900).save(folder / "wide-2000x900.png")
+    rgb = _striped(500, 1400)
+    red, green, blue = rgb.split()
+    rgb.save(folder / "RGB-500x1400.webp", lossless=True)
+    red.save(folder / "L-500x1400.png")
+    Image.merge("LA", (red, green)).save(folder / "LA-500x1400.png")
+    Image.merge("RGBA", (red, green, blue, red)).save(folder / "RGBA-500x1400.png")
+    Image.merge("CMYK", (red, green, blue, ImageChops.invert(red))).save(
+        folder / "CMYK-500x1400.jpg", quality=90
+    )
+    Image.fromarray(np.asarray(red, dtype=np.uint16) * 257).save(folder / "I16-500x1400.png")
+    red.point(lambda v: 255 if v >= 128 else 0, mode="1").save(folder / "1-500x1400.png")
+    palette = Image.frombytes("P", rgb.size, red.point(lambda v: v // 4).tobytes())
+    palette.putpalette([(i * k) % 256 for i in range(64) for k in (4, 37, 251)])
+    palette.save(folder / "P-500x1400.png")
+    palette.save(folder / "P-500x1400.gif")
+    palette.save(folder / "P-500x1400.tif")
+    rgb.save(folder / "RGB-500x1400.bmp")
+    return folder
+
+
+@pytest.fixture(scope="module")
+def unusual_photos(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return _unusual_photos(tmp_path_factory.mktemp("unusual-photos"))
+
+
+# image_data_url 的输出（sha256 的前 16 位，最长边 768 与 512）。演示的 24 张图是 768 见方：
+# 768 不缩放，512 缩放；其余是上面的 unusual_photos，高图在 Pillow 13 上单次缩放会变
+SENT_IMAGE_DIGESTS = {
+    "demo": {
+        "P01.jpg": ("372131d73958967e", "48ef386cd0e7b924"),
+        "P02.jpg": ("1ce01b8c3282c075", "7dd0a253c78b49e0"),
+        "P03.jpg": ("605d50f2644361e3", "031066701b47e528"),
+        "P04.jpg": ("e6b5a05d722fd7f5", "456db0cc1a156f47"),
+        "P05.jpg": ("9ad0777591027418", "118fe88b1a53e262"),
+        "P06.jpg": ("ced287bdfab46e1b", "b40dab13968e488d"),
+        "P07.jpg": ("bf59fb2e69804ca4", "65bc16a745f592c8"),
+        "P08.jpg": ("17f5e5999deab2ba", "821d9c1a1bd18373"),
+        "P09.jpg": ("b354dace783cb039", "4192d4de77fb4756"),
+        "P10.jpg": ("0cff4a3c530dfca9", "cb58ec10a459d8fb"),
+        "P11.jpg": ("9fba564486cd1d2c", "e7b3487c1ab98ece"),
+        "P12.jpg": ("38fe5a8875659f9d", "d35ab62a6cc92e5f"),
+        "P13.jpg": ("dd4cda4638993586", "104a33d477a2b94a"),
+        "P14.jpg": ("602ac7d60a43c08e", "f53d110511f16dfa"),
+        "P15.jpg": ("a7d51e0aa0840bfd", "ddb5d7463f9d4393"),
+        "P16.jpg": ("90b278364dea15ed", "e1ffc946b741cb62"),
+        "P17.jpg": ("de0da030244c76e1", "f237e6f741a04ccb"),
+        "P18.jpg": ("c08f863748717e32", "4fcca6f1d1a1d74f"),
+        "P19.jpg": ("a9aacdae41737da4", "c4f207307c3cb601"),
+        "P20.jpg": ("010ed3f699a65eb3", "46976a7a43f38578"),
+        "P21.jpg": ("0fe45b227df67176", "3d2b159dd44ad574"),
+        "P22.jpg": ("ff06e1cc0b97670f", "e758e16d3357d47f"),
+        "P23.jpg": ("0e5132d36eab59dd", "a3e0021756358bd2"),
+        "P24.jpg": ("f12a555894ce8bc0", "6b3e0d4dd750ece8"),
+    },
+    "unusual": {
+        "1-500x1400.png": ("5a6d478695c0e58c", "cc861d7b8c44fd38"),
+        "CMYK-500x1400.jpg": ("97a3d9e936c0f835", "797a56a973de722f"),
+        "I16-500x1400.png": ("0d5b24d1f9ef5179", "42771a71fccdfb42"),
+        "L-500x1400.png": ("f2f70edce7d07640", "be019feed5d6875b"),
+        "LA-500x1400.png": ("f2f70edce7d07640", "be019feed5d6875b"),
+        "P-500x1400.gif": ("84d7d167469dcf20", "253a6ad5e04d9870"),
+        "P-500x1400.png": ("84d7d167469dcf20", "253a6ad5e04d9870"),
+        "P-500x1400.tif": ("84d7d167469dcf20", "253a6ad5e04d9870"),
+        "RGB-500x1400.bmp": ("dd6b57aba4d80f33", "918e688ff6f70d91"),
+        "RGB-500x1400.webp": ("dd6b57aba4d80f33", "918e688ff6f70d91"),
+        "RGBA-500x1400.png": ("dd6b57aba4d80f33", "918e688ff6f70d91"),
+        "phone-1080x2400.jpg": ("617d782dfb3882ee", "a7b5b99678881ec6"),
+        "strip-700x3000.png": ("8337054b4942de7d", "c331d0fa827136df"),
+        "tall-900x2000.png": ("fff7d276f575fe98", "d984e3dba6d182c0"),
+        "wide-2000x900.png": ("cab2cfa877e8efca", "11965606fa3b6fdf"),
+    },
+}
+
+
 @pytest.mark.parametrize("queued", [False, True], ids=["small", "large"])
 def test_image_bytes_sent_to_models_are_unchanged(
-    monkeypatch: pytest.MonkeyPatch, queued: bool
+    monkeypatch: pytest.MonkeyPatch, queued: bool, unusual_photos: Path
 ) -> None:
     """发给模型的图片字节（因而缓存的键）与以前逐字节相同，排不排队都一样（不用 draft()、
-    thumbnail() 之类的捷径）。768 不缩放，512 缩放。"""
+    thumbnail() 之类的捷径）。768 不缩放，512 缩放。除了 P01 的完整摘要，演示的 24 张图与
+    unusual_photos 的每一张都钉住：高比宽多两倍以上的图（各种模式）在 Pillow 13 上先缩高度、
+    像素会变（13.0.0 的 "Resizing vertically first"），image_data_url 分两次缩放（先宽后高）
+    才保持 Pillow 12 的字节。"""
     if queued:
         monkeypatch.setattr(media, "LARGE_PIXELS", 0)
-    photo = Path(__file__).parents[1] / "demo" / "shop" / "images" / "P01.jpg"
+    shop = Path(__file__).parents[1] / "demo" / "shop" / "images"
+    photo = shop / "P01.jpg"
 
-    def digest(**kwargs: Any) -> str:
-        return hashlib.sha256(image_data_url(photo, **kwargs).encode()).hexdigest()
+    def digest(path: Path, **kwargs: Any) -> str:
+        return hashlib.sha256(image_data_url(path, **kwargs).encode()).hexdigest()
 
-    assert digest() == "372131d73958967e1c0b7bfdccebc90b21457e8848456a5c10d15c9ab1f4ed84"
-    assert digest(max_side=512) == (
+    assert digest(photo) == "372131d73958967e1c0b7bfdccebc90b21457e8848456a5c10d15c9ab1f4ed84"
+    assert digest(photo, max_side=512) == (
         "48ef386cd0e7b9249270ccdb24f8893b05e666346a6982c5603881e90971af22"
     )
+    for kind, folder in (("demo", shop), ("unusual", unusual_photos)):
+        found = {
+            path.name: (digest(path)[:16], digest(path, max_side=512)[:16])
+            for path in sorted(folder.iterdir())
+        }
+        assert found == SENT_IMAGE_DIGESTS[kind], kind

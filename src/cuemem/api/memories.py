@@ -67,6 +67,7 @@ from cuemem.core.models import FactCategory, SupersedeReason
 from cuemem.errors import ConcurrentWriteError, CueMemError, EmbeddingAPIError
 from cuemem.read.controller import Router
 from cuemem.sdk import AnswerMode, Memory, SearchMode, _scope, space_for
+from cuemem.store.media import ACCEPTED_FORMATS
 
 PREFIX = "/api/v1"
 _CODES = {
@@ -567,9 +568,10 @@ def _no_server_files(messages: str | dict[str, Any] | list[dict[str, Any]]) -> N
 
 
 def _image_type(data: bytes) -> str:
-    """图片的 Content-Type：按 PIL 认出的格式（只读文件头），认不出时是通用的二进制。"""
+    """图片的 Content-Type：按 PIL 认出的格式（只读文件头，只试媒体库收的格式），认不出时是通用的
+    二进制。"""
     try:
-        with Image.open(io.BytesIO(data)) as probe:
+        with Image.open(io.BytesIO(data), formats=ACCEPTED_FORMATS) as probe:
             return Image.MIME.get(probe.format or "", "application/octet-stream")
     except Exception:  # 坏图时 PIL 抛的异常五花八门
         return "application/octet-stream"

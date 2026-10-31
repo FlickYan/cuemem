@@ -49,10 +49,12 @@ from PIL import Image
 from cuemem.core.models import SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.core.timeutil import normalize_expiry
 from cuemem.memory import MemorySystem
+from cuemem.store.media import ACCEPTED_FORMATS
 
 FORMAT = "cuemem.space"
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
-# PIL 认出的格式 → 临时文件的后缀（媒体库按后缀存放）；没列出的格式用 .img（同 SDK 的 data URL）
+# PIL 认出的格式 → 临时文件的后缀（媒体库按后缀存放）；没列出的格式用 .img（同 SDK 的 data URL）。
+# 导入只认 store/media.py 的 ACCEPTED_FORMATS（MPO 经 JPEG 的解码器打开）
 _FORMAT_SUFFIX = {
     "JPEG": ".jpg",
     "MPO": ".jpg",  # 手机拍的 JPEG 常被认成 MPO
@@ -222,7 +224,7 @@ def _image_files(images: Sequence[Mapping[str, Any]], scratch: Path) -> Iterator
     for image in images:
         try:
             data = base64.b64decode(image["data"], validate=True)
-            with Image.open(io.BytesIO(data)) as probe:
+            with Image.open(io.BytesIO(data), formats=ACCEPTED_FORMATS) as probe:
                 fmt = probe.format or ""
                 probe.verify()
         except Exception as exc:  # 坏图时 PIL 抛的异常五花八门：OSError、SyntaxError、struct.error…
