@@ -320,6 +320,43 @@ def test_forget_inside_open_session(system: MemorySystem, model: ScriptedModel) 
     assert not any("Ana" in str(m["content"]) for m in history)
 
 
+def test_the_next_turn_drops_what_a_forget_deleted(
+    system: MemorySystem, model: ScriptedModel
+) -> None:
+    """遗忘之后没人调用 agent.prune（SDK、/api/v1 的删除与 reset 都不调用）：下一轮在读取里发现
+    这个空间遗忘过（MemorySystem.forget_epoch），先去掉被删的轮、重取画像再回答。以前被删的话
+    还在工作记忆里，照样发给模型。"""
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "我妹妹 Ana 的生日是 10 月 3 日。", mode="l0")
+    agent.chat(session, "我穿 40 码的鞋。", mode="l0")
+    turns = system.db.get_turns("demo", session.session_id)
+    system.forget("demo", turn_ids=[t.id for t in turns if t.idx in (0, 1)])
+    agent.chat(session, "我穿多大的鞋？", mode="l0")
+    history = model.agent_requests[-1]["messages"]
+    assert not any("Ana" in str(m["content"]) for m in history)
+    assert [e.user_idx for e in session.window] == [2, 4]
+    assert session.forget_epoch == system.forget_epoch("demo") == 1
+
+
+def test_turns_without_a_forget_do_not_resync(
+    system: MemorySystem, model: ScriptedModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有遗忘时每轮只比一次遗忘的次数，不同步、不重取画像：请求与以前相同，稳定前缀不变。"""
+    agent = Agent(system, router="rule")
+
+    def never(session: Any) -> int:
+        raise AssertionError("没有遗忘，不该同步会话")
+
+    monkeypatch.setattr(agent, "_prune_locked", never)
+    session = agent.start("demo", at=DAY)
+    for text in ["你好", "我的狗是什么品种？"]:
+        agent.chat(session, text)
+    first, second = model.agent_requests
+    assert second["messages"][: len(first["messages"]) - 1] == first["messages"][:-1]
+    assert session.forget_epoch == system.forget_epoch("demo") == 0
+
+
 def test_forget_follows_citations(system: MemorySystem, model: ScriptedModel) -> None:
     agent = Agent(system, router="rule")
     first = agent.start("demo", at=DAY)

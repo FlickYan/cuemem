@@ -145,6 +145,8 @@ class ChatSession:
     uploads: dict[str, str] = field(default_factory=dict)  # u1 → 本地路径（存进记忆后是那份）
     upload_turns: dict[str, int] = field(default_factory=dict)  # u1 → 所在发言的序号
     closed: bool = False
+    # 上次与记忆同步（开始、prune）时这个空间遗忘过几次（MemorySystem.forget_epoch）
+    forget_epoch: int = 0
     _clock: float = field(default_factory=time.monotonic)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -193,12 +195,15 @@ class Agent:
         started = naive_local(at).replace(microsecond=0) if at is not None else datetime.now()
         sid = session_id or sortable_session_id("chat", started)
         self.system.open_session(space_id, sid)
+        # 先记遗忘的次数、再取画像：两者之间遗忘了的话，下一轮会再同步一次，不会漏掉
+        epoch = self.system.forget_epoch(space_id)
         return ChatSession(
             space_id=space_id,
             session_id=sid,
             started_at=started,
             profile=self._profile(space_id),
             simulated=at is not None,
+            forget_epoch=epoch,
         )
 
     def _profile(self, space_id: str) -> list[tuple[str, str, str]]:
@@ -226,24 +231,34 @@ class Agent:
         （画像是按剩下的日志重建的）。返回去掉的轮数。
 
         用户的话或助手的回复被删，都整轮去掉：转述只删回复（D-051），留下一句没有回复的问话
-        在上下文里没有意义。"""
+        在上下文里没有意义。
+
+        不调用也行：每轮对话在读取里先比一下这个空间遗忘过几次（见 _chat），变了就自己同步。
+        ChatService.forget 遗忘之后立即调用（记下次数，下一轮不再重取一遍画像）。"""
         with session.lock:
-            space, sid = session.space_id, session.session_id
-            existing = {t.id for t in self.system.db.get_turns(space, sid)}
-            kept = [
-                e
-                for e in session.window
-                if stable_id(space, sid, e.user_idx) in existing
-                and stable_id(space, sid, e.user_idx + 1) in existing
-            ]
-            removed = len(session.window) - len(kept)
-            session.window = kept
-            for label, idx in list(session.upload_turns.items()):
-                if stable_id(space, sid, idx) not in existing:
-                    session.uploads.pop(label, None)
-                    session.upload_turns.pop(label, None)
-            session.profile = self._profile(space)
-            return removed
+            return self._prune_locked(session)
+
+    def _prune_locked(self, session: ChatSession) -> int:
+        """prune 的实现，调用方持有 session.lock（_chat 在这一轮的读取里调用）。先记遗忘的
+        次数：同步期间又遗忘了的话，下一轮再同步一次。"""
+        space, sid = session.space_id, session.session_id
+        epoch = self.system.forget_epoch(space)
+        existing = {t.id for t in self.system.db.get_turns(space, sid)}
+        kept = [
+            e
+            for e in session.window
+            if stable_id(space, sid, e.user_idx) in existing
+            and stable_id(space, sid, e.user_idx + 1) in existing
+        ]
+        removed = len(session.window) - len(kept)
+        session.window = kept
+        for label, idx in list(session.upload_turns.items()):
+            if stable_id(space, sid, idx) not in existing:
+                session.uploads.pop(label, None)
+                session.upload_turns.pop(label, None)
+        session.profile = self._profile(space)
+        session.forget_epoch = epoch
+        return removed
 
     # ---------- 一轮对话 ----------
 
@@ -297,6 +312,12 @@ class Agent:
                 "chat", self.system.tracer, space=space, session=session.session_id, message=text
             ) as trace,
         ):
+            # 上次同步之后这个空间遗忘过（/api/v1 的删除、reset、SDK、MCP……，或者这一轮排在一次
+            # 遗忘后面等读取）：先去掉被删的轮、重取画像，否则被删的内容随这一轮发给模型、又被
+            # 写回日志。在读取里比：遗忘独占这个空间，比完到这一轮做完之间不会再有遗忘。没遗忘过
+            # 时只是查一次字典，请求不变
+            if session.forget_epoch != self.system.forget_epoch(space):
+                self._prune_locked(session)
             exclude = self._window_ids(session)
             l1 = L1Config(budget_tokens=self.budget.recalled)
             with span("recall"):

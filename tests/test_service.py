@@ -23,9 +23,10 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 
-from cuemem.agent import Agent
+from cuemem.agent import Agent, ChatSession
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, Product, shop_tools
 from cuemem.api.app import _sweep, create_app
+from cuemem.api.auth import Keys
 from cuemem.api.failures import provider_failure
 from cuemem.api.mcp import build_server
 from cuemem.api.replay import DemoScript, check, replay
@@ -34,6 +35,7 @@ from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
 from cuemem.config import Settings
 from cuemem.errors import ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.sdk import Memory
 from cuemem.store.media import image_data_url
 
 DAY = datetime(2026, 8, 28, 19, 30)
@@ -322,6 +324,8 @@ def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedMo
     assert not service.system.db.get_turns("shop", session.session_id)
     assert not any("Ana" in f["statement"] for f in service.facts("shop"))
     assert live.window == []
+    # 已经同步过、记下了遗忘的次数：下一轮不再同步一遍（不再重取画像）
+    assert live.forget_epoch == service.system.forget_epoch("shop") == 1
 
 
 def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
@@ -346,6 +350,159 @@ def test_forget_prunes_open_sessions_even_when_the_rebuild_fails(
         report.turns_deleted == 1 and report.rebuild_error == "RuntimeError: Insufficient Balance"
     )
     assert live.window == []
+
+
+SECRET = "My bank PIN 4321 is secret."
+EVE_TOKEN, ADMIN_TOKEN = "eve-token-0123456789", "admin-token-0123456789"
+AS_EVE = {"Authorization": f"Bearer {EVE_TOKEN}"}
+AS_ADMIN = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+def _secret_then_live(service: ChatService, model: ScriptedModel) -> tuple[str, ChatSession]:
+    """eve 在一段结束了的会话里说过 SECRET（画像里有由它抽出的事实），之后开着一个会话、聊过
+    一轮：（结束了的会话，进行中的会话）。"""
+    model.agent = lambda body: "Noted."
+    old = service.start("eve", at=DAY)
+    service.chat(old.session_id, SECRET, mode="l0")
+    service.end(old.session_id, wait=True)
+    live = service.start("eve", at=datetime(2026, 9, 1))
+    service.chat(live.session_id, "I like green tea.", mode="l0")
+    assert any("4321" in statement for _, _, statement in live.profile)
+    return old.session_id, live
+
+
+def _sent_since(fake_api: FakeAPI, n: int) -> str:
+    return json.dumps(fake_api.chat_requests[n:], ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "how", ["delete", "delete_all", "delete_all_run", "admin_reset", "scoped_reset"]
+)
+def test_v1_deletions_reach_open_chat_sessions(
+    service: ChatService, model: ScriptedModel, fake_api: FakeAPI, tmp_path: Path, how: str
+) -> None:
+    """/api/v1 的删除（一条记忆、delete_all、delete_all(run_id)、管理令牌与限定作用域的令牌的
+    reset）不经 ChatService.forget：以前进行中的会话（界面、/api）的画像快照还留着被删的事实，
+    下一轮照样发给模型，回复复述了还写回日志（D-021、D-046）。现在会话在下一轮的读取里发现这个
+    空间遗忘过，先同步再回答。"""
+    keys = Keys.parse(
+        f"keys:\n  - name: eve-app\n    token: {EVE_TOKEN}\n    scopes:\n      - user: eve\n",
+        ADMIN_TOKEN,
+    )
+    app = create_app(
+        service, upload_dir=tmp_path / "up", ui=False, mcp=False, keys=keys, idle_minutes=None
+    )
+    with TestClient(app) as http:
+        old, live = _secret_then_live(service, model)
+        listed = http.get("/api/v1/memories", params={"user_id": "eve"}, headers=AS_EVE).json()
+        fact = next(f["id"] for f in listed["results"] if "4321" in f["memory"])
+        if how == "delete":
+            done = http.delete(f"/api/v1/memories/{fact}", headers=AS_EVE)
+        elif how in ("delete_all", "delete_all_run"):
+            params = {"user_id": "eve"} | ({"run_id": old} if how == "delete_all_run" else {})
+            done = http.delete("/api/v1/memories", params=params, headers=AS_EVE)
+        else:
+            done = http.post("/api/v1/reset", headers=AS_ADMIN if how == "admin_reset" else AS_EVE)
+        assert done.status_code == 200, done.text
+        assert not any("4321" in t.text for t in service.system.db.get_turns("eve"))
+        n = len(fake_api.chat_requests)
+        reply = http.post(
+            f"/api/sessions/{live.session_id}/messages",
+            data={"text": "Hi again", "mode": "l0"},
+            headers=AS_ADMIN,
+        )
+        assert reply.status_code == 200, reply.text
+        assert "4321" not in _sent_since(fake_api, n)
+        assert live.profile == []
+
+
+def test_a_turn_waiting_behind_a_forget_does_not_send_what_it_deleted(
+    service: ChatService,
+    model: ScriptedModel,
+    fake_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """这一轮已经拿着会话锁、在等读取（排在一次遗忘后面）：以前遗忘做完之后它照样带着旧的画像
+    发给模型——ChatService.forget 的同步要等会话锁，也就是等这一轮做完。现在这一轮拿到读取时
+    自己先同步。"""
+    _, live = _secret_then_live(service, model)
+    fact = next(f["id"] for f in service.facts("eve") if "4321" in f["statement"])
+    inside, release = threading.Event(), threading.Event()
+    delete_files = service.system._delete_image_files
+
+    def held(items: Any) -> Any:  # 遗忘提交之后、还独占着这个空间时停下
+        inside.set()
+        release.wait(10)
+        return delete_files(items)
+
+    monkeypatch.setattr(service.system, "_delete_image_files", held)
+    forgetting = threading.Thread(target=service.forget, args=("eve",), kwargs={"fact_ids": [fact]})
+    forgetting.start()
+    assert inside.wait(10)
+    n, asked = len(fake_api.chat_requests), model.calls["agent"]
+    chatting = threading.Thread(
+        target=service.chat, args=(live.session_id, "Hi again"), kwargs={"mode": "l0"}
+    )
+    chatting.start()
+    deadline = time.monotonic() + 10
+    while not live.lock.locked():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    time.sleep(0.1)  # 走到读取那里等着
+    release.set()
+    forgetting.join(10)
+    chatting.join(10)
+    assert not forgetting.is_alive() and not chatting.is_alive()
+    assert model.calls["agent"] == asked + 1
+    assert "4321" not in _sent_since(fake_api, n)
+    assert live.profile == []
+
+
+def test_a_v1_delete_all_does_not_deadlock_with_a_waiting_turn(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """delete_all（删除空间）里的遗忘在删除空间的独占里重入。遗忘做完时就去同步进行中的会话的话
+    （要拿会话锁），会与拿着会话锁、等读取的这一轮互相等死：删除等会话锁，这一轮等删除让出这个
+    空间。会话在自己这一轮的读取里同步，删除的线程不碰会话锁。
+
+    自己建服务：卡死时不能再结束会话、关闭系统（拿不到锁），线程留给进程退出时收拾。"""
+    fake_api.chat_replies = [model]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"))
+    _, live = _secret_then_live(service, model)
+    inside, release = threading.Event(), threading.Event()
+    delete_files = system._delete_image_files
+
+    def held(items: Any) -> Any:  # 删除空间里的遗忘提交之后停下
+        inside.set()
+        release.wait(10)
+        return delete_files(items)
+
+    system._delete_image_files = held  # type: ignore[method-assign]
+    v1 = Memory.from_system(system)
+    deleting = threading.Thread(target=v1.delete_all, kwargs={"user_id": "eve"}, daemon=True)
+    deleting.start()
+    assert inside.wait(10)
+    n = len(fake_api.chat_requests)
+    chatting = threading.Thread(
+        target=service.chat, args=(live.session_id, "Hi again"), kwargs={"mode": "l0"}, daemon=True
+    )
+    chatting.start()
+    deadline = time.monotonic() + 10
+    while not live.lock.locked():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    time.sleep(0.1)
+    release.set()
+    deleting.join(10)
+    chatting.join(10)
+    if deleting.is_alive() or chatting.is_alive():
+        pytest.fail("delete_all 与等着读取的这一轮互相等死")
+    try:
+        assert "4321" not in _sent_since(fake_api, n)
+        assert live.profile == [] and system.db.get_turns("eve", live.session_id) != []
+    finally:
+        service.close()
 
 
 def test_sessions_left_open_by_a_crash_are_adopted(

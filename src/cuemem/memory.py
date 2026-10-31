@@ -374,6 +374,7 @@ class MemorySystem:
         self._session_locks = [threading.Lock() for _ in range(64)]
         self._gates: dict[str, _ReadGate] = {}  # 空间 → 读写门（见 reading）
         self._gates_guard = threading.Lock()
+        self._forget_epochs: dict[str, int] = {}  # 空间 → 遗忘过几次（见 forget_epoch），同上一把锁
         self._traces_expired: date | None = None  # 哪天删过过期的 trace（见 expire_traces）
 
     @classmethod
@@ -625,6 +626,18 @@ class MemorySystem:
         with self._gates_guard:
             return self._gates.setdefault(space_id, _ReadGate())
 
+    def forget_epoch(self, space_id: str) -> int:
+        """这个空间在本进程里遗忘过几次（forget 提交了删除、删除空间）。进行中的会话（Agent）记着
+        开始或上次同步时的值，每轮在读取（reading）里比一下，变了就先去掉被删的内容再回答（见
+        Agent._chat）：不论遗忘经哪个入口（/api/v1、SDK、MCP、reset、集成）、在哪个线程里做。"""
+        with self._gates_guard:
+            return self._forget_epochs.get(space_id, 0)
+
+    def _bump_forget_epoch(self, space_id: str) -> None:
+        """在独占（_exclusive）里调用：提交与加一之间没有读取能开始。"""
+        with self._gates_guard:
+            self._forget_epochs[space_id] = self._forget_epochs.get(space_id, 0) + 1
+
     def adopt_open(self, space_id: str, keep: Collection[str] = (), *, start: bool = True) -> int:
         """接手之前的进程留下的进行中的会话：进程崩溃（没来得及 close_session）时，它们没有
         登记巩固任务，也没人再结束它们。数据库里有标记、本进程里却不在进行中的会话（keep 除外：
@@ -808,6 +821,9 @@ class MemorySystem:
                         removed = self.db.clear_derived(space_id)
                         self.consolidator.requeue(space_id, before, skip)
                 committed = True
+                # 还在独占里：之后的读取（进行中的会话的下一轮）都看得到这次遗忘。之后重建出错
+                # 抛出时也已经加过：日志已经删了
+                self._bump_forget_epoch(space_id)
                 if self.worker is not None:  # 后台巩固记下的出错可能引着被删的内容
                     self.worker.drop(space_id)
 
@@ -1217,6 +1233,7 @@ class MemorySystem:
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.vectors.delete_space(space_id)  # 先于数据库：旧名字的集合按库里的记忆单元核对归属
             self.db.delete_space(space_id)
+            self._bump_forget_epoch(space_id)  # 画像等派生记忆也没了（空间里没有会话时遗忘不加）
             prefix = _open_mark(space_id)
             with self._open_lock:  # 与 open_session 的顺序相同：先这把锁、后数据库
                 live = {sid for space, sid in self._open if space == space_id}
