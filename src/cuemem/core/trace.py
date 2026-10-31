@@ -230,8 +230,9 @@ def trace_queries(record: dict[str, Any]) -> list[str]:
     prune_traces、_remove_traces 与 TraceSink.remove 的 dropped）：属性里的提问与消息（question、
     message），L2 规划的子查询（plan 阶段的 sub_queries），检查证据够不够之后追加的查询（check
     阶段的 queries，检查的模型看过记忆，可能把被删的内容写进查询），Agent 自己的检索（agent 事件
-    的 queries）。以前只删提问与消息的，别的查询向量遗忘、删除空间与过期都找不到。这些文字本来
-    就记在 trace 里，按它们找也覆盖以前写下的 trace。"""
+    的 queries，连同领域工具的查询，例如导购演示的商品目录检索）。以前只删提问与消息的，别的查询
+    向量遗忘、删除空间与过期都找不到。这些文字本来就记在 trace 里，按它们找也覆盖以前写下的
+    trace。"""
     found: list[str] = []
     attrs = record.get("attrs")
     if isinstance(attrs, dict):

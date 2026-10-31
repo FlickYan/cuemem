@@ -223,6 +223,48 @@ def test_forget_purges_the_query_vectors_of_the_agents_own_searches(
     assert system.embedder.cached([query], "query") == set()
 
 
+@pytest.mark.parametrize("how", ["forget", "delete_space", "prune_traces"])
+def test_catalog_search_queries_are_purged_with_the_conversation(
+    system: MemorySystem, model: ScriptedModel, tmp_path: Path, how: str
+) -> None:
+    """导购演示的 search_products 把模型写的查询向量化（Catalog.search 的 "query" 向量，进共用
+    的向量缓存）。模型看过记忆之后写，人设又让它用上预算、尺码与偏好，查询常常复述了用户的情况。
+    以前 trace 的 tool 阶段不记参数、agent 事件只记 memory_search 的查询：遗忘、删除空间与过期
+    都找不到这些查询向量（第四轮复审）。现在记进同一个 agent 事件。"""
+    from cuemem.agent.shop import SHOP_PERSONA, Catalog, Product, shop_tools
+
+    query = "running shoes for my knee injury, size 43, budget 8000"
+    steps: list[dict[str, Any]] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": query})
+            return {"tool_calls": [{"id": "c1", "name": "search_products", "arguments": args}]}
+        return "Try the Aero Knit Runner."
+
+    model.agent = reply
+    catalog = Catalog(
+        [Product(id="P01", name="Aero Knit Runner", category="running shoes", price=110)],
+        tmp_path,
+        embedder=system.embedder,
+    )
+    agent = Agent(system, persona=SHOP_PERSONA, tools=shop_tools(catalog), router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "I need running shoes for my knee.", mode="l0")
+    agent.end(session, wait=True)
+    assert isinstance(system.embedder, CachedEmbedder)
+    assert system.embedder.cached([query], "query") == {query}
+
+    if how == "forget":
+        system.forget("demo", session_ids=[session.session_id])
+    elif how == "delete_space":
+        system.delete_space("demo")
+    else:
+        assert system.prune_traces(1, today=datetime.now().date() + timedelta(days=2))[0] >= 1
+    assert system.embedder.cached([query], "query") == set()
+
+
 def test_tool_loop_stops_and_reports_errors(system: MemorySystem, model: ScriptedModel) -> None:
     def broken(args: dict[str, Any], ctx: Any) -> ToolResult:
         raise RuntimeError("catalog offline")

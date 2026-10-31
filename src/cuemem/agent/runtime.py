@@ -369,9 +369,12 @@ class Agent:
             finally:
                 # 工具里的检索（memory_search）记进 trace，与 ToolReader 的 agent 事件同一个样子：
                 # 遗忘、删除空间与过期按它找到这些查询向量（trace_queries）。以前没记，模型看过
-                # 记忆之后写的查询（可能复述了被删的内容）的向量谁也找不到
-                if memory.queries:
-                    record_event("agent", searches=len(memory.queries), queries=memory.queries)
+                # 记忆之后写的查询（可能复述了被删的内容）的向量谁也找不到。领域工具的查询
+                # （商品目录的检索，ToolContext.queries）一起记（第四轮复审），searches 照旧只数
+                # 记忆的检索
+                queries = list(dict.fromkeys([*memory.queries, *tool_ctx.queries]))
+                if queries:
+                    record_event("agent", searches=len(memory.queries), queries=queries)
             timings["llm"] = _ms(llm_started)
             cited = citations(answer, memory.refs)
             plain = strip_citations(answer)
