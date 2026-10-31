@@ -33,6 +33,9 @@
         max_output_tokens: 2000      # 记忆代理转发的 max_tokens 不超过它，n 只能是 1
 
   后两项只管记忆代理（/v1/chat/completions、/v1/responses）；别的接口用配置里的角色与模型。
+  models 里的别名只放行这个别名（连同目录里它的 extra_body）：写 deepseek-flash 的令牌不能用
+  同一个模型 ID 打开思考的 deepseek-flash-thinking。只写 max_output_tokens 管不住调用方的开关
+  （enable_thinking、thinking 原样转发），要固定它们得写 models。
 
 作用域之外：请求里点名了空间（user_id、agent_id、空间 ID）时 403；按 ID 找的记忆与会话当作不存在
 （404，history 是空列表），不让 ID 成为探测别人有没有某条记忆的途径。/api/spaces 与 /api/v1/spaces

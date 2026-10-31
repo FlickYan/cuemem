@@ -29,9 +29,10 @@ utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id�
 
 作用域不是花费的上限：请求里的 model、n、max_tokens 与供应商的开关（enable_thinking 等）原样
 转发。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求逐字节不变）：
-models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的）与 max_output_tokens
-（max_tokens、max_completion_tokens 不超过它，没给时补上；n 只能是 1，否则 400）。都在检索、
-开会话与转发之前查。
+models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的；列出的别名只放行它自己，
+不放行同一个模型 ID 的别的别名，见 _upstream）与 max_output_tokens（max_tokens、
+max_completion_tokens 不超过它，没给时补上；n 只能是 1，否则 400）。都在检索、开会话与转发之前
+查。max_output_tokens 管不住调用方的开关（enable_thinking、thinking），只有 models 管得住。
 
 另外两个 OpenAI 兼容的接口：
 - /v1/responses：Responses API 的一个子集——非流式、纯文字输入（字符串或 input_text 的消息），
@@ -464,8 +465,12 @@ class MemoryProxy:
         models = principal.models if principal is not None else None
         cap = principal.max_output_tokens if principal is not None else None
         if models is not None:
-            names = {alias for alias, s in settings.models.items() if s == spec} | {spec.model_id}
-            if names.isdisjoint(models):
+            # 列出的别名只放行这个别名的一项（连同它的 extra_body）：同一个模型 ID 可以有好几个
+            # 别名（deepseek-flash 与打开思考的 deepseek-flash-thinking），以前按模型 ID 一并放行。
+            # 列出的是模型 ID、又不是哪个别名时，放行这个 ID 的各项
+            aliases = {alias for alias, s in settings.models.items() if s == spec}
+            bare = spec.model_id in models and spec.model_id not in settings.models
+            if aliases.isdisjoint(models) and not bare:
                 raise ProxyError(
                     403,
                     f"This API key may use only these models: {', '.join(models)} "

@@ -778,12 +778,17 @@ def test_proxy_default_user_is_checked_too(n3_settings: Settings, fake_api: Fake
 LIMITED_TOKEN = "limited-token-0123456789"
 CAPPED_TOKEN = "capped-token-0123456789"
 PLAIN_TOKEN = "plain-token-0123456789"
+FLASH_TOKEN = "flash-token-0123456789"
 LIMITS = f"""
 keys:
   - name: limited
     token: {LIMITED_TOKEN}
     scopes: [{{user: alice}}]
     models: [qwen3.8-flash]
+  - name: flash-only
+    token: {FLASH_TOKEN}
+    scopes: [{{user: alice}}]
+    models: [deepseek-flash]
   - name: capped
     token: {CAPPED_TOKEN}
     scopes: [{{user: alice}}]
@@ -839,6 +844,54 @@ def test_scoped_key_model_allowlist(limited: tuple[TestClient, MemoryProxy, Fake
     assert _chat(http, PLAIN_TOKEN, **EXPENSIVE).status_code == 200  # 没写 models 的照旧
     assert fake_api.chat_requests[-1]["enable_thinking"] is True
     assert _chat(http, ADMIN_TOKEN, **EXPENSIVE).status_code == 200
+
+    # 第四轮复审：列出的别名只放行它自己。deepseek-flash-thinking 与 deepseek-flash 是同一个模型
+    # ID，以前按模型 ID 一并放行，转发的是目录里打开思考的 thinking: {type: enabled}
+    def flash() -> list[dict[str, Any]]:  # 只看转发的（后台抽取用的是 qwen3.8-flash）
+        return [r for r in fake_api.chat_requests if r["model"] == "deepseek-flash"]
+
+    sibling = _chat(http, FLASH_TOKEN, model="deepseek-flash-thinking")
+    assert sibling.status_code == 403 and sibling.json()["error"]["param"] == "model"
+    assert flash() == []
+    thinking = {"thinking": {"type": "enabled"}}
+    sent = _chat(http, FLASH_TOKEN, model="deepseek-flash", **thinking)
+    assert sent.status_code == 200, sent.text
+    assert [r["thinking"] for r in flash()] == [{"type": "disabled"}]
+
+
+def test_scoped_key_models_may_name_a_bare_model_id(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """models 里写的模型 ID 不是哪个别名时，放行这个 ID 的各个别名；写的是别名时只放行它自己。"""
+    fake_api.chat_replies = ["Hi!"]
+    base = n3_settings.models["qwen3.8-flash"]
+    catalogue = {
+        **n3_settings.models,
+        "fast": base.model_copy(update={"model_id": "vendor/fast-1"}),
+        "fast-thinking": base.model_copy(
+            update={"model_id": "vendor/fast-1", "extra_body": {"enable_thinking": True}}
+        ),
+    }
+    system = MemorySystem.from_settings(
+        n3_settings.model_copy(update={"models": catalogue}), http_client=fake_api.client()
+    )
+    proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    keys = f"""
+keys:
+  - {{name: bare, token: {LIMITED_TOKEN}, scopes: [{{user: alice}}], models: [vendor/fast-1]}}
+  - {{name: alias, token: {CAPPED_TOKEN}, scopes: [{{user: alice}}], models: [fast]}}
+"""
+    app = create_proxy_app(proxy, keys=Keys.parse(keys, ADMIN_TOKEN))
+    try:
+        with TestClient(app) as http:
+            for model in ("fast", "fast-thinking", "vendor/fast-1"):
+                assert _chat(http, LIMITED_TOKEN, model=model).status_code == 200, model
+            assert _chat(http, CAPPED_TOKEN, model="fast").status_code == 200
+            assert _chat(http, CAPPED_TOKEN, model="fast-thinking").status_code == 403
+            assert _chat(http, CAPPED_TOKEN, model="qwen3.8-flash").status_code == 403
+    finally:
+        proxy.close_all()
+        system.close()
 
 
 def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI]) -> None:
