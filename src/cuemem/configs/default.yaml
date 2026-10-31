@@ -1,6 +1,8 @@
 # CueMem 默认配置。
 # 任何字段都可以用环境变量覆盖：前缀 CUEMEM_，嵌套用 __，例如 CUEMEM_ROLES__READER__MODEL=qwen3.8-flash。
-# 相对路径以项目根目录为基准。API Key 用 `uv run cuemem configure` 交互式写入 .env，不进仓库。
+# 相对路径以数据目录为基准：CUEMEM_HOME；在源码仓库里运行时是仓库根目录，pip 安装后是 ~/.cuemem。
+# API Key 用 `uv run cuemem configure` 交互式写入数据目录下的 .env，不进仓库。
+# 换模型供应商用预设（presets/ 下的 openai、ollama）：CUEMEM_PRESET=ollama，或 cuemem --preset ollama。
 
 paths:
   db: data/cuemem.sqlite
@@ -13,12 +15,14 @@ paths:
   eval_runs: runs/eval
   eval_spaces: data/eval-spaces   # 评测题目的记忆空间存在磁盘上复用，第二次运行不用重新写入与巩固
   media: data/media               # 原图按内容哈希存放（N6）
+  models: data/models             # 本机模型（fastembed 的向量模型，N12）
 
 # 本地 LLM 响应缓存：read_write（默认）/ read_only（只读，未命中即报错，用于严格复现）/ off
 llm_cache_mode: read_write
 
 # 分时价格的高峰时段遇到需要真实调用的请求时怎么办：wait 暂停到高峰结束（评测等批量任务的默认）；
-# warn 照常调用但提醒；allow 照常调用。交互式提问（cuemem ask）总是 allow。
+# warn 照常调用但提醒；allow 照常调用。交互式的入口（cuemem ask / serve / mcp / proxy 与 Python SDK
+# 的 Memory）缺省用 warn，不用这里的值；SDK 要等高峰结束时传 Memory(peak_policy="wait")。
 peak_policy: wait
 
 providers:
@@ -145,6 +149,8 @@ vector_store:
   # 为空时用 Qdrant 本地模式（数据在 paths.qdrant）。单个记忆空间超过约 2 万条时，
   # 本地模式的稀疏检索会明显变慢（D-005），可用 Docker 启动服务端后填 http://localhost:6333
   url: null
+  # 服务端的 API Key 不写在这里：设环境变量 CUEMEM_VECTOR_STORE__API_KEY（或写进 .env）
+  # api_key: null
 
 retrieval:
   naive_k: 8
@@ -156,6 +162,7 @@ consolidation:
   assistant_chars: 600          # 抽取时每条助手回复只保留开头（记忆以用户为主，输入 token 少一大半）
   max_session_chars: 24000      # 超长会话按轮次切成多个窗口分别抽取
   workers: 8                    # 同一空间内并行抽取的会话数（受供应商并发上限约束）
+  background_workers: 4         # 后台巩固同时处理的空间数（同一空间仍串行；请求同样受供应商并发上限约束）
   fallback_model: deepseek-flash  # 供应商内容审核误拒（如 QwenCloud 的 data_inspection_failed）时改用的模型
   duplicate_threshold: 0.93     # 陈述几乎相同 → 合并（只追加溯源）
   conflict_threshold: 0.75      # 单值事实与已有事实相似 → 交给 LLM 判断是新增、取代还是更正
@@ -164,3 +171,9 @@ consolidation:
   entity_gray_threshold: 0.75
   profile_max_chars: 1600       # 核心记忆上限（约 400 tokens）
   profile_min_importance: 4
+
+# 记忆代理（cuemem proxy 与 cuemem serve 的 /v1，D-062）
+proxy:
+  # 请求的 model 不在上面的模型目录里（别名或模型 ID）时：remap 改用 agent 角色的模型，响应头
+  # X-CueMem-Model 写明实际用的模型；reject 返回 400（model_not_found）。也可以用 --unknown-model
+  unknown_model: remap

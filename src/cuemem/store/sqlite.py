@@ -12,21 +12,43 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from cuemem.core.models import CoreMemory, Entity, Episode, Fact, MediaItem, MemoryUnit, Turn
+from cuemem.core.models import (
+    CoreMemory,
+    Entity,
+    Episode,
+    Fact,
+    MediaItem,
+    MemoryUnit,
+    Turn,
+    TurnMeta,
+)
+from cuemem.core.timeutil import naive_local
 from cuemem.errors import ConfigMismatchError
 
-# v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
-# v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）
-SCHEMA_VERSION = 5
+logger = logging.getLogger(__name__)
 
+MemoryKind = Literal["fact", "excerpt", "image"]  # 按 ID 找到的记忆的种类（MemoryDB.memory_kind）
+
+# v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
+# v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
+# v6：turn_meta（SDK 写入时附带的 metadata、过期时间与 update 的更正目标）。新表都用
+# CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上
+SCHEMA_VERSION = 6
+
+# 新增的索引不用升版本：每次打开都执行 _SCHEMA，已有的库自动补上。facts 的
+# (space_id, superseded_by) 与 (space_id, invalidated_at) 每次读取都用得到：沿版本链找被取代的
+# 旧版本（choose_facts）、数当前有效的事实（space_stats）。jobs 的 (space_id, session_id)：
+# 登记任务时找同一会话还没执行的旧任务（enqueue_jobs），清空派生层之后按会话重新登记时，
+# 没有它每登记一个都要扫一遍已经登记的任务
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -146,12 +168,23 @@ CREATE TABLE IF NOT EXISTS provenance (
     target TEXT NOT NULL,
     PRIMARY KEY (space_id, turn_id, target)
 );
+CREATE TABLE IF NOT EXISTS turn_meta (
+    space_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    expires_at TEXT,
+    edit_of TEXT,
+    PRIMARY KEY (space_id, turn_id)
+);
 CREATE INDEX IF NOT EXISTS idx_provenance_target ON provenance (space_id, target);
 CREATE INDEX IF NOT EXISTS idx_turns_space ON turns (space_id, session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id);
 CREATE INDEX IF NOT EXISTS idx_facts_space ON facts (space_id, subject_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts (space_id, superseded_by);
+CREATE INDEX IF NOT EXISTS idx_facts_current ON facts (space_id, invalidated_at);
 CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (space_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_media_space ON media (space_id, source_turn_id);
 """
 
@@ -168,6 +201,22 @@ _MEDIA_COLUMNS = (
     "id, space_id, sha256, path, caption, ocr_text, tags, entity_ids, source_turn_id, ts,"
     " caption_iso, width, height"
 )
+TURN_WRITES_KEPT = 100_000  # 记着写入次数的会话数（见 turns_version），超过时清空、换一代
+_IDX = "next-idx:"
+_LEGACY_IDX = "next_idx:"
+
+
+def next_idx_key(space_id: str, session_id: str) -> str:
+    """SDK 记下的会话里下一句发言的序号（元信息的键，见 sdk.Memory._next_idx）：遗忘删掉的末尾
+    几句的序号不再复用。空间 ID 带上长度（与进行中会话的标记相同）：以前的键 legacy_idx_key 里，
+    空间 'a:b' 的会话 'c' 与空间 'a' 的会话 'b:c' 是同一行，一个用户的写入会让另一个用户会话里的
+    序号跳过一段（抽取时当成有发言被删过）。以前的键照旧读。"""
+    return f"{_IDX}{len(space_id)}:{space_id}:{session_id}"
+
+
+def legacy_idx_key(space_id: str, session_id: str) -> str:
+    """以前的 next_idx 的键（有歧义，见 next_idx_key）：只读，不再写。"""
+    return f"{_LEGACY_IDX}{space_id}:{session_id}"
 
 
 class MemoryDB:
@@ -177,6 +226,13 @@ class MemoryDB:
         self.path = path
         self._conn = sqlite3.connect(str(path) if path else ":memory:", check_same_thread=False)
         self._lock = threading.RLock()
+        self._depth = 0  # 嵌套的 transaction() 层数（只在持有 _lock 时读写）
+        # 本连接的写入计数（只在持有 _lock 时读写），见 derived_version 与 turns_version
+        self._derived: dict[str, int] = {}  # 空间 → 事实、实体与实体检索单元改过几次
+        self._turn_epochs: dict[str, int] = {}  # 空间 → 删过几次发言（遗忘、删除空间）
+        self._turn_writes: dict[tuple[str, str], int] = {}  # （空间，会话）→ 写过几次发言
+        self._turn_generation = 0  # _turn_writes 清空过几次（见 _count_turn_writes）
+        self._rollbacks = 0  # 回滚过的事务与保存点
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
@@ -197,14 +253,91 @@ class MemoryDB:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """在一个事务里执行多条写入：要么全部生效，要么全部回滚。"""
+        """在一个事务里执行多条写入：要么全部生效，要么全部回滚。
+
+        可以嵌套：只有最外层提交；里层是保存点，里层出错只撤销里层，异常照常往外抛。以前里层
+        提交时连外层已经写的一起提交了，外层随后出错也撤不回来（在线写入把发言、"轮"与巩固
+        任务放在一个事务里，见 OnlineWriter.writing）。"""
         with self._lock:
+            if self._depth:
+                name = f"nested_{self._depth}"
+                self._conn.execute(f"SAVEPOINT {name}")
+                self._depth += 1
+                try:
+                    yield self._conn
+                except BaseException:
+                    self._rollbacks += 1
+                    if self._conn.in_transaction:  # 有的错误（磁盘满等）SQLite 已经整个回滚了
+                        self._conn.execute(f"ROLLBACK TO {name}")
+                        self._conn.execute(f"RELEASE {name}")
+                    raise
+                finally:
+                    self._depth -= 1
+                self._conn.execute(f"RELEASE {name}")
+                return
+            if not self._conn.in_transaction:  # 显式开始：里层的保存点不会自己成为事务、提前提交
+                self._conn.execute("BEGIN")
+            self._depth = 1
             try:
                 yield self._conn
+                self._conn.commit()
             except BaseException:
+                self._rollbacks += 1
                 self._conn.rollback()
                 raise
-            self._conn.commit()
+            finally:
+                self._depth = 0
+
+    def derived_version(self, space_id: str) -> tuple[int, ...]:
+        """这个空间的事实、实体与实体检索单元的版本：两次读到的相同，期间就没有改过（巩固据此
+        跨运行复用载入的状态，见 Consolidator._load_states）。
+
+        本连接的写入由改动它们的方法计数（apply_consolidation、clear_derived、delete_space，
+        以及写到或删掉实体检索单元的 add_units、delete_units；以后加的写入方法也要计数）；
+        事务回滚过、别的连接（别的进程）提交过写入，也都算改过。"""
+        with self._lock:
+            return (self._derived.get(space_id, 0), self._rollbacks, self._data_version())
+
+    def turns_version(self, space_id: str, session_id: str) -> tuple[int, ...]:
+        """这个会话的发言的版本：两次读到的相同，期间这个会话的发言就没有变过（巩固据此不用
+        每次都重算全部会话的内容指纹，见 Consolidator.enqueue）。发言只会追加（add_turns）或
+        删除（delete_turns、delete_space），这几个方法计数（以后加的改动发言的方法也要计数）；
+        回滚与别的连接的提交同样算变过。写入计数清空过（_count_turn_writes）也算变过。"""
+        return self.turns_versions(space_id, [session_id])[session_id]
+
+    def turns_versions(
+        self, space_id: str, session_ids: Sequence[str]
+    ) -> dict[str, tuple[int, ...]]:
+        """同 turns_version，一次取一批会话：只拿一次锁、只查一次 PRAGMA data_version。巩固为
+        全部会话登记任务时用它，以前每个会话各拿一次锁、各查一次。"""
+        with self._lock:
+            generation = self._turn_generation
+            epoch = self._turn_epochs.get(space_id, 0)
+            rollbacks, changed = self._rollbacks, self._data_version()
+            return {
+                sid: (
+                    generation,
+                    epoch,
+                    self._turn_writes.get((space_id, sid), 0),
+                    rollbacks,
+                    changed,
+                )
+                for sid in session_ids
+            }
+
+    def turn_epoch(self, space_id: str) -> int:
+        """这个空间经本连接删过几次发言（遗忘、删除空间）。写入失败、留着稍后重试的发言（记忆
+        代理与 Agents 的会话）据此判断期间有没有遗忘过：遗忘之前说的话不该在之后写进来。"""
+        with self._lock:
+            return self._turn_epochs.get(space_id, 0)
+
+    def _data_version(self) -> int:
+        """别的连接每提交一次写入就变一次（本连接自己的提交不算）。"""
+        return int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+
+    def _bump(self, space_ids: Iterable[str]) -> None:
+        for space_id in set(space_ids):
+            self._derived[space_id] = self._derived.get(space_id, 0) + 1
 
     # ---------- 元信息 ----------
 
@@ -219,8 +352,9 @@ class MemoryDB:
         if row[0] != value:
             raise ConfigMismatchError(
                 f"数据库 {self.path} 建立时的 {key} 是 {row[0]}，当前配置是 {value}。"
-                "混用会导致向量不可比：请删除 data/ 目录后重新导入，"
-                "或通过 CUEMEM_PATHS__* 指定新的存储位置。"
+                "混用会导致向量不可比：换一个新的数据目录（环境变量 CUEMEM_HOME，SDK 用 "
+                "Memory(home=...)），或用 CUEMEM_PATHS__DB 与 CUEMEM_PATHS__QDRANT 指定新的存储"
+                "位置；确定不要这里的记忆时，删掉这个数据库与向量库后重新导入。"
             )
 
     def get_meta(self, key: str) -> str | None:
@@ -231,6 +365,15 @@ class MemoryDB:
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    def delete_meta(self, key: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+    def meta_keys(self, prefix: str) -> list[str]:
+        """以 prefix 开头的键。按区间查询而不用 LIKE：键里的空间 ID 可能有 % 与 _。"""
+        with self._lock:
+            return _keys_under(self._conn, prefix)
 
     # ---------- 原始层 ----------
 
@@ -249,12 +392,45 @@ class MemoryDB:
             )
 
     def get_sessions(self, space_id: str) -> dict[str, datetime]:
-        """会话 ID → 开始时间。"""
+        """会话 ID → 开始时间：整个空间的会话（2 万个会话约 30 毫秒）。只问有没有会话、或者
+        某几个会话时用下面三个方法（按主键查，与会话数无关）。"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, started_at FROM sessions WHERE space_id = ?", (space_id,)
             ).fetchall()
-        return {r[0]: datetime.fromisoformat(r[1]) for r in rows}
+        return {r[0]: _dt(r[1]) for r in rows}
+
+    def has_sessions(self, space_id: str) -> bool:
+        """这个空间有没有会话（检索之前判断空间是不是空的）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE space_id = ? LIMIT 1", (space_id,)
+            ).fetchone()
+        return row is not None
+
+    def session_started(self, space_id: str, session_id: str) -> datetime | None:
+        """这个会话的开始时间；没有这个会话时为 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT started_at FROM sessions WHERE space_id = ? AND id = ?",
+                (space_id, session_id),
+            ).fetchone()
+        return None if row is None else _dt(row[0])
+
+    def sessions_of(self, space_id: str, session_ids: Sequence[str]) -> dict[str, datetime]:
+        """同 get_sessions，只取这几个会话（不在库里的不出现）。"""
+        ids = list(dict.fromkeys(session_ids))
+        found: dict[str, datetime] = {}
+        with self._lock:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                marks = ",".join("?" * len(chunk))
+                rows = self._conn.execute(
+                    f"SELECT id, started_at FROM sessions WHERE space_id = ? AND id IN ({marks})",
+                    [space_id, *chunk],
+                ).fetchall()
+                found.update((r[0], _dt(r[1])) for r in rows)
+        return found
 
     def speakers(self, space_id: str) -> list[str]:
         """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。"""
@@ -266,8 +442,13 @@ class MemoryDB:
             ).fetchall()
         return [r[0] for r in rows]
 
-    def add_turns(self, turns: Sequence[Turn]) -> int:
-        """写入原始轮次，返回实际新增的条数。"""
+    def add_turns(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta] | None = None) -> int:
+        """写入原始轮次，返回实际新增的条数。
+
+        meta：轮 ID → 附加信息（SDK 的 metadata 与过期时间），在同一个事务里写，只给这次真正
+        写进去的发言写：已有的发言（重复导入、撞号）不会被换上别人的附加信息。"""
+        if meta:
+            return self._add_turns_with_meta(turns, meta)
         rows = [
             (
                 t.id,
@@ -289,7 +470,82 @@ class MemoryDB:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            self._count_turn_writes(turns)
             return max(cursor.rowcount, 0)
+
+    def _add_turns_with_meta(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta]) -> int:
+        added = 0
+        with self.transaction() as conn:
+            for t in turns:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO turns"
+                    " (id, space_id, session_id, idx, role, text, ts, media_ids, speaker)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        t.id,
+                        t.space_id,
+                        t.session_id,
+                        t.idx,
+                        t.role,
+                        t.text,
+                        t.ts.isoformat(),
+                        json.dumps(t.media_ids),
+                        t.speaker,
+                    ),
+                )
+                if cursor.rowcount <= 0:
+                    continue
+                added += 1
+                info = meta.get(t.id)
+                if info is not None:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO turn_meta"
+                        " (space_id, turn_id, metadata, expires_at, edit_of)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            t.space_id,
+                            t.id,
+                            json.dumps(info.metadata, ensure_ascii=False),
+                            info.expires_at,
+                            info.edit_of,
+                        ),
+                    )
+            # 与不带附加信息的写入一样计数（turns_version）：以前不计，同一个 run_id 带着 metadata
+            # 再写时巩固以为会话没变，新的发言不再抽取
+            self._count_turn_writes(turns)
+        return added
+
+    def _count_turn_writes(self, turns: Sequence[Turn]) -> None:
+        """给写到的会话的写入次数加一（turns_version，持有 _lock 时调用）。记着的会话到了
+        TURN_WRITES_KEPT 个时先清空、换一代：不给 run_id 的 add 每次都是一个新会话，以前一直
+        记着，常驻的服务每 100 万次写入约 250 MB。换了一代，每个会话的版本都算变过，巩固重算
+        一遍同样的内容指纹（Consolidator._digest），登记的任务不变。"""
+        if len(self._turn_writes) >= TURN_WRITES_KEPT:
+            self._turn_writes.clear()
+            self._turn_generation += 1
+        for key in {(t.space_id, t.session_id) for t in turns}:
+            self._turn_writes[key] = self._turn_writes.get(key, 0) + 1
+
+    def get_turn_meta(
+        self, space_id: str, turn_ids: Sequence[str] | None = None
+    ) -> dict[str, TurnMeta]:
+        """轮 ID → 附加信息；没有附加信息的发言不在结果里。turn_ids 为 None 时取整个空间的。"""
+        sql = "SELECT turn_id, metadata, expires_at, edit_of FROM turn_meta WHERE space_id = ?"
+        chunks: list[list[str] | None] = [None]
+        if turn_ids is not None:
+            unique = list(dict.fromkeys(turn_ids))
+            chunks = [unique[i : i + 500] for i in range(0, len(unique), 500)]
+        out: dict[str, TurnMeta] = {}
+        for chunk in chunks:
+            query, args = sql, [space_id]
+            if chunk is not None:
+                query += f" AND turn_id IN ({', '.join('?' * len(chunk))})"
+                args += chunk
+            with self._lock:
+                fetched = self._conn.execute(query, args).fetchall()
+            for r in fetched:
+                out[r[0]] = TurnMeta(metadata=json.loads(r[1]), expires_at=r[2], edit_of=r[3])
+        return out
 
     def get_turns(
         self,
@@ -315,10 +571,12 @@ class MemoryDB:
         return [_row_to_turn(r) for r in fetched]
 
     def delete_turns(self, space_id: str, turn_ids: Sequence[str]) -> int:
-        """删除原始轮次（遗忘）；会话里的轮次全部删除后，会话本身也删除。"""
+        """删除原始轮次（遗忘）；会话里的轮次全部删除后，会话本身也删除，连同它的 next_idx
+        （_drop_idle_idx）。还有发言的会话的 next_idx 留着：删掉的末尾几句的序号不再复用。"""
         if not turn_ids:
             return 0
         with self.transaction() as conn:
+            self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
             deleted = 0
             for start in range(0, len(turn_ids), 500):
                 chunk = list(turn_ids[start : start + 500])
@@ -333,6 +591,7 @@ class MemoryDB:
                 " (SELECT DISTINCT session_id FROM turns WHERE space_id = ?)",
                 (space_id, space_id),
             )
+            self._drop_idle_idx(conn, space_id)
             # 被删发言里的图片记录一并删除（原图文件由调用方按引用情况清理）
             conn.execute(
                 "DELETE FROM media WHERE space_id = ? AND source_turn_id NOT IN"
@@ -344,7 +603,33 @@ class MemoryDB:
                 " (SELECT id FROM turns WHERE space_id = ?)",
                 (space_id, space_id),
             )
+            # 附加信息（metadata 里也可能有个人信息）随发言一起删
+            conn.execute(
+                "DELETE FROM turn_meta WHERE space_id = ? AND turn_id NOT IN"
+                " (SELECT id FROM turns WHERE space_id = ?)",
+                (space_id, space_id),
+            )
         return deleted
+
+    def _drop_idle_idx(self, conn: sqlite3.Connection, space_id: str) -> None:
+        """删掉这个空间里已经没有发言的会话的 next_idx（next_idx_key，在调用方的事务里）：会话
+        没有发言时 SDK 的序号本来就从 0 开始，留着的只是写着用户 ID 与写入时间的键（不给 run_id
+        的 add 每次一个）。以前遗忘与删除空间都不删，delete_all 之后用户 ID 还在库里。
+
+        以前的键有歧义：不能按前缀删（空间 'acme' 的前缀 'next_idx:acme:' 底下也有空间
+        'acme:alice' 的键），每个键按每一种拆法核对，哪一种拆出的会话还在就留着。顺带删掉以前的
+        遗忘留下的。新的键带着空间 ID 的长度，前缀底下的都是这个空间的。"""
+        idle: list[tuple[str]] = []
+        prefix = next_idx_key(space_id, "")
+        for key in _keys_under(conn, prefix):
+            if not _has_session(conn, space_id, key.removeprefix(prefix)):
+                idle.append((key,))
+        for key in _keys_under(conn, legacy_idx_key(space_id, "")):
+            rest = key.removeprefix(_LEGACY_IDX)
+            owners = [(rest[:i], rest[i + 1 :]) for i, c in enumerate(rest) if c == ":"]
+            if not any(_has_session(conn, space, sid) for space, sid in owners):
+                idle.append((key,))
+        conn.executemany("DELETE FROM meta WHERE key = ?", idle)
 
     # ---------- 溯源：助手的回复引用了哪些记忆（N8） ----------
 
@@ -384,6 +669,7 @@ class MemoryDB:
 
     def add_units(self, units: Sequence[MemoryUnit]) -> int:
         with self.transaction() as conn:
+            self._bump(u.space_id for u in units if u.kind == "entity")
             return _insert_units(conn, units, replace=False)
 
     def missing_unit_ids(self, space_id: str, ids: Sequence[str]) -> list[str]:
@@ -431,6 +717,26 @@ class MemoryDB:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_unit(r) for r in fetched]
 
+    def some_unit_ids(self, space_id: str, limit: int = 3) -> list[str]:
+        """这个空间的几个记忆单元 ID，"轮"优先（在线写入时一定写了向量）：向量库据此确认旧名字的
+        集合是这个空间的（见 VectorStore.collection_name）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM units WHERE space_id = ? ORDER BY kind != 'round' LIMIT ?",
+                (space_id, limit),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def has_units(self, space_id: str, kinds: Sequence[str]) -> bool:
+        """空间里有没有这几种记忆单元（走 idx_units_space，不扫表）。"""
+        marks = ", ".join("?" for _ in kinds)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM units WHERE space_id = ? AND kind IN ({marks}) LIMIT 1",
+                [space_id, *kinds],
+            ).fetchone()
+        return row is not None
+
     def delete_units(self, space_id: str, ids: Sequence[str]) -> int:
         if not ids:
             return 0
@@ -439,6 +745,13 @@ class MemoryDB:
             for start in range(0, len(ids), 500):
                 chunk = list(ids[start : start + 500])
                 marks = ", ".join("?" * len(chunk))
+                entity = conn.execute(  # 删到实体的检索单元时，巩固载入的状态就变了
+                    "SELECT 1 FROM units WHERE space_id = ? AND kind = 'entity'"
+                    f" AND id IN ({marks}) LIMIT 1",
+                    [space_id, *chunk],
+                ).fetchone()
+                if entity is not None:
+                    self._bump([space_id])
                 cursor = conn.execute(
                     f"DELETE FROM units WHERE space_id = ? AND id IN ({marks})",
                     [space_id, *chunk],
@@ -556,6 +869,13 @@ class MemoryDB:
         检索单元，并把任务标记为完成。中途失败则整体回滚，任务保持待处理，重跑即可。"""
         now = datetime.now().isoformat()
         with self.transaction() as conn:
+            self._bump(
+                [
+                    *(f.space_id for f in facts),
+                    *(e.space_id for e in entities),
+                    *(u.space_id for u in units if u.kind == "entity"),
+                ]
+            )
             conn.executemany(
                 f"INSERT OR REPLACE INTO facts ({_FACT_COLUMNS}) VALUES ({', '.join('?' * 20)})",
                 [_fact_row(f) for f in facts],
@@ -644,6 +964,40 @@ class MemoryDB:
             facts.sort(key=lambda f: order.get(f.id, len(order)))
         return facts
 
+    def fact_ids(self, space_id: str) -> list[str]:
+        """全部事实的 ID，顺序同 get_facts（不构造 Fact）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM facts WHERE space_id = ? ORDER BY recorded_at, id", (space_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def fact_links(self, space_id: str) -> dict[str, tuple[bool, str | None]]:
+        """事实 ID →（是否当前有效，被谁取代），顺序同 get_facts（不构造 Fact）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, invalidated_at IS NULL, superseded_by FROM facts WHERE space_id = ?"
+                " ORDER BY recorded_at, id",
+                (space_id,),
+            ).fetchall()
+        return {r[0]: (bool(r[1]), r[2]) for r in rows}
+
+    def memory_kind(self, memory_id: str) -> tuple[str, MemoryKind] | None:
+        """SDK 按 ID 找的记忆：（所在的记忆空间，种类）——事实、对话片段（"轮"）或图片，就是
+        search 结果里的三种 ID；都不是时 None。三张表的 id 都是主键，ID 由空间派生、全局唯一。
+        以前只查事实：search 给出的对话片段与图片的 ID，get、delete 都当成不存在。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT space_id, 'fact', 0 FROM facts WHERE id = ?"
+                " UNION ALL"
+                " SELECT space_id, 'excerpt', 1 FROM units WHERE id = ? AND kind = 'round'"
+                " UNION ALL"
+                " SELECT space_id, 'image', 2 FROM media WHERE id = ?"
+                " ORDER BY 3 LIMIT 1",
+                (memory_id, memory_id, memory_id),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
+
     def get_entities(self, space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
         sql = f"SELECT {_ENTITY_COLUMNS} FROM entities WHERE space_id = ?"
         args: list[Any] = [space_id]
@@ -657,6 +1011,23 @@ class MemoryDB:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_entity(r) for r in fetched]
 
+    def entity_ids(self, space_id: str) -> list[str]:
+        """全部实体的 ID，顺序同 get_entities。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM entities WHERE space_id = ? ORDER BY first_seen, id", (space_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def entity_names(self, space_id: str) -> list[tuple[str, list[str]]]:
+        """各实体的名字与别名（顺序同 get_entities）：只要名字时不用逐行构造 Entity。"""
+        with self._lock:
+            fetched = self._conn.execute(
+                "SELECT name, aliases FROM entities WHERE space_id = ? ORDER BY first_seen, id",
+                (space_id,),
+            ).fetchall()
+        return [(r[0], json.loads(r[1])) for r in fetched]
+
     def get_episodes(self, space_id: str) -> list[Episode]:
         with self._lock:
             fetched = self._conn.execute(
@@ -669,8 +1040,8 @@ class MemoryDB:
                 id=r[0],
                 space_id=r[1],
                 session_id=r[2],
-                start_ts=datetime.fromisoformat(r[3]),
-                end_ts=datetime.fromisoformat(r[4]),
+                start_ts=_dt(r[3]),
+                end_ts=_dt(r[4]),
                 summary=r[5],
                 turn_ids=json.loads(r[6]),
             )
@@ -702,13 +1073,23 @@ class MemoryDB:
             space_id=row[0],
             text=row[1],
             fact_ids=json.loads(row[2]),
-            updated_at=datetime.fromisoformat(row[3]),
+            updated_at=_dt(row[3]),
         )
+
+    def derived_unit_ids(self, space_id: str) -> list[str]:
+        """这个空间里除"轮"以外的检索单元（派生记忆）的 ID：清空之前先删它们的向量（见
+        Consolidator.rebuild）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM units WHERE space_id = ? AND kind != 'round'", (space_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def clear_derived(self, space_id: str) -> list[str]:
         """清空某个空间的全部派生数据（事实、实体、片段、核心记忆、任务，以及除"轮"以外的
         检索单元），返回被删除的检索单元 ID，供调用方同步删除向量。"""
         with self.transaction() as conn:
+            self._bump([space_id])
             ids = [
                 r[0]
                 for r in conn.execute(
@@ -736,23 +1117,57 @@ class MemoryDB:
         新登记时，同一会话还没执行（或失败待重试）的旧任务标记为 superseded：会话又追加了
         发言，旧任务对应的是过时的内容，执行它只会把同一个会话多抽取一遍。
         """
+        return self.enqueue_jobs(space_id, [(job_id, session_id, version, content_hash)]) > 0
+
+    def enqueue_jobs(self, space_id: str, rows: Sequence[tuple[str, str, str, str]]) -> int:
+        """按顺序登记一批任务（任务 ID，会话，流水线版本，内容指纹），每个与 enqueue_job 相同，
+        在一个事务里、不为每个任务另开保存点。返回新登记的个数。
+
+        任务多时（显式的巩固为全部会话登记）先读出这个空间已有的任务 ID，已有的不再插入：
+        INSERT OR IGNORE 本来也什么都不做，结果相同，2 万个会话时省下约 30 毫秒。"""
         now = datetime.now().isoformat()
+        added = 0
         with self.transaction() as conn:
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO jobs"
-                " (id, space_id, session_id, version, content_hash, status, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (job_id, space_id, session_id, version, content_hash, now, now),
-            )
-            added = cursor.rowcount > 0
-            if added:
-                conn.execute(
-                    "UPDATE jobs SET status = 'superseded', updated_at = ?"
-                    " WHERE space_id = ? AND session_id = ? AND id != ?"
-                    " AND status IN ('pending', 'failed')",
-                    (now, space_id, session_id, job_id),
+            known: set[str] = set()
+            if len(rows) > 100:
+                known = {
+                    r[0]
+                    for r in conn.execute("SELECT id FROM jobs WHERE space_id = ?", (space_id,))
+                }
+            for job_id, session_id, version, content_hash in rows:
+                if job_id in known:
+                    continue
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO jobs (id, space_id, session_id, version, content_hash,"
+                    " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (job_id, space_id, session_id, version, content_hash, now, now),
                 )
-            return added
+                if cursor.rowcount > 0:
+                    added += 1
+                    conn.execute(
+                        "UPDATE jobs SET status = 'superseded', updated_at = ?"
+                        " WHERE space_id = ? AND session_id = ? AND id != ?"
+                        " AND status IN ('pending', 'failed')",
+                        (now, space_id, session_id, job_id),
+                    )
+        return added
+
+    def has_jobs(self, space_id: str) -> bool:
+        """这个空间有没有巩固任务（任何状态）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE space_id = ? LIMIT 1", (space_id,)
+            ).fetchone()
+        return row is not None
+
+    def has_jobs_of_other_version(self, space_id: str, version: str) -> bool:
+        """这个空间有没有按别的流水线版本登记的任务（派生记忆过期，见 Consolidator.stale）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE space_id = ? AND version != ? LIMIT 1",
+                (space_id, version),
+            ).fetchone()
+        return row is not None
 
     def get_jobs(self, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
         sql = (
@@ -796,13 +1211,86 @@ class MemoryDB:
             )
             return max(cursor.rowcount, 0)
 
+    def reset_jobs(self, job_ids: Sequence[str]) -> int:
+        """把这些失败的任务改回待处理（后台按退避时间重试）。期间被新任务取代的不动。"""
+        if not job_ids:
+            return 0
+        marks = ",".join("?" * len(job_ids))
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE jobs SET status = 'pending' WHERE id IN ({marks}) AND status = 'failed'",
+                list(job_ids),
+            )
+            return max(cursor.rowcount, 0)
+
+    def restore_jobs(self, jobs: Sequence[Mapping[str, Any]]) -> int:
+        """把清空之前的任务状态写回同一任务键、刚登记的待处理任务（会话内容没变）：状态、
+        失败次数、报错、统计与更新时间。返回写回的个数。"""
+        rows = [
+            (
+                j["status"],
+                j["attempts"],
+                j["error"],
+                json.dumps(j["stats"], ensure_ascii=False),
+                j["updated_at"],
+                j["id"],
+            )
+            for j in jobs
+        ]
+        restored = 0
+        with self.transaction() as conn:
+            for row in rows:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = ?, attempts = ?, error = ?, stats = ?,"
+                    " updated_at = ? WHERE id = ? AND status = 'pending'",
+                    row,
+                )
+                restored += max(cursor.rowcount, 0)
+        return restored
+
+    def regrown_sessions(self, space_id: str, version: str) -> set[str]:
+        """巩固过之后又长了的会话：有待处理的任务，同一版本又有内容指纹不同的已完成任务。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT p.session_id FROM jobs p JOIN jobs d"
+                " ON d.space_id = p.space_id AND d.session_id = p.session_id"
+                " AND d.version = p.version"
+                " WHERE p.space_id = ? AND p.version = ? AND p.status = 'pending'"
+                " AND d.status = 'done' AND d.content_hash != p.content_hash",
+                (space_id, version),
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def spaces_with_work(self, version: str, max_attempts: int) -> list[str]:
+        """有待处理的任务、或失败次数还没到上限的任务的空间（后台线程启动时接着做）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT space_id FROM jobs WHERE version = ?"
+                " AND (status = 'pending' OR (status = 'failed' AND attempts < ?))"
+                " ORDER BY space_id",
+                (version, max_attempts),
+            ).fetchall()
+        return [r[0] for r in rows]
+
     # ---------- 空间级操作 ----------
 
     def delete_space(self, space_id: str) -> None:
+        """删掉这个空间的全部记录，连同元信息里写着它的 ID 的：各会话的 next_idx 与巩固配置的
+        指纹（consolidation:<空间>，见 Consolidator.stale；没有指纹的空间不算过期）。以前这两种
+        都留着，delete_all 之后用户 ID（常常是邮箱）与每次 add 的时间还在库里。进行中会话的标记
+        由 MemorySystem.delete_space 清理（本进程里还在进行中的要留着）。"""
         with self.transaction() as conn:
-            for table in ("units", "turns", "sessions", "media", "provenance", *DERIVED_TABLES):
+            self._bump([space_id])
+            self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
+            raw = ("units", "turns", "sessions", "media", "provenance", "turn_meta")
+            for table in (*raw, *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))
+            self._drop_idle_idx(conn, space_id)
+            conn.execute("DELETE FROM meta WHERE key = ?", (f"consolidation:{space_id}",))
+            # 写入计数也不再记着这个空间的会话：删除次数（_turn_epochs）在上面加过，版本不会重复
+            for key in [k for k in self._turn_writes if k[0] == space_id]:
+                del self._turn_writes[key]
 
     def list_spaces(self) -> list[dict[str, Any]]:
         sql = (
@@ -831,16 +1319,37 @@ class MemoryDB:
             for r in fetched
         ]
 
-    def vacuum(self) -> None:
-        """整理数据库文件（遗忘之后调用，进一步确保被删内容不留在文件里）。"""
+    def scrub(self) -> None:
+        """遗忘之后调用：提交，把 WAL 写回数据库文件并截断，被删内容不留在 WAL 里。
+
+        删除时已经覆写（secure_delete，溢出页也一样），写回之后文件里就没有被删的内容了，
+        不用 VACUUM。VACUUM 要重写整个文件，库大时一次要几秒，期间这个库的读写全部停下；
+        代价是文件不会因为遗忘变小。别的进程正在读这个库时可能截断不了：记一条警告。"""
         with self._lock:
             self._conn.commit()
-            self._conn.execute("VACUUM")
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            busy = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            logger.warning("记忆库的 WAL 没能截断（别的进程正在使用），被删的内容暂时还在 WAL 里")
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+
+def _keys_under(conn: sqlite3.Connection, prefix: str) -> list[str]:
+    """元信息里以 prefix 开头的键（见 MemoryDB.meta_keys）。"""
+    upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    rows = conn.execute(
+        "SELECT key FROM meta WHERE key >= ? AND key < ? ORDER BY key", (prefix, upper)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _has_session(conn: sqlite3.Connection, space_id: str, session_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sessions WHERE space_id = ? AND id = ?", (space_id, session_id)
+    ).fetchone()
+    return row is not None
 
 
 # ---------- 行 ↔ 模型 ----------
@@ -867,6 +1376,22 @@ def _insert_units(conn: sqlite3.Connection, units: Sequence[MemoryUnit], *, repl
     return max(cursor.rowcount, 0)
 
 
+def stored_fact(fact: Fact) -> Fact:
+    """这条事实写进库之后再读出来的样子（与 get_facts 读到的逐字段相同）。"""
+    return _row_to_fact(_fact_row(fact))
+
+
+def stored_entity(entity: Entity) -> Entity:
+    """这个实体写进库之后再读出来的样子（与 get_entities 读到的逐字段相同）。"""
+    return _row_to_entity(_entity_row(entity))
+
+
+def _dt(value: str) -> datetime:
+    """读出的时间一律是本机时间、不带时区。写入时已经换算（见 core/models.py），这里照顾之前
+    用带时区的时间写进去的行（'...+00:00'）：否则与新写入的行混在一起无法比较。"""
+    return naive_local(datetime.fromisoformat(value))
+
+
 def _row_to_turn(r: Sequence[Any]) -> Turn:
     return Turn(
         id=r[0],
@@ -875,7 +1400,7 @@ def _row_to_turn(r: Sequence[Any]) -> Turn:
         idx=r[3],
         role=r[4],
         text=r[5],
-        ts=datetime.fromisoformat(r[6]),
+        ts=_dt(r[6]),
         media_ids=json.loads(r[7]),
         speaker=r[8],
     )
@@ -888,7 +1413,7 @@ def _row_to_unit(row: Sequence[Any]) -> MemoryUnit:
         kind=row[2],
         session_id=row[3],
         text=row[4],
-        ts=datetime.fromisoformat(row[5]),
+        ts=_dt(row[5]),
         source_turn_ids=json.loads(row[6]),
         meta=json.loads(row[7]),
     )
@@ -933,8 +1458,8 @@ def _row_to_fact(r: Sequence[Any]) -> Fact:
         negated=bool(r[9]),
         valid_from=r[10],
         valid_to=r[11],
-        recorded_at=datetime.fromisoformat(r[12]),
-        invalidated_at=datetime.fromisoformat(r[13]) if r[13] else None,
+        recorded_at=_dt(r[12]),
+        invalidated_at=_dt(r[13]) if r[13] else None,
         superseded_by=r[14],
         supersede_reason=r[15],
         importance=r[16],
@@ -966,8 +1491,8 @@ def _row_to_entity(r: Sequence[Any]) -> Entity:
         type=r[3],
         aliases=json.loads(r[4]),
         description=r[5],
-        first_seen=datetime.fromisoformat(r[6]),
-        last_seen=datetime.fromisoformat(r[7]),
+        first_seen=_dt(r[6]),
+        last_seen=_dt(r[7]),
         mentions=r[8],
     )
 
@@ -983,7 +1508,7 @@ def _row_to_media(r: Sequence[Any]) -> MediaItem:
         tags=json.loads(r[6]),
         entity_ids=json.loads(r[7]),
         source_turn_id=r[8],
-        ts=datetime.fromisoformat(r[9]),
+        ts=_dt(r[9]),
         caption_iso=r[10],
         width=r[11],
         height=r[12],

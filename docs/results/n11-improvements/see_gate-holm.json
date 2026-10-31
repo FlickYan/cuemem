@@ -1,0 +1,30 @@
+{
+ "source": "see_gate.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "测试集事后分析": {
+   "description": "各数据集上 v3 对 v2",
+   "m": 2,
+   "tests": {
+    "memlens_32k v3 vs v2": {
+     "wins": 9,
+     "losses": 11,
+     "p": 0.8238,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_128k v3 vs v2": {
+     "wins": 9,
+     "losses": 7,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": []
+}

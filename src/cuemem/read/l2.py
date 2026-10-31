@@ -196,8 +196,13 @@ class L2Retriever:
         *,
         cache_scope: str | None = None,
         exclude: Collection[str] = (),
+        probe: L1Candidates | None = None,
     ) -> L2Result:
-        """exclude：不参与检索的轮与图片（已经在 Agent 上下文里的工作记忆，见 read/l1.py）。"""
+        """exclude：不参与检索的轮与图片（已经在 Agent 上下文里的工作记忆，见 read/l1.py）。
+
+        probe：控制器的探针对原问题检索过的候选。原问题的查询向量与探针的逐位相同时，第一遍
+        召回直接用探针的各路结果、按计划的时间区间重新打分，不再检索一遍（见 L1Retriever 的
+        candidates）；向量化的请求不变，几个查询照旧一次向量化。"""
         timings: dict[str, float] = {}
         started = time.perf_counter()
         plan = (
@@ -210,7 +215,14 @@ class L2Retriever:
 
         with span("retrieve", route="l2", queries=len(plan.queries)) as record:
             pool = self._recall(
-                space_id, plan, plan.queries, question_time, cfg, debug, exclude=exclude
+                space_id,
+                plan,
+                plan.queries,
+                question_time,
+                cfg,
+                debug,
+                exclude=exclude,
+                probe=probe,
             )
             timings["recall"] = _since(started) - timings["plan"]
             ranked = pool.ranked
@@ -281,8 +293,11 @@ class L2Retriever:
         debug: dict[str, Any] | None,
         *,
         exclude: Collection[str] = (),
+        probe: L1Candidates | None = None,
     ) -> L1Candidates:
-        """对每个查询做一遍 L1 打分，按查询融合，再（第一轮时）加上图扩散这一路。"""
+        """对每个查询做一遍 L1 打分，按查询融合，再（第一轮时）加上图扩散这一路。
+
+        probe：探针的候选，召回的输入与某个查询相同时用它的各路结果（见 search）。"""
         vectors = self.embedder.embed(list(queries), "query").dense
         per_query = [
             self.l1.candidates(
@@ -293,6 +308,7 @@ class L2Retriever:
                 query=replace(plan.query, text=text),
                 dense_vec=vectors[i],
                 exclude=exclude,
+                reuse=probe,
             )
             for i, text in enumerate(queries)
         ]

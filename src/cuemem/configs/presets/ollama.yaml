@@ -1,0 +1,53 @@
+# Ollama 预设（N12，D-060）：全部跑在本机，不需要任何 Key，也不花钱。
+# 先装好 Ollama（https://ollama.com），再拉两个模型（与 Mem0 文档里的本地示例相同）：
+#   ollama pull llama3.1:8b
+#   ollama pull nomic-embed-text
+# 用法：CUEMEM_PRESET=ollama（或 cuemem --preset ollama …、Memory(preset="ollama")）。
+#
+# 8B 的本地模型抽取与回答都明显弱于云端模型，适合试用、开发与离线环境；评测数字不能拿来比较。
+# llama3.1 不能看图：图片照样保存，但不生成描述、回答时也不附原图。要用图片，把 vlm、reader、
+# captioner、agent 换成能看图的本地模型（如 qwen2.5vl:7b），再把 consolidation.caption_images 打开。
+
+providers:
+  ollama:
+    base_url: http://localhost:11434/v1
+    api_key_env: null       # 不需要 Key
+    max_concurrency: 2      # 本机一次只跑得动一两个请求
+    timeout_s: 600
+    max_retries: 1
+
+models:
+  llama3.1-8b:
+    provider: ollama
+    model_id: llama3.1:8b
+    context_window: 131072
+    price: {input: 0, output: 0}
+
+roles:
+  extractor: {model: llama3.1-8b}
+  planner: {model: llama3.1-8b}
+  reader: {model: llama3.1-8b}
+  vlm: {model: llama3.1-8b}
+  captioner: {model: llama3.1-8b}
+  judge: {model: llama3.1-8b}
+  agent: {model: llama3.1-8b, max_tokens: 1200}
+
+embedding:
+  backend: openai           # Ollama 提供 OpenAI 兼容的 /v1/embeddings
+  provider: ollama
+  model: nomic-embed-text
+  dim: 768
+  batch_size: 32
+  max_concurrency: 2
+  price_per_m: 0
+
+multimodal_embedding:
+  backend: none
+
+rerank:
+  provider: null
+
+consolidation:
+  workers: 2                # 同一空间并行抽取的会话数，受本机算力限制
+  fallback_model: null
+  caption_images: false

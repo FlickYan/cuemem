@@ -1,13 +1,21 @@
 """向量索引（Qdrant 本地模式）：每个记忆空间一个集合，同时存 dense 与 sparse 向量。
 
-本地模式不需要启动服务，适合笔记本；接口不变即可切换到 Qdrant 服务端（D-005）。
+本地模式不需要启动服务，适合笔记本；接口不变即可切换到 Qdrant 服务端（D-005）。本地模式每个集合
+一直开着一个 SQLite 文件（有图片的空间另有一个图片集合），启动时全部打开、全部向量读进内存：用户
+多的服务改用服务端（打不开时的说明见 _open_failed）。
 """
 
 from __future__ import annotations
 
+import errno
+import gc
+import json
 import re
+import sqlite3
 import threading
-from collections.abc import Sequence
+import traceback
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,9 +23,10 @@ from typing import Any
 import numpy as np
 from qdrant_client import QdrantClient, models
 
+from cuemem.config import cli_command
 from cuemem.core.ids import point_uuid, stable_id
 from cuemem.embed.base import FloatArray, SparseVector
-from cuemem.errors import StorageLockedError
+from cuemem.errors import StorageLockedError, VectorStoreOpenError
 
 DENSE = "dense"
 SPARSE = "sparse"
@@ -33,12 +42,26 @@ class VectorHit:
 
 
 class VectorStore:
-    def __init__(self, path: Path | None, dim: int, *, url: str | None = None) -> None:
-        """url 非空时连接 Qdrant 服务端；否则用本地模式（path 为空则只放在内存里）。"""
+    def __init__(
+        self, path: Path | None, dim: int, *, url: str | None = None, api_key: str | None = None
+    ) -> None:
+        """url 非空时连接 Qdrant 服务端；否则用本地模式（path 为空则只放在内存里）。
+
+        api_key：服务端的 API Key（放在 api-key 请求头里，本地模式不用）。url 要写明 http:// 或
+        https://：不写时 qdrant-client 在有 Key 时改用 https。经 http:// 发 Key 时 qdrant-client
+        每个客户端警告一次 "Api key is used with an insecure connection."（本机与 docker compose
+        的内部网络上无妨）。
+
+        owned_units：空间 → 数据库里这个空间的几个记忆单元 ID（MemorySystem 设为
+        MemoryDB.some_unit_ids），用来确认旧名字的集合是不是这个空间的（见 collection_name）；
+        没设时（单独用的向量库，没有数据库可以核对）旧名字的集合照旧用。"""
         self.dim = dim
         self.remote = url is not None
+        self.owned_units: Callable[[str], Sequence[str]] | None = None
+        self._names: dict[str, str] = {}  # 空间 → 集合名（解析一次）
+        self._path = path if url is None else None  # 本地模式的目录（出错时的说明用）
         if url is not None:
-            self._client = QdrantClient(url=url)
+            self._client = QdrantClient(url=url, api_key=api_key)
         elif path is None:
             self._client = QdrantClient(location=":memory:")
         else:
@@ -54,26 +77,61 @@ class VectorStore:
                     "先停掉那个进程（比如正在运行的 cuemem serve），或者改用 Qdrant 服务端："
                     "设置 CUEMEM_VECTOR_STORE__URL，见 docs/design.md 的部署一节"
                 ) from exc
+            except (sqlite3.OperationalError, OSError) as exc:
+                # 以前原样抛出 sqlite3.OperationalError（不是 CueMemError）：cuemem serve、proxy
+                # 与 migrate-vectors 都打印调用栈退出，看不出是打开的文件太多
+                raise _open_failed(path, exc) from exc
         # 统一加锁：本地模式不是线程安全的；服务端模式下同步客户端被多个线程同时使用也会出错
         # （N11 压测里出现 "Bad file descriptor"）
         self._lock = threading.RLock()
 
+    def collection_name(self, space_id: str) -> str:
+        """这个空间的集合名：前 40 个字符（不是字母数字的换成 "_"）加上空间 ID 的 128 位摘要。
+
+        以前的名字（legacy_name）只带 32 位摘要：前 40 个字符相同、8 位十六进制又撞上的两个空间
+        落进同一个集合，检索不按空间过滤、delete_space 删掉整个集合。限定作用域的令牌可以随便起
+        agent_id，离线算约 2^32 次哈希就能撞上别人（例如 "shop/<用户的 UUID>"）的集合：删掉它，
+        或者往它的检索结果里塞东西。
+
+        升级之前建的旧名字集合（包括评测的构建）照旧用，但只给能证明是自己的空间：数据库里这个
+        空间的记忆单元在这个集合里（只读，不往库里写东西）。别的空间——包括为了撞上它而起的——
+        用新名字。新名字的集合已经有了时总用它。"""
+        with self._lock:
+            name = self._names.get(space_id)
+            if name is None:
+                name = self._names[space_id] = self._resolve(space_id)
+            return name
+
     @staticmethod
-    def collection_name(space_id: str) -> str:
-        safe = re.sub(r"[^A-Za-z0-9_-]", "_", space_id)[:40]
-        return f"space_{safe}_{stable_id(space_id, length=8)}"
+    def legacy_name(space_id: str) -> str:
+        """第二轮复审之前的集合名（32 位摘要），见 collection_name。"""
+        return f"space_{_safe(space_id)}_{stable_id(space_id, length=8)}"
+
+    def _resolve(self, space_id: str) -> str:
+        name = f"space_{_safe(space_id)}_{stable_id(space_id, length=32)}"
+        legacy = self.legacy_name(space_id)
+        if self._client.collection_exists(name) or not self._client.collection_exists(legacy):
+            return name
+        if self.owned_units is None:
+            return legacy
+        ids = [point_uuid(u) for u in self.owned_units(space_id)]
+        mine = ids and self._client.retrieve(legacy, ids=ids, with_payload=False)
+        return legacy if mine else name
 
     def ensure_space(self, space_id: str) -> None:
         name = self.collection_name(space_id)
         with self._lock:
             if not self._client.collection_exists(name):
-                self._client.create_collection(
-                    name,
-                    vectors_config={
-                        DENSE: models.VectorParams(size=self.dim, distance=models.Distance.COSINE)
-                    },
-                    sparse_vectors_config={SPARSE: models.SparseVectorParams()},
-                )
+                with self._creating():
+                    self._client.create_collection(
+                        name,
+                        vectors_config={
+                            DENSE: models.VectorParams(
+                                size=self.dim, distance=models.Distance.COSINE
+                            )
+                        },
+                        sparse_vectors_config={SPARSE: models.SparseVectorParams()},
+                    )
                 if self.remote:  # 服务端按 payload 建索引，过滤检索不必扫全集合（本地模式不支持）
                     for field, schema in PAYLOAD_INDEXES.items():
                         self._client.create_payload_index(name, field, field_schema=schema)
@@ -192,14 +250,15 @@ class VectorStore:
         ]
         with self._lock:
             if not self._client.collection_exists(name):
-                self._client.create_collection(
-                    name,
-                    vectors_config={
-                        DENSE: models.VectorParams(
-                            size=int(vectors.shape[1]), distance=models.Distance.COSINE
-                        )
-                    },
-                )
+                with self._creating():
+                    self._client.create_collection(
+                        name,
+                        vectors_config={
+                            DENSE: models.VectorParams(
+                                size=int(vectors.shape[1]), distance=models.Distance.COSINE
+                            )
+                        },
+                    )
             self._client.upsert(name, points=points)
 
     def search_images(self, space_id: str, vector: FloatArray, k: int) -> list[VectorHit]:
@@ -231,6 +290,19 @@ class VectorStore:
 
     def _image_collection(self, space_id: str) -> str:
         return f"{self.collection_name(space_id)}{IMAGE_SUFFIX}"
+
+    @contextmanager
+    def _creating(self) -> Iterator[None]:
+        """建集合（调用方持有 self._lock）。本地模式下建不了时（多半是打开的文件用光了：每个集合
+        一个文件）抛出写明原因的 VectorStoreOpenError，写入、后台线程的出错与 HTTP 接口都看得到；
+        以前是 sqlite3.OperationalError: unable to open database file。"""
+        try:
+            yield
+        except (sqlite3.OperationalError, OSError) as exc:
+            if self._path is None:
+                raise
+            collections = len(self._client.get_collections().collections)  # 在内存里，不用文件
+            raise _open_failed(self._path, exc, collections) from exc
 
     def dense_vectors(self, space_id: str, unit_ids: Sequence[str]) -> dict[str, FloatArray]:
         """按记忆单元 ID 取回已存的 dense 向量（L2 的实体图用来给语义相近的事实连边）。"""
@@ -318,10 +390,13 @@ class VectorStore:
         return counts
 
     def delete_space(self, space_id: str) -> None:
+        """删掉这个空间的两个集合（文字与图片）。要在数据库删掉这个空间的记忆单元之前调用：旧名字
+        的集合靠它们确认是这个空间的（见 collection_name）。"""
         with self._lock:
             for name in (self.collection_name(space_id), self._image_collection(space_id)):
                 if self._client.collection_exists(name):
                     self._client.delete_collection(name)
+            self._names.pop(space_id, None)
 
     def close(self) -> None:
         with self._lock:
@@ -352,6 +427,49 @@ class VectorStore:
             for point in response.points
             if point.payload
         ]
+
+
+def _safe(space_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", space_id)[:40]
+
+
+def _open_failed(
+    path: Path, exc: Exception, collections: int | None = None
+) -> VectorStoreOpenError:
+    """本地模式的向量库打不开或建不了集合时的出错，写明原因与办法。collections：集合数（没给时
+    读 meta.json，不打开向量库）。
+
+    先放掉打开到一半的集合：它们各占着一个文件，引用它们的只有这个异常的调用栈，不放掉的话进程
+    （例如接住了出错的 SDK 应用）的文件一直用光着，这里也读不了 meta.json。集合数超过打开文件数
+    软上限的一半（cuemem doctor 标黄的条件），或者出错本身就是文件用光了，算作文件太多。"""
+    traceback.clear_frames(exc.__traceback__)
+    gc.collect()
+    if collections is None:
+        with suppress(OSError, ValueError, KeyError, TypeError):
+            collections = len(json.loads((path / "meta.json").read_text("utf-8"))["collections"])
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        unlimited = resource.RLIM_INFINITY
+    except ImportError:  # Windows
+        soft = hard = unlimited = -1
+    exhausted = isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE)
+    crowded = collections is not None and soft != unlimited and collections > soft / 2
+    if not (exhausted or crowded):
+        return VectorStoreOpenError(
+            f"本地模式的向量库 {path} 打不开（{exc}）：检查这个目录的权限与磁盘空间"
+        )
+    count = f"这里有 {collections} 个集合，" if collections is not None else ""
+    limit = "不限" if soft == unlimited else str(soft)
+    cap = "不限" if hard == unlimited else str(hard)
+    migrate = cli_command("migrate-vectors --to URL")
+    return VectorStoreOpenError(
+        f"本地模式的向量库 {path} 打不开（{exc}）：本地模式每个集合（每个记忆空间一个，有图片的"
+        f"空间两个）一直开着一个文件，{count}打开文件数的上限是 {limit}（硬上限 {cap}）。先调高"
+        f" ulimit -n（不够时连硬上限一起调）让它打得开，再用 {migrate} 把向量复制到 Qdrant"
+        " 服务端，并设置 CUEMEM_VECTOR_STORE__URL（见 docs/design.md 的部署一节）"
+    )
 
 
 def _build_filter(

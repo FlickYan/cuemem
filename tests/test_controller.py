@@ -4,23 +4,24 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
 from fakes import TOY_CONVERSATION, FakeAPI
 from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
 
-from cuemem.api.service import english_reason
 from cuemem.config import Settings
-from cuemem.core.models import Conversation
+from cuemem.core.models import Conversation, Entity
 from cuemem.evals import routing as R
 from cuemem.memory import MemorySystem
-from cuemem.read.controller import ControllerModel, LearnedController, LLMRouter
-from cuemem.read.probe import query_features
+from cuemem.read.controller import ControllerModel, LearnedController, LLMRouter, english_reason
+from cuemem.read.probe import Probe, query_features
+from cuemem.store import MemoryDB
 
 ASKED = datetime(2025, 10, 10, 20, 0)
 
@@ -98,6 +99,83 @@ def system_l1_config() -> Any:
     from cuemem.read.l1 import L1Config
 
     return L1Config()
+
+
+def entity_hits_by_regex(entities: list[Entity], question: str) -> int:
+    """改动前的实现（每个名字跑一次正则），用来核对计数。"""
+    lowered = question.lower()
+    count = 0
+    for entity in entities:
+        for name in [entity.name, *entity.aliases]:
+            name = name.strip().lower()
+            if len(name) < 3 or name in ("user", "the user", "用户"):
+                continue
+            if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", lowered):
+                count += 1
+                break
+    return count
+
+
+def test_probe_entity_hits_prefilter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """问题里点名了几个实体：先按子串筛、再按词边界匹配，计数与逐个名字跑正则完全一样。名字与
+    别名多过 re 的缓存（512 个）时，以前每次读取都把每个名字的正则重新编译一遍。"""
+    when = datetime(2025, 1, 1)
+    special = {
+        "C++ Club": [],
+        "Dr. Who": ["the doctor"],
+        "Max": ["Maxie"],
+        "Maximum Fitness": ["the gym"],
+        "Al": ["Big Al"],
+        "the user": ["User"],
+        "  Ana  ": [],
+        "(ok)": [],
+        "林晓明": ["小林子"],
+        "a.b": [],
+    }
+    entities = [
+        Entity(
+            id=f"e{i:04d}",
+            space_id="s",
+            name=name,
+            type="other",
+            aliases=aliases,
+            first_seen=when,
+            last_seen=when,
+        )
+        for i, (name, aliases) in enumerate(
+            [
+                *special.items(),
+                *((f"Person {i:03d}", [f"P{i}x", f"nick{i}"]) for i in range(700)),
+            ]
+        )
+    ]
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    db.apply_consolidation(facts=[], entities=entities, episodes=[], units=[])
+    probe = Probe(db, cast(Any, None))
+    questions = [
+        "Did I tell Dr. Who about the c++ club?",
+        "How is max doing at Maximum Fitness?",
+        "maximum effort, maxime",  # 只作为子串出现
+        "Ask person 007, Person 0071 and NICK12!",
+        "What did the user say to big al and Ana?",
+        "问问 林晓明 和小林子吧",  # 汉字也是 \w：嵌在句子里的"小林子"不算点名
+        "a.b and axb; (ok)",
+        "nothing here",
+    ]
+    expected = [entity_hits_by_regex(entities, q) for q in questions]
+    assert expected == [2, 2, 0, 2, 2, 1, 2, 0]
+
+    searches: list[str] = []
+    search = re.search
+
+    def counting(pattern: str, text: str, *args: Any) -> Any:
+        searches.append(pattern)
+        return search(pattern, text, *args)
+
+    monkeypatch.setattr(re, "search", counting)
+    monkeypatch.setattr(db, "get_entities", lambda *a, **k: pytest.fail("构造了全部 Entity"))
+    assert [probe._entity_hits("s", q) for q in questions] == expected
+    assert len(searches) <= 20  # 只有在问题里出现过的名字才跑正则（以前每个问题 2,000 多次）
 
 
 # ---------- 两段式控制器 ----------
@@ -381,12 +459,44 @@ def test_ask_auto_with_learned_and_hybrid_controllers(
     }
 
 
-def test_controller_model_file_matches_its_schema() -> None:
-    """仓库里导出的控制器（scripts/n7_controller.py）能被运行时读进来，且维度一致。"""
-    model = ControllerModel.load(
-        Path(__file__).parents[1] / "src/cuemem/read/controller_model.json"
-    )
+CONTROLLER_FILES = ("controller_model.json", "controller_model_v1.json", "controller_model_v2.json")
+
+
+@pytest.mark.parametrize("name", CONTROLLER_FILES)
+def test_controller_model_file_matches_its_schema(name: str) -> None:
+    """仓库里导出的控制器（默认的 v3 与冻结评测用的 v1、v2）能被运行时读进来，且维度一致。
+    （文件内容的哈希钉在 tests/test_frozen_config.py。）"""
+    model = ControllerModel.load(Path(__file__).parents[1] / "src/cuemem/read" / name)
     assert model.coef.shape == (len(model.memory_types), len(model.features))
     assert model.gate_coef is not None and model.types[-1] == "none"
+    assert model.gate_coef.shape == (len(model.features),)
     assert set(model.accuracy) == set(model.types)
     assert model.lam > 0
+
+
+def test_controller_drift_ignores_the_date_and_float_noise() -> None:
+    """训练脚本的 --check（复现脚本用）：重新训练的控制器与冻结的文件比，导出日期与浮点噪声
+    不算变化；系数、特征、门槛或字段变了都报出来。"""
+    path = Path(__file__).parents[1] / "src/cuemem/read/controller_model.json"
+    committed = json.loads(path.read_text(encoding="utf-8"))
+    fresh = json.loads(json.dumps(committed))
+    fresh["created"] = "2099-01-01"
+    fresh["coef"][0][0] += 4e-6
+    fresh["mean"] = tuple(np.asarray(fresh["mean"]) + 1e-7)  # 训练时是数组：过一遍 JSON 再比
+    assert R.controller_drift(fresh, committed) == []
+    fresh["coef"][2][3] += 1e-3
+    fresh["features"] = [*fresh["features"][:-1], "q_new"]
+    fresh["see_gate"]["caption_min"] = 0.62
+    del fresh["image_floor"]
+    fresh["extra"] = 1
+    assert R.controller_drift(fresh, committed) == [
+        "coef[2][3]",
+        "extra",
+        f"features[{len(committed['features']) - 1}]",
+        "image_floor",
+        "see_gate.caption_min",
+    ]
+    assert R.controller_drift({**committed, "types": committed["types"][:-1]}, committed) == [
+        "types"
+    ]
+    assert R.controller_drift({**committed, "lambda": True}, committed) == ["lambda"]

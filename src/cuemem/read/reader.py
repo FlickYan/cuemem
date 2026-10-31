@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from cuemem.core.models import Answer, FactHit, Hit, MediaItem, SessionIn
-from cuemem.core.trace import span
+from cuemem.core.trace import record_event, span
 from cuemem.llm.client import LLMClient, Message
 from cuemem.read.facts import ImageMode, MemoryView, Validity, format_facts
 from cuemem.read.plan import TEMPORAL_TYPES, QueryPlan, range_text
@@ -60,6 +62,23 @@ class NotedReaderOutput(BaseModel):
 
 IN_RANGE_MARK = "★"
 
+# 证据抬头里显示的会话名（会话 ID → 名字）。平时为 None，抬头照常显示会话 ID；只有评测的 label
+# 消融（evals/datasets.py，CUEMEM_EVAL_RAW_SESSION_IDS=label）在回答一道题时换成数据集的原始 ID，
+# 存储、检索与排序都不变。
+_SESSION_LABELS: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "cuemem_session_labels", default=None
+)
+
+
+@contextmanager
+def session_labels(labels: Mapping[str, str] | None) -> Iterator[None]:
+    """在这段代码里（同一线程 / 同一上下文）format_memories 的证据抬头按 labels 显示会话名。"""
+    token = _SESSION_LABELS.set(labels)
+    try:
+        yield
+    finally:
+        _SESSION_LABELS.reset(token)
+
 
 def reading_guide(plan: QueryPlan) -> list[str]:
     """按检索计划给 reader 的阅读提示：先记笔记；计数类逐项列出再数；时间类显式算日期差。"""
@@ -105,6 +124,7 @@ def format_memories(
     轮里的图片（N6）在原位写成 [Image i3: 描述]；附了原图的注明是第几张图。
     """
     ordered = sorted(hits, key=lambda h: (h.unit.ts, h.unit.id))
+    labels = _SESSION_LABELS.get() or {}
     refs: dict[str, str] = {}
     blocks: list[str] = []
     images = media or {}
@@ -115,7 +135,7 @@ def format_memories(
         header = f"[{ref}] {hit.unit.ts:%Y-%m-%d (%a) %H:%M}"
         if question_time is not None:
             header += f" · {relative_days(hit.unit.ts, question_time)}"
-        header += f" · session {hit.unit.session_id}"
+        header += f" · session {labels.get(hit.unit.session_id, hit.unit.session_id)}"
         if highlight is not None and highlight.contains(hit.unit.ts):
             header += f" {IN_RANGE_MARK}"
         text = hit.unit.text
@@ -370,6 +390,9 @@ class Reader:
     ) -> ReaderOutput | NotedReaderOutput:
         """组装请求。纯文本时 user 消息是一个字符串（与 N4 之前的请求逐字相同，缓存照常命中）；
         带图时改用内容块：对话里的图按原位插入，再感知的原图附在证据之后、问题之前。"""
+        if pictures and not self.llm.vision(self.role):  # 回答模型看不了图：只给文字描述
+            record_event("pictures_dropped", role=self.role, pictures=len(pictures))
+            pictures = ()
         head = f"Current date: {question_time:%Y-%m-%d (%a) %H:%M}\n\n"
         tail = f"Question: {question}"
         content: str | list[dict[str, Any]]

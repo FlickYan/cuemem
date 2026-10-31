@@ -26,6 +26,7 @@ from cuemem.embed.base import FloatArray
 from cuemem.errors import ContentFilteredError
 from cuemem.llm.client import LLMClient
 from cuemem.write.extract import ExtractedEntity
+from cuemem.write.predicates import lossy, unicode_key
 
 USER_NAMES = frozenset({"user", "the user", "i", "me", "myself", "用户", "我"})
 ASSISTANT_NAMES = frozenset({"assistant", "the assistant", "ai", "ai assistant", "助手"})
@@ -55,6 +56,10 @@ class EntityMatches(BaseModel):
 
 
 def normalize_name(name: str) -> str:
+    """别名索引与实体 ID 用的名字键。拉丁字母与汉字以外的文字（'Анна'、'민준'）按 unicode_key
+    规范化：原来的规则只留 [0-9a-z] 与汉字，这些名字都成了 ''。"""
+    if lossy(name):
+        return unicode_key(name)
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", name.casefold()).strip()
 
 
@@ -138,8 +143,9 @@ class EntityResolver:
             if normalize_name(name) in USER_NAMES:
                 entity_id, display = user_entity_id(state.space_id), "User"
             else:
-                key = normalize_name(name)
-                entity_id, display = stable_id(state.space_id, "entity", key, "person"), name
+                key = normalize_name(name)  # 只有符号或 emoji 的名字键是 ''：按原样区分
+                entity_id = stable_id(state.space_id, "entity", key or name.strip(), "person")
+                display = name
             if entity_id in state.entities:
                 continue
             entity = Entity(
@@ -154,7 +160,7 @@ class EntityResolver:
                 last_seen=ts,
             )
             state.add(entity, None)
-            if display != "User":
+            if display != "User" and normalize_name(name):  # 空键会让任何空宾语都指向这个人
                 state.alias_index[normalize_name(name)] = entity_id
             report.created += 1
             report.changed[entity_id] = entity
@@ -300,7 +306,7 @@ class EntityResolver:
         report: ResolutionReport,
     ) -> str:
         key = normalize_name(mention.name)
-        entity_id = stable_id(state.space_id, "entity", key, mention.type)
+        entity_id = stable_id(state.space_id, "entity", key or mention.name.strip(), mention.type)
         if entity_id in state.entities:  # 同名同类型：确定性 ID 相同，按同一实体处理
             self._link(state, entity_id, mention, ts, report)
             return entity_id

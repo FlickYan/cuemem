@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import email.utils
+import time
+from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx2
 import pytest
 from fakes import FakeAPI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 
 from cuemem.config import Settings
 from cuemem.errors import CacheMissError, MissingAPIKeyError, StructuredOutputError
-from cuemem.llm import Ledger, LLMClient, ResponseCache, Usage, chat_cost
+from cuemem.llm import ChatResult, Ledger, LLMClient, ResponseCache, ToolCall, Usage, chat_cost
+from cuemem.llm import client as llm_client
+from cuemem.llm.cache import request_key
+from cuemem.llm.client import unparsable_json
 
 HELLO = [{"role": "user", "content": "hi"}]
 
@@ -179,6 +189,174 @@ def test_timeout_falls_back_to_other_provider(settings: Settings, fake_api: Fake
     assert result.value.ok and result.result.model_alias == "deepseek-flash"
 
 
+def test_timeout_falls_back_after_one_timeout(settings: Settings, fake_api: FakeAPI) -> None:
+    """默认配置（max_retries=3）：有备用模型时主模型超时一次就换，约 1 × timeout_s。以前 OpenAI SDK
+    先把超时的请求重发 3 次，约 4 × timeout_s（默认 8 分钟）之后才换，期间占着并发名额。没有备用
+    模型时超时照旧重试（等待照 SDK 的退避）。"""
+    from fakes import TIMEOUT
+    from openai import APITimeoutError
+
+    class Out(BaseModel):
+        ok: bool
+
+    fake_api.chat_replies = [
+        lambda body: TIMEOUT if body["model"] == "qwen3.8-flash" else '{"ok": true}'
+    ]
+    waits: list[float] = []
+    client = LLMClient(settings, http_client=fake_api.client(), sleep=waits.append)
+    messages = [{"role": "user", "content": "hello"}]
+    result = client.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert result.result.model_alias == "deepseek-flash"
+    assert [r["model"] for r in fake_api.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+    assert waits == []
+
+    fake_api.chat_requests.clear()
+    with pytest.raises(APITimeoutError):
+        client.structured("extractor", messages, Out)
+    assert [r["model"] for r in fake_api.chat_requests] == ["qwen3.8-flash"] * 4
+    assert all(0.75 * b <= w <= b for w, b in zip(waits, (0.5, 1.0, 2.0), strict=True))
+
+
+def test_read_only_replays_a_cached_fallback(
+    settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """构建时主模型被拒、备用模型回答：缓存里只有备用模型的回复（被拒的请求不缓存）。只读重放
+    （--cache-only）时主模型未命中就换备用模型，拿到构建时的结果，不发请求，trace 里记下
+    llm_fallback（reason=CacheMissError）。以前在主模型那里就 CacheMissError。"""
+    from fakes import REJECT
+
+    from cuemem.core.trace import start_trace
+
+    class Out(BaseModel):
+        ok: bool
+
+    fake_api.chat_replies = [
+        lambda body: REJECT if body["model"] == "qwen3.8-flash" else '{"ok": true}'
+    ]
+    cache = ResponseCache(tmp_path / "llm.sqlite")
+    messages = [{"role": "user", "content": "hello"}]
+    build = LLMClient(settings, cache=cache, http_client=fake_api.client())
+    built = build.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert built.result.model_alias == "deepseek-flash" and not built.result.from_cache
+    sent = len(fake_api.chat_requests)
+
+    read_only = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    replay = LLMClient(read_only, cache=cache, http_client=fake_api.client())
+    with start_trace("replay") as trace:
+        result = replay.structured("extractor", messages, Out, fallback_model="deepseek-flash")
+    assert result.value.ok and result.result.model_alias == "deepseek-flash"
+    assert result.result.from_cache and len(fake_api.chat_requests) == sent
+    fallbacks = [e for e in trace.events if e["kind"] == "llm_fallback"]
+    assert [(e["model"], e["reason"]) for e in fallbacks] == [("deepseek-flash", "CacheMissError")]
+
+    # 没有备用模型：照旧 CacheMissError
+    with pytest.raises(CacheMissError):
+        replay.structured("extractor", messages, Out)
+    # 备用模型也没有缓存：CacheMissError 写明两个模型，cause 是主模型的未命中
+    with pytest.raises(CacheMissError, match=r"qwen3\.8-flash.*qwen3\.7-plus") as caught:
+        replay.structured("extractor", messages, Out, fallback_model="qwen3.7-plus")
+    assert isinstance(caught.value.__cause__, CacheMissError)
+    assert len(fake_api.chat_requests) == sent
+
+    # 别的模式未命中时照常调用 API（主模型被拒才换），与以前相同
+    build.structured(
+        "extractor", [{"role": "user", "content": "new"}], Out, fallback_model="deepseek-flash"
+    )
+    assert [r["model"] for r in fake_api.chat_requests[sent:]] == [
+        "qwen3.8-flash",
+        "deepseek-flash",
+    ]
+
+
+def test_rate_limits_and_server_errors_are_retried_like_the_sdk(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """OpenAI SDK 自己不再重试（它连超时也重试）：429、5xx、连不上由 LLM 客户端照 SDK 的规则重试，
+    评测与网关在线上的重试行为不变——上游的 retry-after-ms 照等，没有时 0.5 秒起翻倍、随机减掉最多
+    25%；余额不足（402）不重试；重试满 max_retries 次仍然限流时抛出 RateLimitError。"""
+    from fakes import NO_BALANCE, RATE_LIMIT, SERVER_ERROR
+    from openai import APIStatusError, RateLimitError
+
+    waits: list[float] = []
+    client = LLMClient(settings, http_client=fake_api.client(), sleep=waits.append)
+    fake_api.chat_replies = [RATE_LIMIT, SERVER_ERROR, "OK"]
+    assert client.chat("reader", HELLO).content == "OK"
+    assert len(fake_api.chat_requests) == 3
+    assert waits[0] == 0.001 and 0.75 <= waits[1] <= 1.0  # retry-after-ms: 1；第二次重试的退避
+
+    for reply, error, sent in ((NO_BALANCE, APIStatusError, 1), (RATE_LIMIT, RateLimitError, 4)):
+        fake_api.chat_requests.clear()
+        fake_api.chat_replies = [reply]
+        with pytest.raises(error):
+            client.chat("reader", [{"role": "user", "content": reply}])
+        assert len(fake_api.chat_requests) == sent
+
+
+UPSTREAM = httpx2.Request("POST", "https://upstream.invalid/v1/chat/completions")
+
+
+def _status(code: int, **headers: str) -> Callable[[], Exception]:
+    def make() -> Exception:
+        response = httpx2.Response(code, headers=headers, request=UPSTREAM)
+        return APIStatusError("upstream", response=response, body=None)
+
+    return make
+
+
+def _in_30_seconds() -> Exception:
+    """Retry-After 写成 HTTP 日期，约 30 秒之后（运行时才算：收集测试之后可能已过了几分钟）。"""
+    soon = email.utils.formatdate(time.time() + 30, usegmt=True)
+    return _status(429, **{"retry-after": soon})()
+
+
+# （说明，造出异常，retry_timeouts，要等的秒数；None 表示不重试；"about30" 表示约 30 秒）
+RETRY_CASES: list[tuple[str, Callable[[], Exception], bool, float | str | None]] = [
+    ("429 retry-after-ms", _status(429, **{"retry-after-ms": "1500"}), True, 1.5),
+    ("429 retry-after seconds", _status(429, **{"retry-after": "3"}), True, 3.0),
+    ("429 over 120 s", _status(429, **{"retry-after": "121"}), True, None),
+    ("429 overflowing number", _status(429, **{"retry-after": "1e400"}), True, None),
+    ("429 literal inf", _status(429, **{"retry-after": "inf"}), True, 0.5),
+    ("429 zero", _status(429, **{"retry-after": "0"}), True, 0.5),
+    ("429 HTTP date", _in_30_seconds, True, "about30"),
+    ("500", _status(500), True, 0.5),
+    ("503", _status(503), True, 0.5),
+    ("408", _status(408), True, 0.5),
+    ("409", _status(409), True, 0.5),
+    ("400", _status(400), True, None),
+    ("402", _status(402), True, None),
+    ("404", _status(404), True, None),
+    ("400 x-should-retry true", _status(400, **{"x-should-retry": "true"}), True, 0.5),
+    ("500 x-should-retry false", _status(500, **{"x-should-retry": "false"}), True, None),
+    ("connection error", lambda: APIConnectionError(request=UPSTREAM), True, 0.5),
+    ("timeout with a fallback", lambda: APITimeoutError(request=UPSTREAM), False, None),
+    ("timeout without a fallback", lambda: APITimeoutError(request=UPSTREAM), True, 0.5),
+]
+
+
+@pytest.mark.parametrize(
+    ("make", "retry_timeouts", "expected"),
+    [case[1:] for case in RETRY_CASES],
+    ids=[case[0] for case in RETRY_CASES],
+)
+def test_retry_rules_follow_the_sdk(
+    make: Callable[[], Exception],
+    retry_timeouts: bool,
+    expected: float | str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_retry_delay 的每条规则（照 OpenAI SDK，D-069）各一行：Retry-After 超过 2 分钟、
+    x-should-retry、409、字面的 inf、HTTP 日期、0、连不上。以前只有三个脚本化的序列走到这里，
+    这些规则改掉哪一条都没有测试失败。"""
+    monkeypatch.setattr(llm_client.random, "random", lambda: 0.0)  # 不减随机的零头
+    exc = make()
+    assert isinstance(exc, APIError)
+    delay = llm_client._retry_delay(exc, 0, retry_timeouts=retry_timeouts)
+    if expected == "about30":
+        assert delay is not None and 25 < delay <= 30
+    else:
+        assert delay == expected
+
+
 def test_identical_concurrent_requests_are_coalesced(settings: Settings, fake_api: FakeAPI) -> None:
     """两个线程同时发出同样的请求：只调用一次 API，另一个等结果（single-flight）。"""
     import threading
@@ -221,3 +399,205 @@ def test_structured_retries_when_provider_aborts_json(settings: Settings) -> Non
     result = client.structured("extractor", [{"role": "user", "content": "hi"}], Out)
     assert result.value.answer == "ok" and result.attempts == 2
     assert api.chat_requests[1]["messages"][-1]["content"].startswith("Reply with one short")
+
+
+# ---------- 解析不了的 JSON 回复与响应缓存（N12，评测网关） ----------
+
+JSON_MODE = {"type": "json_object"}
+BROKEN = '{"name": "Ana", "city": "Ber'  # 生成失控、被截断的 JSON
+
+
+def test_identical_retry_after_bad_json_bypasses_the_cache(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """外部系统拿到解析不了的 JSON 后把同样的请求再发一次：不读缓存、重新调用，并覆盖缓存里的
+    坏回复；之后同样的请求照常命中缓存（拿到的是新的、能解析的回复）。"""
+    fake_api.chat_replies = [BROKEN, '{"name": "Ana", "city": "Berlin"}']
+    client = make_client(settings, fake_api)
+
+    def ask() -> ChatResult:
+        return client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+
+    assert ask().content == BROKEN
+    retried = ask()  # 外部系统的重试：重新调用
+    assert not retried.from_cache and retried.content == '{"name": "Ana", "city": "Berlin"}'
+    assert len(fake_api.chat_requests) == 2
+    third = ask()
+    assert third.from_cache and third.content == '{"name": "Ana", "city": "Berlin"}'
+    assert len(fake_api.chat_requests) == 2
+
+
+def test_concurrent_identical_retries_count_one_refresh(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """拿到坏 JSON 后两个同样的重试同时到：只有一个重新调用，另一个等它、读缓存里的新回复；
+    llm_cache_refresh（网关的 json_refreshes）只记真的重新调用的那一次。"""
+    import threading
+
+    from cuemem.core.trace import Trace, start_trace
+
+    started, release, waiting = threading.Event(), threading.Event(), threading.Event()
+
+    def slow(body: dict[str, object]) -> str:
+        started.set()
+        release.wait(5)
+        return '{"name": "Ana", "city": "Berlin"}'
+
+    fake_api.chat_replies = [BROKEN, slow]
+    client = make_client(settings, fake_api)
+    claim = client._claim
+
+    def watched_claim(key: str) -> threading.Event | None:
+        event = claim(key)
+        if event is not None:  # 这个线程要等别的线程的同样请求
+            waiting.set()
+        return event
+
+    client._claim = watched_claim  # type: ignore[method-assign]
+    assert client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True).content
+    traces: list[Trace] = []
+    results: list[ChatResult] = []
+
+    def retry() -> None:
+        with start_trace("retry") as trace:
+            traces.append(trace)
+            results.append(
+                client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+            )
+
+    first = threading.Thread(target=retry)
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=retry)
+    second.start()
+    assert waiting.wait(5)
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert len(fake_api.chat_requests) == 2  # 第一次的坏回复 + 一次重新调用
+    assert sorted(r.from_cache for r in results) == [False, True]
+    assert {r.content for r in results} == {'{"name": "Ana", "city": "Berlin"}'}
+    refreshes = [e for t in traces for e in t.events if e["kind"] == "llm_cache_refresh"]
+    assert len(refreshes) == 1
+
+
+def test_bad_json_replay_is_unchanged_without_opt_in(settings: Settings, fake_api: FakeAPI) -> None:
+    """不要求的调用方照旧：解析不了的回复也缓存，同样的请求从缓存里拿到同一个回复。"""
+    fake_api.chat_replies = [BROKEN, '{"name": "Ana"}']
+    client = make_client(settings, fake_api)
+    client.chat("extractor", HELLO, response_format=JSON_MODE)
+    again = client.chat("extractor", HELLO, response_format=JSON_MODE)
+    assert again.from_cache and again.content == BROKEN
+    assert len(fake_api.chat_requests) == 1
+
+
+# 默认配置下 extractor 角色、JSON 模式请求 "good" 与 "bad" 的缓存键：在基线提交 67226a8 上用同样
+# 的请求算出的值。键变了，data/cache 里已有的条目就全部失效（发表的数字无法重放）
+GOOD_KEY = "50b048885429ba7f73b63789fc8cd63b92703fee37e77b179b505443498d6748"
+BAD_KEY = "b6006d3aa735cf3c9bd8a1f429b3dcc084268bbc4509c5d93d07e08e347e8e91"
+
+
+def test_existing_cache_entries_still_hit(settings: Settings, fake_api: FakeAPI) -> None:
+    """缓存键不变：以前写进缓存的回复（能解析的、解析不了的）照常命中；解析不了的那条要等同样的
+    请求再来一次才重新调用。缓存条目按写死的键放进去：客户端组装键的方式（字段、参数、
+    extra_body）与 request_key 的规范化有任何变化，都会在这里失败。"""
+    spec = settings.models[settings.roles["extractor"].model]
+    client = make_client(settings, fake_api)
+    good = [{"role": "user", "content": "good"}]
+    bad = [{"role": "user", "content": "bad"}]
+    assert client.cache is not None
+    for key, content in ((GOOD_KEY, '{"ok": true}'), (BAD_KEY, BROKEN)):
+        cached = {"content": content, "model_alias": spec.model_id, "model_id": spec.model_id}
+        client.cache.put(key, spec.model_id, cached)
+
+    hit = client.chat("extractor", good, response_format=JSON_MODE, retry_bad_json=True)
+    assert hit.from_cache and hit.content == '{"ok": true}'
+    first = client.chat("extractor", bad, response_format=JSON_MODE, retry_bad_json=True)
+    assert first.from_cache and first.content == BROKEN  # 第一次照常命中，重跑可复现
+    assert fake_api.chat_requests == []
+    fake_api.chat_replies = ['{"ok": false}']
+    retried = client.chat("extractor", bad, response_format=JSON_MODE, retry_bad_json=True)
+    assert not retried.from_cache and retried.content == '{"ok": false}'
+    assert len(fake_api.chat_requests) == 1
+
+
+def test_request_key_canonicalisation_is_frozen() -> None:
+    """request_key 的规范化（排序、不转义非 ASCII、紧凑分隔符）钉死：非 ASCII 的消息、嵌套的
+    参数（response_format、工具）与 extra_body 一起算出的键与基线提交 67226a8 上相同，字段顺序
+    不影响结果。"""
+    request: dict[str, Any] = {
+        "provider": "qwen",
+        "model": "qwen3.8-flash",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You build the long-term memory of a personal assistant.",
+            },
+            {"role": "user", "content": "我叫林晓，住在 Zürich；“金毛” Max 三岁了。"},
+        ],
+        "params": {
+            "temperature": 0.0,
+            "max_tokens": 800,
+            "response_format": {"type": "json_object"},
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "memory_search",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "required",
+        },
+        "extra_body": {"enable_thinking": False},
+    }
+    expected = "f771e13aa153d4661feb89e5390c16558650d7dd5e4ac60e07133e18b8c30910"
+    assert request_key(request) == expected
+    assert request_key(dict(reversed(list(request.items())))) == expected
+
+
+def test_read_only_cache_serves_bad_json_instead_of_calling(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    fake_api.chat_replies = [BROKEN]
+    client = make_client(settings, fake_api)
+    client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+    client.settings = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    again = client.chat("extractor", HELLO, response_format=JSON_MODE, retry_bad_json=True)
+    assert again.from_cache and again.content == BROKEN
+    assert len(fake_api.chat_requests) == 1
+
+
+def test_structured_output_still_replays_from_cache(settings: Settings, fake_api: FakeAPI) -> None:
+    """CueMem 自己的 JSON 调用（抽取、对账等都走 structured）不受影响：第一次的坏回复与带校验
+    错误的重试都缓存，重跑整个从缓存复现，不再调用 API。"""
+    fake_api.chat_replies = [BROKEN, '{"name": "Max", "breed": "corgi"}']
+    client = make_client(settings, fake_api)
+    messages = [{"role": "user", "content": "Max 是柯基"}]
+    first = client.structured("extractor", messages, Pet)
+    assert first.attempts == 2 and len(fake_api.chat_requests) == 2
+    again = client.structured("extractor", messages, Pet)
+    assert again.value == first.value and again.attempts == 2
+    assert again.result.from_cache and len(fake_api.chat_requests) == 2
+
+
+def test_unparsable_json() -> None:
+    def reply(content: str | None, tool_calls: list[ToolCall] | None = None) -> ChatResult:
+        return ChatResult(
+            content=content, tool_calls=tool_calls or [], model_alias="m", model_id="m"
+        )
+
+    assert not unparsable_json(reply('{"a": [1, 2]}'))
+    assert not unparsable_json(reply('```json\n{"a": 1}\n```'))  # 去掉 markdown 围栏
+    assert unparsable_json(reply(BROKEN))
+    assert unparsable_json(reply(""))
+    assert unparsable_json(reply(None))
+    assert unparsable_json(reply('{"a": "line\nbreak"}'))  # 字符串里原样的换行：严格解析不过
+    call = ToolCall(id="c1", name="save", arguments="{}")
+    assert not unparsable_json(reply(None, [call]))

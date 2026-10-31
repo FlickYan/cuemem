@@ -9,13 +9,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
+import warnings
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,18 +41,24 @@ from cuemem.evals.datasets import (
     EvalSession,
     EvalSet,
     Sample,
+    SessionIds,
+    run_raw_labels,
+    run_session_ids,
     sample_evidence_turns,
+    session_id_scheme,
+    source_labels,
+    storage_name,
     to_conversation,
     to_session_ins,
 )
 from cuemem.evals.judge import Judge, token_f1
-from cuemem.evals.methods import Method, MethodContext, build_methods
+from cuemem.evals.methods import EXTERNAL, METHOD_NAMES, Method, MethodContext, build_methods
 from cuemem.evals.metrics import retrieval_metrics
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
-from cuemem.memory import MemorySystem, build_reranker
-from cuemem.read.reader import Reader
+from cuemem.memory import MemorySystem, build_reranker, controller_path
+from cuemem.read.reader import Reader, session_labels
 from cuemem.read.rerank import Reranker
 from cuemem.write.extract import PIPELINE_VERSION
 from cuemem.write.online import build_rounds, build_turns
@@ -66,6 +76,9 @@ class RunConfig:
     limit: int | None = None  # 只跑前 N 道题（调试用）
     reuse_spaces: bool = True  # 记忆空间存在磁盘上跨运行复用（paths.eval_spaces）
     build_only: bool = False  # 只构建记忆空间（写入与巩固），不回答、不判分
+    # 磁盘上的空间是按另一套巩固配置（指纹）或旧版流水线建的：默认报错、不动它（见
+    # _run_group）；True 时照旧清空它的派生记忆，按这次的配置重建
+    rebuild_spaces: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,8 @@ class ProbeQuery:
     question: str
     question_time: datetime
     meta: dict[str, Any] = field(default_factory=dict)
+    # 空间的会话 ID 写法（见 datasets 的模块说明）；None 时按环境变量，与加载数据集时一致
+    session_ids: SessionIds | None = None
 
 
 @dataclass
@@ -171,7 +186,6 @@ class EvalRunner:
     def run(self, evalset: EvalSet) -> RunSummary:
         started = time.perf_counter()
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self._write_run_info(evalset)
         done = self._load_done()
         samples = evalset.samples[: self.config.limit] if self.config.limit else evalset.samples
         groups: dict[str, list[tuple[Sample, list[Method]]]] = {}
@@ -185,6 +199,7 @@ class EvalRunner:
                 planned += len(pending)
         if self.config.build_only:
             planned = len(groups)
+        self._write_run_info(evalset, has_pending=bool(groups) or self.config.build_only)
         self._on_start(planned)
         # 对话历史比线程少时（LoCoMo 一共 3 段对话），同一段历史里的题也并行回答
         self._inner_workers = max(1, self.config.workers // max(1, len(groups)))
@@ -222,6 +237,7 @@ class EvalRunner:
                     "question_type": s.question_type,
                     "is_abstention": s.is_abstention,
                 },
+                evalset.session_ids,
             )
             for s in samples
         ]
@@ -242,16 +258,19 @@ class EvalRunner:
                     done.add(json.loads(line)["sample_id"])
                 except (json.JSONDecodeError, KeyError):
                     continue
-        groups: dict[tuple[str, str], list[ProbeQuery]] = {}
+        groups: dict[tuple[str, str, SessionIds], list[ProbeQuery]] = {}
         for query in queries:
             if query.query_id not in done:
-                groups.setdefault((query.dataset, query.space_key), []).append(query)
+                scheme = query.session_ids or session_id_scheme(query.dataset)
+                groups.setdefault((query.dataset, query.space_key, scheme), []).append(query)
         self._on_start(sum(len(items) for items in groups.values()))
         counts = Counter[str]()
 
-        def run_group(dataset: str, space_key: str, items: list[ProbeQuery]) -> None:
+        def run_group(
+            dataset: str, space_key: str, scheme: SessionIds, items: list[ProbeQuery]
+        ) -> None:
             space_id = f"{dataset}:{space_key}"
-            system, _ = self._open_space(dataset, space_key)
+            system, _ = self._open_space(dataset, space_key, scheme)
             try:
                 if system.db.space_stats(space_id)["rounds"] == 0:
                     raise RuntimeError(f"空间 {space_id} 还没有构建，先跑一次评测或 --build-only")
@@ -286,8 +305,8 @@ class EvalRunner:
 
         with ThreadPoolExecutor(max_workers=max(1, self.config.workers)) as pool:
             futures = [
-                pool.submit(run_group, dataset, key, items)
-                for (dataset, key), items in groups.items()
+                pool.submit(run_group, dataset, key, scheme, items)
+                for (dataset, key, scheme), items in groups.items()
             ]
             for future in as_completed(futures):
                 future.result()
@@ -336,12 +355,14 @@ class EvalRunner:
             return
         sessions = evalset.haystacks[space_key]
         space_id = f"{evalset.dataset}:{space_key}"
+        # label 消融：证据抬头显示原始 ID（存储与检索照常用改写后的 ID，见 datasets 的模块说明）
+        labels = source_labels(sessions) if evalset.raw_labels else None
         system: MemorySystem | None = None
         turns = sum(len(s.turns) for s in sessions)
         build: dict[str, Any] = {}
         try:
             if any(m.needs_index for _, methods in items for m in methods):
-                system, build = self._open_space(evalset.dataset, space_key)
+                system, build = self._open_space(evalset.dataset, space_key, evalset.session_ids)
                 with start_trace("ingest", space=space_id) as trace:
                     report = system.ingest(to_conversation(space_id, sessions))
                 row = {
@@ -361,6 +382,7 @@ class EvalRunner:
             m.needs_consolidation for _, methods in items for m in methods
         ):
             try:
+                self._check_space_config(system, space_id)
                 with start_trace("consolidate", space=space_id) as trace:
                     consolidation = system.consolidate(space_id, strict=True)
                 row = {
@@ -396,7 +418,9 @@ class EvalRunner:
                 self._stop.set()
                 return
             try:
-                row = self._evaluate(sample, method, sessions, system, space_id)
+                row = self._evaluate(
+                    sample, method, sessions, system, space_id, evalset.session_ids, labels
+                )
             except Exception as exc:
                 self._record_error(sample, method, exc, stage="answer")
                 return
@@ -425,9 +449,14 @@ class EvalRunner:
         sessions: list[EvalSession],
         system: MemorySystem | None,
         space_id: str,
+        session_ids: SessionIds = "native",
+        labels: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        ctx = MethodContext(sample, sessions, self.reader, system, space_id)
-        with start_trace("answer", method=method.name, sample=sample.sample_id) as trace:
+        ctx = MethodContext(sample, sessions, self.reader, system, space_id, session_ids)
+        with (
+            start_trace("answer", method=method.name, sample=sample.sample_id) as trace,
+            session_labels(labels),
+        ):
             output = method.answer(ctx)
         usage = usage_from_trace(trace)
         with start_trace("judge") as judge_trace:
@@ -491,9 +520,14 @@ class EvalRunner:
             relevant_units=relevant_units,
         )
 
-    def _open_space(self, dataset: str, space_key: str) -> tuple[MemorySystem, dict[str, Any]]:
+    def _open_space(
+        self, dataset: str, space_key: str, session_ids: SessionIds | None = None
+    ) -> tuple[MemorySystem, dict[str, Any]]:
         """打开这份对话历史的记忆空间。复用时（reuse_spaces）存在磁盘上，下次运行直接用；
-        build.json 记下首次构建时的写入与巩固统计，复用时报告里的写入成本照样有数。"""
+        build.json 记下首次构建时的写入与巩固统计，复用时报告里的写入成本照样有数。
+
+        会话 ID 改写过（anon）与保留原始 ID（raw）的空间放在不同目录（space_dir），数据库里
+        另记一份写法：对不上的空间作废重建，两种 ID 不会混在一个空间里。"""
         parts: dict[str, Any] = {
             "embedder": self.embedder,
             "llm": self.llm,
@@ -503,16 +537,39 @@ class EvalRunner:
         }
         if not self.config.reuse_spaces:
             return MemorySystem.ephemeral(self.settings, **parts), {}
-        directory = space_dir(self.settings, dataset, self.embedder, space_key)
+        scheme = session_ids or session_id_scheme(dataset)
+        directory = space_dir(self.settings, dataset, self.embedder, space_key, scheme)
         try:
-            system = MemorySystem.on_disk(self.settings, directory, **parts)
-        except ConfigMismatchError:  # 换了向量模型：旧空间作废，重建
+            system = _on_disk(self.settings, directory, scheme, parts)
+        except ConfigMismatchError:  # 换了向量模型或会话 ID 的写法：旧空间作废，重建
             shutil.rmtree(directory, ignore_errors=True)
-            system = MemorySystem.on_disk(self.settings, directory, **parts)
+            system = _on_disk(self.settings, directory, scheme, parts)
         path = directory / "build.json"
         build = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         build["_path"] = str(path)
         return system, build
+
+    def _check_space_config(self, system: MemorySystem, space_id: str) -> None:
+        """复用的空间是按另一套巩固配置（指纹）或旧版抽取流水线建的：报 ConfigMismatchError。
+
+        巩固遇到这样的空间会清空派生记忆、按这次的配置重建，build.json 也跟着改写；评测空间的
+        目录却不分巩固配置（原协议与 pq 协议只差备用模型，指纹就不同，D-067），设错一次目录就把
+        另一个协议的空间悄悄重建了。报错只落在需要事实记忆的方法上（_drop_failed），其余方法照常；
+        每个空间的报错一字不差，报告里归并成一条。不放在 _open_space：那里的 ConfigMismatchError
+        会删掉整个空间重建。--rebuild-spaces（rebuild_spaces）时照旧重建。"""
+        if not self.config.reuse_spaces or self.config.rebuild_spaces:
+            return
+        if not system.consolidator.stale(space_id):
+            return
+        recorded = system.db.get_meta(f"consolidation:{space_id}") or "无"
+        raise ConfigMismatchError(
+            f"{self.settings.paths.eval_spaces} 里的记忆空间是按另一套巩固配置建的（指纹 "
+            f"{recorded}，这次是 {system.consolidator.fingerprint()}；或是旧版抽取流水线建的）："
+            "不重建，也不用它的事实。评测空间的目录不分巩固配置，换配置要换目录（D-067）：原协议"
+            "（默认配置）设 CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-default，pq 协议（通义预设）"
+            "设 CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen；确实要按这次的配置重建这些空间，"
+            "加 --rebuild-spaces。"
+        )
 
     def _record_stage(self, row: dict[str, Any], build: dict[str, Any], *, did_work: bool) -> None:
         """记录写入或巩固的统计：这次真的做了就记实测值；复用已有空间时记首次构建的统计。"""
@@ -525,8 +582,10 @@ class EvalRunner:
             return
         self._append("ingest.jsonl", {**build[stage], "reused": True})
 
-    def _check_resume(self, info: dict[str, Any]) -> None:
-        _check_resume_compatible(info, self.settings, self.config)
+    def _check_resume(
+        self, info: dict[str, Any], session_ids: SessionIds = "native", raw_labels: bool = False
+    ) -> None:
+        _check_resume_compatible(info, self.settings, self.config, session_ids, raw_labels)
 
     def _drop_failed(
         self,
@@ -587,8 +646,13 @@ class EvalRunner:
             done.add((row["sample_id"], row["method"]))
         return done
 
-    def _write_run_info(self, evalset: EvalSet) -> None:
-        """记录本次运行的配置与环境，保证结果可追溯；续跑时保留首次的信息并追加续跑时间。"""
+    def _write_run_info(self, evalset: EvalSet, *, has_pending: bool = True) -> None:
+        """记录本次运行的配置与环境，保证结果可追溯；续跑时保留首次的信息，追加这次续跑的时间、
+        代码版本、命令行与 CUEMEM_* 环境变量（resumes）。
+
+        续跑时先核对关键配置（_check_resume_compatible）；还有没答完的组合时（has_pending）再核对
+        其余影响结果的配置（_check_resume_extended）。全部答完的运行不追加结果，配置变了也混不进
+        来：复现脚本照常重新生成报告，即使当时记下的默认值后来改了。"""
         path = self.run_dir / "run.json"
         info: dict[str, Any] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         now = datetime.now().isoformat(timespec="seconds")
@@ -604,36 +668,66 @@ class EvalRunner:
             info = {
                 "config": asdict(self.config),
                 "samples": len(evalset.samples),
+                # 这次要回答的题（划分、--types 与 --limit 选出的）：续跑时核对是同一批题
+                "sample_ids_sha256": _sample_ids_sha256(evalset, self.config),
                 "roles": roles,
                 "embedding": {
                     "model": self.settings.embedding.model,
                     "dim": self.settings.embedding.dim,
                     "backend": self.settings.embedding.backend,
                 },
-                "retrieval": self.settings.retrieval.model_dump(),
+                # 只记文件名分不出控制器是哪一版（controller_model.json 先后是 v1、v2、v3）：
+                # 另记文件里的版本与内容哈希
+                "retrieval": {
+                    **self.settings.retrieval.model_dump(),
+                    **controller_identity(self.settings.retrieval.controller),
+                },
                 "consolidation": {
                     "pipeline_version": PIPELINE_VERSION,
                     **self.settings.consolidation.model_dump(),
                 },
-                "git": _git_version(),
+                # 记忆空间与外部基线写入记录的目录：报告据此读外部基线的写入成本（N12；
+                # 同一个数据目录下 pds 与 pq 协议的写入分放两处）
+                "eval_spaces": str(self.settings.paths.eval_spaces),
+                **_provenance(),
                 "created": now,
                 "resumed": [],
+                "resumes": [],  # 每次续跑的时间、代码版本、命令行与环境变量
             }
+            if evalset.session_ids != "native":  # LoCoMo 的 run.json 不变
+                info["session_ids"] = evalset.session_ids
+            if evalset.raw_labels:  # label 消融：证据抬头显示数据集的原始 ID
+                info["session_labels"] = "source"
         else:
-            self._check_resume(info)
+            self._check_resume(info, evalset.session_ids, evalset.raw_labels)
+            if has_pending:
+                _check_resume_extended(info, self.settings, self.config, evalset)
             info["resumed"].append(now)
+            info.setdefault("resumes", []).append({"at": now, **_provenance()})
             info["config"]["methods"] = sorted(
                 set(info["config"]["methods"]) | set(self.config.methods)
             )
         path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _check_resume_compatible(info: dict[str, Any], settings: Settings, config: RunConfig) -> None:
-    """续跑同名运行时，关键配置必须一致；否则新旧结果会混在一个目录里（N4 差点发生过）。"""
+def _check_resume_compatible(
+    info: dict[str, Any],
+    settings: Settings,
+    config: RunConfig,
+    session_ids: SessionIds = "native",
+    raw_labels: bool = False,
+) -> None:
+    """续跑同名运行时，关键配置必须一致；否则新旧结果会混在一个目录里（N4 差点发生过）。
+
+    会话 ID 的写法也要一致：改写之前的运行没有记下写法，LongMemEval / MemLens 的都是原始 ID
+    （run_session_ids）；证据抬头显示的会话名（label 消融）同样要一致。"""
     previous = info.get("config", {})
+    label = {False: "会话 ID", True: "原始 ID"}
     checks = {
         "数据集": (previous.get("dataset"), config.dataset),
         "划分": (previous.get("split"), config.split),
+        "会话 ID": (run_session_ids(info), session_ids),
+        "证据抬头的会话名": (label[run_raw_labels(info)], label[raw_labels]),
         "向量模型": (info.get("embedding", {}).get("model"), settings.embedding.model),
         "回答模型": (
             info.get("roles", {}).get("reader", {}).get("model"),
@@ -648,14 +742,199 @@ def _check_resume_compatible(info: dict[str, Any], settings: Settings, config: R
         )
 
 
+ROLE_LABELS = {
+    "extractor": "抽取模型",
+    "planner": "规划模型",
+    "reader": "回答模型",
+    "vlm": "看图模型",
+    "captioner": "图片描述模型",
+    "judge": "判分模型",
+    "agent": "Agent 模型",
+}
+CONTROLLER_METHODS = {"B6", "B6h", "B6a"}  # 用学到的控制器（retrieval.controller）选档的方法
+# ad56fb0（N11）之前 run.json 不记控制器的文件名，那时只有 N7 导出的 v1 这一个文件
+LEGACY_CONTROLLER = "n7-two-stage-v1"
+AMEM_K_ENV = "CUEMEM_AMEM_K"  # A-MEM（MA）的检索条数（evals/baselines/amem.py）
+# 写进 run.json 的环境变量去掉密钥类的（与 evals/baselines/cognee.py 的 SECRET_ENV 相同）
+SECRET_ENV = re.compile(r"^AWS_|KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+
+def _check_resume_extended(
+    info: dict[str, Any], settings: Settings, config: RunConfig, evalset: EvalSet
+) -> None:
+    """续跑还有没答完的组合时，其余影响结果的配置也要一致（只比 run.json 里记下的项）：
+
+    - 各角色的模型（记下的角色；后来才加的角色旧运行里没有，不比）；
+    - 检索条数（--k）、只跑前 N 题（--limit）与这次要回答的题（新运行比题号的哈希，旧运行比
+      数据集按划分与 --types 筛完的题数）；
+    - 巩固与检索的配置：记下的每一项（并发数与控制器的文件名除外），以及抽取流水线的版本；只在
+      有用到 CueMem 自己的事实记忆（或检索）的方法时比，外部基线与 B0、B1 不受它们影响；
+    - 控制器（只在记下的或这次的方法里有 B6、B6h、B6a 时）：比模型文件里的版本，记了内容的
+      sha256 时也比（同一个版本号的文件可能被重新导出过）。旧运行没记版本：
+      没有控制器这一项的是 ad56fb0 之前建的，那时只有 v1；记的是带版本号的文件名就读那个文件；
+      记的是 controller_model.json（N11 之后先后指过 v2、v3）的无从判断，提醒一声、不比；
+    - A-MEM（MA）的检索条数 CUEMEM_AMEM_K（只在 run.json 记了环境变量时）。
+    """
+    previous = info.get("config", {})
+    changed: list[str] = []
+
+    def compare(name: str, old: Any, new: Any) -> None:
+        if old != new:
+            changed.append(f"{name}：{old} → {new}")
+
+    for role, record in info.get("roles", {}).items():
+        current = settings.roles.get(role)
+        compare(
+            ROLE_LABELS.get(role, f"{role} 角色的模型"),
+            record.get("model"),
+            current.model if current else None,
+        )
+    for key, label in (("k", "检索条数（--k）"), ("limit", "只跑前 N 题（--limit）")):
+        if key in previous:
+            compare(label, previous[key], getattr(config, key))
+    if "sample_ids_sha256" in info:
+        if info["sample_ids_sha256"] != _sample_ids_sha256(evalset, config):
+            changed.append("要回答的题（划分、--types 或 --limit 选出的）不同")
+    elif "samples" in info:
+        compare("题数（划分与 --types 筛出的）", info["samples"], len(evalset.samples))
+    methods = set(previous.get("methods", [])) | set(config.methods)
+    indexed, consolidated = _uses_own_memory(methods)
+    sections = {
+        "consolidation": (
+            consolidated,
+            {"pipeline_version": PIPELINE_VERSION, **settings.consolidation.model_dump()},
+        ),
+        "retrieval": (indexed, settings.retrieval.model_dump()),
+    }
+    for section, (relevant, current_values) in sections.items():
+        for key, old in info.get(section, {}).items() if relevant else ():
+            if key not in ("workers", "background_workers", "controller") and key in current_values:
+                compare(f"{section}.{key}", old, current_values[key])
+    if methods & CONTROLLER_METHODS:
+        stored = _stored_controller(info)
+        identity = controller_identity(settings.retrieval.controller)
+        current_version = identity["controller_version"]
+        stored_sha256 = info.get("retrieval", {}).get("controller_sha256")
+        if stored is None:
+            warnings.warn(
+                f"运行 {config.name} 记下的控制器文件"
+                f"（{info.get('retrieval', {}).get('controller')}）看不出是哪一版"
+                f"（controller_model.json 在 N11 之后先后是 v2、v3），没有核对；"
+                f"这次用的是 {current_version}。",
+                stacklevel=2,
+            )
+        elif stored != current_version:
+            changed.append(
+                f"控制器：{stored} → {current_version}（复现 N7 / N9 设 "
+                "CUEMEM_RETRIEVAL__CONTROLLER=controller_model_v1.json，N11 设 "
+                "controller_model_v2.json）"
+            )
+        elif stored_sha256 and stored_sha256 != identity["controller_sha256"]:
+            # 版本号相同，文件却被重新导出过（比如重跑了训练脚本）
+            changed.append(f"控制器 {stored} 的模型文件内容变了（sha256 不同）")
+    if "env" in info and "MA" in methods:
+        compare(
+            f"A-MEM 的检索条数（{AMEM_K_ENV}）",
+            info["env"].get(AMEM_K_ENV, "").strip() or "默认",
+            os.environ.get(AMEM_K_ENV, "").strip() or "默认",
+        )
+    if changed:
+        raise ConfigMismatchError(
+            f"运行 {config.name} 已存在，还有没答完的题，但配置变了（{'；'.join(changed)}）。"
+            "续跑会把新旧结果混在一起：请换一个运行名（--name），或换回当时的配置。"
+        )
+
+
+def _uses_own_memory(names: set[str]) -> tuple[bool, bool]:
+    """这些方法里有没有用 CueMem 自己的检索（要索引）与事实记忆（要巩固）的。外部基线自己写入、
+    自己检索，巩固与检索的配置影响不到它们（也不必为此导入它们的包）。"""
+    own = [n for n in METHOD_NAMES if n in names and n != "M0" and n not in EXTERNAL]
+    methods = build_methods(own)
+    return any(m.needs_index for m in methods), any(m.needs_consolidation for m in methods)
+
+
+def _stored_controller(info: dict[str, Any]) -> str | None:
+    """运行建立时用的控制器版本（见 _check_resume_extended）；看不出来（记的是
+    controller_model.json，或记下的文件已经不在）时为 None。"""
+    retrieval = info.get("retrieval", {})
+    if retrieval.get("controller_version"):
+        return str(retrieval["controller_version"])
+    if "controller" not in retrieval:
+        return LEGACY_CONTROLLER
+    if retrieval["controller"] == "controller_model.json":
+        return None
+    return controller_identity(retrieval["controller"])["controller_version"]
+
+
+def controller_identity(name: str) -> dict[str, str | None]:
+    """检索控制器模型文件（retrieval.controller）里的版本与内容的 sha256；文件不在时都是 None
+    （这时 B6 等退回规则版，见 memory.load_controller）。"""
+    path = controller_path(name)
+    if not path.exists():
+        return {"controller_version": None, "controller_sha256": None}
+    raw = path.read_bytes()
+    version = json.loads(raw).get("version")
+    return {
+        "controller_version": str(version) if version is not None else None,
+        "controller_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _sample_ids_sha256(evalset: EvalSet, config: RunConfig) -> str:
+    """这次要回答的题（--limit 之后）的题号，排序后的哈希。"""
+    samples = evalset.samples[: config.limit] if config.limit else evalset.samples
+    ids = sorted(s.sample_id for s in samples)
+    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+
+
+def _provenance() -> dict[str, Any]:
+    """这次运行（或续跑）的代码版本、命令行与 CUEMEM_* 环境变量（去掉密钥类的）。"""
+    argv = [Path(sys.argv[0]).name, *sys.argv[1:]] if sys.argv else []
+    env = {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name.startswith("CUEMEM_") and not SECRET_ENV.search(name)
+    }
+    return {"git": _git_version(), "argv": argv, "env": env}
+
+
 def _safe_name(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", key)
 
 
-def space_dir(settings: Settings, dataset: str, embedder: TextEmbedder, space_key: str) -> Path:
-    """评测记忆空间的目录：按向量模型分开存，换模型对比时两套空间可以共存。"""
+def space_dir(
+    settings: Settings,
+    dataset: str,
+    embedder: TextEmbedder,
+    space_key: str,
+    session_ids: SessionIds | None = None,
+) -> Path:
+    """评测记忆空间的目录：按向量模型分开存，换模型对比时两套空间可以共存。
+
+    会话 ID 改写过的空间放在 <数据集>-anon 下，与之前（原始 ID）的空间分开（见 datasets 的
+    storage_name）；session_ids 为 None 时按环境变量，与加载数据集时一致。LoCoMo 不变。"""
     model = _safe_name(f"{embedder.name}-{embedder.dim}")
-    return settings.paths.eval_spaces / dataset / model / _safe_name(space_key)
+    folder = storage_name(dataset, session_ids)
+    return settings.paths.eval_spaces / folder / model / _safe_name(space_key)
+
+
+SESSION_IDS_META = "session_ids"  # 评测空间的数据库里记下的会话 ID 写法
+
+
+def _on_disk(
+    settings: Settings, directory: Path, scheme: SessionIds, parts: dict[str, Any]
+) -> MemorySystem:
+    """打开磁盘上的评测空间；LongMemEval / MemLens 的空间核对会话 ID 的写法（不一致时报
+    ConfigMismatchError，调用方删掉重建）。改写之前建的空间没有这条记录，都是原始 ID：
+    它们在原来的目录里，只会被原始 ID 的运行打开，第一次打开时记为 raw。LoCoMo 不记。"""
+    system = MemorySystem.on_disk(settings, directory, **parts)
+    if scheme != "native":
+        try:
+            system.db.check_or_set_meta(SESSION_IDS_META, scheme)
+        except ConfigMismatchError:
+            system.close()
+            raise
+    return system
 
 
 def _git_version() -> str:

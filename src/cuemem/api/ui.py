@@ -5,7 +5,12 @@
 - 记忆：用户画像、事实时间线（含被取代的旧版本）、实体图、图库、会话，以及遗忘；
 - 原理：一页说明。
 
-界面文字用英文；与接口共用服务对象（api/service.py）。
+界面文字用英文；与接口共用服务对象（api/service.py）。默认不联系第三方：字体是 Gradio 自带的，
+Gradio 的使用统计与版本检查要设 GRADIO_ANALYTICS_ENABLED=True 才打开（第四轮体检）。
+
+访问令牌（api/auth.py）：用限定作用域的令牌登录时，每个事件（经界面或 /gradio_api 直接调用）都
+先检查记忆空间在不在它的作用域里，不在时报错、什么都不读不写；页面打开时，默认的记忆空间不在
+作用域里就换成作用域里的第一个。
 """
 
 from __future__ import annotations
@@ -14,8 +19,9 @@ import base64
 import html
 import io
 import math
+import os
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast, get_args
@@ -25,14 +31,24 @@ from PIL import Image
 
 from cuemem.agent import Reply
 from cuemem.agent.runtime import RecalledItem, TurnTrace
-from cuemem.api.service import ChatService, english_reason
+from cuemem.api.auth import ADMIN, Principal
+from cuemem.api.service import ChatService
 from cuemem.memory import RecallMode
-from cuemem.read.controller import Router
+from cuemem.read.controller import Router, english_reason
+from cuemem.store.media import decoding
 
+# 字体用 Gradio 自带的 IBM Plex Sans（三种粗细的文件都在包里，由本服务提供）。以前是
+# GoogleFont("Inter")：Gradio 没带它，登录之后每个访客的浏览器都去 fonts.googleapis.com 取，访客的
+# IP 发给了 Google（第四轮体检）。等宽字体 Soft 本来就用自带的 IBM Plex Mono
 THEME = gr.themes.Soft(
     primary_hue="teal",
     neutral_hue="slate",
-    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
+    font=[
+        gr.themes.LocalFont("IBM Plex Sans", weights=(400, 600, 700)),
+        "ui-sans-serif",
+        "system-ui",
+        "sans-serif",
+    ],
 )
 
 CSS = """
@@ -137,9 +153,48 @@ The store and products are made up for the demo; product photos are AI-generated
 """
 
 
-def build_ui(service: ChatService) -> gr.Blocks:
+def build_ui(
+    service: ChatService, *, access: Callable[[str | None], Principal | None] | None = None
+) -> gr.Blocks:
+    """access：登录的用户名 → 令牌（api.auth.Keys.by_username；None 是没登录）。不给时不限制
+    （没有访问令牌的本机演示）。"""
     lam_default = _lam_default(service)
-    with gr.Blocks(title="CueMem demo") as demo:
+
+    def who(request: gr.Request | None) -> Principal:
+        if access is None:
+            return ADMIN
+        principal = access(request.username if request is not None else None)
+        if principal is None:
+            raise gr.Error("Sign in first.")
+        return principal
+
+    def allowed(request: gr.Request | None, space_id: str) -> str:
+        """界面里填的记忆空间（空着是默认空间），先过令牌的作用域检查。"""
+        space = space_id.strip() or service.default_space
+        if not who(request).allows(space):
+            raise gr.Error(f"Your access token cannot open the memory space {space!r}.")
+        return space
+
+    def mine(request: gr.Request | None, sid: str | None) -> str | None:
+        """这个页面的会话：属于作用域之外的空间时当作没有（会话 ID 只在服务端的页面状态里，
+        这里再查一遍）。"""
+        if not sid:
+            return None
+        try:
+            space = service.get(sid).space_id
+        except KeyError:
+            return sid  # 已经结束：照常由 _end、service.chat 处理
+        return sid if who(request).allows(space) else None
+
+    # Gradio 把上传的照片、对话与图库里显示的图都复制进自己的临时目录，遗忘时没法删到：每小时清掉
+    # 一小时以前的副本（会话读的是记忆里存的那份，不受影响；更早的对话里的图不再显示）。
+    # 使用统计默认关：gr.Blocks 一建好（挂载、从不 launch 的也一样）就向 api.gradio.app 查版本、经
+    # huggingface_hub 向 huggingface.co 报告；运营者设 GRADIO_ANALYTICS_ENABLED=True（.env 里也行，
+    # 这时已经读过）才打开
+    analytics = os.environ.get("GRADIO_ANALYTICS_ENABLED") == "True"
+    with gr.Blocks(
+        title="CueMem demo", delete_cache=(3600, 3600), analytics_enabled=analytics
+    ) as demo:
         session_id = gr.State(None)
         gr.HTML(
             '<div class="cm-header"><h1>CueMem</h1><p>A shopping assistant with long-term '
@@ -239,11 +294,14 @@ def build_ui(service: ChatService) -> gr.Blocks:
 
         # ---------- 事件 ----------
 
-        def start(space_id: str, date: str, sid: str | None) -> tuple[Any, ...]:
+        def start(
+            space_id: str, date: str, sid: str | None, request: gr.Request
+        ) -> tuple[Any, ...]:
+            space = allowed(request, space_id)
             notice = ""
-            if sid:
+            if sid := mine(request, sid):
                 notice = _end(service, sid)
-            session = service.start(space_id.strip() or None, at=_parse_date(date))
+            session = service.start(space, at=_parse_date(date))
             return (
                 session.session_id,
                 [],
@@ -253,7 +311,8 @@ def build_ui(service: ChatService) -> gr.Blocks:
 
         new_button.click(start, [space, when, session_id], [session_id, chatbot, trace, status])
 
-        def end(sid: str | None) -> tuple[Any, ...]:
+        def end(sid: str | None, request: gr.Request) -> tuple[Any, ...]:
+            sid = mine(request, sid)
             if not sid:
                 return None, "No session to end."
             return None, _end(service, sid)
@@ -269,14 +328,20 @@ def build_ui(service: ChatService) -> gr.Blocks:
             recall_mode: str,
             controller: str,
             lam_value: float,
+            request: gr.Request,
         ) -> Iterator[tuple[Any, ...]]:
+            space = allowed(request, space_id)  # 还没有会话时在这里开
+            sid = mine(request, sid)
             text = str((message or {}).get("text") or "").strip()
             files = [_file_path(f) for f in (message or {}).get("files") or []]
             if not text and not files:
                 yield history, gr.MultimodalTextbox(value=None), sid, gr.skip(), gr.skip()
                 return
+            notice = ""
+            if sid and not service.is_open(sid):  # 闲置太久，清理线程结束了它（已经交给抽取）
+                sid, notice = None, _ended_notice(service)
             if not sid:
-                sid = service.start(space_id.strip() or None, at=_parse_date(date)).session_id
+                sid = service.start(space, at=_parse_date(date)).session_id
             user: list[Any] = [text] if text else []
             user += [{"path": f} for f in files]
             history = [*history, {"role": "user", "content": user}]
@@ -285,7 +350,7 @@ def build_ui(service: ChatService) -> gr.Blocks:
                 gr.MultimodalTextbox(value=None, interactive=False),
                 sid,
                 '<div class="trace muted"><h4>Memory trace</h4>Thinking…</div>',
-                _status_text(service, sid),
+                _status_text(service, sid, notice),
             )
             try:
                 reply = service.chat(
@@ -308,7 +373,7 @@ def build_ui(service: ChatService) -> gr.Blocks:
                     gr.MultimodalTextbox(value=None, interactive=True),
                     sid,
                     EMPTY_TRACE,
-                    _status_text(service, sid),
+                    _status_text(service, sid, notice),
                 )
                 return
             history = [*history, {"role": "assistant", "content": answer}]
@@ -317,7 +382,7 @@ def build_ui(service: ChatService) -> gr.Blocks:
                 gr.MultimodalTextbox(value=None, interactive=True),
                 sid,
                 panel,
-                _status_text(service, sid),
+                _status_text(service, sid, notice),
             )
 
         box.submit(
@@ -326,8 +391,10 @@ def build_ui(service: ChatService) -> gr.Blocks:
             [chatbot, box, session_id, trace, status],
         )
 
-        def load_memory(space_id: str, current: bool, kind: str) -> tuple[Any, ...]:
-            sid = space_id.strip() or service.default_space
+        def load_memory(
+            space_id: str, current: bool, kind: str, request: gr.Request
+        ) -> tuple[Any, ...]:
+            sid = allowed(request, space_id)
             rows = service.facts(sid, current_only=current)
             table = [
                 [r["said_on"][:10], r["statement"], r["status"], r["replaced_by"] or ""]
@@ -357,16 +424,17 @@ def build_ui(service: ChatService) -> gr.Blocks:
         refresh.click(load_memory, memory_inputs, memory_outputs)
         memory_tab.select(load_memory, memory_inputs, memory_outputs)
         current_only.change(load_memory, memory_inputs, memory_outputs)
-        forget_kind.change(
-            lambda s, k: gr.Dropdown(choices=_forget_choices(service, s, k), value=None),
-            [space, forget_kind],
-            [forget_target],
-        )
 
-        def forget(space_id: str, kind: str, target: str | None) -> str:
+        def choices(space_id: str, kind: str, request: gr.Request) -> Any:
+            options = _forget_choices(service, allowed(request, space_id), kind)
+            return gr.Dropdown(choices=options, value=None)
+
+        forget_kind.change(choices, [space, forget_kind], [forget_target])
+
+        def forget(space_id: str, kind: str, target: str | None, request: gr.Request) -> str:
+            sid = allowed(request, space_id)
             if not target:
                 return "Pick something to forget first."
-            sid = space_id.strip() or service.default_space
             report = service.forget(
                 sid,
                 fact_ids=[target] if kind == "fact" else [],
@@ -380,6 +448,12 @@ def build_ui(service: ChatService) -> gr.Blocks:
             cascade = ", including " + " and ".join(e for e in extra if e) if any(extra) else ""
             if report.regrown:
                 cascade += f"; {report.regrown} fact(s) grew back after the rebuild and went too"
+            if report.rebuild_error:  # 删了，只是重建没做完
+                return (
+                    f"Forgot {report.turns_deleted} conversation turn(s){cascade}. Rebuilding the "
+                    f"memory from the remaining log failed ({report.rebuild_error}); it finishes "
+                    "on the next consolidation."
+                )
             return (
                 f"Forgot {report.turns_deleted} conversation turn(s){cascade}; facts "
                 f"{report.facts_before} → {report.facts_after}, rebuilt from the remaining log "
@@ -390,6 +464,15 @@ def build_ui(service: ChatService) -> gr.Blocks:
         forget_button.click(forget, [space, forget_kind, forget_target], [forget_result]).then(
             load_memory, memory_inputs, memory_outputs
         )
+
+        def opened(request: gr.Request) -> Any:
+            """页面打开时：默认的记忆空间不在令牌的作用域里，换成作用域里的第一个。"""
+            principal = who(request)
+            if principal.allows(service.default_space):
+                return gr.skip()
+            return principal.home() or ""
+
+        demo.load(opened, None, [space])
     return demo
 
 
@@ -689,6 +772,16 @@ def _status_text(service: ChatService, sid: str | None, notice: str = "") -> str
     return " · ".join(parts) or "No session yet: sending a message starts one."
 
 
+def _ended_notice(service: ChatService) -> str:
+    """页面里的会话已经不在了（闲置太久，HTTP 应用的清理线程结束了它）：发的这句话开一个新的会话。
+    以前页面一直拿着结束了的会话，之后每句话都报 KeyError，直到点 New session。"""
+    idle = f" after {service.idle_minutes:g} idle minutes" if service.idle_minutes else ""
+    return (
+        f"The previous session ended{idle} and is being consolidated; "
+        "this message starts a new one."
+    )
+
+
 def _end(service: ChatService, sid: str) -> str:
     try:
         out = service.end(sid)
@@ -721,9 +814,9 @@ def _file_path(item: Any) -> str:
 
 
 def _thumbnail(path: str, size: int = 144) -> str:
-    with Image.open(path) as source:
+    with Image.open(path) as source, decoding(source):  # 大图的解码排队（store/media.py）
         image = source.convert("RGB")
-    image.thumbnail((size, size))
+        image.thumbnail((size, size))
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=80)
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")

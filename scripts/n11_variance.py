@@ -69,14 +69,20 @@ def compare(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    settings = load_settings()
+    runs = load_settings().paths.eval_runs
+    rows = {
+        name: latest(load_rows(runs / name, "results.jsonl"))
+        for pair in PAIRS.items()
+        for name in pair
+    }
+    if missing := [name for name, found in rows.items() if not found]:
+        # 缺一个就不写：以前跳过缺的、照样写，可选的重跑没跑时把发表的结果清空成 {}
+        raise SystemExit(
+            f"还没有结果：{'、'.join(missing)}（重跑的命令见脚本说明）；没有写 {OUT.name}"
+        )
     result: dict[str, Any] = {}
     for rerun, original in PAIRS.items():
-        second = latest(load_rows(settings.paths.eval_runs / rerun, "results.jsonl"))
-        if not second:
-            print(f"{rerun}：还没有结果，跳过")
-            continue
-        first = latest(load_rows(settings.paths.eval_runs / original, "results.jsonl"))
+        first, second = rows[original], rows[rerun]
         result[rerun] = {"original": original, "methods": compare(first, second)}
         for method, row in result[rerun]["methods"].items():
             print(

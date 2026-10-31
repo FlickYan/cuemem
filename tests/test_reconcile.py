@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import json
+import random
 from datetime import datetime
 from typing import Any
 
 import numpy as np
+import pytest
 from fakes import FakeAPI
 
 from cuemem.config import Settings
 from cuemem.core.models import Fact
 from cuemem.llm import LLMClient
+from cuemem.write import reconcile as reconcile_module
 from cuemem.write.entities import EntityResolver, EntityState, ResolutionReport, user_entity_id
 from cuemem.write.extract import ExtractedEntity
-from cuemem.write.reconcile import FactState, Reconciler
+from cuemem.write.predicates import normalize_value
+from cuemem.write.reconcile import FactState, Reconciler, _by_similarity
 
 USER = "u"
 
@@ -189,6 +193,50 @@ def test_registered_multi_valued_never_calls_llm(settings: Settings, fake_api: F
     assert fake_api.chat_requests == []
 
 
+def test_logged_correction_replaces_its_target(settings: Settings, fake_api: FakeAPI) -> None:
+    """SDK 的 update 记下的更正（corrections：轮 ID → 要取代的事实）：由那句抽出的事实里，同谓词
+    的、其次陈述最相近的那条以"说错了"取代目标，不问 LLM；同一句抽出的其他事实照常对账。没有
+    更正时规则不变（多值的谓词只会新增）。"""
+    state = FactState()
+    rec = reconciler(settings, fake_api, [])
+    jazz = fact("a", "User likes jazz.", "likes", "jazz", "2025-01-01", cardinality="multi")
+    rec.reconcile(state, [(jazz, vec(1, 0, 0))])
+    edit = ["t-edit"]
+    trip = fact(
+        "b", "User visited a jazz bar.", "visited", "bar", "2025-02-01", cardinality="multi"
+    )
+    blues = fact("c", "User likes blues.", "likes", "blues", "2025-02-01", cardinality="multi")
+    soul = fact("d", "User likes soul.", "likes", "soul", "2025-02-01", cardinality="multi")
+    new = [
+        (f.model_copy(update={"source_turn_ids": edit}), v)
+        for f, v in (
+            (trip, vec(0.9, 0.1, 0)),  # 陈述最相近，但谓词不同
+            (blues, vec(0, 1, 0)),
+            (soul, vec(0.3, 0.7, 0)),  # 同谓词里与 jazz 更近的这条被选中
+        )
+    ]
+    result = rec.reconcile(state, new, corrections={"t-edit": "a"})
+    retired = state.facts["a"]
+    assert retired.superseded_by == "d" and retired.supersede_reason == "corrected"
+    assert retired.valid_to is None
+    assert [(op.action, op.fact_id, op.rule) for op in result.operations] == [
+        ("add", "b", "multi_valued"),
+        ("add", "c", "multi_valued"),
+        ("supersede", "d", "edit"),
+    ]
+    assert fake_api.chat_requests == []
+
+    # 目标已经不在（被遗忘、换了抽取模型）或不是当前的：照常对账
+    later = fact("e", "User likes funk.", "likes", "funk", "2025-03-01", cardinality="multi")
+    funk = later.model_copy(update={"source_turn_ids": ["t-edit2"]})
+    rec.reconcile(state, [(funk, vec(0, 0, 1))], corrections={"t-edit2": "a"})
+    assert state.facts["e"].is_current and state.facts["a"].superseded_by == "d"
+    ghost = fact("f", "User likes pop.", "likes", "pop", "2025-03-02", cardinality="multi")
+    ghost = ghost.model_copy(update={"source_turn_ids": ["t-edit3"]})
+    rec.reconcile(state, [(ghost, vec(0, 0, 1))], corrections={"t-edit3": "gone"})
+    assert state.facts["f"].is_current
+
+
 # ---------- 实体消歧 ----------
 
 
@@ -242,6 +290,144 @@ def test_user_name_becomes_alias(settings: Settings, fake_api: FakeAPI) -> None:
     assert state.lookup("林晓") == user_entity_id("s")
     assert "林晓" in state.entities[user_entity_id("s")].aliases
     assert report.created == 1  # 只有用户本人这一个实体
+
+
+def test_speakers_in_other_scripts_are_separate_people(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """说话人名字是西里尔文或只有 emoji：以前名字键都是 ''，所有这样的说话人是同一个实体，
+    别名索引里还有 '' 这个键（任何规范化成 '' 的宾语都会指向这个人）。"""
+    state = EntityState("s")
+    res = resolver(settings, fake_api, {"matches": []})
+    report = ResolutionReport()
+    res.ensure_people(state, ["Анна", "Иван", "🙂", "🙃"], datetime(2026, 1, 10), report)
+    assert report.created == 4 and len(state.entities) == 4
+    assert "" not in state.alias_index
+    assert state.lookup("Анна") != state.lookup("Иван")
+    assert state.lookup("анна") == state.lookup("Анна") is not None
+    assert state.lookup("—") is None
+
+
+def test_reconcile_cost_is_not_quadratic(
+    settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """遗忘与重建都按会话把整个空间重放一遍：以前每条新事实都把这个主语的全部当前事实规范化
+    一遍、把它们的向量 np.vstack 一遍，n 条事实要 n² 次（9600 条要 6 分多钟）。现在候选从
+    FactState 的索引里取，宾语的规范形式按文本只算一次。"""
+    calls = 0
+    real = reconcile_module.normalize_value
+
+    def counting(text: str) -> str:
+        nonlocal calls
+        calls += 1
+        return real(text)
+
+    monkeypatch.setattr(reconcile_module, "normalize_value", counting)
+    state = FactState()
+    rec = reconciler(settings, fake_api, [])
+    n = 300
+    for i in range(n):  # 互相正交的向量：每条都是登记过的多值谓词，直接新增
+        vector = np.zeros(n, dtype=np.float32)
+        vector[i] = 1.0
+        statement = f"User likes thing {i}."
+        new = fact(f"f{i}", statement, "likes", f"thing {i}", "2025-01-01", cardinality="multi")
+        rec.reconcile(state, [(new, vector)])
+    assert len(state.current_of(USER)) == n
+    assert calls <= 2 * n  # 以前约 n² 次（9 万次）
+    assert fake_api.chat_requests == []
+
+
+def test_fact_state_index_matches_a_full_scan() -> None:
+    """FactState 的索引与逐条扫描当前事实的结果相同：先后顺序、同值事实里的第一条、每行的
+    谓词，相似度与把向量 np.vstack 起来再相乘逐位相同。覆盖合并、取代、迟到的旧版本、同一个
+    ID 换了主语、没有向量的事实，以及向量不是 float32 的主语（照原样 np.vstack）。"""
+    rng = random.Random(7)
+    vectors = np.random.default_rng(7)
+    dim = 1024
+    state = FactState()
+    subjects = ["u", "mia", "odd"]
+    predicates = ["likes", "lives_in", "age", "has_pet"]
+    objects = ["Cats", "cats", "the cats", "Berlin", "Paris", "31", "a dog"]
+
+    def unit(subject: str) -> np.ndarray:
+        v = vectors.standard_normal(dim)
+        v = v / np.linalg.norm(v)
+        return v if subject == "odd" else v.astype(np.float32)  # "odd" 的向量是 float64
+
+    def new_fact(i: int) -> Fact:
+        return fact(
+            f"f{i}",
+            f"statement {i}",
+            rng.choice(predicates),
+            rng.choice(objects),
+            "2025-01-01",
+            negated=rng.random() < 0.2,
+            subject=rng.choice(subjects),
+        )
+
+    when = datetime(2025, 6, 1)
+    for i in range(700):
+        current = [f for f in state.facts.values() if f.is_current]
+        roll = rng.random()
+        if roll < 0.55 or not current:  # 新事实（偶尔没有向量，偶尔是迟到的旧版本）
+            new = new_fact(i)
+            if rng.random() < 0.05:
+                new = new.model_copy(update={"invalidated_at": when, "superseded_by": "x"})
+            state.put(new, None if rng.random() < 0.1 else unit(new.subject_id))
+        elif roll < 0.75:  # 合并：只追加溯源
+            old = rng.choice(current)
+            state.put(old.model_copy(update={"source_turn_ids": [*old.source_turn_ids, "t"]}))
+        elif roll < 0.9:  # 取代：旧事实不再是当前的
+            old = rng.choice(current)
+            state.put(old.model_copy(update={"invalidated_at": when, "superseded_by": f"f{i}"}))
+        else:  # 同一个 ID 写进别的内容（同一会话里陈述相同的两条事实）
+            old = rng.choice(list(state.facts.values()))
+            other = new_fact(i).model_copy(update={"id": old.id})
+            state.put(other, unit(other.subject_id) if rng.random() < 0.7 else None)
+        if i % 7:
+            continue
+        for subject in subjects:
+            scan = [f for f in state.facts.values() if f.subject_id == subject and f.is_current]
+            assert state.current_of(subject) == scan
+            with_vectors = [f for f in scan if f.id in state.vectors]
+            query = unit(subject)
+            ids, sims = state.similarities(subject, query)
+            assert ids == [f.id for f in with_vectors]
+            if with_vectors:
+                expected = np.vstack([state.vectors[f.id] for f in with_vectors]) @ query
+                assert sims.dtype == expected.dtype and sims.tobytes() == expected.tobytes()
+                for predicate in predicates:
+                    rows = state.predicate_rows(subject, predicate).tolist()
+                    assert rows == [f.predicate == predicate for f in with_vectors]
+            for predicate in predicates:
+                for obj in objects:
+                    for negated in (False, True):
+                        value = normalize_value(obj)
+                        first = next(
+                            (
+                                f
+                                for f in scan
+                                if f.predicate == predicate
+                                and normalize_value(f.object) == value
+                                and f.negated == negated
+                            ),
+                            None,
+                        )
+                        assert state.first_current(subject, predicate, value, negated) == first
+
+
+def test_similarity_ranking_matches_sorted() -> None:
+    """相似度排序与以前对全部 (事实, 相似度) 做 sorted(key=-相似度) 再筛选的结果相同：相同的
+    相似度保持原来的先后，-0.0 与 0.0 算相同，有 NaN 时照 sorted 的结果。"""
+    rng = random.Random(3)
+    pool = [0.9, 0.9, 0.5, 0.0, -0.0, -0.3, 0.75, float("nan")]
+    for trial in range(400):
+        n = rng.randint(0, 12)
+        scores = [rng.choice(pool[:-1] if trial % 2 else pool) for _ in range(n)]
+        wanted = [rng.random() < 0.6 for _ in range(n)]
+        expected = [i for i in sorted(range(n), key=lambda i: -scores[i]) if wanted[i]]
+        got = _by_similarity(np.array(scores, dtype=np.float64), np.array(wanted, dtype=bool))
+        assert got == expected
 
 
 def test_plans_do_not_trigger_single_valued_rule(settings: Settings, fake_api: FakeAPI) -> None:

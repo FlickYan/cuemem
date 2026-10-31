@@ -1,7 +1,17 @@
 """外部基线 M0（Mem0）的接线测试：不联网、不调用模型。
 
-mem0ai 不是 CueMem 的依赖，平时这个文件整体跳过；要跑时临时装上：
-    uv run --with mem0ai --with spacy --with fastembed pytest tests/test_mem0_baseline.py
+mem0ai 不是 CueMem 的依赖，平时只跑写入记录（协议、会话 ID 的写法）的测试，其余跳过；要跑全部
+时临时装上（与 scripts/reproduce.py 相同，带上 spaCy 的模型：没有它时 Mem0 在测试里去 GitHub
+下载，网络守卫让测试失败）：
+    SM=https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0
+    uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
+        --with "en_core_web_sm @ $SM/en_core_web_sm-3.8.0-py3-none-any.whl" \\
+        pytest tests/test_mem0_baseline.py
+Mem0 的混合检索还要 fastembed 的 Qdrant/bm25 模型，第一次用时从 huggingface.co 下载进 fastembed 的
+缓存（默认 <临时目录>/fastembed_cache，环境变量 FASTEMBED_CACHE_PATH）：缓存里没有时网络守卫让 4 个
+测试失败，先在测试之外下载一次（同样的 --with，把 pytest … 换成
+python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('Qdrant/bm25')"）。
+CI 的"外部基线"（.github/workflows/baselines.yml）照这些命令跑。
 """
 
 from __future__ import annotations
@@ -9,18 +19,23 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+from collections.abc import Sequence
 from datetime import datetime
+from importlib import metadata
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from cuemem.config import Settings
+from cuemem.errors import ConfigMismatchError
 from cuemem.evals.datasets import EvalSession, EvalTurn, Sample
 from cuemem.evals.methods import MethodContext
 
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("mem0") is None, reason="需要 mem0ai（uv run --with mem0ai ...）"
+needs_mem0 = pytest.mark.skipif(
+    importlib.util.find_spec("mem0") is None,
+    reason="需要 mem0ai（uv run --with mem0ai==2.2.1 ...）",
 )
 
 
@@ -75,6 +90,7 @@ def _sessions() -> list[EvalSession]:
     ]
 
 
+@needs_mem0
 def test_mem0_baseline_builds_once_with_session_dates(offline_settings: Settings) -> None:
     from cuemem.evals.mem0_baseline import Mem0Baseline
 
@@ -98,6 +114,8 @@ def test_mem0_baseline_builds_once_with_session_dates(offline_settings: Settings
     # 抽取提示里的"观察日期"是会话日期，不是运行当天：相对日期才会被换算到对的年份
     assert llm.observed == ["2023-05-08", "2023-06-01"]
     assert first.details["mem0_build"]["memories"] == 2
+    assert first.details["mem0_build"]["protocol"] == method.protocol
+    assert method.protocol.startswith("qwen3.8-flash|")
     texts = {h.unit.text: h.unit for h in first.hits}
     beagle = texts["I adopted a beagle named Biscuit yesterday."]
     assert beagle.ts == datetime(2023, 5, 8, 13, 56) and beagle.session_id == "s1"
@@ -107,6 +125,7 @@ def test_mem0_baseline_builds_once_with_session_dates(offline_settings: Settings
     assert second.hits and reader.seen[-1] == second.hits
 
 
+@needs_mem0
 def test_mem0_baseline_gives_each_speaker_a_user_id(offline_settings: Settings) -> None:
     """两个人之间的对话（LoCoMo）：照 Mem0 论文的评测代码，每位说话人一个 user_id，
     自己的话是 user、对方的话是 assistant；检索两边都取，每条注明是谁的记忆。"""
@@ -157,6 +176,7 @@ class ListLLM(FakeLLM):
         return SimpleNamespace(content=json.dumps(json.loads(reply.content)["memory"]))
 
 
+@needs_mem0
 def test_mem0_baseline_accepts_a_bare_list(offline_settings: Settings) -> None:
     from cuemem.evals.mem0_baseline import Mem0Baseline, _wrap_list
 
@@ -190,6 +210,7 @@ class FlakyLLM(FakeLLM):
         return super().chat(role, messages, **kw)
 
 
+@needs_mem0
 def test_mem0_baseline_skips_a_failing_session(offline_settings: Settings) -> None:
     from cuemem.evals.mem0_baseline import Mem0Baseline
 
@@ -212,6 +233,7 @@ def test_mem0_baseline_skips_a_failing_session(offline_settings: Settings) -> No
     assert "s2" in build["failed_sessions"][0]
 
 
+@needs_mem0
 def test_mem0_baseline_does_not_rebuild_after_a_failed_build(
     offline_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -242,3 +264,154 @@ def test_mem0_baseline_does_not_rebuild_after_a_failed_build(
         with pytest.raises(RuntimeError):
             method.answer(ctx)
     assert calls == ["conv"]  # 只尝试一次：同一份历史后面的题直接报错，不再花钱重建
+
+
+# ---------- 写入记录：协议与会话 ID 的写法（不需要 mem0ai） ----------
+
+PQ = "qwen3.8-flash|qwen3.7-text-embedding:1024"
+PDS = "deepseek-flash|BAAI/bge-small-en-v1.5:384"
+
+
+def _offline(root: Path, monkeypatch: pytest.MonkeyPatch, built: list[str]) -> Any:
+    """不导入 mem0：写入换成只建目录、记一笔（_ensure_built 之外的都不碰）。"""
+    from cuemem.evals.mem0_baseline import Mem0Baseline
+
+    def build(self: Any, key: str, sessions: Sequence[EvalSession]) -> dict[str, Any]:
+        built.append(key)
+        (self.root / key / "qdrant").mkdir(parents=True)  # 真正的写入在这里建 Mem0 的存储
+        return {"memories": 1, "spent": 0.0}
+
+    monkeypatch.setattr(Mem0Baseline, "_build", build)
+    method = Mem0Baseline()
+    method.root, method.protocol = root, PQ
+    return method
+
+
+def test_mem0_records_and_checks_the_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """build.json 记下协议；另一个协议的写入（目录名相同）报错，目录与文件原样不动；没记协议
+    的旧记录（N11、pds 现存的写入）按当前协议复用。"""
+    built: list[str] = []
+    method = _offline(tmp_path, monkeypatch, built)
+    key = "locomo_conv-1"
+    record = tmp_path / key / "build.json"
+    stats = method._ensure_built(key, _sessions())
+    assert stats is not None and stats["protocol"] == PQ and built == [key]
+    stored = json.loads(record.read_text("utf-8"))
+    assert stored["protocol"] == PQ
+    # 写入时装着的全部包只记进 build.json，不进触发写入那道题的 details（results.jsonl）
+    assert stored["environment"]["openai"] == metadata.version("openai")
+    assert "environment" not in stats
+    assert method._ensure_built(key, _sessions()) is None and built == [key]
+
+    method.protocol = PDS  # 忘了设 CUEMEM_PATHS__EVAL_SPACES
+    before = record.read_bytes()
+    with pytest.raises(ConfigMismatchError) as caught:
+        method._ensure_built(key, _sessions())
+    assert str(tmp_path / key) in str(caught.value) and PQ in str(caught.value)
+    assert "CUEMEM_PATHS__EVAL_SPACES=data/eval-spaces-qwen" in str(caught.value)
+    assert record.read_bytes() == before and (tmp_path / key / "qdrant").is_dir()
+    assert built == [key]
+
+    legacy = {"memories": 3, "perspectives": ["Ana", "Ben"], "failed_sessions": []}
+    record.write_text(json.dumps(legacy), "utf-8")
+    assert method._ensure_built(key, _sessions()) is None and built == [key]
+
+
+def test_mem0_checks_the_protocol_before_the_session_id_scheme(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """会话 ID 的写法对不上时照旧重建（同一协议）；另一个协议的写入哪怕写法也对不上，也先报错，
+    不会被当成要重建的旧写入删掉。"""
+    built: list[str] = []
+    method = _offline(tmp_path, monkeypatch, built)
+    key = "longmemeval_s-anon_q1"
+    directory = tmp_path / key
+    directory.mkdir()
+    record = directory / "build.json"
+    record.write_text(json.dumps({"protocol": PDS}), "utf-8")  # 没记写法：原始 ID
+    with pytest.raises(ConfigMismatchError):
+        method._ensure_built(key, _sessions(), "anon")
+    assert json.loads(record.read_text("utf-8")) == {"protocol": PDS} and built == []
+
+    record.write_text(json.dumps({"protocol": PQ}), "utf-8")
+    stats = method._ensure_built(key, _sessions(), "anon")
+    assert stats is not None and stats["session_ids"] == "anon" and built == [key]
+    assert method._ensure_built(key, _sessions(), "anon") is None
+
+
+def test_mem0_llm_falls_back_after_one_timeout(settings: Settings) -> None:
+    """Mem0 的抽取经 CueMem 的 LLM 客户端：主模型超时一次就换备用模型（以前 SDK 先重发
+    max_retries 次）。不需要装 mem0。"""
+    from fakes import TIMEOUT, FakeAPI
+
+    from cuemem.evals.mem0_baseline import _LLM
+    from cuemem.llm.client import LLMClient
+
+    fake = FakeAPI()
+    fake.chat_replies = [lambda body: TIMEOUT if body["model"] == "qwen3.8-flash" else "{}"]
+    llm = LLMClient(settings, http_client=fake.client(), sleep=lambda _: None)
+    reply = _LLM(llm, "mem0|x").generate_response([{"role": "user", "content": "hi"}])
+    assert reply == "{}"
+    assert [r["model"] for r in fake.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+
+
+def test_mem0_llm_read_only_replays_a_cached_fallback(settings: Settings, tmp_path: Path) -> None:
+    """构建时主模型被拒、备用模型回答：只读重放（--cache-only，reproduce.py 的 N11 M0）时主模型
+    未命中就换备用模型，拿到构建时的回复，不发请求。以前 CacheMissError。"""
+    from fakes import REJECT, FakeAPI
+
+    from cuemem.errors import CacheMissError
+    from cuemem.evals.mem0_baseline import _LLM
+    from cuemem.llm import LLMClient, ResponseCache
+
+    fake = FakeAPI()
+    fake.chat_replies = [lambda body: REJECT if body["model"] == "qwen3.8-flash" else "{}"]
+    cache = ResponseCache(tmp_path / "llm.sqlite")
+    messages = [{"role": "user", "content": "hi"}]
+    build = LLMClient(settings, cache=cache, http_client=fake.client())
+    assert _LLM(build, "mem0|x").generate_response(messages) == "{}"
+    assert [r["model"] for r in fake.chat_requests] == ["qwen3.8-flash", "deepseek-flash"]
+
+    read_only = settings.model_copy(update={"llm_cache_mode": "read_only"})
+    replay = LLMClient(read_only, cache=cache, http_client=fake.client())
+    fake.chat_requests.clear()
+    assert _LLM(replay, "mem0|x").generate_response(messages) == "{}"
+    with pytest.raises(CacheMissError, match="deepseek-flash"):  # 两个都未命中
+        _LLM(replay, "mem0|x").generate_response([*messages, *messages])
+    assert fake.chat_requests == []
+
+
+def test_mem0_llm_treats_the_extractor_itself_as_no_fallback(settings: Settings) -> None:
+    """consolidation.fallback_model 就是抽取模型时等于没有备用模型（与 LLMClient.structured、
+    评测网关相同）：超时照常重试，一共 1 + max_retries 次。以前先只发一次（以为有备用），再把
+    同样的请求当备用重发满 1 + max_retries 次。"""
+    from fakes import TIMEOUT, FakeAPI
+    from openai import APITimeoutError
+    from pydantic import BaseModel
+
+    from cuemem.evals.mem0_baseline import _LLM
+    from cuemem.llm.client import LLMClient
+
+    class Out(BaseModel):
+        a: int = 0
+
+    extractor = settings.roles["extractor"].model
+    cons = settings.consolidation.model_copy(update={"fallback_model": extractor})
+    same = settings.model_copy(update={"consolidation": cons})
+    attempts = 1 + same.providers[same.models[extractor].provider].max_retries
+    messages = [{"role": "user", "content": "hi"}]
+    sent: dict[str, list[str]] = {}
+    for name in ("mem0", "structured"):
+        fake = FakeAPI()
+        fake.chat_replies = [lambda body: TIMEOUT]
+        llm = LLMClient(same, http_client=fake.client(), sleep=lambda _: None)
+        with pytest.raises(APITimeoutError):
+            if name == "mem0":
+                _LLM(llm, "mem0|x").generate_response(messages)
+            else:
+                llm.structured("extractor", messages, Out, fallback_model=extractor)
+        sent[name] = [r["model"] for r in fake.chat_requests]
+    model_id = same.models[extractor].model_id
+    assert sent["mem0"] == sent["structured"] == [model_id] * attempts

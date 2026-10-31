@@ -1,0 +1,48 @@
+name: 依赖审计
+
+# 锁文件里的依赖有没有已公开的安全公告（pip-audit 查 PyPI 的漏洞库）。不在规则集的必需检查里：
+# 新的公告不需要代码改动就会出现，红了说明要升级依赖（Dependabot 的安全更新会开 PR），不该挡住
+# 无关的合并。每周另跑一次，没有推送时也能发现。GitHub 依赖图的文档没有列出 uv.lock，Dependabot
+# 的提醒未必看得到间接依赖（certifi、brotli、filelock 这类），这里按锁文件逐个查
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * 3" # 每周三（UTC）
+
+# 令牌只读；第三方 Action 按提交号固定（同 ci.yml，tests/test_ci_pins.py 核对）
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
+          # 不用缓存：setup-uv 的缓存键不分任务，这里存进去的缓存（只有 pip-audit）会被 CI 的任务取到
+          enable-cache: false
+      # 导出带哈希、不带项目本身（--no-emit-project）：--disable-pip 只认全部带哈希的文件，
+      # 不带哈希（--no-hashes）或带着 "-e ." 时 pip-audit 直接报错退出
+      - name: 镜像里装的依赖（与 Dockerfile 相同：--no-dev --extra ui --extra local）
+        run: |
+          uv export --locked --no-dev --extra ui --extra local --no-emit-project \
+            --format requirements-txt -o image.txt
+          uvx pip-audit==2.10.1 -r image.txt --disable-pip
+      - name: 全部依赖（所有可选依赖与开发依赖）
+        # 上一步红了也跑：看得出公告只在开发依赖里（如 pre-commit 带的 virtualenv）还是在镜像里
+        if: ${{ !cancelled() }}
+        run: |
+          uv export --locked --all-extras --all-groups --no-emit-project \
+            --format requirements-txt -o all.txt
+          uvx pip-audit==2.10.1 -r all.txt --disable-pip

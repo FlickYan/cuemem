@@ -1,0 +1,56 @@
+# OpenAI 预设（N12，D-060）：叠加在默认配置上，所有角色换成 OpenAI 的模型，向量用 text-embedding-3-small。
+# 用法：CUEMEM_PRESET=openai（或 cuemem --preset openai …、Memory(preset="openai")）；
+# Key 放在 OPENAI_API_KEY（cuemem configure 只会问用得到的 Key）。
+#
+# 价格：美元 / 百万 tokens，2026-10-14 按 OpenRouter 上转列的 OpenAI 标价核对（开发环境访问不了
+# OpenAI 官网价格页），以官网为准。模型 ID 以 `cuemem doctor --live` 的实测结果为准。
+# 换了向量模型的数据目录不能混用：记忆库记录了建库时的向量模型，换了会明确报错。
+
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    max_concurrency: 8
+
+models:
+  gpt-5.4-mini:
+    provider: openai
+    model_id: gpt-5.4-mini
+    context_window: 400000
+    vision: true
+    price: {input: 0.75, cached_input: 0.075, output: 4.50}
+    # GPT-5 系列是推理模型：只接受默认温度、输出上限叫 max_completion_tokens；推理强度调低，
+    # 抽取与回答不需要长时间思考
+    fixed_temperature: true
+    max_tokens_param: max_completion_tokens
+    extra_body: {reasoning_effort: low}
+
+# 主 reader 与 judge 同一家族会有"给自己打高分"的偏差（D-008）；只做评测时建议把 judge 换成别家的模型
+roles:
+  extractor: {model: gpt-5.4-mini}
+  planner: {model: gpt-5.4-mini}
+  reader: {model: gpt-5.4-mini}
+  vlm: {model: gpt-5.4-mini}
+  captioner: {model: gpt-5.4-mini}
+  judge: {model: gpt-5.4-mini}
+  agent: {model: gpt-5.4-mini, max_tokens: 4000}   # 推理 token 也算在上限里，留足余量
+
+embedding:
+  backend: openai
+  provider: openai
+  model: text-embedding-3-small
+  dim: 1536
+  batch_size: 64
+  max_concurrency: 4
+  price_per_m: 0.02
+
+# OpenAI 没有图文同空间的向量模型：图片照样保存、生成描述、按描述检索，只是不能以图搜图
+multimodal_embedding:
+  backend: none
+
+# OpenAI 没有重排接口：L2 跳过重排（其余步骤不变）
+rerank:
+  provider: null
+
+consolidation:
+  fallback_model: null   # 默认配置的兜底模型是 DeepSeek 的；这里不跨供应商兜底

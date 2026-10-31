@@ -1,0 +1,600 @@
+{
+  "protocol": "pds",
+  "dataset": "locomo",
+  "runs": [
+    "pds-locomo-amem",
+    "pds-locomo-cognee",
+    "pds-locomo-cuemem",
+    "pds-locomo-graphiti",
+    "pds-locomo-langmem",
+    "pds-locomo-mem0"
+  ],
+  "questions": 200,
+  "dropped": {},
+  "labels": {
+    "B1": "Full context",
+    "B2": "Naive RAG (dense top-10)",
+    "B4-nobm25": "CueMem L1",
+    "B5": "CueMem L2",
+    "B6": "CueMem controller",
+    "M0": "Mem0 2.2.1 (OSS)",
+    "MG": "Graphiti (graphiti-core 0.30.2)",
+    "ML": "LangMem 0.0.30",
+    "MC": "Cognee 1.6.4",
+    "MA": "A-MEM (agiresearch/A-mem@ceffb86)"
+  },
+  "methods": {
+    "B1": {
+      "n": 200,
+      "accuracy": 0.845,
+      "ci95": [
+        0.7884,
+        0.8886
+      ],
+      "answer_cost_per_1k": 6.887,
+      "answer_tokens_mean": 22706,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.639
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.538
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.973
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.775
+        }
+      },
+      "write": {}
+    },
+    "B2": {
+      "n": 200,
+      "accuracy": 0.595,
+      "ci95": [
+        0.5258,
+        0.6606
+      ],
+      "answer_cost_per_1k": 0.371,
+      "answer_tokens_mean": 1006,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.389
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.308
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.685
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.625
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.92,
+        "session_recall_all": 0.8545,
+        "turn_recall_any": 0.67,
+        "turn_recall_all": 0.5872
+      },
+      "write": {
+        "cost": 0.0,
+        "spent": 0.0,
+        "llm_calls": 0.0,
+        "seconds": 256.8443,
+        "spaces": 0.0
+      }
+    },
+    "B4-nobm25": {
+      "n": 200,
+      "accuracy": 0.825,
+      "ci95": [
+        0.7664,
+        0.8714
+      ],
+      "answer_cost_per_1k": 1.382,
+      "answer_tokens_mean": 4333,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.667
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.462
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.901
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.875
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.99,
+        "session_recall_all": 0.9789,
+        "turn_recall_any": 0.925,
+        "turn_recall_all": 0.8812
+      },
+      "write": {
+        "cost": 0.529,
+        "spent": 0.2222,
+        "llm_calls": 438.0,
+        "seconds": 903.3575,
+        "spaces": 7.0
+      }
+    },
+    "B5": {
+      "n": 200,
+      "accuracy": 0.87,
+      "ci95": [
+        0.8163,
+        0.9097
+      ],
+      "answer_cost_per_1k": 4.108,
+      "answer_tokens_mean": 12255,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.75
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.538
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.937
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.9
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 1.0,
+        "session_recall_all": 0.997,
+        "turn_recall_any": 0.955,
+        "turn_recall_all": 0.9261
+      },
+      "write": {
+        "cost": 0.529,
+        "spent": 0.2222,
+        "llm_calls": 438.0,
+        "seconds": 903.3575,
+        "spaces": 7.0
+      }
+    },
+    "B6": {
+      "n": 200,
+      "accuracy": 0.835,
+      "ci95": [
+        0.7773,
+        0.88
+      ],
+      "answer_cost_per_1k": 2.814,
+      "answer_tokens_mean": 8480,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.75
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.462
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.901
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.85
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.995,
+        "session_recall_all": 0.9897,
+        "turn_recall_any": 0.94,
+        "turn_recall_all": 0.9087
+      },
+      "write": {
+        "cost": 0.529,
+        "spent": 0.2222,
+        "llm_calls": 438.0,
+        "seconds": 903.3575,
+        "spaces": 7.0
+      }
+    },
+    "M0": {
+      "n": 200,
+      "accuracy": 0.81,
+      "ci95": [
+        0.75,
+        0.8583
+      ],
+      "answer_cost_per_1k": 1.371,
+      "answer_tokens_mean": 4289,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.639
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.385
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.91
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.825
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 1.0,
+        "session_recall_all": 0.9891,
+        "turn_recall_any": null,
+        "turn_recall_all": null
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 1.3815,
+        "spent": 0.242,
+        "llm_calls": 404.0,
+        "seconds": 1887.9716,
+        "memories": 4059.0
+      },
+      "build": {
+        "failed_sessions": 0
+      }
+    },
+    "MG": {
+      "n": 200,
+      "accuracy": 0.59,
+      "ci95": [
+        0.5208,
+        0.6558
+      ],
+      "answer_cost_per_1k": 1.092,
+      "answer_tokens_mean": 3358,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.583
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.231
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.64
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.575
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.92,
+        "session_recall_all": 0.8843,
+        "turn_recall_any": 0.735,
+        "turn_recall_all": 0.6385
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 9.9923,
+        "spent": 1.5084,
+        "llm_calls": 14240.0,
+        "seconds": 7265.0,
+        "memories": 0.0
+      },
+      "build": {
+        "entities": 1253,
+        "facts": 3426,
+        "failed_episodes": 0,
+        "target_entity_not_found_per_space": [
+          4,
+          15
+        ]
+      }
+    },
+    "ML": {
+      "n": 200,
+      "accuracy": 0.78,
+      "ci95": [
+        0.7176,
+        0.8318
+      ],
+      "answer_cost_per_1k": 1.481,
+      "answer_tokens_mean": 4623,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.639
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.462
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.865
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.775
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.88,
+        "session_recall_all": 0.8407,
+        "turn_recall_any": null,
+        "turn_recall_all": null
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 0.563,
+        "spent": 0.2386,
+        "llm_calls": 211.0,
+        "seconds": 23276.5,
+        "memories": 705.0
+      },
+      "build": {
+        "sessions": 202,
+        "empty_sessions": 2,
+        "memories_over_embed_limit": 2,
+        "longest_memory_chars": 10122
+      }
+    },
+    "MC": {
+      "n": 200,
+      "accuracy": 0.775,
+      "ci95": [
+        0.7123,
+        0.8274
+      ],
+      "answer_cost_per_1k": 1.787,
+      "answer_tokens_mean": 5683,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.667
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.462
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.838
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.8
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.995,
+        "session_recall_all": 0.9725,
+        "turn_recall_any": 0.855,
+        "turn_recall_all": 0.766
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 2.845,
+        "spent": 0.7975,
+        "llm_calls": 4547.0,
+        "seconds": 10110.7,
+        "memories": 0.0
+      },
+      "build": {
+        "nodes": 6663,
+        "edges": 18954
+      }
+    },
+    "MA": {
+      "n": 200,
+      "accuracy": 0.58,
+      "ci95": [
+        0.5107,
+        0.6463
+      ],
+      "answer_cost_per_1k": 3.475,
+      "answer_tokens_mean": 11247,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.444
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.231
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.667
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.575
+        }
+      },
+      "retrieval": {
+        "session_recall_any": 0.9,
+        "session_recall_all": 0.865,
+        "turn_recall_any": 0.675,
+        "turn_recall_all": 0.5969
+      },
+      "write": {
+        "spaces": 7.0,
+        "cost": 17.5673,
+        "spent": 7.8772,
+        "llm_calls": 9161.0,
+        "seconds": 50907.1,
+        "memories": 4431.0
+      },
+      "build": {
+        "links": 15961,
+        "evolved": 4300
+      }
+    }
+  },
+  "paired": {
+    "B4-nobm25_vs_B1": {
+      "wins": 9,
+      "losses": 13,
+      "p": 0.5235
+    },
+    "B4-nobm25_vs_B2": {
+      "wins": 49,
+      "losses": 3,
+      "p": 0.0
+    },
+    "B4-nobm25_vs_B5": {
+      "wins": 6,
+      "losses": 15,
+      "p": 0.0784
+    },
+    "B4-nobm25_vs_B6": {
+      "wins": 6,
+      "losses": 8,
+      "p": 0.7905
+    },
+    "B4-nobm25_vs_M0": {
+      "wins": 14,
+      "losses": 11,
+      "p": 0.69
+    },
+    "B4-nobm25_vs_MG": {
+      "wins": 55,
+      "losses": 8,
+      "p": 0.0
+    },
+    "B4-nobm25_vs_ML": {
+      "wins": 24,
+      "losses": 15,
+      "p": 0.1996
+    },
+    "B4-nobm25_vs_MC": {
+      "wins": 20,
+      "losses": 10,
+      "p": 0.0987
+    },
+    "B4-nobm25_vs_MA": {
+      "wins": 56,
+      "losses": 7,
+      "p": 0.0
+    },
+    "B5_vs_B1": {
+      "wins": 12,
+      "losses": 7,
+      "p": 0.3593
+    },
+    "B5_vs_B2": {
+      "wins": 59,
+      "losses": 4,
+      "p": 0.0
+    },
+    "B5_vs_B4-nobm25": {
+      "wins": 15,
+      "losses": 6,
+      "p": 0.0784
+    },
+    "B5_vs_B6": {
+      "wins": 7,
+      "losses": 0,
+      "p": 0.0156
+    },
+    "B5_vs_M0": {
+      "wins": 17,
+      "losses": 5,
+      "p": 0.0169
+    },
+    "B5_vs_MG": {
+      "wins": 62,
+      "losses": 6,
+      "p": 0.0
+    },
+    "B5_vs_ML": {
+      "wins": 25,
+      "losses": 7,
+      "p": 0.0021
+    },
+    "B5_vs_MC": {
+      "wins": 27,
+      "losses": 8,
+      "p": 0.0019
+    },
+    "B5_vs_MA": {
+      "wins": 64,
+      "losses": 6,
+      "p": 0.0
+    }
+  },
+  "sensitivity": {
+    "MA-k40": {
+      "runs": [
+        "k40-pds-locomo-amem"
+      ],
+      "n": 200,
+      "accuracy": 0.75,
+      "ci95": [
+        0.6857,
+        0.8049
+      ],
+      "answer_cost_per_1k": 8.966,
+      "answer_tokens_mean": 29550,
+      "by_type": {
+        "multi-hop": {
+          "n": 36,
+          "accuracy": 0.667
+        },
+        "open-domain": {
+          "n": 13,
+          "accuracy": 0.308
+        },
+        "single-hop": {
+          "n": 111,
+          "accuracy": 0.856
+        },
+        "temporal": {
+          "n": 40,
+          "accuracy": 0.675
+        }
+      },
+      "write": "same as MA",
+      "paired": {
+        "MA-k40_vs_MA": {
+          "wins": 40,
+          "losses": 6,
+          "p": 0.0
+        },
+        "B4-nobm25_vs_MA-k40": {
+          "wins": 27,
+          "losses": 12,
+          "p": 0.0237
+        },
+        "B5_vs_MA-k40": {
+          "wins": 32,
+          "losses": 8,
+          "p": 0.0002
+        }
+      }
+    }
+  }
+}

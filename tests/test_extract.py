@@ -1,9 +1,9 @@
-"""抽取：会话渲染、宽松解析（模型输出不规范时不应整条失败）、超长会话切窗、谓词规范化。"""
+"""抽取：会话渲染、宽松解析（模型输出不规范时不应整条失败）、超长会话切窗、谓词与名字的规范化。"""
 
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fakes import FakeAPI
 
@@ -12,8 +12,14 @@ from cuemem.core.models import SessionIn, TurnIn
 from cuemem.core.timeutil import normalize_partial_date
 from cuemem.llm import LLMClient
 from cuemem.write import build_turns
-from cuemem.write.extract import ExtractionOutput, Extractor, render_session
-from cuemem.write.predicates import normalize_predicate, registered_cardinality
+from cuemem.write.entities import normalize_name
+from cuemem.write.extract import DATED_NOTE, ExtractionOutput, Extractor, render_session
+from cuemem.write.predicates import (
+    legacy_value_key,
+    normalize_predicate,
+    normalize_value,
+    registered_cardinality,
+)
 
 WHEN = datetime(2023, 5, 20, 9, 0)
 
@@ -133,6 +139,37 @@ def test_deleted_gaps_are_marked_only_where_messages_were_deleted(
     assert len(marked) == 1 and "[deleted]\n[t5]" in marked[0]
 
 
+def test_turns_said_on_another_day_get_a_date_line() -> None:
+    """一段会话跨了几天（复用的 run_id、LangGraph 的线程）：换了日期的发言前标出日期，加一行
+    说明。同一天里的会话（评测的会话、Agent 的一次对话）渲染结果与之前逐字相同。"""
+    turns = session(
+        ("user", "I adopted a dog."), ("assistant", "Nice."), ("user", "I moved yesterday.")
+    )
+    expected = (
+        "Conversation date: 2023-05-20 (Saturday)\n"
+        "Participants: User, Assistant (AI)\n"
+        "Language: English\n"
+        "\n"
+        "[t0] User: I adopted a dog.\n"
+        "[t1] Assistant: Nice.\n"
+        "[t2] User: I moved yesterday."
+    )
+    assert render_session(turns, WHEN, assistant_chars=None) == expected
+    same_day = [*turns[:2], turns[2].model_copy(update={"ts": WHEN + timedelta(hours=14)})]
+    assert render_session(same_day, WHEN, assistant_chars=None) == expected
+
+    later = [*turns[:2], turns[2].model_copy(update={"ts": datetime(2023, 5, 28, 18, 0)})]
+    text = render_session(later, WHEN, assistant_chars=None)
+    header, body = text.split("\n\n")
+    assert header == expected.split("\n\n")[0] + "\n" + DATED_NOTE
+    assert body == (
+        "[t0] User: I adopted a dog.\n"
+        "[t1] Assistant: Nice.\n"
+        "[Date: 2023-05-28 (Sunday)]\n"
+        "[t2] User: I moved yesterday."
+    )
+
+
 def test_predicate_normalization() -> None:
     assert normalize_predicate("Lives In") == "lives_in"
     assert normalize_predicate("employer") == "works_at"
@@ -140,3 +177,44 @@ def test_predicate_normalization() -> None:
     assert registered_cardinality("job_title") == "single"
     assert registered_cardinality("visited") == "multi"
     assert registered_cardinality("laptop_budget") is None
+
+
+def test_normalization_keeps_other_scripts() -> None:
+    """西里尔、希腊、韩文、假名等文字不再被规范化成 ''：两个俄文名字是两个键，'서울' 与
+    '부산' 不再相同，日文句子不再只剩汉字。"""
+    assert normalize_name("Анна") == "анна" and normalize_name("Иван") == "иван"
+    assert normalize_name("Μαρία") == "μαρία" and normalize_name("민준") == "민준"
+    assert normalize_value("Москва") == "москва"
+    assert normalize_value("서울") != normalize_value("부산")
+    assert normalize_value("The user has a dog named 초코.") == "user has a dog named 초코"
+    assert normalize_value("ユーザーは東京に住んでいる。") == "ユーザーは東京に住んでいる"
+    assert normalize_predicate("живёт в") == "живёт_в"
+    assert normalize_predicate("—") == "related_to"
+    # 派生事实 ID 用的旧键不变
+    assert legacy_value_key("The user has a dog named 초코.") == "user has a dog named"
+
+
+def test_normalization_of_latin_and_chinese_is_unchanged() -> None:
+    """拉丁字母（含带重音的）与中文的键与原来逐字相同：评测里已有的事实 ID、实体与对账不变。"""
+    values = {
+        "The user reads Brené Brown.": "user reads bren brown",
+        "A Wüsthof chef's knife": "w sthof chef s knife",
+        "Zoë": "zo",
+        "x² café": "x caf",
+        "用户住在北京。": "用户住在北京",
+        "My dog Max (golden retriever)": "dog max golden retriever",
+        "The user lives in New York City.": "user lives in new york city",
+    }
+    for text, key in values.items():
+        assert normalize_value(text) == key == legacy_value_key(text)
+    names = {
+        "Brené Brown": "bren brown",
+        "Wüsthof": "w sthof",
+        "Zoë": "zo",
+        "林晓": "林晓",
+        "The User": "the user",
+        "Dr. Who": "dr who",
+    }
+    for text, key in names.items():
+        assert normalize_name(text) == key
+    assert normalize_predicate("最喜欢的颜色") == "最喜欢的颜色"

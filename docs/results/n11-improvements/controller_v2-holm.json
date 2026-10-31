@@ -1,0 +1,1118 @@
+{
+ "source": "controller_v2.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "开发集：总体": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 2,
+   "tests": {
+    "v2 vs v1": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 0.4531,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs always-L2": {
+     "wins": 8,
+     "losses": 29,
+     "p": 0.0008,
+     "p_holm": 0.0015,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "开发集：longmemeval_s": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 1,
+   "tests": {
+    "v2 vs always-L2": {
+     "wins": 1,
+     "losses": 6,
+     "p": 0.125,
+     "p_holm": 0.125,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "开发集：locomo": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 1,
+   "tests": {
+    "v2 vs always-L2": {
+     "wins": 7,
+     "losses": 17,
+     "p": 0.0639,
+     "p_holm": 0.0639,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "开发集：memlens_32k": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 2,
+   "tests": {
+    "v2 vs v1": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 0.4531,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs always-L2": {
+     "wins": 0,
+     "losses": 6,
+     "p": 0.0312,
+     "p_holm": 0.0625,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "测试集事后分析：总体": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 2,
+   "tests": {
+    "v2 vs v1": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 0.3018,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs always-L2": {
+     "wins": 15,
+     "losses": 59,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "测试集事后分析：longmemeval_s": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 2,
+   "tests": {
+    "v2 vs always-L2": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 0.0694,
+     "nominal": true,
+     "holm": false
+    },
+    "v2 vs always-L1": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "测试集事后分析：locomo": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 2,
+   "tests": {
+    "v2 vs always-L2": {
+     "wins": 7,
+     "losses": 34,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "v2 vs always-L1": {
+     "wins": 42,
+     "losses": 13,
+     "p": 0.0001,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "测试集事后分析：memlens_32k": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 4,
+   "tests": {
+    "table only vs v1": {
+     "wins": 7,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs v1": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 0.9053,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs always-L2": {
+     "wins": 2,
+     "losses": 8,
+     "p": 0.1094,
+     "p_holm": 0.4375,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs always-L1": {
+     "wins": 11,
+     "losses": 12,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "测试集事后分析：memlens_128k": {
+   "description": "v2 控制器对 v1 与固定档位",
+   "m": 4,
+   "tests": {
+    "table only vs v1": {
+     "wins": 3,
+     "losses": 5,
+     "p": 0.7266,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs v1": {
+     "wins": 5,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "v2 vs always-L2": {
+     "wins": 1,
+     "losses": 9,
+     "p": 0.0215,
+     "p_holm": 0.0859,
+     "nominal": true,
+     "holm": false
+    },
+    "v2 vs always-L1": {
+     "wins": 19,
+     "losses": 8,
+     "p": 0.0522,
+     "p_holm": 0.1567,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.8-flash）：longmemeval_s": {
+   "description": "换回答模型后控制器与校准的对比",
+   "m": 5,
+   "tests": {
+    "B6 v2 + dev calibration vs B6 v2": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 0.625,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + dev calibration vs L2": {
+     "wins": 4,
+     "losses": 8,
+     "p": 0.3877,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 vs L2": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs L2": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.8-flash）：longmemeval_s λ 扫描": {
+   "description": "各个 λ 下控制器对 L2",
+   "m": 4,
+   "tests": {
+    "λ=30": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=15": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=10": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=5": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.8-flash）：locomo": {
+   "description": "换回答模型后控制器与校准的对比",
+   "m": 5,
+   "tests": {
+    "B6 v2 + dev calibration vs B6 v2": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 0.3594,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + dev calibration vs L2": {
+     "wins": 4,
+     "losses": 17,
+     "p": 0.0072,
+     "p_holm": 0.036,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 v2 vs L2": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 0.1543,
+     "nominal": true,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs L2": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 0.1543,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.8-flash）：locomo λ 扫描": {
+   "description": "各个 λ 下控制器对 L2",
+   "m": 3,
+   "tests": {
+    "λ=30": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 0.1157,
+     "nominal": true,
+     "holm": false
+    },
+    "λ=15": {
+     "wins": 1,
+     "losses": 4,
+     "p": 0.375,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=10": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.6-35b-a3b）：longmemeval_s": {
+   "description": "换回答模型后控制器与校准的对比",
+   "m": 3,
+   "tests": {
+    "B6 v2 vs L2": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.0312,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs L2": {
+     "wins": 0,
+     "losses": 8,
+     "p": 0.0078,
+     "p_holm": 0.0234,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描": {
+   "description": "各个 λ 下控制器对 L2",
+   "m": 4,
+   "tests": {
+    "λ=30": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.0625,
+     "nominal": true,
+     "holm": false
+    },
+    "λ=15": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=10": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=5": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.6-35b-a3b）：locomo": {
+   "description": "换回答模型后控制器与校准的对比",
+   "m": 3,
+   "tests": {
+    "B6 v2 vs L2": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 0.5391,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 6,
+     "losses": 4,
+     "p": 0.7539,
+     "p_holm": 0.9062,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs L2": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 0.9062,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（qwen3.6-35b-a3b）：locomo λ 扫描": {
+   "description": "各个 λ 下控制器对 L2",
+   "m": 2,
+   "tests": {
+    "λ=30": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 0.3594,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=15": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（deepseek-flash）：longmemeval_s": {
+   "description": "换回答模型后控制器与校准的对比",
+   "m": 3,
+   "tests": {
+    "B6 v2 vs L2": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 0.8672,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs L2": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 0.9062,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（deepseek-flash）：longmemeval_s λ 扫描": {
+   "description": "各个 λ 下控制器对 L2",
+   "m": 4,
+   "tests": {
+    "λ=30": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=15": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=10": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "λ=5": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（deepseek-flash）：locomo": {
+   "description": "换回答模型后控制器与校准的对比",
+   "m": 3,
+   "tests": {
+    "B6 v2 vs L2": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 0.375,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 5,
+     "losses": 5,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 v2 + 2-fold calibration vs L2": {
+     "wins": 1,
+     "losses": 5,
+     "p": 0.2188,
+     "p_holm": 0.4375,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "换回答模型（deepseek-flash）：locomo λ 扫描": {
+   "description": "各个 λ 下控制器对 L2",
+   "m": 1,
+   "tests": {
+    "λ=30": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 0.125,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 60,
+   "tests": {
+    "开发集：总体 | v2 vs v1": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "开发集：总体 | v2 vs always-L2": {
+     "wins": 8,
+     "losses": 29,
+     "p": 0.0008,
+     "p_holm": 0.0429,
+     "nominal": true,
+     "holm": true
+    },
+    "开发集：longmemeval_s | v2 vs always-L2": {
+     "wins": 1,
+     "losses": 6,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "开发集：locomo | v2 vs always-L2": {
+     "wins": 7,
+     "losses": 17,
+     "p": 0.0639,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "开发集：memlens_32k | v2 vs v1": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "开发集：memlens_32k | v2 vs always-L2": {
+     "wins": 0,
+     "losses": 6,
+     "p": 0.0312,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "测试集事后分析：总体 | v2 vs v1": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：总体 | v2 vs always-L2": {
+     "wins": 15,
+     "losses": 59,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "测试集事后分析：longmemeval_s | v2 vs always-L2": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "测试集事后分析：longmemeval_s | v2 vs always-L1": {
+     "wins": 10,
+     "losses": 10,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：locomo | v2 vs always-L2": {
+     "wins": 7,
+     "losses": 34,
+     "p": 0.0,
+     "p_holm": 0.0015,
+     "nominal": true,
+     "holm": true
+    },
+    "测试集事后分析：locomo | v2 vs always-L1": {
+     "wins": 42,
+     "losses": 13,
+     "p": 0.0001,
+     "p_holm": 0.0066,
+     "nominal": true,
+     "holm": true
+    },
+    "测试集事后分析：memlens_32k | table only vs v1": {
+     "wins": 7,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：memlens_32k | v2 vs v1": {
+     "wins": 10,
+     "losses": 5,
+     "p": 0.3018,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：memlens_32k | v2 vs always-L2": {
+     "wins": 2,
+     "losses": 8,
+     "p": 0.1094,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：memlens_32k | v2 vs always-L1": {
+     "wins": 11,
+     "losses": 12,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：memlens_128k | table only vs v1": {
+     "wins": 3,
+     "losses": 5,
+     "p": 0.7266,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：memlens_128k | v2 vs v1": {
+     "wins": 5,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "测试集事后分析：memlens_128k | v2 vs always-L2": {
+     "wins": 1,
+     "losses": 9,
+     "p": 0.0215,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "测试集事后分析：memlens_128k | v2 vs always-L1": {
+     "wins": 19,
+     "losses": 8,
+     "p": 0.0522,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s | B6 v2 + dev calibration vs B6 v2": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s | B6 v2 + dev calibration vs L2": {
+     "wins": 4,
+     "losses": 8,
+     "p": 0.3877,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s | B6 v2 vs L2": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s | B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s | B6 v2 + 2-fold calibration vs L2": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s λ 扫描 | λ=30": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s λ 扫描 | λ=15": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s λ 扫描 | λ=10": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：longmemeval_s λ 扫描 | λ=5": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo | B6 v2 + dev calibration vs B6 v2": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo | B6 v2 + dev calibration vs L2": {
+     "wins": 4,
+     "losses": 17,
+     "p": 0.0072,
+     "p_holm": 0.4031,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo | B6 v2 vs L2": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo | B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 4,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo | B6 v2 + 2-fold calibration vs L2": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo λ 扫描 | λ=30": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo λ 扫描 | λ=15": {
+     "wins": 1,
+     "losses": 4,
+     "p": 0.375,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.8-flash）：locomo λ 扫描 | λ=10": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s | B6 v2 vs L2": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.8438,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s | B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s | B6 v2 + 2-fold calibration vs L2": {
+     "wins": 0,
+     "losses": 8,
+     "p": 0.0078,
+     "p_holm": 0.4297,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描 | λ=30": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.8438,
+     "nominal": true,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描 | λ=15": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描 | λ=10": {
+     "wins": 0,
+     "losses": 2,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描 | λ=5": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：locomo | B6 v2 vs L2": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：locomo | B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 6,
+     "losses": 4,
+     "p": 0.7539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：locomo | B6 v2 + 2-fold calibration vs L2": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：locomo λ 扫描 | λ=30": {
+     "wins": 2,
+     "losses": 7,
+     "p": 0.1797,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（qwen3.6-35b-a3b）：locomo λ 扫描 | λ=15": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s | B6 v2 vs L2": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s | B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 1,
+     "losses": 0,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s | B6 v2 + 2-fold calibration vs L2": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s λ 扫描 | λ=30": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s λ 扫描 | λ=15": {
+     "wins": 1,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s λ 扫描 | λ=10": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：longmemeval_s λ 扫描 | λ=5": {
+     "wins": 0,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：locomo | B6 v2 vs L2": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：locomo | B6 v2 + 2-fold calibration vs B6 v2": {
+     "wins": 5,
+     "losses": 5,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：locomo | B6 v2 + 2-fold calibration vs L2": {
+     "wins": 1,
+     "losses": 5,
+     "p": 0.2188,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "换回答模型（deepseek-flash）：locomo λ 扫描 | λ=30": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "开发集：memlens_32k | v2 vs always-L2",
+  "测试集事后分析：longmemeval_s | v2 vs always-L2",
+  "测试集事后分析：memlens_128k | v2 vs always-L2",
+  "换回答模型（qwen3.8-flash）：locomo | B6 v2 vs L2",
+  "换回答模型（qwen3.8-flash）：locomo | B6 v2 + 2-fold calibration vs L2",
+  "换回答模型（qwen3.8-flash）：locomo λ 扫描 | λ=30",
+  "换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描 | λ=30",
+  "全文 | 开发集：memlens_32k | v2 vs always-L2",
+  "全文 | 测试集事后分析：longmemeval_s | v2 vs always-L2",
+  "全文 | 测试集事后分析：memlens_128k | v2 vs always-L2",
+  "全文 | 换回答模型（qwen3.8-flash）：locomo | B6 v2 + dev calibration vs L2",
+  "全文 | 换回答模型（qwen3.8-flash）：locomo | B6 v2 vs L2",
+  "全文 | 换回答模型（qwen3.8-flash）：locomo | B6 v2 + 2-fold calibration vs L2",
+  "全文 | 换回答模型（qwen3.8-flash）：locomo λ 扫描 | λ=30",
+  "全文 | 换回答模型（qwen3.6-35b-a3b）：longmemeval_s | B6 v2 vs L2",
+  "全文 | 换回答模型（qwen3.6-35b-a3b）：longmemeval_s | B6 v2 + 2-fold calibration vs L2",
+  "全文 | 换回答模型（qwen3.6-35b-a3b）：longmemeval_s λ 扫描 | λ=30"
+ ]
+}

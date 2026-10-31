@@ -4,16 +4,32 @@ on:
   push:
   pull_request:
 
+# 令牌只读（以前只靠仓库设置）。第三方 Action 按提交号固定、注释着版本；uv 与 Dockerfile 同一个
+# 版本，在 build-system 的 uv_build 范围里（tests/test_ci_pins.py 核对）
+permissions:
+  contents: read
+
+# 同一个 PR 的新推送取消还在跑的旧运行；push 各跑各的（run_id 兜底，不按分支排队）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
           enable-cache: true
+          prune-cache: true
       - name: 安装依赖
-        run: uv sync --locked
+        # 界面与评测的测试要 ui、eval（开发依赖组里也有）；框架集成的测试与类型检查也要跑（N12）
+        run: uv sync --locked --extra ui --extra eval --extra integrations
       - name: 代码风格
         run: |
           uv run ruff check .
@@ -21,4 +37,123 @@ jobs:
       - name: 类型检查
         run: uv run mypy
       - name: 单元测试（离线，不需要 API Key）
+        # tests/conftest.py 的网络守卫：只许连本机，有访问外网的尝试时测试失败
         run: uv run pytest
+
+  qdrant-server:
+    # Qdrant 服务端模式（vector_store.url，docker-compose 推荐的部署）：只在服务端才走的分支——
+    # payload 索引、indexed()、迁到服务端——在别的任务里从不运行（测试都用本地模式）。版本与
+    # docker-compose.yml 相同。服务端要 API Key（vector_store.api_key 每个请求都带上，另有一个
+    # 测试确认不带的被拒绝）；/readyz 不查 Key
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        env:
+          QDRANT__SERVICE__API_KEY: ci-test-key
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
+          enable-cache: true
+          prune-cache: true
+      - name: 安装依赖
+        run: uv sync --locked
+      - name: 等 Qdrant 起来
+        run: |
+          for _ in $(seq 60); do curl -fsS http://localhost:6333/readyz && break; sleep 1; done
+          curl -fsS http://localhost:6333/readyz
+      - name: 服务端模式的测试（不许跳过）
+        shell: bash
+        env:
+          CUEMEM_TEST_QDRANT_URL: http://localhost:6333
+          CUEMEM_TEST_QDRANT_API_KEY: ci-test-key
+        run: |
+          set -o pipefail
+          uv run pytest tests/test_qdrant_server.py -rs | tee pytest.log
+          if grep -q SKIPPED pytest.log; then exit 1; fi
+
+  package:
+    # pip 安装的路径：在仓库外装上构建出的 wheel（只有核心依赖，不带可选依赖），跑命令行、SDK、
+    # HTTP 接口与记忆代理（离线，不需要 API Key）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
+          enable-cache: true
+          prune-cache: true
+      - name: 构建 wheel
+        run: uv build --wheel
+      - name: wheel 里有配置、预设、控制器与类型标记（py.typed）
+        run: |
+          python3 - <<'EOF'
+          import glob
+          import zipfile
+
+          [wheel] = glob.glob("dist/*.whl")
+          names = set(zipfile.ZipFile(wheel).namelist())
+          need = {"cuemem/configs/default.yaml", "cuemem/py.typed"}
+          need |= {f"cuemem/configs/presets/{p}.yaml" for p in ("openai", "ollama", "deepseek", "qwen")}
+          need |= {f"cuemem/read/controller_model{v}.json" for v in ("", "_v1", "_v2")}
+          missing = sorted(need - names)
+          assert not missing, f"wheel 里缺少 {missing}"
+          EOF
+      - name: 在仓库外安装 wheel
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv" dist/*.whl
+      - name: 冒烟测试（哈希向量，数据写在临时目录）
+        working-directory: ${{ runner.temp }}
+        env:
+          CUEMEM_HOME: ${{ runner.temp }}/home
+          CUEMEM_EMBEDDING__BACKEND: hash
+        run: |
+          export PATH="$RUNNER_TEMP/venv/bin:$PATH"
+          # 核心依赖不带界面与评测的包（它们在可选依赖 ui、eval 里）
+          python -c "import importlib.util as u; bad = [m for m in ('gradio', 'matplotlib', 'sklearn') if u.find_spec(m)]; assert not bad, bad"
+          cuemem --help
+          cuemem doctor
+          cuemem mcp --help > /dev/null
+          cuemem proxy --help > /dev/null
+          python "$GITHUB_WORKSPACE/scripts/smoke_wheel.py"
+          # 评测要画图：没装 eval 时说明要装什么
+          if cuemem eval report nothing > eval.log 2>&1; then exit 1; fi
+          grep -F 'cuemem[eval]' eval.log || { cat eval.log; exit 1; }
+          # 默认场景：包里没有导购演示的商品目录，cuemem serve 改用通用助手照常起来；
+          # 没装界面时只启动接口，并说明怎么装
+          cuemem serve --port 7860 > serve.log 2>&1 &
+          pid=$!
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:7860/api/health || { cat serve.log; exit 1; }
+          kill "$pid"
+          grep -F 'cuemem[ui]' serve.log || { cat serve.log; exit 1; }
+
+  docker:
+    # 镜像能构建、带着界面与本机向量的可选依赖（预设 deepseek 要用），启动后 /api/health 正常
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 构建镜像
+        run: docker build -t cuemem:ci .
+      - name: 界面与本机向量的可选依赖在镜像里
+        run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed, gradio"
+      - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设至少 16 个字符的访问令牌）
+        run: |
+          docker run -d --name cuemem -p 127.0.0.1:7860:7860 \
+            -e CUEMEM_API_TOKEN=ci-token-0123456789 -e CUEMEM_EMBEDDING__BACKEND=hash cuemem:ci
+          for _ in $(seq 90); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:7860/api/health || { docker logs cuemem; exit 1; }

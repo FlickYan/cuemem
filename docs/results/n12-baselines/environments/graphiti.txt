@@ -1,0 +1,97 @@
+# Graphiti（"graphiti-core[kuzu]==0.30.2"）的写入环境
+# N12 写入那台机器的 uv 缓存（~/.cache/uv/environments-v2）里 2026-10-16 之前建的、装着它的
+# 环境，只列 CPython 3.12.3 的（与项目环境同一个解释器：uv run --with 的叠加环境只能是
+# 这样的），按建立时间排列，包完全相同的合成一节。每节是那个环境 site-packages 里的包。
+# 发表的写入没有记下用的是哪一个（那时 build.json 还不记 environment）。
+# 写入时间（UTC，各空间 build.json 的修改时间）：pds 2026-10-15 00:27–11:45，pq 2026-10-15 05:21–07:38。
+# 只是记录，不是锁文件：uv run --with 不按它安装。
+
+## 2026-10-14 19:47 UTC 建立（uv 0.11.32，28 个包）
+annotated-types==0.8.0
+anyio==4.15.1
+backoff==2.2.1
+certifi==2026.7.22
+charset-normalizer==3.5.2
+distro==1.9.0
+graphiti-core==0.30.2
+h11==0.16.0
+httpcore2==2.13.1
+httpx2==2.13.1
+idna==3.20
+jiter==0.17.0
+kuzu==0.11.3
+neo4j==6.4.0
+numpy==2.5.4
+openai==3.29.0
+posthog==7.70.0
+pydantic==2.14.1
+pydantic-core==2.50.1
+python-dotenv==1.2.4
+pytz==2026.5
+requests==2.34.2
+sniffio==1.3.1
+tenacity==9.2.1
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.8.0
+
+## 2026-10-15 11:03 UTC 建立（uv 0.11.32，28 个包）
+annotated-types==0.8.0
+anyio==4.15.1
+backoff==2.2.1
+certifi==2026.7.22
+charset-normalizer==3.5.2
+distro==1.9.0
+graphiti-core==0.30.2
+h11==0.16.0
+httpcore2==2.13.1
+httpx2==2.13.1
+idna==3.20
+jiter==0.17.0
+kuzu==0.11.3
+neo4j==6.4.1
+numpy==2.5.4
+openai==3.29.0
+posthog==7.70.0
+pydantic==2.14.1
+pydantic-core==2.50.1
+python-dotenv==1.2.4
+pytz==2026.5
+requests==2.34.2
+sniffio==1.3.1
+tenacity==9.2.1
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.8.0
+
+## 2026-10-15 19:39 UTC 建立（uv 0.11.32，28 个包）
+annotated-types==0.8.0
+anyio==4.15.1
+backoff==2.2.1
+certifi==2026.7.22
+charset-normalizer==3.5.2
+distro==1.9.0
+graphiti-core==0.30.2
+h11==0.16.0
+httpcore2==2.13.1
+httpx2==2.13.1
+idna==3.20
+jiter==0.17.0
+kuzu==0.11.3
+neo4j==6.4.1
+numpy==2.5.4
+openai==3.29.0
+posthog==7.70.2
+pydantic==2.14.1
+pydantic-core==2.50.1
+python-dotenv==1.2.4
+pytz==2026.5
+requests==2.34.2
+sniffio==1.3.1
+tenacity==9.2.1
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.8.0

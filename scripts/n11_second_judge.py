@@ -6,7 +6,8 @@
 
 - 两个判分的一致率与 Cohen's κ（按数据集）；
 - 每个方法在两种判分下的准确率，方法之间的排序是否改变（Kendall τ）；
-- 报告里的关键对比（L1 对全上下文、控制器对 L1 / L2、ReAct 对 L2……）胜负是否改变。
+- 报告里的关键对比（L1 对全上下文、控制器对 L1 / L2、ReAct 对 L2……）胜负是否改变；每个数据集、
+  每个判分模型下的关键对比各是一族，做 Holm 校正，写到 second_judge-holm.json。
 
 注意 deepseek-flash 也是主回答模型：判自己家族的回答可能偏宽，报告里要一并说明。
 
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +39,9 @@ from cuemem.evals.routing import sign_test
 from cuemem.evals.splits import load_split
 from cuemem.llm import Ledger, LLMClient
 from cuemem.llm.cache import ResponseCache
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs" / "results" / "n11-improvements" / "second_judge.json"
@@ -166,12 +171,17 @@ def kendall_tau(x: list[float], y: list[float]) -> float:
 def report(settings: Settings) -> None:
     verdicts = load_rows(settings.paths.eval_runs / "n11-judge2", "verdicts.jsonl")
     latest = {(v["dataset"], v["sample_id"], v["method"]): v for v in verdicts}
+    if missing := [dataset for dataset in RUNS if not any(k[0] == dataset for k in latest)]:
+        # 缺一个数据集就不写：以前跳过它照样重写 second_judge.json 与 -holm.json（没有
+        # runs/eval 的机器上把发表的结果清空成只剩判分模型的名字）
+        raise SystemExit(
+            f"还没有 {'、'.join(missing)} 的重判（先 run，要 N9 的运行 "
+            f"{'、'.join(RUNS[d][0] for d in missing)}）；没有写 {OUT.name}"
+        )
     result: dict[str, Any] = {"judge": {"primary": "qwen3.8-max", "second": JUDGE2}}
     disagreements: list[dict[str, Any]] = []
     for dataset in RUNS:
         rows = [v for (d, _, _), v in latest.items() if d == dataset]
-        if not rows:
-            continue
         pairs = [(bool(v["primary"]), bool(v["second"])) for v in rows]
         by_method: dict[str, list[tuple[bool, bool]]] = defaultdict(list)
         cell = {(v["sample_id"], v["method"]): v for v in rows}
@@ -220,6 +230,7 @@ def report(settings: Settings) -> None:
         "".join(json.dumps(v, ensure_ascii=False) + "\n" for v in disagreements), "utf-8"
     )
     print(f"→ {OUT.relative_to(ROOT)}；两个判分不一致的 {len(disagreements)} 条 → {path}")
+    multiplicity.update(OUT, multiplicity.n11_second_judge)  # Holm 校正 → second_judge-holm.json
 
 
 def main() -> None:

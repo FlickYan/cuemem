@@ -40,6 +40,7 @@ class DashScopeTextEmbedder:
         self.dim = cfg.dim
         self.supports_sparse = cfg.sparse
         self._api_key = api_key
+        self._url = cfg.native_url
         self._http = http_client or httpx2.Client(timeout=cfg.timeout_s)
         self._ledger = ledger
         self._max_attempts = max(1, cfg.max_attempts)
@@ -57,7 +58,7 @@ class DashScopeTextEmbedder:
                 t[: self.cfg.max_chars] or " " for t in texts[start : start + self.cfg.batch_size]
             ]
             data, latency_ms = self._post(self._body(batch, kind))
-            vectors, sparse_vectors, used = _parse(data, expected=len(batch))
+            vectors, sparse_vectors, used = self._parse(data, expected=len(batch))
             dense_parts.append(vectors)
             sparse.extend(sparse_vectors)
             tokens += used
@@ -81,13 +82,18 @@ class DashScopeTextEmbedder:
             params["instruct"] = self.cfg.query_instruct
         return {"model": self.cfg.model, "input": {"texts": batch}, "parameters": params}
 
+    def _parse(
+        self, data: dict[str, Any], *, expected: int
+    ) -> tuple[FloatArray, list[SparseVector], int]:
+        return _parse(data, expected=expected)
+
     def _post(self, body: dict[str, Any]) -> tuple[dict[str, Any], float]:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         for attempt in range(1, self._max_attempts + 1):
             started = time.perf_counter()
             try:
                 with self._slots:
-                    response = self._http.post(self.cfg.native_url, json=body, headers=headers)
+                    response = self._http.post(self._url, json=body, headers=headers)
             except httpx2.TransportError as exc:
                 if attempt == self._max_attempts:
                     raise EmbeddingAPIError(f"向量接口网络错误：{exc}") from exc
@@ -100,7 +106,9 @@ class DashScopeTextEmbedder:
                 self._wait(attempt, response.status_code, response.headers.get("retry-after"))
                 continue
             raise EmbeddingAPIError(
-                f"向量接口返回 HTTP {response.status_code}：{response.text[:300]}"
+                f"向量接口返回 HTTP {response.status_code}：{response.text[:300]}",
+                status=response.status_code,
+                retry_after=response.headers.get("retry-after"),
             )
         raise EmbeddingAPIError("向量接口重试次数用尽")
 

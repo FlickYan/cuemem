@@ -27,14 +27,14 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal
 
 from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MediaItem, MemoryUnit
 from cuemem.core.timeutil import partial_date_start
 from cuemem.core.trace import span
-from cuemem.embed.base import FloatArray, TextEmbedder
+from cuemem.embed.base import FloatArray, SparseVector, TextEmbedder
 from cuemem.embed.multimodal import ImageEmbedder
 from cuemem.read.bm25 import BM25
 from cuemem.read.facts import choose_facts
@@ -92,6 +92,19 @@ class L1Result:
     attach: list[str] = field(default_factory=list)  # 要附上原图的图片 ID（按相关度）
 
 
+@dataclass(frozen=True)
+class RecallKey:
+    """一次文本多路召回的全部输入。两次相同（索引期间没有变）时，各路结果也相同。"""
+
+    text: str
+    dtype: str  # dense 查询向量的类型与字节：逐位比较
+    vector: bytes
+    pool: int
+    sparse: str  # 实际走的稀疏路：v4（有词项权重时）、bm25 或 none
+    kinds: tuple[str, ...]  # 检索了哪几种单元
+    exclude: frozenset[str]
+
+
 @dataclass
 class L1Candidates:
     """一次查询的全部候选（打包之前）：按分数排好的轮，以及事实的分数。"""
@@ -107,6 +120,7 @@ class L1Candidates:
     media_score: dict[str, float] = field(default_factory=dict)  # 图片 ID → 相关度（RRF 分）
     # 各路召回的原始结果（单元 ID 与分数，从高到低），键是（单元类型，模态）；探针从这里取分数分布
     routes: dict[tuple[str, str], list[tuple[str, float]]] = field(default_factory=dict)
+    recall_key: RecallKey | None = None  # routes 里文本各路的输入（candidates 的 reuse 用）
 
 
 class L1Retriever:
@@ -181,12 +195,21 @@ class L1Retriever:
         query: QueryInfo | None = None,
         dense_vec: FloatArray | None = None,
         exclude: Collection[str] = (),
+        probe: bool = False,
+        reuse: L1Candidates | None = None,
     ) -> L1Candidates:
         """一次查询的候选与分数（不打包）。
 
         query 可以传入改写过的问题分析（L2 用查询规划给出的时间区间替换规则解析的结果）；
         dense_vec 是已经算好的查询向量（L2 把几个子查询一次向量化）；
         exclude 是不参与检索的轮与图片的 ID（已经在上下文里的）。
+
+        probe：探针要看会话摘要这一路的分数（p_summary_*），summary_weight 为 0 时也检索摘要。
+        其他时候权重为 0 就不检索：摘要只给所在会话的轮加 summary_weight × 先验，乘 0 不改分数。
+
+        reuse：同一个问题之前的一次候选（探针的）。文本各路的输入（RecallKey：问题、逐位相同的
+        查询向量、每路条数、稀疏路、排除的 ID）相同、这次要的几种单元它都检索过时，直接用它的
+        各路结果，只按这次的问题分析与配置重新打分；以文搜图这一路照常向量化、检索。
         """
         timings: dict[str, float] = {}
         started = time.perf_counter()
@@ -198,16 +221,22 @@ class L1Retriever:
                 dense_vec = batch.dense[0]
                 sparse_vec = batch.sparse[0] if batch.sparse is not None else None
             timings["embed"] = (time.perf_counter() - started) * 1000
-            routes: dict[tuple[str, str], list[tuple[str, float]]] = {}
             kinds = [*KINDS, cfg.image_kind] if cfg.image_kind else list(KINDS)
-            for kind in kinds:
-                hits = self.vectors.search_dense(space_id, dense_vec, cfg.pool, kinds=[kind])
-                routes[(kind, "dense")] = [(h.unit_id, h.score) for h in hits]
-                if cfg.sparse == "v4" and sparse_vec is not None and len(sparse_vec) > 0:
-                    hits = self.vectors.search_sparse(space_id, sparse_vec, cfg.pool, kinds=[kind])
-                    routes[(kind, "sparse")] = [(h.unit_id, h.score) for h in hits]
-                elif cfg.sparse == "bm25":
-                    routes[(kind, "sparse")] = self._bm25_search(space_id, kind, question, cfg.pool)
+            if cfg.summary_weight == 0 and not probe:
+                kinds.remove("summary")
+            v4 = cfg.sparse == "v4" and sparse_vec is not None and len(sparse_vec) > 0
+            recall = RecallKey(
+                text=question,
+                dtype=str(dense_vec.dtype),
+                vector=dense_vec.tobytes(),
+                pool=cfg.pool,
+                sparse="v4" if v4 else "bm25" if cfg.sparse == "bm25" else "none",
+                kinds=tuple(kinds),
+                exclude=frozenset(exclude),
+            )
+            routes = _reusable_routes(reuse, recall)
+            if routes is None:
+                routes = self._text_routes(space_id, dense_vec, sparse_vec, recall)
             if (
                 cfg.visual_weight > 0
                 and self.image_embedder is not None
@@ -227,6 +256,7 @@ class L1Retriever:
 
             cands = self._score(space_id, query, routes, cfg)
             cands.routes = routes
+            cands.recall_key = recall
             if skip:
                 cands.ranked = [(rid, score) for rid, score in cands.ranked if rid not in skip]
                 cands.media_score = {
@@ -237,6 +267,33 @@ class L1Retriever:
         timings["total"] = (time.perf_counter() - started) * 1000
         cands.timings_ms = timings
         return cands
+
+    def _text_routes(
+        self,
+        space_id: str,
+        dense_vec: FloatArray,
+        sparse_vec: SparseVector | None,
+        key: RecallKey,
+    ) -> dict[tuple[str, str], list[tuple[str, float]]]:
+        """轮、事实、摘要与图片描述各自的 dense（与 sparse）召回。
+
+        本地 Qdrant 每次按类型过滤的检索都要给整个集合打分、逐点判断类型；空间里没有这种图片
+        描述（纯文字空间）时结果一定是空的，就不检索，直接记一个空列表。"""
+        routes: dict[tuple[str, str], list[tuple[str, float]]] = {}
+        for kind in key.kinds:
+            if kind not in KINDS and not self.db.has_units(space_id, [kind]):
+                routes[(kind, "dense")] = []
+                if key.sparse != "none":
+                    routes[(kind, "sparse")] = []
+                continue
+            hits = self.vectors.search_dense(space_id, dense_vec, key.pool, kinds=[kind])
+            routes[(kind, "dense")] = [(h.unit_id, h.score) for h in hits]
+            if key.sparse == "v4" and sparse_vec is not None:
+                hits = self.vectors.search_sparse(space_id, sparse_vec, key.pool, kinds=[kind])
+                routes[(kind, "sparse")] = [(h.unit_id, h.score) for h in hits]
+            elif key.sparse == "bm25":
+                routes[(kind, "sparse")] = self._bm25_search(space_id, kind, key.text, key.pool)
+        return routes
 
     # ---------- 融合与重排 ----------
 
@@ -267,11 +324,9 @@ class L1Retriever:
         for unit in self.db.list_units(space_id, kinds=["round"], session_ids=sessions):
             round_units.setdefault(unit.id, unit)
         if visual_media:  # 以文搜图命中的图片可能在任何会话里：按发言找到所在的轮
-            turn_sessions = {
-                t.id: t.session_id
-                for t in self.db.get_turns(space_id)
-                if t.id in {m.source_turn_id for m in visual_media.values()}
-            }
+            wanted = sorted({m.source_turn_id for m in visual_media.values()})
+            # 只取这几句发言（以前载入整个空间的原始日志，1.6 万轮时约 250 毫秒）
+            turn_sessions = {t.id: t.session_id for t in self.db.get_turns(space_id, ids=wanted)}
             extra = sorted(set(turn_sessions.values()) - set(sessions))
             for unit in self.db.list_units(space_id, kinds=["round"], session_ids=extra):
                 round_units.setdefault(unit.id, unit)
@@ -468,6 +523,23 @@ def pack_rounds(
         Hit(unit=round_units[rid], score=score, route=route, rank=rank)
         for rank, (rid, score) in enumerate(chosen, start=1)
     ]
+
+
+def _reusable_routes(
+    reuse: L1Candidates | None, key: RecallKey
+) -> dict[tuple[str, str], list[tuple[str, float]]] | None:
+    """reuse 的文本各路结果能不能直接用：输入相同，且这次要的几种单元它都检索过（探针多检索
+    摘要）。能用时返回其中这次要的几路，顺序与检索时相同；以文搜图那一路不在其中。"""
+    old = reuse.recall_key if reuse is not None else None
+    if reuse is None or old is None or not set(key.kinds) <= set(old.kinds):
+        return None
+    if replace(old, kinds=key.kinds) != key:
+        return None
+    return {
+        (kind, modality): list(hits)
+        for (kind, modality), hits in reuse.routes.items()
+        if kind in key.kinds
+    }
 
 
 def _normalized(hits: list[tuple[str, float]], modality: str) -> list[tuple[str, float]]:

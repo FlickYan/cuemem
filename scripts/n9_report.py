@@ -1,24 +1,30 @@
 """N9：测试集上的最终评测，汇总成 docs/results/n9-final/results.json 与图。
 
 只读评测运行的结果（runs/eval/<运行名>/），不调用 DeepSeek；混合流上零样本 LLM 路由（B6z、B6h）
-的路由结果用通义，缓存在 runs/eval/n9-final/。缺哪个运行就跳过那一部分。
+的路由结果用通义，缓存在 runs/eval/n9-final/。四个测试集的运行（TEST_RUNS）缺一个就停下、什么都
+不写：runs/ 不在仓库里，以前在没有这些运行的克隆里照样执行，把发表的 results.json、
+results-holm.json 与 tables.md 写成几乎是空的。其余的运行（换回答模型、混合流）缺了就跳过那一部分。
 
 1. 主表：四个测试集上各方法的准确率（95% 置信区间）、每题名义成本、输入 tokens、分题型；
 2. 冻结的控制器：N7 导出的模型直接在测试集上选档（与 B6 的真实运行逐题核对），λ 扫描的曲线，
    与固定档位、规则、模型自主检索、"控制器先选、模型兜底"的配对比较；
 3. 混合流（测试集版，scripts/n9_mixed.py）：20% 记忆题时的成本、记忆题准确率与误召回；
-4. L2 对 L1 的分题型配对检验；LoCoMo 上的图扩散；写入路径与有效期（H4）；
+4. L2 对 L1 的分题型配对检验；LoCoMo 上的图扩散；写入路径与有效期（H4）；全部配对检验按族做
+   Holm 校正，写到 results-holm.json（族的定义见 scripts/multiplicity.py）；
 5. 换回答模型（H3）：test100r / test200r 上各回答模型 × 各方法；
 6. 错误分析：主方法答错的题分类。
 
 最后由 scripts/n9_tables.py 把结果渲染成 docs/results/n9-final/tables.md。
 
 用法：
-    uv run python scripts/n9_report.py
+    uv run python scripts/n9_report.py                 # 要 N9 的运行
+    uv run python scripts/n9_report.py --figures-only  # 只按发表的 results.json 重画图
+    uv run python scripts/n9_tables.py                 # 只按发表的 JSON 重新生成 tables.md
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import warnings
@@ -49,6 +55,7 @@ from cuemem.evals.splits import load_split
 from cuemem.read.controller import HYBRID_BAND, HYBRID_CONFIDENCE, V1_MODEL, LearnedController
 
 sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 import n7_controller as N7
 import n9_errors as E
 import n9_tables
@@ -87,6 +94,12 @@ READERS = {
     "deepseek-v4-pro": {"longmemeval_s": "test100r-dspro", "locomo": "locomo-test200r-dspro"},
 }
 READER_METHODS = ("L0", "B4-nobm25", "B5", "B6r", "B6", "B3", "B6a")
+# 图用 matplotlib 的默认样式与它自带的 DejaVu Sans，不跟着本机的 matplotlibrc 变（有的机器默认
+# 字体是 Inter、关掉了字形微调）：重新生成的 PNG 只因内容而变
+FIGURE_STYLE: list[Any] = ["default", {"font.family": "DejaVu Sans"}]
+# 每千题回答成本超过这个数的全上下文（LongMemEval $31.88、MemLens 128K $40.60）画在横轴右边缘、
+# 标上真实的数：按真实位置画会把其他方法挤到一起，以前干脆不画，图例里却有它
+OFF_SCALE = 20
 
 
 def available(name: str) -> bool:
@@ -509,61 +522,90 @@ def _style(ax: Any, theme: Any) -> None:
 
 
 def plot_pareto(sections: dict[str, dict[str, Any]], path_for: Callable[[str], Path]) -> None:
-    """每个测试集一个面板：各方法一个点（中性色、形状区分），学到的控制器随 λ 一条曲线。"""
+    """每个测试集一个面板：各方法一个点（中性色、形状区分），学到的控制器随 λ 一条曲线。横轴是
+    每千题的名义回答成本：一次性的写入不在内（D-070）。"""
     datasets = [d for d in TEST_RUNS if d in sections]
     if not datasets:
         return
-    for mode, theme in THEMES.items():
-        cols = min(2, len(datasets))
-        rows_n = (len(datasets) + cols - 1) // cols
-        fig, axes = plt.subplots(rows_n, cols, figsize=(5.4 * cols, 3.9 * rows_n), squeeze=False)
-        fig.patch.set_facecolor(theme.surface)
-        handles: dict[str, Any] = {}
-        for ax, dataset in zip(axes.flat, datasets, strict=False):
-            sec = sections[dataset]
-            _style(ax, theme)
-            curve = sec["curve"]
-            xs = [c["cost_per_1k"] for c in curve]
-            ys = [c["accuracy"] for c in curve]
-            (line,) = ax.plot(
-                xs, ys, color=theme.series["blue"], linewidth=2, marker="o", markersize=3.5,
-                zorder=3,
+    with plt.style.context(FIGURE_STYLE):
+        for mode, theme in THEMES.items():
+            _plot_pareto(sections, datasets, theme, path_for(mode))
+
+
+def _plot_pareto(
+    sections: dict[str, dict[str, Any]], datasets: list[str], theme: Any, path: Path
+) -> None:
+    cols = min(2, len(datasets))
+    rows_n = (len(datasets) + cols - 1) // cols
+    fig, axes = plt.subplots(rows_n, cols, figsize=(5.4 * cols, 3.9 * rows_n), squeeze=False)
+    fig.patch.set_facecolor(theme.surface)
+    handles: dict[str, Any] = {}
+    for ax, dataset in zip(axes.flat, datasets, strict=False):
+        sec = sections[dataset]
+        _style(ax, theme)
+        curve = sec["curve"]
+        xs = [c["cost_per_1k"] for c in curve]
+        ys = [c["accuracy"] for c in curve]
+        (line,) = ax.plot(
+            xs, ys, color=theme.series["blue"], linewidth=2, marker="o", markersize=3.5, zorder=3,
+        )  # fmt: skip
+        handles["B6 learned controller (λ sweep)"] = line
+        b6 = sec["policies"]["B6 (frozen)"]
+        star = ax.scatter(
+            [b6["cost_per_1k"]], [b6["accuracy"]], s=90, marker="*",
+            color=theme.series["blue"], edgecolor=theme.surface, linewidth=1.5, zorder=5,
+        )  # fmt: skip
+        handles["B6 at default λ = 30"] = star
+        off_scale = []
+        for key, (marker, label) in POINTS.items():
+            p = sec["policies"].get(key)
+            if p is None:
+                continue
+            if key == "B1" and p["cost_per_1k"] > OFF_SCALE:
+                off_scale.append((marker, label, p))
+                continue
+            color = theme.series["yellow"] if key == "B6a" else theme.ink2
+            h = ax.scatter(
+                [p["cost_per_1k"]], [p["accuracy"]], s=42, marker=marker, color=color,
+                edgecolor=theme.surface, linewidth=1.2, zorder=4,
             )  # fmt: skip
-            handles["B6 learned controller (λ sweep)"] = line
-            b6 = sec["policies"]["B6 (frozen)"]
-            star = ax.scatter(
-                [b6["cost_per_1k"]], [b6["accuracy"]], s=90, marker="*",
-                color=theme.series["blue"], edgecolor=theme.surface, linewidth=1.5, zorder=5,
-            )  # fmt: skip
-            handles["B6 at default λ = 30"] = star
-            for key, (marker, label) in POINTS.items():
-                p = sec["policies"].get(key)
-                if p is None or (key == "B1" and p["cost_per_1k"] > 20):
-                    continue
-                color = theme.series["yellow"] if key == "B6a" else theme.ink2
+            handles.setdefault(label, h)
+        # set_xscale 会换掉格式器：之后再设美元刻度，并关掉挤在一起的次刻度标签
+        ax.set_xscale("log")
+        ax.xaxis.set_major_locator(FixedLocator([0.2, 0.5, 1, 2, 5, 10, 20, 50]))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:g}"))
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        if off_scale:
+            # 横轴按其余的点定下来，再把超出的点画在右边缘（不裁掉），旁边写真实的准确率与成本
+            left, right = ax.get_xlim()
+            ax.set_xlim(left, right)
+            for marker, label, p in off_scale:
                 h = ax.scatter(
-                    [p["cost_per_1k"]], [p["accuracy"]], s=42, marker=marker, color=color,
-                    edgecolor=theme.surface, linewidth=1.2, zorder=4,
+                    [right], [p["accuracy"]], s=42, marker=marker, color=theme.ink2,
+                    edgecolor=theme.surface, linewidth=1.2, zorder=4, clip_on=False,
                 )  # fmt: skip
                 handles.setdefault(label, h)
-            # set_xscale 会换掉格式器：之后再设美元刻度，并关掉挤在一起的次刻度标签
-            ax.set_xscale("log")
-            ax.xaxis.set_major_locator(FixedLocator([0.2, 0.5, 1, 2, 5, 10, 20, 50]))
-            ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:g}"))
-            ax.xaxis.set_minor_formatter(NullFormatter())
-            ax.set_title(DATASET_EN[dataset], color=theme.ink, fontsize=10, loc="left")
-            ax.set_xlabel("nominal cost per 1k questions (log)", color=theme.ink2, fontsize=8)
-            ax.set_ylabel("accuracy", color=theme.ink2, fontsize=8)
-        for ax in list(axes.flat)[len(datasets) :]:
-            ax.set_visible(False)
-        legend = fig.legend(
-            list(handles.values()), list(handles.keys()), loc="lower center", ncol=3,
-            frameon=False, fontsize=8, labelcolor=theme.ink2,
+                ax.annotate(
+                    rf"B1 {p['accuracy']:.1f}% · \${p['cost_per_1k']:.2f} →",
+                    xy=(right, p["accuracy"]), xytext=(-8, 0), textcoords="offset points",
+                    ha="right", va="center", color=theme.ink2, fontsize=7.5,
+                )  # fmt: skip
+        ax.set_title(DATASET_EN[dataset], color=theme.ink, fontsize=10, loc="left")
+        ax.set_xlabel(
+            "nominal answer cost per 1k questions (log; one-off write excluded)",
+            color=theme.ink2, fontsize=8,
         )  # fmt: skip
-        legend.set_zorder(10)
-        fig.tight_layout(rect=(0, 0.11 if rows_n > 1 else 0.17, 1, 1))
-        fig.savefig(path_for(mode), dpi=160, facecolor=theme.surface)
-        plt.close(fig)
+        ax.set_ylabel("accuracy", color=theme.ink2, fontsize=8)
+    for ax in list(axes.flat)[len(datasets) :]:
+        ax.set_visible(False)
+    legend = fig.legend(
+        list(handles.values()), list(handles.keys()), loc="lower center", ncol=3,
+        frameon=False, fontsize=8, labelcolor=theme.ink2,
+    )  # fmt: skip
+    legend.set_zorder(10)
+    fig.tight_layout(rect=(0, 0.11 if rows_n > 1 else 0.17, 1, 1))
+    fig.savefig(path, dpi=160, facecolor=theme.surface)
+    plt.close(fig)
 
 
 def plot_readers(section: dict[str, Any], path_for: Callable[[str], Path]) -> None:
@@ -571,55 +613,83 @@ def plot_readers(section: dict[str, Any], path_for: Callable[[str], Path]) -> No
     datasets = [d for d in READER_SPLITS if d in section]
     if not datasets:
         return
+    with plt.style.context(FIGURE_STYLE):
+        for mode, theme in THEMES.items():
+            _plot_readers(section, datasets, theme, path_for(mode))
+
+
+def _plot_readers(section: dict[str, Any], datasets: list[str], theme: Any, path: Path) -> None:
     methods = ("L0", "B4-nobm25", "B5", "B6r", "B6", "B3", "B6a")
     labels = ("L0", "L1", "L2", "B6r", "B6", "B3", "B6a")
     order = ("qwen3.6-35b-a3b", "qwen3.8-flash", "deepseek-flash", "deepseek-v4-pro")
-    for mode, theme in THEMES.items():
-        fig, axes = plt.subplots(
-            1, len(datasets), figsize=(5.4 * len(datasets), 3.6), squeeze=False
-        )
-        fig.patch.set_facecolor(theme.surface)
-        palette = [theme.series["yellow"], theme.series["aqua"], theme.series["blue"], theme.ink2]
-        handles = {}
-        for ax, dataset in zip(axes.flat, datasets, strict=True):
-            readers = section[dataset]["readers"]
-            ax.set_facecolor(theme.surface)
-            ax.grid(color=theme.grid, linewidth=0.45, axis="y")
-            ax.set_axisbelow(True)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            for side in ("left", "bottom"):
-                ax.spines[side].set_color(theme.axis)
-                ax.spines[side].set_linewidth(0.45)
-            ax.tick_params(colors=theme.muted, labelsize=8)
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
-            for color, reader in zip(palette, order, strict=True):
-                if reader not in readers:
-                    continue
-                ys = [readers[reader].get(m, {}).get("accuracy", np.nan) for m in methods]
-                (h,) = ax.plot(
-                    range(len(methods)), ys, marker="o", markersize=4, linewidth=2, color=color
-                )
-                handles[reader] = h
-            ax.set_xticks(range(len(methods)), labels)
-            ax.set_title(
-                f"{DATASET_EN[dataset].split(' ')[0]} ({section[dataset]['n']} questions)",
-                color=theme.ink, fontsize=10, loc="left",
-            )  # fmt: skip
-            ax.set_ylabel("accuracy", color=theme.ink2, fontsize=8)
-        fig.legend(
-            list(handles.values()), list(handles.keys()), loc="lower center", ncol=4,
-            frameon=False, fontsize=8, labelcolor=theme.ink2,
+    fig, axes = plt.subplots(1, len(datasets), figsize=(5.4 * len(datasets), 3.6), squeeze=False)
+    fig.patch.set_facecolor(theme.surface)
+    palette = [theme.series["yellow"], theme.series["aqua"], theme.series["blue"], theme.ink2]
+    handles = {}
+    for ax, dataset in zip(axes.flat, datasets, strict=True):
+        readers = section[dataset]["readers"]
+        ax.set_facecolor(theme.surface)
+        ax.grid(color=theme.grid, linewidth=0.45, axis="y")
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(theme.axis)
+            ax.spines[side].set_linewidth(0.45)
+        ax.tick_params(colors=theme.muted, labelsize=8)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
+        for color, reader in zip(palette, order, strict=True):
+            if reader not in readers:
+                continue
+            ys = [readers[reader].get(m, {}).get("accuracy", np.nan) for m in methods]
+            (h,) = ax.plot(
+                range(len(methods)), ys, marker="o", markersize=4, linewidth=2, color=color
+            )
+            handles[reader] = h
+        ax.set_xticks(range(len(methods)), labels)
+        ax.set_title(
+            f"{DATASET_EN[dataset].split(' ')[0]} ({section[dataset]['n']} questions)",
+            color=theme.ink, fontsize=10, loc="left",
         )  # fmt: skip
-        fig.tight_layout(rect=(0, 0.1, 1, 1))
-        fig.savefig(path_for(mode), dpi=160, facecolor=theme.surface)
-        plt.close(fig)
+        ax.set_ylabel("accuracy", color=theme.ink2, fontsize=8)
+    fig.legend(
+        list(handles.values()), list(handles.keys()), loc="lower center", ncol=4,
+        frameon=False, fontsize=8, labelcolor=theme.ink2,
+    )  # fmt: skip
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
+    fig.savefig(path, dpi=160, facecolor=theme.surface)
+    plt.close(fig)
+
+
+def plot_figures(results: dict[str, Any]) -> None:
+    """Pareto 图与换回答模型的图（浅色、深色各一张），写到 OUT。"""
+    if results.get("controller"):
+        plot_pareto(results["controller"], lambda mode: OUT / f"pareto-{mode}.png")
+    if results.get("readers"):
+        plot_readers(results["readers"], lambda mode: OUT / f"readers-{mode}.png")
 
 
 # ---------- 主流程 ----------
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="N9：汇总测试集上的评测，写 results.json、表与图")
+    parser.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="只按 docs/results/n9-final/results.json 重画图（不需要评测运行，不改别的文件）",
+    )
+    args = parser.parse_args(argv)
+    if args.figures_only:
+        plot_figures(json.loads((OUT / "results.json").read_text("utf-8")))
+        print(f"图：{OUT}")
+        return
+    if missing := [run for run in TEST_RUNS.values() if not available(run)]:
+        # 缺一个就不写：runs/ 不在仓库里，以前照样执行，把发表的结果写成几乎是空的
+        raise SystemExit(
+            f"还没有 N9 测试集的运行：{'、'.join(missing)}（{RUNS_DIR}）；什么都没有写。"
+            "只重画图用 --figures-only，只重新生成表用 scripts/n9_tables.py"
+        )
     OUT.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(parents=True, exist_ok=True)
     ctrl = LearnedController.load(V1_MODEL)  # N9 冻结评测的是 v1
@@ -678,10 +748,8 @@ def main() -> None:
     (OUT / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )
-    if results["controller"]:
-        plot_pareto(results["controller"], lambda mode: OUT / f"pareto-{mode}.png")
-    if results["readers"]:
-        plot_readers(results["readers"], lambda mode: OUT / f"readers-{mode}.png")
+    multiplicity.update(OUT / "results.json", multiplicity.n9)  # Holm 校正 → results-holm.json
+    plot_figures(results)
     print(f"结果：{OUT / 'results.json'}，表格：{n9_tables.write(results)}")
     for dataset, sec in results["controller"].items():
         b6 = sec["policies"]["B6 (frozen)"]

@@ -196,6 +196,186 @@ def test_l2_without_planner_equals_l1_ranking(toy: tuple[MemorySystem, ScriptedM
     assert l2.plan.source == "rules" and model.calls["plan"] == 0
 
 
+# ---------- 本地 Qdrant 的检索次数 ----------
+
+
+def count_searches(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
+    """记下每次向量检索按哪种单元过滤：本地 Qdrant 每次按类型过滤的检索都要扫一遍整个集合。"""
+    kinds: list[str | None] = []
+    real = system.vectors._query
+
+    def query(space_id: str, vector: Any, using: str, k: int, flt: Any) -> Any:
+        kinds.append(flt.must[0].match.any[0] if flt is not None else None)
+        return real(space_id, vector, using, k, flt)
+
+    monkeypatch.setattr(system.vectors, "_query", query)
+    return kinds
+
+
+def test_l1_skips_routes_that_cannot_change_scores(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """纯文字空间里不检索图片描述（结果一定是空的）；摘要的权重为 0 时不检索摘要（乘 0 不改
+    分数），只有探针为了 p_summary_* 特征检索它。以前每次都是四次检索。"""
+    system, _ = toy
+    question = "Max 喜欢吃什么？"
+    kinds = count_searches(system, monkeypatch)
+    cfg = L1Config()
+    cands = system.l1.candidates("demo", question, ASKED, cfg)
+    assert kinds == ["round", "fact"]
+    assert cands.routes[("image", "dense")] == [] and ("summary", "dense") not in cands.routes
+    kinds.clear()
+    probe = system.probe.run("demo", question, ASKED, cfg)
+    assert kinds == ["round", "fact", "summary"]
+    assert probe.candidates.routes[("summary", "dense")]
+    assert probe.features["p_summary_top1"] > 0 and probe.features["p_caption_top1"] == 0.0
+    # 摘要这一路在权重为 0 时不改任何分数：加上它重新打分，排名与分数逐位相同
+    summary = {k: v for k, v in probe.candidates.routes.items() if k[0] == "summary"}
+    rescored = system.l1._score("demo", cands.query, {**cands.routes, **summary}, cfg)
+    assert rescored.ranked == cands.ranked and rescored.fact_score == cands.fact_score
+    kinds.clear()
+    system.l1.candidates("demo", question, ASKED, L1Config(summary_weight=0.5))
+    assert kinds == ["round", "fact", "summary"]
+    kinds.clear()
+    bm25 = system.l1.candidates("demo", question, ASKED, L1Config(sparse="bm25"))
+    assert kinds == ["round", "fact"] and bm25.routes[("image", "sparse")] == []
+
+
+def test_l2_reuses_the_probe_routes_for_the_question(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """控制器选了 L2 时，原问题的召回直接用探针的各路结果、按计划重新打分；子查询照常检索。
+    以前探针检索四次之后，L2 对原问题再检索四次。"""
+    system, model = toy
+    question = "我一共养了几只狗？"
+    kinds = count_searches(system, monkeypatch)
+    cfg = L2Config(plan=False, iterations=0)
+    recall = system.retrieve("demo", question, question_time=ASKED, lam=-1e9, l2=cfg)
+    assert recall.level == "l2" and recall.candidates is not None
+    assert kinds == ["round", "fact", "summary"]  # 只有探针的检索
+    kinds.clear()
+    fresh = system.l2.search("demo", question, ASKED, cfg)  # 没有探针：自己检索
+    assert kinds == ["round", "fact"]
+    assert [(h.unit.id, h.score) for h in recall.view.rounds] == [
+        (h.unit.id, h.score) for h in fresh.rounds
+    ]
+    assert [(f.fact.id, f.score) for f in recall.view.facts] == [
+        (f.fact.id, f.score) for f in fresh.facts
+    ]
+
+    # 有子查询时：原问题用探针的结果，两个子查询各检索两次（轮、事实）
+    model.planner = lambda prompt: {"answer_type": "count", "sub_queries": ["狗", "领养"]}
+    kinds.clear()
+    planned = system.retrieve("demo", question, question_time=ASKED, lam=-1e9, l2=L2Config())
+    assert planned.level == "l2" and planned.plan is not None and planned.plan.sub_queries
+    assert kinds == ["round", "fact", "summary", "round", "fact", "round", "fact"]
+
+
+def test_probe_routes_are_reused_only_for_the_same_input(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只有问题、逐位相同的查询向量、每路条数、稀疏路与排除的 ID 都相同时才用探针的结果。"""
+    system, _ = toy
+    question = "Max 喜欢吃什么？"
+    probe = system.l1.candidates("demo", question, ASKED, L1Config(), probe=True)
+    assert probe.recall_key is not None
+    vector = np.frombuffer(probe.recall_key.vector, dtype=np.float32).copy()
+    kinds = count_searches(system, monkeypatch)
+    same = system.l1.candidates(
+        "demo", question, ASKED, L1Config(), dense_vec=vector.copy(), reuse=probe
+    )
+    assert kinds == []
+    assert same.routes == {k: v for k, v in probe.routes.items() if k[0] != "summary"}
+    nudged = vector.copy()
+    nudged[0] = np.nextafter(nudged[0], np.float32(1))
+    some_round = system.db.list_units("demo", kinds=["round"])[0].id
+    for text, cfg, kwargs in (
+        (question, L1Config(), {"dense_vec": nudged}),
+        (question, L1Config(), {"dense_vec": vector, "exclude": [some_round]}),
+        (question, L1Config(pool=10), {"dense_vec": vector}),
+        (question, L1Config(sparse="bm25"), {"dense_vec": vector}),
+        ("Max 爱吃什么？", L1Config(), {"dense_vec": vector}),
+    ):
+        kinds.clear()
+        system.l1.candidates("demo", text, ASKED, cfg, reuse=probe, **kwargs)
+        assert kinds == ["round", "fact"], (text, cfg, kwargs)
+
+
+def test_recall_listing_raised_from_l0_packs_the_probe(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP、Agents 与 LangGraph 的 recall（at_least_l1）：控制器选了 L0 时直接打包探针的候选，
+    结果与直接走 L1 相同。以前改走 L1 时把探针做过的四次检索再做一遍。"""
+    from cuemem.evidence import RAISED_REASON, recall_listing
+
+    system, _ = toy
+    question = "Max 喜欢吃什么？"
+    kinds = count_searches(system, monkeypatch)
+    raised = recall_listing(system, "demo", question, at=ASKED, at_least_l1=True, lam=1e9)
+    assert raised["level"] == "L1" and raised["reasons"] == [RAISED_REASON]
+    assert kinds == ["round", "fact", "summary"]
+    kinds.clear()
+    plain = recall_listing(system, "demo", question, at=ASKED, mode="l1")
+    assert kinds == ["round", "fact"]
+    assert raised["excerpts"] and raised["excerpts"] == plain["excerpts"]
+    assert raised["facts"] == plain["facts"]
+
+
+@pytest.mark.parametrize("at", [ASKED, None])
+def test_sdk_search_raised_from_l0_packs_the_probe(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch, at: datetime | None
+) -> None:
+    """SDK 的 search（缺省不低于 L1）与 recall_listing 相同：控制器选了 L0 时直接打包探针的候选
+    （两次用同一个问题时间），结果与直接走 L1 相同。以前改走 L1 时把探针做过的检索再做一遍。"""
+    from cuemem.evidence import RAISED_REASON
+    from cuemem.sdk import Memory
+
+    system, _ = toy
+    memory = Memory.from_system(system)
+    question = "Max 喜欢吃什么？"
+    kinds = count_searches(system, monkeypatch)
+    raised = memory.search(question, user_id="demo", at=at, lam=1e9)
+    assert raised["level"] == "L1" and raised["reasons"] == [RAISED_REASON]
+    assert kinds == ["round", "fact", "summary"]
+    kinds.clear()
+    plain = memory.search(question, user_id="demo", at=at, mode="l1")
+    assert kinds == ["round", "fact"]
+    assert raised["results"] and raised["results"] == plain["results"]
+
+
+def test_probe_candidates_are_packed_only_under_a_held_read(
+    toy: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retrieve(mode="l1", candidates=...) 只在调用方持有这个空间的读（reading）时直接打包探针的
+    候选：两次检索之间没有持有读时，遗忘可以插在中间，打包出来的是已经删掉的记忆。这时照 R5 之前
+    那样重新检索一遍。"""
+    system, _ = toy
+    question = "Max 喜欢吃什么？"
+    probe = system.retrieve("demo", question, question_time=ASKED, lam=1e9)
+    assert probe.level == "l0" and probe.candidates is not None
+    calls: list[bool] = []
+    real = system.l1.candidates
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        calls.append(bool(kwargs.get("probe")))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(system.l1, "candidates", counting)
+    unheld = system.retrieve(
+        "demo", question, question_time=ASKED, mode="l1", candidates=probe.candidates
+    )
+    assert calls == [False]
+    calls.clear()
+    with system.reading("demo"):
+        held = system.retrieve(
+            "demo", question, question_time=ASKED, mode="l1", candidates=probe.candidates
+        )
+    assert calls == []
+    assert held.view.rounds and [h.unit.id for h in held.view.rounds] == [
+        h.unit.id for h in unheld.view.rounds
+    ]
+
+
 def test_planner_and_checker_failures_fall_back(toy: tuple[MemorySystem, ScriptedModel]) -> None:
     system, model = toy
     model.planner = lambda prompt: {"answer_type": ["not", "a", "string"], "exhaustive": "maybe"}

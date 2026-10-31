@@ -1,0 +1,57 @@
+# CueMem + Qdrant 服务端（N12）。本地模式的向量库同一时间只能被一个进程打开、规模大了会变慢（D-005、
+# D-056）；这里改用 Qdrant 服务端。
+#   install -m 600 .env.example .env   # 只给本人读写；填 Key（或者 CUEMEM_PRESET=ollama，不要 Key），
+#                                      # 并设置 CUEMEM_API_TOKEN
+#   docker compose up -d               # 没有 CUEMEM_API_TOKEN 时拒绝启动
+#   界面 http://localhost:7860/ · 接口文档 /docs · OpenAI 兼容的记忆代理 http://localhost:7860/v1
+# Key 看用哪套配置：默认 DEEPSEEK_API_KEY 与 DASHSCOPE_API_KEY；CUEMEM_PRESET=openai 时
+# OPENAI_API_KEY，=deepseek 时 DEEPSEEK_API_KEY，=ollama 时不要 Key（另设下面的
+# CUEMEM_PROVIDERS__OLLAMA__BASE_URL，宿主机上的 Ollama 要监听容器连得到的地址）。
+# up -d 在容器启动后就返回：http://127.0.0.1:7860/ 没有响应时 docker compose ps 显示 Restarting，
+# docker compose logs cuemem 里写着原因（多半是缺 Key，或 CUEMEM_API_TOKEN 短于 16 个字符）；改好
+# .env 再 docker compose up -d。restart: unless-stopped 对这些错误也反复重启（退出码 1、2 都不让
+# 它停），但崩溃与重启机器后能自己起来
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    # 不映射端口：只有 compose 内部网络上的 cuemem 连得到。另加一层：.env 里设了
+    # CUEMEM_VECTOR_STORE__API_KEY（openssl rand -hex 32）时 Qdrant 要这个 Key，cuemem 经 env_file
+    # 拿到同一个（只在这里引用这一个变量，两边不会不一致）；不设或为空时两边都不鉴权
+    environment:
+      QDRANT__SERVICE__API_KEY: ${CUEMEM_VECTOR_STORE__API_KEY:-}
+    volumes:
+      - qdrant-storage:/qdrant/storage
+
+  cuemem:
+    build: .
+    image: cuemem:latest
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    ports:
+      # 只映射到宿主机的本机地址。别的机器要访问时在前面放 TLS 反向代理（README 的 Public
+      # deployment）；改成 "7860:7860" 会在所有网卡上公开明文 HTTP（令牌与记忆都不加密），
+      # 只适合可信的局域网
+      - "127.0.0.1:7860:7860"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CUEMEM_VECTOR_STORE__URL: http://qdrant:6333
+      CUEMEM_PRESET: ${CUEMEM_PRESET:-}
+      # 必填：接口、界面与记忆代理的访问令牌（容器里监听 0.0.0.0，没有令牌或令牌短于 16 个字符时
+      # cuemem 拒绝启动；确实要用短令牌时加上
+      # command: [serve, --host, 0.0.0.0, --port, "7860", --scenario, plain, --space, default,
+      #           --insecure-weak-token]）
+      CUEMEM_API_TOKEN: ${CUEMEM_API_TOKEN:?在 .env 里设置 CUEMEM_API_TOKEN（openssl rand -hex 32）}
+      # 用宿主机上的 Ollama 时：
+      # CUEMEM_PROVIDERS__OLLAMA__BASE_URL: http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - cuemem-data:/data
+
+volumes:
+  qdrant-storage:
+  cuemem-data:

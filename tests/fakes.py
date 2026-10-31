@@ -1,9 +1,12 @@
-"""测试替身：模拟 OpenAI 兼容的聊天接口与 DashScope 原生向量接口，并记录收到的请求。"""
+"""测试替身：模拟 OpenAI 兼容的聊天与向量接口、DashScope 原生向量接口，并记录收到的请求；
+要 API Key 的 Qdrant 服务端（KeyedQdrant，本机回环上的真 HTTP）。"""
 
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,10 @@ ChatReply = str | Callable[[dict[str, Any]], str | dict[str, Any]]
 REJECT = "__REJECT__"  # 回复函数返回它时，模拟内容审核拒绝（HTTP 400）
 ABORT_JSON = "__ABORT_JSON__"  # 模拟 QwenCloud 在 JSON 模式下中止生成（HTTP 400）
 TIMEOUT = "__TIMEOUT__"  # 模拟请求超时（生成失控、迟迟不结束）
+# 模拟限流（HTTP 429）：带 FakeAPI.chat_rate_limit_headers 里的头（默认让 SDK 只等 1 毫秒）
+RATE_LIMIT = "__RATE_LIMIT__"
+NO_BALANCE = "__NO_BALANCE__"  # 模拟 DeepSeek 余额不足（HTTP 402，不重试）
+SERVER_ERROR = "__SERVER_ERROR__"  # 模拟上游出错（HTTP 500，不带 Retry-After）
 
 
 def chat_completion_body(
@@ -66,6 +73,31 @@ def chat_completion_body(
     }
 
 
+def sse_body(content: str) -> bytes:
+    """流式聊天补全的响应：每个词一个 data 块，最后是用量与 [DONE]。"""
+    chunks = []
+    for i, word in enumerate(content.split(" ")):
+        piece = word if i == 0 else " " + word
+        delta = {"role": "assistant", "content": piece} if i == 0 else {"content": piece}
+        chunks.append(
+            {
+                "id": "c",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": delta}],
+            }
+        )
+    chunks.append(
+        {
+            "id": "c",
+            "object": "chat.completion.chunk",
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        }
+    )
+    lines = [f"data: {json.dumps(c)}\n\n" for c in chunks] + ["data: [DONE]\n\n"]
+    return "".join(lines).encode()
+
+
 class FakeAPI:
     """chat_replies 按顺序消费，元素可以是字符串或"由请求体生成回复"的函数；只剩一个时重复使用。"""
 
@@ -76,6 +108,7 @@ class FakeAPI:
         self.rerank_requests: list[dict[str, Any]] = []
         self.embed_status: list[int] = []  # 预设的状态码序列，用于模拟限流和错误
         self.embed_retry_after: str | None = None  # 出错响应附带的 Retry-After 头
+        self.chat_rate_limit_headers: dict[str, str] = {"retry-after-ms": "1"}
         self.cached_tokens = 0
         self.embed_dim = 8
 
@@ -90,6 +123,27 @@ class FakeAPI:
             content = reply(body) if callable(reply) else reply
             if content == TIMEOUT:
                 raise httpx2.ReadTimeout("timed out", request=request)
+            if content == RATE_LIMIT:
+                return httpx2.Response(
+                    429,
+                    json={
+                        "error": {
+                            "code": "Throttling.RateQuota",
+                            "message": "Requests rate limit exceeded, please try again later.",
+                            "type": "Throttling.RateQuota",
+                        }
+                    },
+                    headers=self.chat_rate_limit_headers,
+                )
+            if content == NO_BALANCE:
+                return httpx2.Response(
+                    402,
+                    json={"error": {"message": "Insufficient Balance", "type": "unknown_error"}},
+                )
+            if content == SERVER_ERROR:
+                return httpx2.Response(
+                    500, json={"error": {"message": "internal error", "type": "server_error"}}
+                )
             deepseek = "deepseek" in request.url.host
             if isinstance(content, dict):  # 工具调用
                 return httpx2.Response(
@@ -120,6 +174,12 @@ class FakeAPI:
                             "type": "data_inspection_failed",
                         }
                     },
+                )
+            if body.get("stream"):  # 流式（N12 的记忆代理）：按词切成几个 SSE 块
+                return httpx2.Response(
+                    200,
+                    content=sse_body(content),
+                    headers={"content-type": "text/event-stream"},
                 )
             return httpx2.Response(
                 200,
@@ -173,4 +233,84 @@ class FakeAPI:
                     "usage": {"total_tokens": 5 * len(texts)},
                 },
             )
+        if request.url.path.endswith("/embeddings"):  # OpenAI 兼容的向量接口（N12）
+            self.embed_requests.append(body)
+            texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            data = [
+                {
+                    "object": "embedding",
+                    "index": i,
+                    "embedding": [float(len(text) % 7 + 1)] + [0.5] * (self.embed_dim - 1),
+                }
+                for i, text in enumerate(texts)
+            ]
+            data.reverse()  # 故意打乱顺序，检验按 index 排序
+            return httpx2.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": data,
+                    "model": body["model"],
+                    "usage": {"prompt_tokens": 5 * len(texts), "total_tokens": 5 * len(texts)},
+                },
+            )
         return httpx2.Response(404, json={"error": "not found"})
+
+
+class KeyedQdrant:
+    """本机回环上的 Qdrant 服务端替身：像设了 QDRANT__SERVICE__API_KEY 的 Qdrant 一样，api-key
+    请求头不对时 401（"/" 不查，qdrant-client 用它核对版本）。seen 记下每个请求的（方法，路径，
+    api-key）。只答 CueMem 用到的几个接口：没有集合，建集合、建索引与写入都成功。
+
+        with KeyedQdrant("k") as qdrant:
+            VectorStore(None, dim=4, url=qdrant.url, api_key="k")
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.seen: list[tuple[str, str, str | None]] = []
+        self.url = ""
+
+    def __enter__(self) -> KeyedQdrant:
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def _reply(self) -> None:
+                self.rfile.read(int(self.headers.get("content-length") or 0))
+                path = self.path.split("?")[0]
+                key = self.headers.get("api-key")
+                stub.seen.append((self.command, path, key))
+                status, body = stub.answer(self.command, path, key)
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_PUT = do_DELETE = _reply
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def answer(self, method: str, path: str, key: str | None) -> tuple[int, bytes]:
+        if path == "/":
+            return 200, json.dumps({"title": "qdrant", "version": "1.19.1"}).encode()
+        if key != self.key:
+            return 401, b"Must provide an API key or an Authorization bearer token"
+        result: Any = {"operation_id": 0, "status": "completed"}  # 建索引、写入点
+        if path == "/collections":
+            result = {"collections": []}
+        elif path.endswith("/exists"):
+            result = {"exists": False}
+        elif method == "PUT" and path.count("/") == 2:  # 建集合
+            result = True
+        return 200, json.dumps({"result": result, "status": "ok", "time": 0.0}).encode()

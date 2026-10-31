@@ -13,10 +13,19 @@
 - **检索**：`Memory.search(top_k=30)`，两人对话每位说话人各取 30 条。Mem0 2.x 的混合检索
   （语义 + BM25 + 实体加权）需要 spaCy 与 fastembed，运行命令里一并装上；每条记忆标上来源会话
   的日期（两人对话再注明是谁的记忆），交给同一个回答模型、同一套提示（与 B2 朴素检索的格式相同）。
+  检索在回答线程里调用 CueMem 的向量器，用量本来就记在这道题名下。
+- **写入记录**：每份对话历史写完留下 build.json，记下协议（"抽取模型|向量模型:维度"，与其他外部
+  基线同一写法，见 evals/external.py）。写入目录（paths.eval_spaces / mem0）不分协议：另一个
+  协议的写入不删也不复用，直接报 ConfigMismatchError（pq 协议的写入在 data/eval-spaces-qwen，
+  用 CUEMEM_PATHS__EVAL_SPACES 指过去）；没记协议的旧记录按当前协议处理。build.json 另记
+  写入时装着的全部包（environment，同 evals/external.py），不进结果。
 
-mem0ai 不是 CueMem 的依赖，评测时用 uv 临时装上（遥测在导入前关闭）：
+mem0ai 不是 CueMem 的依赖，评测时用 uv 临时装上（遥测在导入前关闭）。spaCy 与 fastembed 固定在
+N12 期间构建机 uv 缓存里 Mem0 环境的版本（2026-10-14 起建的几个都是这两个版本；发表的 M0 写入，
+包括 N11 的，用的是哪个版本没有记录）：
 
-    uv run --with mem0ai --with spacy --with fastembed --with "en_core_web_sm @ $SPACY_SM" \\
+    uv run --with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
+        --with "en_core_web_sm @ $SPACY_SM" \\
         cuemem eval run --dataset locomo --split test200r --methods M0 --name locomo-test200r-mem0
 
 其中 SPACY_SM 是 spaCy 英文小模型的地址（与 spaCy 3.8 配套）：
@@ -37,16 +46,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from openai import APITimeoutError, BadRequestError
+from openai import BadRequestError
 
 from cuemem.core.models import Hit, MemoryUnit
 from cuemem.core.trace import start_trace
 from cuemem.embed import build_embedder
 from cuemem.embed.base import EmbedKind, TextEmbedder
-from cuemem.errors import ContentFilteredError
-from cuemem.evals.datasets import EvalSession
+from cuemem.evals.datasets import (
+    EvalSession,
+    SessionIds,
+    build_matches_session_ids,
+    storage_space_id,
+)
+from cuemem.evals.external import check_protocol, installed_environment, protocol_of
 from cuemem.evals.methods import MethodContext, MethodOutput
-from cuemem.llm.client import LLMClient, Message
+from cuemem.llm.client import LLMClient, Message, fallback_errors, replay_miss
 
 TOP_K = 30  # Mem0 默认 20；多给一些，免得说限制了它的召回
 USER = "user"
@@ -60,13 +74,19 @@ class _LLM:
     """Mem0 的 LLM 接口（generate_response）→ CueMem 的 LLMClient。
 
     与 CueMem 自己的抽取一样：内容审核误拒、请求超时、JSON 生成被中止时，改用备用模型
-    （另一家供应商）再试一次。
+    （另一家供应商）再试一次；有备用模型时主模型超时一次就换（retry_timeouts，见 LLMClient.chat）。
+    只读缓存模式下主模型未命中缓存时也换（见 llm.client.fallback_errors）。
     """
 
     def __init__(self, llm: LLMClient, scope: str) -> None:
         self.llm = llm
         self.scope = scope
-        self.fallback = llm.settings.consolidation.fallback_model
+        fallback = llm.settings.consolidation.fallback_model
+        roles = llm.settings.roles
+        self.primary = roles["extractor"].model if "extractor" in roles else None
+        # 备用模型就是抽取模型时等于没有备用（与 LLMClient.structured、评测网关相同）：超时照常
+        # 重试。以前先只发一次（以为有备用），再把同样的请求当备用重发满 1 + max_retries 次
+        self.fallback = fallback if fallback != self.primary else None
 
     def generate_response(
         self,
@@ -85,17 +105,19 @@ class _LLM:
                 tools=tools,
                 tool_choice=tool_choice if tools else None,
                 cache_scope=self.scope,
+                retry_timeouts=model is not None or self.fallback is None,
             )
             return _wrap_list(result.content or "") if response_format else result.content or ""
 
         try:
             return call(None)
-        except (ContentFilteredError, APITimeoutError, BadRequestError) as exc:
+        except fallback_errors(self.llm.settings, BadRequestError) as exc:
             # 通义在 JSON 模式下偶尔中止生成（"Model output became abnormal"），重发多半还会中止
             aborted = "Model output became abnormal" in str(exc)
             if self.fallback is None or (isinstance(exc, BadRequestError) and not aborted):
                 raise
-            return call(self.fallback)
+            with replay_miss(exc, "extractor", self.primary, self.fallback):
+                return call(self.fallback)
 
 
 def _wrap_list(content: str) -> str:
@@ -141,7 +163,7 @@ def _import_mem0(home: Path) -> Any:
         import mem0.memory.notices as mem0_notices  # type: ignore[import-not-found, unused-ignore]
     except ImportError as exc:  # pragma: no cover - 取决于运行环境
         raise RuntimeError(
-            "M0 需要 mem0ai：用 uv run --with mem0ai ... 运行（见模块说明）"
+            "M0 需要 mem0ai：用 uv run --with mem0ai==2.2.1 ... 运行（见模块说明）"
         ) from exc
     mem0_notices._fetch_remote_config = lambda: None
     original = mem0_main.generate_additive_extraction_prompt
@@ -178,15 +200,19 @@ class Mem0Baseline:
             self.root = settings.paths.eval_spaces / "mem0"
             self.llm = llm
             self.embedder = build_embedder(settings, ledger=llm.ledger)
+            # 写入协议：记进 build.json，另一个协议的写入不复用也不删（见模块说明）
+            self.protocol = protocol_of(settings, self.embedder)
             self.mem0 = _import_mem0(self.root / "_home")
             self._ready = True
 
     def answer(self, ctx: MethodContext) -> MethodOutput:
         self._setup(ctx.reader.llm)
-        key = re.sub(r"[^A-Za-z0-9_.-]", "_", ctx.space_id)  # 如 locomo:conv-42 → locomo_conv-42
+        # 如 locomo:conv-42 → locomo_conv-42；会话 ID 改写过的另存（longmemeval_s-anon_<题号>）
+        stored = storage_space_id(ctx.space_id, ctx.session_ids)
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", stored)
         found: list[tuple[str | None, dict[str, Any]]] = []
         with self._space_lock(key):
-            built = self._ensure_built(key, ctx.sessions)
+            built = self._ensure_built(key, ctx.sessions, ctx.session_ids)
             memory = self._memory(key)
             for me in _perspectives(ctx.sessions):
                 results = memory.search(
@@ -204,15 +230,27 @@ class Mem0Baseline:
 
     # ---------- 写入 ----------
 
-    def _ensure_built(self, key: str, sessions: Sequence[EvalSession]) -> dict[str, Any] | None:
+    def _ensure_built(
+        self, key: str, sessions: Sequence[EvalSession], session_ids: SessionIds = "native"
+    ) -> dict[str, Any] | None:
         """第一次用到这份对话历史时写入 Mem0；写完留下 build.json，之后的运行直接复用。
 
         写入在独立线程里做：不算进当前这道题的回答用量（评测 trace 绑定在调用线程上），
         单独统计后写进 build.json。中途失败的半成品下次整个重建。
+
+        记忆的元数据里存着会话 ID（证据的抬头会显示它）：LongMemEval / MemLens 的写入记下
+        会话 ID 的写法，对不上就重建（改写之前的写入没有这条记录，都是原始 ID）。
+
+        写入记录记下协议（抽取模型与向量模型）：另一个协议的写入报 ConfigMismatchError，不删也
+        不复用（目录不分协议，见模块说明）；没记协议的旧记录按当前协议处理。
         """
         directory = self.root / key
-        if (directory / "build.json").exists():
-            return None
+        record = directory / "build.json"
+        if record.exists():
+            stored = _read_json(record)
+            check_protocol(stored, self.protocol, directory, "Mem0")
+            if session_ids == "native" or build_matches_session_ids(stored, session_ids):
+                return None
         with self._lock:
             if key in self._failed:
                 raise RuntimeError(f"Mem0 写入这份对话历史时失败过，不再重试：{self._failed[key]}")
@@ -228,7 +266,13 @@ class Mem0Baseline:
             with self._lock:
                 self._failed[key] = f"{type(exc).__name__}: {exc}"[:300]
             raise
-        (directory / "build.json").write_text(json.dumps(stats, indent=2), "utf-8")
+        stats["protocol"] = self.protocol
+        if session_ids != "native":  # LoCoMo 的写入记录不变
+            stats["session_ids"] = session_ids
+        # 装着的包只记进文件，不进返回的统计（那份记进这道题的 details，即 results.jsonl）
+        record.write_text(
+            json.dumps({**stats, "environment": installed_environment()}, indent=2), "utf-8"
+        )
         with self._lock:
             self._build_spent += float(stats.get("spent", 0.0))
         return stats
@@ -326,6 +370,15 @@ class Mem0Baseline:
             return
         memory.close()
         memory.vector_store.client.close()
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """读写入记录；读不了时当作空记录（于是按原始 ID 处理，对不上就重建）。"""
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _perspectives(sessions: Sequence[EvalSession]) -> list[str | None]:

@@ -107,7 +107,8 @@ uv run python scripts/n8_assets.py
 
 # 整段剧本回放与核对（只用通义；约 $0.02）
 uv run cuemem demo demo/shop/script.json --fresh --report runs/demo/final-full.json
-uv run python scripts/n8_summary.py runs/demo/final-full.json
+uv run python scripts/n8_summary.py runs/demo/final-full.json   # 回放命中了缓存时不覆盖 demo.json（退出码 1）
+uv run python scripts/n8_summary.py runs/demo/final-full.json --out runs/demo/summary.json   # 另写一份
 
 # 上下文布局实验（关掉本地缓存，约 $0.1）
 uv run python scripts/n8_context.py

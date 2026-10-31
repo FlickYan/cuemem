@@ -8,10 +8,20 @@
 并发压测（--load-size 那个规模）里用 110 ms 的等待模拟这次网络调用：等待期间不占 GIL，
 多线程能把它重叠起来，这才是线上的形态。
 
+默认的空间没有实体、也没有图片（发表的延迟表就是这样测的）。--entities-per-round 按每轮多少个
+写入合成的实体（名字与别名，LongMemEval 约每轮 1 个、LoCoMo 约 0.12 个），--photos 在均匀分布的
+会话里附上几张图片（媒体记录与图片向量，以文搜图那一路会跑起来）。用了这两个参数时结果写进
+latency-extended.json，不覆盖 latency.json。
+
+结果写进 docs/results/n11-improvements/ 下（按 local / server 各占一组，替换本机这一组）；
+--out 换一个目录。复现脚本（scripts/reproduce.py）写到 runs/n11-latency/：延迟随机器而变，
+发表的表是在另一台机器上测的。
+
 用法：
     uv run python scripts/n11_latency.py                     # Qdrant 本地模式
-    docker run -d --name cuemem-qdrant -p 6333:6333 qdrant/qdrant:v1.19.1
+    docker run -d --name cuemem-qdrant -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.19.1
     uv run python scripts/n11_latency.py --qdrant-url http://localhost:6333
+    uv run python scripts/n11_latency.py --entities-per-round 0.6 --photos 30
 """
 
 from __future__ import annotations
@@ -33,7 +43,16 @@ import numpy as np
 
 from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.core.ids import stable_id
-from cuemem.core.models import Conversation, Episode, Fact, MemoryUnit, SessionIn, TurnIn
+from cuemem.core.models import (
+    Conversation,
+    Entity,
+    EntityType,
+    Episode,
+    Fact,
+    MemoryUnit,
+    SessionIn,
+    TurnIn,
+)
 from cuemem.core.timeutil import to_epoch
 from cuemem.embed.base import EmbeddingBatch, EmbedKind, TextEmbedder
 from cuemem.memory import MemorySystem
@@ -53,6 +72,8 @@ LOAD_READS = 64  # 每种并发度共发多少次读
 EMBED_DELAY_S = 0.11  # 线上查询向量化的网络耗时（N7 实测约 110 ms）
 
 PEOPLE = ["Ana", "Ben", "Chloe", "Dev", "Emma", "Farid", "Grace", "Hiro", "Iris", "Jon"]
+SYLLABLES = ["ka", "lo", "mi", "ren", "sa", "tor", "vel", "wen", "dri", "osh", "pal", "quin"]
+ENTITY_TYPES: list[EntityType] = ["person", "pet", "place", "organization", "product", "event"]
 PLACES = ["Singapore", "Lisbon", "the office", "the gym", "Tokyo", "the park", "home", "Paris"]
 TOPICS = [
     "running shoes",
@@ -63,7 +84,7 @@ TOPICS = [
     "a camping trip",
     "the new apartment",
     "piano lessons",
-    "a job interview",
+    "a cooking class",
     "the dentist",
     "a road trip",
     "my budget",
@@ -148,11 +169,52 @@ def derived(space: str, sess: SessionIn, rng: random.Random) -> tuple[list[Fact]
     return facts, episode
 
 
+def entities_for(space: str, sess: SessionIn, count: int, rng: random.Random) -> list[Entity]:
+    """一个会话里新出现的实体（合成，--entities-per-round）：名 + 随机拼的姓，别名是姓，
+    三成还有只叫名字的别名（问题里点名的人就会命中）。"""
+    out = []
+    for _ in range(count):
+        first = rng.choice(PEOPLE)
+        last = "".join(rng.choice(SYLLABLES) for _ in range(rng.randrange(2, 4))).capitalize()
+        name, etype = f"{first} {last}", rng.choice(ENTITY_TYPES)
+        out.append(
+            Entity(
+                id=stable_id(space, "entity", name.lower(), etype),
+                space_id=space,
+                name=name,
+                type=etype,
+                aliases=[last, *([first] if rng.random() < 0.3 else [])],
+                description=f"mentioned with {rng.choice(TOPICS)}",
+                first_seen=sess.started_at,
+                last_seen=sess.started_at,
+            )
+        )
+    return out
+
+
 def write_derived(
-    system: MemorySystem, space: str, items: list[tuple[list[Fact], Episode]]
+    system: MemorySystem,
+    space: str,
+    items: list[tuple[list[Fact], Episode]],
+    entities: Sequence[Entity] = (),
 ) -> None:
     units: list[MemoryUnit] = []
     payloads: list[dict[str, Any]] = []
+    unique = list({e.id: e for e in entities}.values())  # 重名的合成实体只留一个
+    for entity in unique:  # 与巩固一样：实体的描述也进向量索引
+        units.append(
+            MemoryUnit(
+                id=entity.id,
+                space_id=space,
+                kind="entity",
+                session_id="",
+                text=entity.descriptor,
+                ts=entity.first_seen,
+                source_turn_ids=[],
+                meta={"name": entity.name, "type": entity.type},
+            )
+        )
+        payloads.append({"kind": "entity"})
     for facts, episode in items:
         for fact in facts:
             units.append(
@@ -193,21 +255,65 @@ def write_derived(
     )
     system.db.apply_consolidation(
         facts=[f for facts, _ in items for f in facts],
-        entities=[],
+        entities=unique,
         episodes=[e for _, e in items],
         units=units,
     )
 
 
-def build_space(system: MemorySystem, space: str, rounds: int, seed: int) -> float:
+def photo(directory: Path, index: int) -> Path:
+    """一张小图片（每张颜色不同，内容哈希不同）。"""
+    from PIL import Image
+
+    path = directory / f"photo-{index:04d}.png"
+    color = (index * 37 % 256, index * 91 % 256, index * 53 % 256)
+    Image.new("RGB", (32, 24), color).save(path)
+    return path
+
+
+def with_photos(sessions: list[SessionIn], photos: int, directory: Path) -> list[SessionIn]:
+    """在均匀分布的 photos 个会话的第一句用户发言里附一张图片。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    out = list(sessions)
+    for k in range(min(photos, len(out))):
+        i = k * len(out) // photos
+        turns = list(out[i].turns)
+        turns[0] = turns[0].model_copy(update={"images": [str(photo(directory, k))]})
+        out[i] = out[i].model_copy(update={"turns": turns})
+    return out
+
+
+def build_space(
+    system: MemorySystem,
+    space: str,
+    rounds: int,
+    seed: int,
+    *,
+    entities_per_round: float = 0.0,
+    photos: int = 0,
+    media_dir: Path | None = None,
+) -> float:
+    """entities_per_round 与 photos 为 0 时，合成的数据与以前逐字相同（发表的延迟表可比）。"""
     rng = random.Random(seed)
     start = datetime(2024, 1, 1, 9)
     sessions = [session(rng, i, start) for i in range(rounds // ROUNDS_PER_SESSION)]
+    if photos:
+        assert media_dir is not None
+        sessions = with_photos(sessions, photos, media_dir / space)
+    entity_rng = random.Random(seed + 7)  # 另用一个随机数发生器：不改动事实与摘要
+    per_session = entities_per_round * ROUNDS_PER_SESSION
     started = time.perf_counter()
     for i in range(0, len(sessions), BATCH_SESSIONS):
         chunk = sessions[i : i + BATCH_SESSIONS]
         system.ingest(Conversation(space_id=space, sessions=chunk))
-        write_derived(system, space, [derived(space, s, rng) for s in chunk])
+        entities = [
+            e
+            for j, s in enumerate(chunk, start=i)
+            for e in entities_for(
+                space, s, int((j + 1) * per_session) - int(j * per_session), entity_rng
+            )
+        ]
+        write_derived(system, space, [derived(space, s, rng) for s in chunk], entities)
     return time.perf_counter() - started
 
 
@@ -253,12 +359,13 @@ def measure(
     cfg = L1Config()
     parts: dict[str, list[float]] = {"recall": [], "probe": [], "decide": [], "pack": []}
     assert system.learned is not None
+    images = system.db.has_media(space)  # 只有 --photos 时为真
 
     def read(i: int) -> None:
         question = questions[i]
         probe = system.probe.run(space, question, when, cfg)
         started = time.perf_counter()
-        system.learned.decide(probe.features, has_images=False)
+        system.learned.decide(probe.features, has_images=images)
         decided = time.perf_counter()
         system.l1.pack(space, probe.candidates, cfg)
         packed = time.perf_counter()
@@ -306,10 +413,12 @@ def load(system: MemorySystem, space: str, rounds: int, seed: int) -> list[dict[
     original = system.l1.embedder
     system.l1.embedder = DelayedEmbedder(original, EMBED_DELAY_S)
 
+    images = system.db.has_media(space)
+
     def read(question: str) -> float:
         started = time.perf_counter()
         probe = system.probe.run(space, question, when, cfg)
-        learned.decide(probe.features, has_images=False)
+        learned.decide(probe.features, has_images=images)
         system.l1.pack(space, probe.candidates, cfg)
         return (time.perf_counter() - started) * 1000
 
@@ -354,8 +463,19 @@ def main() -> None:
     parser.add_argument("--sizes", type=int, nargs="*", default=list(SIZES))
     parser.add_argument("--load-size", type=int, default=LOAD_SIZE, help="并发压测的规模；0 = 不做")
     parser.add_argument("--trials", type=int, default=3, help="每个规模测几次，取中位数")
+    parser.add_argument(
+        "--entities-per-round",
+        type=float,
+        default=0.0,
+        help="每轮写入多少个合成实体（如 0.6）；默认 0，与发表的延迟表一致",
+    )
+    parser.add_argument("--photos", type=int, default=0, help="每个空间附几张图片（如 30）；默认 0")
+    parser.add_argument(
+        "--out", type=Path, default=OUT, help="结果写进哪个目录（默认是发表结果的目录）"
+    )
     args = parser.parse_args()
     mode = "server" if args.qdrant_url else "local"
+    extended = bool(args.entities_per_round or args.photos)
     rows = []
     concurrency: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="cuemem-latency-") as tmp:
@@ -364,7 +484,15 @@ def main() -> None:
             for size in args.sizes:
                 space = f"bench-{mode}-{size}"
                 system.vectors.delete_space(space)
-                build_s = build_space(system, space, size, seed=size)
+                build_s = build_space(
+                    system,
+                    space,
+                    size,
+                    seed=size,
+                    entities_per_round=args.entities_per_round,
+                    photos=args.photos,
+                    media_dir=Path(tmp) / "photos",
+                )
                 waited = time.perf_counter()
                 while not system.vectors.indexed(space):  # 服务端：等后台建完索引再测
                     time.sleep(0.5)
@@ -383,12 +511,18 @@ def main() -> None:
                 system.vectors.delete_space(space)
         finally:
             system.close()
-    OUT.mkdir(parents=True, exist_ok=True)
-    path = OUT / "latency.json"
+    args.out.mkdir(parents=True, exist_ok=True)
+    # 带实体或图片的结果另存一个文件：发表的 latency.json 与以前的合成数据可比
+    path = args.out / ("latency-extended.json" if extended else "latency.json")
     existing = json.loads(path.read_text("utf-8")) if path.exists() else {}
     existing[mode] = {
         "machine": f"{platform.platform()}, {os.cpu_count()} CPUs",
         "embedder": "hash-1024 (no API call; production adds ~110 ms per query)",
+        **(
+            {"entities_per_round": args.entities_per_round, "photos": args.photos}
+            if extended
+            else {}
+        ),
         "repeats": REPEATS,
         "trials": args.trials,
         "rows": rows,
@@ -400,7 +534,7 @@ def main() -> None:
         },
     }
     path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", "utf-8")
-    print(f"→ {path.relative_to(ROOT)}")
+    print(f"→ {path}")
 
 
 if __name__ == "__main__":
