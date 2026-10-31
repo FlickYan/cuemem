@@ -707,7 +707,7 @@ English edition of [docs/decisions.md](../decisions.md), which remains the sourc
 ## D-057 The gate on real traffic: first messages of real chatbot conversations
 
 - **Status:** adopted (N11; answers "the mixed stream behind the controller's result is synthetic").
-- **Context:** the controller's "whether to recall" result (41% cheaper than always retrieving in a mixed stream) rests on synthetic non-memory queries: Dolly instructions and generated same-topic questions. Real messages are more colloquial and varied and often use the first person ("help me fix my résumé"), which may fool the gate.
+- **Context:** the controller's "whether to recall" result (41% cheaper than always retrieving in a mixed stream) rests on synthetic non-memory queries: Dolly instructions and generated same-topic questions. Real messages are more colloquial and varied and often use the first person ("help me fix my email"), which may fool the gate.
 - **Decision:**
   1. Use WildChat-1M (real conversations between users and a chatbot, ODC-BY), first shard: the **first message** of English, non-toxic, non-redacted conversations. The start of a conversation cannot refer to an earlier one, so none of them needs long-term memory. Same filter as Dolly (10–300 characters), deduplicated by text: 14,319 candidates, 1,750 sampled (as many as the test memory questions).
   2. Pair each with a test memory space and run the probe, as for N9's mixed stream; apply the frozen v1 and v2 controllers offline: false recall, gate AUC, and the cost with these messages replacing the synthetic non-memory queries. The zero-shot LLM router (B6z: qwen3.8-flash looking at the message alone) also judges the same messages, and with the hybrid (B6h) serves as a comparison.

@@ -2,6 +2,7 @@
 
     uv sync --extra anthropic
     export ANTHROPIC_API_KEY=sk-ant-...   # Claude
+    export ANTHROPIC_MODEL=...            # 要用的 Claude 模型 ID（见下）
     export DASHSCOPE_API_KEY=sk-ws-...    # CueMem 的默认配置：通义千问（QwenCloud）抽取事实、算向量
     CUEMEM_HOME=$(mktemp -d) uv run python examples/integrations/claude_example.py
 
@@ -21,12 +22,14 @@
 抽取成事实。第二段是新的对话，问晚饭吃什么。每句话发出之前先过检索控制器（with_recall）。
 最后打印 /memories/facts.md，以及删掉 Claude 的文件时 CueMem 遗忘了什么。
 
-模型用 claude-opus-5-5，开着服务端的拒答兜底（fallbacks="default"，安全分类器误拒时换模型重答）。
-它的思考块绑定在对话上：历史只能往后加（见 Conversation.send），改动已经发出去的消息会被拒绝。
+模型由 ANTHROPIC_MODEL 指定，要支持记忆工具（memory_20250818）、effort 与服务端的拒答兜底
+（fallbacks="default"，安全分类器误拒时换模型重答）。保留思考块的模型把思考块绑定在对话上：
+历史只能往后加（见 Conversation.send），改动已经发出去的消息会被拒绝。
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import anthropic
@@ -35,7 +38,7 @@ from anthropic.types.beta import BetaMessageParam
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
-MODEL = "claude-opus-5-5"
+MODEL = os.environ["ANTHROPIC_MODEL"]
 USER = "claude-demo"
 SYSTEM = "You are a friendly personal assistant. Keep answers short."
 

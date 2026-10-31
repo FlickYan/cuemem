@@ -84,7 +84,7 @@ TOPICS = [
     "a camping trip",
     "the new apartment",
     "piano lessons",
-    "a job interview",
+    "a cooking class",
     "the dentist",
     "a road trip",
     "my budget",

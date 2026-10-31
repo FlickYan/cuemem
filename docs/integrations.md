@@ -106,6 +106,8 @@ cuemem.close()  # 应用退出时，memory.close() 之前；异步用 aend_threa
 - 路径严格校验（不能出 `/memories`），有大小上限；`with_recall` / `awith_recall` 在发给 Claude 之前先过控制器、注入证据。
 
 ```python
+import os
+
 import anthropic
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
@@ -113,6 +115,7 @@ from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 # 默认配置：通义千问抽取与检索、DeepSeek 回答；或 Memory(preset="deepseek")
 memory = Memory()
 client = anthropic.Anthropic()
+model = os.environ["ANTHROPIC_MODEL"]  # 支持 memory tool 的 Claude 模型
 
 with CueMemMemoryTool(memory, user_id="alice") as tool:
     history = []  # 只追加：with_recall 只动最新一句用户消息
@@ -120,7 +123,7 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
         user = {"role": "user", "content": text}
         history, evidence = with_recall([*history, user], memory, user_id="alice")
         runner = client.beta.messages.tool_runner(
-            model="claude-opus-5-5",
+            model=model,
             max_tokens=16000,
             tools=[tool],
             messages=history,

@@ -578,7 +578,7 @@ def message(content: list[dict[str, Any]], stop: str) -> dict[str, Any]:
         "id": "msg_test",
         "type": "message",
         "role": "assistant",
-        "model": "claude-opus-5-5",
+        "model": "test-model",
         "content": content,
         "stop_reason": stop,
         "stop_sequence": None,
@@ -641,7 +641,7 @@ def test_tool_runner_round_trip(tool: CueMemMemoryTool, memory: Memory) -> None:
         max_retries=0,
     )
     runner = client.beta.messages.tool_runner(
-        model="claude-opus-5-5",
+        model="test-model",
         max_tokens=1024,
         tools=[tool],
         messages=[{"role": "user", "content": "I live in Berlin. Please remember that."}],
@@ -671,7 +671,7 @@ def test_async_tool_with_the_async_runner(n3_settings: Settings, fake_api: FakeA
                 max_retries=0,
             )
             runner = client.beta.messages.tool_runner(
-                model="claude-opus-5-5",
+                model="test-model",
                 max_tokens=1024,
                 tools=[tool],
                 messages=[{"role": "user", "content": "I live in Berlin. Please remember that."}],
@@ -1102,7 +1102,7 @@ def test_history_stays_append_only_across_turns(tool: CueMemMemoryTool, memory: 
         history, evidence = with_recall([*history, user], memory, user_id="alice", mode="l1")
         assert evidence.level == "L1"
         runner = client.beta.messages.tool_runner(
-            model="claude-opus-5-5", max_tokens=1024, tools=[tool], messages=history
+            model="test-model", max_tokens=1024, tools=[tool], messages=history
         )
         for reply in runner:
             history.append(reply.to_param())

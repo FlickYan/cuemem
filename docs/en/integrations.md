@@ -129,6 +129,8 @@ cuemem.close()  # at shutdown, before memory.close(); async: aend_thread / aclos
 - **Recall:** `with_recall` / `awith_recall` run the controller and inject evidence before the request goes to Claude.
 
 ```python
+import os
+
 import anthropic
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
@@ -136,6 +138,7 @@ from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 # default config: Qwen extracts and retrieves, DeepSeek answers; or Memory(preset="deepseek")
 memory = Memory()
 client = anthropic.Anthropic()
+model = os.environ["ANTHROPIC_MODEL"]  # a Claude model that supports the memory tool
 
 with CueMemMemoryTool(memory, user_id="alice") as tool:
     history = []  # append-only: with_recall only touches the newest user message
@@ -143,7 +146,7 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
         user = {"role": "user", "content": text}
         history, evidence = with_recall([*history, user], memory, user_id="alice")
         runner = client.beta.messages.tool_runner(
-            model="claude-opus-5-5",
+            model=model,
             max_tokens=16000,
             tools=[tool],
             messages=history,

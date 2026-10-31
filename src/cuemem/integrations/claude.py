@@ -1,5 +1,7 @@
 """Claude 的记忆工具（memory_20250818）接到 CueMem 上（N12）：/memories 目录的后端。
 
+    import os
+
     import anthropic
     from cuemem import Memory
     from cuemem.integrations.claude import CueMemMemoryTool, with_recall
@@ -11,7 +13,7 @@
         [{"role": "user", "content": "I moved to Lisbon last month."}], memory, user_id="alice"
     )
     runner = anthropic.Anthropic().beta.messages.tool_runner(
-        model="claude-opus-5-5", max_tokens=16000, tools=[tool], messages=history
+        model=os.environ["ANTHROPIC_MODEL"], max_tokens=16000, tools=[tool], messages=history
     )
     runner.until_done()
 
@@ -50,8 +52,8 @@ clear_all_memory 照样能遗忘它们。整个记忆空间被删除（Memory.de
 with_recall / awith_recall（可选）：调用模型之前先过检索控制器（L0 只给画像），证据块由
 cuemem.evidence 排成，与记忆代理同一个格式、同一个位置，放在最新一句用户消息的开头（后面跟着的
 mid-conversation system 消息不算）。返回的列表就是之后的对话历史：下一轮在它后面追加，再调用
-with_recall——只往后加，已经发出去的消息一个字节都不改（Claude Opus 5.5 等模型的 preserved
-thinking 要求前缀不变，否则 400 或丢掉思考块，提示缓存也失效）。检索出错时照常返回原消息，
+with_recall——只往后加，已经发出去的消息一个字节都不改（保留思考块的模型（preserved
+thinking）要求前缀不变，否则 400 或丢掉思考块，提示缓存也失效）。检索出错时照常返回原消息，
 level 为 "error"，这一轮只是不带记忆。
 """
 
@@ -950,7 +952,7 @@ def with_recall(
     工具结果（工具循环的中途）或助手的话时不检索。
 
     返回的列表就是之后的历史：下一轮在它后面追加用户消息再调用（只往后加）。不要每轮从
-    不带证据的消息重新拼——那样会改动已经发出去的消息，Claude Opus 5.5 这样的模型会拒绝
+    不带证据的消息重新拼——那样会改动已经发出去的消息，保留思考块的模型会拒绝
     （preserved thinking），提示缓存也会失效。检索出错时给出 RuntimeWarning，原样返回消息，
     level 为 "error"。这个函数会等网络请求：异步代码里用 awith_recall。
     """
