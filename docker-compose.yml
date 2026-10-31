@@ -4,6 +4,12 @@
 #                                      # 并设置 CUEMEM_API_TOKEN
 #   docker compose up -d               # 没有 CUEMEM_API_TOKEN 时拒绝启动
 #   界面 http://localhost:7860/ · 接口文档 /docs · OpenAI 兼容的记忆代理 http://localhost:7860/v1
+# Key 看用哪套配置：默认 DEEPSEEK_API_KEY 与 DASHSCOPE_API_KEY；CUEMEM_PRESET=openai 时
+# OPENAI_API_KEY，=deepseek 时 DEEPSEEK_API_KEY，=ollama 时不要 Key（另设下面的
+# CUEMEM_PROVIDERS__OLLAMA__BASE_URL，宿主机上的 Ollama 要监听容器连得到的地址）。
+# up -d 在容器启动后就返回：http://127.0.0.1:7860/ 没有响应时 docker compose ps 显示 Restarting，
+# docker compose logs cuemem 里是一行原因（多半是缺 Key）；改好 .env 再 docker compose up -d。
+# restart: unless-stopped 对配置错误也反复重启（退出码 1 不让它停），但崩溃与重启机器后能自己起来
 services:
   qdrant:
     image: qdrant/qdrant:v1.19.1

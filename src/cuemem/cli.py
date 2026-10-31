@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -148,6 +149,35 @@ PROVIDER_LABELS = {
 KEY_HINTS = {"qwen": "以 sk-ws- 开头"}  # 帮助区分同一平台上的其他 Key
 
 
+def _settings(*, stderr: bool = False, **overrides: Any) -> Settings:
+    """读配置（load_settings）；配置写错时只打印一行原因、以 1 退出，不打印调用栈。
+
+    写错的预设名（ValueError）与不合法的值（pydantic 的 ValidationError，也是 ValueError；例如
+    docker run --env-file 把行尾的 # 注释算进了值里）以前在多数命令里打出几十行调用栈：退出码同样
+    是 1，容器同样反复重启，原因却埋在调用栈里。SDK 不变，照旧抛出这些异常。stderr：mcp 的 stdout
+    是 MCP 的通道。"""
+    try:
+        return load_settings(**overrides)
+    except (CueMemError, ValueError) as exc:
+        out = Console(stderr=True) if stderr else console
+        out.print(f"[red]错误：[/red]配置有误：{escape(_config_problem(exc))}")
+        raise typer.Exit(1) from exc
+
+
+def _config_problem(exc: Exception) -> str:
+    """配置错误的一行说明：pydantic 的 ValidationError 每个字段一句（字段、原因、收到的值，过长时
+    截断），不要它多行的格式与文档链接；别的错误原样。"""
+    if not isinstance(exc, ValidationError):
+        return str(exc)
+    parts = []
+    for error in exc.errors(include_url=False):
+        where = ".".join(str(part) for part in error["loc"]) or "配置"
+        got = repr(error.get("input"))
+        got = got if len(got) <= 60 else got[:57] + "…"
+        parts.append(f"{where}：{error['msg']}（收到 {got}）")
+    return "；".join(parts)
+
+
 @contextmanager
 def _open_system() -> Iterator[MemorySystem]:
     """组装 MemorySystem；把 CueMem 的已知错误转成友好的提示。
@@ -158,7 +188,7 @@ def _open_system() -> Iterator[MemorySystem]:
 
     system: MemorySystem | None = None
     try:
-        settings = load_settings(peak_policy="warn")
+        settings = _settings(peak_policy="warn")
         _peak_note(settings)
         system = MemorySystem.from_settings(settings)
         yield system
@@ -173,7 +203,7 @@ def _open_system() -> Iterator[MemorySystem]:
 @app.command()
 def configure() -> None:
     """交互式填写各供应商的 API Key，写入 .env（Key 输入时不显示）。"""
-    settings = load_settings()
+    settings = _settings()
     path = env_file_path()
     current = read_env(path)
     console.print(
@@ -219,7 +249,7 @@ def doctor(
     ] = False,
 ) -> None:
     """检查配置、API Key、数据目录与密钥文件的权限，以及（可选）各模型的连通性。"""
-    settings = load_settings()
+    settings = _settings()
     _print_config(settings)
     _print_local_store(settings)
     for line in _loose_modes(settings):
@@ -456,7 +486,7 @@ def spaces() -> None:
     """列出所有记忆空间。"""
     from cuemem.store.sqlite import MemoryDB
 
-    settings = load_settings()
+    settings = _settings()
     db = MemoryDB(settings.paths.db)
     rows = db.list_spaces()
     db.close()
@@ -487,7 +517,7 @@ def usage(
     """汇总模型调用量与成本。"""
     from cuemem.llm.ledger import Ledger
 
-    settings = load_settings()
+    settings = _settings()
     ledger = Ledger(settings.paths.ledger)
     since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) if today else None
     rows = ledger.summary(run_id=run, since=since)
@@ -522,8 +552,10 @@ def _service(
         raise typer.Exit(1)
     from cuemem.api.service import ChatService
 
-    try:  # 缺 Key、换了向量模型、没有商品目录等：提示原因，不打印调用栈（Docker 里会反复重启）
-        settings = load_settings(peak_policy="warn")
+    # 缺 Key、换了向量模型、没有商品目录等：提示一行原因，不打印调用栈。退出码与调用栈时一样是 1，
+    # docker compose 的 restart: unless-stopped 照样反复重启，这一行在 docker compose logs 里
+    try:
+        settings = _settings(peak_policy="warn")
         if check is not None:
             check()
         _peak_note(settings)
@@ -855,7 +887,7 @@ def proxy(
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(RecallMode))}[/red]")
         raise typer.Exit(1)
     unknown = _unknown_model(unknown_model)
-    settings = load_settings(peak_policy="warn")
+    settings = _settings(peak_policy="warn")
     try:
         keys = _access_keys()  # load_settings 已读入 .env
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
@@ -1043,7 +1075,7 @@ def migrate_vectors(
     """
     from cuemem.store.vector import VectorStore
 
-    settings = load_settings()
+    settings = _settings()
     if settings.vector_store.url:
         console.print(
             "[red]当前已经在用服务端[/red]（CUEMEM_VECTOR_STORE__URL）：这个命令只从本地模式迁出"
@@ -1095,7 +1127,7 @@ def mcp_cmd(
     from cuemem.api.mcp import build_server
     from cuemem.api.service import ChatService
 
-    settings = load_settings(peak_policy="warn")
+    settings = _settings(stderr=True, peak_policy="warn")
     try:  # 缺 Key、向量库打不开等：说明原因，不打印调用栈；写到 stderr（stdout 是 MCP 的通道）
         service = ChatService.create(
             settings, scenario="plain", default_space=space, router=cast(Router, router)
@@ -1256,7 +1288,7 @@ def data_download(
     from cuemem.evals.datasets import DATASETS
     from cuemem.evals.datasets import download as download_dataset
 
-    settings = load_settings()
+    settings = _settings()
     for name in names or [n for n, spec in DATASETS.items() if not spec.optional]:
         if name not in DATASETS:
             console.print(f"[red]未知数据集 {name}[/red]，可选：{', '.join(DATASETS)}")
@@ -1286,7 +1318,7 @@ def eval_split(
     """按（题型，是否拒答）分层抽样，生成划分文件（提交进仓库，保证可复现）。"""
     from cuemem.evals.splits import save_split, stratified_ids
 
-    settings = load_settings()
+    settings = _settings()
     evalset = _load_evalset(settings, dataset, parent)
     chosen = stratified_ids(evalset.samples, size, seed=seed)
     note = f"从 {parent} 分层抽样" if parent else "按（题型，是否拒答）分层抽样"
@@ -1369,7 +1401,7 @@ def eval_run(
     from cuemem.evals.report import build_report
     from cuemem.evals.runner import EvalRunner, RunConfig
 
-    settings = load_settings()
+    settings = _settings()
     if peak is not None:
         settings = settings.model_copy(update={"peak_policy": peak})
     for line in _peak_status(settings):
@@ -1474,7 +1506,7 @@ def eval_probe(
     from cuemem.evals.datasets import protocol_samples
     from cuemem.evals.runner import EvalRunner, RunConfig
 
-    settings = load_settings()
+    settings = _settings()
     split_name = None if split == "all" else split
     evalset = _load_evalset(settings, dataset, split_name)
     evalset.samples = protocol_samples(evalset)  # 与评测一致：LoCoMo 不含对抗题
@@ -1507,7 +1539,7 @@ def eval_report(
     _require_plotting()
     from cuemem.evals.report import build_report
 
-    settings = load_settings()
+    settings = _settings()
     run_dir = Path(run) if Path(run).exists() else settings.paths.eval_runs / run
     if not (run_dir / "run.json").exists():
         console.print(f"[red]找不到运行目录 {run_dir}[/red]")
@@ -1528,7 +1560,7 @@ def eval_audit(
     from cuemem.evals.audit import export_audit, score_audit
     from cuemem.evals.report import load_rows
 
-    settings = load_settings()
+    settings = _settings()
     run_dir = Path(run) if Path(run).exists() else settings.paths.eval_runs / run
     path = run_dir / "judge-audit.md"
     if score:

@@ -2,14 +2,16 @@
 
     uv sync --extra local --extra openai-agents
     export DEEPSEEK_API_KEY=sk-...
-    CUEMEM_PRESET=deepseek uv run python examples/integrations/openai_agents_example.py
+    CUEMEM_PRESET=deepseek CUEMEM_HOME=$(mktemp -d) \\
+        uv run python examples/integrations/openai_agents_example.py
 
 Agent 用 CueMem 配置里 agent 角色的模型（同一个模型目录、同一个 Key，走 OpenAI 兼容的 Chat
 Completions）：deepseek 预设是 deepseek-flash（关掉思考模式），抽取也用它，向量在本机算。
 花费不到一美分。只有通义千问（QwenCloud）的 Key 时：设 DASHSCOPE_API_KEY、不设 CUEMEM_PRESET，
 用默认配置（qwen3.8-flash），不需要 --extra local。
 
-数据写在 CUEMEM_HOME（不设时：源码仓库里是仓库根目录）；演示用户每次运行先清空。
+数据写在 CUEMEM_HOME（不设时：源码仓库里是仓库根目录）；演示用户每次运行先清空。数据目录会记住
+向量模型：deepseek 预设（本机向量）别用默认配置的数据目录，上面的命令用一个临时目录。
 """
 
 from __future__ import annotations

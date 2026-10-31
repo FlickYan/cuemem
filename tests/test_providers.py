@@ -92,6 +92,8 @@ def test_missing_key_errors_name_the_right_remedy(
         build_embedder(settings)
     assert "DASHSCOPE_API_KEY，请运行 cuemem configure" in str(caught.value)
     assert "openai" not in str(caught.value)
+    # 离线试用的提示说清楚要另用数据目录：数据目录会记住向量模型，命令失败了也一样
+    assert "单独的数据目录（CUEMEM_HOME）里设置 CUEMEM_EMBEDDING__BACKEND=hash" in str(caught.value)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     with pytest.raises(MissingAPIKeyError, match=r'Memory\(preset="openai"\)'):
         build_embedder(settings)

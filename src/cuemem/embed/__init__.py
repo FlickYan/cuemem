@@ -88,7 +88,8 @@ def build_embedder(
         if api_key is None:
             raise MissingAPIKeyError(
                 f"向量化需要环境变量 {provider.api_key_env}，{missing_key_remedy(cfg.provider)}；"
-                "离线试用可设置 CUEMEM_EMBEDDING__BACKEND=hash"
+                "离线试用可在单独的数据目录（CUEMEM_HOME）里设置 CUEMEM_EMBEDDING__BACKEND=hash"
+                "（数据目录会记住向量模型）"
             )
         if cfg.backend == "openai":
             from cuemem.embed.openai_compat import OpenAICompatibleEmbedder

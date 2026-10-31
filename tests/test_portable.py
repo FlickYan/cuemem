@@ -6,6 +6,8 @@ import base64
 import io
 import json
 import os
+import re
+import runpy
 import tempfile
 import uuid
 from collections.abc import Iterator, Sequence
@@ -14,14 +16,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import TOY_CONVERSATION, FakeAPI
+from fakes import PROJECT_ROOT, TOY_CONVERSATION, FakeAPI
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 from test_cli import _flat, runner
 
 from cuemem import Memory
 from cuemem.cli import app
-from cuemem.config import PathsConfig, Settings
+from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.core.models import Turn
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import EmbeddingAPIError
@@ -370,3 +372,76 @@ def test_cli_export_import_and_preset(
     assert result.exit_code == 0, result.output
     assert os.environ["CUEMEM_PRESET"] == "ollama"
     assert "不需要Key" in _flat(result.output) and "llama3.1-8b" in result.output
+
+
+@pytest.mark.parametrize(
+    ("env", "command", "expected"),
+    [
+        ({}, ["--preset", "opneai", "doctor"], ["没有预设opneai；可用的有："]),
+        (  # docker run --env-file 把行尾的注释算进值里
+            {"CUEMEM_EMBEDDING__BACKEND": "hash   # 行尾注释"},
+            ["proxy"],
+            ["embedding.backend：Inputshouldbe", "收到'hash#行尾注释'"],
+        ),
+        (
+            {"CUEMEM_API_TOKEN": "t", "CUEMEM_PRESET": "opneai"},
+            ["serve", "--host", "0.0.0.0"],
+            ["没有预设opneai"],
+        ),
+        ({"CUEMEM_PRESET": "opneai"}, ["ask", "q", "--space", "s"], ["没有预设opneai"]),
+        ({"CUEMEM_PRESET": "opneai"}, ["mcp"], ["没有预设opneai"]),
+    ],
+)
+def test_config_errors_are_one_line_not_a_traceback(
+    clean_env: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+    command: list[str],
+    expected: list[str],
+) -> None:
+    """预设名写错、配置项的值不合法时，各命令都只打印一行原因、以 1 退出。以前 load_settings 的
+    ValueError（预设）与 pydantic 的 ValidationError（取值）在 doctor、proxy、serve、ask、mcp 等
+    命令里都是几十行调用栈：Docker 里同样以 1 退出、反复重启，原因埋在调用栈里。mcp 写到 stderr。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_PRESET", "")  # --preset 会写这个变量：登记一下，测试结束时还原
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    served: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: served.append(app_))
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    flat = _flat(result.output)
+    assert "错误：配置有误：" in flat and all(part in flat for part in expected), result.output
+    assert "errors.pydantic.dev" not in result.output and served == []
+    if command == ["mcp"]:  # stdout 是 MCP 的通道
+        assert "配置有误" in result.stderr and result.stdout == ""
+
+
+ENV_ASSIGNMENT = re.compile(r"^#?\s*([A-Z][A-Z0-9_]*)=(.*)$")
+
+
+def test_env_example_lines_survive_docker_env_file(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """docker run --env-file 不认行尾注释：值原样取到行尾，连同空格与 # 之后的说明。.env.example
+    里的每一行赋值（注释掉的取消注释之后）都没有这些，cuemem 也读得进去。以前三行把说明写在值的
+    后面，取消注释之后预设成了 "openai   # 全部换成 OpenAI…"，哈希向量的那一行同样读不进去
+    （compose 的 env_file 与 python-dotenv 会去掉行尾注释，只有这条路出错）。"""
+    lines = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    found = [m.groups() for line in lines if (m := ENV_ASSIGNMENT.match(line))]
+    names = {name for name, _ in found}
+    assert {"CUEMEM_PRESET", "CUEMEM_EMBEDDING__BACKEND", "CUEMEM_API_TOKEN"} <= names
+    for name, value in found:
+        assert "#" not in value and value == value.strip(), (name, value)
+        if name.startswith("CUEMEM_") and value:
+            with monkeypatch.context() as patch:
+                patch.setenv(name, value)
+                load_settings(home=tmp_path)  # 预设名与取值都合法
+
+
+def test_keyless_example_runs_offline(clean_env: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """examples/keyless.py（不要 Key 的试用）：不设任何 Key、不调用模型，用哈希向量写入一句话、
+    再检索出来；数据在临时目录里。"""
+    runpy.run_path(str(PROJECT_ROOT / "examples" / "keyless.py"), run_name="__main__")
+    assert capsys.readouterr().out == "L1 User: I just started a new job at Acme in Berlin.\n"
