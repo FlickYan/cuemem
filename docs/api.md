@@ -21,7 +21,7 @@
 - 没装 `ui` 时，`cuemem serve` 只提供 `/api`、`/api/v1`、`/mcp`、`/docs` 与 `/v1`，并说明怎么装界面（`pip install "cuemem[ui] @ git+https://github.com/FlickYan/cuemem"`，源码仓库里是 `uv sync --extra ui`）。
 - 没装 `eval` 时，`cuemem eval run`（`--build-only` 除外）与 `cuemem eval report` 给出同样的安装提示、退出码 1；`eval split`、`eval probe`、`eval audit` 与 `data download` 照常。
 - Docker 镜像缺省装 `ui` 与 `local`；`docker build --build-arg EXTRAS= .` 构建只有接口的镜像。镜像里缺可选依赖时办法是重新构建，例如 `docker build --build-arg EXTRAS="--extra ui --extra local" -t cuemem .`（再加 `--extra eval` 等），镜像里的提示也这样说：容器里的 pip 装进别的环境，镜像里也没有 git。
-- 用 pip 装 `cuemem[ui]`（与 `cuemem[local]`）时 Pillow 仍解到 13 以下：gradio 与 fastembed 声明了 `pillow<13`，而 Pillow 12 有只在 13 修好的安全公告。接收别人图片的服务请用 Docker 镜像，或在源码仓库里 `uv sync --locked`，它们装的是 Pillow 13。两者发给模型的图片字节相同。
+- 用 pip 装的依赖里有 `cuemem[ui]` 时 Pillow 仍解到 13 以下：gradio 声明了 `pillow<13`（只装 `cuemem[local]` 时解到 fastembed 0.9.1，它允许 Pillow 13），而 Pillow 12 有只在 13 修好的安全公告。接收别人图片的服务请用 Docker 镜像，或在源码仓库里 `uv sync --locked`，它们装的是 Pillow 13。两者发给模型的图片字节相同。
 - 包带着 `py.typed`，mypy 与 pyright 会检查对 CueMem 的调用（升级之后可能报出新的、正确的错误）。
 
 ## 记忆空间与身份

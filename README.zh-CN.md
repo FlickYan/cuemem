@@ -5,7 +5,7 @@
 
 [English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [接口参考](docs/api.md) · [与 Mem0、Letta、Zep 等的对比](docs/landscape.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
-> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变；仓库公开之后第四轮从六个视角再查，修掉核实为真的 22 处（D-071）：有安全公告的依赖与 CI 的供应链、安全策略、公网部署（不鉴权时的 DNS 重绑定、太短的令牌、按令牌的花费上限、Qdrant 的 API Key、只给本人读写的文件、界面不联系第三方）、删除传到进行中的会话并且不留残留、跨过重启的 run、从 GitHub 安装与更顺的第一次运行、许可声明，以及与外部基线比较的说法，评测请求、图片请求与发表的数字都不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变；仓库公开之后第四轮从六个视角再查，核实为真的 22 处里修掉要改的 21 处（D-071）：有安全公告的依赖与 CI 的供应链、安全策略、公网部署（不鉴权时的 DNS 重绑定、太短的令牌、按令牌的花费上限、Qdrant 的 API Key、只给本人读写的文件、界面不联系第三方）、删除传到进行中的会话并且不留残留、跨过重启的 run、从 GitHub 安装与更顺的第一次运行、许可声明，以及与外部基线比较的说法，评测请求、图片请求与发表的数字都不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 <a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
 
@@ -195,7 +195,7 @@ uv run cuemem eval run --split pilot10   # 10 题试跑全部基线（约 $0.4�
 | `eval` | 评测的图，以及控制器与门控的训练脚本（matplotlib、scikit-learn）。没装时 `cuemem eval run` 与 `eval report` 说明要装哪个、退出 1 |
 | `integrations` | OpenAI Agents SDK、LangGraph / LangChain 与 Anthropic 的集成（也可以只装 `openai-agents`、`langgraph`、`anthropic` 之一） |
 
-源码仓库里 `uv sync` 经开发依赖组装上 `ui` 与 `eval`，需要时再加 `--extra local` 或 `--extra integrations`。用 pip 装 `cuemem[ui]` 或 `cuemem[local]` 时 Pillow 仍解到 13 以下：gradio 与 fastembed 声明了 `pillow<13`，而 Pillow 12 有只在 13 修好的安全公告；接收别人图片的服务请用 Docker 镜像，或在源码仓库里 `uv sync --locked`，它们装的是 Pillow 13。pip 安装后命令是 `cuemem …`（不是 `uv run cuemem …`），数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`cuemem serve` 启动通用助手，因为导购演示的商品目录只在仓库里（`cuemem demo` 读剧本旁边的 `catalog.json`）。开发机上 `cuemem --help` 与 `import cuemem.sdk` 约 0.3–0.4 秒。CI 每次推送都在仓库外装 wheel，跑命令行、SDK 与服务。
+源码仓库里 `uv sync` 经开发依赖组装上 `ui` 与 `eval`，需要时再加 `--extra local` 或 `--extra integrations`。用 pip 装的依赖里有 `cuemem[ui]` 时 Pillow 仍解到 13 以下：gradio 声明了 `pillow<13`（只装 `cuemem[local]` 时解到 fastembed 0.9.1 与 Pillow 13），而 Pillow 12 有只在 13 修好的安全公告；接收别人图片的服务请用 Docker 镜像，或在源码仓库里 `uv sync --locked`，它们装的是 Pillow 13。pip 安装后命令是 `cuemem …`（不是 `uv run cuemem …`），数据放在 `~/.cuemem`（用 `CUEMEM_HOME` 改）；`cuemem serve` 启动通用助手，因为导购演示的商品目录只在仓库里（`cuemem demo` 读剧本旁边的 `catalog.json`）。开发机上 `cuemem --help` 与 `import cuemem.sdk` 约 0.3–0.4 秒。CI 每次推送都在仓库外装 wheel，跑命令行、SDK 与服务。
 
 命令行的提示是中文；Agent、网页界面、演示、`/api/v1`、记忆代理与 MCP 工具是英文，SDK 的返回值与它自己的报错也是英文；更深处的核心抛出的错误（缺 Key、向量库被占用、配置写错）是中文。预设名写错或 `CUEMEM_*` 的值不合法时，任何命令都只打印一行"错误：配置有误：…"并以 1 退出。
 
@@ -356,7 +356,7 @@ uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基�
 | N12 后续 | 全面体检：七个视角找问题，修掉 24 处，评测请求不变 | 已完成 |
 | N12 后续 | 第二轮体检：留到以后的 17 条做了 14 条（原子写入、供应商出错、对账与遗忘的代价、启动与依赖、数据集与显著性、Mem0 接口与 `MemoryClient`、多租户、记忆代理），评测请求不变 | 已完成 |
 | N12 后续 | 第三轮体检：七个视角从头再查，修掉核实为真的 22 处（遗忘与锁、提交之后的出错、删除的残留、`status()`、闲置结束、规模与打开的文件、界面与输入的上限、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现与说法），评测请求不变 | 已完成 |
-| N12 后续 | 第四轮体检（仓库公开之后）：六个视角，修掉核实为真的 22 处（依赖的安全公告与 CI 供应链、安全策略、公网部署、删除传到进行中的会话、跨过重启的 run、遗忘的残留、文件权限、从 GitHub 安装与第一次运行、许可声明、与外部基线比较的说法），评测请求、图片请求与发表的数字不变 | 已完成 |
+| N12 后续 | 第四轮体检（仓库公开之后）：六个视角，核实为真的 22 处里修掉要改的 21 处（依赖的安全公告与 CI 供应链、安全策略、公网部署、删除传到进行中的会话、跨过重启的 run、遗忘的残留、文件权限、从 GitHub 安装与第一次运行、许可声明、与外部基线比较的说法），评测请求、图片请求与发表的数字不变 | 已完成 |
 
 ## 结果
 
