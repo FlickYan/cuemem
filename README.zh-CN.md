@@ -296,7 +296,7 @@ uv run cuemem serve --host 0.0.0.0   # /api、/api/v1、/v1 与 /mcp 要带 Bear
 uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基准（不调用 API，不覆盖发表的表）
 ```
 
-不写 127.0.0.1 时 Docker 在所有网卡上公开这个端口并绕过 ufw；不加 -v 时 docker rm（比如升级镜像）会删掉所有向量，CueMem 没有重建索引的命令。CueMem 把 `CUEMEM_VECTOR_STORE__API_KEY`（只从环境变量或 `.env` 读，没有命令行参数）作为 Qdrant 的 `api-key` 请求头发出，`cuemem migrate-vectors` 也一样，`cuemem doctor` 写明设了没有。URL 是 `http://` 时 qdrant-client 每个客户端警告一次 Key 经不加密的连接发送：本机与 compose 的内部网络上无妨；远处的服务端与 Qdrant Cloud 用 `https://`。
+不写 127.0.0.1 时 Docker 在所有网卡上公开这个端口并绕过 ufw；不加 -v 时 docker rm（比如升级镜像）会删掉所有向量，CueMem 没有重建索引的命令。CueMem 把 `CUEMEM_VECTOR_STORE__API_KEY`（只从环境变量或 `.env` 读，没有命令行参数）作为 Qdrant 的 `api-key` 请求头发出，`cuemem migrate-vectors` 也一样，`cuemem doctor` 写明设了没有。URL 是 `http://` 时 qdrant-client 每个客户端警告一次 Key 经不加密的连接发送：本机与 compose 的内部网络上无妨；远处的服务端与 Qdrant Cloud 用 `https://`。像上面这样监听 `0.0.0.0` 只适合可信的网络；要从公网访问时让它监听 127.0.0.1，前面放 TLS 反向代理，见下。
 
 #### 公网部署
 

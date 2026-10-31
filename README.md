@@ -340,7 +340,7 @@ uv run cuemem serve --host 0.0.0.0   # Bearer token for /api, /api/v1, /v1 and /
 uv run python scripts/n11_latency.py --out runs/n11-latency   # offline latency benchmark, no API calls
 ```
 
-Without `127.0.0.1`, Docker publishes the Qdrant port on every interface and bypasses ufw; without `-v`, `docker rm` (for example to upgrade the image) deletes every vector, and CueMem has no reindex command. CueMem sends `CUEMEM_VECTOR_STORE__API_KEY` (from the environment or `.env` only; there is no command-line flag) as Qdrant's `api-key` header, also from `cuemem migrate-vectors`, and `cuemem doctor` shows whether it is set. With an `http://` URL, qdrant-client warns once per client that the key is used over an insecure connection: harmless on loopback and on compose's internal network; use `https://` for a remote server or Qdrant Cloud.
+Without `127.0.0.1`, Docker publishes the Qdrant port on every interface and bypasses ufw; without `-v`, `docker rm` (for example to upgrade the image) deletes every vector, and CueMem has no reindex command. CueMem sends `CUEMEM_VECTOR_STORE__API_KEY` (from the environment or `.env` only; there is no command-line flag) as Qdrant's `api-key` header, also from `cuemem migrate-vectors`, and `cuemem doctor` shows whether it is set. With an `http://` URL, qdrant-client warns once per client that the key is used over an insecure connection: harmless on loopback and on compose's internal network; use `https://` for a remote server or Qdrant Cloud. Serving on `0.0.0.0` as above suits a trusted network; to reach the server from the internet, keep it on 127.0.0.1 behind a TLS reverse proxy, as below.
 
 #### Public deployment
 
