@@ -310,10 +310,13 @@ class _ReadGate:
                     self._cond.notify_all()
 
 
+_OPEN_MARKS = "open-session:"  # 进行中的会话的标记的共同前缀（见 _open_mark）
+
+
 def _open_mark(space_id: str, session_id: str = "") -> str:
     """进行中的会话在数据库里的标记（元信息的键）；session_id 为空时是这个空间全部标记的
     共同前缀。空间 ID 带上长度：一个空间的前缀不会同时是另一个空间的前缀。"""
-    return f"open-session:{len(space_id)}:{space_id}:{session_id}"
+    return f"{_OPEN_MARKS}{len(space_id)}:{space_id}:{session_id}"
 
 
 class MemorySystem:
@@ -646,7 +649,8 @@ class MemorySystem:
 
         只认标记，不碰没有任务的其他会话：SDK 的 infer=False 写入的会话本来就不该抽取。
         记忆代理、SDK 与 HTTP 服务第一次碰到一个空间时各调用一次（同一个数据库同时只有一个
-        进程在写时，本进程里不在进行中的就是崩溃留下的）。"""
+        进程在写时，本进程里不在进行中的就是之前的进程留下的）；cuemem serve 与 cuemem proxy
+        启动一个闲置期之后再对全部空间调用一次（adopt_left_open）。"""
         prefix = _open_mark(space_id)
         with self._open_lock:
             live = {sid for space, sid in self._open if space == space_id} | set(keep)
@@ -660,6 +664,32 @@ class MemorySystem:
         if start or self.worker is not None:
             self.start_worker().submit(space_id)
         return len(leftover)
+
+    def adopt_left_open(self) -> int:
+        """接手全部空间里之前的进程留下的进行中的会话（每个有标记的空间各 adopt_open 一次），
+        返回接手的会话数。cuemem serve 与 cuemem proxy 启动之后过一个闲置期调用一次（见
+        api.app._adopt_after）：以前只在 SDK、HTTP 服务与记忆代理第一次碰到一个空间时接手，
+        /api/v1 的 search、MCP 与界面的浏览都不接手，之后没人再写的空间里的会话一直不抽取。
+        与 adopt_open 一样，只在同一个数据库同时只有一个进程在写时才对。"""
+        spaces: set[str] = set()
+        for key in self.db.meta_keys(_OPEN_MARKS):
+            size, _, rest = key.removeprefix(_OPEN_MARKS).partition(":")
+            if size.isdigit() and len(rest) > int(size):
+                spaces.add(rest[: int(size)])
+        return sum(self.adopt_open(space) for space in sorted(spaces))
+
+    def resume_left_open(self, space_id: str, session_id: str) -> bool:
+        """接着写之前的进程留下、还开着的会话（cuemem serve 停止或崩溃时没有结束的 /api/v1 的
+        run）：数据库里有它的标记、本进程里却不在进行中时，在本进程里重新算作进行中（标记留着），
+        返回 True；已经在进行中或没有标记时 False。不接手（adopt_open）：接手就是交给抽取，调用方
+        接着写的每一句又要把整段重新抽取、把整个空间重放一遍（见 Memory._resume）。"""
+        with self._open_lock:
+            if (space_id, session_id) in self._open:
+                return False
+            if self.db.get_meta(_open_mark(space_id, session_id)) is None:
+                return False
+            self._open.add((space_id, session_id))
+            return True
 
     def consolidate(
         self, space_id: str, *, rebuild: bool = False, strict: bool = False

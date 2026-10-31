@@ -227,7 +227,8 @@ class Memory:
         """这个对象第一次碰到这个空间：之前的进程崩溃时还开着的 run（open_run 了、没来得及
         end_run 或 close()），以及 Agent 与记忆代理的会话，没有抽取任务、也没人再结束它们，
         交给抽取（MemorySystem.adopt_open；没有后台线程时只登记，下次 consolidate 时完成）。
-        keep：调用方马上要接着写的 run（open_run 重新打开它）。"""
+        keep：调用方马上要接着写的 run（open_run 重新打开它；add 写的 run 已经由 _resume 重新算作
+        进行中，不用列出）。"""
         with self._runs_lock:
             if space in self._adopted:
                 return
@@ -341,8 +342,9 @@ class Memory:
         end_run 时整段只抽取一次。返回 run_id（不给时生成一个）。
 
         进程崩溃时还开着的 run 由下一个进程第一次碰到这个用户时交给抽取（见 _adopt）；用同一个
-        run_id 再 open_run 就是接着这段对话写，它不被接手。cuemem serve 的 /api/v1 上闲置（默认
-        30 分钟没有 add）的 run 先交给抽取，之后再 add 时重新打开（close_idle_runs）。"""
+        run_id 再 open_run 或 add 就是接着这段对话写，它不被接手（见 _resume）。cuemem serve 停止时
+        /api/v1 的 run 留着，重启之后接着写；没人接着写的，启动一个闲置期之后交给抽取。/api/v1 上
+        闲置（默认 30 分钟没有 add）的 run 先交给抽取，之后再 add 时重新打开（close_idle_runs）。"""
         space = space_for(user_id, agent_id)
         rid = run_id or sortable_session_id("run", datetime.now())
         self._adopt(space, keep=[rid])
@@ -428,15 +430,25 @@ class Memory:
     def _resume(self, space: str, run_id: str) -> None:
         """add 写进 run 之前：还开着的记下这次活动（close_idle_runs 据此判断闲置）；闲置太久、被
         close_idle_runs 结束了的重新打开（open_session），结束时整段只抽取一次。不重新打开的话，
-        之后每次 add 都把整段重新抽取、从原始日志重放一遍。"""
+        之后每次 add 都把整段重新抽取、从原始日志重放一遍。
+
+        之前的进程留下、还开着的 run（cuemem serve 停止时不结束 /api/v1 的 run，崩溃时也来不及
+        结束）同样接着写（MemorySystem.resume_left_open），与用同一个 run_id 再 open_run 相同。
+        以前 add 里的 _adopt 把它交给抽取：跨过一次部署的 run 每写一句都要再抽取、重放一遍。"""
         key = (space, run_id)
         with self._runs_lock:
             if key in self._runs:
                 self._run_seen[key] = time.monotonic()
                 return
-            if key not in self._idle_closed:
-                return
+            idle = key in self._idle_closed
+        # 锁的顺序与 close_idle_runs 相同：先会话锁，再 _runs_lock（resume_left_open 拿 _open_lock）
         with self.system.session_lock(space, run_id):
+            if not idle:
+                if self.system.resume_left_open(space, run_id):
+                    with self._runs_lock:
+                        self._runs.add(key)
+                        self._run_seen[key] = time.monotonic()
+                return
             with self._runs_lock:
                 if key not in self._idle_closed:  # 期间别的 add 已经重新打开了
                     if key in self._runs:

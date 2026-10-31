@@ -33,6 +33,7 @@ import importlib.util
 import logging
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
@@ -281,6 +282,28 @@ def _sweep_jobs(system: MemorySystem, *idle: Callable[[], object]) -> list[Calla
     return jobs
 
 
+def _adopt_after(
+    system: MemorySystem, idle_s: float, clock: Callable[[], float] = time.monotonic
+) -> Callable[[], None]:
+    """清理线程的一项（cuemem serve 与 cuemem proxy）：启动 idle_s 秒（一个闲置期）之后，接手之前
+    的进程留下的进行中的会话，只做一次（MemorySystem.adopt_left_open）。cuemem serve 停止时
+    /api/v1 的 run 留着，崩溃时界面、/api 与记忆代理的会话也来不及结束；以前只在有人再碰这个空间
+    时接手，没人再碰的一直不抽取。调用方在这个闲置期里接着写的照常接着写（Memory._resume、指定了
+    会话的 /api 与代理请求），之后才接手的是没人接着写的。不在启动时就接手：那会接手调用方马上要
+    接着写的 run，它之后每写一句都要整段再抽取一遍、把整个空间重放一遍。"""
+    due = clock() + idle_s
+    done = False
+
+    def adopt() -> None:
+        nonlocal done
+        if done or clock() < due:
+            return
+        system.adopt_left_open()
+        done = True  # 出错时下一遍再试：接手过的已经去掉了标记，不会接手两次
+
+    return adopt
+
+
 def create_app(
     service: ChatService,
     *,
@@ -322,8 +345,9 @@ def create_app(
     一个清理线程每分钟查一遍：/api 与界面的会话（ChatService.close_idle）、/api/v1 的 run
     （Memory.close_idle_runs）与记忆代理的会话（MemoryProxy.close_idle，按它自己的 idle_minutes）。
     以前关掉的标签页、崩溃的客户端留下的会话一直开着，服务运行期间一直不抽取；与记忆代理和各个
-    框架集成一样，默认 30 分钟。设了 traces_retention_days 时这个线程还删过期的 trace（启动时与
-    之后每天一次，见 _sweep_jobs），idle_minutes 为 None 时也起。
+    框架集成一样，默认 30 分钟。启动这么久之后，这个线程还把之前的进程留下、没人接着写的进行中
+    的会话交给抽取（一次，见 _adopt_after）。设了 traces_retention_days 时这个线程还删过期的 trace
+    （启动时与之后每天一次，见 _sweep_jobs），idle_minutes 为 None 时也起。
     """
     _clear_uploads(upload_dir)
     v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
@@ -341,6 +365,8 @@ def create_app(
             # cuemem serve 里的记忆代理：以前要等下一个 /v1 请求才结束闲置的会话
             if proxy is not None:
                 idle.append(proxy.close_idle)
+            # 之前的进程留下、过了一个闲置期还没人接着写的会话交给抽取（从启动时算起）
+            idle.append(_adopt_after(service.system, idle_s))
         jobs = _sweep_jobs(service.system, *idle)  # 只设了 traces_retention_days 时也要起线程
         if not jobs:
             yield
@@ -351,7 +377,10 @@ def create_app(
         sweeper.start()
         try:
             yield
-        finally:  # 退出时还开着的会话由 cuemem serve 结束（ChatService.close、close_all）
+        # 退出时界面与 /api 的会话、记忆代理的会话由 cuemem serve 结束（ChatService.close、
+        # close_all）。/api/v1 的 run 留着、不结束：重启（部署）之后调用方接着写（Memory._resume），
+        # 结束时整段只抽取一次；没人接着写的，下一个进程启动一个闲置期之后交给抽取（_adopt_after）
+        finally:
             stop.set()
             sweeper.join(timeout=5)
 

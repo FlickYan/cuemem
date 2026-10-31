@@ -971,14 +971,16 @@ def create_proxy_app(
     不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts 同 api.app.create_app。
     max_body_bytes：请求体的上限（字节，超过时 413，见 api/limits.py），cuemem proxy 从环境变量
     CUEMEM_MAX_BODY_BYTES 读。"""
-    from cuemem.api.app import SWEEP_INTERVAL_S, _guard, _sweep, _sweep_jobs
+    from cuemem.api.app import SWEEP_INTERVAL_S, _adopt_after, _guard, _sweep, _sweep_jobs
 
     stop = threading.Event()
-    # 每分钟把空闲的会话交给后台抽取；设了 traces_retention_days 时再删过期的 trace
-    jobs = _sweep_jobs(proxy.system, proxy.close_idle)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # 每分钟把空闲的会话交给后台抽取；启动一个闲置期之后，把之前的进程（崩溃时）留下、没人
+        # 接着写的会话交给抽取（一次）；设了 traces_retention_days 时再删过期的 trace
+        adopt = _adopt_after(proxy.system, proxy.idle_s)
+        jobs = _sweep_jobs(proxy.system, proxy.close_idle, adopt)
         threading.Thread(
             target=_sweep,
             args=(stop, SWEEP_INTERVAL_S, *jobs),

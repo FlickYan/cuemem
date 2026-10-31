@@ -785,6 +785,47 @@ def test_idle_remote_run_is_ended_and_reopened(system: MemorySystem, where: str)
         assert system.open_sessions("eve") == set()
 
 
+@pytest.mark.parametrize("where", ["local", "remote"])
+def test_a_run_left_open_by_an_earlier_process_is_continued(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, where: str
+) -> None:
+    """cuemem serve 停止（部署）时 /api/v1 的 run 留着：重启之后调用方接着往这个 run 里 add，就是
+    接着这段对话写（与用同一个 run_id 再 open_run 相同），end_run 时整段只抽取一次、不重放。以前
+    第一次 add 就把它交给抽取（adopt_open），之后每写一句都要整段再抽取、把整个空间重放一遍。"""
+    fake_api.chat_replies = [model]
+    before = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    server = Memory.from_system(before)
+    rid = server.open_run(user_id="eve")
+    server.add("I live in Lisbon", user_id="eve", run_id=rid)
+    before.close()  # cuemem serve 停止：/api/v1 的 Memory 不 close，run 没有结束
+
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    worker = after.start_worker()  # 与 cuemem serve 相同，后台线程在跑
+    try:
+        with TestClient(v1_app(after)) as http:
+            mem: Mem = (
+                Memory.from_system(after)
+                if where == "local"
+                else MemoryClient("http://testserver", http_client=http)
+            )
+            extracted = model.calls["extract"]
+            for text in ("I like tea", "I like jazz"):
+                mem.add(text, user_id="eve", run_id=rid)
+                worker.wait()
+            assert after.open_sessions("eve") == {rid} and after.db.get_jobs("eve") == []
+            with pytest.raises(ValueError, match="still open"):  # 与重启之前一样
+                mem.add("I like rain", user_id="eve", run_id=rid, wait=True)
+            assert mem.end_run(rid, user_id="eve", wait=True)["turns"] == 3
+            assert model.calls["extract"] - extracted == 1
+            assert [j["status"] for j in after.db.get_jobs("eve")] == ["done"]  # 没有被取代的
+            assert "The user lives in Lisbon." in current(mem, "eve")
+            assert after.db.meta_keys("open-session:") == []
+        traces = after.settings.paths.traces.glob("*.jsonl")
+        assert not any("consolidate_regrown_replay" in p.read_text("utf-8") for p in traces)
+    finally:
+        after.close()
+
+
 def test_a_scoped_reset_forgets_the_idle_runs_of_its_spaces_only(system: MemorySystem) -> None:
     """限定作用域的令牌 reset（/api/v1/reset）与闲置结束的 run：作用域里闲置结束过的 run 跟着
     忘掉，之后同名的 add 是一个普通的会话，不会把删掉的 run 重新打开；作用域外的照旧记着，接着

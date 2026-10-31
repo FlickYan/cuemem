@@ -9,7 +9,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,16 +25,17 @@ from scripted import ScriptedModel, echo_extraction
 
 from cuemem.agent import Agent, ChatSession
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, Product, shop_tools
-from cuemem.api.app import _sweep, create_app
+from cuemem.api.app import _adopt_after, _sweep, create_app
 from cuemem.api.auth import Keys
 from cuemem.api.failures import provider_failure
 from cuemem.api.mcp import build_server
+from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.replay import DemoScript, check, replay
 from cuemem.api.service import ChatService
 from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
 from cuemem.config import Settings
 from cuemem.errors import ContentFilteredError, EmbeddingAPIError
-from cuemem.memory import MemorySystem
+from cuemem.memory import MemorySystem, _open_mark
 from cuemem.sdk import Memory
 from cuemem.store.media import image_data_url
 
@@ -534,6 +535,90 @@ def test_sessions_left_open_by_a_crash_are_adopted(
         assert service.system.open_sessions("shop") == {"kept"}
     finally:
         service.close()
+
+
+def _leave_open(n3_settings: Settings, fake_api: FakeAPI) -> tuple[str, str]:
+    """一个进程留下两个进行中的会话就退出了：eve 的 /api/v1 run（cuemem serve 停止时不结束它）与
+    zoe 的界面会话（进程崩溃，没有 service.close()）。返回（run_id，界面的会话）。"""
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    server = Memory.from_system(system)
+    run_id = server.open_run(user_id="eve")
+    server.add("I live in Lisbon", user_id="eve", run_id=run_id)
+    chat = ChatService(system, Agent(system, router="rule"))
+    left = chat.start("zoe", at=DAY).session_id
+    chat.chat(left, "I like jazz", mode="l0")
+    system.close()
+    return run_id, left
+
+
+def test_left_open_sessions_are_handed_over_after_one_idle_period(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """之前的进程留下的进行中的会话，启动一个闲置期之后由清理线程的这一项交给抽取，即使再也没人碰
+    这些空间（以前只在有人再写这个空间时接手：/api/v1 的 search、MCP 与界面的浏览都不接手）。
+    一个闲置期之内不动（调用方可能马上接着写），之后本进程里进行中的会话不动；只做一次。"""
+    fake_api.chat_replies = [model]
+    run_id, left = _leave_open(n3_settings, fake_api)
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    try:
+        now = [1000.0]
+        adopt = _adopt_after(system, 60, clock=lambda: now[0])
+        now[0] += 59
+        adopt()
+        assert len(system.db.meta_keys("open-session:")) == 2 and system.db.get_jobs("eve") == []
+        system.open_session("zoe", "live")
+        now[0] += 1
+        adopt()
+        assert system.worker is not None
+        system.worker.wait()
+        jobs = [*system.db.get_jobs("eve"), *system.db.get_jobs("zoe")]
+        assert {j["session_id"]: j["status"] for j in jobs} == {run_id: "done", left: "done"}
+        assert "I live in Lisbon" in {f.statement for f in system.facts("eve")}
+        assert system.db.meta_keys("open-session:") == [_open_mark("zoe", "live")]
+        assert system.open_sessions("zoe") == {"live"}
+        system.db.set_meta(_open_mark("zoe", "later"), DAY.isoformat())
+        now[0] += 3600
+        adopt()  # 只做一次
+        assert _open_mark("zoe", "later") in system.db.meta_keys("open-session:")
+    finally:
+        system.close()
+
+
+@pytest.mark.parametrize("app", ["serve", "proxy"])
+def test_serve_and_proxy_hand_over_left_open_sessions(
+    n3_settings: Settings,
+    fake_api: FakeAPI,
+    model: ScriptedModel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    app: str,
+) -> None:
+    """cuemem serve（create_app）与 cuemem proxy（create_proxy_app）的清理线程装着这一项：之前的
+    进程留下的会话在启动一个闲置期（idle_minutes）之后交给抽取。以前重启之后这些标记一直留着。"""
+    fake_api.chat_replies = [model]
+    run_id, left = _leave_open(n3_settings, fake_api)
+    monkeypatch.setattr("cuemem.api.app.SWEEP_INTERVAL_S", 0.01)
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    if app == "serve":
+        service = ChatService(system, Agent(system, router="rule"))
+        built = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=0.001)
+        close: Callable[[], None] = service.close
+    else:
+        proxy = MemoryProxy(system, http_client=fake_api.client(), idle_minutes=0.001)
+        built = create_proxy_app(proxy)
+        close = system.close
+    try:
+        with TestClient(built):
+            deadline = time.monotonic() + 5
+            while system.db.meta_keys("open-session:"):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        assert system.worker is not None
+        system.worker.wait()
+        jobs = [*system.db.get_jobs("eve"), *system.db.get_jobs("zoe")]
+        assert {j["session_id"]: j["status"] for j in jobs} == {run_id: "done", left: "done"}
+    finally:
+        close()
 
 
 def test_forget_keeps_other_sessions_reply_cache(
