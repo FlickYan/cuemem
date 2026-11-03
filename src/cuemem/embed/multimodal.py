@@ -61,7 +61,7 @@ class DashScopeMultimodalEmbedder:
         self._api_key = api_key
         self._http = http_client or httpx2.Client(timeout=cfg.timeout_s)
         self._ledger = ledger
-        self._cache = cache
+        self.cache = cache
         self._sleep = sleep
         self._slots = threading.BoundedSemaphore(max(1, cfg.max_concurrency))
 
@@ -73,10 +73,19 @@ class DashScopeMultimodalEmbedder:
         keys = [self._key("text", content_hash(t)) for t in texts]
         return self._embed(keys, [{"text": t or " "} for t in texts])
 
+    def purge(self, texts: Sequence[str] = (), image_digests: Sequence[str] = ()) -> int:
+        """从缓存里删掉这些文字（以文搜图的查询）与图片（按内容的 sha256）的向量，返回删掉的
+        条数。遗忘、删除空间与过期时用：向量本身也可能泄露原文（D-021）。没有缓存时什么都不做。"""
+        if self.cache is None:
+            return 0
+        keys = [self._key("text", content_hash(t)) for t in texts]
+        keys += [self._key("image", d) for d in image_digests]
+        return self.cache.delete_many(keys)
+
     def _embed(self, keys: list[str], contents: list[dict[str, str]]) -> FloatArray:
         found: dict[str, FloatArray] = {}
-        if self._cache is not None:
-            found = {k: v[0] for k, v in self._cache.get_many(keys).items()}
+        if self.cache is not None:
+            found = {k: v[0] for k, v in self.cache.get_many(keys).items()}
         todo: list[int] = []  # 需要真正请求的下标（同一批里的重复内容只请求一次）
         seen: set[str] = set()
         for i, key in enumerate(keys):
@@ -95,8 +104,8 @@ class DashScopeMultimodalEmbedder:
             for row, i in enumerate(batch):
                 found[keys[i]] = vectors[row]
                 items.append((keys[i], vectors[row], None))
-            if self._cache is not None:
-                self._cache.put_many(items)
+            if self.cache is not None:
+                self.cache.put_many(items)
             self._account(tokens, latency_ms, len(batch))
         if not keys:
             return np.zeros((0, self.dim), dtype=np.float32)

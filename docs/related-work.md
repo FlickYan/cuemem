@@ -2,6 +2,8 @@
 
 > 两个用途：理清本项目借鉴了什么、和谁不同；回答"你的方法和 XX 有什么区别"。
 >
+> 这里按论文看；GitHub 上工程化的同类项目（Mem0、Letta、Graphiti / Zep、Cognee、Supermemory……）逐项对比、各家公开的分数，以及 N12 照着它们补了什么，见 [landscape.md](landscape.md)。
+>
 > arXiv 链接均已于 2026-10-12 核对标题。他人报告的数字通常基于不同的 reader、judge 与 prompt，不能直接与本项目比较。
 
 ## 1. 对比总览

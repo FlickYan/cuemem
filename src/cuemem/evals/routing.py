@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -491,6 +491,46 @@ class TwoStageModel:
         if self.accuracy.image is not None:
             out["accuracy_images"] = rounded(self.accuracy.image)
         return out
+
+
+def controller_drift(
+    fresh: dict[str, Any], committed: dict[str, Any], *, atol: float = 1e-5
+) -> list[str]:
+    """重新训练出的控制器（to_json 的输出）与仓库里冻结的那份对不上的字段（训练脚本的 --check）。
+
+    导出日期（created）不比；数值差在 atol 以内不算变化（系数导出时保留 6 位小数，浮点运算的
+    噪声不该让核对失败）；特征名、推理类型等字符串、列表长度与字段逐一比较。"""
+    drift: list[str] = []
+
+    def walk(path: str, a: Any, b: Any) -> None:
+        if isinstance(a, dict) and isinstance(b, dict):
+            for key in sorted(set(a) | set(b)):
+                if not path and key == "created":
+                    continue
+                sub = f"{path}.{key}" if path else key
+                if key in a and key in b:
+                    walk(sub, a[key], b[key])
+                else:
+                    drift.append(sub)
+        elif isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                drift.append(path)
+                return
+            for i, (x, y) in enumerate(zip(a, b, strict=True)):
+                walk(f"{path}[{i}]", x, y)
+        elif _number(a) and _number(b):
+            if not math.isclose(a, b, rel_tol=0.0, abs_tol=atol):
+                drift.append(path)
+        elif a != b:
+            drift.append(path)
+
+    # 先过一遍 JSON：元组、numpy 的数值与写进文件后的样子一致
+    walk("", json.loads(json.dumps(fresh, ensure_ascii=False)), committed)
+    return drift
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
 def _standardize(x: FloatArray) -> tuple[FloatArray, FloatArray]:
@@ -1031,6 +1071,74 @@ def sign_test(wins: int, losses: int) -> float:
     k = min(wins, losses)
     tail = sum(math.comb(n, i) for i in range(k + 1)) / 2**n
     return min(1.0, 2 * tail)
+
+
+def paired_diff_ci(
+    both: int, a_only: int, b_only: int, neither: int, z: float = 1.96
+) -> tuple[float, float]:
+    """同一批题上甲、乙准确率之差（甲 − 乙）的置信区间（默认 95%），Newcombe（1998）的方法 10：
+    两边各自的 Wilson 区间，按配对的相关（φ，ad − bc 先扣掉 n / 2）合起来。
+
+    both：两边都对的题数，a_only：只有甲对，b_only：只有乙对，neither：都错。符号检验只看
+    a_only 与 b_only，回答"有没有差别"；这个区间回答"差别最多可能有多大"。"""
+    n = both + a_only + b_only + neither
+    if n == 0:
+        return math.nan, math.nan
+
+    def wilson(x: int) -> tuple[float, float]:
+        p = x / n
+        center = p + z * z / (2 * n)
+        half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        return (center - half) / (1 + z * z / n), (center + half) / (1 + z * z / n)
+
+    p1, p2 = (both + a_only) / n, (both + b_only) / n
+    (l1, u1), (l2, u2) = wilson(both + a_only), wilson(both + b_only)
+    margins = (both + a_only) * (b_only + neither) * (both + b_only) * (a_only + neither)
+    cross: float = both * neither - a_only * b_only
+    if cross > n / 2:
+        cross -= n / 2
+    elif cross >= 0:
+        cross = 0
+    phi = cross / math.sqrt(margins) if margins else 0.0
+    low = math.sqrt((p1 - l1) ** 2 - 2 * phi * (p1 - l1) * (u2 - p2) + (u2 - p2) ** 2)
+    high = math.sqrt((u1 - p1) ** 2 - 2 * phi * (u1 - p1) * (p2 - l2) + (p2 - l2) ** 2)
+    return p1 - p2 - low, p1 - p2 + high
+
+
+def holm(pvalues: Mapping[str, float]) -> dict[str, float]:
+    """Holm–Bonferroni 校正：一族检验（键 → p 值）各自校正后的 p 值，键的顺序不变。
+
+    从小到大第 i 个（从 0 数）乘以 m − i，再与比它小的那些取最大值（校正后的 p 随原 p 单调），
+    不超过 1。校正后的 p 小于 α 的才算显著时，整族里错判一次以上的概率不超过 α（FWER），不要求
+    各检验独立：同一批题上的几个配对比较也适用。"""
+    order = sorted(pvalues, key=lambda key: pvalues[key])
+    adjusted: dict[str, float] = {}
+    running = 0.0
+    for i, key in enumerate(order):
+        running = max(running, min(1.0, (len(order) - i) * pvalues[key]))
+        adjusted[key] = running
+    return {key: adjusted[key] for key in pvalues}
+
+
+def holm_family(
+    tests: Mapping[str, Mapping[str, Any]], alpha: float = 0.05
+) -> dict[str, dict[str, Any]]:
+    """一族配对检验（各带 wins、losses）→ 每个检验的胜负、精确符号检验的 p、Holm 校正后的 p，
+    以及校正前后是否小于 alpha。p 按胜负重新算（发表的 JSON 里多数四舍五入到 4 位，极小的写成 0），
+    输出时保留 4 位，比较用未舍入的值。"""
+    raw = {key: sign_test(int(t["wins"]), int(t["losses"])) for key, t in tests.items()}
+    adjusted = holm(raw)
+    return {
+        key: {
+            "wins": int(t["wins"]),
+            "losses": int(t["losses"]),
+            "p": round(raw[key], 4),
+            "p_holm": round(adjusted[key], 4),
+            "nominal": raw[key] < alpha,
+            "holm": adjusted[key] < alpha,
+        }
+        for key, t in tests.items()
+    }
 
 
 def paired(a: PolicyResult, b: PolicyResult) -> tuple[int, int, float]:

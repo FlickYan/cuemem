@@ -11,9 +11,12 @@ v3 = v2 + 一道门槛：问题带画面线索（q_visual / q_scene），或者�
 协议（与 D-052 相同）：τ 只在开发集（MemLens 32K dev100）上选——让开发集准确率不低于 v2 的
 最大 τ；测试集只作事后重放。文字数据集的空间里没有图，结果应与 v2 逐题相同（顺带核对）。
 
+v3 是默认的控制器，复现脚本只核对、不覆盖它（--no-export --check，见 scripts/n7_controller.py）。
+
 用法：
     uv run python scripts/n11_see_gate.py            # 评测 + 导出 controller_model.json（v3）
     uv run python scripts/n11_see_gate.py --no-export
+    uv run python scripts/n11_see_gate.py --no-export --check  # 核对 v3 没有变
 """
 
 from __future__ import annotations
@@ -26,7 +29,9 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+import multiplicity
 import n9_report as N9
+from n7_controller import add_export_flags, finish_export
 from n11_controller_v2 import IMAGE_FLOOR, OUT, RUNS, add_scene, frozen, pct, versus
 
 from cuemem.evals import routing as R
@@ -86,8 +91,9 @@ def test_replay(v2: LearnedController, v3: LearnedController) -> dict[str, Any]:
     return out
 
 
-def export(v2_raw: dict[str, Any], tau: float) -> None:
-    raw = {
+def v3_model(v2_raw: dict[str, Any], tau: float) -> dict[str, Any]:
+    """v3 = v2 + 再感知的门槛：要导出的 JSON。"""
+    return {
         **v2_raw,
         "version": "n11-two-stage-v3",
         "see_gate": {"cues": IMAGE_FLOOR, "caption_min": tau},
@@ -98,18 +104,17 @@ def export(v2_raw: dict[str, Any], tau: float) -> None:
         ),
         "created": datetime.now().strftime("%Y-%m-%d"),
     }
-    DEFAULT_MODEL.write_text(json.dumps(raw, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    print(f"导出 v3：{DEFAULT_MODEL}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--no-export", action="store_true", help="只评测，不覆盖 controller_model.json"
-    )
+    add_export_flags(parser, DEFAULT_MODEL.name)
     args = parser.parse_args()
     v2 = LearnedController.load(V2_MODEL)
     tau, dev = choose_tau(v2)
+    model = v3_model(json.loads(V2_MODEL.read_text(encoding="utf-8")), tau)
+    if finish_export(args, DEFAULT_MODEL, model):  # 在写任何结果之前：对不上时都不动
+        print(f"导出 v3：{DEFAULT_MODEL}")
     v3 = gated(v2, tau)
     result = {"rule": "开发集准确率不低于 v2 的最大 τ", "tau": tau, "dev": dev}
     result["test_post_hoc"] = test_replay(v2, v3)
@@ -118,8 +123,7 @@ def main() -> None:
         json.dumps(result, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
     )
     print(f"结果：{OUT / 'see_gate.json'}")
-    if not args.no_export:
-        export(json.loads(V2_MODEL.read_text(encoding="utf-8")), tau)
+    multiplicity.update(OUT / "see_gate.json", multiplicity.n11_see_gate)  # → see_gate-holm.json
 
 
 if __name__ == "__main__":

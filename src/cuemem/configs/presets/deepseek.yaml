@@ -1,0 +1,36 @@
+# DeepSeek 预设（N12）：只有 DeepSeek 一家的 Key 时用。所有角色都用 deepseek-flash，
+# 向量在本机算（fastembed，BAAI/bge-small-en-v1.5，384 维，英文），不需要别的 Key。
+#   uv sync --extra local            # 装上本机向量的可选依赖
+#   CUEMEM_PRESET=deepseek            # 或 cuemem --preset deepseek …、Memory(preset="deepseek")
+#
+# 局限：
+# - 本机向量在 CPU 上慢（长文本每秒几条），也只认英文；中文对话换成 BAAI/bge-small-zh-v1.5（512 维）。
+# - 回答与判分是同一个模型（D-008 说的"给自己打分"的偏差）；N11 的第二判分实验里 deepseek-flash
+#   与 qwen3.8-max 的判分一致率 94.7–97.9%，排序基本不变。
+# - 巩固的相似度阈值是按通义向量调的（N3），换向量模型后可能偏松或偏紧。
+
+roles:
+  extractor: {model: deepseek-flash}
+  planner: {model: deepseek-flash}
+  reader: {model: deepseek-flash}
+  vlm: {model: deepseek-flash}
+  captioner: {model: deepseek-flash}
+  judge: {model: deepseek-flash}
+  agent: {model: deepseek-flash, max_tokens: 1200}
+
+embedding:
+  backend: fastembed
+  model: BAAI/bge-small-en-v1.5
+  dim: 384
+  batch_size: 32
+  query_instruct: null      # bge v1.5 不加检索指令也可以；加了查询与文档就不是同一种向量
+  price_per_m: 0
+
+multimodal_embedding:
+  backend: none
+
+rerank:
+  provider: null
+
+consolidation:
+  fallback_model: null      # 只有一家供应商，没有可以换的备用模型

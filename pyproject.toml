@@ -6,11 +6,13 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_prompts/LICENSE"]
 requires-python = ">=3.12"
+# 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用
+classifiers = ["Typing :: Typed"]
+keywords = ["llm", "agents", "agent-memory", "long-term-memory", "multimodal", "rag", "mcp"]
+# 核心依赖：SDK、命令行、HTTP 接口、记忆代理与 MCP。界面、评测与本机向量是可选依赖
 dependencies = [
     "fastapi>=0.143",
-    "gradio>=6.30",
     "httpx2>=2.13.1",
-    "matplotlib>=3.10",
     "mcp>=2.3",
     "numpy>=2.5.4",
     "openai>=3.29.0",
@@ -22,10 +24,35 @@ dependencies = [
     "pyyaml>=6.0.3",
     "qdrant-client>=1.19.1",
     "rich>=15.0.0",
-    "scikit-learn>=1.7",
     "scipy>=1.18.1",
     "typer>=0.27.3",
     "uvicorn>=0.54",
+]
+
+# 还没有发布到 PyPI：从 GitHub 安装（pip install "cuemem @ git+https://github.com/FlickYan/cuemem"）
+[project.urls]
+Homepage = "https://github.com/FlickYan/cuemem"
+Source = "https://github.com/FlickYan/cuemem"
+Issues = "https://github.com/FlickYan/cuemem/issues"
+Documentation = "https://github.com/FlickYan/cuemem/blob/main/docs/en/api.md"
+
+[project.optional-dependencies]
+# 演示界面（cuemem serve 的 Gradio 界面）：不装时 serve 只启动 HTTP 接口与记忆代理
+ui = ["gradio>=6.30"]
+# 评测（cuemem eval run / report 的图）与控制器、门控的训练脚本（scripts/）
+eval = ["matplotlib>=3.10", "scikit-learn>=1.7"]
+# 本机向量（embedding.backend: fastembed，预设 deepseek 用它）：ONNX 推理，不要 Key
+local = ["fastembed>=0.9"]
+# 框架集成（N12，cuemem/integrations/）：按需安装
+langgraph = ["langgraph>=1.2", "langchain-core>=1.6", "langchain>=1.4"]
+openai-agents = ["openai-agents>=0.23"]
+anthropic = ["anthropic>=1.14"]
+integrations = [
+    "langgraph>=1.2",
+    "langchain-core>=1.6",
+    "langchain>=1.4",
+    "openai-agents>=0.23",
+    "anthropic>=1.14",
 ]
 
 [project.scripts]
@@ -36,13 +63,24 @@ requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# 源码仓库里的 uv sync 照旧装上界面与评测（测试、类型检查与复现脚本要用）
 dev = [
+    "cuemem[ui,eval]",
     "mypy>=2.4.0",
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",
     "ruff>=0.17.0",
     "types-pyyaml>=6.0.12.20260906",
 ]
+
+[tool.uv]
+# Pillow 12.x 有 41 条安全公告，只在 13.0.0 修好；gradio 6.30/6.31 与 fastembed 0.9.0 声明了
+# pillow<13，不覆盖时锁文件（Docker 镜像与 uv sync）停在 12.x。整套离线测试在 13 上通过，发给
+# 模型的图片字节不变（store/media.py 的 image_data_url 分两次缩放；tests/test_store.py 钉着摘要）。
+# 只管 uv：pip 装 cuemem[ui] 照旧解到 Pillow<13，所以核心依赖的下限仍是 12.3.0。在这个目录里
+# 运行的 uv pip install 同样被覆盖（uv pip install pillow==12.3.0 装上的是 13.0.0）：要拿 12.x 对比
+# 图片字节，在仓库之外建环境，或者用 uv run --with pillow==12.3.0（--with 不受覆盖）
+override-dependencies = ["pillow>=13.0.0"]
 
 [tool.ruff]
 line-length = 100

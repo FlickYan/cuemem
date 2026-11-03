@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 from cuemem.config import PROJECT_ROOT, load_settings
-from cuemem.evals.datasets import Sample, dataset_path
+from cuemem.evals.datasets import Sample, dataset_path, protocol_samples
 from cuemem.evals.datasets import load as load_dataset
 from cuemem.evals.runner import EvalRunner, ProbeQuery, RunConfig
 from cuemem.evals.splits import load_split
@@ -48,7 +48,7 @@ def test_samples(datasets: Path) -> list[Sample]:
         evalset = load_dataset(
             dataset, dataset_path(datasets, dataset), ids=load_split(dataset, split)
         )
-        samples.extend(s for s in evalset.samples if s.question_type != "adversarial")
+        samples.extend(protocol_samples(evalset))  # 与评测一致：LoCoMo 不含对抗题
     return samples
 
 
@@ -163,10 +163,13 @@ def main() -> None:
     config = RunConfig(
         name=args.name, dataset="mixed", split=None, methods=[], workers=args.workers
     )
-    done, errors = EvalRunner(settings, config).probe_queries(queries)
+    runner = EvalRunner(settings, config)
+    done, errors = runner.probe_queries(queries)
     ledger.close()
     print(f"测试记忆题 {len(samples)} 道；难负例 {len(negatives)} 条，通用请求 {len(dolly)} 条")
     print(f"探针完成 {done} 条，出错 {errors} 条")
+    if errors:  # n9_report 会悄悄略过没有探针特征的查询：停下，别让复现脚本接着往下走
+        sys.exit(f"有 {errors} 条探针出错，报错见 {runner.run_dir / 'errors.jsonl'}")
 
 
 if __name__ == "__main__":

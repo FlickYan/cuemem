@@ -2,7 +2,8 @@
 
 两种成本口径：
 - cost（名义成本）：全部输入按"未命中缓存"的标价计算。同一个实验无论何时运行，成本都一样，便于比较。
-- cost_cached：按供应商报告的缓存命中 token 打折后的估算，更接近真实账单（仍未计入错峰折扣）。
+- cost_cached：按供应商报告的缓存命中 token 打折后的估算，非高峰时段的调用再乘上错峰系数
+  （LLMClient._account 记账前已经乘好），更接近真实账单。
 命中本地响应缓存的调用（from_cache=True）实际没有花钱，汇总时单独统计。
 """
 
@@ -60,7 +61,10 @@ class Ledger:
         self.run_id = run_id or f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path) if path else ":memory:", check_same_thread=False)
+        # 几个评测进程共用一个账本：写锁默认只等 5 秒，忙时会报 "database is locked"，这里等 60 秒
+        self._conn = sqlite3.connect(
+            str(path) if path else ":memory:", check_same_thread=False, timeout=60.0
+        )
         self._lock = threading.Lock()
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")

@@ -2,7 +2,8 @@
 
 职责：
 - 按角色选模型（roles → models），拼请求参数，处理供应商差异（例如关闭思考模式）；
-- 按供应商限制并发；
+- 按供应商限制并发；限流、5xx、连不上时退避重试（照 OpenAI SDK 的规则，见 _retry_delay）；
+  超时只在调用方没有备用模型时重试；
 - 分时价格：高峰时段需要真实调用时，按策略暂停到高峰结束（见 llm/peak.py）；
 - 本地响应缓存：相同请求只调用一次 API，既省钱也让实验可复现；
 - 用量记账与 trace 事件；
@@ -11,22 +12,34 @@
 
 from __future__ import annotations
 
+import email.utils
 import json
+import math
+import random
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import httpx2
-from openai import APITimeoutError, BadRequestError, OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    BadRequestError,
+    OpenAI,
+)
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ValidationError
 
-from cuemem.config import ModelSpec, Settings
+from cuemem.config import ModelSpec, Settings, missing_key_remedy
 from cuemem.core.trace import record_event
+from cuemem.core.types import PeakPolicy
 from cuemem.errors import (
     CacheMissError,
     ContentFilteredError,
@@ -39,9 +52,12 @@ from cuemem.llm.peak import in_peak, peak_end
 from cuemem.llm.types import ChatResult, ToolCall, Usage
 
 Message = dict[str, Any]
-PeakPolicy = Literal["wait", "warn", "allow"]
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+# 重试的退避（与 OpenAI SDK 3.x 相同）：0.5 秒起翻倍、最多 8 秒；上游的 Retry-After 最多照等 2 分钟
+_RETRY_INITIAL_S = 0.5
+_RETRY_MAX_S = 8.0
+_RETRY_AFTER_MAX_S = 120.0
 
 
 @dataclass
@@ -82,6 +98,7 @@ class LLMClient:
         self._lock = threading.Lock()
         self._notified: set[tuple[str, datetime]] = set()
         self._inflight: dict[str, threading.Event] = {}  # 正在请求中的缓存键（相同请求合并）
+        self._bad_json: set[str] = set()  # 上次拿到解析不了的 JSON 的缓存键（见 retry_bad_json）
 
     def chat(
         self,
@@ -94,17 +111,40 @@ class LLMClient:
         response_format: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         use_cache: bool = True,
         cache_scope: str | None = None,
+        retry_bad_json: bool = False,
+        retry_timeouts: bool = True,
     ) -> ChatResult:
         """调用一次聊天补全。role 决定默认模型与参数，model 可显式指定模型别名。
 
+        parallel_tool_calls 只在带工具时发出（通义不设为 true 时一次只回一个工具调用，N12）。
         cache_scope 标记缓存条目所属的记忆空间，遗忘时据此清理。
+
+        限流、5xx 与连不上时按 providers.*.max_retries 退避重试（_send）。retry_timeouts=False：
+        超时不重发，立即抛出 APITimeoutError——调用方有备用模型时传（structured、评测网关）：
+        超时多半是模型在这条输入上生成失控，重发同样的请求还会超时，以前要等 SDK 重试满
+        （约 4 × timeout_s）才换模型。
+
+        retry_bad_json：给照 OpenAI 的方式重试的外部系统用（评测网关，N12）。JSON 模式的回复解析
+        不了时记下这个请求；同样的请求再来（外部系统的重试）时不读缓存，重新调用并覆盖缓存里的
+        坏回复——否则每次重试都从缓存里拿到同一个坏回复。缓存键不变，能解析的回复照常命中缓存；
+        解析不了的回复照常缓存（外部系统换一个请求接着修时，重跑能原样复现）。CueMem 自己的
+        结构化输出（structured）重试时带上校验错误，请求本来就不同，不用它。
         """
         alias, spec, params = self._prepare(
-            role, model, temperature, max_tokens, response_format, tools, tool_choice
+            role,
+            model,
+            temperature,
+            max_tokens,
+            response_format,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
         )
         caching = use_cache and self.cache is not None and self.settings.llm_cache_mode != "off"
+        json_guard = retry_bad_json and _json_mode(params)
         key = ""
         if caching:
             assert self.cache is not None
@@ -117,25 +157,63 @@ class LLMClient:
                     "extra_body": spec.extra_body,
                 }
             )
+            # 上次同样的请求拿到的是解析不了的 JSON：这是外部系统的重试，不读缓存
+            # （只读缓存模式下不调用 API，照常读缓存）
+            refresh = (
+                json_guard
+                and self.settings.llm_cache_mode != "read_only"
+                and self._bad_json_seen(key)
+            )
             while True:
-                hit = self._from_cache(key, role, alias, spec)
-                if hit is not None:
-                    return hit
-                if self.settings.llm_cache_mode == "read_only":
-                    raise CacheMissError(f"read_only 模式下缓存未命中：role={role}, model={alias}")
+                if not refresh:
+                    hit = self._from_cache(key, role, alias, spec)
+                    if hit is not None:
+                        if json_guard:
+                            self._note_json(key, hit)
+                        return hit
+                    if self.settings.llm_cache_mode == "read_only":
+                        raise CacheMissError(
+                            f"read_only 模式下缓存未命中：role={role}, model={alias}"
+                        )
                 # 相同请求合并（single-flight）：别的线程正在请求同样的内容时，等它的结果，
                 # 不重复花钱；它失败了（没写进缓存）就由本线程接着请求
                 waiting = self._claim(key)
                 if waiting is None:
                     break
                 waiting.wait()
+                refresh = False  # 别的线程刚请求过同样的内容：缓存里是新的回复，直接用
+            # 真的要重新调用时才记：同时到的同样重试里，等别的线程结果的那些读的是缓存
+            if refresh:
+                record_event("llm_cache_refresh", role=role, model=alias)
         try:
-            return self._call_api(
-                role, alias, spec, messages, params, key if caching else "", cache_scope
+            result = self._call_api(
+                role,
+                alias,
+                spec,
+                messages,
+                params,
+                key if caching else "",
+                cache_scope,
+                retry_timeouts,
             )
         finally:
             if caching:
                 self._release(key)
+        if json_guard and caching:
+            self._note_json(key, result)
+        return result
+
+    def _bad_json_seen(self, key: str) -> bool:
+        with self._lock:
+            return key in self._bad_json
+
+    def _note_json(self, key: str, result: ChatResult) -> None:
+        """记下（或清掉）这个请求"上次拿到的是解析不了的 JSON"。"""
+        with self._lock:
+            if unparsable_json(result):
+                self._bad_json.add(key)
+            else:
+                self._bad_json.discard(key)
 
     def _from_cache(self, key: str, role: str, alias: str, spec: ModelSpec) -> ChatResult | None:
         assert self.cache is not None
@@ -171,18 +249,19 @@ class LLMClient:
         params: dict[str, Any],
         key: str,
         cache_scope: str | None,
+        retry_timeouts: bool,
     ) -> ChatResult:
         self._peak_gate(spec.provider, role)
-        create = cast(Any, self._client(spec.provider).chat.completions.create)
+        request = {
+            "model": spec.model_id,
+            "messages": messages,
+            "extra_body": spec.extra_body or None,
+            **params,
+        }
         started = time.perf_counter()
         with self._semaphores[spec.provider]:
             try:
-                completion = create(
-                    model=spec.model_id,
-                    messages=messages,
-                    extra_body=spec.extra_body or None,
-                    **params,
-                )
+                completion = self._send(spec.provider, request, retry_timeouts)
             except BadRequestError as exc:
                 if _is_content_filter(exc):
                     record_event("llm_filtered", role=role, model=alias)
@@ -208,6 +287,22 @@ class LLMClient:
         self._account(role, alias, spec, result)
         return result
 
+    def _send(self, provider: str, request: dict[str, Any], retry_timeouts: bool) -> Any:
+        """发出请求；出错时按 _retry_delay 决定要不要重试、等多久，最多重试 max_retries 次，用尽时
+        抛出最后一次的异常。OpenAI SDK 自己不再重试（见 _client）：它对超时也照样重试。"""
+        create = cast(Any, self._client(provider).chat.completions.create)
+        retries = self.settings.providers[provider].max_retries
+        attempt = 0
+        while True:
+            try:
+                return create(**request)
+            except APIError as exc:
+                delay = _retry_delay(exc, attempt, retry_timeouts=retry_timeouts)
+                if attempt >= retries or delay is None:
+                    raise
+            self._sleep(delay)
+            attempt += 1
+
     def structured[T: BaseModel](
         self,
         role: str,
@@ -223,22 +318,36 @@ class LLMClient:
         """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。
 
         fallback_model：内容审核拒绝或请求超时时改用的模型（通常是另一家供应商的）。
-        超时多半不是网络问题：模型在某条输入上生成失控、迟迟不结束，重发同样的请求还会超时。
+        超时多半不是网络问题：模型在某条输入上生成失控、迟迟不结束，重发同样的请求还会超时，
+        所以有备用模型时主模型超时一次就换（约 1 × timeout_s，以前 SDK 先重试满 max_retries 次）。
+
+        只读缓存（llm_cache_mode=read_only，--cache-only）下主模型未命中缓存时也换备用模型：
+        构建时主模型被拒或超时的请求没有缓存，缓存里只有备用模型的回复，以前重放到这里就
+        CacheMissError。两个都未命中时抛出 CacheMissError（写明两个模型）。
         """
+        primary = model or (
+            self.settings.roles[role].model if role in self.settings.roles else None
+        )
+        fallback = fallback_model if fallback_model != primary else None
         try:
             return self._structured(
-                role, messages, schema, model, max_tokens, max_attempts, cache_scope
+                role,
+                messages,
+                schema,
+                model,
+                max_tokens,
+                max_attempts,
+                cache_scope,
+                retry_timeouts=fallback is None,
             )
-        except (ContentFilteredError, APITimeoutError) as exc:
-            primary = model or (
-                self.settings.roles[role].model if role in self.settings.roles else None
-            )
-            if fallback_model is None or fallback_model == primary:
+        except fallback_errors(self.settings) as exc:
+            if fallback is None:
                 raise
-            record_event("llm_fallback", role=role, model=fallback_model, reason=type(exc).__name__)
-            return self._structured(
-                role, messages, schema, fallback_model, max_tokens, max_attempts, cache_scope
-            )
+            record_event("llm_fallback", role=role, model=fallback, reason=type(exc).__name__)
+            with replay_miss(exc, role, primary, fallback):
+                return self._structured(
+                    role, messages, schema, fallback, max_tokens, max_attempts, cache_scope
+                )
 
     def _structured[T: BaseModel](
         self,
@@ -249,6 +358,8 @@ class LLMClient:
         max_tokens: int | None,
         max_attempts: int,
         cache_scope: str | None,
+        *,
+        retry_timeouts: bool = True,
     ) -> Structured[T]:
         msgs = _with_schema_instruction(messages, schema)
         last_error = ""
@@ -261,6 +372,7 @@ class LLMClient:
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                     cache_scope=cache_scope,
+                    retry_timeouts=retry_timeouts,
                 )
             except BadRequestError as exc:
                 # QwenCloud 在 JSON 模式下偶尔中止生成（"Model output became abnormal ..."），
@@ -302,9 +414,18 @@ class LLMClient:
                 ]
         raise StructuredOutputError(f"{max_attempts} 次尝试后仍未得到合法 JSON：{last_error}")
 
+    def vision(self, role: str, model: str | None = None) -> bool:
+        """这个角色（或指定的模型）能不能看图。不能时调用方不附图片（本地纯文本模型，N12）。"""
+        role_cfg = self.settings.roles.get(role)
+        alias = model or (role_cfg.model if role_cfg else None)
+        spec = self.settings.models.get(alias) if alias is not None else None
+        return spec is not None and spec.vision
+
     def list_models(self, provider: str) -> list[str]:
-        """列出供应商可用的模型 ID，用于核对配置（不是所有供应商都支持）。"""
-        return sorted(m.id for m in self._client(provider).models.list())
+        """列出供应商可用的模型 ID，用于核对配置（不是所有供应商都支持）。这里照旧由 SDK 重试。"""
+        retries = self.settings.providers[provider].max_retries
+        client = self._client(provider).with_options(max_retries=retries)
+        return sorted(m.id for m in client.models.list())
 
     def _prepare(
         self,
@@ -315,28 +436,33 @@ class LLMClient:
         response_format: dict[str, Any] | None,
         tools: list[dict[str, Any]] | None,
         tool_choice: str | dict[str, Any] | None,
+        parallel_tool_calls: bool | None = None,
     ) -> tuple[str, ModelSpec, dict[str, Any]]:
         role_cfg = self.settings.roles.get(role)
         alias = model or (role_cfg.model if role_cfg else None)
         if alias is None:
             raise KeyError(f"角色 {role} 没有配置模型，调用时也没有指定 model")
         spec = self.settings.models[alias]
-        params: dict[str, Any] = {
-            "temperature": temperature
-            if temperature is not None
-            else (role_cfg.temperature if role_cfg else 0.0)
-        }
+        params: dict[str, Any] = {}
+        if not spec.fixed_temperature:  # 推理模型只接受默认温度，不带这个参数（N12）
+            params["temperature"] = (
+                temperature
+                if temperature is not None
+                else (role_cfg.temperature if role_cfg else 0.0)
+            )
         limit = (
             max_tokens if max_tokens is not None else (role_cfg.max_tokens if role_cfg else None)
         )
         if limit is not None:
-            params["max_tokens"] = limit
+            params[spec.max_tokens_param] = limit
         if response_format is not None:
             params["response_format"] = response_format
         if tools:
             params["tools"] = tools
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
+        if tools and parallel_tool_calls is not None:
+            params["parallel_tool_calls"] = parallel_tool_calls
         return alias, spec, params
 
     def _client(self, provider: str) -> OpenAI:
@@ -347,13 +473,15 @@ class LLMClient:
                 if api_key is None:
                     raise MissingAPIKeyError(
                         f"缺少环境变量 {cfg.api_key_env}（{provider}），"
-                        "请运行 uv run cuemem configure"
+                        f"{missing_key_remedy(provider)}"
                     )
                 self._clients[provider] = OpenAI(
                     api_key=api_key,
                     base_url=cfg.base_url,
                     timeout=cfg.timeout_s,
-                    max_retries=cfg.max_retries,  # SDK 自带对 429 / 5xx / 网络错误的指数退避重试
+                    # SDK 不重试：它对超时也重试，备用模型要等 max_retries + 1 次超时才用得上。
+                    # 429 / 5xx / 连不上照 SDK 的规则由 _send 重试 cfg.max_retries 次
+                    max_retries=0,
                     http_client=self._http_client,
                 )
             return self._clients[provider]
@@ -422,6 +550,105 @@ class LLMClient:
             spent=0.0 if result.from_cache else round(discounted, 6),
             latency_ms=round(result.latency_ms, 1),
         )
+
+
+def _json_mode(params: dict[str, Any]) -> bool:
+    response_format = params.get("response_format")
+    return isinstance(response_format, dict) and response_format.get("type") in (
+        "json_object",
+        "json_schema",
+    )
+
+
+def unparsable_json(result: ChatResult) -> bool:
+    """JSON 模式的回复解析不了：去掉 markdown 围栏后仍不是合法 JSON（空回复也算）。
+
+    按 json.loads 的默认（严格）规则：字符串里有原样的换行等控制字符也算解析不了，外部系统
+    多数照这个规则解析。带工具调用的回复不算（内容不是给调用方解析的）。"""
+    if result.tool_calls:
+        return False
+    try:
+        json.loads(_strip_code_fence(result.content or ""))
+    except ValueError:  # 包括 json.JSONDecodeError
+        return True
+    return False
+
+
+def fallback_errors(settings: Settings, *also: type[Exception]) -> tuple[type[Exception], ...]:
+    """有备用模型时，主模型出哪些错换备用模型：内容审核拒绝、超时与 also；只读缓存模式下还有
+    缓存未命中。
+
+    被拒与超时的请求不缓存，所以构建时换过备用模型的调用，缓存里只有备用模型的回复：只读
+    重放（--cache-only）时主模型未命中就换备用模型，原样复现构建时的结果，不发请求。别的模式
+    未命中时照常调用 API，不受影响。LLMClient.structured、评测网关与 Mem0 的适配层共用。"""
+    errors: tuple[type[Exception], ...] = (ContentFilteredError, APITimeoutError, *also)
+    return (*errors, CacheMissError) if settings.llm_cache_mode == "read_only" else errors
+
+
+@contextmanager
+def replay_miss(
+    primary_error: Exception, role: str, primary: str | None, fallback: str
+) -> Iterator[None]:
+    """包住备用模型的调用：主模型是缓存未命中、备用模型也未命中时，抛出写明两个模型的
+    CacheMissError（cause 是主模型的未命中）。"""
+    try:
+        yield
+    except CacheMissError:
+        if not isinstance(primary_error, CacheMissError):
+            raise
+        raise CacheMissError(
+            f"read_only 模式下缓存未命中：role={role}, model={primary}，"
+            f"备用模型 {fallback} 也未命中"
+        ) from primary_error
+
+
+def _retry_delay(exc: APIError, attempt: int, *, retry_timeouts: bool) -> float | None:
+    """第 attempt 次重试（从 0 起）之前等几秒；None 表示这个错误不重试。规则照 OpenAI SDK 3.x
+    （_should_retry、_calculate_retry_timeout），评测与网关在线上的重试行为因此与以前相同：
+
+    - 超时：retry_timeouts 时重试（调用方有备用模型时不重试，见 chat）；连不上：重试；
+    - 有响应的：上游要求等超过 2 分钟的不重试；x-should-retry 头说了算；否则 408、409、429 与
+      5xx 重试（402 余额不足、400、401 等不重试）；
+    - 等多久：上游给了 retry-after-ms / retry-after（秒数或 HTTP 日期）且在 0–120 秒之间就照它，
+      否则 0.5 秒起翻倍、最多 8 秒，再随机减掉最多 25%。"""
+    asked: float | None = None  # 上游要求等几秒
+    if isinstance(exc, APITimeoutError):
+        if not retry_timeouts:
+            return None
+    elif isinstance(exc, APIStatusError):
+        headers = exc.response.headers
+        asked = _retry_after_s(headers)
+        if asked is not None and math.isfinite(asked) and asked > _RETRY_AFTER_MAX_S:
+            return None
+        flag = headers.get("x-should-retry")
+        status = exc.status_code
+        if flag == "false" or (flag != "true" and status not in (408, 409, 429) and status < 500):
+            return None
+    elif not isinstance(exc, APIConnectionError):
+        return None
+    if asked is not None and math.isfinite(asked) and 0 < asked <= _RETRY_AFTER_MAX_S:
+        return asked
+    return min(_RETRY_INITIAL_S * 2.0**attempt, _RETRY_MAX_S) * (1 - 0.25 * random.random())
+
+
+def _retry_after_s(headers: Mapping[str, str]) -> float | None:
+    """上游要求等几秒：先看 retry-after-ms，再看 retry-after（秒数或 HTTP 日期）；没有或看不懂时
+    为 None。数字大到溢出时按"等不起"处理（与 SDK 相同）。"""
+    for name, divisor in (("retry-after-ms", 1000.0), ("retry-after", 1.0)):
+        value = headers.get(name)
+        if value is None:
+            continue
+        try:
+            seconds = float(value) / divisor
+        except ValueError:
+            continue
+        literal = value.strip().lower() in ("inf", "+inf", "infinity", "+infinity")
+        return _RETRY_AFTER_MAX_S + 1 if seconds == math.inf and not literal else seconds
+    try:
+        parsed = email.utils.parsedate_tz(headers.get("retry-after") or "")
+        return None if parsed is None else float(email.utils.mktime_tz(parsed) - time.time())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 def _is_aborted_json(exc: BadRequestError) -> bool:

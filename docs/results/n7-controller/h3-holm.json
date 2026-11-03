@@ -1,0 +1,307 @@
+{
+ "source": "h3.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "longmemeval_s：换回答模型前后": {
+   "description": "同一策略、同一道题，通义对 DeepSeek",
+   "m": 5,
+   "tests": {
+    "always-L1": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "always-L2": {
+     "wins": 5,
+     "losses": 12,
+     "p": 0.1435,
+     "p_holm": 0.625,
+     "nominal": false,
+     "holm": false
+    },
+    "B6r": {
+     "wins": 7,
+     "losses": 13,
+     "p": 0.2632,
+     "p_holm": 0.7895,
+     "nominal": false,
+     "holm": false
+    },
+    "B6": {
+     "wins": 8,
+     "losses": 10,
+     "p": 0.8145,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B3": {
+     "wins": 6,
+     "losses": 1,
+     "p": 0.125,
+     "p_holm": 0.625,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：换成通义之后对 B3": {
+   "description": "回答模型换成通义之后各策略对 B3",
+   "m": 3,
+   "tests": {
+    "B6_vs_B3_qwen": {
+     "wins": 3,
+     "losses": 12,
+     "p": 0.0352,
+     "p_holm": 0.1055,
+     "nominal": true,
+     "holm": false
+    },
+    "B6r_vs_B3_qwen": {
+     "wins": 3,
+     "losses": 12,
+     "p": 0.0352,
+     "p_holm": 0.1055,
+     "nominal": true,
+     "holm": false
+    },
+    "always-L2_vs_B3_qwen": {
+     "wins": 3,
+     "losses": 12,
+     "p": 0.0352,
+     "p_holm": 0.1055,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "locomo：换回答模型前后": {
+   "description": "同一策略、同一道题，通义对 DeepSeek",
+   "m": 5,
+   "tests": {
+    "always-L1": {
+     "wins": 13,
+     "losses": 30,
+     "p": 0.0137,
+     "p_holm": 0.0549,
+     "nominal": true,
+     "holm": false
+    },
+    "always-L2": {
+     "wins": 11,
+     "losses": 22,
+     "p": 0.0801,
+     "p_holm": 0.1603,
+     "nominal": false,
+     "holm": false
+    },
+    "B6r": {
+     "wins": 13,
+     "losses": 29,
+     "p": 0.0195,
+     "p_holm": 0.0586,
+     "nominal": true,
+     "holm": false
+    },
+    "B6": {
+     "wins": 10,
+     "losses": 28,
+     "p": 0.0051,
+     "p_holm": 0.0255,
+     "nominal": true,
+     "holm": true
+    },
+    "B3": {
+     "wins": 20,
+     "losses": 15,
+     "p": 0.4996,
+     "p_holm": 0.4996,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：换成通义之后对 B3": {
+   "description": "回答模型换成通义之后各策略对 B3",
+   "m": 3,
+   "tests": {
+    "B6_vs_B3_qwen": {
+     "wins": 8,
+     "losses": 40,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B6r_vs_B3_qwen": {
+     "wins": 11,
+     "losses": 43,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "always-L2_vs_B3_qwen": {
+     "wins": 13,
+     "losses": 28,
+     "p": 0.0275,
+     "p_holm": 0.0275,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 16,
+   "tests": {
+    "longmemeval_s：换回答模型前后 | always-L1": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型前后 | always-L2": {
+     "wins": 5,
+     "losses": 12,
+     "p": 0.1435,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型前后 | B6r": {
+     "wins": 7,
+     "losses": 13,
+     "p": 0.2632,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型前后 | B6": {
+     "wins": 8,
+     "losses": 10,
+     "p": 0.8145,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换回答模型前后 | B3": {
+     "wins": 6,
+     "losses": 1,
+     "p": 0.125,
+     "p_holm": 0.75,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：换成通义之后对 B3 | B6_vs_B3_qwen": {
+     "wins": 3,
+     "losses": 12,
+     "p": 0.0352,
+     "p_holm": 0.3516,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：换成通义之后对 B3 | B6r_vs_B3_qwen": {
+     "wins": 3,
+     "losses": 12,
+     "p": 0.0352,
+     "p_holm": 0.3516,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：换成通义之后对 B3 | always-L2_vs_B3_qwen": {
+     "wins": 3,
+     "losses": 12,
+     "p": 0.0352,
+     "p_holm": 0.3516,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型前后 | always-L1": {
+     "wins": 13,
+     "losses": 30,
+     "p": 0.0137,
+     "p_holm": 0.1783,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型前后 | always-L2": {
+     "wins": 11,
+     "losses": 22,
+     "p": 0.0801,
+     "p_holm": 0.561,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换回答模型前后 | B6r": {
+     "wins": 13,
+     "losses": 29,
+     "p": 0.0195,
+     "p_holm": 0.2342,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型前后 | B6": {
+     "wins": 10,
+     "losses": 28,
+     "p": 0.0051,
+     "p_holm": 0.0714,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：换回答模型前后 | B3": {
+     "wins": 20,
+     "losses": 15,
+     "p": 0.4996,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：换成通义之后对 B3 | B6_vs_B3_qwen": {
+     "wins": 8,
+     "losses": 40,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：换成通义之后对 B3 | B6r_vs_B3_qwen": {
+     "wins": 11,
+     "losses": 43,
+     "p": 0.0,
+     "p_holm": 0.0002,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo：换成通义之后对 B3 | always-L2_vs_B3_qwen": {
+     "wins": 13,
+     "losses": 28,
+     "p": 0.0275,
+     "p_holm": 0.3029,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "longmemeval_s：换成通义之后对 B3 | B6_vs_B3_qwen",
+  "longmemeval_s：换成通义之后对 B3 | B6r_vs_B3_qwen",
+  "longmemeval_s：换成通义之后对 B3 | always-L2_vs_B3_qwen",
+  "locomo：换回答模型前后 | always-L1",
+  "locomo：换回答模型前后 | B6r",
+  "全文 | longmemeval_s：换成通义之后对 B3 | B6_vs_B3_qwen",
+  "全文 | longmemeval_s：换成通义之后对 B3 | B6r_vs_B3_qwen",
+  "全文 | longmemeval_s：换成通义之后对 B3 | always-L2_vs_B3_qwen",
+  "全文 | locomo：换回答模型前后 | always-L1",
+  "全文 | locomo：换回答模型前后 | B6r",
+  "全文 | locomo：换回答模型前后 | B6",
+  "全文 | locomo：换成通义之后对 B3 | always-L2_vs_B3_qwen"
+ ]
+}

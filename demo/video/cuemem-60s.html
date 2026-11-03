@@ -427,12 +427,12 @@ sup.cite { font-size: 16px; font-weight: 700; color: var(--teal-d); margin-left:
 
   <!-- 6 结果 -->
   <section class="scene" id="s6">
-    <h2 class="sc-title">Results<small>test sets used once · every method frozen beforehand · nominal cost per 1,000 questions</small></h2>
+    <h2 class="sc-title">Results<small>one frozen pass over the test sets · every method frozen beforehand · nominal answer cost per 1,000 questions</small></h2>
     <div class="res-card" id="r1">
       <h3>Memory vs a long context window<small>LongMemEval · 400 questions</small></h3>
       <div class="hrow"><div class="lab"><span>Full context</span><b data-n="73.0">0%</b></div><div class="htrack"><i style="--v:73.0"></i></div><div class="cost">$31.88 per 1k questions</div></div>
       <div class="hrow teal"><div class="lab"><span>CueMem · L1 fast recall</span><b data-n="90.5">0%</b></div><div class="htrack"><i style="--v:90.5"></i></div><div class="cost">$1.60 per 1k questions</div></div>
-      <div class="deltas"><span class="dl teal">+17.5 points</span><span class="dl teal">1/20 of the cost</span></div>
+      <div class="deltas"><span class="dl teal">+17.5 points</span><span class="dl teal">1/20 the answer-time cost</span></div>
       <p class="r-note">Full context sends the whole chat history, about 106K tokens per question, to the model.</p>
     </div>
     <div class="res-card" id="r2">
@@ -489,7 +489,7 @@ const CAPTIONS = [
   [35.4, 39.3, "Memory is rebuilt from what's left. Ask again, and Cue doesn't know."],
   [39.8, 44.2, 'A small trained controller picks the recall depth before the LLM runs.'],
   [44.4, 48.3, 'It weighs expected accuracy against cost, and never calls an LLM itself.'],
-  [48.8, 52.9, 'Memory beats a long context: +17.5 points at 1/20 of the cost.'],
+  [48.8, 52.9, 'Memory beats a long context: +17.5 points at 1/20 of the answer-time cost.'],
   [53.1, 57.2, 'Against Mem0 with the same models: a tie on LoCoMo, +9 points on LongMemEval.'],
 ];
 

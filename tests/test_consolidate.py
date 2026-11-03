@@ -3,15 +3,50 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import itertools
+import json
+import logging
+import re
+import sqlite3
+import threading
+import time
+from collections import Counter
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pytest
-from fakes import TOY_CONVERSATION, FakeAPI
-from scripted import TOY_EXTRACTIONS, TOY_UPDATE_KEYWORDS, ScriptedModel, reconcile_by_keyword
+from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
+from scripted import (
+    TOY_EXTRACTIONS,
+    TOY_UPDATE_KEYWORDS,
+    ScriptedModel,
+    echo_extraction,
+    growing_extraction,
+    reconcile_by_keyword,
+)
+from test_sdk import AUG, SEP, moved, where_i_live
 
-from cuemem.config import Settings
-from cuemem.core.models import Conversation, Fact
+from cuemem import Memory
+from cuemem import sdk as sdk_module
+from cuemem.config import PathsConfig, Settings
+from cuemem.core.ids import stable_id
+from cuemem.core.models import Conversation, Entity, Fact, SessionIn, Turn, TurnIn
+from cuemem.core.trace import start_trace
+from cuemem.embed import CachedEmbedder
+from cuemem.embed.base import EmbeddingBatch, EmbedKind
+from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.memory import MemorySystem
+from cuemem.sdk import space_for
+from cuemem.store import MemoryDB
+from cuemem.write import consolidate as consolidate_module
+from cuemem.write.consolidate import MAX_ATTEMPTS
+from cuemem.write.extract import PIPELINE_VERSION, session_content_hash
+
+EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
+RECONCILE = "You maintain a long-term memory"  # 对账请求的系统提示开头
 
 
 def toy() -> Conversation:
@@ -103,7 +138,7 @@ def test_consolidation_is_idempotent_and_replayable(
     assert again.sessions == 0
     assert len(fake_api.chat_requests) == requests
 
-    system.ingest(toy())  # 重复导入同一份对话不会登记新任务
+    system.ingest(toy())  # 重复导入同一份对话不会登记新任务，也不会重放（会话没长）
     assert system.consolidate("demo").sessions == 0
 
     rebuilt = system.consolidate("demo", rebuild=True)  # 清空派生记忆后从原始日志重放
@@ -189,6 +224,459 @@ def test_background_worker(n3_settings: Settings, fake_api: FakeAPI, model: Scri
         assert memory.facts("demo", current_only=True)
 
 
+def outage(model: ScriptedModel) -> tuple[dict[str, int], Any]:
+    """供应商故障的替身：left 还剩几次时，抽取请求返回余额不足（HTTP 402，SDK 不重试）。"""
+    left = {"left": 0}
+
+    def reply(body: dict[str, Any]) -> Any:
+        if left["left"] and body["messages"][0]["content"].startswith(EXTRACT):
+            left["left"] -= 1
+            return NO_BALANCE
+        return model(body)
+
+    return left, reply
+
+
+def statuses(memory: Memory, space: str) -> list[tuple[str, int]]:
+    return sorted((j["status"], j["attempts"]) for j in memory.system.db.get_jobs(space))
+
+
+def test_worker_retries_failed_job_after_outage(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """后台抽取遇上供应商故障：不用等显式的巩固，后台线程按退避时间自动重试；失败 3 次之后
+    不再自动重试（之后的会话照常抽取），显式的 consolidate 仍能补上。"""
+    down, reply = outage(ScriptedModel(where_i_live))
+    fake_api.chat_replies = [reply]
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        worker = memory.system.worker
+        assert worker is not None
+        worker.retry_base_s = 0.0  # 不等退避时间：失败之后马上重试
+        down["left"] = 2  # 前两次失败，第三次成功
+        memory.add("I live in Berlin", user_id="alice")
+        memory.wait()
+        assert statuses(memory, "alice") == [("done", 2)]
+        assert [f["memory"] for f in memory.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
+        assert len(worker.errors) == 2 and "1 个会话抽取失败" in worker.errors[0]
+        assert "Insufficient Balance" in worker.errors[0]
+
+        down["left"] = 99  # 一直失败
+        memory.add("I live in Paris", user_id="bob", timestamp=datetime(2026, 8, 1))
+        memory.wait()
+        assert statuses(memory, "bob") == [("failed", 3)]
+        down["left"] = 0
+        memory.add("I like jazz", user_id="bob", timestamp=datetime(2026, 9, 1))
+        memory.wait()
+        assert statuses(memory, "bob") == [("done", 0), ("failed", 3)]
+        memory.consolidate(user_id="bob")  # 显式的巩固重试全部失败的任务
+        assert [s for s, _ in statuses(memory, "bob")] == ["done", "done"]
+        assert len(memory.get_all(user_id="bob")["results"]) == 2
+
+
+def test_worker_retries_a_space_whose_consolidation_raised(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """后台巩固时对账（不是抽取）遇上余额不足：异常从 run() 抛出，任务保持待处理。后台线程按
+    同样的退避时间把这个空间再做一遍，供应商恢复之后不用等新的写入就补上；一直抛出时最多做
+    MAX_ATTEMPTS 次。"""
+    model = ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
+    down = {"left": 0}
+
+    def reply(body: dict[str, Any]) -> Any:
+        if down["left"] and body["messages"][0]["content"].startswith(RECONCILE):
+            down["left"] -= 1
+            return NO_BALANCE
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    conv = toy()
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        system.ingest(conv.model_copy(update={"sessions": conv.sessions[:1]}), consolidate=True)
+        worker = system.start_worker()
+        worker.retry_base_s = 0.2  # 退避缩短：第一次之后等 0.2 秒（缺省 1 分钟）
+        down["left"] = 1  # 对账失败一次，之后恢复
+        system.ingest(conv)  # 后面几个会话交给后台线程：抽取成功，对账时 402
+        worker.wait()
+        assert len(worker.errors) == 1 and "Insufficient Balance" in worker.errors[0]
+        deadline = time.monotonic() + 10  # 没有新的提交：后台线程自己到时间再做
+        while {j["status"] for j in system.db.get_jobs("demo")} != {"done"}:
+            assert time.monotonic() < deadline, system.db.get_jobs("demo")
+            time.sleep(0.05)
+        assert len(worker.errors) == 1
+        assert system.facts("demo", current_only=True)
+
+        calls: list[str] = []
+
+        def broken(space_id: str) -> None:
+            calls.append(space_id)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(system.consolidator, "run", broken)
+        worker.retry_base_s = 0.0
+        worker.submit("demo")
+        worker.wait()  # 退避时间为 0：到期的重试在这一轮清出 _running 之前排上，wait() 一并等
+        assert calls == ["demo"] * MAX_ATTEMPTS and worker._until_due() is None
+
+
+def test_failed_jobs_back_off(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """自动重试的退避：第一次失败之后等 1 分钟，第二次之后等 4 分钟，失败 3 次就不再自动重试。"""
+    down, reply = outage(ScriptedModel(where_i_live))
+    fake_api.chat_replies = [reply]
+    down["left"] = 99
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("I live in Berlin", user_id="alice")
+        consolidator = memory.system.consolidator
+        for attempts, wait in ((1, 60), (2, 240)):
+            assert consolidator.run("alice").failed
+            assert statuses(memory, "alice") == [("failed", attempts)]
+            left = consolidator.next_retry("alice")
+            assert left is not None and wait - 5 < left <= wait
+            now = datetime.now()
+            assert consolidator.retry_due("alice", now=now + timedelta(seconds=wait - 5)) == 0
+            assert consolidator.retry_due("alice", now=now + timedelta(seconds=wait + 1)) == 1
+            assert statuses(memory, "alice") == [("pending", attempts)]
+        assert consolidator.run("alice").failed
+        assert consolidator.next_retry("alice") is None
+        assert consolidator.retry_due("alice", now=datetime.now() + timedelta(days=1)) == 0
+
+
+def test_worker_resumes_pending_jobs_on_start(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """进程退出时还没做完的抽取：下次启动后台线程时接着做，不用等这个用户再写入。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        assert memory.add("I live in Berlin", user_id="alice")["status"] == "queued"
+        assert statuses(memory, "alice") == [("pending", 0)]
+    with Memory(n3_settings, http_client=fake_api.client()) as memory:
+        memory.wait()
+        assert statuses(memory, "alice") == [("done", 0)]
+        assert [f["memory"] for f in memory.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
+
+
+def test_close_timeout_does_not_record_closed_db_error(
+    n3_settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """关闭时后台线程还在抽取、等不到它做完：照常关闭，线程随后碰到已关闭的数据库时不记报错；
+    任务留在待处理，下次启动时接着做。"""
+    model = ScriptedModel(where_i_live)
+    entered, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if body["messages"][0]["content"].startswith(EXTRACT) and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    memory = Memory(n3_settings, http_client=fake_api.client())
+    worker = memory.system.worker
+    assert worker is not None
+    memory.add("I live in Berlin", user_id="alice")
+    assert entered.wait(10)
+    worker.stop_timeout_s = 0.2
+    with caplog.at_level(logging.WARNING, logger="cuemem.write.consolidate"):
+        memory.close()
+    assert worker.closing and "下次启动时接着做" in caplog.text
+    release.set()
+    for thread in worker._threads:
+        thread.join(10)
+    assert not any(t.is_alive() for t in worker._threads) and not worker.errors
+
+    with Memory(n3_settings, http_client=fake_api.client()) as again:
+        again.wait()
+        assert statuses(again, "alice") == [("done", 0)]
+        assert [f["memory"] for f in again.get_all(user_id="alice")["results"]] == [
+            "The user lives in Berlin."
+        ]
+
+
+def test_one_slow_space_does_not_hold_back_another(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """一个用户的巩固很慢（几百个会话的重放、供应商限流）时，别的用户的抽取照常开始：后台有几个
+    线程（consolidation.background_workers，缺省 4）。以前只有一个线程，别的用户都排在它后面
+    （离线复现：600 个会话的重放期间，另一个用户一个会话的抽取等了近 20 秒，单独只要 0.01 秒）。"""
+    model = ScriptedModel(echo_extraction)
+    alice_in, bob_in = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        text = str(body["messages"])
+        if "ALICE" in text:
+            alice_in.set()
+            bob_in.wait(10)
+        if "BOB" in text:
+            bob_in.set()
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        assert len(worker._threads) == n3_settings.consolidation.background_workers == 4
+        system.append("alice", said_once("s1", "ALICE lives in Rome", 1), 0)
+        assert alice_in.wait(10)  # alice 的抽取卡在供应商那里
+        system.append("bob", said_once("s1", "BOB lives in Oslo", 1), 0)
+        assert bob_in.wait(5), "bob 的抽取排在 alice 的后面"
+        worker.wait()
+        assert not worker.errors
+        assert [f.statement for f in system.facts("bob")] == ["BOB lives in Oslo"]
+        assert [f.statement for f in system.facts("alice")] == ["ALICE lives in Rome"]
+
+
+def test_repeated_submits_of_one_space_are_merged(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """一个空间在队列里最多排一次：线程都忙时同一个用户连着写 30 次（每次都提交），轮到它时只
+    巩固一轮。以前提交几次就巩固几轮，其余的什么都不做、各写一条 trace（离线复现：30 次后台的
+    add 巩固了 30 轮，24 轮一个会话都没有）。"""
+    model = ScriptedModel(echo_extraction)
+    held, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "HOLD" in str(body["messages"]):
+            held.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    one = n3_settings.consolidation.model_copy(update={"background_workers": 1})
+    settings = n3_settings.model_copy(update={"consolidation": one})
+    with MemorySystem.from_settings(settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        assert len(worker._threads) == 1
+        system.append("hold", said_once("s1", "HOLD the only thread", 1), 0)
+        assert held.wait(10)
+        system.append("dave", said_once("s1", "I bought a bike", 1), 0)
+        for _ in range(29):
+            worker.submit("dave")
+        release.set()
+        worker.wait()
+        runs = [r for r in worker.reports if r.space_id == "dave"]
+        assert [r.sessions for r in runs] == [1]
+
+
+def test_a_space_submitted_while_it_consolidates_runs_again(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """正在巩固的空间又提交了（期间又写了一个会话）：这一轮做完再做一轮，新会话不会因为合并
+    提交而漏掉，wait() 也等到它做完。"""
+    model = ScriptedModel(echo_extraction)
+    entered, release = threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "FIRST" in str(body["messages"]) and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        system.append("erin", said_once("s1", "FIRST I live in Lima", 1), 0)
+        assert entered.wait(10)
+        system.append("erin", said_once("s2", "I work as a nurse", 2), 0)
+        release.set()
+        worker.wait()
+        assert {j["status"] for j in system.db.get_jobs("erin")} == {"done"}
+        assert sorted(f.statement for f in system.facts("erin")) == [
+            "FIRST I live in Lima",
+            "I work as a nurse",
+        ]
+        assert [r.sessions for r in worker.reports if r.space_id == "erin"] == [1, 1]
+
+
+def said_once(session_id: str, text: str, day: int) -> SessionIn:
+    return SessionIn(
+        session_id=session_id,
+        started_at=datetime(2026, 9, day, 10),
+        turns=[TurnIn(role="user", text=text)],
+    )
+
+
+@pytest.mark.parametrize("rebuild", [True, False], ids=["rebuild", "plain"])
+def test_consolidate_reads_open_sessions_once_it_holds_the_lock(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch, rebuild: bool
+) -> None:
+    """显式的巩固要等后台线程做完手上这一轮才拿到巩固锁。等锁期间结束的会话照样被抽取（重建时
+    它刚登记的任务被清空，要重新登记）；等锁期间新开、已经说了几句的会话不被抽取半段。"""
+    model = ScriptedModel(echo_extraction)
+    entered, release, asked = threading.Event(), threading.Event(), threading.Event()
+
+    def reply(body: dict[str, Any]) -> Any:
+        if "SLOW" in str(body["messages"]) and not release.is_set():
+            entered.set()
+            release.wait(10)
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        worker = system.start_worker()
+        if rebuild:
+            system.open_session("u", "x")
+            system.append("u", said_once("x", "I live in Paris", 2), 0)  # 进行中：不登记
+        system.append("u", said_once("slow", "SLOW extraction in flight", 1), 0)
+        assert entered.wait(10)  # 后台线程拿着巩固锁，卡在抽取里
+
+        exclusive = system.consolidator.exclusive
+
+        def announced(space_id: str) -> Any:
+            asked.set()
+            return exclusive(space_id)
+
+        monkeypatch.setattr(system.consolidator, "exclusive", announced)
+        waiting = threading.Thread(target=lambda: system.consolidate("u", rebuild=rebuild))
+        waiting.start()
+        assert asked.wait(10)  # 显式的巩固在等锁
+        if rebuild:
+            system.close_session("u", "x", submit=False)  # 会话结束：登记任务
+        else:
+            system.open_session("u", "y")  # 新的一段对话开始，已经说了一句
+            system.append("u", said_once("y", "I am planning a trip", 3), 0)
+        release.set()
+        waiting.join(10)
+        worker.wait()
+        assert not worker.errors
+        jobs = {j["session_id"]: j["status"] for j in system.db.get_jobs("u")}
+        facts = sorted(f.statement for f in system.facts("u"))
+        if rebuild:
+            assert jobs == {"slow": "done", "x": "done"}
+            assert facts == ["I live in Paris", "SLOW extraction in flight"]
+        else:
+            assert jobs == {"slow": "done"} and facts == ["SLOW extraction in flight"]
+            system.close_session("u", "y", wait=True)
+            assert "I am planning a trip" in [f.statement for f in system.facts("u")]
+
+
+def test_stale_enqueue_and_run_do_not_read_the_whole_space(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """判断派生记忆是否过期（add(wait=True) 与 update 每次都有）不再读出全部任务；为几个会话登记
+    任务（每次 add）与执行任务不再读出全部会话。以前这几处都随空间里的会话数变慢：2 万个会话时
+    读全部任务约 0.1 秒、读全部会话约 20 毫秒，都拿着数据库的锁。"""
+    whole: list[str] = []
+    get_jobs, get_sessions = MemoryDB.get_jobs, MemoryDB.get_sessions
+
+    def jobs_spy(db: MemoryDB, space_id: str, status: str | None = None) -> Any:
+        if status is None:
+            whole.append(f"get_jobs({space_id})")
+        return get_jobs(db, space_id, status)
+
+    def sessions_spy(db: MemoryDB, space_id: str) -> Any:
+        whole.append(f"get_sessions({space_id})")
+        return get_sessions(db, space_id)
+
+    monkeypatch.setattr(MemoryDB, "get_jobs", jobs_spy)
+    monkeypatch.setattr(MemoryDB, "get_sessions", sessions_spy)
+    consolidator = system.consolidator
+    assert not consolidator.stale("demo")
+    system.append("demo", said_once("s9", "I bought a bike", 9), 0, enqueue=False)
+    assert consolidator.enqueue("demo", ["s9", "nope", "s9"]) == 1
+    assert consolidator.enqueue("demo", ["s9"]) == 0
+    assert consolidator.run("demo").sessions == 1
+    system.db.set_meta("consolidation:empty", "another fingerprint")
+    assert not consolidator.stale("empty")  # 没有任务的空间：没有要重建的
+    system.db.set_meta("consolidation:demo", "another fingerprint")
+    assert consolidator.stale("demo")
+    system.db.set_meta("consolidation:demo", consolidator.fingerprint())
+    assert not consolidator.stale("demo")
+    system.db.enqueue_job("old", "demo", "s9", "an older pipeline", "h")
+    assert consolidator.stale("demo")
+    assert whole == []
+
+
+def reference_enqueue(
+    db: MemoryDB, space_id: str, session_ids: Sequence[str] | None, skip: set[str]
+) -> int:
+    """以前登记任务的做法：读出全部会话，逐个会话读发言、算指纹，各自 INSERT OR IGNORE，新登记
+    时取代同一会话还没执行的旧任务。"""
+    sessions = db.get_sessions(space_id)
+    added = 0
+    for session_id in session_ids if session_ids is not None else sorted(sessions):
+        if session_id not in sessions or session_id in skip:
+            continue
+        turns = db.get_turns(space_id, session_id)
+        if not turns:
+            continue
+        digest = session_content_hash(turns, sessions[session_id])
+        job_id = stable_id(space_id, "consolidate", session_id, digest, PIPELINE_VERSION)
+        now = datetime.now().isoformat()
+        with db.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO jobs (id, space_id, session_id, version, content_hash,"
+                " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (job_id, space_id, session_id, PIPELINE_VERSION, digest, now, now),
+            )
+            if cursor.rowcount > 0:
+                added += 1
+                conn.execute(
+                    "UPDATE jobs SET status = 'superseded', updated_at = ?"
+                    " WHERE space_id = ? AND session_id = ? AND id != ?"
+                    " AND status IN ('pending', 'failed')",
+                    (now, space_id, session_id, job_id),
+                )
+    return added
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["all", "listed"])
+def test_batched_enqueue_matches_enqueueing_one_session_at_a_time(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, listed: bool
+) -> None:
+    """登记任务改成只读列出的会话、一次取发言的版本、一个事务批量插入（MemoryDB.enqueue_jobs，
+    任务多时先读出已有的任务 ID）之后，任务表（按 rowid 的顺序）与返回的个数与以前逐个会话登记
+    时逐行相同：巩固过、没变的，巩固过又长了的，已经登记、还没执行的（没变的与又长了的），新的，
+    只记了日志的（infer=False），没有发言的，重复列出的，库里没有的，以及跳过的会话。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as system:
+        db = system.db
+        system.append("u", said_once("done", "I live in Paris", 1), 0)
+        system.append("u", said_once("grown", "I like jazz", 2), 0)
+        system.append("u", said_once("skipped", "I like tea", 3), 0)
+        system.consolidate("u")
+        system.append("u", said_once("pending", "I am planning a trip", 4), 0)
+        bulk = [f"bulk-{i:03d}" for i in range(120)]  # 任务多于 100 个：先读出已有的任务 ID
+        for i, sid in enumerate(bulk):
+            started = datetime(2026, 10, 1) + timedelta(minutes=i)
+            db.add_session("u", sid, started)
+            db.add_turns(
+                [
+                    Turn(
+                        id=f"{sid}-0",
+                        space_id="u",
+                        session_id=sid,
+                        idx=0,
+                        role="user",
+                        text=f"note {i}",
+                        ts=started,
+                    )
+                ]
+            )
+        # 已经登记的会话：同时记下它们的内容指纹（之后的登记先查它，发言变了才重算）
+        system.consolidator.enqueue("u", ["done", "grown", "skipped", "pending", *bulk[::2]])
+        for sid, text, day in (("grown", "and blues", 2), ("skipped", "and coffee", 3)):
+            system.append("u", said_once(sid, text, day), 1, enqueue=False)
+        system.append("u", said_once("pending", "to Rome", 4), 1, enqueue=False)
+        system.append("u", said_once("new", "I bought a bike", 5), 0, enqueue=False)
+        system.append("u", said_once("logged", "I only log this", 6), 0, enqueue=False)
+        db.add_session("u", "empty", datetime(2026, 9, 7, 10))
+        copy = tmp_path / "copy.sqlite"
+        with sqlite3.connect(copy) as target:
+            db._conn.backup(target)
+        target.close()
+
+        ids = None
+        if listed:
+            ids = ["new", "grown", "new", "missing", "skipped", "empty", "done", "pending"]
+            ids += bulk[::-1]
+        skip = {"skipped"}
+        added = system.consolidator.enqueue("u", ids, skip=skip)
+        reference = MemoryDB(copy)
+        try:
+            expected = reference_enqueue(reference, "u", ids, skip)
+            rows = "SELECT id, session_id, status, content_hash FROM jobs ORDER BY rowid"
+            assert db._conn.execute(rows).fetchall() == reference._conn.execute(rows).fetchall()
+        finally:
+            reference.close()
+        assert added == expected == (63 if listed else 64)
+
+
 def test_content_filter_skips_session_or_falls_back_to_rules(
     n3_settings: Settings, fake_api: FakeAPI
 ) -> None:
@@ -222,12 +710,13 @@ def test_content_filter_skips_session_or_falls_back_to_rules(
 def test_config_change_triggers_rebuild(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:
-    """影响巩固结果的配置（如阈值）变了：派生记忆自动重建；只改并发数不算。"""
+    """影响巩固结果的配置（如阈值）变了：派生记忆自动重建；只改并发数（同一空间里并行抽取的
+    会话数、后台同时巩固的空间数）不算。"""
     with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
         memory.ingest(toy(), consolidate=True)
         before = memory.consolidator.fingerprint()
         assert not memory.consolidator.stale("demo")
-    faster = n3_settings.consolidation.model_copy(update={"workers": 7})
+    faster = n3_settings.consolidation.model_copy(update={"workers": 7, "background_workers": 2})
     with MemorySystem.from_settings(
         n3_settings.model_copy(update={"consolidation": faster}), http_client=fake_api.client()
     ) as memory:
@@ -240,3 +729,610 @@ def test_config_change_triggers_rebuild(
         assert memory.consolidator.stale("demo")
         report = memory.consolidate("demo")  # 自动重建：5 个会话全部重放（命中缓存）
         assert report.sessions == 5 and not memory.consolidator.stale("demo")
+
+
+HIKING = [{"role": "user", "content": "I like hiking"}, {"role": "assistant", "content": "Nice!"}]
+ALPS = [
+    {"role": "user", "content": "Mostly in the Alps"},
+    {"role": "assistant", "content": "Cool."},
+]
+
+
+def statements(memory: Memory, space: str = "u") -> list[str]:
+    return sorted(f.statement for f in memory.system.facts(space))
+
+
+def test_a_session_that_grows_is_replayed_from_the_log(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """巩固过的会话又追加了发言（SDK 每轮 add 同一个 run_id）：整段重新抽取之后，之前那次抽取的
+    说法（"The user likes hiking."）不再留着，派生记忆与从原始日志重建的一样。重放只重新抽取
+    长了的会话，其余会话命中缓存。"""
+    model = ScriptedModel(growing_extraction)
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        add = memory.add
+        add("I live in Berlin", user_id="u", run_id="before", timestamp=datetime(2026, 7, 1))
+        add(HIKING, user_id="u", run_id="chat", timestamp=datetime(2026, 8, 1), wait=True)
+        add("I like jazz", user_id="u", run_id="after", timestamp=datetime(2026, 9, 1), wait=True)
+        assert "The user likes hiking." in statements(memory)
+        requests = len(fake_api.chat_requests)
+
+        add(ALPS, user_id="u", run_id="chat", timestamp=datetime(2026, 8, 1, 0, 5), wait=True)
+        assert len(fake_api.chat_requests) == requests + 1  # 只有长了的会话重新抽取
+        assert "Mostly in the Alps" in model.prompts["extract"][-1]
+        grown = statements(memory)
+        assert grown == [
+            "The user enjoys hiking in the Alps.",
+            "The user said: I like jazz",
+            "The user said: I live in Berlin",
+            "The user said: Mostly in the Alps",
+        ]
+        assert [j["status"] for j in memory.system.db.get_jobs("u")] == ["done"] * 3
+        traces = memory.system.settings.paths.traces.glob("*.jsonl")
+        assert any("consolidate_regrown_replay" in p.read_text("utf-8") for p in traces)
+
+        memory.consolidate(user_id="u", rebuild=True)
+        assert statements(memory) == grown
+
+
+def test_a_grown_session_is_not_replayed_without_a_writable_cache(
+    n3_settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """LLM 缓存不可写时重放会把所有会话重新抽取一遍：照旧增量巩固，并给出警告。"""
+    fake_api.chat_replies = [ScriptedModel(growing_extraction)]
+    settings = n3_settings.model_copy(update={"llm_cache_mode": "off"})
+    with Memory(settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add(HIKING, user_id="u", run_id="chat", wait=True)
+        with caplog.at_level(logging.WARNING, logger="cuemem.write.consolidate"):
+            memory.add(ALPS, user_id="u", run_id="chat", wait=True)
+        assert "不从原始日志重放" in caplog.text
+        assert "The user likes hiking." in statements(memory)
+
+
+def test_a_replay_extracts_only_what_was_extracted_before(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """会话又长了时的重放只重新抽取原来就有任务的会话：infer=False 只记了日志的会话照旧不抽取；
+    内容审核拒绝过、内容没变的会话不再请求（拒绝不进缓存）；失败次数用完的会话不因重放清零、
+    重新开始自动重试。显式的 consolidate 照旧抽取 infer=False 的会话。"""
+    from fakes import REJECT
+
+    model = ScriptedModel(echo_extraction)
+    sent: Counter[str] = Counter()
+
+    def reply(body: dict[str, Any]) -> Any:
+        text = str(body["messages"])
+        sent.update(mark for mark in ("DIARY", "FILTERED", "BROKEN") if mark in text)
+        if "FILTERED" in text:
+            return REJECT
+        if "BROKEN" in text and body["messages"][0]["content"].startswith(EXTRACT):
+            return NO_BALANCE
+        return model(body)
+
+    fake_api.chat_replies = [reply]
+    t0 = datetime(2026, 9, 1, 10)
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("DIARY raw log only", user_id="u", infer=False, timestamp=t0)
+        memory.add("FILTERED by moderation", user_id="u", timestamp=t0 + timedelta(hours=1))
+        memory.add("BROKEN extraction", user_id="u", timestamp=t0 + timedelta(hours=2))
+        memory.add("I like tea", user_id="u", run_id="chat", timestamp=t0 + timedelta(hours=3))
+        consolidator = memory.system.consolidator
+        consolidator.run("u")  # 后台线程的做法：只执行待处理的任务
+        for _ in range(MAX_ATTEMPTS - 1):  # 退避时间到了就重试，直到用完次数
+            assert consolidator.retry_due("u", base_s=0) == 1
+            consolidator.run("u")
+
+        def outcomes() -> dict[str, tuple[str, int, str | None]]:
+            jobs = memory.system.db.get_jobs("u")
+            return {
+                memory.system.db.get_turns("u", j["session_id"])[0].text.split()[0]: (
+                    j["status"],
+                    j["attempts"],
+                    j["stats"].get("skipped"),
+                )
+                for j in jobs
+                if j["status"] != "superseded"
+            }
+
+        before = outcomes()
+        assert before == {
+            "FILTERED": ("done", 0, "content_filter"),
+            "BROKEN": ("failed", MAX_ATTEMPTS, None),
+            "I": ("done", 0, None),
+        }
+        requests = dict(sent)
+
+        memory.add("I like jazz", user_id="u", run_id="chat", timestamp=t0 + timedelta(hours=4))
+        assert consolidator.retry_due("u", base_s=0) == 0
+        with start_trace("consolidate", memory.system.tracer, space="u"):
+            report = consolidator.run("u")  # chat 又长了：从原始日志重放
+        assert report.sessions == 1 and not report.failed
+        assert outcomes() == before
+        assert dict(sent) == requests  # 没有新的抽取请求发给这三个会话
+        assert statements(memory) == ["I like jazz", "I like tea"]
+        traces = memory.system.settings.paths.traces.glob("*.jsonl")
+        assert any("consolidate_regrown_replay" in p.read_text("utf-8") for p in traces)
+
+        memory.consolidate(user_id="u")  # 显式的巩固：infer=False 的会话这时才抽取
+        assert "DIARY raw log only" in statements(memory)
+
+
+def test_a_replay_survives_a_vector_store_error(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """会话又长了时的重放，删派生记忆的向量时向量库出错（Qdrant 服务一时连不上）：任务都还在，
+    后台线程的重试把重放做完。以前先提交清空（任务也一起清空了）再删向量，出错时任务一个不剩，
+    重试与重启都找不到要做的事，整个空间的事实都没了。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=moved)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Berlin", user_id="u", run_id="a", timestamp=AUG, wait=True)
+        day2 = AUG + timedelta(days=1)
+        memory.add("I like jazz", user_id="u", run_id="b", timestamp=day2, wait=True)
+        memory.add("I like chess", user_id="u", run_id="b", timestamp=SEP)  # b 又长了，待处理
+        delete, calls = system.vectors.delete, Counter[str]()
+
+        def unreachable_once(space: str, ids: Sequence[str]) -> Any:
+            calls["delete"] += 1
+            if calls["delete"] == 1:
+                raise ConnectionError("qdrant unreachable")
+            return delete(space, ids)
+
+        monkeypatch.setattr(system.vectors, "delete", unreachable_once)
+        with pytest.raises(ConnectionError):
+            system.consolidator.run("u")  # 后台线程的做法
+        assert len(statements(memory)) == 2  # 什么都没清空
+        assert system.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS) == ["u"]
+        system.consolidator.run("u")  # 后台线程按退避重试
+        assert statements(memory) == ["I like chess", "I like jazz", "The user lives in Berlin."]
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def said(
+    statement: str, subject: str, predicate: str, obj: str, turn: int, cardinality: str = "single"
+) -> dict[str, Any]:
+    return {
+        "statement": statement,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
+        "category": "attribute",
+        "cardinality": cardinality,
+        "importance": 4,
+        "turns": [turn],
+    }
+
+
+# 抽取提示要求用英文写记忆，名字与专名保留原来的文字
+NATIVE_NAMES: dict[str, Any] = {
+    "2026-01-10": {
+        "summary": "",
+        "facts": [
+            said("Анна lives in Moscow.", "Анна", "lives_in", "Moscow", 0),
+            said("Иван works as a doctor.", "Иван", "job_title", "doctor", 1),
+        ],
+        "entities": [],
+    },
+    "2026-02-01": {
+        "summary": "",
+        "facts": [
+            said("The user has a dog named 초코.", "User", "has_pet", "초코", 0, "multi"),
+            said("The user has a dog named 보리.", "User", "has_pet", "보리", 0, "multi"),
+            said("The user lives in 서울.", "User", "lives_in", "서울", 0),
+        ],
+        "entities": [],
+    },
+    "2026-03-01": {
+        "summary": "",
+        "facts": [said("The user moved to 부산.", "User", "lives_in", "부산", 0)],
+        "entities": [],
+    },
+}
+
+
+def test_names_and_values_in_other_scripts(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """名字与宾语是西里尔、韩文等文字时（以前规范化成 ''）：两位俄文名字的说话人是两个实体，
+    关于他们的事实都留着；同一会话里两只韩文名字的狗都留着；从 서울 搬到 부산 经过对账，
+    서울 不再是当前的（以前当成同一个值，부산 被当作重复丢掉）。"""
+    model = ScriptedModel(
+        NATIVE_NAMES,
+        reconcile=lambda prompt: {"decisions": [{"new": 1, "action": "update", "target": "e1"}]},
+    )
+    fake_api.chat_replies = [model]
+    speakers = SessionIn(
+        session_id="g",
+        started_at=datetime(2026, 1, 10),
+        turns=[
+            TurnIn(role="user", speaker="Анна", text="Я живу в Москве."),
+            TurnIn(role="user", speaker="Иван", text="А я работаю врачом."),
+        ],
+    )
+    pets = SessionIn(
+        session_id="a",
+        started_at=datetime(2026, 2, 1),
+        turns=[TurnIn(role="user", text="강아지 초코랑 보리를 키워요. 서울에 살아요.")],
+    )
+    moved = SessionIn(
+        session_id="b",
+        started_at=datetime(2026, 3, 1),
+        turns=[TurnIn(role="user", text="부산으로 이사했어요.")],
+    )
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
+        memory.ingest(Conversation(space_id="ru", sessions=[speakers]), consolidate=True)
+        people = {e.name: e.id for e in memory.entities("ru")}
+        assert set(people) == {"Анна", "Иван"}
+        facts = memory.facts("ru")
+        assert by_statement(facts, "Moscow").subject_id == people["Анна"]
+        assert by_statement(facts, "doctor").subject_id == people["Иван"]
+
+        memory.ingest(Conversation(space_id="ko", sessions=[pets, moved]), consolidate=True)
+        facts = memory.facts("ko")
+        assert {f.object for f in facts if f.predicate == "has_pet"} == {"초코", "보리"}
+        seoul, busan = by_statement(facts, "서울"), by_statement(facts, "부산")
+        assert busan.is_current and not seoul.is_current
+        assert seoul.superseded_by == busan.id
+        assert model.calls["reconcile"] == 1 and "서울" in model.prompts["reconcile"][0]
+
+
+# ---------- 跨巩固复用载入的状态（R6） ----------
+
+
+def life_story(prompt: str) -> dict[str, Any]:
+    """抽取替身：住址、喜好、最喜欢的颜色、家人与宠物各抽成一条事实；提到的宠物与人记成实体，
+    宠物的描述后来才说（实体的描述变了，描述向量要重新查）；喜好的陈述两边带空白（库里存的是
+    去掉空白的，载入时查的是另一段文本）。"""
+    facts: list[dict[str, Any]] = []
+    entities: list[dict[str, Any]] = []
+
+    def fact(statement: str, predicate: str, obj: str, cardinality: str, turn: str) -> None:
+        subject = statement.split()[0] if predicate == "is_a" else "User"
+        facts.append(
+            {
+                "statement": statement,
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+                "cardinality": cardinality,
+                "importance": 4,
+                "turns": [int(turn)],
+            }
+        )
+
+    for n, text in re.findall(r"\[t(\d+)\] User: (.*)", prompt):
+        if m := re.search(r"(?:live in|moved to) (\w+)", text):
+            fact(f"The user lives in {m[1]}.", "lives_in", m[1], "single", n)
+        elif m := re.search(r"like (\w+)", text):
+            fact(f" The user likes {m[1]}. ", "likes", m[1], "multi", n)
+        elif m := re.search(r"favorite color is (\w+)", text):
+            fact(f"The user's favorite color is {m[1]}.", "favorite_color", m[1], "single", n)
+        elif m := re.search(r"(\w+) is my (dog|sister)", text):
+            pet = m[2] == "dog"
+            fact(
+                f"{m[1]} is the user's {m[2]}.",
+                "has_pet" if pet else "has_family_member",
+                m[1],
+                "multi",
+                n,
+            )
+            kind = "pet" if pet else "person"
+            entities.append({"name": m[1], "type": kind, "aliases": [], "description": ""})
+        elif m := re.search(r"(\w+) is an? (.*)", text):
+            fact(f"{m[1]} is a {m[2]}", "is_a", m[2], "single", n)
+            # 只说了是什么，没说是宠物：类型记成 other，链接到已有的宠物时补上描述
+            entities.append({"name": m[1], "type": "other", "aliases": [], "description": m[2]})
+    return {"summary": "", "facts": facts, "entities": entities}
+
+
+@pytest.fixture
+def story_settings(offline_settings: Settings) -> Settings:
+    """哈希向量有字面相似度：阈值放低，让对账与消歧的灰区真的要问模型；抽取逐个会话做，
+    请求的先后确定。"""
+    consolidation = offline_settings.consolidation.model_copy(
+        update={
+            "duplicate_threshold": 0.95,
+            "conflict_threshold": 0.4,
+            "multi_conflict_threshold": 0.8,
+            "entity_merge_threshold": 0.95,
+            "entity_gray_threshold": 0.3,
+            "workers": 1,
+        }
+    )
+    return offline_settings.model_copy(update={"consolidation": consolidation})
+
+
+def story(settings: Settings, fake_api: FakeAPI, root: Path) -> dict[str, Any]:
+    """SDK 的一串写入、遗忘、导入、重建与删除空间，返回发给模型的请求、交给向量器的文本
+    （缓存未命中）、add 返回的事件、最后的事实与实体，以及从库里整个载入状态的次数。"""
+    fake_api.chat_replies = [
+        ScriptedModel(
+            life_story,
+            reconcile=reconcile_by_keyword("lives in", "favorite color"),
+            entity=lambda prompt: {"matches": [{"new": 1, "same_as": "c1"}]},
+        )
+    ]
+    fake_api.chat_requests.clear()
+    paths = PathsConfig().resolve_against(root)
+    settings = settings.model_copy(update={"paths": paths})
+    out: dict[str, Any] = {"events": [], "misses": [], "loads": 0}
+    with Memory(settings, http_client=fake_api.client(), background=False) as m:
+        db = m.system.db
+        assert isinstance(m.system.embedder, CachedEmbedder)
+        inner = m.system.embedder.inner
+        embed, get_entities = inner.embed, db.get_entities
+
+        def recording(texts: Sequence[str], kind: EmbedKind) -> EmbeddingBatch:
+            out["misses"].extend(f"{kind}:{t}" for t in texts)
+            return embed(texts, kind)
+
+        def counting(space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
+            out["loads"] += ids is None
+            return get_entities(space_id, ids)
+
+        inner.embed = recording  # type: ignore[method-assign]
+        db.get_entities = counting  # type: ignore[method-assign]
+        day = itertools.count()
+
+        def add(text: str, run: str, user: str = "u", **kw: Any) -> dict[str, Any]:
+            when = datetime(2026, 1, 1) + timedelta(days=next(day))
+            result = m.add(text, user_id=user, run_id=run, timestamp=when, **kw)
+            out["events"].append(result["results"])
+            return result
+
+        add("I live in Berlin", "s1", wait=True)
+        add("I like hiking", "s2", wait=True)
+        add("Max is my dog", "s3", wait=True)
+        add("My favorite color is blue", "s4", wait=True)
+        add("Max is a golden retriever", "s5", wait=True)  # 描述填上了：描述向量要重新查
+        add("Rex is my dog", "s5b", wait=True)  # 实体的灰区：与 Max 的描述有几分像
+        add("I moved to Munich", "s6", wait=True)  # 灰区：取代柏林
+        add("I like chess", "s7", wait=True)
+        add("My favorite color is green", "s7", wait=True)  # 会话又长了：清空重放
+        add("I like painting", "s8", infer=False)
+        out["events"].append(m.consolidate(user_id="u"))
+        chess = next(f for f in m.get_all(user_id="u")["results"] if "chess" in f["memory"])
+        m.delete(chess["id"])  # 遗忘：清空重放
+        add("I like swimming", "s9", wait=True)
+        add("Mia is my sister", "s10", wait=True)
+        m.load(m.export(user_id="u"), user_id="v", wait=True)  # 导入到另一个空间
+        add("I moved to Paris", "s11", wait=True)
+        add("I live in Rome", "v1", user="v", wait=True)
+        m.delete_all(user_id="u", run_id="s2")  # 按会话遗忘
+        out["events"].append(m.consolidate(user_id="u", rebuild=True))
+        add("I like rowing", "s12", wait=True)
+        m.delete_all(user_id="v")  # 删除空间之后同一个空间重新写入
+        add("I live in Oslo", "v2", user="v", wait=True)
+        add("Bella is my dog", "v3", user="v", wait=True)
+        for user in ("u", "v"):
+            space = space_for(user)
+            out[f"facts:{user}"] = [f.model_dump() for f in db.get_facts(space)]
+            out[f"entities:{user}"] = [e.model_dump() for e in get_entities(space)]
+        out["units"] = sorted((u.id, u.kind, u.text) for u in db.list_units(space_for("u")))
+    for report in out["events"]:
+        if isinstance(report, dict):
+            report.pop("elapsed_ms", None)
+    out["requests"] = [json.dumps(r, sort_keys=True) for r in fake_api.chat_requests]
+    return out
+
+
+def test_reused_state_matches_loading_from_the_database(
+    story_settings: Settings,
+    fake_api: FakeAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """以前每次巩固都从库里读全部事实与实体、逐条查向量缓存；现在上一次巩固之后留下镜像，
+    派生记忆没变过就直接用。经过遗忘、会话又长了的重放、导入、重建与删除空间，发给模型的请求、
+    向量缓存的未命中、add 的事件与最后的事实和实体，与每次都从库里读完全相同。"""
+    # 只撤销这一处：以前 monkeypatch.undo() 把这个测试的环境变量也全撤了（settings 夹具设的假 Key、
+    # clean_env 指到临时目录的 .env），第二遍只在环境里本来就有真 Key 时才跑得通（CI 没有 Key：
+    # 抽取失败，找不到 chess 那条事实）
+    with monkeypatch.context() as patch:
+        patch.setattr(consolidate_module, "MIRRORED_SPACES", 0)  # 不留镜像：每次都从库里读
+        cold = story(story_settings, fake_api, tmp_path / "cold")
+    warm = story(story_settings, fake_api, tmp_path / "warm")
+    assert warm["requests"] == cold["requests"]
+    assert warm["misses"] == cold["misses"]
+    assert warm["events"] == cold["events"]
+    for key in ("facts:u", "entities:u", "facts:v", "entities:v", "units"):
+        assert warm[key] == cold[key], key
+    # 场景确实走到了要问模型的灰区与要重新查的向量，镜像也确实用上了
+    assert sum(RECONCILE in r for r in cold["requests"]) >= 2
+    assert any("You link entity mentions" in r for r in cold["requests"])
+    assert "document:Max (pet): golden retriever" in cold["misses"]  # 载入时才查的描述
+    assert any(f["supersede_reason"] == "changed" for f in cold["facts:u"])
+    assert warm["loads"] < cold["loads"] // 2
+
+
+def corrections_story(settings: Settings, fake_api: FakeAPI, root: Path) -> dict[str, Any]:
+    """SDK 的 metadata、update（记进原始日志的更正）、带 metadata 又长了的会话、导出导入到另一个
+    空间（version 2，带更正目标），最后遗忘那句更正。返回发给模型的请求、各步的结果、更正之后与
+    最后的事实和实体，以及从库里整个载入状态的次数。"""
+    fake_api.chat_replies = [
+        ScriptedModel(life_story, reconcile=reconcile_by_keyword("lives in", "favorite color"))
+    ]
+    fake_api.chat_requests.clear()
+    paths = PathsConfig().resolve_against(root)
+    out: dict[str, Any] = {"events": [], "loads": 0}
+    with Memory(
+        settings.model_copy(update={"paths": paths}),
+        http_client=fake_api.client(),
+        background=False,
+    ) as m:
+        db = m.system.db
+        get_entities = db.get_entities
+
+        def counting(space_id: str, ids: Sequence[str] | None = None) -> list[Entity]:
+            out["loads"] += ids is None
+            return get_entities(space_id, ids)
+
+        db.get_entities = counting  # type: ignore[method-assign]
+        day = itertools.count()
+
+        def add(text: str, run: str, **kw: Any) -> None:
+            # 写在将来：update 给更正的会话取的时间是原来那条之后一点，不是当前时间，两次相同
+            when = datetime(2030, 1, 1) + timedelta(days=next(day))
+            result = m.add(text, user_id="u", run_id=run, timestamp=when, wait=True, **kw)
+            out["events"].append(result["results"])
+
+        add("I live in Berlin", "s1", metadata={"source": "crm"})
+        add("I like swimming", "s2", metadata={"source": "chat"})
+        add("Max is my dog", "s3")
+        swim = next(f for f in m.get_all(user_id="u")["results"] if "swimming" in f["memory"])
+        updated = m.update(swim["id"], "I like diving", metadata={"checked": True})
+        out["events"].append(updated)
+        add("I moved to Munich", "s4")
+        add("My favorite color is blue", "s4", metadata={"source": "chat"})  # 会话又长了
+        out["events"].append(m.get_all(user_id="u", filters={"source": "chat"})["results"])
+        m.load(m.export(user_id="u"), user_id="v", wait=True)
+        (diving,) = updated["results"]
+        out["corrected:u"] = [f.model_dump() for f in db.get_facts(space_for("u"))]
+        m.delete(diving["id"])  # 遗忘那句更正：原来那条恢复
+        for user in ("u", "v"):
+            space = space_for(user)
+            out[f"facts:{user}"] = [f.model_dump() for f in db.get_facts(space)]
+            out[f"entities:{user}"] = [e.model_dump() for e in get_entities(space)]
+    for event in out["events"]:
+        if isinstance(event, dict):
+            event["consolidation"].pop("elapsed_ms", None)
+    out["requests"] = [json.dumps(r, sort_keys=True) for r in fake_api.chat_requests]
+    return out
+
+
+def test_reused_state_matches_loading_from_the_database_with_corrections(
+    story_settings: Settings,
+    fake_api: FakeAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK 的 update 与 metadata（R10）经过留下的镜像（R6）：更正以"说错了"取代原来那条、带着
+    metadata 又长了的会话、导入与遗忘更正，发给模型的请求、事件与最后的事实和实体，与每次都从
+    库里读完全相同。更正的会话 ID 带计数与随机数，这里固定住，两次的事实 ID 才相同。"""
+    monkeypatch.setattr(
+        sdk_module, "sortable_session_id", lambda prefix, when: f"{prefix}-{when:%Y%m%d-%H%M%S-%f}"
+    )
+    monkeypatch.setattr(consolidate_module, "MIRRORED_SPACES", 0)  # 不留镜像：每次都从库里读
+    cold = corrections_story(story_settings, fake_api, tmp_path / "cold")
+    monkeypatch.setattr(consolidate_module, "MIRRORED_SPACES", 4)
+    warm = corrections_story(story_settings, fake_api, tmp_path / "warm")
+    for key in ("requests", "events", "corrected:u", "facts:u", "entities:u", "facts:v"):
+        assert warm[key] == cold[key], key
+    assert any(f["supersede_reason"] == "corrected" for f in cold["corrected:u"])
+    assert not any(f["supersede_reason"] == "corrected" for f in cold["facts:u"])
+    assert {f["object"] for f in cold["facts:u"] if f["superseded_by"] is None} >= {"swimming"}
+    assert warm["loads"] < cold["loads"]
+
+
+def test_add_with_wait_does_not_reload_the_whole_space(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SDK 的 add(wait=True)：以前前后各读一遍全部事实、巩固时再从库里读一遍全部事实与实体、
+    逐条查向量缓存，还把每个会话的发言读出来重算内容指纹（9,600 条事实、800 个会话时每次
+    1–1.5 秒）。现在只读新会话的发言、新的与被取代的事实。"""
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=lambda p: {"decisions": []})]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as m:
+        for i in range(12):
+            m.add(f"I like topic {i}", user_id="u", run_id=f"s{i}", wait=True)
+        db, embedder = m.system.db, m.system.embedder
+        assert isinstance(embedder, CachedEmbedder)
+        calls: Counter[str] = Counter()
+
+        def spy(name: str, target: Any) -> None:
+            real = getattr(target, name)
+
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                calls[name] += 1
+                if name == "get_facts" and kwargs.get("ids") is None:
+                    calls["get_facts(all)"] += 1
+                if name == "get_turns":
+                    calls[f"get_turns:{args[1] if len(args) > 1 else 'all'}"] += 1
+                if name == "get_many":
+                    calls["cached texts"] += len(args[0])
+                return real(*args, **kwargs)
+
+            monkeypatch.setattr(target, name, wrapper)
+
+        for name in ("get_facts", "get_entities", "get_turns"):
+            spy(name, db)
+        spy("get_many", embedder.cache)
+        out = m.add("I moved to Munich", user_id="u", run_id="s12", wait=True)
+    assert [e["memory"] for e in out["results"]] == ["The user lives in Munich."]
+    assert calls["get_facts(all)"] == 0 and calls["get_entities"] == 0
+    # 只读新会话的发言（分配序号、登记任务、抽取），其余 12 个会话的内容指纹不重算
+    assert calls["get_turns"] == calls["get_turns:s12"] == 3
+    assert calls["cached texts"] <= 3  # 只查这次新抽取的陈述
+
+
+def test_image_and_text_embeddings_share_one_cache_connection(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """默认配置（通义的多模态向量）下图片与文本向量器共用一个向量缓存连接，图片向量写缓存时文本
+    向量器的版本不变，巩固留着的镜像照样能用。以前图片的另开一个连接：以文搜图遇到没见过的问题、
+    写入带图的发言都写缓存，文本那边读到的 PRAGMA data_version 就变了，巩固当缓存被别的进程改过，
+    丢掉所有空间的镜像（9,000 条事实时每次巩固多花约 0.3 秒）。"""
+    with MemorySystem.from_settings(settings, http_client=fake_api.client()) as system:
+        embedder, image = system.embedder, system.image_embedder
+        assert isinstance(embedder, CachedEmbedder)
+        assert isinstance(image, DashScopeMultimodalEmbedder) and image.cache is not None
+        assert image.cache is embedder.cache
+        before = embedder.version()
+        image.cache.put_many([("mm-key", np.zeros(4, dtype=np.float32), None)])
+        assert embedder.version() == before
+
+
+def test_default_consolidation_fingerprint_is_unchanged(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """默认配置的巩固配置指纹（第三轮体检之前的值）。新加的配置字段计入指纹时，每个已有空间都被
+    判为过期：显式的巩固把它重建一遍，评测复用的空间报 ConfigMismatchError。并发数这类不影响结果
+    的字段（workers、background_workers）要放进 Consolidator.fingerprint 的 exclude。"""
+    with MemorySystem.from_settings(settings, http_client=fake_api.client()) as system:
+        assert system.consolidator.fingerprint() == "2f0adc7890b6a52e"
+
+
+def test_reused_state_notices_writes_from_another_connection(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """别的进程（库的另一个连接）改了事实时不用留下的镜像，照样从库里读：这里另一个连接把
+    "住在柏林"标成了不再有效，搬到慕尼黑就没有可以取代的旧住址，不该再问模型。"""
+    model = ScriptedModel(where_i_live)
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as m:
+        m.add("I live in Berlin", user_id="u", run_id="s1", wait=True)
+        [berlin] = m.system.db.get_facts(space_for("u"))
+        assert m.system.db.path is not None
+        other = MemoryDB(m.system.db.path)
+        retired = berlin.model_copy(update={"invalidated_at": berlin.recorded_at})
+        other.apply_consolidation(facts=[retired], entities=[], episodes=[], units=[])
+        other.close()
+        m.add("I moved to Munich", user_id="u", run_id="s2", wait=True)
+    assert model.calls["reconcile"] == 0
+
+
+def test_state_is_not_reused_after_another_connection_wrote_during_the_run(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """巩固进行中别的连接改了库（这里在对账问模型时把"住在柏林"标成不再有效）：这次巩固的
+    状态是改动之前载入的，做完之后不能留给下一次，下一次照样从库里读。"""
+    path: list[Path] = []
+    prompts: list[str] = []
+
+    def decide(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        if len(prompts) == 1:  # 搬到慕尼黑的对账进行中：另一个连接改了柏林那条
+            other = MemoryDB(path[0])
+            [berlin] = [f for f in other.get_facts(space_for("u")) if "Berlin" in f.statement]
+            retired = berlin.model_copy(update={"invalidated_at": berlin.recorded_at})
+            other.apply_consolidation(facts=[retired], entities=[], episodes=[], units=[])
+            other.close()
+        return {"decisions": []}  # 都按新增处理：这次巩固不会改写柏林那条
+
+    fake_api.chat_replies = [ScriptedModel(where_i_live, reconcile=decide)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as m:
+        assert m.system.db.path is not None
+        path.append(m.system.db.path)
+        m.add("I live in Berlin", user_id="u", run_id="s1", wait=True)
+        m.add("I moved to Munich", user_id="u", run_id="s2", wait=True)
+        m.add("I moved to Paris", user_id="u", run_id="s3", wait=True)
+    assert len(prompts) == 2
+    assert "Munich" in prompts[1] and "Berlin" not in prompts[1]

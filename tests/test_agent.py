@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
-from datetime import datetime
+from collections.abc import Iterator, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,11 @@ from cuemem.agent import Agent, ContextBudget, Tool, ToolResult
 from cuemem.agent.context import Exchange, citations, evict, strip_citations
 from cuemem.config import Settings
 from cuemem.core.models import Conversation
+from cuemem.embed import CachedEmbedder
+from cuemem.embed.base import EmbedKind
+from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.store.media import image_data_url
 
 DAY = datetime(2025, 10, 10, 19, 0)
 
@@ -107,6 +111,36 @@ def test_working_memory_is_written_and_excluded(system: MemorySystem, model: Scr
     assert not [j for j in system.db.get_jobs("demo") if j["session_id"] == session.session_id]
 
 
+def test_a_failed_write_back_leaves_nothing_and_the_turn_can_be_redone(
+    system: MemorySystem, model: ScriptedModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """写回这一轮时向量接口出错：这一问一答与它的溯源都不留，会话的序号不动；同一句话重来一次
+    只写一遍，"轮"与溯源都齐。以前发言先提交了：没有"轮"、也没有溯源（遗忘时追不到这次回复），
+    重来时同样的序号又被悄悄跳过（INSERT OR IGNORE）。"""
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    embed = system.embedder.embed
+
+    def documents_down(texts: Sequence[str], kind: EmbedKind) -> Any:
+        if kind == "document":  # 检索时的查询照常向量化
+            raise EmbeddingAPIError("向量接口返回 HTTP 503", status=503)
+        return embed(texts, kind)
+
+    model.agent = lambda body: "Max 是金毛 [f2]。"
+    monkeypatch.setattr(system.embedder, "embed", documents_down)
+    with pytest.raises(EmbeddingAPIError):
+        agent.chat(session, "Max 是什么品种？")
+    assert system.db.get_turns("demo", session.session_id) == [] and session.next_idx == 0
+
+    monkeypatch.setattr(system.embedder, "embed", embed)
+    agent.chat(session, "Max 是什么品种？")  # 回答命中 LLM 缓存，与上一次相同
+    turns = system.db.get_turns("demo", session.session_id)
+    assert [(t.idx, t.text) for t in turns] == [(0, "Max 是什么品种？"), (1, "Max 是金毛。")]
+    rounds = system.db.list_units("demo", kinds=["round"], session_ids=[session.session_id])
+    assert [u.text for u in rounds] == ["User: Max 是什么品种？\nAssistant: Max 是金毛。"]
+    assert len(system.db.provenance("demo", turns[1].id)) == 1 and session.next_idx == 2
+
+
 def test_session_end_consolidates(system: MemorySystem, model: ScriptedModel) -> None:
     agent = Agent(system, router="rule")
     session = agent.start("demo", at=DAY)
@@ -119,6 +153,22 @@ def test_session_end_consolidates(system: MemorySystem, model: ScriptedModel) ->
     assert any("新加坡" in f.statement for f in facts)
     with pytest.raises(ValueError, match="已经结束"):
         agent.chat(session, "还在吗？")
+
+
+def test_aware_and_naive_times_in_one_session(system: MemorySystem, model: ScriptedModel) -> None:
+    """HTTP 接口传来的 at 可能带时区（'Z'）：换算成本机时间。以前带时区开始的会话再用不带时区的
+    时间聊（或者反过来），比较"时间不倒流"时就报 TypeError。"""
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY.astimezone(UTC))
+    assert session.started_at == DAY and session.started_at.tzinfo is None
+    agent.chat(session, "你好", at=DAY + timedelta(minutes=1))
+    later = (DAY + timedelta(minutes=2)).astimezone(UTC)
+    reply = agent.chat(session, "我下个月要去新加坡出差。", at=later)
+    assert reply.at == DAY + timedelta(minutes=2)
+    turns = system.db.get_turns("demo", session.session_id)
+    assert all(t.ts.tzinfo is None for t in turns) and len(turns) == 4
+    report = agent.end(session, wait=True)
+    assert report is not None and report.sessions == 1
 
 
 def test_memory_search_escape_hatch(system: MemorySystem, model: ScriptedModel) -> None:
@@ -143,6 +193,76 @@ def test_memory_search_escape_hatch(system: MemorySystem, model: ScriptedModel) 
     assert out.citations and out.trace.recalled
     assert all(item.via == "memory_search" for item in out.trace.recalled)
     assert steps[0]["tool_choice"] == "auto"
+
+
+def test_forget_purges_the_query_vectors_of_the_agents_own_searches(
+    system: MemorySystem, model: ScriptedModel
+) -> None:
+    """模型用 memory_search 自己查的话（看过记忆之后写的，可能复述了被删的内容）也向量化成查询
+    向量。以前 chat 的 trace 里没记它们（tool 阶段不记参数），遗忘找不到这些查询向量；现在记成
+    agent 事件（与 ToolReader 的同一个样子），遗忘时一起删。"""
+    query = "新加坡 电商公司 AI 产品经理"
+    steps: list[dict[str, Any]] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": query}, ensure_ascii=False)
+            return {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": args}]}
+        return "你在新加坡做 AI 产品经理。"
+
+    model.agent = reply
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "我现在做什么工作？", mode="l0")
+    assert isinstance(system.embedder, CachedEmbedder)
+    assert system.embedder.cached([query], "query") == {query}
+
+    report = system.forget("demo", session_ids=["s4"])
+    assert report.traces_removed >= 1
+    assert system.embedder.cached([query], "query") == set()
+
+
+@pytest.mark.parametrize("how", ["forget", "delete_space", "prune_traces"])
+def test_catalog_search_queries_are_purged_with_the_conversation(
+    system: MemorySystem, model: ScriptedModel, tmp_path: Path, how: str
+) -> None:
+    """导购演示的 search_products 把模型写的查询向量化（Catalog.search 的 "query" 向量，进共用
+    的向量缓存）。模型看过记忆之后写，人设又让它用上预算、尺码与偏好，查询常常复述了用户的情况。
+    以前 trace 的 tool 阶段不记参数、agent 事件只记 memory_search 的查询：遗忘、删除空间与过期
+    都找不到这些查询向量（第四轮复审）。现在记进同一个 agent 事件。"""
+    from cuemem.agent.shop import SHOP_PERSONA, Catalog, Product, shop_tools
+
+    query = "running shoes for my knee injury, size 43, budget 8000"
+    steps: list[dict[str, Any]] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": query})
+            return {"tool_calls": [{"id": "c1", "name": "search_products", "arguments": args}]}
+        return "Try the Aero Knit Runner."
+
+    model.agent = reply
+    catalog = Catalog(
+        [Product(id="P01", name="Aero Knit Runner", category="running shoes", price=110)],
+        tmp_path,
+        embedder=system.embedder,
+    )
+    agent = Agent(system, persona=SHOP_PERSONA, tools=shop_tools(catalog), router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "I need running shoes for my knee.", mode="l0")
+    agent.end(session, wait=True)
+    assert isinstance(system.embedder, CachedEmbedder)
+    assert system.embedder.cached([query], "query") == {query}
+
+    if how == "forget":
+        system.forget("demo", session_ids=[session.session_id])
+    elif how == "delete_space":
+        system.delete_space("demo")
+    else:
+        assert system.prune_traces(1, today=datetime.now().date() + timedelta(days=2))[0] >= 1
+    assert system.embedder.cached([query], "query") == set()
 
 
 def test_tool_loop_stops_and_reports_errors(system: MemorySystem, model: ScriptedModel) -> None:
@@ -177,6 +297,27 @@ def test_images_in_chat(system: MemorySystem, model: ScriptedModel, tmp_path: Pa
     media = system.db.get_media("demo")
     assert len(media) == 1 and Path(media[0].path).exists()
     assert media[0].id in agent._window_ids(session)  # 检索时排除工作记忆里的图
+
+
+def test_pictures_are_read_from_memory_once_written(
+    system: MemorySystem, model: ScriptedModel, tmp_path: Path
+) -> None:
+    """用户发的图写进记忆之后，会话（工作记忆、找同款用的 u1）改读媒体库里的那份：调用方的
+    文件（HTTP 的上传、界面的临时文件）用完就能删，遗忘删掉原图后不留副本；之后的请求不变。"""
+    picture = tmp_path / "shoes.png"
+    Image.new("RGB", (64, 48), "white").save(picture)
+    sent = image_data_url(picture)
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "我朋友穿的这双鞋好看吗？", images=[picture], mode="l0")
+    (stored,) = system.db.get_media("demo")
+    assert Path(stored.path).is_relative_to(system.settings.paths.media)
+    assert session.uploads == {"u1": stored.path}
+    assert session.window[-1].images == [("u1", stored.path)]
+    picture.unlink()  # 调用方删掉自己的文件：下一轮照常，请求里的图逐字不变
+    agent.chat(session, "那双鞋是什么颜色？", mode="l0")
+    history = model.agent_requests[-1]["messages"][1]["content"]
+    assert [b["image_url"]["url"] for b in history if b.get("type") == "image_url"] == [sent]
 
 
 def test_eviction_in_chunks() -> None:
@@ -248,6 +389,43 @@ def test_forget_inside_open_session(system: MemorySystem, model: ScriptedModel) 
     assert [t.idx for t in system.db.get_turns("demo", session.session_id)] == [2, 3, 4, 5]
     history = model.agent_requests[-1]["messages"]
     assert not any("Ana" in str(m["content"]) for m in history)
+
+
+def test_the_next_turn_drops_what_a_forget_deleted(
+    system: MemorySystem, model: ScriptedModel
+) -> None:
+    """遗忘之后没人调用 agent.prune（SDK、/api/v1 的删除与 reset 都不调用）：下一轮在读取里发现
+    这个空间遗忘过（MemorySystem.forget_epoch），先去掉被删的轮、重取画像再回答。以前被删的话
+    还在工作记忆里，照样发给模型。"""
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "我妹妹 Ana 的生日是 10 月 3 日。", mode="l0")
+    agent.chat(session, "我穿 40 码的鞋。", mode="l0")
+    turns = system.db.get_turns("demo", session.session_id)
+    system.forget("demo", turn_ids=[t.id for t in turns if t.idx in (0, 1)])
+    agent.chat(session, "我穿多大的鞋？", mode="l0")
+    history = model.agent_requests[-1]["messages"]
+    assert not any("Ana" in str(m["content"]) for m in history)
+    assert [e.user_idx for e in session.window] == [2, 4]
+    assert session.forget_epoch == system.forget_epoch("demo") > 0
+
+
+def test_turns_without_a_forget_do_not_resync(
+    system: MemorySystem, model: ScriptedModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有遗忘时每轮只比一次遗忘的次数，不同步、不重取画像：请求与以前相同，稳定前缀不变。"""
+    agent = Agent(system, router="rule")
+
+    def never(session: Any) -> int:
+        raise AssertionError("没有遗忘，不该同步会话")
+
+    monkeypatch.setattr(agent, "_prune_locked", never)
+    session = agent.start("demo", at=DAY)
+    for text in ["你好", "我的狗是什么品种？"]:
+        agent.chat(session, text)
+    first, second = model.agent_requests
+    assert second["messages"][: len(first["messages"]) - 1] == first["messages"][:-1]
+    assert session.forget_epoch == system.forget_epoch("demo") == 0
 
 
 def test_forget_follows_citations(system: MemorySystem, model: ScriptedModel) -> None:

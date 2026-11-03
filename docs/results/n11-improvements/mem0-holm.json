@@ -1,0 +1,125 @@
+{
+ "source": "mem0.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "locomo-test200r-mem0：对 Mem0": {
+   "description": "CueMem 各方法与朴素检索对 Mem0",
+   "m": 3,
+   "tests": {
+    "B4-nobm25_vs_M0": {
+     "wins": 15,
+     "losses": 14,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B2_vs_M0": {
+     "wins": 12,
+     "losses": 38,
+     "p": 0.0003,
+     "p_holm": 0.0009,
+     "nominal": true,
+     "holm": true
+    },
+    "B6_vs_M0": {
+     "wins": 18,
+     "losses": 8,
+     "p": 0.0755,
+     "p_holm": 0.151,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "test100r-mem0：对 Mem0": {
+   "description": "CueMem 各方法与朴素检索对 Mem0",
+   "m": 3,
+   "tests": {
+    "B4-nobm25_vs_M0": {
+     "wins": 13,
+     "losses": 4,
+     "p": 0.049,
+     "p_holm": 0.1471,
+     "nominal": true,
+     "holm": false
+    },
+    "B2_vs_M0": {
+     "wins": 8,
+     "losses": 5,
+     "p": 0.5811,
+     "p_holm": 0.5811,
+     "nominal": false,
+     "holm": false
+    },
+    "B6_vs_M0": {
+     "wins": 15,
+     "losses": 6,
+     "p": 0.0784,
+     "p_holm": 0.1567,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 6,
+   "tests": {
+    "locomo-test200r-mem0：对 Mem0 | B4-nobm25_vs_M0": {
+     "wins": 15,
+     "losses": 14,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo-test200r-mem0：对 Mem0 | B2_vs_M0": {
+     "wins": 12,
+     "losses": 38,
+     "p": 0.0003,
+     "p_holm": 0.0018,
+     "nominal": true,
+     "holm": true
+    },
+    "locomo-test200r-mem0：对 Mem0 | B6_vs_M0": {
+     "wins": 18,
+     "losses": 8,
+     "p": 0.0755,
+     "p_holm": 0.3021,
+     "nominal": false,
+     "holm": false
+    },
+    "test100r-mem0：对 Mem0 | B4-nobm25_vs_M0": {
+     "wins": 13,
+     "losses": 4,
+     "p": 0.049,
+     "p_holm": 0.2452,
+     "nominal": true,
+     "holm": false
+    },
+    "test100r-mem0：对 Mem0 | B2_vs_M0": {
+     "wins": 8,
+     "losses": 5,
+     "p": 0.5811,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "test100r-mem0：对 Mem0 | B6_vs_M0": {
+     "wins": 15,
+     "losses": 6,
+     "p": 0.0784,
+     "p_holm": 0.3021,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "test100r-mem0：对 Mem0 | B4-nobm25_vs_M0",
+  "全文 | test100r-mem0：对 Mem0 | B4-nobm25_vs_M0"
+ ]
+}

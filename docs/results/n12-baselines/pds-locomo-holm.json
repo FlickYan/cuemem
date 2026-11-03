@@ -1,0 +1,358 @@
+{
+ "source": "pds-locomo.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "CueMem 与参照": {
+   "description": "L1、L2 对全上下文、朴素检索、控制器与彼此（L1 对 L2 只算一次）",
+   "m": 7,
+   "tests": {
+    "B4-nobm25_vs_B1": {
+     "wins": 9,
+     "losses": 13,
+     "p": 0.5235,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_B2": {
+     "wins": 49,
+     "losses": 3,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B4-nobm25_vs_B5": {
+     "wins": 6,
+     "losses": 15,
+     "p": 0.0784,
+     "p_holm": 0.3134,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_B6": {
+     "wins": 6,
+     "losses": 8,
+     "p": 0.7905,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5_vs_B1": {
+     "wins": 12,
+     "losses": 7,
+     "p": 0.3593,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5_vs_B2": {
+     "wins": 59,
+     "losses": 4,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B5_vs_B6": {
+     "wins": 7,
+     "losses": 0,
+     "p": 0.0156,
+     "p_holm": 0.0781,
+     "nominal": true,
+     "holm": false
+    }
+   }
+  },
+  "L1、L2 对外部系统": {
+   "description": "CueMem L1、L2 各对 Mem0、Graphiti、LangMem、Cognee、A-MEM",
+   "m": 10,
+   "tests": {
+    "B4-nobm25_vs_M0": {
+     "wins": 14,
+     "losses": 11,
+     "p": 0.69,
+     "p_holm": 0.69,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_MG": {
+     "wins": 55,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B4-nobm25_vs_ML": {
+     "wins": 24,
+     "losses": 15,
+     "p": 0.1996,
+     "p_holm": 0.3992,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_MC": {
+     "wins": 20,
+     "losses": 10,
+     "p": 0.0987,
+     "p_holm": 0.2962,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_MA": {
+     "wins": 56,
+     "losses": 7,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B5_vs_M0": {
+     "wins": 17,
+     "losses": 5,
+     "p": 0.0169,
+     "p_holm": 0.0676,
+     "nominal": true,
+     "holm": false
+    },
+    "B5_vs_MG": {
+     "wins": 62,
+     "losses": 6,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B5_vs_ML": {
+     "wins": 25,
+     "losses": 7,
+     "p": 0.0021,
+     "p_holm": 0.0113,
+     "nominal": true,
+     "holm": true
+    },
+    "B5_vs_MC": {
+     "wins": 27,
+     "losses": 8,
+     "p": 0.0019,
+     "p_holm": 0.0113,
+     "nominal": true,
+     "holm": true
+    },
+    "B5_vs_MA": {
+     "wins": 64,
+     "losses": 6,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "敏感性（MA-k40）": {
+   "description": "敏感性运行与主方法、L1、L2 的配对",
+   "m": 3,
+   "tests": {
+    "MA-k40_vs_MA": {
+     "wins": 40,
+     "losses": 6,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B4-nobm25_vs_MA-k40": {
+     "wins": 27,
+     "losses": 12,
+     "p": 0.0237,
+     "p_holm": 0.0237,
+     "nominal": true,
+     "holm": true
+    },
+    "B5_vs_MA-k40": {
+     "wins": 32,
+     "losses": 8,
+     "p": 0.0002,
+     "p_holm": 0.0004,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 20,
+   "tests": {
+    "CueMem 与参照 | B4-nobm25_vs_B1": {
+     "wins": 9,
+     "losses": 13,
+     "p": 0.5235,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "CueMem 与参照 | B4-nobm25_vs_B2": {
+     "wins": 49,
+     "losses": 3,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "CueMem 与参照 | B4-nobm25_vs_B5": {
+     "wins": 6,
+     "losses": 15,
+     "p": 0.0784,
+     "p_holm": 0.5485,
+     "nominal": false,
+     "holm": false
+    },
+    "CueMem 与参照 | B4-nobm25_vs_B6": {
+     "wins": 6,
+     "losses": 8,
+     "p": 0.7905,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "CueMem 与参照 | B5_vs_B1": {
+     "wins": 12,
+     "losses": 7,
+     "p": 0.3593,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "CueMem 与参照 | B5_vs_B2": {
+     "wins": 59,
+     "losses": 4,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "CueMem 与参照 | B5_vs_B6": {
+     "wins": 7,
+     "losses": 0,
+     "p": 0.0156,
+     "p_holm": 0.1562,
+     "nominal": true,
+     "holm": false
+    },
+    "L1、L2 对外部系统 | B4-nobm25_vs_M0": {
+     "wins": 14,
+     "losses": 11,
+     "p": 0.69,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "L1、L2 对外部系统 | B4-nobm25_vs_MG": {
+     "wins": 55,
+     "losses": 8,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "L1、L2 对外部系统 | B4-nobm25_vs_ML": {
+     "wins": 24,
+     "losses": 15,
+     "p": 0.1996,
+     "p_holm": 0.998,
+     "nominal": false,
+     "holm": false
+    },
+    "L1、L2 对外部系统 | B4-nobm25_vs_MC": {
+     "wins": 20,
+     "losses": 10,
+     "p": 0.0987,
+     "p_holm": 0.5924,
+     "nominal": false,
+     "holm": false
+    },
+    "L1、L2 对外部系统 | B4-nobm25_vs_MA": {
+     "wins": 56,
+     "losses": 7,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "L1、L2 对外部系统 | B5_vs_M0": {
+     "wins": 17,
+     "losses": 5,
+     "p": 0.0169,
+     "p_holm": 0.1562,
+     "nominal": true,
+     "holm": false
+    },
+    "L1、L2 对外部系统 | B5_vs_MG": {
+     "wins": 62,
+     "losses": 6,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "L1、L2 对外部系统 | B5_vs_ML": {
+     "wins": 25,
+     "losses": 7,
+     "p": 0.0021,
+     "p_holm": 0.0231,
+     "nominal": true,
+     "holm": true
+    },
+    "L1、L2 对外部系统 | B5_vs_MC": {
+     "wins": 27,
+     "losses": 8,
+     "p": 0.0019,
+     "p_holm": 0.0225,
+     "nominal": true,
+     "holm": true
+    },
+    "L1、L2 对外部系统 | B5_vs_MA": {
+     "wins": 64,
+     "losses": 6,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "敏感性（MA-k40） | MA-k40_vs_MA": {
+     "wins": 40,
+     "losses": 6,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "敏感性（MA-k40） | B4-nobm25_vs_MA-k40": {
+     "wins": 27,
+     "losses": 12,
+     "p": 0.0237,
+     "p_holm": 0.1896,
+     "nominal": true,
+     "holm": false
+    },
+    "敏感性（MA-k40） | B5_vs_MA-k40": {
+     "wins": 32,
+     "losses": 8,
+     "p": 0.0002,
+     "p_holm": 0.0024,
+     "nominal": true,
+     "holm": true
+    }
+   }
+  }
+ },
+ "lost": [
+  "CueMem 与参照 | B5_vs_B6",
+  "L1、L2 对外部系统 | B5_vs_M0",
+  "全文 | CueMem 与参照 | B5_vs_B6",
+  "全文 | L1、L2 对外部系统 | B5_vs_M0",
+  "全文 | 敏感性（MA-k40） | B4-nobm25_vs_MA-k40"
+ ]
+}

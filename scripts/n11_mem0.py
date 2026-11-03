@@ -2,8 +2,10 @@
 
 Mem0 在 LoCoMo test200r 与 LongMemEval test100r 上各跑一次（方法 M0，见 evals/mem0_baseline.py）；
 CueMem 各方法取 N9 测试集运行里同一批题的结果（同一个回答模型、同一个判分模型、同一套提示）。
+每个运行里对 Mem0 的几个配对检验是一族，做 Holm 校正，写到 mem0-holm.json。
 
-    MEM0="--with mem0ai --with spacy --with fastembed --with en_core_web_sm@$SPACY_SM"
+    MEM0="--with mem0ai==2.2.1 --with spacy==3.8.16 --with fastembed==0.9.0 \\
+        --with en_core_web_sm@$SPACY_SM"
     uv run $MEM0 cuemem eval run --dataset locomo --split test200r --methods M0 \\
         --name locomo-test200r-mem0
     uv run $MEM0 cuemem eval run --dataset longmemeval_s --split test100r --methods M0 \\
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,9 @@ from typing import Any
 from cuemem.config import load_settings
 from cuemem.evals.report import load_rows
 from cuemem.evals.routing import sign_test
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs" / "results" / "n11-improvements" / "mem0.json"
@@ -70,14 +76,22 @@ def write_cost(settings: Any, dataset: str, original: str, keys: set[str]) -> di
 
 def main() -> None:
     settings = load_settings()
+    rows = {
+        name: latest(load_rows(settings.paths.eval_runs / name, "results.jsonl"))
+        for run, (_, original) in RUNS.items()
+        for name in (run, original)
+    }
+    if missing := [name for name, found in rows.items() if not found]:
+        # 缺一个就不写：以前跳过缺的 Mem0 运行、把缺的 N9 运行当作空的，照样重写 mem0.json 与
+        # mem0-holm.json（没有 runs/eval 的机器上把发表的结果清空）
+        raise SystemExit(
+            f"还没有结果：{'、'.join(missing)}（运行的命令见脚本说明）；没有写 {OUT.name}"
+        )
     result: dict[str, Any] = {"labels": LABELS}
     for run, (dataset, original) in RUNS.items():
-        mem0 = latest(load_rows(settings.paths.eval_runs / run, "results.jsonl"))
-        if not mem0:
-            print(f"{run}：还没有结果，跳过")
-            continue
+        mem0 = rows[run]
         ids = sorted({sid for sid, _ in mem0})
-        base = latest(load_rows(settings.paths.eval_runs / original, "results.jsonl"))
+        base = rows[original]
         cells = {**mem0, **{k: v for k, v in base.items() if k[0] in set(ids)}}
         methods: dict[str, Any] = {}
         for method in ["M0", *CUEMEM]:
@@ -129,6 +143,7 @@ def main() -> None:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", "utf-8")
     print(f"→ {OUT.relative_to(ROOT)}")
+    multiplicity.update(OUT, multiplicity.n11_mem0)  # Holm 校正 → mem0-holm.json
 
 
 if __name__ == "__main__":

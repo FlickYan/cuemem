@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from cuemem.core.models import Cardinality
 
@@ -113,10 +114,40 @@ SUGGESTED = (
 
 _CANONICAL = {alias: canon for canon, aliases in SYNONYMS.items() for alias in aliases}
 
+# ASCII 与汉字以外的字符：一个都没有的文本（绝大多数）不用逐字检查
+_BEYOND = re.compile(r"[^\x00-\x7f\u4e00-\u9fff]")
+_LATIN_OR_CJK = ("LATIN", "FULLWIDTH LATIN", "FULLWIDTH DIGIT", "CJK")
+
+
+def lossy(text: str) -> bool:
+    """原来的规范化会丢掉这段文本里的字：含有西里尔、希腊、韩文、假名、阿拉伯、希伯来等
+    文字（拉丁字母与汉字以外、又不是 '²' '½' 这类数字符号的字母或数字）。
+
+    带重音的拉丁字母（Zoë、Wüsthof）不算：照旧按原来的规则规范化（'Zoë' → 'zo'），评测里
+    已有的事实、实体与对账用到的键一个都不变。
+    """
+    if not _BEYOND.search(text):
+        return False
+    return any(
+        ch.isalnum()
+        and _BEYOND.match(ch)
+        and unicodedata.category(ch) != "No"
+        and not unicodedata.name(ch, "").startswith(_LATIN_OR_CJK)
+        for ch in text
+    )
+
+
+def unicode_key(text: str) -> str:
+    """不限文字的规范形式：NFKC、casefold，连续的非字母数字换成一个空格。"""
+    return re.sub(r"[\W_]+", " ", unicodedata.normalize("NFKC", text).casefold()).strip()
+
 
 def normalize_predicate(predicate: str) -> str:
     """转成 snake_case 并归并同义词：'Lives In' → 'lives_in'，'employer' → 'works_at'。"""
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", predicate.strip().lower()).strip("_")
+    if not text or lossy(predicate):  # 'живёт_в'、'사는_곳' 原来都成了 related_to
+        folded = unicodedata.normalize("NFKC", predicate).casefold()
+        text = re.sub(r"[\W_]+", "_", folded).strip("_")
     text = text or "related_to"
     return _CANONICAL.get(text, text)
 
@@ -131,6 +162,19 @@ def registered_cardinality(predicate: str) -> Cardinality | None:
 
 
 def normalize_value(text: str) -> str:
-    """比较宾语是否相同时用的规范形式：小写、去标点与多余空白、去掉常见冠词。"""
-    flat = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", text.lower()).strip()
+    """比较宾语是否相同时用的规范形式：小写、去标点与多余空白、去掉常见冠词。
+
+    含有拉丁字母与汉字以外文字的文本（'서울'、'Москва'）按 unicode_key 规范化：原来的规则
+    只留 [0-9a-z] 与汉字，'서울' 与 '부산' 都成了 ''，被当成同一个值。
+    """
+    flat = unicode_key(text) if lossy(text) else _legacy_flat(text)
     return re.sub(r"^(the|a|an|my) ", "", flat)
+
+
+def legacy_value_key(text: str) -> str:
+    """原来的 normalize_value，只用来派生事实 ID：已有的事实 ID 一个都不变。"""
+    return re.sub(r"^(the|a|an|my) ", "", _legacy_flat(text))
+
+
+def _legacy_flat(text: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", text.lower()).strip()

@@ -1,0 +1,751 @@
+{
+ "source": "summary.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "orig：泄漏（逐方法）": {
+   "description": "每个方法的三组对照（label 对 anon、raw 对 label、raw 对 anon）",
+   "m": 13,
+   "tests": {
+    "B2 label_vs_anon": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B2 raw_vs_label": {
+     "wins": 0,
+     "losses": 5,
+     "p": 0.0625,
+     "p_holm": 0.8125,
+     "nominal": false,
+     "holm": false
+    },
+    "B2 raw_vs_anon": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 label_vs_anon": {
+     "wins": 3,
+     "losses": 1,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 raw_vs_label": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 raw_vs_anon": {
+     "wins": 4,
+     "losses": 2,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 label_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 raw_vs_label": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 raw_vs_anon": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 label_vs_anon": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 raw_vs_label": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 raw_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "M0 label_vs_anon": {
+     "wins": 9,
+     "losses": 3,
+     "p": 0.146,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "orig：泄漏（合并）": {
+   "description": "合并各检索方法的三组对照",
+   "m": 3,
+   "tests": {
+    "label_vs_anon": {
+     "wins": 21,
+     "losses": 12,
+     "p": 0.1628,
+     "p_holm": 0.3255,
+     "nominal": false,
+     "holm": false
+    },
+    "raw_vs_label": {
+     "wins": 5,
+     "losses": 14,
+     "p": 0.0636,
+     "p_holm": 0.1907,
+     "nominal": false,
+     "holm": false
+    },
+    "raw_vs_anon": {
+     "wins": 8,
+     "losses": 14,
+     "p": 0.2863,
+     "p_holm": 0.3255,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "orig：对 Mem0（anon）": {
+   "description": "同一臂里朴素检索与 CueMem 各方法对 Mem0",
+   "m": 4,
+   "tests": {
+    "B2_vs_M0": {
+     "wins": 12,
+     "losses": 5,
+     "p": 0.1435,
+     "p_holm": 0.1435,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_M0": {
+     "wins": 15,
+     "losses": 4,
+     "p": 0.0192,
+     "p_holm": 0.0576,
+     "nominal": true,
+     "holm": false
+    },
+    "B5_vs_M0": {
+     "wins": 19,
+     "losses": 2,
+     "p": 0.0002,
+     "p_holm": 0.0009,
+     "nominal": true,
+     "holm": true
+    },
+    "B6_vs_M0": {
+     "wins": 17,
+     "losses": 7,
+     "p": 0.0639,
+     "p_holm": 0.1278,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "orig：对 Mem0（label）": {
+   "description": "同一臂里朴素检索与 CueMem 各方法对 Mem0",
+   "m": 4,
+   "tests": {
+    "B2_vs_M0": {
+     "wins": 10,
+     "losses": 8,
+     "p": 0.8145,
+     "p_holm": 0.8145,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_M0": {
+     "wins": 9,
+     "losses": 2,
+     "p": 0.0654,
+     "p_holm": 0.1963,
+     "nominal": false,
+     "holm": false
+    },
+    "B5_vs_M0": {
+     "wins": 12,
+     "losses": 2,
+     "p": 0.0129,
+     "p_holm": 0.0518,
+     "nominal": true,
+     "holm": false
+    },
+    "B6_vs_M0": {
+     "wins": 12,
+     "losses": 7,
+     "p": 0.3593,
+     "p_holm": 0.7186,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "pq：泄漏（逐方法）": {
+   "description": "每个方法的三组对照（label 对 anon、raw 对 label、raw 对 anon）",
+   "m": 12,
+   "tests": {
+    "B2 label_vs_anon": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B2 raw_vs_label": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B2 raw_vs_anon": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 label_vs_anon": {
+     "wins": 1,
+     "losses": 3,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 raw_vs_label": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25 raw_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 label_vs_anon": {
+     "wins": 3,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 raw_vs_label": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B5 raw_vs_anon": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 label_vs_anon": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 raw_vs_label": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 raw_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "pq：泄漏（合并）": {
+   "description": "合并各检索方法的三组对照",
+   "m": 3,
+   "tests": {
+    "label_vs_anon": {
+     "wins": 10,
+     "losses": 14,
+     "p": 0.5413,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "raw_vs_label": {
+     "wins": 8,
+     "losses": 6,
+     "p": 0.7905,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "raw_vs_anon": {
+     "wins": 9,
+     "losses": 11,
+     "p": 0.8238,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "pq：对 Mem0（raw）": {
+   "description": "同一臂里朴素检索与 CueMem 各方法对 Mem0",
+   "m": 4,
+   "tests": {
+    "B2_vs_M0": {
+     "wins": 7,
+     "losses": 8,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B4-nobm25_vs_M0": {
+     "wins": 12,
+     "losses": 5,
+     "p": 0.1435,
+     "p_holm": 0.4304,
+     "nominal": false,
+     "holm": false
+    },
+    "B5_vs_M0": {
+     "wins": 14,
+     "losses": 3,
+     "p": 0.0127,
+     "p_holm": 0.0509,
+     "nominal": true,
+     "holm": false
+    },
+    "B6_vs_M0": {
+     "wins": 14,
+     "losses": 8,
+     "p": 0.2863,
+     "p_holm": 0.5726,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 43,
+   "tests": {
+    "orig：泄漏（逐方法） | B2 label_vs_anon": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B2 raw_vs_label": {
+     "wins": 0,
+     "losses": 5,
+     "p": 0.0625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B2 raw_vs_anon": {
+     "wins": 2,
+     "losses": 6,
+     "p": 0.2891,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B4-nobm25 label_vs_anon": {
+     "wins": 3,
+     "losses": 1,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B4-nobm25 raw_vs_label": {
+     "wins": 1,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B4-nobm25 raw_vs_anon": {
+     "wins": 4,
+     "losses": 2,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B5 label_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B5 raw_vs_label": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B5 raw_vs_anon": {
+     "wins": 0,
+     "losses": 3,
+     "p": 0.25,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B6 label_vs_anon": {
+     "wins": 3,
+     "losses": 2,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B6 raw_vs_label": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | B6 raw_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（逐方法） | M0 label_vs_anon": {
+     "wins": 9,
+     "losses": 3,
+     "p": 0.146,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（合并） | label_vs_anon": {
+     "wins": 21,
+     "losses": 12,
+     "p": 0.1628,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（合并） | raw_vs_label": {
+     "wins": 5,
+     "losses": 14,
+     "p": 0.0636,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：泄漏（合并） | raw_vs_anon": {
+     "wins": 8,
+     "losses": 14,
+     "p": 0.2863,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：对 Mem0（anon） | B2_vs_M0": {
+     "wins": 12,
+     "losses": 5,
+     "p": 0.1435,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：对 Mem0（anon） | B4-nobm25_vs_M0": {
+     "wins": 15,
+     "losses": 4,
+     "p": 0.0192,
+     "p_holm": 0.7684,
+     "nominal": true,
+     "holm": false
+    },
+    "orig：对 Mem0（anon） | B5_vs_M0": {
+     "wins": 19,
+     "losses": 2,
+     "p": 0.0002,
+     "p_holm": 0.0095,
+     "nominal": true,
+     "holm": true
+    },
+    "orig：对 Mem0（anon） | B6_vs_M0": {
+     "wins": 17,
+     "losses": 7,
+     "p": 0.0639,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：对 Mem0（label） | B2_vs_M0": {
+     "wins": 10,
+     "losses": 8,
+     "p": 0.8145,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：对 Mem0（label） | B4-nobm25_vs_M0": {
+     "wins": 9,
+     "losses": 2,
+     "p": 0.0654,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "orig：对 Mem0（label） | B5_vs_M0": {
+     "wins": 12,
+     "losses": 2,
+     "p": 0.0129,
+     "p_holm": 0.5345,
+     "nominal": true,
+     "holm": false
+    },
+    "orig：对 Mem0（label） | B6_vs_M0": {
+     "wins": 12,
+     "losses": 7,
+     "p": 0.3593,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B2 label_vs_anon": {
+     "wins": 4,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B2 raw_vs_label": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B2 raw_vs_anon": {
+     "wins": 3,
+     "losses": 4,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B4-nobm25 label_vs_anon": {
+     "wins": 1,
+     "losses": 3,
+     "p": 0.625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B4-nobm25 raw_vs_label": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B4-nobm25 raw_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B5 label_vs_anon": {
+     "wins": 3,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B5 raw_vs_label": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B5 raw_vs_anon": {
+     "wins": 2,
+     "losses": 1,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B6 label_vs_anon": {
+     "wins": 2,
+     "losses": 5,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B6 raw_vs_label": {
+     "wins": 2,
+     "losses": 0,
+     "p": 0.5,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（逐方法） | B6 raw_vs_anon": {
+     "wins": 2,
+     "losses": 3,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（合并） | label_vs_anon": {
+     "wins": 10,
+     "losses": 14,
+     "p": 0.5413,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（合并） | raw_vs_label": {
+     "wins": 8,
+     "losses": 6,
+     "p": 0.7905,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：泄漏（合并） | raw_vs_anon": {
+     "wins": 9,
+     "losses": 11,
+     "p": 0.8238,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：对 Mem0（raw） | B2_vs_M0": {
+     "wins": 7,
+     "losses": 8,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：对 Mem0（raw） | B4-nobm25_vs_M0": {
+     "wins": 12,
+     "losses": 5,
+     "p": 0.1435,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "pq：对 Mem0（raw） | B5_vs_M0": {
+     "wins": 14,
+     "losses": 3,
+     "p": 0.0127,
+     "p_holm": 0.5345,
+     "nominal": true,
+     "holm": false
+    },
+    "pq：对 Mem0（raw） | B6_vs_M0": {
+     "wins": 14,
+     "losses": 8,
+     "p": 0.2863,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "orig：对 Mem0（anon） | B4-nobm25_vs_M0",
+  "orig：对 Mem0（label） | B5_vs_M0",
+  "pq：对 Mem0（raw） | B5_vs_M0",
+  "全文 | orig：对 Mem0（anon） | B4-nobm25_vs_M0",
+  "全文 | orig：对 Mem0（label） | B5_vs_M0",
+  "全文 | pq：对 Mem0（raw） | B5_vs_M0"
+ ]
+}

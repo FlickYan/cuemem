@@ -1,7 +1,8 @@
 """LongMemEval 官方判分模板的原样副本，仅用于回归测试，确认 cuemem.evals.judge 与官方逐字一致。
 
 来源：https://github.com/xiaowu0162/LongMemEval/blob/main/src/evaluation/evaluate_qa.py
-（MIT License, Copyright (c) 2024 Di Wu）。除本说明外未做任何修改。
+（MIT License, Copyright (c) 2024 Di Wu）。除本说明与 ruff 的格式化（四处引号、一处行尾空格）外
+未做修改，模板字符串逐字相同。
 """
 
 # ruff: noqa

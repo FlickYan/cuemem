@@ -7,6 +7,8 @@
 | run.json | 运行配置、各角色模型与标价、检索与巩固参数、代码版本 |
 | [extractor-comparison.md](extractor-comparison.md) | 抽取模型对比：qwen3.8-flash vs deepseek-flash（D-018） |
 
+会话 ID 泄漏（N12 补记，D-067）：本页 LongMemEval 上检索类方法（朴素检索、L1、L2、控制器、模型自主检索等）的数字都是在泄漏修复之前测的；无记忆、L0、全上下文与 ORACLE 不受影响，LoCoMo 与 MemLens 也不受影响。[泄漏对照](../n12-leak/README.md)在 test100r 上没测出 L1、L2 与控制器的虚高，但 95% 区间仍容许单个方法约 8 个点；数字照原样保留。
+
 ## 配对比较（基准 B2，同一批 100 题）
 
 `uv run python scripts/paired_compare.py runs/eval/dev100-n3 --base B2 --others ...`

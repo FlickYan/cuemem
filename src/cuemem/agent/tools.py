@@ -36,6 +36,10 @@ class ToolContext:
     when: datetime
     memory: SearchSession  # 本轮已经给模型看过的记忆（编号 → 记忆 ID 在 memory.refs 里）
     uploads: dict[str, str] = field(default_factory=dict)  # 用户在本会话发的图：u1 → 本地路径
+    # 领域工具拿去算查询向量的文字（例如商品目录的检索，见 agent/shop.py）：模型看过记忆之后写的，
+    # 常常复述了用户的情况。Agent 与 memory.queries 一起记进 trace 的 agent 事件，遗忘、删除空间
+    # 与过期按它删掉这些查询向量（trace_queries）
+    queries: list[str] = field(default_factory=list)
 
     def image_path(self, label: str) -> Path | None:
         """模型说的图片编号 → 本地文件：u1 是用户在本会话发的图，i1 是召回的记忆里的图。"""

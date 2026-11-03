@@ -12,7 +12,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from cuemem.core.timeutil import naive_local
 
 Role = Literal["user", "assistant"]
 # image：图片的上下文感知描述（N6）；image_iso：孤立描述（只看图、不看对话），只用于对比实验
@@ -36,11 +38,38 @@ class TurnIn(BaseModel):
     # 这次发言附带的图片（本地文件路径）。文本里的 "<image>" 标记图片出现的位置（N6）
     images: list[str] = Field(default_factory=list)
 
+    @field_validator("ts")
+    @classmethod
+    def _local_ts(cls, value: datetime | None) -> datetime | None:
+        # 所有写入（SDK、HTTP、导入、代理、各个集成、评测）都经过这里：带时区的时间换算成本机
+        # 时间，否则与不带时区的时间混在一起无法比较（见 core/timeutil.py）
+        return naive_local(value) if value is not None else None
+
 
 class SessionIn(BaseModel):
     session_id: str
     started_at: datetime
     turns: list[TurnIn]
+
+    @field_validator("started_at")
+    @classmethod
+    def _local_started_at(cls, value: datetime) -> datetime:
+        return naive_local(value)
+
+
+class TurnMeta(BaseModel):
+    """SDK 写入时随发言存下的附加信息（N12 之后，Mem0 兼容）。属于原始层：与发言一起导出、一起
+    遗忘，重建派生记忆时不清空；不进抽取提示，也不进会话的内容指纹（session_content_hash），
+    抽取请求与缓存键因此不变。
+
+    - metadata：调用方给的 JSON 对象（Mem0 的 metadata）；事实与对话片段带上出处各句的并集；
+    - expires_at：过期时间（Mem0 的 expiration_date），"YYYY-MM-DD"（那天结束时过期）或本机时间；
+    - edit_of：这句是 Memory.update 写下的更正，要取代的事实 ID（对账据此取代它）。
+    """
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    expires_at: str | None = None
+    edit_of: str | None = None
 
 
 class Conversation(BaseModel):

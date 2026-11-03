@@ -25,12 +25,12 @@ import numpy as np
 from pydantic import BaseModel
 
 from cuemem.core.trace import record_event
+from cuemem.core.types import Router as Router  # 原来定义在这里，各处照旧从这里导入
 from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient, Message
 from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyze
 
 Level = Literal["L0", "L1", "L2"]
-Router = Literal["learned", "hybrid", "rule", "llm"]
 # 默认是 v3（N11 之后：v2 + 只在问到图时看图，D-058）；v2 是 N11 导出的那一版（有图的空间直接查
 # 有图的准确率表），v1 是 N7 导出、N9 测试集上冻结评测的那一版。复现某个节点的数字时用当时的文件
 # （配置 retrieval.controller，scripts/reproduce.py 会自动指定）
@@ -320,3 +320,25 @@ class LearnedController:
             "L0" if action.startswith("L0") else "L1" if action.startswith("L1") else "L2"
         )
         return RouteDecision(level, reasons, see=action.endswith("+see"), scores=scores)
+
+
+# 控制器给的理由用中文标签（CLI 是中文的）；接口、界面、MCP 与 SDK 给英文（N12 从服务层移来）
+REASON_EN = {
+    "单点事实": "single fact",
+    "多会话 / 多跳": "multi-session",
+    "时间推理": "temporal",
+    "知识更新": "knowledge update",
+    "偏好与建议": "preference / advice",
+    "开放推断": "open inference",
+    "拒答": "probably not in memory",
+    "与记忆无关": "no memory needed",
+}
+
+
+def english_reason(text: str) -> str:
+    if text == IMAGE_FLOOR_REASON:
+        return "asks about details in a photo: recall and look at it"
+    for zh, en in REASON_EN.items():
+        if text.startswith(zh):
+            return en + text[len(zh) :]
+    return text.replace("llm:", "LLM said ")

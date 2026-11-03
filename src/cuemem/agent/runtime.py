@@ -20,7 +20,6 @@ import json
 import re
 import threading
 import time
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -39,15 +38,17 @@ from cuemem.agent.context import (
     strip_citations,
 )
 from cuemem.agent.tools import Tool, ToolContext, ToolResult, memory_tools
-from cuemem.core.ids import stable_id
+from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import SessionIn, TurnIn
-from cuemem.core.trace import Trace, span, start_trace
+from cuemem.core.timeutil import naive_local
+from cuemem.core.trace import Trace, record_event, span, start_trace
 from cuemem.llm.client import Message
 from cuemem.memory import MemorySystem, Recall, RecallMode
 from cuemem.read.agent import SearchSession
 from cuemem.read.controller import Router
 from cuemem.read.facts import fact_status
 from cuemem.read.l1 import L1Config
+from cuemem.store.media import check_image
 from cuemem.write.consolidate import ConsolidationReport, scope
 from cuemem.write.online import media_id
 
@@ -141,16 +142,18 @@ class ChatSession:
     simulated: bool = False
     next_idx: int = 0  # 下一句发言的序号（只增不减：遗忘删掉的序号不再复用）
     window: list[Exchange] = field(default_factory=list)
-    uploads: dict[str, str] = field(default_factory=dict)  # u1 → 本地路径
+    uploads: dict[str, str] = field(default_factory=dict)  # u1 → 本地路径（存进记忆后是那份）
     upload_turns: dict[str, int] = field(default_factory=dict)  # u1 → 所在发言的序号
     closed: bool = False
+    # 上次与记忆同步（开始、prune）时这个空间遗忘过几次（MemorySystem.forget_epoch）
+    forget_epoch: int = 0
     _clock: float = field(default_factory=time.monotonic)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def now(self) -> datetime:
         """当前时间：真实会话就是现在；模拟的会话从给定的开始时间起，按真实流逝往前走。"""
-        if not self.simulated:
-            return datetime.now().replace(microsecond=0)
+        if not self.simulated:  # 不截到秒：与 SDK、各个集成的写入在同一秒里也分得出先后
+            return datetime.now()
         return self.started_at + timedelta(seconds=round(time.monotonic() - self._clock))
 
     @property
@@ -187,16 +190,20 @@ class Agent:
     def start(
         self, space_id: str, *, at: datetime | None = None, session_id: str | None = None
     ) -> ChatSession:
-        """开始一个会话：标记为进行中（暂不巩固），取一次核心记忆快照。"""
-        started = (at or datetime.now()).replace(microsecond=0)
-        sid = session_id or f"chat-{started:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+        """开始一个会话：标记为进行中（暂不巩固），取一次核心记忆快照。
+        at（模拟的开始时间）带时区时换算成本机时间。"""
+        started = naive_local(at).replace(microsecond=0) if at is not None else datetime.now()
+        sid = session_id or sortable_session_id("chat", started)
         self.system.open_session(space_id, sid)
+        # 先记遗忘的次数、再取画像：两者之间遗忘了的话，下一轮会再同步一次，不会漏掉
+        epoch = self.system.forget_epoch(space_id)
         return ChatSession(
             space_id=space_id,
             session_id=sid,
             started_at=started,
             profile=self._profile(space_id),
             simulated=at is not None,
+            forget_epoch=epoch,
         )
 
     def _profile(self, space_id: str) -> list[tuple[str, str, str]]:
@@ -224,24 +231,34 @@ class Agent:
         （画像是按剩下的日志重建的）。返回去掉的轮数。
 
         用户的话或助手的回复被删，都整轮去掉：转述只删回复（D-051），留下一句没有回复的问话
-        在上下文里没有意义。"""
+        在上下文里没有意义。
+
+        不调用也行：每轮对话在读取里先比一下这个空间遗忘过几次（见 _chat），变了就自己同步。
+        ChatService.forget 遗忘之后立即调用（记下次数，下一轮不再重取一遍画像）。"""
         with session.lock:
-            space, sid = session.space_id, session.session_id
-            existing = {t.id for t in self.system.db.get_turns(space, sid)}
-            kept = [
-                e
-                for e in session.window
-                if stable_id(space, sid, e.user_idx) in existing
-                and stable_id(space, sid, e.user_idx + 1) in existing
-            ]
-            removed = len(session.window) - len(kept)
-            session.window = kept
-            for label, idx in list(session.upload_turns.items()):
-                if stable_id(space, sid, idx) not in existing:
-                    session.uploads.pop(label, None)
-                    session.upload_turns.pop(label, None)
-            session.profile = self._profile(space)
-            return removed
+            return self._prune_locked(session)
+
+    def _prune_locked(self, session: ChatSession) -> int:
+        """prune 的实现，调用方持有 session.lock（_chat 在这一轮的读取里调用）。先记遗忘的
+        次数：同步期间又遗忘了的话，下一轮再同步一次。"""
+        space, sid = session.space_id, session.session_id
+        epoch = self.system.forget_epoch(space)
+        existing = {t.id for t in self.system.db.get_turns(space, sid)}
+        kept = [
+            e
+            for e in session.window
+            if stable_id(space, sid, e.user_idx) in existing
+            and stable_id(space, sid, e.user_idx + 1) in existing
+        ]
+        removed = len(session.window) - len(kept)
+        session.window = kept
+        for label, idx in list(session.upload_turns.items()):
+            if stable_id(space, sid, idx) not in existing:
+                session.uploads.pop(label, None)
+                session.upload_turns.pop(label, None)
+        session.profile = self._profile(space)
+        session.forget_epoch = epoch
+        return removed
 
     # ---------- 一轮对话 ----------
 
@@ -259,6 +276,11 @@ class Agent:
         with session.lock:
             if session.closed:
                 raise ValueError(f"会话 {session.session_id} 已经结束")
+            # 像素太多的图片（解压炸弹）在召回、解码与调用模型之前就拒绝（ValueError，/api 是
+            # 409）。以前先解码、发给模型，写进记忆时才被拒绝：回答丢了、钱照付；超过两倍上限的是
+            # Pillow 的 DecompressionBombError（500）
+            for path in images:
+                check_image(path)
             return self._chat(session, text, [str(p) for p in images], at, mode, router, lam)
 
     def _chat(
@@ -272,7 +294,7 @@ class Agent:
         lam: float | None,
     ) -> Reply:
         space = session.space_id
-        when = at or session.now()
+        when = naive_local(at) if at is not None else session.now()
         if session.last_at is not None and when < session.last_at:
             when = session.last_at  # 时间不倒流
         # 回答缓存按会话归属（N11）：遗忘只清受影响会话的缓存。整个空间共用一个归属时，删一条事实
@@ -284,9 +306,18 @@ class Agent:
         labels = [f"u{first + i}" for i in range(len(images))]
         uploads = list(zip(labels, images, strict=True))
         timings: dict[str, float] = {}
-        with start_trace(
-            "chat", self.system.tracer, space=space, session=session.session_id, message=text
-        ) as trace:
+        with (
+            self.system.reading(space),  # 遗忘等这一轮做完：回复写进日志、溯源记下之后才清理
+            start_trace(
+                "chat", self.system.tracer, space=space, session=session.session_id, message=text
+            ) as trace,
+        ):
+            # 上次同步之后这个空间遗忘过（/api/v1 的删除、reset、SDK、MCP……，或者这一轮排在一次
+            # 遗忘后面等读取）：先去掉被删的轮、重取画像，否则被删的内容随这一轮发给模型、又被
+            # 写回日志。在读取里比：遗忘独占这个空间，比完到这一轮做完之间不会再有遗忘。没遗忘过
+            # 时只是查一次字典，请求不变
+            if session.forget_epoch != self.system.forget_epoch(space):
+                self._prune_locked(session)
             exclude = self._window_ids(session)
             l1 = L1Config(budget_tokens=self.budget.recalled)
             with span("recall"):
@@ -333,32 +364,43 @@ class Agent:
                 uploads={**session.uploads, **dict(uploads)},
             )
             llm_started = time.perf_counter()
-            answer, records = self._loop(ctx.messages, schemas, tool_ctx, cache_scope)
+            try:
+                answer, records = self._loop(ctx.messages, schemas, tool_ctx, cache_scope)
+            finally:
+                # 工具里的检索（memory_search）记进 trace，与 ToolReader 的 agent 事件同一个样子：
+                # 遗忘、删除空间与过期按它找到这些查询向量（trace_queries）。以前没记，模型看过
+                # 记忆之后写的查询（可能复述了被删的内容）的向量谁也找不到。领域工具的查询
+                # （商品目录的检索，ToolContext.queries）一起记（第四轮复审），searches 照旧只数
+                # 记忆的检索
+                queries = list(dict.fromkeys([*memory.queries, *tool_ctx.queries]))
+                if queries:
+                    record_event("agent", searches=len(memory.queries), queries=queries)
             timings["llm"] = _ms(llm_started)
             cited = citations(answer, memory.refs)
             plain = strip_citations(answer)
 
             write_started = time.perf_counter()
             user_idx = session.next_idx
-            self.system.append(
-                space,
-                SessionIn(
-                    session_id=session.session_id,
-                    started_at=session.started_at,
-                    turns=[
-                        TurnIn(role="user", text=text, ts=when, images=images),
-                        TurnIn(role="assistant", text=plain, ts=when),
-                    ],
-                ),
-                first_idx=user_idx,
+            exchange = SessionIn(
+                session_id=session.session_id,
+                started_at=session.started_at,
+                turns=[
+                    TurnIn(role="user", text=text, ts=when, images=images),
+                    TurnIn(role="assistant", text=plain, ts=when),
+                ],
             )
+            with self.system.appending(space, [(exchange, user_idx)]):
+                # 溯源：这次回复引用了哪些记忆（遗忘时沿引用扩散，见 MemorySystem.forget）。与这一轮
+                # 在同一个事务里提交：写入出错时都不留，这一轮重来时不会写两遍
+                self.system.db.add_provenance(
+                    space,
+                    stable_id(space, session.session_id, user_idx + 1),
+                    [memory.refs[ref] for ref in cited],
+                )
             session.next_idx += 2
-            # 溯源：这次回复引用了哪些记忆（遗忘时沿引用扩散，见 MemorySystem.forget）
-            self.system.db.add_provenance(
-                space,
-                stable_id(space, session.session_id, user_idx + 1),
-                [memory.refs[ref] for ref in cited],
-            )
+            # 之后各轮（工作记忆里的图、找同款的 u1）改读记忆里存的那份，字节相同、请求不变：
+            # 调用方的文件（HTTP 的上传、界面的临时文件）用完就能删，遗忘删掉原图后不留副本
+            uploads = self._stored_uploads(space, session.session_id, user_idx, uploads)
             timings["write"] = _ms(write_started)
             for label, path in uploads:
                 session.uploads[label] = path
@@ -393,6 +435,19 @@ class Agent:
                 prefix_messages=ctx.prefix,
             ),
         )
+
+    def _stored_uploads(
+        self, space: str, session_id: str, user_idx: int, uploads: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """这一轮的图片 → 媒体库里存的路径（没有媒体库、没存下的保留原路径）。"""
+        if not uploads:
+            return uploads
+        turn_id = stable_id(space, session_id, user_idx)
+        ids = [media_id(space, turn_id, i) for i in range(len(uploads))]
+        stored = {m.id: m.path for m in self.system.db.get_media(space, ids=ids)}
+        return [
+            (label, stored.get(mid, path)) for (label, path), mid in zip(uploads, ids, strict=True)
+        ]
 
     def _loop(
         self,

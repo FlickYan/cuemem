@@ -26,11 +26,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import bisect
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
+import numpy.typing as npt
 from pydantic import BaseModel, field_validator
 
 from cuemem.core.models import Fact, SupersedeReason
@@ -88,15 +90,171 @@ class Operation:
     rule: str = ""  # duplicate / similar / single_valued / negation / llm / late_arrival / default
 
 
+ValueKey = tuple[str, str, str, bool]  # （主语，谓词，宾语的规范形式，是否否定）
+
+
 @dataclass
 class FactState:
-    """一个空间的事实快照（含历史版本）与当前事实的陈述向量。巩固过程中随会话逐步更新。"""
+    """一个空间的事实快照（含历史版本）与当前事实的陈述向量。巩固过程中随会话逐步更新。
+
+    另有几个随写入更新的索引，对账查候选时不用每条新事实都扫一遍全部事实（以前遗忘与重建的
+    重放在 CPU 上是平方级）：每个主语的当前事实（按 facts 的插入顺序）与它们的向量矩阵、
+    按（主语，谓词，规范化的宾语，否定）分组的当前事实、宾语规范形式的备忘。查出来的候选、
+    先后与相似度都与逐条扫描相同。所以 facts 与 vectors 只能经 put 改动。
+    """
 
     facts: dict[str, Fact] = field(default_factory=dict)
     vectors: dict[str, FloatArray] = field(default_factory=dict)
+    _pos: dict[str, int] = field(default_factory=dict, repr=False)  # 事实 ID → 在 facts 里的位置
+    _subjects: dict[str, _Current] = field(default_factory=dict, repr=False)
+    _values: dict[ValueKey, dict[str, int]] = field(default_factory=dict, repr=False)
+    _codes: dict[str, int] = field(default_factory=dict, repr=False)  # 谓词 → 编号
+    _norms: dict[str, str] = field(default_factory=dict, repr=False)  # 宾语 → normalize_value
+
+    def put(self, fact: Fact, vector: FloatArray | None = None) -> None:
+        """写入或替换一条事实；vector 不为 None 时同时设它的陈述向量。索引随之更新。"""
+        old = self.facts.get(fact.id)
+        pos = self._pos.setdefault(fact.id, len(self._pos))  # 替换不改变在字典里的位置
+        self.facts[fact.id] = fact
+        if vector is not None:
+            self.vectors[fact.id] = vector
+        if old is not None and old.is_current:
+            if fact.is_current and vector is None and _same_keys(old, fact):
+                return  # 合并：只追加了溯源，索引不变
+            self._unindex(old)
+        if fact.is_current:
+            self._index(fact, pos)
 
     def current_of(self, subject_id: str) -> list[Fact]:
-        return [f for f in self.facts.values() if f.subject_id == subject_id and f.is_current]
+        """这个主语的当前事实，按 facts 的插入顺序。"""
+        current = self._subjects.get(subject_id)
+        return [self.facts[i] for i in current.order] if current else []
+
+    def first_current(
+        self, subject_id: str, predicate: str, value: str, negated: bool
+    ) -> Fact | None:
+        """current_of 里第一条谓词相同、宾语的规范形式（normalize_value）是 value、否定与否
+        相同的事实。"""
+        ids = self._values.get((subject_id, predicate, value, negated))
+        return self.facts[next(iter(ids))] if ids else None
+
+    def similarities(self, subject_id: str, vector: FloatArray) -> tuple[list[str], FloatArray]:
+        """这个主语有向量的当前事实（按 current_of 的顺序）与它们的陈述和 vector 的相似度。
+        与把这些向量 np.vstack 起来再乘 vector 是同一次矩阵运算，结果逐位相同。"""
+        current = self._subjects.get(subject_id)
+        if current is None or not current.rows:
+            return [], np.zeros(0, dtype=np.float32)
+        return list(current.rows), current.matrix() @ vector
+
+    def predicate_rows(self, subject_id: str, predicate: str) -> npt.NDArray[np.bool_]:
+        """similarities 的各行是不是这个谓词。"""
+        current = self._subjects[subject_id]
+        code = self._codes.get(predicate, -1)
+        return current.codes[: len(current.rows)] == code
+
+    def norm(self, text: str) -> str:
+        """normalize_value(text)，算过的记下来：一条事实的宾语不会变，每次对账却都要比。"""
+        value = self._norms.get(text)
+        if value is None:
+            value = self._norms[text] = normalize_value(text)
+        return value
+
+    def _value_key(self, fact: Fact) -> ValueKey:
+        return (fact.subject_id, fact.predicate, self.norm(fact.object), fact.negated)
+
+    def _index(self, fact: Fact, pos: int) -> None:
+        current = self._subjects.setdefault(fact.subject_id, _Current())
+        code = self._codes.setdefault(fact.predicate, len(self._codes))
+        current.add(fact.id, pos, self.vectors.get(fact.id), code)
+        _insert(self._values.setdefault(self._value_key(fact), {}), fact.id, pos)
+
+    def _unindex(self, fact: Fact) -> None:
+        self._subjects[fact.subject_id].remove(fact.id)
+        key = self._value_key(fact)
+        ids = self._values[key]
+        del ids[fact.id]
+        if not ids:
+            del self._values[key]
+
+
+class _Current:
+    """一个主语的当前事实：ID（按在 facts 里的位置排）；有向量的那些另按同样的顺序存成一个
+    可增长的 float32 矩阵（每条新事实不用再 np.vstack 一遍）与每行谓词的编号。
+
+    向量不是一维 float32、或维数不一样时不用矩阵（regular=False），查询时照原样 np.vstack。"""
+
+    def __init__(self) -> None:
+        self.order: dict[str, int] = {}  # 当前事实 ID → 位置，按位置排
+        self.rows: list[str] = []  # 有向量的当前事实，按位置排
+        self.row_pos: list[int] = []
+        self.vecs: list[FloatArray] = []
+        self.codes: npt.NDArray[np.int32] = np.zeros(8, dtype=np.int32)
+        self.buf: FloatArray | None = None  # 前 len(rows) 行是 vecs
+        self.regular = True
+
+    def add(self, fact_id: str, pos: int, vector: FloatArray | None, code: int) -> None:
+        _insert(self.order, fact_id, pos)
+        if vector is None:
+            return
+        n = len(self.rows)
+        k = bisect.bisect_left(self.row_pos, pos)
+        self.rows.insert(k, fact_id)
+        self.row_pos.insert(k, pos)
+        self.vecs.insert(k, vector)
+        if n + 1 > len(self.codes):
+            self.codes = np.concatenate([self.codes, np.zeros_like(self.codes)])
+        self.codes[k + 1 : n + 1] = self.codes[k:n]
+        self.codes[k] = code
+        if not self.regular:
+            return
+        if not (vector.dtype == np.float32 and vector.ndim == 1) or (
+            self.buf is not None and vector.shape[0] != self.buf.shape[1]
+        ):
+            self.regular, self.buf = False, None
+            return
+        if self.buf is None or n + 1 > len(self.buf):
+            grown = np.empty((max(8, 2 * (n + 1)), vector.shape[0]), dtype=np.float32)
+            if self.buf is not None:
+                grown[:n] = self.buf[:n]
+            self.buf = grown
+        self.buf[k + 1 : n + 1] = self.buf[k:n]
+        self.buf[k] = vector
+
+    def remove(self, fact_id: str) -> None:
+        pos = self.order.pop(fact_id)
+        k = bisect.bisect_left(self.row_pos, pos)
+        if k == len(self.rows) or self.rows[k] != fact_id:
+            return  # 没有向量
+        n = len(self.rows)
+        del self.rows[k], self.row_pos[k], self.vecs[k]
+        self.codes[k : n - 1] = self.codes[k + 1 : n]
+        if self.buf is not None:
+            self.buf[k : n - 1] = self.buf[k + 1 : n]
+
+    def matrix(self) -> FloatArray:
+        if self.buf is not None:
+            return self.buf[: len(self.rows)]
+        return np.vstack(self.vecs)
+
+
+def _insert(index: dict[str, int], key: str, pos: int) -> None:
+    """往按位置排的 {ID: 位置} 里加一项（几乎总是加在最后）。"""
+    if index and pos < next(reversed(index.values())):
+        index[key] = pos
+        ordered = sorted(index.items(), key=lambda item: item[1])
+        index.clear()
+        index.update(ordered)
+        return
+    index[key] = pos
+
+
+def _same_keys(a: Fact, b: Fact) -> bool:
+    return (a.subject_id, a.predicate, a.object, a.negated) == (
+        b.subject_id,
+        b.predicate,
+        b.object,
+        b.negated,
+    )
 
 
 @dataclass
@@ -134,41 +292,44 @@ class Reconciler:
         *,
         cache_scope: str | None = None,
         sources: Mapping[str, str] | None = None,
+        corrections: Mapping[str, str] | None = None,
     ) -> ReconcileResult:
         """按顺序处理一个会话的新事实，原地更新 state，返回操作列表与改动过的事实。
 
         sources：轮 ID → 这一轮的原话；灰区交给 LLM 时，每条新事实附上它出自的那句话。
+        corrections：轮 ID → 这句更正要取代的事实 ID（SDK 的 Memory.update 记在原始层的
+        edit_of）。由更正那句抽出的新事实里挑一条（_pair_corrections）以"说错了"取代它，不问
+        LLM；其余的照常对账。没有更正时（评测与其他所有写入）什么都不变。
         """
         result = ReconcileResult()
         gray: list[tuple[Fact, FloatArray, list[Fact]]] = []
+        pairs = self._pair_corrections(state, new_facts, corrections) if corrections else {}
         for fact, vector in new_facts:
             if fact.id in state.facts:
                 result.operations.append(Operation("noop", fact.id, fact.id, rule="replay"))
                 continue
-            current = state.current_of(fact.subject_id)
-            sims = self._similarities(state, current, vector)
-            same_value = next(
-                (
-                    c
-                    for c in current
-                    if c.predicate == fact.predicate
-                    and normalize_value(c.object) == normalize_value(fact.object)
-                    and c.negated == fact.negated
-                ),
-                None,
-            )
+            edited = state.facts.get(pairs.get(fact.id, ""))
+            if edited is not None and edited.is_current:
+                self._supersede(state, result, edited, fact, vector, "corrected", "edit")
+                continue
+            # 候选都从 state 的索引里取（见 FactState）：与按 current_of 逐条比较的结果相同
+            subject, value = fact.subject_id, state.norm(fact.object)
+            same_value = state.first_current(subject, fact.predicate, value, fact.negated)
             if same_value is not None:
                 self._merge(state, result, same_value, fact, rule="duplicate")
                 continue
+            ids, sims = state.similarities(subject, vector)
+            scores = sims.astype(np.float64)  # 与阈值比较、排序都按 float(sim)，与以前相同
             # 陈述几乎相同、且宾语一致（或一个包含另一个）才算重复：向量对数字和专名不敏感，
             # "预算 8000 元"与"预算 6000 元"的余弦相似度可能很高，不能只看相似度就合并
             similar = next(
                 (
                     c
-                    for c, sim in sorted(sims, key=lambda pair: -pair[1])
-                    if sim >= self.duplicate_threshold
-                    and c.negated == fact.negated
-                    and _same_object(c.object, fact.object)
+                    for c in (
+                        state.facts[ids[i]]
+                        for i in _by_similarity(scores, scores >= self.duplicate_threshold)
+                    )
+                    if c.negated == fact.negated and _same_object(c.object, fact.object, state.norm)
                 ),
                 None,
             )
@@ -176,16 +337,7 @@ class Reconciler:
                 self._merge(state, result, similar, fact, rule="similar")
                 continue
             if fact.negated:
-                positive = next(
-                    (
-                        c
-                        for c in current
-                        if c.predicate == fact.predicate
-                        and not c.negated
-                        and normalize_value(c.object) == normalize_value(fact.object)
-                    ),
-                    None,
-                )
+                positive = state.first_current(subject, fact.predicate, value, False)
                 if positive is not None:
                     self._supersede(state, result, positive, fact, vector, "changed", "negation")
                     continue
@@ -197,11 +349,10 @@ class Reconciler:
             # 不按规则直接取代：dev100 抽样显示规则取代的精确率只有约 10%（D-019）
             single = registered == "single" or fact.cardinality == "single"
             threshold = self.conflict_threshold if single else self.multi_conflict_threshold
-            related = [
-                c
-                for c, sim in sorted(sims, key=lambda pair: -pair[1])
-                if (single and c.predicate == fact.predicate) or sim >= threshold
-            ][:3]
+            wanted = scores >= threshold
+            if single and ids:
+                wanted |= state.predicate_rows(subject, fact.predicate)
+            related = [state.facts[ids[i]] for i in _by_similarity(scores, wanted)[:3]]
             if related:
                 gray.append((fact, vector, related))
                 continue
@@ -209,6 +360,42 @@ class Reconciler:
         if gray:
             self._resolve_gray(state, result, gray, cache_scope, sources or {})
         return result
+
+    @staticmethod
+    def _pair_corrections(
+        state: FactState,
+        new_facts: Sequence[tuple[Fact, FloatArray]],
+        corrections: Mapping[str, str],
+    ) -> dict[str, str]:
+        """新事实 ID → 它要取代的事实 ID。每条要取代的事实只配一条新事实：出自更正那句、谓词
+        相同的优先，其次是陈述向量与它最相近的，再次是抽取的顺序。一句更正抽出几条事实时
+        （"住在巴黎，在谷歌上班"），其余的照常对账。"""
+        pairs: dict[str, str] = {}
+        for target_id in dict.fromkeys(corrections.values()):
+            target = state.facts.get(target_id)
+            if target is None:  # 要取代的事实已经不在（被遗忘、换了抽取模型）：照常对账
+                continue
+            turns = {t for t, wanted in corrections.items() if wanted == target_id}
+            candidates = [
+                (fact, vector)
+                for fact, vector in new_facts
+                if turns & set(fact.source_turn_ids)
+                and fact.id not in pairs
+                and fact.id not in state.facts
+            ]
+            old = state.vectors.get(target_id)
+            ranked = [
+                (
+                    fact.predicate == target.predicate,
+                    float(old @ vector) if old is not None else 0.0,
+                    -order,  # 并列时取先抽出的
+                    fact.id,
+                )
+                for order, (fact, vector) in enumerate(candidates)
+            ]
+            if ranked:
+                pairs[max(ranked)[3]] = target_id
+        return pairs
 
     # ---------- 动作 ----------
 
@@ -222,8 +409,7 @@ class Reconciler:
         rule: str,
         record: bool = True,
     ) -> None:
-        state.facts[fact.id] = fact
-        state.vectors[fact.id] = vector
+        state.put(fact, vector)
         result.changed[fact.id] = fact
         if record:
             result.operations.append(Operation("add", fact.id, rule=rule))
@@ -241,7 +427,7 @@ class Reconciler:
                 "valid_from": existing.valid_from or new.valid_from,
             }
         )
-        state.facts[existing.id] = merged
+        state.put(merged)
         result.changed[existing.id] = merged
         result.operations.append(Operation("merge", new.id, existing.id, rule=rule))
 
@@ -266,8 +452,7 @@ class Reconciler:
                     "supersede_reason": "changed",
                 }
             )
-            state.facts[new.id] = historical
-            state.vectors[new.id] = vector
+            state.put(historical, vector)
             result.changed[new.id] = historical
             result.operations.append(Operation("add", new.id, old.id, reason, "late_arrival"))
             return
@@ -279,7 +464,7 @@ class Reconciler:
                 "supersede_reason": reason,
             }
         )
-        state.facts[old.id] = retired
+        state.put(retired)
         result.changed[old.id] = retired
         self._add(state, result, new, vector, rule=rule, record=False)
         result.operations.append(Operation("supersede", new.id, old.id, reason, rule))
@@ -350,19 +535,19 @@ class Reconciler:
             else:
                 self._supersede(state, result, target, fact, vector, "corrected", "llm")
 
-    def _similarities(
-        self, state: FactState, current: Sequence[Fact], vector: FloatArray
-    ) -> list[tuple[Fact, float]]:
-        with_vectors = [c for c in current if c.id in state.vectors]
-        if not with_vectors:
-            return []
-        matrix = np.vstack([state.vectors[c.id] for c in with_vectors])
-        sims = matrix @ vector
-        return [(c, float(s)) for c, s in zip(with_vectors, sims, strict=True)]
+
+def _by_similarity(scores: npt.NDArray[np.float64], wanted: npt.NDArray[np.bool_]) -> list[int]:
+    """wanted 为真的行号，按相似度从高到低、相似度相同的保持原来的先后：与对全部 (事实, 相似度)
+    sorted(key=-相似度) 之后再筛出这些行的结果相同。有 NaN 时 sorted 的结果与 numpy 的排序
+    不同，照原来的写法对全部行排序。"""
+    if np.isnan(scores).any():
+        return [i for i in sorted(range(len(scores)), key=lambda i: -scores[i]) if wanted[i]]
+    rows = np.flatnonzero(wanted)
+    return [int(i) for i in rows[np.argsort(-scores[rows], kind="stable")]]
 
 
-def _same_object(a: str, b: str) -> bool:
-    na, nb = normalize_value(a), normalize_value(b)
+def _same_object(a: str, b: str, norm: Callable[[str], str] = normalize_value) -> bool:
+    na, nb = norm(a), norm(b)
     return na == nb or bool(na and nb and (na in nb or nb in na))
 
 

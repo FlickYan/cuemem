@@ -54,6 +54,12 @@ For each fact:
 Also list the named entities that appear in the facts (people, pets, places, organizations, products, events) with their type, other names used for them in this conversation, and a short description; and summarize the conversation in one or two sentences. Write the descriptions and the summary in the same language as the statements.
 Return empty lists if nothing is worth remembering."""  # noqa: E501
 
+# 应用给抽取的补充说明（consolidation.instructions，N12）放在系统提示的最后
+INSTRUCTIONS_HEADER = (
+    "Additional instructions from the application (they take precedence over the defaults "
+    "above when they conflict):"
+)
+
 # 遗忘删掉了会话里的发言时（D-021，发言编号不复用，留下空缺）才加的说明。剩下的发言可能用代词
 # 指着被删的内容（"那副登山杖正合适，我给她买了"）；不说明的话，模型会从剩下的人里挑一个顶上
 # （演示里成了"给 Lena 买"）。没有空缺的会话渲染结果不变，已有的抽取缓存照常命中（D-059）
@@ -64,6 +70,14 @@ DELETED_NOTE = (
     "message: do not resolve it to a person or thing named elsewhere in the conversation. Write "
     'such a fact without the name (for example "someone"), or leave it out. This overrides the '
     "rule to use names instead of pronouns."
+)
+
+# 会话跨了几天（复用的 run_id、LangGraph 的线程）才加的说明：换了日期的发言前标出 [Date: …]，
+# 否则模型按会话开始的日期换算"昨天""上周"。同一天里的会话渲染结果不变，抽取缓存照常命中
+DATED_NOTE = (
+    "Some turns were said on a different day from the conversation date. A line such as "
+    "[Date: YYYY-MM-DD (Weekday)] gives the date of the turns after it: for those turns, use "
+    "that date instead of the conversation date, including when converting relative times."
 )
 
 _ENTITY_TYPES = set(get_args(EntityType))
@@ -204,6 +218,9 @@ def render_session(
 
     deleted_from：会话里有发言被遗忘删掉时，这一段（超长会话切成的窗口）第一句应有的编号；
     空缺标成 [deleted]，并加一行说明（DELETED_NOTE）。为 None（没删过）时渲染结果不变。
+
+    发言的日期与会话日期（或上一句标出的日期）不同时，在它前面标出新的日期并加一行说明
+    （DATED_NOTE）。所有发言都在会话开始的那天时渲染结果不变。
     """
     names = participants(turns)
     who = ", ".join(names) if names != ["User", "Assistant"] else "User, Assistant (AI)"
@@ -220,11 +237,17 @@ def render_session(
         )
     body: list[str] = []
     expected = deleted_from
+    shown = started_at.date()  # 正文里当前标着的日期
+    dated = False
     for turn in turns:
         if expected is not None:
             if turn.idx > expected:
                 body.append("[deleted]")
             expected = turn.idx + 1
+        if turn.ts.date() != shown:
+            shown = turn.ts.date()
+            body.append(f"[Date: {turn.ts:%Y-%m-%d (%A)}]")
+            dated = True
         label = turn.speaker or ("User" if turn.role == "user" else "Assistant")
         text = turn.text.strip()
         if turn.role == "assistant" and assistant_chars is not None and len(text) > assistant_chars:
@@ -232,6 +255,8 @@ def render_session(
         if notes.get(turn.id):
             text = inline_images(text, notes[turn.id])
         body.append(f"[t{turn.idx}] {label}: {text}")
+    if dated:
+        lines.append(DATED_NOTE)
     if "[deleted]" in body:
         lines.append(DELETED_NOTE)
     return "\n".join([*lines, "", *body])
@@ -260,6 +285,7 @@ class Extractor:
         assistant_chars: int | None = 600,
         max_chars: int = 24_000,
         fallback_model: str | None = None,
+        instructions: str | None = None,
     ) -> None:
         self.llm = llm
         self.role = role
@@ -267,6 +293,7 @@ class Extractor:
         self.assistant_chars = assistant_chars
         self.max_chars = max_chars
         self.fallback_model = fallback_model
+        self.instructions = instructions.strip() if instructions else None
 
     def extract(
         self,
@@ -337,6 +364,8 @@ class Extractor:
             focus = "the speakers (" + ", ".join(names) + ")"
             subject_hint = "the speaker's name (" + ", ".join(names) + ")"
         system = EXTRACTION_SYSTEM.format(focus=focus, subject_hint=subject_hint)
+        if self.instructions:  # 没有补充说明时提示词逐字不变，已有的抽取缓存照常命中
+            system += f"\n\n{INSTRUCTIONS_HEADER}\n{self.instructions}"
         text = render_session(
             turns,
             started_at,

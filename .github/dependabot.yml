@@ -1,0 +1,42 @@
+# Dependabot 的版本更新，每周一次；安全更新另在仓库设置里打开（SECURITY.md 的 For maintainers）。
+# 机器人的 PR 与别的 PR 一样要过四项必需检查：test 跑 tests/test_frozen_config.py 与
+# tests/test_eval_leak.py（发给模型的请求）、tests/test_store.py 的图片字节测试，升级改动了发给
+# 模型的字节时会红。tests/test_ci_pins.py 核对这个文件
+version: 2
+updates:
+  # 工作流里按提交号固定的 Action（版本注释一起改），合成一个 PR
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # uv.lock：小版本与补丁合成一个 PR，大版本（如 Pillow 13）与安全更新各自单独开 PR；新发布的
+  # 版本等 7 天再用（冷却期不管安全更新）。改到 uv.lock 的 PR 也会触发外部基线的工作流
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      uv-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Dockerfile 的基础镜像。Python 停在 3.12（与 .python-version、CI 相同），不升小版本与大版本。
+  # 两行 FROM 现在只写标签（python:3.12-slim）、没有摘要：Dependabot 只提议同样精度的标签
+  # （3.13-slim、3.14-slim），又被下面的 ignore 挡掉，所以这一项暂时不会开 PR；镜像里 3.12 的
+  # 补丁版本与系统包靠每次构建重新拉取 3.12-slim 跟上。FROM 改成按摘要固定
+  # （python:3.12-slim@sha256:…）之后，它每周提议新的摘要。
+  # Dependabot 只改 FROM 行，COPY --from 的 uv 不动（与 CI 的 setup-uv 一起手工升级）。
+  # 不加 docker-compose：qdrant/qdrant 的版本还写在 ci.yml 的服务端任务等处，要一起手工升级
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: python
+        update-types: [version-update:semver-major, version-update:semver-minor]

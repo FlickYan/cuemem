@@ -6,51 +6,31 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
-import uuid
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import httpx2
 
 from cuemem.agent import Agent, ChatSession, Persona, Reply
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
 from cuemem.config import PROJECT_ROOT, Settings
-from cuemem.core.ids import stable_id
-from cuemem.core.models import Fact, SessionIn, TurnIn
-from cuemem.memory import ForgetReport, MemorySystem, RecallMode
-from cuemem.read.controller import IMAGE_FLOOR_REASON, Router
+from cuemem.core.ids import sortable_session_id, stable_id
+from cuemem.core.models import SessionIn, TurnIn
+from cuemem.core.types import RecallMode, Router, Scenario
+from cuemem.errors import CueMemError
+from cuemem.evidence import fact_state, recall_listing, resolve_ids
+from cuemem.memory import ForgetReport, MemorySystem
 
-Scenario = Literal["shop", "plain"]
-# 控制器给的理由用中文标签（CLI 是中文的）；接口、界面与 MCP 给英文
-REGROW_ROUNDS = 3  # 遗忘后追查复述的轮数上限（每轮要重建一次派生记忆）
+SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
 
-REASON_EN = {
-    "单点事实": "single fact",
-    "多会话 / 多跳": "multi-session",
-    "时间推理": "temporal",
-    "知识更新": "knowledge update",
-    "偏好与建议": "preference / advice",
-    "开放推断": "open inference",
-    "拒答": "probably not in memory",
-    "与记忆无关": "no memory needed",
-}
-
-
-def english_reason(text: str) -> str:
-    if text == IMAGE_FLOOR_REASON:
-        return "asks about details in a photo: recall and look at it"
-    for zh, en in REASON_EN.items():
-        if text.startswith(zh):
-            return en + text[len(zh) :]
-    return text.replace("llm:", "LLM said ")
-
-
-SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,6 +43,10 @@ class SessionInfo:
 
 
 class ChatService:
+    """clock：会话最后一次活动的时间用的时钟（close_idle 据此判断闲置，测试里可以换）。
+    idle_minutes：会话闲置多久由 HTTP 应用的清理线程结束（create_app 设置；None 是不结束），
+    只用于说明。"""
+
     def __init__(
         self,
         system: MemorySystem,
@@ -70,12 +54,17 @@ class ChatService:
         *,
         catalog: Catalog | None = None,
         default_space: str = "default",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.system = system
         self.agent = agent
         self.catalog = catalog
         self.default_space = default_space
         self.sessions: dict[str, ChatSession] = {}
+        self.idle_minutes: float | None = None
+        self._clock = clock
+        self._seen: dict[str, float] = {}  # 会话 → 最后一次活动（开始、发消息）的时刻
+        self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间（见 start）
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的巩固在后台完成
 
@@ -91,15 +80,20 @@ class ChatService:
         lam: float | None = None,
         http_client: httpx2.Client | None = None,
     ) -> ChatService:
+        catalog_path = catalog_path or SHOP_CATALOG
+        if scenario == "shop" and not catalog_path.is_file():  # 在打开记忆系统之前检查
+            raise CueMemError(
+                f"找不到导购演示的商品目录 {catalog_path}：它只在源码仓库里（demo/shop/），"
+                "pip 安装的包里没有。改用通用助手（cuemem serve --scenario plain，"
+                '代码里 scenario="plain"），或用 catalog_path 指定商品目录'
+            )
         system = MemorySystem.from_settings(settings, http_client=http_client)
         catalog = None
         persona: Persona | None = None
         tools = []
         if scenario == "shop":
             catalog = Catalog.load(
-                catalog_path or SHOP_CATALOG,
-                embedder=system.embedder,
-                image_embedder=system.image_embedder,
+                catalog_path, embedder=system.embedder, image_embedder=system.image_embedder
             )
             persona = SHOP_PERSONA
             tools = shop_tools(catalog)
@@ -115,17 +109,32 @@ class ChatService:
         at: datetime | None = None,
         session_id: str | None = None,
     ) -> ChatSession:
-        session = self.agent.start(space_id or self.default_space, at=at, session_id=session_id)
+        space = space_id or self.default_space
+        with self._lock:
+            first = space not in self._adopted
+            self._adopted.add(space)
+        if first:  # 之前的进程崩溃时还在进行中的会话交给抽取；接着写的那个会话除外
+            self.system.adopt_open(space, keep=[session_id] if session_id else [])
+        session = self.agent.start(space, at=at, session_id=session_id)
         with self._lock:
             self.sessions[session.session_id] = session
+            self._seen[session.session_id] = self._clock()
         return session
 
     def get(self, session_id: str) -> ChatSession:
         with self._lock:
             session = self.sessions.get(session_id)
         if session is None:
-            raise KeyError(f"没有进行中的会话 {session_id}")
+            raise KeyError(self._missing(session_id))
         return session
+
+    def is_open(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self.sessions
+
+    def _missing(self, session_id: str) -> str:
+        idle = f"（闲置 {self.idle_minutes:g} 分钟的会话自动结束）" if self.idle_minutes else ""
+        return f"没有进行中的会话 {session_id}：不存在或已经结束{idle}，请开始一个新的会话"
 
     def chat(
         self,
@@ -138,8 +147,16 @@ class ChatService:
         router: Router | None = None,
         lam: float | None = None,
     ) -> Reply:
+        # 取会话与记下这次活动在同一把锁里：清理线程（close_idle）在这把锁里判断闲置、取走会话，
+        # 不会结束一个正要发消息的会话
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is not None:
+                self._seen[session_id] = self._clock()
+        if session is None:
+            raise KeyError(self._missing(session_id))
         return self.agent.chat(
-            self.get(session_id), text, images=images, at=at, mode=mode, router=router, lam=lam
+            session, text, images=images, at=at, mode=mode, router=router, lam=lam
         )
 
     def end(self, session_id: str, *, wait: bool = False) -> dict[str, Any]:
@@ -147,12 +164,35 @@ class ChatService:
         report = self.agent.end(session, wait=wait)
         with self._lock:
             self.sessions.pop(session_id, None)
+            self._seen.pop(session_id, None)
         out: dict[str, Any] = {"session_id": session_id, "turns": session.next_idx}
         if report is not None:
             out["consolidation"] = report.as_dict()
         elif session.next_idx:
             out["consolidation"] = "queued"
         return out
+
+    def close_idle(self, idle_s: float) -> int:
+        """闲置（开始或上一条消息之后）超过 idle_s 秒的会话结束、交给后台抽取，与 end 相同；返回
+        结束的个数。HTTP 应用的清理线程每分钟调用一次（create_app 的 idle_minutes）。以前只有
+        /api/sessions/{id}/end 与界面的按钮结束会话：关掉的标签页、崩溃的客户端留下的会话一直
+        开着，服务运行期间一直不抽取。之后再往这个会话发消息是 404（与不存在的会话一样，不告诉
+        作用域之外的调用方这个 ID 存在过），界面开一个新的会话。
+
+        判断闲置与取走会话在发消息记下活动的同一把锁里（见 chat）：正要发消息的会话不会被结束。
+        正在回答的会话（持有会话锁）等这一轮做完再结束，这一轮也一起抽取。"""
+        now = self._clock()
+        with self._lock:
+            stale = [sid for sid, seen in self._seen.items() if now - seen >= idle_s]
+            sessions = [self.sessions.pop(sid) for sid in stale if sid in self.sessions]
+            for sid in stale:
+                del self._seen[sid]
+        for session in sessions:
+            try:
+                self.agent.end(session)
+            except Exception:  # 一个会话结束不了不影响别的
+                logger.warning("闲置的会话 %s 没能结束", session.session_id, exc_info=True)
+        return len(sessions)
 
     def open_sessions(self, space_id: str) -> list[ChatSession]:
         with self._lock:
@@ -171,64 +211,23 @@ class ChatService:
         at: datetime | None = None,
         at_least_l1: bool = False,
     ) -> dict[str, Any]:
-        """检索控制器选档、取回记忆，原样交给调用方（另一个 Agent）去推理，不调用回答模型。
-
-        at_least_l1：调用方已经决定要查记忆（例如 MCP 的 recall），控制器选了 L0 时改走 L1，
-        控制器只决定要不要查得更深。
-        """
-        recall = self.system.retrieve(
+        """检索控制器选档、取回记忆，原样交给调用方（另一个 Agent）去推理（见 evidence.py）。"""
+        return recall_listing(
+            self.system,
             space_id,
             query,
-            question_time=at,
             mode=mode,
             router=router or self.agent.router,
             lam=lam,
+            at=at,
+            at_least_l1=at_least_l1,
         )
-        raised = at_least_l1 and recall.level == "l0"
-        if raised:
-            recall = self.system.retrieve(space_id, query, question_time=at, mode="l1")
-        view = recall.view
-        decision = recall.decision
-        return {
-            "level": recall.level.upper(),
-            "see": bool(decision and decision.see),
-            "reasons": (
-                ["raised from L0: the caller asked to recall"]
-                if raised
-                else [english_reason(r) for r in decision.reasons]
-                if decision
-                else []
-            ),
-            "profile": view.core.text if view.core is not None else "",
-            "facts": [
-                {
-                    "id": fh.fact.id,
-                    "statement": fh.fact.statement,
-                    "said_on": fh.fact.recorded_at.isoformat(),
-                    "status": _status(fh.fact),
-                }
-                for fh in view.facts
-            ],
-            "excerpts": [
-                {
-                    "id": hit.unit.id,
-                    "session_id": hit.unit.session_id,
-                    "ts": hit.unit.ts.isoformat(),
-                    "text": hit.unit.text,
-                    "turn_ids": hit.unit.source_turn_ids,
-                }
-                for hit in sorted(view.rounds, key=lambda h: h.unit.ts)
-            ],
-            "images": [
-                {"id": m.id, "caption": m.caption, "path": m.path, "attached": m.id in view.attach}
-                for m in view.media.values()
-            ],
-        }
 
     def remember(self, space_id: str, text: str, *, at: datetime | None = None) -> dict[str, str]:
         """记一条笔记（MCP 的 remember）：写成只有一句话的会话，在线写入、后台巩固。"""
-        when = (at or datetime.now()).replace(microsecond=0)
-        sid = f"note-{when:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+        # 现在的时间不截到秒：与 SDK、各个集成写入的会话在同一秒里也分得出先后
+        when = at.replace(microsecond=0) if at is not None else datetime.now()
+        sid = sortable_session_id("note", when)
         self.system.append(
             space_id,
             SessionIn(
@@ -242,9 +241,7 @@ class ChatService:
 
     def forget_ids(self, space_id: str, ids: Sequence[str]) -> ForgetReport:
         """按 recall 给出的 ID 遗忘：事实 ID，或对话片段（轮）的 ID。"""
-        fact_ids = [f.id for f in self.system.db.get_facts(space_id, ids=list(ids))]
-        rounds = self.system.db.get_units(space_id, list(ids))
-        turns = [t for unit in rounds if unit.kind == "round" for t in unit.source_turn_ids]
+        fact_ids, turns = resolve_ids(self.system, space_id, ids)
         return self.forget(space_id, fact_ids=fact_ids, turn_ids=turns)
 
     # ---------- 记忆浏览器 ----------
@@ -274,7 +271,7 @@ class ChatService:
                     "valid_from": fact.valid_from,
                     "valid_to": fact.valid_to,
                     "current": fact.is_current,
-                    "status": _status(fact),
+                    "status": fact_state(fact),
                     "superseded_by": fact.superseded_by,
                     "replaced_by": (
                         by_id[fact.superseded_by].statement if fact.superseded_by in by_id else None
@@ -314,10 +311,13 @@ class ChatService:
                 continue
             degree[fact.subject_id] = degree.get(fact.subject_id, 0) + 1
             text = f"{fact.statement} {fact.object}".lower()
+            # 先按子串筛：每个名字一个正则，名字多过 re 的缓存后每条事实都要全部重新编译
             linked = set(fact.entity_ids) | {
                 eid
                 for eid, aliases in names.items()
-                if any(re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text) for a in aliases)
+                if any(
+                    a in text and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text) for a in aliases
+                )
             }
             for other in sorted(linked - {fact.subject_id}):
                 pair = (min(fact.subject_id, other), max(fact.subject_id, other))
@@ -359,13 +359,15 @@ class ChatService:
         ]
 
     def status(self, space_id: str) -> dict[str, Any]:
+        """巩固任务的状态与后台线程最近的出错，都只是这个空间的：以前 errors 是全部空间的最近
+        3 条，限定作用域的令牌借自己的空间就看得到别的用户的空间 ID 与出错里引着的模型输出。"""
         jobs = self.system.db.get_jobs(space_id)
         worker = self.system.worker
         return {
             "pending": sum(1 for j in jobs if j["status"] == "pending"),
             "failed": sum(1 for j in jobs if j["status"] == "failed"),
             "done": sum(1 for j in jobs if j["status"] == "done"),
-            "errors": list(worker.errors[-3:]) if worker is not None else [],
+            "errors": worker.errors_for(space_id)[-3:] if worker is not None else [],
         }
 
     # ---------- 遗忘与巩固 ----------
@@ -379,43 +381,24 @@ class ChatService:
         fact_ids: Sequence[str] = (),
         media_ids: Sequence[str] = (),
     ) -> ForgetReport:
-        """遗忘。原始日志是唯一的事实来源：删一条事实或一张图，删的是它出自的那一轮对话
-        （用户的话与助手的回复），然后由剩下的日志重建所有派生记忆（D-021）。
-        删事实时还要追没有引用、追不到的转述（D-051）：先在原始日志里找复述了它的发言
-        （包括进行中的会话）一起删；重建之后如果同样的信息又从别处长了出来，再删它的出处，
-        最多再追 REGROW_ROUNDS 轮。按内容找到的转述只删那条发言、不沿引用扩散：同一轮里
-        用户说的别的事，以及后来引用这些事的回复，都不该连带删掉。进行中的会话同步去掉被删的内容。"""
-        sources: list[str] = []
-        statements: list[str] = []
-        if fact_ids:
-            for fact in self.system.db.get_facts(space_id, ids=list(fact_ids)):
-                sources.extend(fact.source_turn_ids)
-                statements.append(fact.statement)
-        if media_ids:
-            sources.extend(
-                m.source_turn_id for m in self.system.db.get_media(space_id, ids=list(media_ids))
+        """遗忘（逻辑见 MemorySystem.forget_memories）；进行中的会话同步去掉被删的内容。
+        删除做完之后重建派生记忆出错时不抛出，写在报告的 rebuild_error 里（HTTP 接口与 MCP 据此
+        说明删除已经做了）。
+
+        别的入口（/api/v1、SDK、reset）的遗忘不经这里：进行中的会话在下一轮自己同步（见
+        Agent._chat）。这里立即同步，界面马上显示删掉之后的工作记忆。"""
+        try:
+            return self.system.forget_memories(
+                space_id,
+                session_ids=session_ids,
+                turn_ids=turn_ids,
+                fact_ids=fact_ids,
+                media_ids=media_ids,
+                report_rebuild_errors=True,
             )
-        # 事实与图片出自的发言扩展成整轮：助手的回复里常常复述了同样的信息
-        turns = [*turn_ids, *self.system.round_turns(space_id, sources)]
-        restated = self.system.restating_turns(space_id, statements, exclude=turns)
-        report = self.system.forget(
-            space_id,
-            session_ids=list(session_ids),
-            turn_ids=list(dict.fromkeys(turns)),
-            restated_turn_ids=restated,
-        )
-        report = replace(report, restated=len(restated))
-        for _ in range(REGROW_ROUNDS if statements else 0):
-            regrown = self.system.regrown_facts(space_id, statements)
-            if not regrown:
-                break
-            more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
-            report = report.merged(
-                replace(self.system.forget(space_id, restated_turn_ids=more), regrown=len(regrown))
-            )
-        for session in self.open_sessions(space_id):
-            self.agent.prune(session)
-        return report
+        finally:  # 重建失败时原始日志也已经删了：进行中的会话照样去掉被删的轮
+            for session in self.open_sessions(space_id):
+                self.agent.prune(session)
 
     def consolidate(self, space_id: str) -> dict[str, Any]:
         return self.system.consolidate(space_id).as_dict()
@@ -425,16 +408,6 @@ class ChatService:
             if not session.closed:
                 self.agent.end(session)  # 登记巩固任务；进程退出后下次巩固时完成
         self.system.close()
-
-
-def _status(fact: Fact) -> str:
-    """界面上的有效状态：当前有效 / 何时因现实变化而失效 / 何时被更正。"""
-    if fact.is_current:
-        return "current"
-    when = f"{fact.invalidated_at:%Y-%m-%d}" if fact.invalidated_at else "?"
-    if fact.supersede_reason == "corrected":
-        return f"corrected on {when}"
-    return f"changed on {when}" + (f" (until {fact.valid_to})" if fact.valid_to else "")
 
 
 def _display(name: str, aliases: list[str]) -> str:

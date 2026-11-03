@@ -1,0 +1,269 @@
+"""N12：LongMemEval 会话 ID 泄漏有多大影响（只读结果，不调用 API）。
+
+泄漏：LongMemEval 的证据会话 ID 都以 "answer_" 开头（拒答题还带 "_abs"），其他会话是
+sharegpt_ / ultrachat_ / 哈希；回答模型看到的每条检索结果标题里写着 "session <ID>"。所有检索
+方法（B2、CueMem L1 / L2 / 控制器、Mem0 与外部基线）都受影响，全上下文（B1）按序号给会话编号，
+不受影响。修复（D-067）在加载时按日期改成 session_<i>。
+
+同一批题（test100r）跑三臂，回答与判分相同：
+- raw：原始 ID（CUEMEM_EVAL_RAW_SESSION_IDS=1，修复之前的条件，即 N9 / N11 发表数字的条件）；
+- anon：中性 ID（修复后的默认）；
+- label：在 anon 的空间上，只把证据标题里的 ID 换回原始 ID（CUEMEM_EVAL_RAW_SESSION_IDS=label）。
+
+label 对 anon 只差标题里的字，是泄漏本身的效应；raw 对 label 标签相同、只差空间里的 ID
+（同一会话内各轮的先后按含 ID 的哈希排，换了 ID 顺序就变），是换写法带来的噪声；raw 对 anon
+两者都有。
+
+协议：
+- orig：原协议（默认配置：抽取 qwen3.8-flash、向量 qwen3.7-text-embedding、回答 deepseek-flash、
+  判分 qwen3.8-max），写入在 data/eval-spaces-default；运行名 orig-lme-*；
+- pq：只用通义（CUEMEM_PRESET=qwen，回答 qwen3.8-flash），写入在 data/eval-spaces-qwen；运行名
+  pq-lme-*（raw 一臂用修复之前的代码跑，结果与 =1 相同，见 tests/test_eval_leak.py）。
+
+另外在每一臂里，照 N11 的 mem0.json 把朴素检索与 CueMem 各方法同 Mem0 逐题比较（vs_mem0），
+看 N11 "L1 对 Mem0" 的结论在修复之后是否还成立。
+
+符号检验只回答"有没有差别"；泄漏最多可能把发表的数字抬高多少，要看差的置信区间：每个配对
+另记 ci95（准确率之差的 95% 区间，Newcombe 的配对方法，routing.paired_diff_ci）；pooled_cuemem
+把 CueMem 的 L1、L2 与控制器合起来，按题取三者之差的平均，对题做 bootstrap 得到 95% 区间
+（metrics.bootstrap_ci，种子 0）。
+
+    uv run python scripts/n12_leak.py
+
+结果写到 docs/results/n12-leak/summary.json；配对检验按族做 Holm 校正，写到 summary-holm.json
+（族的定义见 scripts/multiplicity.py）。
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from cuemem.evals.metrics import bootstrap_ci
+from cuemem.evals.routing import paired_diff_ci, sign_test
+
+sys.path.insert(0, str(Path(__file__).parent))
+import multiplicity
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNS = ROOT / "runs" / "eval"
+OUT = ROOT / "docs" / "results" / "n12-leak" / "summary.json"
+
+# 协议 → 臂 → 这一臂的运行（CueMem 与 Mem0 分开跑）
+ARMS: dict[str, dict[str, list[str]]] = {
+    "orig": {
+        "raw": ["orig-lme-raw-cuemem", "orig-lme-raw-mem0"],
+        "anon": ["orig-lme-cuemem", "orig-lme-mem0"],
+        "label": ["orig-lme-label-cuemem", "orig-lme-label-mem0"],
+    },
+    "pq": {
+        "raw": ["pq-lme-raw-cuemem", "pq-lme-warm-b1", "pq-lme-raw-mem0"],
+        "anon": ["pq-lme-cuemem", "pq-lme-mem0"],
+        "label": ["pq-lme-label-cuemem", "pq-lme-label-mem0"],
+    },
+}
+# Mem0 不是每臂都有（README §3.3）：原协议只跑了 anon 与 label（raw 的参照是 N11 发表的那次运行），
+# pq 只跑了 raw。这三个运行没有跑过，缺了照常；别的缺一个就不写（以前缺的当作空的，照样重写
+# summary.json 与 summary-holm.json，没有 runs/eval 的机器上把发表的结果写成几百字节）
+NOT_RUN = {"orig-lme-raw-mem0", "pq-lme-mem0", "pq-lme-label-mem0"}
+RETRIEVAL = ["B2", "B4-nobm25", "B5", "B6", "M0"]
+LABELS = {
+    "B1": "Full context",
+    "B2": "Naive RAG",
+    "B4-nobm25": "CueMem L1",
+    "B5": "CueMem L2",
+    "B6": "CueMem controller",
+    "M0": "Mem0 2.2.1",
+}
+COMPARISONS = [  # （甲，乙，含义）
+    ("label", "anon", "leak only (same spaces, only the evidence-header IDs differ)"),
+    ("raw", "label", "renaming noise only (same labels, rounds reordered)"),
+    ("raw", "anon", "leak + renaming noise (pre-fix vs post-fix)"),
+]
+VS_MEM0 = ["B2", "B4-nobm25", "B5", "B6"]  # 同一臂里与 Mem0 逐题比较的方法（N11 mem0.json 的写法）
+CUEMEM = ["B4-nobm25", "B5", "B6"]  # pooled_cuemem 合并的方法：L1、L2、控制器
+
+
+def load(run: str) -> dict[tuple[str, str], dict[str, Any]]:
+    path = RUNS / run / "results.jsonl"
+    if not path.exists():
+        return {}
+    rows = [json.loads(line) for line in path.open(encoding="utf-8")]
+    return {(r["method"], r["sample_id"]): r for r in rows}
+
+
+def accuracy(rows: list[dict[str, Any]]) -> float | None:
+    return round(sum(bool(r["correct"]) for r in rows) / len(rows), 4) if rows else None
+
+
+def paired(ra: dict[str, dict[str, Any]], rb: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """同一批题上甲对乙的逐题胜负与精确符号检验（只数一边对、另一边错的题），以及准确率之差
+    （甲 − 乙）的 95% 置信区间 ci95（比例，Newcombe 的配对方法）。"""
+    common = sorted(ra.keys() & rb.keys())
+    if not common:
+        return None
+    wins = sum(1 for s in common if ra[s]["correct"] and not rb[s]["correct"])
+    losses = sum(1 for s in common if rb[s]["correct"] and not ra[s]["correct"])
+    both = sum(1 for s in common if ra[s]["correct"] and rb[s]["correct"])
+    low, high = paired_diff_ci(both, wins, losses, len(common) - both - wins - losses)
+    return {
+        "n": len(common),
+        "wins": wins,
+        "losses": losses,
+        "p": round(sign_test(wins, losses), 4),
+        "ci95": [round(low, 4), round(high, 4)],
+    }
+
+
+def pooled_cuemem(by_arm: dict[str, dict[tuple[str, str], dict[str, Any]]]) -> dict[str, Any]:
+    """CueMem 的 L1、L2 与控制器合起来的差（每组对照）：每道题取三个方法（甲对 − 乙对）的平均，
+    对题做 bootstrap 的 95% 区间。三个方法答的是同一批题、彼此相关，按题重抽才不低估区间。"""
+    out: dict[str, Any] = {}
+    for a, b, _ in COMPARISONS:
+        methods = [
+            m
+            for m in CUEMEM
+            if any(k[0] == m for k in by_arm[a]) and any(k[0] == m for k in by_arm[b])
+        ]
+        questions = sorted({s for m, s in by_arm[a] if m in methods})
+        diffs = [
+            sum(
+                int(bool(by_arm[a][(m, s)]["correct"])) - int(bool(by_arm[b][(m, s)]["correct"]))
+                for m in methods
+            )
+            / len(methods)
+            for s in questions
+            if all((m, s) in by_arm[a] and (m, s) in by_arm[b] for m in methods)
+        ]
+        if not diffs:
+            continue
+        low, high = bootstrap_ci(diffs)
+        out[f"{a}_vs_{b}"] = {
+            "methods": methods,
+            "n": len(diffs),
+            "mean_diff": round(sum(diffs) / len(diffs), 4),
+            "ci95": [round(low, 4), round(high, 4)],
+            "note": "per-question mean of the methods' differences; question-level bootstrap",
+        }
+    return out
+
+
+def vs_mem0(by_arm: dict[str, dict[tuple[str, str], dict[str, Any]]]) -> dict[str, Any]:
+    """每一臂里，朴素检索与 CueMem 各方法对 Mem0 的逐题比较（两边都有的臂才算）。"""
+    out: dict[str, Any] = {}
+    for arm, rows in by_arm.items():
+        mem0 = {s: r for (m, s), r in rows.items() if m == "M0"}
+        tests: dict[str, Any] = {}
+        for method in VS_MEM0:
+            test = paired({s: r for (m, s), r in rows.items() if m == method}, mem0)
+            if test is not None:
+                tests[f"{method}_vs_M0"] = test
+        if tests:
+            out[arm] = tests
+    return out
+
+
+def missing() -> list[str]:
+    """ARMS 里还没有结果（results.jsonl）的运行，NOT_RUN 除外。"""
+    return [
+        run
+        for arms in ARMS.values()
+        for runs in arms.values()
+        for run in runs
+        if run not in NOT_RUN and not (RUNS / run / "results.jsonl").exists()
+    ]
+
+
+def main() -> None:
+    if gone := missing():
+        raise SystemExit(f"还没有结果：{'、'.join(gone)}（见脚本说明）；没有写 {OUT.name}")
+    summary: dict[str, Any] = {}
+    for protocol, arms in ARMS.items():
+        by_arm = {
+            arm: {k: v for run in runs for k, v in load(run).items()} for arm, runs in arms.items()
+        }
+        methods = sorted({m for rows in by_arm.values() for m, _ in rows}, key=list(LABELS).index)
+        section: dict[str, Any] = {"runs": arms, "methods": {}, "pooled": {}}
+        pooled: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        for method in methods:
+            entry: dict[str, Any] = {"label": LABELS.get(method, method), "arms": {}}
+            for arm, rows in by_arm.items():
+                mine = [r for (m, _), r in rows.items() if m == method]
+                if not mine:
+                    continue
+                abst = [r for r in mine if r.get("is_abstention")]
+                entry["arms"][arm] = {
+                    "n": len(mine),
+                    "accuracy": accuracy(mine),
+                    "abstention_n": len(abst),
+                    "abstention_accuracy": accuracy(abst),
+                }
+            entry["paired"] = {}
+            for a, b, meaning in COMPARISONS:
+                test = paired(
+                    {s: r for (m, s), r in by_arm[a].items() if m == method},
+                    {s: r for (m, s), r in by_arm[b].items() if m == method},
+                )
+                if test is None:
+                    continue
+                entry["paired"][f"{a}_vs_{b}"] = {**test, "meaning": meaning}
+                if method in RETRIEVAL:
+                    pooled[f"{a}_vs_{b}"][0] += test["wins"]
+                    pooled[f"{a}_vs_{b}"][1] += test["losses"]
+            section["methods"][method] = entry
+        for key, (wins, losses) in pooled.items():
+            questions = sum(
+                section["methods"][m]["paired"][key]["n"]
+                for m in methods
+                if m in RETRIEVAL and key in section["methods"][m]["paired"]
+            )
+            section["pooled"][key] = {
+                "wins": wins,
+                "losses": losses,
+                "net_points": round(100 * (wins - losses) / questions, 2) if questions else None,
+                "p": round(sign_test(wins, losses), 4),
+                "note": "summed over retrieval methods on the same questions (not independent)",
+            }
+        section["pooled_cuemem"] = pooled_cuemem(by_arm)
+        section["vs_mem0"] = vs_mem0(by_arm)
+        summary[protocol] = section
+        print(f"\n== {protocol}")
+        for entry in section["methods"].values():
+            accs = "  ".join(
+                f"{arm} {100 * v['accuracy']:.1f}%"
+                for arm, v in entry["arms"].items()
+                if v["accuracy"]
+            )
+            pairs = "  ".join(
+                f"{k}: +{v['wins']}/-{v['losses']} p={v['p']} "
+                f"[{100 * v['ci95'][0]:+.1f}, {100 * v['ci95'][1]:+.1f}]"
+                for k, v in entry["paired"].items()
+            )
+            print(f"  {entry['label']:<18} {accs}\n  {'':<18} {pairs}")
+        for key, v in section["pooled"].items():
+            print(
+                f"  pooled {key}: +{v['wins']}/-{v['losses']}"
+                f" (net {v['net_points']} pt, p={v['p']})"
+            )
+        for key, v in section["pooled_cuemem"].items():
+            low, high = v["ci95"]
+            print(
+                f"  CueMem pooled {key}: {100 * v['mean_diff']:+.2f} pt"
+                f" [{100 * low:+.2f}, {100 * high:+.2f}]"
+            )
+        for arm, tests in section["vs_mem0"].items():
+            pairs = "  ".join(
+                f"{k}: +{v['wins']}/-{v['losses']} p={v['p']}" for k, v in tests.items()
+            )
+            print(f"  {arm} vs Mem0: {pairs}")
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(f"\n→ {OUT.relative_to(ROOT)}")
+    multiplicity.update(OUT, multiplicity.n12_leak)  # Holm 校正 → summary-holm.json
+
+
+if __name__ == "__main__":
+    main()

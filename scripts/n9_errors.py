@@ -44,7 +44,14 @@ from typing import Any
 
 from cuemem.config import PROJECT_ROOT, load_settings
 from cuemem.core.ids import stable_id
-from cuemem.evals.datasets import EvalSet, Sample, dataset_path, sample_evidence_turns
+from cuemem.evals.datasets import (
+    EvalSet,
+    Sample,
+    dataset_path,
+    run_raw_labels,
+    run_session_ids,
+    sample_evidence_turns,
+)
 from cuemem.evals.datasets import load as load_dataset
 from cuemem.evals.report import load_rows
 from cuemem.read.probe import DONT_KNOW
@@ -110,10 +117,14 @@ def wrong_rows(run: str, method: str) -> tuple[list[dict[str, Any]], dict[str, b
 
 
 def load_evalset(run: str) -> tuple[str, EvalSet]:
+    """按这次运行当时的会话 ID 写法加载（run.json；修复泄漏之前的运行是原始 ID），不看当前的
+    环境变量：证据发言的会话 ID、关键图片的记录 ID 才与运行里的对得上。"""
     info = json.loads((RUNS / run / "run.json").read_text("utf-8"))
     dataset = str(info["config"]["dataset"])
     settings = load_settings()
-    return dataset, load_dataset(dataset, dataset_path(settings.paths.datasets, dataset))
+    path = dataset_path(settings.paths.datasets, dataset)
+    raw = run_session_ids(info) == "raw"
+    return dataset, load_dataset(dataset, path, raw_ids=raw, raw_labels=run_raw_labels(info))
 
 
 def needle_images(dataset: str, evalset: EvalSet, sample: Sample) -> set[str]:

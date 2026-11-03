@@ -53,6 +53,20 @@ def test_media_store_is_content_addressed(tmp_path: Path, images: dict[str, Path
     assert small.startswith("data:image/jpeg;base64,") and len(small) < 20_000
 
 
+def test_unused_images_are_deleted_only_once_no_write_needs_them(
+    tmp_path: Path, images: dict[str, Path]
+) -> None:
+    """同一张图有两次写入进行中：一次失败时不删（另一次马上要登记它），两次都结束、也没有记录
+    引用时才删。遗忘按同样的规则删（delete_unused）。"""
+    store = MediaStore(tmp_path / "media")
+    first, second = store.put(images["red"]), store.put(images["red"])
+    unused = lambda sha: False  # noqa: E731
+    assert not store.release(first, in_use=unused) and first.path.exists()
+    assert not store.delete_unused(first.path, first.sha256, unused)
+    assert not store.release(second, in_use=lambda sha: True) and first.path.exists()
+    assert store.delete_unused(first.path, first.sha256, unused) and not first.path.exists()
+
+
 def test_fill_images() -> None:
     assert inline_images("look <image> here", ["a dog"]) == "look [Image: a dog] here"
     assert fill_images("no marker", ["[A]"]) == "no marker [A]"
@@ -168,11 +182,63 @@ def test_text_only_requests_stay_strings(
     assert isinstance(fake_api.chat_requests[-1]["messages"][-1]["content"], str)
 
 
+def test_caption_routes_are_searched_only_where_captions_exist(
+    mm: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """有图片描述的空间照常检索描述这一路；某种描述一条都没有时不检索（结果一定是空的）。"""
+    system, _ = mm
+    kinds: list[str] = []
+    real = system.vectors._query
+
+    def query(space_id: str, vector: Any, using: str, k: int, flt: Any) -> Any:
+        kinds.append(flt.must[0].match.any[0])
+        return real(space_id, vector, using, k, flt)
+
+    monkeypatch.setattr(system.vectors, "_query", query)
+    cands = system.l1.candidates("pics", "sign", ASKED, L1Config())
+    assert kinds == ["round", "fact", "image"] and cands.routes[("image", "dense")]
+    iso = [u.id for u in system.db.list_units("pics", kinds=["image_iso"])]
+    system.db.delete_units("pics", iso)
+    kinds.clear()
+    cands = system.l1.candidates("pics", "sign", ASKED, L1Config(image_kind="image_iso"))
+    assert kinds == ["round", "fact"] and cands.routes[("image_iso", "dense")] == []
+
+
 def test_visual_route_finds_images(mm: tuple[MemorySystem, ScriptedModel]) -> None:
     system, _ = mm
     cfg = L1Config(image_kind=None, visual_weight=1.0, attach_images=2)
     result = system.l1.search("pics", "car", ASKED, cfg)
     assert result.media and len(result.attach) >= 1
+
+
+def test_visual_route_reads_only_the_hit_turns(
+    mm: tuple[MemorySystem, ScriptedModel], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """以文搜图命中的图片按发言找所在的轮：只取命中图片的那几句发言。以前每次检索都载入并解析
+    整个空间的原始日志（1.6 万轮时约 250 毫秒）。"""
+    system, _ = mm
+    cfg = L1Config(image_kind=None, visual_weight=1.0, attach_images=2)
+    media = system.db.get_media("pics")
+    rounds = system.db.list_units("pics", kinds=["round"])
+    owner = {
+        m.id: next(r.id for r in rounds if m.source_turn_id in r.source_turn_ids) for m in media
+    }
+    real = system.db.get_turns
+    asked: list[list[str] | None] = []
+
+    def get_turns(space_id: str, session_id: str | None = None, **kwargs: Any) -> Any:
+        assert session_id is not None or kwargs.get("ids") is not None, "载入了整个原始日志"
+        asked.append(kwargs.get("ids"))
+        return real(space_id, session_id, **kwargs)
+
+    monkeypatch.setattr(system.db, "get_turns", get_turns)
+    cands = system.l1.candidates("pics", "car", ASKED, cfg)
+    visual = cands.routes[("media", "visual")]
+    assert {mid for mid, _ in visual} == set(owner)
+    assert sorted(m.source_turn_id for m in media) in asked
+    ranked = dict(cands.ranked)
+    assert all(owner[mid] in ranked for mid in owner)  # 每张命中的图片都映射回了所在的轮
+    assert set(cands.media_score) == set(owner)
 
 
 def test_history_blocks_interleave_images(images: dict[str, Path]) -> None:
@@ -196,6 +262,36 @@ def test_forget_deletes_images(mm: tuple[MemorySystem, ScriptedModel]) -> None:
     report = system.forget("pics", session_ids=["s1"])
     assert report.images_deleted == 2 and not any(p.exists() for p in paths)
     assert system.db.get_media("pics") == []
+
+
+def test_forget_goes_on_when_an_image_file_cannot_be_deleted(
+    mm: tuple[MemorySystem, ScriptedModel],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """原图文件删不掉（没有权限）：记录已经删了，遗忘照样重放派生记忆、清理缓存，别的原图照删，
+    记一条写明路径的警告（之后的遗忘找不到它，要手动删）。以前异常在删发言之后、清空派生层之前
+    抛出：由这段会话抽出的事实还是当前有效的，重试找不到要删的发言。"""
+    system, _ = mm
+    assert system.media is not None
+    paths = sorted(Path(m.path) for m in system.db.get_media("pics"))
+    delete_unused = system.media.delete_unused
+
+    def locked(path: Path, sha256: str, in_use: Any) -> bool:
+        if path == paths[0]:
+            raise PermissionError(13, "Permission denied", str(path))
+        return delete_unused(path, sha256, in_use)
+
+    monkeypatch.setattr(system.media, "delete_unused", locked)
+    with caplog.at_level("WARNING", logger="cuemem.memory"):
+        report = system.forget("pics", session_ids=["s1"])
+
+    assert report.turns_deleted == 3 and report.images_deleted == 1
+    assert report.rebuild_error is None
+    assert paths[0].exists() and not paths[1].exists()
+    assert str(paths[0]) in caplog.text
+    assert system.db.get_media("pics") == []
+    assert not any("CUE 42" in f.statement for f in system.facts("pics"))
 
 
 def test_memlens_loader_and_judge(tmp_path: Path, images: dict[str, Path], fake_api: FakeAPI,
@@ -231,7 +327,11 @@ def test_memlens_loader_and_judge(tmp_path: Path, images: dict[str, Path], fake_
     turn = evalset.haystacks["q_1"][0].turns[0]
     assert turn.images == [str(target)] and sample.meta["question_subtype"] == "arithmetic"
     assert turn.has_answer  # 证据会话里带关键图片的发言是证据发言
-    assert not sample.is_abstention and sample.evidence_session_ids == ["s1"]
+    # 会话 ID 按时间顺序改写成 session_<i>，证据随之改写，原 ID 只留作追溯
+    assert not sample.is_abstention and sample.evidence_session_ids == ["session_1"]
+    assert evalset.session_ids == "anon"
+    assert evalset.haystacks["q_1"][0].session_id == "session_1"
+    assert evalset.haystacks["q_1"][0].source_id == "s1"
 
     prompt = memlens_prompt(sample, "$10")
     assert "[MSR — Arithmetic]" in prompt and prompt.endswith("[Scoring Rationale]:")

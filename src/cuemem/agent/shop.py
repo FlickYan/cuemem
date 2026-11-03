@@ -197,6 +197,7 @@ def shop_tools(catalog: Catalog) -> list[Tool]:
         query = str(args.get("query", "")).strip()
         if not query:
             return ToolResult("Give a non-empty query.")
+        ctx.queries.append(query)  # 查询向量进共用的向量缓存：trace 记下它，遗忘时一起删
         found = catalog.search(
             query, category=_text(args.get("category")), max_price=_number(args.get("max_price"))
         )

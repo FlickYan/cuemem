@@ -12,17 +12,23 @@
 5. 跨数据集：在两个数据集上训练、第三个上测试；
 6. 混合流：记忆题与无关查询按 1:1 与 1:4 混合；
 7. 用全部开发数据训练最终的控制器，导出 src/cuemem/read/controller_model_v1.json
-   （N9 冻结评测的那一版；N11 的 v2 由 scripts/n11_controller_v2.py 导出为默认的
-   controller_model.json）。
+   （N9 冻结评测的那一版；N11 的 v2 由 scripts/n11_controller_v2.py 导出为
+   controller_model_v2.json）。
+
+v1 是冻结评测用的那一版，复现脚本只核对、不覆盖它（--no-export --check）：重新训练的结果与
+仓库里的文件（导出日期除外）对不上时以非零退出码结束。有意更新控制器时不加这两个参数，并更新
+tests/test_frozen_config.py 里钉住的哈希。
 
 用法：
-    uv run python scripts/n7_controller.py
+    uv run python scripts/n7_controller.py                      # 评测 + 导出 v1
+    uv run python scripts/n7_controller.py --no-export --check  # 只评测，核对 v1 没有变
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import warnings
 from collections import Counter
 from collections.abc import Sequence
@@ -35,6 +41,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import multiplicity
 import numpy as np
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
@@ -297,9 +304,44 @@ def fmt_cost(value: float) -> str:
     return f"${value * 1000:.2f}"
 
 
+def check_export(path: Path, fresh: dict[str, Any]) -> None:
+    """--check：重新训练的控制器与仓库里冻结的那份（导出日期除外）对不上时，以非零退出码结束。"""
+    drift = R.controller_drift(fresh, json.loads(path.read_text(encoding="utf-8")))
+    if drift:
+        shown = "、".join(drift[:10]) + (f" 等 {len(drift)} 处" if len(drift) > 10 else "")
+        sys.exit(
+            f"重新训练的控制器与 {path.name} 对不上：{shown}。冻结评测用的是仓库里的那份；"
+            "有意更新时不加 --no-export / --check 重新导出，"
+            "并更新 tests/test_frozen_config.py 里的哈希"
+        )
+    print(f"核对通过：重新训练的控制器与 {path.name} 一致（导出日期除外）")
+
+
+def finish_export(args: argparse.Namespace, path: Path, model: dict[str, Any]) -> bool:
+    """三个训练脚本在写任何结果（docs/results）之前调用：--check 时先与仓库里的 path 比对，对不上
+    时以非零退出码结束、什么都不写；不带 --no-export 时再写入 path。返回是否写了。"""
+    if args.check:
+        check_export(path, model)
+    if args.no_export:
+        return False
+    path.write_text(json.dumps(model, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return True
+
+
+def add_export_flags(parser: argparse.ArgumentParser, filename: str) -> None:
+    """三个训练脚本（N7 的 v1、N11 的 v2 与 v3）共用的导出开关。"""
+    parser.add_argument("--no-export", action="store_true", help=f"只评测，不覆盖 {filename}")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=f"重新训练的结果与仓库里的 {filename} 比对，对不上时以非零退出码结束（复现脚本用）",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=5)
+    add_export_flags(parser, V1_MODEL.name)
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     runs = PROJECT_ROOT / "runs" / "eval"
@@ -508,15 +550,14 @@ def main() -> None:
         "hybrid_band": list(BAND),
         "created": datetime.now().strftime("%Y-%m-%d"),
     }
-    V1_MODEL.write_text(
-        json.dumps(final.to_json(lam=lam, meta=meta), ensure_ascii=False, indent=1) + "\n",
-        encoding="utf-8",
-    )
+    model = final.to_json(lam=lam, meta=meta)
+    finish_export(args, V1_MODEL, model)  # 在写任何结果之前：对不上时 docs/results 也不动
     (OUT / "results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1, default=float) + "\n", encoding="utf-8"
     )
+    multiplicity.update(OUT / "results.json", multiplicity.n7_controller)  # → results-holm.json
     draw(items, datasets, fixed, curves)
-    print(f"结果：{OUT}；控制器：{V1_MODEL}")
+    print(f"结果：{OUT}" + ("" if args.no_export else f"；控制器：{V1_MODEL}"))
 
 
 ADAPT_SIZES = (0, 10, 20, 50, 100)

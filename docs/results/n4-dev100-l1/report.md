@@ -2,7 +2,7 @@
 
 - 数据集：`longmemeval_s`（划分 `dev100`） · 题数 100
 - 回答模型：`deepseek-flash` · 判分模型：`qwen3.8-max` · 向量：`qwen3.7-text-embedding`（1024 维）
-- B2 检索条数 k = 10 · 代码版本 `4839bbd-dirty` · 首次运行 2026-10-12T07:55:40
+- B2 检索条数 k = 10 · 代码版本 `2e4d8e6-dirty` · 首次运行 2026-10-12T07:55:40
 
 ## 总体结果
 

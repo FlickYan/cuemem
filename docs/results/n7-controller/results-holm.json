@@ -1,0 +1,626 @@
+{
+ "source": "results.json",
+ "method": "Holm–Bonferroni（族内校正，族内错判一次以上的概率不超过 alpha）",
+ "alpha": 0.05,
+ "families": {
+  "all：控制器的配对": {
+   "description": "B6、B6h 对固定档位、规则版、零样本路由与 B3",
+   "m": 8,
+   "tests": {
+    "B6 vs always-L1": {
+     "wins": 19,
+     "losses": 15,
+     "p": 0.6076,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs always-L2": {
+     "wins": 8,
+     "losses": 32,
+     "p": 0.0002,
+     "p_holm": 0.0013,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B6r": {
+     "wins": 9,
+     "losses": 17,
+     "p": 0.1686,
+     "p_holm": 0.8432,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B6z": {
+     "wins": 20,
+     "losses": 17,
+     "p": 0.7428,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L1": {
+     "wins": 20,
+     "losses": 22,
+     "p": 0.8776,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L2": {
+     "wins": 6,
+     "losses": 36,
+     "p": 0.0,
+     "p_holm": 0.0,
+     "nominal": true,
+     "holm": true
+    },
+    "B6h vs B6r": {
+     "wins": 10,
+     "losses": 24,
+     "p": 0.0243,
+     "p_holm": 0.1458,
+     "nominal": true,
+     "holm": false
+    },
+    "B6h vs B6z": {
+     "wins": 15,
+     "losses": 18,
+     "p": 0.7283,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "longmemeval_s：控制器的配对": {
+   "description": "B6、B6h 对固定档位、规则版、零样本路由与 B3",
+   "m": 10,
+   "tests": {
+    "B6 vs always-L1": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs always-L2": {
+     "wins": 1,
+     "losses": 6,
+     "p": 0.125,
+     "p_holm": 0.875,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B6r": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 0.875,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B6z": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B3": {
+     "wins": 6,
+     "losses": 8,
+     "p": 0.7905,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L1": {
+     "wins": 5,
+     "losses": 5,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L2": {
+     "wins": 0,
+     "losses": 8,
+     "p": 0.0078,
+     "p_holm": 0.0781,
+     "nominal": true,
+     "holm": false
+    },
+    "B6h vs B6r": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.1406,
+     "nominal": true,
+     "holm": false
+    },
+    "B6h vs B6z": {
+     "wins": 0,
+     "losses": 5,
+     "p": 0.0625,
+     "p_holm": 0.5,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs B3": {
+     "wins": 6,
+     "losses": 11,
+     "p": 0.3323,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "locomo：控制器的配对": {
+   "description": "B6、B6h 对固定档位、规则版、零样本路由与 B3",
+   "m": 10,
+   "tests": {
+    "B6 vs always-L1": {
+     "wins": 7,
+     "losses": 6,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs always-L2": {
+     "wins": 7,
+     "losses": 17,
+     "p": 0.0639,
+     "p_holm": 0.5752,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B6r": {
+     "wins": 7,
+     "losses": 5,
+     "p": 0.7744,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B6z": {
+     "wins": 8,
+     "losses": 9,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B3": {
+     "wins": 15,
+     "losses": 24,
+     "p": 0.1996,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L1": {
+     "wins": 8,
+     "losses": 8,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L2": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 0.3469,
+     "nominal": true,
+     "holm": false
+    },
+    "B6h vs B6r": {
+     "wins": 8,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs B6z": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs B3": {
+     "wins": 15,
+     "losses": 25,
+     "p": 0.1539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "memlens_32k：控制器的配对": {
+   "description": "B6、B6h 对固定档位、规则版、零样本路由与 B3",
+   "m": 8,
+   "tests": {
+    "B6 vs always-L1": {
+     "wins": 7,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs always-L2": {
+     "wins": 0,
+     "losses": 9,
+     "p": 0.0039,
+     "p_holm": 0.0273,
+     "nominal": true,
+     "holm": true
+    },
+    "B6 vs B6r": {
+     "wins": 2,
+     "losses": 8,
+     "p": 0.1094,
+     "p_holm": 0.5469,
+     "nominal": false,
+     "holm": false
+    },
+    "B6 vs B6z": {
+     "wins": 10,
+     "losses": 4,
+     "p": 0.1796,
+     "p_holm": 0.7183,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L1": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "B6h vs always-L2": {
+     "wins": 0,
+     "losses": 11,
+     "p": 0.001,
+     "p_holm": 0.0078,
+     "nominal": true,
+     "holm": true
+    },
+    "B6h vs B6r": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 0.2314,
+     "nominal": true,
+     "holm": false
+    },
+    "B6h vs B6z": {
+     "wins": 8,
+     "losses": 4,
+     "p": 0.3877,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  },
+  "全文": {
+   "description": "这份结果里全部的检验放在一起校正（最保守的上界）",
+   "m": 36,
+   "tests": {
+    "all：控制器的配对 | B6 vs always-L1": {
+     "wins": 19,
+     "losses": 15,
+     "p": 0.6076,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "all：控制器的配对 | B6 vs always-L2": {
+     "wins": 8,
+     "losses": 32,
+     "p": 0.0002,
+     "p_holm": 0.0064,
+     "nominal": true,
+     "holm": true
+    },
+    "all：控制器的配对 | B6 vs B6r": {
+     "wins": 9,
+     "losses": 17,
+     "p": 0.1686,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "all：控制器的配对 | B6 vs B6z": {
+     "wins": 20,
+     "losses": 17,
+     "p": 0.7428,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "all：控制器的配对 | B6h vs always-L1": {
+     "wins": 20,
+     "losses": 22,
+     "p": 0.8776,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "all：控制器的配对 | B6h vs always-L2": {
+     "wins": 6,
+     "losses": 36,
+     "p": 0.0,
+     "p_holm": 0.0001,
+     "nominal": true,
+     "holm": true
+    },
+    "all：控制器的配对 | B6h vs B6r": {
+     "wins": 10,
+     "losses": 24,
+     "p": 0.0243,
+     "p_holm": 0.7292,
+     "nominal": true,
+     "holm": false
+    },
+    "all：控制器的配对 | B6h vs B6z": {
+     "wins": 15,
+     "losses": 18,
+     "p": 0.7283,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6 vs always-L1": {
+     "wins": 5,
+     "losses": 2,
+     "p": 0.4531,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6 vs always-L2": {
+     "wins": 1,
+     "losses": 6,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6 vs B6r": {
+     "wins": 0,
+     "losses": 4,
+     "p": 0.125,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6 vs B6z": {
+     "wins": 2,
+     "losses": 4,
+     "p": 0.6875,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6 vs B3": {
+     "wins": 6,
+     "losses": 8,
+     "p": 0.7905,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6h vs always-L1": {
+     "wins": 5,
+     "losses": 5,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6h vs always-L2": {
+     "wins": 0,
+     "losses": 8,
+     "p": 0.0078,
+     "p_holm": 0.25,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6h vs B6r": {
+     "wins": 0,
+     "losses": 7,
+     "p": 0.0156,
+     "p_holm": 0.4844,
+     "nominal": true,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6h vs B6z": {
+     "wins": 0,
+     "losses": 5,
+     "p": 0.0625,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "longmemeval_s：控制器的配对 | B6h vs B3": {
+     "wins": 6,
+     "losses": 11,
+     "p": 0.3323,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6 vs always-L1": {
+     "wins": 7,
+     "losses": 6,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6 vs always-L2": {
+     "wins": 7,
+     "losses": 17,
+     "p": 0.0639,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6 vs B6r": {
+     "wins": 7,
+     "losses": 5,
+     "p": 0.7744,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6 vs B6z": {
+     "wins": 8,
+     "losses": 9,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6 vs B3": {
+     "wins": 15,
+     "losses": 24,
+     "p": 0.1996,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6h vs always-L1": {
+     "wins": 8,
+     "losses": 8,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6h vs always-L2": {
+     "wins": 6,
+     "losses": 17,
+     "p": 0.0347,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6h vs B6r": {
+     "wins": 8,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6h vs B6z": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "locomo：控制器的配对 | B6h vs B3": {
+     "wins": 15,
+     "losses": 25,
+     "p": 0.1539,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6 vs always-L1": {
+     "wins": 7,
+     "losses": 7,
+     "p": 1.0,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6 vs always-L2": {
+     "wins": 0,
+     "losses": 9,
+     "p": 0.0039,
+     "p_holm": 0.1289,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6 vs B6r": {
+     "wins": 2,
+     "losses": 8,
+     "p": 0.1094,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6 vs B6z": {
+     "wins": 10,
+     "losses": 4,
+     "p": 0.1796,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6h vs always-L1": {
+     "wins": 7,
+     "losses": 9,
+     "p": 0.8036,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6h vs always-L2": {
+     "wins": 0,
+     "losses": 11,
+     "p": 0.001,
+     "p_holm": 0.0332,
+     "nominal": true,
+     "holm": true
+    },
+    "memlens_32k：控制器的配对 | B6h vs B6r": {
+     "wins": 2,
+     "losses": 10,
+     "p": 0.0386,
+     "p_holm": 1.0,
+     "nominal": true,
+     "holm": false
+    },
+    "memlens_32k：控制器的配对 | B6h vs B6z": {
+     "wins": 8,
+     "losses": 4,
+     "p": 0.3877,
+     "p_holm": 1.0,
+     "nominal": false,
+     "holm": false
+    }
+   }
+  }
+ },
+ "lost": [
+  "all：控制器的配对 | B6h vs B6r",
+  "longmemeval_s：控制器的配对 | B6h vs always-L2",
+  "longmemeval_s：控制器的配对 | B6h vs B6r",
+  "locomo：控制器的配对 | B6h vs always-L2",
+  "memlens_32k：控制器的配对 | B6h vs B6r",
+  "全文 | all：控制器的配对 | B6h vs B6r",
+  "全文 | longmemeval_s：控制器的配对 | B6h vs always-L2",
+  "全文 | longmemeval_s：控制器的配对 | B6h vs B6r",
+  "全文 | locomo：控制器的配对 | B6h vs always-L2",
+  "全文 | memlens_32k：控制器的配对 | B6 vs always-L2",
+  "全文 | memlens_32k：控制器的配对 | B6h vs B6r"
+ ]
+}

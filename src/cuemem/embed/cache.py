@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -17,13 +18,19 @@ from cuemem.embed.base import EmbeddingBatch, EmbedKind, FloatArray, SparseVecto
 
 CachedVector = tuple[FloatArray, SparseVector | None]
 
+logger = logging.getLogger(__name__)
+
 
 class EmbeddingCache:
     def __init__(self, path: Path | None) -> None:
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path) if path else ":memory:", check_same_thread=False)
+        # 几个评测进程共用一份缓存：写锁多等一会儿（默认 5 秒），免得忙时报 "database is locked"
+        self._conn = sqlite3.connect(
+            str(path) if path else ":memory:", check_same_thread=False, timeout=60.0
+        )
         self._lock = threading.Lock()
+        self._deletes = 0  # 删过几次条目（见 version）
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
@@ -74,7 +81,11 @@ class EmbeddingCache:
             self._conn.commit()
 
     def delete_many(self, keys: Sequence[str]) -> int:
-        """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。"""
+        """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。
+
+        删除时覆写（secure_delete），删了东西就把 WAL 写回并截断：否则被删的键与向量留在
+        WAL 里，直到进程退出。截断的是整个文件的 WAL，同一个文件的别的连接（评测与 tune_mm 里
+        图片向量器另开的；MemorySystem.from_settings 让图片与文本共用这一个）不用再截断一次。"""
         deleted = 0
         unique = list(dict.fromkeys(keys))
         with self._lock:
@@ -86,11 +97,28 @@ class EmbeddingCache:
                 )
                 deleted += max(cursor.rowcount, 0)
             self._conn.commit()
+            if deleted:
+                self._deletes += 1
+                self._checkpoint()
         return deleted
+
+    def version(self) -> tuple[int, int]:
+        """缓存的版本：两次读到的相同，期间就没有删过条目（本连接删的，或别的连接写过、
+        删过），之前读到的向量与现在再查一遍逐位相同（巩固据此跨运行复用向量）。"""
+        with self._lock:
+            changed = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+            return self._deletes, changed
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _checkpoint(self) -> None:
+        """把 WAL 写回数据库并截断（调用方持有 self._lock）。别的进程（评测）正在读写这份缓存时
+        可能做不完，被删的条目暂时还在 WAL 里：记一条警告。"""
+        busy = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            logger.warning("向量缓存的 WAL 没能截断（别的进程正在使用），被删的条目暂时还在 WAL 里")
 
 
 class CachedEmbedder:
@@ -150,6 +178,11 @@ class CachedEmbedder:
             else None
         )
         return EmbeddingBatch(dense=dense, sparse=sparse_out, tokens=tokens)
+
+    def version(self) -> tuple[int, int]:
+        """见 EmbeddingCache.version：版本没变时，同一段文本再向量化一次得到逐位相同的结果、
+        也不会发出请求（之前得到过的向量都在缓存里）。"""
+        return self.cache.version()
 
     def cached(self, texts: Sequence[str], kind: EmbedKind) -> set[str]:
         """返回 texts 中已经在缓存里的那些（测试与遗忘检查用）。"""
