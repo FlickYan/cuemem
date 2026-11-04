@@ -576,11 +576,27 @@ class Memory:
         """同步执行待处理的抽取（包括 infer=False 写入的会话）。rebuild=True 时全部重新抽取。"""
         return self.system.consolidate(space_for(user_id, agent_id), rebuild=rebuild).as_dict()
 
-    def wait(self) -> None:
+    def wait(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
         """等后台线程把已登记的抽取做完（测试、脚本退出前用）。抽取失败时不抛出（与 Mem0
-        相同），后台线程记一条警告日志；失败的会话与原因见 status()。"""
-        if self.system.worker is not None:
-            self.system.worker.wait()
+        相同），后台线程记一条警告日志；失败的会话与原因见 status()。
+
+        给了 user_id 或 agent_id 时只等这个用户（或 Agent）的抽取，不给时等全部。timeout 秒内
+        没做完时抛 TimeoutError（抽取在后台照常继续）；不给时一直等。"""
+        worker = self.system.worker
+        if worker is None:
+            return
+        spaces = None
+        if user_id is not None or agent_id is not None:
+            space = space_for(user_id, agent_id)
+            spaces = space.__eq__
+        if not worker.wait(spaces, timeout):
+            raise TimeoutError(f"Extraction did not finish within {timeout}s")
 
     def status(self, *, user_id: str | None = None, agent_id: str | None = None) -> dict[str, Any]:
         """这个用户（或 Agent）的记忆的抽取状态：pending 是等着抽取的会话数；failed 是抽取失败的

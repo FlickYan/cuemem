@@ -948,11 +948,26 @@ class ConsolidationWorker:
             self._enqueue(space_id)
             self._cond.notify_all()
 
-    def wait(self) -> None:
-        """等待已提交的空间全部处理完（其间到期的重试也等；还没到期的不等）。"""
+    def wait(
+        self, spaces: Callable[[str], bool] | None = None, timeout: float | None = None
+    ) -> bool:
+        """等待已提交的空间全部处理完（其间到期的重试也等；还没到期的不等）。spaces：只等让它返回
+        True 的空间（SDK 的 wait(user_id=...)、/api/v1/wait 只等令牌能访问的空间）；None 是全部。
+        timeout 秒内没等到时返回 False，否则 True。"""
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
-            while self._pending or self._running or self._again:
-                self._cond.wait()
+            while any(
+                spaces is None or spaces(space)
+                for space in (*self._pending, *self._running, *self._again)
+            ):
+                if deadline is None:
+                    self._cond.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+        return True
 
     def stop(self) -> None:
         """已经排着的空间做完再退出（之后到期的重试不再排），所有线程一共最多等 stop_timeout_s

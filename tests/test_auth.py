@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import re
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -644,6 +645,53 @@ def test_v1_reset_stays_in_scope(world: World) -> None:
     everything = admin.reset()  # 管理令牌照旧删全部、结束全部
     assert everything["message"] == "All memories deleted"
     assert admin.spaces() == [] and world.system.open_sessions("shop/bob") == set()
+
+
+def _finishes(call: Callable[[], Any], seconds: float = 10.0) -> Any:
+    """在另一个线程里调用，seconds 秒内要返回（或抛出）：返回它的结果，抛出的异常照样抛出。"""
+    out: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            out["value"] = call()
+        except BaseException as exc:
+            out["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "still waiting"
+    if "error" in out:
+        raise out["error"]
+    return out["value"]
+
+
+def test_v1_wait_stays_in_scope(world: World) -> None:
+    """POST /api/v1/wait：bob 的抽取还在做时，alice 的令牌不给 user_id 时只等它能访问的空间
+    （马上返回），点名 bob 时 403；管理令牌照样等 bob（timeout 到了是 TimeoutError，同本地的
+    Memory.wait）。以前不看作用域、等全部用户的抽取：alice 的令牌也被 bob 的抽取挡住。"""
+    alice = MemoryClient("http://testserver", api_key=ALICE_TOKEN, http_client=world.http)
+    admin = MemoryClient("http://testserver", api_key=ADMIN_TOKEN, http_client=world.http)
+    worker = world.system.worker
+    assert worker is not None
+    held = world.system.consolidator.exclusive("bob")
+    held.acquire()  # bob 的抽取卡在巩固锁上：一直在 _running 里
+    try:
+        worker.submit("bob")
+        assert _finishes(lambda: alice.wait()) is None
+        assert _finishes(lambda: alice.wait(user_id="alice", timeout=1)) is None
+        _forbidden(lambda: _finishes(lambda: alice.wait(user_id="bob")))
+        with pytest.raises(TimeoutError):
+            _finishes(lambda: admin.wait(timeout=0.2))
+        with pytest.raises(TimeoutError):
+            _finishes(lambda: admin.wait(user_id="bob", timeout=0.2))
+        response = world.http.post(
+            "/api/v1/wait", json={"timeout": 0.1}, headers=bearer(ADMIN_TOKEN)
+        )
+        assert response.status_code == 504 and response.json()["error"]["code"] == "timeout"
+    finally:
+        held.release()
+    assert _finishes(lambda: admin.wait()) is None
 
 
 def test_v1_excerpt_and_image_ids_stay_in_scope(world: World) -> None:

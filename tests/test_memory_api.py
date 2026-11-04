@@ -213,6 +213,7 @@ ARGUMENTS: dict[str, Any] = {
     "dry_run": True,
     "rebuild": True,
     "derived": False,
+    "timeout": 5.0,
 }
 PER_METHOD: dict[tuple[str, str], Any] = {("load", "data"): {"version": 2, "space_id": "alice"}}
 RETURNS: dict[str, Any] = {
@@ -791,6 +792,41 @@ def test_the_client_explains_a_wrong_base_url(system: MemorySystem) -> None:
         with pytest.raises(MemoryAPIError, match="is `cuemem serve` running") as raised:
             MemoryClient("http://127.0.0.1:9", http_client=dead).spaces()
         assert raised.value.status is None
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "sent"),
+    [
+        (httpx2.ConnectError, "unreachable", False),
+        (httpx2.ConnectTimeout, "unreachable", False),
+        (httpx2.PoolTimeout, "unreachable", False),
+        (httpx2.ReadTimeout, "timeout", True),
+        (httpx2.WriteTimeout, "timeout", True),
+        (httpx2.RemoteProtocolError, "disconnected", True),
+        (httpx2.ReadError, "disconnected", True),
+        (httpx2.WriteError, "disconnected", True),
+        (httpx2.ProxyError, "transport", True),
+    ],
+)
+def test_transport_errors_say_whether_the_request_was_sent(
+    error: type[httpx2.TransportError], code: str, sent: bool
+) -> None:
+    """没有拿到响应时 code 与 sent 说清请求有没有送到：连不上（unreachable，sent=False）可以
+    重发；超时与中途断开（timeout、disconnected，sent=True）时写入可能已经提交。以前一律是
+    "Cannot reach"、code 为 None，只能看 __cause__。"""
+
+    def fail(request: httpx2.Request) -> httpx2.Response:
+        raise error("boom", request=request)
+
+    with (
+        httpx2.Client(transport=httpx2.MockTransport(fail), timeout=7.0) as http,
+        pytest.raises(MemoryAPIError) as raised,
+    ):
+        MemoryClient("http://127.0.0.1:9", http_client=http).add("hi", user_id="alice")
+    assert (raised.value.code, raised.value.sent, raised.value.status) == (code, sent, None)
+    assert ("Cannot reach" in str(raised.value)) == (code == "unreachable")
+    if error is httpx2.ReadTimeout:
+        assert "within 7s" in str(raised.value) and "may have been processed" in str(raised.value)
 
 
 def test_images_reach_the_memory(mem: Mem, system: MemorySystem, tmp_path: Path) -> None:

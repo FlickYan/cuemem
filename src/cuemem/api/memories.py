@@ -70,6 +70,7 @@ from cuemem.sdk import AnswerMode, Lam, Memory, MinLevel, SearchMode, _scope, sp
 from cuemem.store.media import ACCEPTED_FORMATS
 
 PREFIX = "/api/v1"
+WAIT_TIMEOUT_S = 300.0  # POST /wait 最多等这么久（MemoryClient 默认的超时），之后 504
 _CODES = {
     400: "invalid_request",
     401: "unauthorized",
@@ -172,6 +173,14 @@ class ConsolidateRequest(BaseModel):
     user_id: str | None = None
     agent_id: str | None = None
     rebuild: bool = False
+
+
+class WaitRequest(BaseModel):
+    user_id: str | None = None
+    agent_id: str | None = None
+    timeout: float | None = Field(
+        None, ge=0, allow_inf_nan=False, description=f"Seconds; at most {WAIT_TIMEOUT_S:g}"
+    )
 
 
 class ImportRequest(BaseModel):
@@ -504,7 +513,7 @@ _ERRORS = {
     429: "Rate-limited by the model provider; see Retry-After.",
     502: "The model or embedding provider failed.",
     503: "The model provider is temporarily unavailable; see Retry-After.",
-    504: "The model provider timed out.",
+    504: "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
 }
 
 
@@ -836,8 +845,34 @@ def memories_router(
             )
 
     @router.post("/wait", responses=_ok(WaitResult))
-    def wait() -> V1Json:
-        memory.wait()
+    def wait(http: Request, request: WaitRequest | None = None) -> V1Json:
+        """给了 user_id、agent_id 时只等这个空间（要在作用域里）；不给时管理令牌（没配令牌时的
+        本机演示）等全部，限定作用域的令牌只等它能访问的空间。以前不看作用域、等全部用户的抽取：
+        限定作用域的令牌也能占着一个线程，还能从等了多久看出别的用户排着多少抽取。最多等
+        WAIT_TIMEOUT_S 秒，没做完时 504（timeout，type TimeoutError）。"""
+        request = request or WaitRequest()
+        timeout = min(
+            request.timeout if request.timeout is not None else WAIT_TIMEOUT_S, WAIT_TIMEOUT_S
+        )
+        who = principal_of(http)
+        user_id, agent_id = request.user_id, request.agent_id
+        try:
+            if user_id is not None or agent_id is not None:
+                with _sdk_errors():
+                    allow(http, user_id, agent_id)
+                memory.wait(user_id=user_id, agent_id=agent_id, timeout=timeout)
+            elif who.admin:
+                memory.wait(timeout=timeout)
+            else:
+                worker = memory.system.worker
+                if worker is not None and not worker.wait(who.allows, timeout):
+                    raise TimeoutError
+        except TimeoutError as exc:
+            raise V1Error(
+                504,
+                f"Extraction did not finish within {timeout:g}s; it continues in the background.",
+                error_type="TimeoutError",
+            ) from exc
         return {"ok": True}
 
     @router.get("/status", responses=_ok(StatusResult))

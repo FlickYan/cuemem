@@ -151,7 +151,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -447,7 +447,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -642,7 +642,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -794,7 +794,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -975,7 +975,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1141,7 +1141,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1314,7 +1314,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1475,7 +1475,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1634,7 +1634,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1777,7 +1777,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1934,7 +1934,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2120,7 +2120,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2272,7 +2272,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2429,7 +2429,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2586,7 +2586,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2609,7 +2609,25 @@
           "memories (v1)"
         ],
         "summary": "Wait",
+        "description": "给了 user_id、agent_id 时只等这个空间（要在作用域里）；不给时管理令牌（没配令牌时的\n本机演示）等全部，限定作用域的令牌只等它能访问的空间。以前不看作用域、等全部用户的抽取：\n限定作用域的令牌也能占着一个线程，还能从等了多久看出别的用户排着多少抽取。最多等\nWAIT_TIMEOUT_S 秒，没做完时 504（timeout，type TimeoutError）。",
         "operationId": "wait_api_v1_wait_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/WaitRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2733,7 +2751,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2919,7 +2937,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3110,7 +3128,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3262,7 +3280,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3412,7 +3430,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -5797,6 +5815,47 @@
         ],
         "title": "V1ErrorBody",
         "description": "Every /api/v1 error has this shape, including 401, 404 and 422."
+      },
+      "WaitRequest": {
+        "properties": {
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout",
+            "description": "Seconds; at most 300"
+          }
+        },
+        "type": "object",
+        "title": "WaitRequest"
       },
       "WaitResult": {
         "properties": {

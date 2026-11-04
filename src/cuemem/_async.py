@@ -116,9 +116,15 @@ class AsyncMethods:
             self.sync.consolidate, user_id=user_id, agent_id=agent_id, rebuild=rebuild
         )
 
-    async def wait(self) -> None:
+    async def wait(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
         """见 Memory.wait。"""
-        await asyncio.to_thread(self.sync.wait)
+        await asyncio.to_thread(self.sync.wait, user_id=user_id, agent_id=agent_id, timeout=timeout)
 
     async def status(
         self, *, user_id: str | None = None, agent_id: str | None = None
