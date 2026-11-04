@@ -343,6 +343,19 @@ def test_consolidate_inspect_and_forget(
     assert "走L2" in flat and "检索计划（LLM）" in flat and "充分性检查1：够了" in flat
     assert runner.invoke(app, [*args, "--mode", "bogus"]).exit_code == 1
 
+    result = runner.invoke(app, ["forget", "--space", "demo"])  # 没说删什么
+    assert result.exit_code == 1 and "请用--session、--turn或--fact指定" in _flat(result.output)
+    with MemorySystem.from_settings(load_settings()) as system:
+        turns = len(system.db.get_turns("demo"))
+    # 预演：列出会删的发言，什么都不删
+    result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "预演：将删除4条发言（什么都还没删）" in flat and "会话s4" in flat
+    with MemorySystem.from_settings(load_settings()) as system:
+        assert len(system.db.get_turns("demo")) == turns
+    result = runner.invoke(app, ["forget", "--space", "demo", "--session", "nope", "--yes"])
+    assert result.exit_code == 0 and "没有找到要删除的内容。" in result.output
     result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4"], input="n\n")
     assert result.exit_code == 1  # 没有确认，不删除
     result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4", "--yes"])

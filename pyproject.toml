@@ -117,4 +117,6 @@ ignore_missing_imports = true  # scipy、scikit-learn 没有自带类型标注
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -m 'not live'"
+# 单个测试超过 120 秒时打印全部线程的调用栈（只打印一次，不中止）：死锁时 CI 日志里有现场
+faulthandler_timeout = 120
 markers = ["live: 需要真实 API Key 的联网测试，用 `uv run pytest -m live` 运行"]

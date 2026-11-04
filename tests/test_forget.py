@@ -36,7 +36,7 @@ import cuemem.llm.client as llm_client
 from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.ids import content_hash
-from cuemem.core.models import Conversation, SessionIn, TurnIn
+from cuemem.core.models import Conversation, MediaItem, MemoryUnit, SessionIn, Turn, TurnIn
 from cuemem.core.trace import Trace
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
@@ -182,6 +182,113 @@ def test_forget_unknown_target_is_noop(system: MemorySystem) -> None:
     report = system.forget("demo", session_ids=["nope"])
     assert report.turns_deleted == 0
     assert len(system.facts("demo")) == before
+
+
+def _reply(system: MemorySystem, session_id: str) -> Turn:
+    return next(t for t in system.db.get_turns("demo", session_id) if t.role == "assistant")
+
+
+def _round_of(system: MemorySystem, turn: Turn) -> MemoryUnit:
+    rounds = system.db.list_units("demo", kinds=["round"], session_ids=[turn.session_id])
+    return next(u for u in rounds if turn.id in u.source_turn_ids)
+
+
+def _photo(system: MemorySystem, turn: Turn, tmp_path: Path) -> MediaItem:
+    """给一条发言登记一张图（只登记记录，不走看图的流程）。"""
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (8, 8), "red").save(path)
+    item = MediaItem(
+        id="img-1",
+        space_id="demo",
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        path=str(path),
+        source_turn_id=turn.id,
+        ts=turn.ts,
+    )
+    system.db.add_media([item])
+    return item
+
+
+def test_forget_follows_citations_transitively(system: MemorySystem) -> None:
+    """s2 的回复引用了 s1 的一轮，s3 的回复又引用了 s2 那一轮：遗忘 s1 时两轮都删（第二跳）。
+    以前只有一跳的测试，扩散在第一跳之后就停下也没有测试发现（第五轮体检）。"""
+    s1_round = system.db.list_units("demo", kinds=["round"], session_ids=["s1"])[0]
+    t2, t3 = _reply(system, "s2"), _reply(system, "s3")
+    r2, r3 = _round_of(system, t2), _round_of(system, t3)
+    system.db.add_provenance("demo", t2.id, [s1_round.id])
+    system.db.add_provenance("demo", t3.id, [r2.id])
+    s1 = {t.id for t in system.db.get_turns("demo", "s1")}
+    expected = s1 | set(r2.source_turn_ids) | set(r3.source_turn_ids)
+    before = {t.id for t in system.db.get_turns("demo")}
+
+    preview = system.preview_forget("demo", session_ids=["s1"])
+    report = system.forget("demo", session_ids=["s1"])
+
+    deleted = before - {t.id for t in system.db.get_turns("demo")}
+    assert deleted == expected and {t["id"] for t in preview["turns"]} == expected
+    assert report.cascaded == preview["cascaded"] == 4  # s2 与 s3 各一轮（问话与回复）
+    assert report.turns_deleted == len(expected)
+
+
+def test_forget_follows_citations_of_an_image(system: MemorySystem, tmp_path: Path) -> None:
+    """后来的回复只引用了被删会话里的一张图（没有引用那一轮或事实）：那一轮同样要删。"""
+    user = next(t for t in system.db.get_turns("demo", "s1") if t.role == "user")
+    photo = _photo(system, user, tmp_path)
+    t2 = _reply(system, "s2")
+    system.db.add_provenance("demo", t2.id, [photo.id])
+    r2 = set(_round_of(system, t2).source_turn_ids)
+    report = system.forget("demo", session_ids=["s1"])
+    assert report.cascaded == len(r2) == 2  # 引用了图的那一轮（问话与回复）
+    assert not r2 & {t.id for t in system.db.get_turns("demo")}
+
+
+def test_forget_removes_traces_that_only_saw_the_deleted_image(
+    system: MemorySystem, tmp_path: Path
+) -> None:
+    """trace 里只记着被删图片的 ID（以图搜图、看图的检索记录，没有原话也没有那一轮的 ID）：
+    回答模型看过这张图，trace 一起删。"""
+    assert system.tracer is not None
+    user = next(t for t in system.db.get_turns("demo", "s1") if t.role == "user")
+    photo = _photo(system, user, tmp_path)
+    seen = Trace("retrieve", space="demo", question="what was in the picture?")
+    seen.spans.append({"name": "image_search", "hits": [photo.id]})
+    system.tracer.write(seen)
+    unrelated = Trace("retrieve", space="demo", question="what is the dog's name?")
+    unrelated.spans.append({"name": "image_search", "hits": ["img-other"]})
+    system.tracer.write(unrelated)
+
+    report = system.forget("demo", turn_ids=[user.id])
+    assert report.traces_removed == 1
+    assert photo.id not in _traces(system) and "img-other" in _traces(system)
+
+
+def test_a_trace_cleanup_that_raises_is_reported_not_raised(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """遗忘提交之后清理 trace 抛出了意料之外的异常（D-070 T5）：记一条警告，在遗忘的 trace 里
+    记下 traces_left=["*"]，接着清理向量缓存，遗忘照常返回。"""
+    s4_texts = [u.text for u in system.db.list_units("demo") if SECRET in u.text]
+    assert isinstance(system.embedder, CachedEmbedder)
+    assert system.embedder.cached(s4_texts, "document") == set(s4_texts)
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("trace sink exploded")
+
+    monkeypatch.setattr(system, "_remove_traces", broken)
+    with caplog.at_level("WARNING", "cuemem.memory"):
+        report = system.forget("demo", session_ids=["s4"])
+    monkeypatch.undo()
+
+    assert report.turns_deleted == 4 and report.traces_removed == 0
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        "遗忘 demo：trace 没能清理，里面可能还有被删的内容"
+    ]
+    # 第 6 步照样做了：被删文本的向量清掉了
+    assert report.embed_cache_purged >= len(s4_texts) > 0
+    assert system.embedder.cached(s4_texts, "document") == set()
+    records = [json.loads(line) for line in _traces(system).splitlines()]
+    [forget] = [r for r in records if r["name"] == "forget"]
+    assert forget["attrs"]["traces_left"] == ["*"]
 
 
 def _org(name: str, description: str, kind: str = "organization") -> dict[str, Any]:

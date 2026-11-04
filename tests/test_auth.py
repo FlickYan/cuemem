@@ -13,6 +13,7 @@ import json
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from cuemem.api.auth import ADMIN, Keys, Principal, Scope
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
+from cuemem.core.models import SessionIn, TurnIn
 from cuemem.errors import AccessKeysError, MemoryAPIError
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for, space_owner
@@ -963,9 +965,13 @@ def test_key_limits_are_validated() -> None:
 # ---------- 界面 ----------
 
 
-def _ui_call(http: TestClient, name: str, data: list[Any]) -> str:
-    """调用界面的一个事件（与浏览器里的界面走同一条路），返回 SSE 的全文。"""
-    posted = http.post(f"/gradio_api/call/{name}", json={"data": data})
+def _ui_call(http: TestClient, name: str, data: list[Any], session: str | None = None) -> str:
+    """调用界面的一个事件（与浏览器里的界面走同一条路），返回 SSE 的全文。session：同一个页面
+    （Gradio 的 session_hash），事件改过的组件（例如下拉框的选项）在同一个页面的后续事件里有效。"""
+    body: dict[str, Any] = {"data": data}
+    if session is not None:
+        body["session_hash"] = session
+    posted = http.post(f"/gradio_api/call/{name}", json=body)
     assert posted.status_code == 200, posted.text
     return http.get(f"/gradio_api/call/{name}/{posted.json()['event_id']}").text
 
@@ -1127,6 +1133,49 @@ def test_ui_rejects_server_side_paths(
     copies = [*(tmp_path / "gradio").rglob(".env"), *(tmp_path / "gradio").rglob("secret.png")]
     assert copies == []  # 没有复制进 Gradio 的缓存
     assert system.db.get_media("alice") == []
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_ui_forget(
+    ui_alice: tuple[TestClient, MemorySystem], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """界面的遗忘：按事实、按会话删，什么都没选时提示先选，重建失败时说明删了、只是重建没做完。
+    以前只测了作用域之外的拒绝。"""
+    http, system = ui_alice
+    for n, text in enumerate(("My PIN is 4321.", "I live in Lisbon.", "I play the cello.")):
+        when = datetime(2025, 6, 1 + n)
+        turns = [TurnIn(role="user", text=text, ts=when)]
+        system.append("alice", SessionIn(session_id=f"s{n}", started_at=when, turns=turns), 0)
+    system.consolidate("alice")
+    pin = next(f.id for f in system.facts("alice") if "4321" in f.statement)
+
+    def forget(kind: str, target: str | None) -> str:
+        # 与页面上一样：先按种类列出可选的（下拉框只接受列出来的），再遗忘
+        assert "event: error" not in _ui_call(http, "choices", ["alice", kind], "page")
+        out = _ui_call(http, "forget", ["alice", kind, target], "page")
+        assert "event: error" not in out, out
+        [reply] = _last_data(out)
+        return str(reply)
+
+    out = forget("fact", pin)
+    assert "Forgot 1 conversation turn(s); facts 3 → 2" in out
+    assert not any("4321" in f.statement for f in system.facts("alice"))
+
+    out = forget("session", "s1")
+    assert "Forgot 1 conversation turn(s)" in out and system.db.get_turns("alice", "s1") == []
+
+    out = forget("session", None)
+    assert "Pick something to forget first." in out
+    assert system.db.get_turns("alice", "s2")
+
+    def broken(space_id: str) -> Any:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(system.consolidator, "run", broken)
+    out = forget("session", "s2")
+    assert "Forgot 1 conversation turn(s). Rebuilding the memory" in out
+    assert "failed (" in out and "provider down" in out
+    assert system.db.get_turns("alice", "s2") == []
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
