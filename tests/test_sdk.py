@@ -1445,6 +1445,27 @@ def naming(memory: Memory, user: str) -> tuple[list[str], bool, int]:
     return keys, user.encode() in paths.db.read_bytes(), len(traces)
 
 
+def test_deleting_a_user_with_more_turns_than_sqlite_takes_parameters(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第五轮复审：遗忘整个用户时 get_media(turn_ids=…) 与 citing_turns 一条 SQL 带上全部的轮、
+    事实与图片，超过 SQLite 的参数上限（3.32 起 32766：几万句的用户）就 "too many SQL
+    variables"、什么都没删。这里把上限降到 600（别处的分批是 500 个），批次降到 100。"""
+    import cuemem.store.sqlite as sqlite_module
+
+    memory.add("I live in Berlin", user_id="u", wait=True)
+    talk = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(700)]
+    memory.add(talk, user_id="u", infer=False)
+    db = memory.system.db
+    monkeypatch.setattr(sqlite_module, "IN_CHUNK", 100)
+    db._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 600)
+    many = [f"x{i}" for i in range(700)]
+    assert db.get_media("u", turn_ids=many) == [] and db.citing_turns("u", many) == []
+    assert db.get_facts("u", session_ids=many) == []
+    memory.delete_all(user_id="u")
+    assert memory.get_all(user_id="u") == {"results": []} and db.get_turns("u") == []
+
+
 @pytest.mark.parametrize("how", ["delete_all", "reset"])
 def test_delete_all_and_reset_leave_nothing_naming_the_user(memory: Memory, how: str) -> None:
     """delete_all 与 reset 之后，库里与 trace 里不再有写着这个用户 ID（常常是邮箱）的东西。以前

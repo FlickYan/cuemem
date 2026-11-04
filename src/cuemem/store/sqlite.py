@@ -617,6 +617,21 @@ class MemoryDB:
             rows.setdefault(r[0], r)
         return [_row_to_turn(r) for r in sorted(rows.values(), key=_turn_order)]
 
+    def _in_chunks(
+        self, sql: str, args: list[Any], column: str, values: Sequence[Any], order: str = ""
+    ) -> list[Sequence[Any]]:
+        """sql AND column IN values 分批执行（每批 IN_CHUNK 个，重复的值只查一次），行按批次
+        接起来；给了 order 时每批 ORDER BY order，分了几批的由调用方再排一次。"""
+        unique = list(dict.fromkeys(values))
+        rows: list[Sequence[Any]] = []
+        for start in range(0, len(unique), IN_CHUNK):
+            chunk = unique[start : start + IN_CHUNK]
+            query = f"{sql} AND {column} IN ({', '.join('?' for _ in chunk)})"
+            query += f" ORDER BY {order}" if order else ""
+            with self._lock:
+                rows.extend(self._conn.execute(query, [*args, *chunk]).fetchall())
+        return rows
+
     def _turn_rows(
         self, sql: str, args: list[Any], column: str, values: Sequence[str]
     ) -> list[Sequence[Any]]:
@@ -710,17 +725,11 @@ class MemoryDB:
             )
 
     def citing_turns(self, space_id: str, targets: Sequence[str]) -> list[str]:
-        """引用过这些记忆的发言。"""
-        if not targets:
-            return []
-        marks = ", ".join("?" * len(targets))
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT turn_id FROM provenance"
-                f" WHERE space_id = ? AND target IN ({marks})",
-                [space_id, *targets],
-            ).fetchall()
-        return [r[0] for r in rows]
+        """引用过这些记忆的发言。targets 分批查（IN_CHUNK）：删掉整个用户时遗忘的轮、事实与图片
+        可以有几万个，以前一条 SQL 超过 SQLite 的参数上限（3.32 起 32766）就报错、什么都没删。"""
+        sql = "SELECT DISTINCT turn_id FROM provenance WHERE space_id = ?"
+        rows = self._in_chunks(sql, [space_id], "target", targets)
+        return list(dict.fromkeys(r[0] for r in rows))
 
     def provenance(self, space_id: str, turn_id: str) -> list[str]:
         with self._lock:
@@ -902,17 +911,26 @@ class MemoryDB:
         ids: Sequence[str] | None = None,
         turn_ids: Sequence[str] | None = None,
     ) -> list[MediaItem]:
+        """图片，按 ts、id 排。ids 与 turn_ids 里长的那个分批查（IN_CHUNK）：遗忘整个用户时的
+        turn_ids 可以有几万个，以前一条 SQL 超过 SQLite 的参数上限就报错、什么都没删。"""
         sql = f"SELECT {_MEDIA_COLUMNS} FROM media WHERE space_id = ?"
         args: list[Any] = [space_id]
-        for column, values in (("id", ids), ("source_turn_id", turn_ids)):
-            if values is not None:
-                if not values:
-                    return []
+        given = [(c, v) for c, v in (("id", ids), ("source_turn_id", turn_ids)) if v is not None]
+        if any(not values for _, values in given):
+            return []
+        if not given:
+            with self._lock:
+                fetched = self._conn.execute(f"{sql} ORDER BY ts, id", args).fetchall()
+            return [_row_to_media(r) for r in fetched]
+        longest = max(range(len(given)), key=lambda i: len(given[i][1]))
+        for i, (column, values) in enumerate(given):
+            if i != longest:
                 sql += f" AND {column} IN ({', '.join('?' for _ in values)})"
                 args.extend(values)
-        sql += " ORDER BY ts, id"
-        with self._lock:
-            fetched = self._conn.execute(sql, args).fetchall()
+        column, values = given[longest]
+        fetched = self._in_chunks(sql, args, column, values, "ts, id")
+        if len(set(values)) > IN_CHUNK:
+            fetched.sort(key=lambda r: (r[9] or "", r[0]))  # 同 ORDER BY ts, id（NULL 在前）
         return [_row_to_media(r) for r in fetched]
 
     def set_media_captions(self, items: Sequence[MediaItem]) -> None:
@@ -1054,11 +1072,8 @@ class MemoryDB:
                 return []
             sql += f" AND superseded_by IN ({', '.join('?' for _ in superseded_by)})"
             args.extend(superseded_by)
-        if session_ids is not None:  # 这几个会话里抽出的事实
-            if not session_ids:
-                return []
-            sql += f" AND session_id IN ({', '.join('?' for _ in session_ids)})"
-            args.extend(session_ids)
+        if session_ids is not None and not session_ids:  # 这几个会话里抽出的事实（见下）
+            return []
         if valid_period is not None:
             # 与这段时间有重叠：起点不晚于段尾、终点晚于段首。存下的部分日期按字典序比较即可：
             # '2023-05' <= '2023-05-31'。查询的一端是部分日期时不行（'2023-05-07' <= '2023-05'
@@ -1073,9 +1088,13 @@ class MemoryDB:
         if known_at is not None:
             sql += " AND recorded_at <= ? AND (invalidated_at IS NULL OR ? < invalidated_at)"
             args.extend([known_at.isoformat(), known_at.isoformat()])
-        sql += " ORDER BY recorded_at, id"
-        with self._lock:
-            fetched = self._conn.execute(sql, args).fetchall()
+        if session_ids is not None:  # 分批查（IN_CHUNK）：过期的发言可以出自几万个会话
+            fetched = self._in_chunks(sql, args, "session_id", session_ids, "recorded_at, id")
+            if len(set(session_ids)) > IN_CHUNK:
+                fetched.sort(key=lambda r: (r[12], r[0]))  # 同 ORDER BY recorded_at, id
+        else:
+            with self._lock:
+                fetched = self._conn.execute(f"{sql} ORDER BY recorded_at, id", args).fetchall()
         facts = [_row_to_fact(r) for r in fetched]
         if ids is not None:
             order = {fid: i for i, fid in enumerate(ids)}
