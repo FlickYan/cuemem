@@ -396,6 +396,73 @@ def test_vector_store_search_and_filters(tmp_path: Path) -> None:
     reopened.close()
 
 
+def _commits(store: VectorStore, name: str) -> list[str]:
+    """记下这个本地模式集合的 SQLite 连接上执行的 COMMIT（qdrant-client 的内部属性）。"""
+    seen: list[str] = []
+    conn = store._client._client.collections[name].storage.storage
+    conn.set_trace_callback(lambda sql: seen.append(sql) if sql.upper() == "COMMIT" else None)
+    return seen
+
+
+def test_local_writes_commit_once_per_call_and_persist(tmp_path: Path) -> None:
+    """本地模式一次写入只提交一次 SQLite：qdrant-client 每写一个点提交一次（每次一个 fsync），
+    遗忘删 1 万个向量时全程拿着向量库的锁，别的用户的检索最多等了 13.6 秒（第五轮体检）。重新
+    打开之后点数、payload 与图片都在。"""
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    ids = [f"u{i}" for i in range(300)]
+    dense = l2_normalize(np.random.default_rng(0).random((300, 4)).astype(np.float32))
+    payloads = [{"kind": "round", "ts": float(i)} for i in range(300)]
+    store.ensure_space("s")
+    commits = _commits(store, store.collection_name("s"))
+    store.upsert("s", ids, dense, None, payloads)
+    assert len(commits) <= 2  # 以前 300 次
+    store.set_payload("s", ids[:100], {"kind": "fact"})
+    store.delete("s", ids[150:])
+    assert len(commits) <= 6
+    image = l2_normalize(np.ones((3, 2), dtype=np.float32))
+    store.upsert_images("s", ["m1", "m2", "m3"], image, [{}, {}, {}])
+    store.delete_images("s", ["m2"])
+    store.close()
+
+    reopened = VectorStore(tmp_path / "qdrant", dim=4)
+    assert reopened.count("s") == 150 and reopened.count("s", kinds=["fact"]) == 100
+    assert sorted(reopened.unit_ids("s"), key=lambda u: int(u[1:])) == ids[:150]
+    hits = reopened.search_dense("s", dense[120], 1, kinds=["round"], ts_range=(120.0, 120.0))
+    assert [h.unit_id for h in hits] == ["u120"]
+    images = reopened.search_images("s", np.ones(2) / np.sqrt(2), 3)
+    assert sorted(h.unit_id for h in images) == ["m1", "m3"]
+    reopened.close()
+
+
+def test_local_writes_fall_back_when_qdrant_internals_differ(tmp_path: Path) -> None:
+    """qdrant-client 的内部属性对不上时（这里集合的连接已经被换成别的对象）照旧每个点提交一次，
+    写入照常、重新打开之后都在。"""
+
+    class Counting:
+        def __init__(self, conn: Any) -> None:
+            self.conn, self.commits = conn, 0
+
+        def commit(self) -> None:
+            self.commits += 1
+            self.conn.commit()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.conn, name)
+
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    store.ensure_space("s")
+    persistence = store._client._client.collections[store.collection_name("s")].storage
+    counting = persistence.storage = Counting(persistence.storage)
+    dense = l2_normalize(np.ones((5, 4), dtype=np.float32))
+    store.upsert("s", [f"u{i}" for i in range(5)], dense, None, [{"kind": "round"}] * 5)
+    store.delete("s", ["u0"])
+    assert counting.commits == 6 and persistence.storage is counting
+    store.close()
+    reopened = VectorStore(tmp_path / "qdrant", dim=4)
+    assert reopened.count("s") == 4
+    reopened.close()
+
+
 def test_locked_local_store_explains_itself(tmp_path: Path) -> None:
     """Qdrant 本地模式一次只允许一个进程打开：第二个打开者得到能看懂的报错，而不是库内部的异常。"""
     first = VectorStore(tmp_path / "qdrant", dim=4)

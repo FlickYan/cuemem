@@ -160,7 +160,9 @@ class VectorStore:
             )
         with self._lock:
             self.ensure_space(space_id)
-            self._client.upsert(self.collection_name(space_id), points=points)
+            name = self.collection_name(space_id)
+            with self._batched(name):
+                self._client.upsert(name, points=points)
 
     def search_dense(
         self,
@@ -211,10 +213,11 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return
-            self._client.delete(
-                name,
-                points_selector=models.PointIdsList(points=[point_uuid(u) for u in unit_ids]),
-            )
+            with self._batched(name):
+                self._client.delete(
+                    name,
+                    points_selector=models.PointIdsList(points=[point_uuid(u) for u in unit_ids]),
+                )
 
     def set_payload(self, space_id: str, unit_ids: Sequence[str], payload: dict[str, Any]) -> None:
         """更新若干点的 payload，例如事实被取代后把 current 改为 False，供过滤检索使用。"""
@@ -224,9 +227,10 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return
-            self._client.set_payload(
-                name, payload=payload, points=[point_uuid(u) for u in unit_ids]
-            )
+            with self._batched(name):
+                self._client.set_payload(
+                    name, payload=payload, points=[point_uuid(u) for u in unit_ids]
+                )
 
     # ---------- 图片向量（N6）：每个空间另建一个集合，维度与文本向量不同 ----------
 
@@ -259,7 +263,8 @@ class VectorStore:
                             )
                         },
                     )
-            self._client.upsert(name, points=points)
+            with self._batched(name):
+                self._client.upsert(name, points=points)
 
     def search_images(self, space_id: str, vector: FloatArray, k: int) -> list[VectorHit]:
         """以文搜图 / 以图搜图：返回（图片 ID，余弦相似度）。"""
@@ -283,13 +288,43 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return
-            self._client.delete(
-                name,
-                points_selector=models.PointIdsList(points=[point_uuid(m) for m in media_ids]),
-            )
+            with self._batched(name):
+                self._client.delete(
+                    name,
+                    points_selector=models.PointIdsList(points=[point_uuid(m) for m in media_ids]),
+                )
 
     def _image_collection(self, space_id: str) -> str:
         return f"{self.collection_name(space_id)}{IMAGE_SUFFIX}"
+
+    @contextmanager
+    def _batched(self, name: str) -> Iterator[None]:
+        """一次写入（upsert、delete、set_payload）只提交一次本地模式的 SQLite（调用方持有
+        self._lock）。qdrant-client 的本地模式每写一个点提交一次（CollectionPersistence.persist
+        与 delete），默认的回滚日志加 synchronous=FULL，每个点一次 fsync：遗忘一次删掉 1 万个
+        派生向量，全程拿着 self._lock，别的用户的检索最多等了 13.6 秒（第五轮体检）。这里把
+        这个集合的连接换成 commit 什么都不做的替身，做完再提交一次；点、顺序与内容都不变。
+
+        出错时也提交：内存里的集合已经改了，写下已经写的，磁盘与内存才一致（与以前每个点一提交
+        相同）。进程中途被杀时这一次写入在磁盘上整个没有（以前留下前面一部分点）：遗忘先删向量、
+        后删记录，这等于什么都没删，正是遗忘当作安全的状态。
+
+        用的是 qdrant-client 的内部属性（QdrantLocal.collections、LocalCollection.storage、
+        CollectionPersistence.storage）：对不上时（服务端模式、只放在内存里、以后的 qdrant-client
+        改了）照旧每个点提交一次。"""
+        local = getattr(self._client, "_client", None) if not self.remote and self._path else None
+        collection = getattr(local, "collections", {}).get(name) if local is not None else None
+        persistence: Any = getattr(collection, "storage", None)
+        real = getattr(persistence, "storage", None)
+        if not isinstance(real, sqlite3.Connection):
+            yield
+            return
+        persistence.storage = _NoCommit(real)
+        try:
+            yield
+        finally:
+            persistence.storage = real
+            real.commit()
 
     @contextmanager
     def _creating(self) -> Iterator[None]:
@@ -382,7 +417,7 @@ class VectorStore:
                     for r in records
                 ]
                 if points:
-                    with target._lock:
+                    with target._lock, target._batched(name):
                         target._client.upsert(name, points=points)
                 counts[name] += len(points)
                 if offset is None:
@@ -427,6 +462,19 @@ class VectorStore:
             for point in response.points
             if point.payload
         ]
+
+
+class _NoCommit:
+    """本地模式集合的 SQLite 连接的替身：commit 什么都不做，其余原样交给连接（见 _batched）。"""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def commit(self) -> None:
+        pass
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
 
 
 def _safe(space_id: str) -> str:
