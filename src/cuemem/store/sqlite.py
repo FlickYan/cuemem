@@ -201,6 +201,7 @@ _MEDIA_COLUMNS = (
     "id, space_id, sha256, path, caption, ocr_text, tags, entity_ids, source_turn_id, ts,"
     " caption_iso, width, height"
 )
+IN_CHUNK = 900  # 一条 SQL 的 IN (...) 里最多放几个参数（SQLite 旧版本的上限是 999）
 TURN_WRITES_KEPT = 100_000  # 记着写入次数的会话数（见 turns_version），超过时清空、换一代
 _IDX = "next-idx:"
 _LEGACY_IDX = "next_idx:"
@@ -553,22 +554,58 @@ class MemoryDB:
         session_id: str | None = None,
         *,
         ids: Sequence[str] | None = None,
+        session_ids: Sequence[str] | None = None,
     ) -> list[Turn]:
+        """按日志顺序（ts, session_id, idx）返回发言。ids、session_ids 只取其中的（与 session_id
+        一起时取交集）；很长的列表分批查，再按同样的顺序合起来（见 _turn_rows）。"""
         sql = "SELECT id, space_id, session_id, idx, role, text, ts, media_ids, speaker FROM turns"
         sql += " WHERE space_id = ?"
         args: list[Any] = [space_id]
         if session_id is not None:
             sql += " AND session_id = ?"
             args.append(session_id)
+        if ids is not None and session_ids is not None:
+            sessions = set(session_ids)
+            rows = self._turn_rows(sql, args, "id", ids)
+            return [_row_to_turn(r) for r in rows if r[2] in sessions]
         if ids is not None:
-            if not ids:
-                return []
-            sql += f" AND id IN ({', '.join('?' for _ in ids)})"
-            args.extend(ids)
+            return [_row_to_turn(r) for r in self._turn_rows(sql, args, "id", ids)]
+        if session_ids is not None:
+            return [_row_to_turn(r) for r in self._turn_rows(sql, args, "session_id", session_ids)]
         sql += " ORDER BY ts, session_id, idx"
         with self._lock:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_turn(r) for r in fetched]
+
+    def turns_of(
+        self, space_id: str, *, ids: Sequence[str] = (), session_ids: Sequence[str] = ()
+    ) -> list[Turn]:
+        """ids 里的发言加上 session_ids 里的会话的全部发言（并集，去重），按日志顺序返回：遗忘
+        只读要删的这几个会话，不再读整个空间（第五轮体检：5 万轮的空间删一个会话 4.2 秒）。"""
+        sql = "SELECT id, space_id, session_id, idx, role, text, ts, media_ids, speaker FROM turns"
+        sql += " WHERE space_id = ?"
+        rows = {r[0]: r for r in self._turn_rows(sql, [space_id], "session_id", session_ids)}
+        for r in self._turn_rows(sql, [space_id], "id", ids):
+            rows.setdefault(r[0], r)
+        return [_row_to_turn(r) for r in sorted(rows.values(), key=_turn_order)]
+
+    def _turn_rows(
+        self, sql: str, args: list[Any], column: str, values: Sequence[str]
+    ) -> list[Sequence[Any]]:
+        """按 column IN values 分批（每批 IN_CHUNK 个）取发言的行，按 ORDER BY ts, session_id, idx
+        的顺序合起来：按存的原文排序（ts 是 TEXT，以前写进去的带时区的行按原文比较），与一次查完
+        的 ORDER BY 相同。"""
+        unique = list(dict.fromkeys(values))
+        rows: list[Sequence[Any]] = []
+        for start in range(0, len(unique), IN_CHUNK):
+            chunk = unique[start : start + IN_CHUNK]
+            query = f"{sql} AND {column} IN ({', '.join('?' for _ in chunk)})"
+            query += " ORDER BY ts, session_id, idx"
+            with self._lock:
+                rows.extend(self._conn.execute(query, [*args, *chunk]).fetchall())
+        if len(unique) > IN_CHUNK:
+            rows.sort(key=_turn_order)
+        return rows
 
     def delete_turns(self, space_id: str, turn_ids: Sequence[str]) -> int:
         """删除原始轮次（遗忘）；会话里的轮次全部删除后，会话本身也删除，连同它的 next_idx
@@ -707,15 +744,48 @@ class MemoryDB:
         if kinds is not None:
             sql += f" AND kind IN ({', '.join('?' for _ in kinds)})"
             args.extend(kinds)
-        if session_ids is not None:
-            if not session_ids:
-                return []
-            sql += f" AND session_id IN ({', '.join('?' for _ in session_ids)})"
-            args.extend(session_ids)
+        if session_ids is not None:  # 很长的列表分批查，再按 ORDER BY ts, id 合起来
+            unique = list(dict.fromkeys(session_ids))
+            rows: list[Sequence[Any]] = []
+            for start in range(0, len(unique), IN_CHUNK):
+                chunk = unique[start : start + IN_CHUNK]
+                query = f"{sql} AND session_id IN ({', '.join('?' for _ in chunk)})"
+                with self._lock:
+                    rows.extend(
+                        self._conn.execute(query + " ORDER BY ts, id", [*args, *chunk]).fetchall()
+                    )
+            if len(unique) > IN_CHUNK:
+                rows.sort(key=lambda r: (r[5], r[0]))
+            return [_row_to_unit(r) for r in rows]
         sql += " ORDER BY ts, id"
         with self._lock:
             fetched = self._conn.execute(sql, args).fetchall()
         return [_row_to_unit(r) for r in fetched]
+
+    def unit_texts(self, space_id: str, *, kinds_not: Sequence[str] = ()) -> list[str]:
+        """这个空间的记忆单元的文本（不要 kinds_not 里的几种），只读 text 一列：遗忘时记下派生
+        记忆的文本，不再把整个空间的记忆单元解出来（见 MemorySystem.forget）。"""
+        sql = "SELECT text FROM units WHERE space_id = ?"
+        if kinds_not:
+            sql += f" AND kind NOT IN ({', '.join('?' for _ in kinds_not)})"
+        with self._lock:
+            rows = self._conn.execute(sql, [space_id, *kinds_not]).fetchall()
+        return [r[0] for r in rows]
+
+    def existing_texts(self, space_id: str, texts: Iterable[str]) -> set[str]:
+        """texts 里还有记忆单元用着的那些（分批查）。"""
+        unique = list(dict.fromkeys(texts))
+        found: set[str] = set()
+        for start in range(0, len(unique), IN_CHUNK):
+            chunk = unique[start : start + IN_CHUNK]
+            marks = ", ".join("?" for _ in chunk)
+            with self._lock:
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT text FROM units WHERE space_id = ? AND text IN ({marks})",
+                    [space_id, *chunk],
+                ).fetchall()
+            found.update(r[0] for r in rows)
+        return found
 
     def some_unit_ids(self, space_id: str, limit: int = 3) -> list[str]:
         """这个空间的几个记忆单元 ID，"轮"优先（在线写入时一定写了向量）：向量库据此确认旧名字的
@@ -1169,6 +1239,15 @@ class MemoryDB:
             ).fetchone()
         return row is not None
 
+    def job_counts(self, space_id: str) -> dict[str, int]:
+        """这个空间每种状态的任务各有几个（走 idx_jobs_space，不解出每个任务）：状态查询只要数目，
+        以前读出并 json.loads 每个任务，1 万个任务时 40 毫秒，界面每发一条消息查一次。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM jobs WHERE space_id = ? GROUP BY status", (space_id,)
+            ).fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+
     def get_jobs(self, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
         sql = (
             "SELECT id, session_id, version, content_hash, status, attempts, error, stats,"
@@ -1390,6 +1469,11 @@ def _dt(value: str) -> datetime:
     """读出的时间一律是本机时间、不带时区。写入时已经换算（见 core/models.py），这里照顾之前
     用带时区的时间写进去的行（'...+00:00'）：否则与新写入的行混在一起无法比较。"""
     return naive_local(datetime.fromisoformat(value))
+
+
+def _turn_order(r: Sequence[Any]) -> tuple[Any, ...]:
+    """发言的行按 ORDER BY ts, session_id, idx 的顺序（存的原文，与 SQLite 的比较相同）。"""
+    return (r[6], r[2], r[3])
 
 
 def _row_to_turn(r: Sequence[Any]) -> Turn:

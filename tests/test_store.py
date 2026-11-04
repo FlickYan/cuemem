@@ -46,6 +46,43 @@ def test_db_writes_are_idempotent(tmp_path: Path) -> None:
     assert db.list_spaces()[0]["turns"] == len(turns)
 
 
+def test_turn_and_unit_lookups_by_id_or_session_keep_log_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """按发言 ID、会话取发言与"轮"（遗忘只读要删的会话）：分批查的结果与一次查完相同，顺序是日志的
+    顺序（ts, session_id, idx）；以前写进去的带时区的时间按存的原文排，与 ORDER BY 相同。"""
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    conv = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8"))
+    db.ensure_space("demo")
+    for session in reversed(conv.sessions):  # 写入的先后与日志顺序相反
+        db.add_session("demo", session.session_id, session.started_at)
+        turns = build_turns("demo", session)
+        db.add_turns(turns)
+        db.add_units(build_rounds(turns))
+    with db.transaction() as conn:  # 以前带时区写进去的一行
+        conn.execute("UPDATE turns SET ts = ts || '+00:00' WHERE session_id = 's3' AND idx = 1")
+    everything = db.get_turns("demo")
+    rounds = db.list_units("demo", kinds=["round"])
+    ids = [*[t.id for t in everything][::-1], "no-such-turn"]
+    sessions = ["s4", "s2", "s3"]
+    expected = {
+        "ids": [t for t in everything if t.id in ids],
+        "sessions": [t for t in everything if t.session_id in sessions],
+        "both": [t for t in everything if t.id in ids[:7] or t.session_id in sessions],
+        "units": [u for u in rounds if u.session_id in sessions],
+    }
+    for chunk in (900, 2):
+        monkeypatch.setattr(sqlite_module, "IN_CHUNK", chunk)
+        assert db.get_turns("demo", ids=ids) == expected["ids"]
+        assert db.get_turns("demo", session_ids=sessions) == expected["sessions"]
+        assert db.turns_of("demo", ids=ids[:7], session_ids=sessions) == expected["both"]
+        assert db.list_units("demo", kinds=["round"], session_ids=sessions) == expected["units"]
+        texts = [u.text for u in rounds[:5]] + ["no such text"]
+        assert db.existing_texts("demo", texts) == set(texts[:5])
+    assert db.get_turns("demo", ids=[]) == db.get_turns("demo", session_ids=[]) == []
+    assert db.unit_texts("demo", kinds_not=["round"]) == []
+
+
 def test_nested_transactions_commit_only_at_the_outermost(tmp_path: Path) -> None:
     """嵌套的事务：外层出错时里层的写入一起撤销（以前里层自己提交了，撤不回来）；里层出错只撤销
     里层，外层接着写、照常提交。在线写入把发言、"轮"与巩固任务放在一个事务里（D-068 之后）。"""

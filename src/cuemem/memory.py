@@ -29,6 +29,7 @@ from cuemem.core.models import (
     Fact,
     Hit,
     MediaItem,
+    MemoryUnit,
     SessionIn,
     Turn,
     TurnMeta,
@@ -895,11 +896,13 @@ class MemorySystem:
             if not targets:
                 return ForgetReport(space_id, 0, [], 0, 0, 0, 0, 0.0)
             facts = self.db.get_facts(space_id)
-            units_now = self.db.list_units(space_id)
-            texts_before = {u.text for u in units_now}
+            # 只读受影响会话的"轮"与派生记忆的文本（以前每次遗忘把整个空间的记忆单元解出来两遍：
+            # 5 万轮的空间删一个会话 4.2 秒）。别的会话的"轮"这次不动，它们的文本一直在，
+            # 本来就不会被清理
+            old_rounds = self.db.list_units(space_id, kinds=["round"], session_ids=affected)
+            texts_before = {u.text for u in old_rounds}
+            texts_before.update(self.db.unit_texts(space_id, kinds_not=["round"]))
             doomed = {t.id for t in targets}
-            touched = set(affected)
-            old_rounds = [u for u in units_now if u.kind == "round" and u.session_id in touched]
             doomed_media = self.db.get_media(space_id, turn_ids=[t.id for t in targets])
             # 被删内容的记忆 ID：含有被删发言的轮、由它们抽出的事实、其中的图片（trace 按 ID
             # 记着回答模型看过哪些记忆）
@@ -911,7 +914,7 @@ class MemorySystem:
             #    记录的向量（与以前删旧"轮"相同，先删向量、后删记录）。出错时什么都没删
             new_rounds = self.writer.prepare_rounds(space_id, affected, doomed)
             kept = {u.id for u in new_rounds}
-            derived = [u.id for u in units_now if u.kind != "round"]
+            derived = self.db.derived_unit_ids(space_id)
             self.vectors.delete(space_id, [u.id for u in old_rounds if u.id not in kept] + derived)
             self.vectors.delete_images(space_id, [m.id for m in doomed_media])
 
@@ -988,9 +991,18 @@ class MemorySystem:
                     #    （提问只记在那里），这些向量再也清不掉。没清理的不重试
                     embed_purged = 0
                     try:
-                        units_after = {u.text for u in self.db.list_units(space_id)}
+                        # 不再出现的文本：先去掉重放之后的派生记忆与受影响会话的"轮"里还有的，
+                        # 剩下的（通常只是被删的那几轮与事实）再到整个空间里查一遍
+                        gone = texts_before - set(self.db.unit_texts(space_id, kinds_not=["round"]))
+                        gone -= {
+                            u.text
+                            for u in self.db.list_units(
+                                space_id, kinds=["round"], session_ids=affected
+                            )
+                        }
+                        gone -= self.db.existing_texts(space_id, gone)
                         if isinstance(self.embedder, CachedEmbedder):
-                            embed_purged = self.embedder.purge(sorted(texts_before - units_after))
+                            embed_purged = self.embedder.purge(sorted(gone))
                         embed_purged += self._purge_queries([*texts, *questions])
                         if isinstance(self.image_embedder, DashScopeMultimodalEmbedder):
                             unused = {m.sha256 for m in doomed_media}
@@ -1087,18 +1099,18 @@ class MemorySystem:
         follow_citations: bool,
         restated_turn_ids: Sequence[str],
     ) -> tuple[list[Turn], int]:
-        """要删的发言（按日志顺序）与沿引用扩散多出来的条数。遗忘与预览共用。"""
-        all_turns = self.db.get_turns(space_id)
-        asked, sessions = set(turn_ids), set(session_ids)
-        wanted_turns = {t.id for t in all_turns if t.id in asked or t.session_id in sessions}
+        """要删的发言（按日志顺序）与沿引用扩散多出来的条数。遗忘与预览共用。
+
+        只读要删的会话与发言（以前读整个空间的日志）。"""
+        asked, sessions = sorted(set(turn_ids)), sorted(set(session_ids))
+        wanted_turns = {t.id for t in self.db.turns_of(space_id, ids=asked, session_ids=sessions)}
         cascaded = 0
         if follow_citations and wanted_turns:
             expanded = self._follow_citations(space_id, wanted_turns)
             cascaded = len(expanded - wanted_turns)
             wanted_turns = expanded
-        restated = set(restated_turn_ids)
-        wanted_turns |= {t.id for t in all_turns if t.id in restated}
-        return [t for t in all_turns if t.id in wanted_turns], cascaded
+        wanted_turns |= set(restated_turn_ids)  # 不在日志里的 ID 下面读不到，与以前相同
+        return self.db.get_turns(space_id, ids=sorted(wanted_turns)), cascaded
 
     def _remove_traces(
         self, space_id: str, texts: Sequence[str], refs: Collection[str] = ()
@@ -1137,18 +1149,32 @@ class MemorySystem:
 
     def _follow_citations(self, space_id: str, turns: set[str]) -> set[str]:
         """沿引用扩散：要删的发言所在的轮、由它们抽取的事实、其中的图片，凡是被后来的回复
-        引用过，那一轮也要删；新删的轮又可能被更后来的回复引用，直到没有新的为止。"""
-        rounds = self.db.list_units(space_id, kinds=["round"])
-        round_of = {t: u for u in rounds for t in u.source_turn_ids}
+        引用过，那一轮也要删；新删的轮又可能被更后来的回复引用，直到没有新的为止。
+
+        "轮"只读用到的发言所在的会话（一轮的发言都在这一轮的会话里），读过的会话记下来，不再
+        读整个空间的"轮"。事实与图片照旧整个读（没有派生记忆时什么都没有）。"""
+        round_of: dict[str, MemoryUnit] = {}
+        loaded: set[str] = set()
+
+        def load(turn_ids: Collection[str]) -> None:
+            found = self.db.get_turns(space_id, ids=sorted(turn_ids)) if turn_ids else []
+            fresh = sorted({t.session_id for t in found} - loaded)
+            for unit in self.db.list_units(space_id, kinds=["round"], session_ids=fresh):
+                for turn_id in unit.source_turn_ids:
+                    round_of[turn_id] = unit
+            loaded.update(fresh)
+
         facts = self.db.get_facts(space_id)
         media = self.db.get_media(space_id)
         doomed = set(turns)
         frontier = set(turns)
         while frontier:
+            load(frontier)
             items = {round_of[t].id for t in frontier if t in round_of}
             items |= {f.id for f in facts if frontier & set(f.source_turn_ids)}
             items |= {m.id for m in media if m.source_turn_id in frontier}
             citing = set(self.db.citing_turns(space_id, sorted(items))) - doomed
+            load(citing)
             fresh: set[str] = set()
             for turn_id in citing:  # 整轮删除：用户的问话里也可能带着同样的信息
                 unit = round_of.get(turn_id)
@@ -1258,7 +1284,11 @@ class MemorySystem:
         之后照样检索得到。"""
         wanted = set(turn_ids)
         out = list(dict.fromkeys(turn_ids))
-        for unit in self.db.list_units(space_id, kinds=["round"]):
+        if not wanted:  # 只删会话或发言时（以前照样读一遍整个空间的"轮"）
+            return out
+        # 只读这些发言所在的会话的"轮"（一轮的发言都在这一轮的会话里）
+        sessions = {t.session_id for t in self.db.get_turns(space_id, ids=sorted(wanted))}
+        for unit in self.db.list_units(space_id, kinds=["round"], session_ids=sorted(sessions)):
             if wanted & set(unit.source_turn_ids):
                 out.extend(t for t in unit.source_turn_ids if t not in out)
         return out

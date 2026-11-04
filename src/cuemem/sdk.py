@@ -586,13 +586,14 @@ class Memory:
         from cuemem.write.extract import PIPELINE_VERSION
 
         space = space_for(user_id, agent_id)
-        jobs = self.system.db.get_jobs(space)
+        # 只数待处理的、只读失败的（以前读出并解开每个任务，1 万个任务时 40 毫秒）。按会话排：
+        # 与以前读全部任务时的顺序相同（那条查询走 idx_jobs_session），同一会话的按写入的先后
+        db = self.system.db
+        jobs = sorted(db.get_jobs(space, status="failed"), key=lambda j: j["session_id"])
         worker = self.system.worker
         base_s = worker.retry_base_s if worker is not None else RETRY_BASE_S
         failed = []
         for job in jobs:
-            if job["status"] != "failed":
-                continue
             retry_at = None
             due = job["attempts"] < MAX_ATTEMPTS and job["version"] == PIPELINE_VERSION
             if due and worker is not None:  # 与后台线程的退避相同（Consolidator.retry_due）
@@ -608,7 +609,7 @@ class Memory:
                 }
             )
         return {
-            "pending": sum(1 for j in jobs if j["status"] == "pending"),
+            "pending": db.job_counts(space).get("pending", 0),
             "failed": failed,
             "background": worker is not None,
             # 只给这个空间的：worker.errors 里有别的用户的空间 ID 与出错

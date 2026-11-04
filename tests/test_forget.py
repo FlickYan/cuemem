@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from cuemem.embed import CachedEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.errors import EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.sdk import space_for
 from cuemem.write.consolidate import scope
 
 SECRET = "电商"  # 只出现在第 4 段会话（s4）里的词
@@ -1274,3 +1276,248 @@ def test_forget_inside_a_read_is_refused_instead_of_deadlocking(
                     call()
             assert len(system.db.get_turns("alice")) == 1
         assert system.forget("alice", session_ids=["s1"]).turns_deleted == 1
+
+
+# ---------- 遗忘只读要删的会话（第五轮体检：5 万轮的空间删一个会话 4.2 秒） ----------
+# 下面三个是以前读整个空间的写法，原样留作参照：新的写法与它们给出的结果必须一模一样
+
+
+def _old_follow_citations(system: MemorySystem, space_id: str, turns: set[str]) -> set[str]:
+    rounds = system.db.list_units(space_id, kinds=["round"])
+    round_of = {t: u for u in rounds for t in u.source_turn_ids}
+    facts = system.db.get_facts(space_id)
+    media = system.db.get_media(space_id)
+    doomed = set(turns)
+    frontier = set(turns)
+    while frontier:
+        items = {round_of[t].id for t in frontier if t in round_of}
+        items |= {f.id for f in facts if frontier & set(f.source_turn_ids)}
+        items |= {m.id for m in media if m.source_turn_id in frontier}
+        citing = set(system.db.citing_turns(space_id, sorted(items))) - doomed
+        fresh: set[str] = set()
+        for turn_id in citing:
+            unit = round_of.get(turn_id)
+            fresh |= set(unit.source_turn_ids) if unit is not None else {turn_id}
+        frontier = fresh - doomed
+        doomed |= frontier
+    return doomed
+
+
+def _old_forget_targets(
+    system: MemorySystem,
+    space_id: str,
+    session_ids: Sequence[str],
+    turn_ids: Sequence[str],
+    follow_citations: bool,
+    restated_turn_ids: Sequence[str],
+) -> tuple[list[Any], int]:
+    all_turns = system.db.get_turns(space_id)
+    asked, sessions = set(turn_ids), set(session_ids)
+    wanted_turns = {t.id for t in all_turns if t.id in asked or t.session_id in sessions}
+    cascaded = 0
+    if follow_citations and wanted_turns:
+        expanded = _old_follow_citations(system, space_id, wanted_turns)
+        cascaded = len(expanded - wanted_turns)
+        wanted_turns = expanded
+    restated = set(restated_turn_ids)
+    wanted_turns |= {t.id for t in all_turns if t.id in restated}
+    return [t for t in all_turns if t.id in wanted_turns], cascaded
+
+
+def _old_round_turns(system: MemorySystem, space_id: str, turn_ids: Sequence[str]) -> list[str]:
+    wanted = set(turn_ids)
+    out = list(dict.fromkeys(turn_ids))
+    for unit in system.db.list_units(space_id, kinds=["round"]):
+        if wanted & set(unit.source_turn_ids):
+            out.extend(t for t in unit.source_turn_ids if t not in out)
+    return out
+
+
+def _rich_system(settings: Settings, root: Path) -> MemorySystem:
+    """玩具对话（5 段会话，有事实）加两段文字一模一样的会话（d1、d2，只记日志），再加两条跨会话的
+    引用：s5 的回复引用了 s4 的一轮，d1 的回复引用了出自 s2 的一条事实。"""
+    from cuemem.config import PathsConfig
+
+    api = FakeAPI()
+    api.chat_replies = [
+        ScriptedModel(TOY_EXTRACTIONS, reconcile=reconcile_by_keyword(*TOY_UPDATE_KEYWORDS))
+    ]
+    paths = PathsConfig().resolve_against(root)
+    system = MemorySystem.from_settings(
+        settings.model_copy(update={"paths": paths}), http_client=api.client()
+    )
+    system.ingest(
+        Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8")), consolidate=True
+    )
+    same = [
+        TurnIn(role="user", text="我最近在学游泳，每周去两次，教练很耐心。"),
+        TurnIn(role="assistant", text="坚持下去，游泳对颈椎很好。"),
+    ]
+    for day, sid in ((1, "d1"), (2, "d2")):
+        session = SessionIn(session_id=sid, started_at=datetime(2025, 6, day), turns=same)
+        system.append("demo", session, 0, enqueue=False)
+    db = system.db
+    [s4_round, *_] = db.list_units("demo", kinds=["round"], session_ids=["s4"])
+    s5_reply = next(t for t in db.get_turns("demo", "s5") if t.role == "assistant")
+    db.add_provenance("demo", s5_reply.id, [s4_round.id])
+    s2_turns = {t.id for t in db.get_turns("demo", "s2")}
+    s2_fact = next(f for f in db.get_facts("demo") if s2_turns & set(f.source_turn_ids))
+    d1_reply = next(t for t in db.get_turns("demo", "d1") if t.role == "assistant")
+    db.add_provenance("demo", d1_reply.id, [s2_fact.id])
+    return system
+
+
+def _state(system: MemorySystem) -> dict[str, Any]:
+    db = system.db
+    return {
+        "turns": [(t.id, t.session_id, t.text) for t in db.get_turns("demo")],
+        "units": sorted(
+            (u.id, u.kind, u.session_id, u.text, tuple(u.source_turn_ids))
+            for u in db.list_units("demo")
+        ),
+        "facts": sorted(
+            (f.id, f.statement, f.invalidated_at is None) for f in db.get_facts("demo")
+        ),
+        "jobs": sorted((j["session_id"], j["status"]) for j in db.get_jobs("demo")),
+    }
+
+
+def test_forget_planning_matches_whole_space_reads(n3_settings: Settings, tmp_path: Path) -> None:
+    """要删的发言、沿引用扩散的条数、扩展成整轮与预览，与以前读整个空间时一模一样：扩散跨会话
+    （s5 引用 s4，d1 引用 s2 的事实），文字相同的两段会话互不影响。"""
+    with _rich_system(n3_settings, tmp_path / "a") as system:
+        db = system.db
+        turns = db.get_turns("demo")
+        by_session: dict[str, list[str]] = {}
+        for t in turns:
+            by_session.setdefault(t.session_id, []).append(t.id)
+        cases: list[tuple[list[str], list[str], bool, list[str]]] = [
+            (["s4"], [], True, []),
+            (["s2"], [], True, []),
+            (["d1"], [], True, []),
+            (["s1", "s4"], [], False, []),
+            ([], [by_session["s2"][0], "no-such-turn"], True, [by_session["d2"][1]]),
+            (["s3"], by_session["d1"][:1], True, ["no-such-turn", by_session["s1"][2]]),
+            (list(by_session), [], True, []),
+            ([], [], True, []),
+        ]
+        for sessions, asked, follow, restated in cases:
+            new = system._forget_targets("demo", sessions, asked, follow, restated)
+            old = _old_forget_targets(system, "demo", sessions, asked, follow, restated)
+            assert new == old, (sessions, asked)
+        assert _old_forget_targets(system, "demo", ["s2"], [], True, [])[1] >= 2  # 扩散到了 d1
+        for sources in ([], [by_session["s3"][1]], [by_session["d2"][0], by_session["s1"][3]]):
+            assert system.round_turns("demo", sources) == _old_round_turns(system, "demo", sources)
+        for fact in db.get_facts("demo"):
+            sources = list(fact.source_turn_ids)
+            assert system.round_turns("demo", sources) == _old_round_turns(system, "demo", sources)
+            assert system._follow_citations("demo", set(sources)) == _old_follow_citations(
+                system, "demo", set(sources)
+            )
+
+        fact = next(
+            f for f in db.get_facts("demo") if set(f.source_turn_ids) & set(by_session["s2"])
+        )
+        previews = [
+            system.preview_forget("demo", session_ids=["s4"]),
+            system.preview_forget("demo", turn_ids=by_session["d2"][:1]),
+            system.preview_forget("demo", fact_ids=[fact.id]),
+        ]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                system, "_forget_targets", lambda *a, **k: _old_forget_targets(system, *a, **k)
+            )
+            patch.setattr(system, "round_turns", lambda *a, **k: _old_round_turns(system, *a, **k))
+            assert previews == [
+                system.preview_forget("demo", session_ids=["s4"]),
+                system.preview_forget("demo", turn_ids=by_session["d2"][:1]),
+                system.preview_forget("demo", fact_ids=[fact.id]),
+            ]
+
+
+def test_forget_matches_whole_space_reads(n3_settings: Settings, tmp_path: Path) -> None:
+    """同样的几次遗忘，一个用新的写法、一个换上以前读整个空间的写法：报告、剩下的发言、记忆单元、
+    事实与任务一模一样；清理的向量缓存正好是遗忘前后整个空间的文本之差（以前的算法）。"""
+    new_system = _rich_system(n3_settings, tmp_path / "new")
+    old_system = _rich_system(n3_settings, tmp_path / "old")
+    old_system._forget_targets = lambda *a, **k: _old_forget_targets(old_system, *a, **k)  # type: ignore[method-assign]
+    old_system.round_turns = lambda *a, **k: _old_round_turns(old_system, *a, **k)  # type: ignore[method-assign]
+    purged: dict[int, list[list[str]]] = {}
+    for system in (new_system, old_system):
+        embedder = system.embedder
+        assert isinstance(embedder, CachedEmbedder)
+        real = embedder.purge
+        seen: list[list[str]] = []
+        purged[id(system)] = seen
+
+        def spy(texts: Sequence[str], *args: Any, _real: Any = real, _seen: Any = seen) -> int:
+            _seen.append(list(texts))
+            return int(_real(texts, *args))
+
+        embedder.purge = spy  # type: ignore[method-assign]
+    with new_system, old_system:
+        s1 = {t.id for t in new_system.db.get_turns("demo", "s1")}
+        s3 = [t.id for t in new_system.db.get_turns("demo", "s3")]
+
+        def s1_fact(m: MemorySystem) -> list[str]:
+            return [next(f.id for f in m.db.get_facts("demo") if set(f.source_turn_ids) & s1)]
+
+        calls: list[Any] = [
+            lambda m: m.forget("demo", session_ids=["d1"]),  # 文字与 d2 相同：d2 的不清理
+            lambda m: m.forget("demo", session_ids=["s4"]),  # 扩散到 s5
+            lambda m: m.forget("demo", turn_ids=s3[:1]),
+            lambda m: m.forget_memories("demo", fact_ids=s1_fact(m)),
+            lambda m: m.forget("demo", session_ids=["s2"]),
+        ]
+        for call in calls:
+            reports = []
+            for system in (new_system, old_system):
+                texts_before = {u.text for u in system.db.list_units("demo")}
+                start = len(purged[id(system)])
+                report = call(system)
+                texts_after = {u.text for u in system.db.list_units("demo")}
+                first = purged[id(system)][start]  # forget 清理文档向量的那一次
+                assert first == sorted(texts_before - texts_after)
+                reports.append(replace(report, elapsed_ms=0.0))
+            assert reports[0] == reports[1]
+            assert _state(new_system) == _state(old_system)
+            assert purged[id(new_system)] == purged[id(old_system)]
+        assert {sid for _, sid, _ in _state(new_system)["turns"]} == {"d2", "s1", "s3"}
+
+
+def test_forget_one_session_reads_only_that_session(
+    offline_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只记日志的 200 段会话里删一段（delete_all(run_id=...)）：不再读整个空间的"轮"、记忆单元或
+    日志（以前读了 6 遍，5 万轮时 4.2 秒）。"""
+    from cuemem.store import MemoryDB
+
+    with Memory(offline_settings, http_client=fake_api.client(), background=False) as m:
+        for i in range(200):
+            messages = [
+                {"role": "user", "content": f"session {i} question"},
+                {"role": "assistant", "content": f"session {i} answer"},
+            ]
+            m.add(messages, user_id="u", run_id=f"r{i}", infer=False)
+        units: list[tuple[Any, Any]] = []
+        turns: list[tuple[Any, Any, Any]] = []
+        real_units, real_turns = MemoryDB.list_units, MemoryDB.get_turns
+
+        def list_units(self: MemoryDB, space_id: str, **kw: Any) -> Any:
+            units.append((kw.get("kinds"), kw.get("session_ids")))
+            return real_units(self, space_id, **kw)
+
+        def get_turns(self: MemoryDB, space_id: str, session_id: Any = None, **kw: Any) -> Any:
+            turns.append((session_id, kw.get("ids"), kw.get("session_ids")))
+            return real_turns(self, space_id, session_id, **kw)
+
+        monkeypatch.setattr(MemoryDB, "list_units", list_units)
+        monkeypatch.setattr(MemoryDB, "get_turns", get_turns)
+        out = m.delete_all(user_id="u", run_id="r100")
+        monkeypatch.undo()
+        assert out["turns_deleted"] == 2
+        assert units and turns
+        assert not [c for c in units if c[1] is None and c[0] in (None, ["round"])]
+        assert not [c for c in turns if c == (None, None, None)]
+        left = {t.session_id for t in m.system.db.get_turns(space_for("u", None))}
+        assert len(left) == 199 and "r100" not in left

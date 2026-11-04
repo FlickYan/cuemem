@@ -1777,3 +1777,73 @@ def test_async_run(n3_settings: Settings, fake_api: FakeAPI, model: ScriptedMode
             return during, [f["memory"] for f in found["results"]]
 
     assert asyncio.run(run()) == ([], ["The user lives in Berlin."])
+
+
+def test_status_counts_jobs_without_reading_them_all(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """status() 只数待处理的、只读失败的任务（以前读出并解开每个任务：1 万个任务时 40 毫秒，界面
+    每发一条消息查一次，第五轮体检）。结果与以前相同，失败的仍按以前的顺序（按会话，同一会话的按
+    写入的先后）；HTTP 服务的状态同样只数。"""
+    from cuemem.agent import Agent
+    from cuemem.api.service import ChatService
+
+    db = memory.system.db
+    space = space_for("alice", None)
+    db.ensure_space(space)
+    db.enqueue_jobs(
+        space,
+        [
+            ("j1", "zz", "v", "h1"),
+            ("j2", "aa", "v", "h2"),
+            ("j3", "mm", "v", "h3"),
+            ("j4", "dd", "v", "h4"),
+            ("j5", "ss", "v", "h5"),
+            ("j6", "ss", "v", "h6"),  # j5 被取代
+            ("j7", "aa", "old", "h7"),  # j2 被取代，下面再改回失败：同一会话两个失败的
+        ],
+    )
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', attempts = 2, error = 'boom\nmore'"
+            " WHERE id IN ('j1', 'j2', 'j7')"
+        )
+        conn.execute("UPDATE jobs SET status = 'done' WHERE id = 'j4'")
+
+    def reference() -> dict[str, Any]:  # 以前的写法：读出全部任务再挑
+        jobs = db.get_jobs(space)
+        failed = [
+            {
+                "session_id": j["session_id"],
+                "attempts": j["attempts"],
+                "error": (j["error"] or "").splitlines()[0][:300],
+                "retry_at": None,
+            }
+            for j in jobs
+            if j["status"] == "failed"
+        ]
+        counts = {s: sum(1 for j in jobs if j["status"] == s) for s in ("pending", "done")}
+        return {"failed": failed, **counts}
+
+    expected = reference()
+    assert [f["session_id"] for f in expected["failed"]] == ["aa", "aa", "zz"]
+    chat = ChatService(memory.system, Agent(memory.system, router="rule"))
+    calls: list[str | None] = []
+    real = type(db).get_jobs
+
+    def spy(self: Any, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
+        calls.append(status)
+        return real(self, space_id, status)
+
+    monkeypatch.setattr(type(db), "get_jobs", spy)
+    state = memory.status(user_id="alice")
+    served = chat.status(space)
+    assert None not in calls
+    assert state["pending"] == expected["pending"] == 2
+    assert state["failed"] == expected["failed"]
+    assert {k: served[k] for k in ("pending", "failed", "done")} == {
+        "pending": 2,
+        "failed": 3,
+        "done": expected["done"],
+    }
+    assert db.job_counts(space) == {"pending": 2, "failed": 3, "done": 1, "superseded": 1}
