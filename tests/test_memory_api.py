@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -407,7 +407,15 @@ def test_valid_at_takes_a_year_month_or_day(mem: Mem) -> None:
     assert then("2026-08-15") == then(date(2026, 8, 15)) == berlin
     assert then("2026-08-31T23:00") == berlin and then("2026-09-01") == munich
     assert then("2025") == [] and then("2026-07") == []
-    for bad in ("2026-8", "2026/08/15", "Aug 2026", "banana", "2026-13", "2026-02-30", ""):
+    # 带时区的时刻先换算成本机时间再取日期，本地（datetime）与远程（发带时区的 ISO 字符串）
+    # 相同：本机 8 月 31 日 23:30 往前两个时区的时刻，在本机已是 9 月 1 日 01:30。以前远程只取
+    # 字符串里的日期（8 月 31 日，Berlin），本地是 9 月 1 日（Munich）
+    local = datetime(2026, 8, 31, 23, 30).astimezone().utcoffset()
+    assert local is not None
+    late = datetime(2026, 8, 31, 23, 30, tzinfo=timezone(local - timedelta(hours=2)))
+    assert then(late) == then(late.isoformat()) == munich
+    bad_values = ("2026-8", "2026/08/15", "Aug 2026", "banana", "2026-13", "2026-02-30", "")
+    for bad in (*bad_values, "2026-08-15Tbanana", "2026-08-15 25:00"):
         with pytest.raises(ValueError, match="valid_at"):
             then(bad)
 

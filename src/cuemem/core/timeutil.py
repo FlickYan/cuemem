@@ -16,7 +16,7 @@ import re
 from datetime import UTC, date, datetime, time, timedelta
 
 _PARTIAL_DATE = re.compile(r"^(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2}))?)?")
-_VALID_AT = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:[T ].*)?)?)?$")
+_VALID_AT = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2})([T ].*)?)?)?$")
 
 
 def naive_local(dt: datetime) -> datetime:
@@ -97,16 +97,22 @@ def valid_period(value: str | date) -> tuple[str, str]:
     """事实查询的 valid_at（事件时间）→ 它所指的时间段 (起, 止)，两端都是 YYYY-MM-DD、都含在内：
     '2025' → 全年，'2025-06' → 整个六月，'2025-06-07'（或带时间的写法、date、datetime）→ 那一天。
     只接受 ISO 写法：以前 '2025-6'、'2025/06/07'、'banana' 都不报错，按字符串比较给出错的结果。
-    报错是英文：调用方是 SDK、/api/v1 与 CLI。"""
+    带时间的字符串同 datetime：整个按 ISO 时间解析（'2026-08-15Tbanana' 报错），带时区的先换算
+    成本机时间再取日期。以前只取字符串里的日期，同一时刻本地（datetime）与远程（MemoryClient 发
+    带时区的 ISO 字符串）在午夜附近会落在不同的两天。报错是英文：调用方是 SDK、/api/v1 与 CLI。"""
     if isinstance(value, datetime):  # 事件时间按天记，时刻不看
         value = naive_local(value).date()
     if isinstance(value, date):
         return value.isoformat(), value.isoformat()
-    match = _VALID_AT.match(value.strip()) if isinstance(value, str) else None
+    text = value.strip() if isinstance(value, str) else ""
+    match = _VALID_AT.match(text)
     try:
         if match is None:
             raise ValueError(value)
-        year, month, dom = match.groups()
+        year, month, dom, clock = match.groups()
+        if clock is not None:
+            one = naive_local(datetime.fromisoformat(text)).date().isoformat()
+            return one, one
         if dom is not None:
             one = date(int(year), int(month), int(dom)).isoformat()
             return one, one
