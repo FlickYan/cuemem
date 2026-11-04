@@ -605,11 +605,13 @@ class MemorySystem:
         *,
         enqueue: bool = True,
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+        log_only: Collection[str] = (),
     ) -> Iterator[IngestReport]:
         """同 append，pieces 是若干段（会话，第一句的序号），每段各向量化一次（导入文件时每段
         连续的发言一段，与以前逐段追加时的请求相同）。with 块里的写入（Agent 的溯源）与发言、
         巩固任务在同一个事务里提交，块里出错时一起撤销（块里只做数据库的写入：事务持有数据库
-        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。"""
+        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。log_only：只写日志、
+        不登记巩固任务的会话（导入文件里 "infer": false 的会话，同 SDK 的 add(infer=False)）。"""
         sessions = list(dict.fromkeys(s.session_id for s, _ in pieces))
         names = {"session": sessions[0]} if len(sessions) == 1 else {"sessions": sessions}
         skip = self.open_sessions(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
@@ -619,7 +621,7 @@ class MemorySystem:
             self.writer.writing(space_id, [[piece] for piece in pieces], meta) as report,
         ):
             if enqueue:
-                queued = self.consolidator.enqueue(space_id, sessions, skip=skip)
+                queued = self.consolidator.enqueue(space_id, sessions, skip=skip | set(log_only))
             yield report
         if queued and self.worker is not None:
             self.worker.submit(space_id)

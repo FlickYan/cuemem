@@ -187,6 +187,48 @@ def test_export_v2_carries_metadata_and_v1_files_still_import(memory: Memory) ->
         memory.load(newer, user_id="dave")
 
 
+def test_infer_false_survives_export_and_import(
+    memory: Memory, n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """add(infer=False) 的会话没有巩固任务：导出时带 "infer": false，导入时同样不登记，后台线程
+    不去抽取它（以前导入时为每个会话登记任务，多花 LLM 请求）；显式的巩固照样抽取，同源空间。
+    还开着的 run 不带这个键，导入时照常登记任务。"""
+    memory.add("raw diary line", user_id="alice", run_id="log", timestamp=DAY, infer=False)
+    memory.add("I like green tea", user_id="alice", run_id="chat", timestamp=DAY)
+    memory.open_run("live", user_id="alice")
+    memory.add("half a conversation", user_id="alice", run_id="live", timestamp=DAY)
+    data = json.loads(json.dumps(memory.export(user_id="alice", derived=False)))
+    flags = {s["session_id"]: s.get("infer") for s in data["sessions"]}
+    assert flags == {"log": False, "chat": None, "live": None}
+    assert "infer" not in next(s for s in data["sessions"] if s["session_id"] == "chat")
+
+    other = n3_settings.model_copy(
+        update={"paths": PathsConfig().resolve_against(tmp_path / "other")}
+    )
+    fake_api.chat_requests.clear()
+    with Memory(other, http_client=fake_api.client(), background=True) as fresh:
+        fresh.load(data, user_id="bob")
+        fresh.wait()
+        assert {j["session_id"] for j in fresh.system.db.get_jobs("bob")} == {"chat", "live"}
+        assert "raw diary line" not in json.dumps(fake_api.chat_requests)
+        assert "green tea" in json.dumps(fake_api.chat_requests)
+        # 显式的巩固照样抽取它（同源空间）
+        fresh.consolidate(user_id="bob")
+        assert "raw diary line" in {f["memory"] for f in fresh.get_all(user_id="bob")["results"]}
+        # 目标空间里已有任务的会话：再导入时照常登记
+        log = next(s for s in data["sessions"] if s["session_id"] == "log")
+        log["turns"].append({**log["turns"][0], "idx": 5, "text": "another raw line"})
+        before = len(fresh.system.db.get_jobs("bob"))
+        assert import_space(fresh.system, data, space_id="bob")["turns_added"] == 1
+        assert len(fresh.system.db.get_jobs("bob")) == before + 1
+
+    bad = json.loads(json.dumps(data))
+    next(s for s in bad["sessions"] if s["session_id"] == "log")["infer"] = "no"
+    with pytest.raises(ValueError, match="Malformed export"):
+        memory.load(bad, user_id="dave")
+    assert memory.system.db.get_turns("dave") == []
+
+
 def test_updates_survive_export_to_the_same_space(
     memory: Memory, n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
 ) -> None:
