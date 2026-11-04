@@ -229,6 +229,38 @@ def test_infer_false_survives_export_and_import(
     assert memory.system.db.get_turns("dave") == []
 
 
+def test_cli_export_reads_infer_false_from_the_database_alone(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cuemem export 只打开数据库（向量库坏了也能导出）：只写了日志的会话照样带 "infer": false，
+    上一个进程没结束的 run 凭数据库里的标记认出来、不带这个键；导入后只给后者与普通会话登记任务。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    settings = load_settings()
+    with Memory(settings, background=False) as memory:
+        memory.add("raw diary line", user_id="alice", run_id="log", timestamp=DAY, infer=False)
+        memory.add("I like green tea", user_id="alice", run_id="chat", timestamp=DAY)
+        memory.open_run("live", user_id="alice")  # 进程结束时还开着：数据库里留着标记
+        memory.add("half a conversation", user_id="alice", run_id="live", timestamp=DAY)
+    (settings.paths.qdrant / "meta.json").write_text("", "utf-8")
+
+    out = tmp_path / "alice.json"
+    result = runner.invoke(app, ["export", "--space", "alice", "-o", str(out)])
+    assert result.exit_code == 0, result.output
+    data = json.loads(out.read_text("utf-8"))
+    assert {s["session_id"]: s.get("infer") for s in data["sessions"]} == {
+        "log": False,
+        "chat": None,
+        "live": None,
+    }
+    assert runner.invoke(app, ["doctor", "--repair-vectors"]).exit_code == 0
+    result = runner.invoke(app, ["import", str(out), "--space", "copy"])
+    assert result.exit_code == 0, result.output
+    with Memory(load_settings(), background=False) as memory:
+        assert {j["session_id"] for j in memory.system.db.get_jobs("copy")} == {"chat", "live"}
+
+
 def test_updates_survive_export_to_the_same_space(
     memory: Memory, n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
 ) -> None:
