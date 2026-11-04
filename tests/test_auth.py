@@ -910,6 +910,13 @@ def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI])
     assert reasoning.status_code == 200
     sent = fake_api.chat_requests[-1]
     assert sent["max_completion_tokens"] == 1000 and sent["max_tokens"] == 1000
+    # 只给 max_completion_tokens：目录里这个模型写 max_tokens，上限也按 max_tokens 写上
+    assert _chat(http, CAPPED_TOKEN, max_completion_tokens=5000).status_code == 200
+    sent = fake_api.chat_requests[-1]
+    assert sent["max_tokens"] == 1000 and sent["max_completion_tokens"] == 1000
+    assert _chat(http, CAPPED_TOKEN, max_completion_tokens=200).status_code == 200
+    sent = fake_api.chat_requests[-1]
+    assert sent["max_tokens"] == 200 and sent["max_completion_tokens"] == 200
     responses = _chat(http, CAPPED_TOKEN, path="/v1/responses", max_output_tokens=9000)
     assert responses.status_code == 200 and fake_api.chat_requests[-1]["max_tokens"] == 1000
     seen = len(fake_api.chat_requests)
@@ -921,6 +928,27 @@ def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI])
     assert _chat(http, PLAIN_TOKEN, **EXPENSIVE).status_code == 200  # 没写的照旧
     assert fake_api.chat_requests[-1]["max_tokens"] == 32768
     assert fake_api.chat_requests[-1]["n"] == 16
+
+
+def test_cap_output_for_max_completion_tokens_models() -> None:
+    """目录里写 max_completion_tokens 的模型（OpenAI 推理模型）：_adapt 把 max_tokens 改名之后
+    _cap_output 压的是 max_completion_tokens，不再补一份 max_tokens。"""
+    from cuemem.api.proxy import _adapt, _cap_output
+    from cuemem.config import ModelSpec, Price
+
+    spec = ModelSpec(
+        provider="openai",
+        model_id="o-test",
+        price=Price(input=1.0, output=1.0),
+        max_tokens_param="max_completion_tokens",
+    )
+    body: dict[str, Any] = {"model": "o-test", "max_tokens": 5000}
+    _adapt(body, spec)
+    _cap_output(body, spec, 1000)
+    assert body == {"model": "o-test", "max_completion_tokens": 1000}
+    body = {"model": "o-test"}
+    _cap_output(body, spec, 1000)
+    assert body == {"model": "o-test", "max_completion_tokens": 1000}
 
 
 def test_scoped_keys_without_limits_forward_the_same_bytes(
