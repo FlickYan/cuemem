@@ -370,7 +370,13 @@ class MemorySystem:
             db, vectors, embedder, media=media, image_embedder=image_embedder
         )
         self.consolidator = Consolidator(
-            db, vectors, embedder, llm, settings.consolidation, open_sessions=self._held
+            db,
+            vectors,
+            embedder,
+            llm,
+            settings.consolidation,
+            open_sessions=self._held,
+            holding_open=self._holding_held,
         )
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
@@ -633,6 +639,14 @@ class MemorySystem:
         相同。"""
         with self._open_lock:
             return {sid for space, sid in self._open | self._deferred if space == space_id}
+
+    @contextmanager
+    def _holding_held(self, space_id: str) -> Iterator[set[str]]:
+        """与 _held 相同的会话，拿着进行中会话的锁给出、直到退出：重建在里面清空派生层、重新
+        登记任务（Consolidator.rebuild），期间打开、结束的会话等它提交。锁不可重入，里面不能再
+        调用 _held 或 open_sessions。"""
+        with self._open_lock:
+            yield {sid for space, sid in self._open | self._deferred if space == space_id}
 
     def session_lock(self, space_id: str, session_id: str) -> threading.Lock:
         """往这个会话里写入时持有的锁：从分配发言序号到写完为止。放在系统上而不是 SDK 的

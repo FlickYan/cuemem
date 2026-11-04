@@ -26,6 +26,7 @@ import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -140,6 +141,7 @@ class Consolidator:
         *,
         extractor_model: str | None = None,
         open_sessions: Callable[[str], Collection[str]] | None = None,
+        holding_open: Callable[[str], AbstractContextManager[Collection[str]]] | None = None,
     ) -> None:
         self.db = db
         self.vectors = vectors
@@ -148,6 +150,11 @@ class Consolidator:
         # 为全部会话重新登记任务时跳过的会话（MemorySystem._held）：进行中的，以及之前的进程留下、
         # 还没接手的（defer_adoption）；结束或接手时再整体登记
         self.open_sessions: Callable[[str], Collection[str]] = open_sessions or (lambda _: ())
+        # 重建在这里面清空、重新登记：给出要跳过的会话，并挡住期间的打开与结束（MemorySystem
+        # 拿着进行中会话的锁）。没给时只是读一下 open_sessions，不加锁（单独使用 Consolidator）
+        self.holding_open: Callable[[str], AbstractContextManager[Collection[str]]] = (
+            holding_open or (lambda space_id: nullcontext(self.open_sessions(space_id)))
+        )
         self.extractor = Extractor(
             llm,
             model=extractor_model,
@@ -270,25 +277,28 @@ class Consolidator:
         """清空派生记忆（数据库与向量），再为全部会话登记任务，open_sessions 返回的会话
         除外：进行中的，以及之前的进程留下、defer_adoption 还没接手的（MemorySystem._held；以前
         只跳过前者，闲置期里一次重建就把后者抽取半段，调用方接着写完时又整段再抽取、重放一遍）。
-        进行中的会话在清空之后才读：这期间结束的会话（close_session 先把它移出进行中、再登记
-        任务），任务要么在清空之后登记、不会被删，要么在这里登记。
+
+        清空与重新登记在同一个事务里（与遗忘相同），要跳过的会话在 holding_open 里读、拿着它
+        直到提交（MemorySystem 的进行中会话的锁；先这把锁、后数据库，与 open_session、
+        close_session 和遗忘的顺序相同）：期间结束的会话（close_session 拿着这把锁把它移出进行中）
+        要么在这之前结束、在这里登记，要么等提交之后才登记、不会被清空。以前清空单独提交、之后
+        才重新登记：重新登记时出错（另一个进程拿着数据库，"database is locked"）或进程被杀，空间
+        既没有事实也没有任务，后台线程的重试与重启都找不到要做的事，直到这个用户再写一次。
 
         replay=True（会话又长了时的重放，见 _replay_regrown）：只为原来有任务的会话登记，
         SDK 的 infer=False 只记了日志的会话照旧等显式的 consolidate；内容没变的会话保留原来的
-        结局（_keeps_outcome，见 requeue）。清空前的任务与清空在同一个事务里读：期间别的线程
-        登记的任务不会被删掉而没人补上。
+        结局（_keeps_outcome，见 requeue）。清空前的任务也在这个事务里读：期间别的线程登记的任务
+        不会被删掉而没人补上。
 
         先删派生记忆的向量，再清空数据库（与遗忘相同：先删向量、后删记录）：向量库出错时数据库
-        里什么都没改，会话又长了的那对任务还在，后台线程按退避把重放再做一遍。以前先提交清空
-        （任务也清空了）、再删向量、最后才重新登记：删向量时出错，任务一个不剩，后台线程的重试与
-        重启都找不到要做的事，整个空间的事实、实体与画像都没了，直到有人显式地巩固。现在清空与
-        重新登记之间只有本地的读写。"""
+        里什么都没改，会话又长了的那对任务还在，后台线程按退避把重放再做一遍。期间新写的派生
+        向量（通常没有）在提交之后、锁外删。"""
         derived = self.db.derived_unit_ids(space_id)
         self.vectors.delete(space_id, derived)
-        with self.db.transaction():
+        with self.holding_open(space_id) as skip, self.db.transaction():
             before = self.db.get_jobs(space_id) if replay else None
             removed = self.db.clear_derived(space_id)
-        self.requeue(space_id, before, self.open_sessions(space_id))
+            self.requeue(space_id, before, skip)  # 里层的事务是保存点
         self.vectors.delete(space_id, sorted(set(removed) - set(derived)))  # 通常没有
 
     def requeue(
@@ -298,6 +308,7 @@ class Consolidator:
         skip: Collection[str],
     ) -> int:
         """清空派生记忆（clear_derived，任务也清空了）之后重新登记任务，返回新登记的个数。
+        调用方在清空的同一个事务里调用（rebuild 与遗忘），这里的事务是保存点。
 
         before：清空之前的任务（与清空在同一个事务里读）。只为其中有任务的会话登记：SDK 的
         infer=False 只记了日志的会话照旧不抽取；内容没变（任务键相同）的会话保留原来的结局

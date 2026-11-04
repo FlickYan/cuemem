@@ -889,6 +889,68 @@ def test_a_replay_survives_a_vector_store_error(
         assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
 
 
+def committed(db: MemoryDB, space: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """另开一个连接读到的任务与事实：只有已经提交的。进程这时被杀掉，重启之后看到的就是这些。"""
+    assert db.path is not None
+    other = sqlite3.connect(db.path)
+    try:
+        jobs = other.execute(
+            "SELECT session_id, status FROM jobs WHERE space_id = ? ORDER BY session_id", (space,)
+        ).fetchall()
+        facts = other.execute(
+            "SELECT statement FROM facts WHERE space_id = ? ORDER BY statement", (space,)
+        ).fetchall()
+    finally:
+        other.close()
+    return [(s, status) for s, status in jobs], [f for (f,) in facts]
+
+
+@pytest.mark.parametrize("replay", [True, False], ids=["regrown-replay", "rebuild"])
+def test_a_rebuild_clears_and_requeues_in_one_transaction(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch, replay: bool
+) -> None:
+    """重建（会话又长了时的重放，与 consolidate(rebuild=True)）的清空与重新登记在一个事务里：
+    重新登记时出错（另一个进程拿着数据库，"database is locked"）或进程被杀，事实与任务都还在，
+    后台线程照样能把重放做完。以前清空单独提交、之后才重新登记：两者之间空间既没有事实也没有
+    任务，后台线程的重试与重启都找不到要做的事，事实要等这个用户再写一次才回来（第五轮体检）。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        day2 = AUG + timedelta(days=1)
+        memory.add("I play violin", user_id="u", run_id="s2", timestamp=day2, wait=True)
+        if replay:
+            memory.add("I also play piano", user_id="u", run_id="s1", timestamp=SEP)  # s1 又长了
+        jobs = sorted((j["session_id"], j["status"]) for j in system.db.get_jobs("u"))
+        facts = statements(memory)
+        assert facts == ["I live in Paris", "I play violin"]
+        requeue, seen = system.consolidator.requeue, []
+
+        def killed_once(space: str, before: Any, skip: Any) -> int:
+            if not seen:
+                seen.append(committed(system.db, space))  # 进程在这里被杀掉时留下的
+                raise sqlite3.OperationalError("database is locked")
+            return requeue(space, before, skip)
+
+        monkeypatch.setattr(system.consolidator, "requeue", killed_once)
+        with pytest.raises(sqlite3.OperationalError):
+            if replay:
+                system.consolidator.run("u")  # 后台线程的做法
+            else:
+                system.consolidate("u", rebuild=True)
+        assert seen == [(jobs, facts)]  # 清空没有单独提交
+        assert sorted((j["session_id"], j["status"]) for j in system.db.get_jobs("u")) == jobs
+        assert statements(memory) == facts
+        if replay:
+            assert system.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS) == ["u"]
+            system.consolidator.run("u")  # 后台线程按退避重试
+            assert statements(memory) == ["I also play piano", "I live in Paris", "I play violin"]
+        else:
+            system.consolidate("u", rebuild=True)
+            assert statements(memory) == facts
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
 def said(
     statement: str, subject: str, predicate: str, obj: str, turn: int, cardinality: str = "single"
 ) -> dict[str, Any]:
