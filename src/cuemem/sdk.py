@@ -666,9 +666,10 @@ class Memory:
 
         filters={"user_id": …, "agent_id": …, "run_id": …} 与 top_k 是 Mem0 v3 的写法，与
         user_id、limit 等价。run_id：只要这个会话里的事实、对话片段与图片。filters 里的其他键是
-        metadata 的条件（见 _check_where）。检索照常在整个空间里做（控制器与 L1 / L2 不变），
-        再按会话、条件与过期时间筛，所以结果可能少于 limit；show_expired=True 时过期的也给
-        （Mem0 的写法）。画像是整个空间的（总是去掉过期的事实）。
+        metadata 的条件（见 _check_where）；Mem0 保留的 created_at、updated_at 与 categories 在
+        metadata 没有这个键时对记忆自己的字段（见 _Select）。检索照常在整个空间里做（控制器与
+        L1 / L2 不变），再按会话、条件与过期时间筛，所以结果可能少于 limit；show_expired=True 时
+        过期的也给（Mem0 的写法）。画像是整个空间的（总是去掉过期的事实）。
 
         score 只用来排序（L1 是排名融合的分数，第一名约 0.016），不是相似度：没有 Mem0 的
         threshold（按 Mem0 默认的 0.1 截断会什么都不剩）；Mem0 的 rerank 对应 mode="l2"。
@@ -773,7 +774,9 @@ class Memory:
         items = [
             _fact_item(f, None, user_id, agent_id, sources)
             for f in facts
-            if select.keep(f.session_id, f.source_turn_ids, sources)
+            if select.keep(
+                f.session_id, f.source_turn_ids, sources, _mem0_fields(f.recorded_at, f.category)
+            )
         ]
         return {"results": items[:limit] if limit is not None else items}
 
@@ -1321,7 +1324,8 @@ def _check_where(where: Mapping[str, Any]) -> None:
       "contains" | "icontains": v}}：几个运算并列时都要满足；没有这个键时只有 ne、nin 成立；
     - {"AND": [条件, ...]}、{"OR": [...]}、{"NOT": [...]}（NOT：一个都不满足）。
 
-    条件里的 user_id、agent_id、run_id 指记忆所在的空间与会话，其余的键指 metadata。"""
+    条件里的 user_id、agent_id、run_id 指记忆所在的空间与会话，created_at、updated_at 与
+    categories 也对记忆自己的字段（metadata 里没有这个键时，见 _Select），其余的键指 metadata。"""
     for key, cond in where.items():
         if key in _LOGIC:
             if isinstance(cond, str | bytes | Mapping) or not isinstance(cond, Sequence):
@@ -1403,7 +1407,12 @@ def _scope_record(user_id: str | None, agent_id: str | None) -> dict[str, str]:
 @dataclass
 class _Select:
     """search / get_all 的事后筛选：会话（run_id）、metadata 的条件与过期时间（show_expired 时
-    不看过期时间；画像另算，总是去掉过期的）。"""
+    不看过期时间；画像另算，总是去掉过期的）。
+
+    条件里 Mem0 保留的几个名字（created_at、updated_at、categories）也对记忆自己的字段（fields，
+    见 _mem0_fields）：以前只对 metadata，照 Mem0 写的 {"created_at": {"gte": …}}、
+    {"categories": {"contains": …}} 悄悄什么都不给。metadata 里有同名的键时以 metadata 为准
+    （以前能筛出来的照样筛出来），user_id、agent_id、run_id 总是指空间与会话。"""
 
     run_id: str | None
     where: Mapping[str, Any] | None
@@ -1411,17 +1420,34 @@ class _Select:
     now: datetime
     show_expired: bool = False
 
-    def keep(self, session_id: str | None, turn_ids: Sequence[str], sources: _Sources) -> bool:
+    def keep(
+        self,
+        session_id: str | None,
+        turn_ids: Sequence[str],
+        sources: _Sources,
+        fields: Mapping[str, Any] | None = None,
+    ) -> bool:
         if self.run_id is not None and session_id != self.run_id:
             return False
         if not self.show_expired and sources.expired(turn_ids, self.now):
             return False
         if not self.where:
             return True
-        record = {**sources.metadata(turn_ids), **self.scope}
+        record = {**(fields or {}), **sources.metadata(turn_ids), **self.scope}
         if session_id is not None:
             record["run_id"] = session_id
         return _matches(self.where, record)
+
+
+def _mem0_fields(created_at: datetime, category: str | None = None) -> dict[str, Any]:
+    """filters 里 Mem0 保留的名字对应的记忆自己的字段（见 _Select）：created_at、updated_at 是
+    结果里 created_at 的同一个 ISO 字符串（按字符串比较，{"gte": "2026-01-01"} 就能用），事实
+    另有 categories（它的 category，一个元素的列表）。"""
+    stamp = created_at.isoformat()
+    out: dict[str, Any] = {"created_at": stamp, "updated_at": stamp}
+    if category is not None:
+        out["categories"] = [category]
+    return out
 
 
 def _profile(system: MemorySystem, space: str, core: CoreMemory | None, now: datetime) -> str:
@@ -1539,16 +1565,29 @@ def _recall_out(
         ],
     )
     facts: list[FactHit] = [
-        fh for fh in view.facts if select.keep(fh.fact.session_id, fh.fact.source_turn_ids, sources)
+        fh
+        for fh in view.facts
+        if select.keep(
+            fh.fact.session_id,
+            fh.fact.source_turn_ids,
+            sources,
+            _mem0_fields(fh.fact.recorded_at, fh.fact.category),
+        )
     ]
     rounds = [
-        h for h in view.rounds if select.keep(h.unit.session_id, h.unit.source_turn_ids, sources)
+        h
+        for h in view.rounds
+        if select.keep(h.unit.session_id, h.unit.source_turn_ids, sources, _mem0_fields(h.unit.ts))
     ]
     # 图片来自装入的轮（l1.collect_media）：会话按它所在的那一轮算
     session_of = {
         m: h.unit.session_id for h in view.rounds for m in h.unit.meta.get("media_ids", [])
     }
-    media = [m for m in media if select.keep(session_of.get(m.id), [m.source_turn_id], sources)]
+    media = [
+        m
+        for m in media
+        if select.keep(session_of.get(m.id), [m.source_turn_id], sources, _mem0_fields(m.ts))
+    ]
     items = [_fact_item(fh.fact, fh.score, user_id, agent_id, sources) for fh in facts]
     items += [_unit_item(h.unit, h.score, sources) for h in sorted(rounds, key=lambda h: -h.score)]
     decision = recall.decision

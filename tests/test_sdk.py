@@ -1007,6 +1007,57 @@ def test_filter_operators_at_their_edges(where: dict[str, Any], expected: bool) 
     assert _matches(where, RECORD) is expected
 
 
+def test_mem0_reserved_filters(memory: Memory) -> None:
+    """filters 里 Mem0 保留的 created_at、updated_at 与 categories 也对记忆自己的字段（照 Mem0
+    写的筛选不再悄悄什么都不给）；以前只对 metadata，三个都是 0 条。"""
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    (fact,) = memory.get_all(user_id="alice")["results"]
+    assert fact["category"] == "attribute"
+    for where in (
+        {"categories": {"contains": "attribute"}},
+        {"created_at": {"gte": "2000-01-01"}},
+        {"updated_at": {"gte": "2000-01-01"}},
+    ):
+        assert [f["id"] for f in memory.get_all(user_id="alice", filters=where)["results"]] == [
+            fact["id"]
+        ], where
+        found = memory.search("Where do I live?", user_id="alice", mode="l1", filters=where)
+        assert fact["id"] in {r["id"] for r in found["results"]}, where
+    assert memory.get_all(user_id="alice", filters={"created_at": {"lt": "2000-01-01"}}) == {
+        "results": []
+    }
+    early = memory.search(
+        "Where do I live?", user_id="alice", mode="l1", filters={"created_at": {"lt": "2000"}}
+    )
+    assert early["results"] == [] and early["images"] == []
+    assert memory.get_all(user_id="alice", filters={"categories": {"contains": "event"}}) == {
+        "results": []
+    }
+    # 对话片段有 created_at，没有 categories
+    excerpts = memory.search(
+        "Where do I live?", user_id="alice", mode="l1", filters={"created_at": {"gte": "2000"}}
+    )
+    assert any(r["type"] == "excerpt" for r in excerpts["results"])
+    only = memory.search(
+        "Where do I live?", user_id="alice", mode="l1", filters={"categories": "*"}
+    )
+    assert {r["type"] for r in only["results"]} == {"fact"}
+
+
+def test_metadata_wins_over_the_reserved_filter_names(memory: Memory) -> None:
+    """metadata 里有同名的键时以 metadata 为准：以前能筛出来的照样筛出来（category 本来就不是
+    保留的名字，照旧只对 metadata）。"""
+    memory.add("I like tea", user_id="bob", metadata={"category": "food"}, wait=True)
+    (tea,) = memory.get_all(user_id="bob", filters={"category": "food"})["results"]
+    assert tea["category"] != "food"  # 事实自己的 category 不同，按 metadata 筛出来
+    assert memory.get_all(user_id="bob", filters={"category": tea["category"]}) == {"results": []}
+    memory.add("I like chess", user_id="carol", metadata={"created_at": "x"}, wait=True)
+    assert len(memory.get_all(user_id="carol", filters={"created_at": "x"})["results"]) == 1
+    # 记忆自己的 created_at（2026-…）在这个范围里，metadata 的 "x" 不在：按 metadata 筛
+    dated = {"created_at": {"gte": "2000", "lt": "3000"}}
+    assert memory.get_all(user_id="carol", filters=dated) == {"results": []}
+
+
 def test_metadata_and_expiration_stay_out_of_extraction(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, tmp_path: Path
 ) -> None:
