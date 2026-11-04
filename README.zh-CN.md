@@ -5,7 +5,7 @@
 
 [English](README.md) · 简体中文 · [技术报告](docs/report.md) · [设计文档](docs/design.md) · [接口参考](docs/api.md) · [与 Mem0、Letta、Zep 等的对比](docs/landscape.md) · [演示指南](demo/README.md) · [60 秒介绍视频](https://youtu.be/HbGS0_Yo4kI)
 
-> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变；仓库公开之后第四轮从六个视角再查，核实为真的 22 处里修掉要改的 21 处（D-071）：有安全公告的依赖与 CI 的供应链、安全策略、公网部署（不鉴权时的 DNS 重绑定、太短的令牌、按令牌的花费上限、Qdrant 的 API Key、只给本人读写的文件、界面不联系第三方）、删除传到进行中的会话并且不留残留、跨过重启的 run、从 GitHub 安装与更顺的第一次运行、许可声明，以及与外部基线比较的说法，评测请求、图片请求与发表的数字都不变；合并之后第五轮从六个视角再查（第四轮的代码、规模上的性能、持久与升级、与别的记忆项目比缺什么、测试的质量、开发者体验），修掉核实为真的 22 处（D-072）：反向代理后面也要令牌、重建与跨过重启的 run、向量库丢了或坏了时的恢复（`cuemem reindex`、`cuemem doctor --vectors` 与 `--repair-vectors`、备份的做法、不再悄悄降级）、原子的导出、更快的本地写入与 kind 过滤与遗忘、过期的记忆不再出现在任何产品入口、按时间段的 `valid_at`、本地检查参数、Mem0 保留的过滤名、远程的等待与超时，以及 OpenAPI 的约定，评测请求、图片请求与发表的数字仍然不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
+> N0–N12 已完成（N11 是测试集之后的补做：控制器 v2、外部基线 Mem0、第二判分与重复运行、真实流量上的门控检验、延迟基准与部署；N12 对标开源同类项目，补上 Python SDK、OpenAI 兼容的记忆代理、OpenAI / Ollama 预设、导出导入与 Docker）。N12 之后做了一次全面体检，修掉 24 处核实过的问题（遗忘、并发、安全、SDK 写入、评测规范、安装、读取性能），评测请求与发表的数字不变（D-068）；第二轮做了那次留到以后的 17 条里的 14 条（D-069）：在线写入要么全写要么不留、供应商出错说清楚、对账巩固与遗忘更省、启动更快且界面与评测改成可选依赖、数据集固定版本与显著性的多重比较校正、补齐 Mem0 的接口与 `MemoryClient`、`/api/v1`、限定作用域的令牌、记忆代理的覆盖面，评测请求同样不变；第三轮从头再查一遍，修掉核实为真的 22 处（D-070）：遗忘与它的锁、提交之后仍会抛出的写入、`delete_all` 之后的残留、看不见的后台失败（新增 `status()`）、闲置的会话、规模上的工作量与打开的文件、界面的文件路径与输入大小、Mem0 的写法、HTTP 上的 MCP、带类型的客户端、复现脚本与几处说过头的结论，评测请求仍然不变；仓库公开之后第四轮从六个视角再查，核实为真的 22 处里修掉要改的 21 处（D-071）：有安全公告的依赖与 CI 的供应链、安全策略、公网部署（不鉴权时的 DNS 重绑定、太短的令牌、按令牌的花费上限、Qdrant 的 API Key、只给本人读写的文件、界面不联系第三方）、删除传到进行中的会话并且不留残留、跨过重启的 run、从 GitHub 安装与更顺的第一次运行、许可声明，以及与外部基线比较的说法，评测请求、图片请求与发表的数字都不变；合并之后第五轮从六个视角再查（第四轮的代码、规模上的性能、持久与升级、与别的记忆项目比缺什么、测试的质量、开发者体验），修掉核实为真的 22 处（D-072）：反向代理后面也要令牌、重建与跨过重启的 run、向量库丢了或坏了时的恢复（`cuemem reindex`、`cuemem doctor --vectors` 与 `--repair-vectors`、备份的做法、不再悄悄降级）、原子的导出、更快的本地写入与 kind 过滤与遗忘、过期的记忆不再出现在召回、回答与画像里、按时间段的 `valid_at`、本地检查参数、Mem0 保留的过滤名、远程的等待与超时，以及 OpenAPI 的约定，评测请求、图片请求与发表的数字仍然不变。测试集上的最终评测见[技术报告](docs/report.md)，英文文档见 [README](README.md) 与 [docs/en/](docs/en/)。各节点的实验与决策见[路线图](docs/roadmap.md)与[决策记录](docs/decisions.md)。
 
 <a href="https://youtu.be/HbGS0_Yo4kI"><img alt="60 秒看懂 CueMem：在 YouTube 上观看" src="docs/assets/video-thumbnail.png" width="720"></a>
 
@@ -54,7 +54,7 @@ m.update(events[0]["id"], text="我搬到的是柏林，不是慕尼黑。")
 m.delete_all(user_id="alice", run_id=run_id)  # 只遗忘这段对话；reset() 清空所有空间
 ```
 
-- **metadata 与过期**：metadata 随原始发言存下（不给抽取模型看），由这些发言得来的事实与对话片段都带上它，`filters` 可以按它筛，照 Mem0 的运算（`eq`、`ne`、`gt`、`in`、`contains`、`AND` / `OR` / `NOT`……）。过期的记忆不再出现在 `search`、`get_all`、画像、`answer()`、记忆代理、MCP 的 recall、`cuemem serve` 的对话 Agent 与各框架集成里，`get`、`history`、导出、浏览原始数据的事实列表与 `cuemem ask` 照样给出。
+- **metadata 与过期**：metadata 随原始发言存下（不给抽取模型看），由这些发言得来的事实与对话片段都带上它，`filters` 可以按它筛，照 Mem0 的运算（`eq`、`ne`、`gt`、`in`、`contains`、`AND` / `OR` / `NOT`……）。过期的记忆不再出现在 `search`、`get_all`、画像、`answer()`、记忆代理、MCP 的 recall、`cuemem serve` 的对话 Agent 与各框架集成里，`get`、`history`、导出、浏览原始数据的事实列表、实体图、图库、`cuemem ask` 与 `cuemem inspect` 照样给出。
 - **`update`** 在原始日志里记一句 "Correction: …"，由它抽出的事实以"说错了"（corrected）取代原来那条（不需要对账的调用）；遗忘这句更正时原来那条恢复。
 - **`search` 不会因为控制器选了 L0 而返回空列表**：调用它就是已经决定要查记忆，L0 改走 L1（`min_level="l0"` 时照控制器的决定）。`answer()` 仍由控制器决定要不要想起。
 - **写入可以放心重试**：向量化或向量库出错时什么都不存，同样的调用可以原样再来一次；发言存下之后抽取出错时，`add(wait=True)` 不抛出，返回 `status: "queued"` 与 `error`，下次巩固时补上。`m.status(user_id="alice")` 列出待抽取与抽取失败的会话、出错与自动重试的时间，后台失败也记警告日志。
@@ -305,7 +305,7 @@ uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基�
 - 不用 Docker 时让 `cuemem serve` 监听 127.0.0.1；用 compose 时保留 `127.0.0.1:7860:7860` 的映射。
 - 在前面放 TLS 反向代理。Caddy 默认转发 Host 与 `X-Forwarded-Proto`：`mem.example.com { reverse_proxy 127.0.0.1:7860 }`。nginx 在做 `proxy_pass http://127.0.0.1:7860;` 的 `location` 里设 `proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_buffering off;`（后几项让界面的流式输出照常工作）。
 - 在 `.env` 里设 `CUEMEM_ALLOWED_HOSTS=mem.example.com`，Host 与 Origin 的检查才认这个名字。
-- 必须设访问令牌：`CUEMEM_API_TOKEN`（至少 16 个字符，例如 `openssl rand -hex 32`）或限定作用域的令牌。监听本机地址但 `CUEMEM_ALLOWED_HOSTS` 列了不只指本机的主机名（或 `*`）时，没有令牌或令牌短于 16 个字符，`serve` 与 `proxy` 拒绝启动（退出码 2），除非加 `--insecure-no-auth` / `--insecure-weak-token`，加了 `--insecure-no-auth` 时打印一条写着这些主机名的警告；只指本机的项（127.x、::1、localhost、*.localhost）不算。这时也打印明文 HTTP 的提示。
+- 必须设访问令牌：`CUEMEM_API_TOKEN`（至少 16 个字符，例如 `openssl rand -hex 32`）或限定作用域的令牌。监听本机地址但 `CUEMEM_ALLOWED_HOSTS` 列了不只指本机的主机名（或 `*`）时，没有令牌或令牌短于 16 个字符，`serve` 与 `proxy` 拒绝启动（退出码 2），除非加 `--insecure-no-auth` / `--insecure-weak-token`，加了 `--insecure-no-auth` 时打印一条写着这些主机名的警告；只指本机的项（127.x、::1、localhost、*.localhost）不算。有令牌时（加了 `--insecure-weak-token` 也是）这时也打印明文 HTTP 的提示。
 - `.env` 只给本人读写（`chmod 600 .env`；`cuemem configure` 与 `install -m 600` 建出来就是这样），令牌用 `openssl rand -hex 32` 生成。
 - CueMem 不限制登录与令牌出错的次数，在反向代理里做，例如 nginx 的 `limit_req`：`/login` 按客户端地址，接口按 `Authorization` 头。
 
@@ -313,7 +313,7 @@ uv run python scripts/n11_latency.py --out runs/n11-latency   # 离线延迟基�
 
 - **要备份的**：数据目录（源码仓库里是 `data/`，pip 安装后是 `~/.cuemem/data`）里的 `cuemem.sqlite` 连同它的 `-wal` 与 `-shm`（原始日志与派生记忆）、`ledger.sqlite`、`media/`（原图）与 `qdrant/`（或 Qdrant 服务端的存储）；`cache/` 可备可不备（能重建，要花请求）。
 - **怎么备份**：停掉 `cuemem serve` 再复制整个目录，或者每个 SQLite 文件用 `sqlite3 cuemem.sqlite ".backup DEST"`（或 Python 的 `sqlite3.Connection.backup`）。从不 `cp` 一个正在用、不带 `-wal` 的 `.sqlite`：最近提交的还在 `-wal` 文件里。`cuemem export --space S -o FILE`（按空间导出原始日志与原图）原子地写 FILE，导出失败（例如磁盘满）时旧的备份不动；它只打开数据库，serve 开着时也能用。
-- **恢复**：先放回 SQLite 文件，再放回 `media/`，`qdrant/` 可选，然后跑 `cuemem doctor --vectors` 与 `cuemem reindex --all`。向量库丢了、或与数据库对不上时（检索什么都没有，`get_all` 却列得出），`cuemem doctor --vectors` 列出哪些空间对不上，`cuemem reindex --space S`（或 `--all`）补齐；它不调用 LLM，向量缓存是热的时候不发请求，`--full` 把每个向量都重写一遍，不只补缺的。
+- **恢复**：停掉 `cuemem serve`，先放回 SQLite 文件，再放回 `media/`，`qdrant/` 可选，然后跑 `cuemem doctor --vectors` 与 `cuemem reindex --all`。向量库丢了、或与数据库对不上时（检索什么都没有，`get_all` 却列得出），`cuemem doctor --vectors` 列出哪些空间对不上，`cuemem reindex --space S`（或 `--all`）补齐；它不调用 LLM，向量缓存是热的时候不发请求，`--full` 把每个向量都重写一遍，不只补缺的。放回 `.backup` 的副本之前，先删掉数据目录里留着的 `cuemem.sqlite-wal` / `-shm` 与 `ledger.sqlite-wal` / `-shm`（serve 崩溃时会留下，SQLite 会把那个不相干的 WAL 重放到放回的文件上）；停机时复制的整个目录连同它自己的 `-wal` 与 `-shm` 一起放回。
 - **本地向量库坏了**：`data/qdrant/meta.json` 被清空时（建集合时进程被杀），停掉 serve，运行 `cuemem doctor --repair-vectors`：按 `collection/` 重写它，原来的文件改名为 `meta.json.broken-<时间>`。不要手动删掉 `data/qdrant/meta.json`：Qdrant 会写一个空的，已有的集合就再也找不到了。
 - **升级**：数据目录自动升级；不支持降级。更新的 CueMem 写的库拒绝打开、只打印一行原因；要换回旧版本，用新版本导出（`cuemem export`）再导入。
 

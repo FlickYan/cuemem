@@ -41,13 +41,13 @@ MemoryKind = Literal["fact", "excerpt", "image"]  # 按 ID 找到的记忆的种
 # v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
 # v6：turn_meta（SDK 写入时附带的 metadata、过期时间与 update 的更正目标）。新表都用
-# CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上；v7：表不变，标出第三轮复审的 128 位
-# 集合名（VectorStore.collection_name）。
+# CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上；v7：表不变，标出第二轮复审的 128 位
+# 集合名（VectorStore.collection_name，D-069）。
 #
 # 旧代码读不懂新代码写下的东西时就要升版本：不只是 SQLite 的表，也包括 Qdrant 的集合名与
-# payload。D-070 的 128 位集合名是在 v6 里改的、当时没升版本，所以 D-070 之前的 v6 提交读不到
-# 之后建的空间（检索为空）。打开比 SCHEMA_VERSION 新的库时拒绝（MemoryDB.__init__），
-# user_version 也从不调低：降级走导出再导入
+# payload。D-069 的 128 位集合名（第二轮复审）是在 v6 里改的、当时没升版本，所以那次复审
+# 之前的 v6 提交读不到之后建的空间（检索为空）。打开比 SCHEMA_VERSION 新的库时拒绝
+# （MemoryDB.__init__），user_version 也从不调低：降级走导出再导入
 SCHEMA_VERSION = 7
 
 # 新增的索引不用升版本：每次打开都执行 _SCHEMA，已有的库自动补上。facts 的

@@ -115,7 +115,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 - `run_id`：写进这个会话。每轮 `add` 一次同一个 `run_id` 时，每次都把整段会话重新抽取一遍（还要重放派生记忆）；一段多轮对话用 `with m.run(...)` 包起来，结束时只抽取一次。
 - `metadata`：JSON 对象，键是字符串，记在这次写入的每句发言上。它不给抽取模型看，请求不变。由这些发言得来的事实、对话片段与图片都带上它，`filters` 可以按它筛。不是字典时 TypeError；键不是字符串、值写不成 JSON 时 ValueError。
-- `expiration_date`：日期、时间或 ISO 字符串；只给日期时到那天结束。过期的记忆不再出现在 `search`、`get_all` 与画像里，除非 `show_expired=True`；`get` 与 `history` 照样取得到，要 `delete` 才删。同一件事后来又说过一次、没给过期时间，它就不过期。过期的记忆也不出现在 `answer()`、记忆代理注入的 `<memory>`、MCP 与 HTTP 的 recall（`cuemem mcp`、`/mcp`、`/api/spaces/{space}/recall`）、各处的画像（`profile()`、MCP 的 profile 工具、`GET /api/spaces/{space}/profile`、界面的画像栏）、`cuemem serve` 的对话 Agent（它的画像、召回与 `memory_search` 工具），以及 Claude、OpenAI Agents 与 LangGraph 的集成里（召回、自动召回，Claude memory tool 的 `profile.md`、`facts.md` 与 `history/`）。过期按现在的时钟算，不按提问的时间 `at`。浏览原始数据的事实列表（`GET /api/spaces/{space}/facts`、界面的事实列表）、`cuemem ask` 与 `cuemem inspect` 仍给出过期的记忆，`get`、`history` 与导出也是。
+- `expiration_date`：日期、时间或 ISO 字符串；只给日期时到那天结束。过期的记忆不再出现在 `search`、`get_all` 与画像里，除非 `show_expired=True`；`get` 与 `history` 照样取得到，要 `delete` 才删。同一件事后来又说过一次、没给过期时间，它就不过期。过期的记忆也不出现在 `answer()`、记忆代理注入的 `<memory>`、MCP 与 HTTP 的 recall（`cuemem mcp`、`/mcp`、`/api/spaces/{space}/recall`）、各处的画像（`profile()`、MCP 的 profile 工具、`GET /api/spaces/{space}/profile`、界面的画像栏）、`cuemem serve` 的对话 Agent（它的画像、召回与 `memory_search` 工具），以及 Claude、OpenAI Agents 与 LangGraph 的集成里（召回、自动召回，Claude memory tool 的 `profile.md`、`facts.md` 与 `history/`）。过期按现在的时钟算，不按提问的时间 `at`。浏览原始数据的事实列表（`GET /api/spaces/{space}/facts`、界面的事实列表）、实体图（`GET /api/spaces/{space}/graph`、界面的实体图）、图库（`GET /api/spaces/{space}/media`、界面的图库）、`cuemem ask` 与 `cuemem inspect` 仍给出过期的记忆，`get`、`history` 与导出也是。
 - `timestamp`：这些话是什么时候说的（时间、ISO 字符串或 Unix 时间戳；默认现在）。带时区的时间换算成本机时间。
 - `infer=False`：只写日志（`status: "logged"`），之后用 `consolidate()` 抽取。空间里别处的遗忘不会抽取这样的会话，导入它们的导出文件也不会（见导出与导入）；`consolidate()`、`add(wait=True)` 与 `update()` 会，它们巩固的是整个空间。
 - `wait=True`：同步抽取，返回 Mem0 风格的事件（`status: "consolidated"`，另有 `consolidation`）。run 还开着时不能用（ValueError：用 `end_run(..., wait=True)` 结束它）。发言存下之后抽取出错（例如模型供应商余额不足）时，`add` 不抛出：返回 `status: "queued"` 与 `error`；发言已经存下，下次巩固时补上抽取，不要再调用一遍。
@@ -203,7 +203,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 | `add()` 返回抽取出的事件 | 只在 `wait=True` 时；不带时 `results` 是 `[]`、`status` 是 `"queued"` |
 | `update` 返回的内容 | `id` 是原来的 ID，`results` 里是新的事实；原来的 ID 之后属于被取代的版本 |
 | `history` 的行是 `old_memory` / `new_memory` | 完整的事实，带 `event` `ADD` 或 `UPDATE` |
-| 不存在的 ID 上 `get` / `update` / `delete` 报 ValueError | KeyError |
+| 不存在的 ID 上 `update` / `delete` 报 ValueError（`get` 返回 `None`） | KeyError（`get` 也返回 `None`） |
 | `search` 与 `get_all` 缺省给 20 条（mem0ai 2.2.1 的 `top_k=20`） | 没有缺省：全部给，除非传 `limit` 或 `top_k` |
 
 ### `AsyncMemory`
@@ -264,7 +264,7 @@ MemoryClient(
 | `--no-ui` | 关 | 只启动接口、记忆代理与 MCP |
 | `--no-mcp` | 关 | 不在 `/mcp` 提供 MCP |
 | `--idle-minutes` | `30` | 对话会话、`/api/v1` 的 run 与记忆代理的会话闲置这么久后结束、交给抽取（要大于 0）；也是启动之后过多久把之前的进程留下的会话交给抽取 |
-| `--insecure-no-auth` | 关 | 没有任何令牌也在非本机地址上（或在本机地址上、`CUEMEM_ALLOWED_HOSTS` 却列了别的主机名时）启动；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字。设了令牌时只是不查令牌是否够 16 个字符 |
+| `--insecure-no-auth` | 关 | 没有任何令牌也在非本机地址上（或在本机地址上、`CUEMEM_ALLOWED_HOSTS` 却列了别的主机名时）启动。监听非本机地址时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字；监听本机地址时只能是 127.0.0.1、localhost、[::1]、监听地址或 `CUEMEM_ALLOWED_HOSTS` 里的名字，与设了令牌时相同。设了令牌时只是不查令牌是否够 16 个字符 |
 | `--insecure-weak-token` | 关 | 监听非本机地址、或在反向代理后面监听本机地址（`CUEMEM_ALLOWED_HOSTS`）时也允许短于 16 个字符的令牌 |
 | `--unknown-model` | `proxy.unknown_model`（`remap`） | 记忆代理收到不认识的模型时：`remap` 或 `reject` |
 
@@ -272,8 +272,8 @@ MemoryClient(
 
 ### 鉴权与限定作用域的令牌
 
-- 没有配任何令牌时不鉴权，只能监听没有对外的本机地址：监听非本机地址又没有令牌时拒绝启动，除非加 `--insecure-no-auth`；监听本机地址、`CUEMEM_ALLOWED_HOSTS` 却列了不只指本机的主机名或 `*` 时（经反向代理对外；只指本机的项是 127.x、::1、localhost 与 *.localhost，可带端口或方括号）也一样；这时 Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字（否则 400，防 DNS 重绑定）。
-- 监听非本机地址、以及像上面那样在反向代理后面监听本机地址时，每个令牌至少 16 个字符（`cuemem.api.auth.MIN_TOKEN_CHARS`）：管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是。更短的让 `cuemem serve` 与 `cuemem proxy` 在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项、从不打印令牌本身，除非加 `--insecure-weak-token`（compose 里加进 `command:`）。`--insecure-no-auth` 也跳过这项检查：设了令牌时服务带着这个短令牌启动，请求仍要带它，并且与任何设了令牌的监听一样不查 Host。用 `openssl rand -hex 32` 生成令牌。`sha256:` 的条目量不出长度，不查。
+- 没有配任何令牌时不鉴权，只能监听没有对外的本机地址：监听非本机地址又没有令牌时拒绝启动，除非加 `--insecure-no-auth`；监听本机地址、`CUEMEM_ALLOWED_HOSTS` 却列了不只指本机的主机名或 `*` 时（经反向代理对外；只指本机的项是 127.x、::1、localhost 与 *.localhost，可带端口或方括号）也一样。加了 `--insecure-no-auth` 又监听非本机地址时，Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字；监听本机地址时，不管有没有令牌，只能是 127.0.0.1、localhost、[::1]、监听地址或 `CUEMEM_ALLOWED_HOSTS` 里的名字（否则 400，防 DNS 重绑定；列表里有 `*` 时不查 Host）。
+- 监听非本机地址、以及像上面那样在反向代理后面监听本机地址时，每个令牌至少 16 个字符（`cuemem.api.auth.MIN_TOKEN_CHARS`）：管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是。更短的让 `cuemem serve` 与 `cuemem proxy` 在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项、从不打印令牌本身，除非加 `--insecure-weak-token`（compose 里加进 `command:`）。`--insecure-no-auth` 也跳过这项检查：设了令牌时服务带着这个短令牌启动，请求仍要带它；监听非本机地址时与那里任何设了令牌的监听一样不查 Host，监听本机地址时照上面查 Host。用 `openssl rand -hex 32` 生成令牌。`sha256:` 的条目量不出长度，不查。
 - 服务说的是明文 HTTP。设了令牌又监听非本机地址（或 `CUEMEM_ALLOWED_HOSTS` 让本机地址对外）时，启动时提示令牌（也是界面的密码）与记忆都不加密地经过网络；可信网络之外要在前面放 TLS 反向代理，见 README 的[公网部署](../README.zh-CN.md#公网部署)。CueMem 不限制登录与令牌出错的次数，在反向代理里做。
 - `CUEMEM_API_TOKEN` 是管理令牌，请求带 `Authorization: Bearer <令牌>`。`GET /api/health` 不要令牌。`/api` 与 `/api/v1` 在读请求体之前就认令牌，没认上的请求不论请求体是什么都回 401。
 - 限定作用域的令牌（`CUEMEM_API_KEYS_FILE` 是 YAML 文件的路径，`CUEMEM_API_KEYS` 是同样内容的 YAML 或 JSON 文本，只能设一个）给每个令牌列出它能访问的用户与 Agent：
@@ -523,7 +523,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 - 预设名写错或 `CUEMEM_*` 的值不合法时，任何命令都只打印一行"错误：配置有误：…"（字段、原因与收到的值，密钥类的值不回显）并以 1 退出，不再打印调用栈；`cuemem mcp` 写到 stderr。SDK 照旧抛 ValueError 或 pydantic 的 ValidationError。
 - 文件权限：命令行把 umask 收紧到至少 077（从不放宽），写的文件都是 0600、目录 0700；SDK 与 `MemorySystem.from_settings` 新建缺的数据目录时也是 0700。已经存在的目录一律不改。POSIX 上 `cuemem doctor` 还查数据目录、`.env` 与 `CUEMEM_API_KEYS_FILE` 的权限，别人能读时写出要运行的 `chmod 700` / `chmod 600`；`serve` 与 `proxy` 启动时提醒这两个密钥文件。`cuemem configure` 经一个 0600 的临时文件替换 `.env`（符号链接的 `.env` 链接留着；它所在的目录要可写）。
 - 用 Qdrant 服务端时 `cuemem doctor` 写 `向量库：<url>（API Key 已设/未设）`；`cuemem migrate-vectors` 给目标带上 `CUEMEM_VECTOR_STORE__API_KEY`。
-- `cuemem doctor` 还打印数据目录的剩余空间（少于 200 MiB 或没有写权限时标黄）。打不开 SQLite 数据库时（目录只读、磁盘满），任何命令都只打印一行、写明数据目录，以 1 退出。
+- `cuemem doctor` 还打印数据目录的剩余空间（少于 200 MiB 或没有写权限时标黄）。打不开 SQLite 数据库时（目录只读、磁盘满），自己打开它的命令（`ingest`、`import`、`export`、`consolidate`、`reindex`、`forget`、`ask`、`search-image`、`spaces`、`inspect` 与 `doctor --vectors`）只打印一行、写明数据目录，以 1 退出；`serve`、`proxy`、`chat`、`demo` 与 `mcp` 仍打印调用栈。
 - `cuemem doctor --repair-vectors`：本地向量库的 `data/qdrant/meta.json` 读不出、不在了而集合还在、或者某个集合的配置不合法时，按 `collection/<名字>/storage.sqlite` 重写它。先停掉 `cuemem serve` 或 `cuemem proxy`：别的进程拿着向量库时拒绝。稠密向量的维度从存着的点读（空的集合用 `embedding.dim` 或 `multimodal_embedding.dim`），原来的文件改名为 `meta.json.broken-<时间>`。不要手动删掉 `meta.json`：Qdrant 会写一个空的，已有的集合就再也找不到了。
 - `cuemem doctor --vectors`（要显式加）：逐个空间比较数据库里各种单元的个数与向量库里的点数，开了图片向量时再比较图片的行与图片的点。对不上的空间标黄并给出 `cuemem reindex --space S`，最后一行是 `cuemem reindex --all`；都对得上时打印 `向量库：N 个空间的点数与数据库一致`。本地向量库正被别的进程（serve）拿着时跳过这项并说明，doctor 的其余检查照常。
 - `cuemem reindex [--space S | --all] [--full]`：按数据库补齐向量库（不调用 LLM；向量缓存是热的时候也不发请求）：没有向量的单元与图片重新向量化，删掉数据库里已经没有的点；`--full` 把每个向量都重写一遍。`--space` 与 `--all` 必须给且只给一个（否则退出码 2），空间不存在时退出码 1。每个空间打印一行：补上了哪几种、各几个，删掉的多余的点，原图不在了的图片，事实表里找不到的事实单元。本地模式下要打开向量库，先停掉 serve。在 Python 里：`MemorySystem.reindex(space_id, *, only_missing=True)`（例如 `m.system.reindex(space)`）返回一个字典：每种补上的单元一个计数（`round`、`fact`、`summary`、`entity`、`image`、`image_iso`），`images`、`orphans`、`image_orphans`、`missing_files`，有时还有 `facts_missing`；在这个空间的 `reading()` 里调用时与遗忘一样抛 RuntimeError。
@@ -534,4 +534,4 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 - **要留的**（在数据目录里，源码仓库里是 `data/`）：`cuemem.sqlite` 连同它的 `-wal` 与 `-shm`（原始日志与派生记忆）、`ledger.sqlite`、`media/`（原图）与 `qdrant/`（或 Qdrant 服务端的存储）；`cache/` 可留可不留（能重建，但要花请求）。
 - **怎么备份**：停掉 `cuemem serve` 再复制整个数据目录，或者每个 SQLite 文件用 `sqlite3 cuemem.sqlite ".backup DEST"`（或 Python 的 `sqlite3.Connection.backup`）。从不 `cp` 一个正在用、不带 `-wal` 的 `.sqlite`：用 WAL 时最近提交的还在 `-wal` 文件里。
-- **恢复**：先放回 SQLite 文件，再放回 `media/`，`qdrant/` 可选；然后跑 `cuemem doctor --vectors` 与 `cuemem reindex --all`。SQLite 与 Qdrant 不是同一时刻的备份、或者向量库丢了（检索什么都没有、`get_all` 仍列得出）时，都这样补。按空间的 `cuemem export` 是可以带走的另一种做法，它带着原始日志与原图，不带向量。
+- **恢复**：停掉 `cuemem serve`，先放回 SQLite 文件，再放回 `media/`，`qdrant/` 可选；然后跑 `cuemem doctor --vectors` 与 `cuemem reindex --all`。放回 `.backup` 的副本之前，先删掉数据目录里留着的 `cuemem.sqlite-wal` / `-shm` 与 `ledger.sqlite-wal` / `-shm`：serve 崩溃时会留下，SQLite 会把那个不相干的 WAL 重放到放回的文件上。停机时复制的整个目录连同它自己的 `-wal` 与 `-shm` 一起放回。SQLite 与 Qdrant 不是同一时刻的备份、或者向量库丢了（检索什么都没有、`get_all` 仍列得出）时，都这样补。按空间的 `cuemem export` 是可以带走的另一种做法，它带着原始日志与原图，不带向量。

@@ -47,7 +47,7 @@
 | 零代码接入 | OpenAI 兼容的 HTTP 代理（`/v1/chat/completions`，流式；`/v1/embeddings`；`/v1/responses` 的非流式纯文字子集） | 客户端包装（`Mem0().chat.completions.create`） | — | — | — | Memory Router（改 base URL；文档已重定向，现状未核实） |
 | 每轮都检索吗 | 否：控制器先判断，L0 不检索（SDK 的 `search` 缺省不低于 L1） | 包装里每轮检索 | LLM 决定 | 应用决定 | 规则路由 | 每轮 |
 | 知识更新 | 失效而不删除，版本链 `history()`；`update()` 在日志里记一句更正，取代原来那条 | v3 只增不改；`update()` 就地改写；`history()` | LLM 改写 | 失效而不删除 | 矛盾检测（默认关） | `isLatest` 版本链 |
-| 两条时间轴 | 事件时间与记录时间分开回放：`valid_at`（那时现实中成立的）、`known_at`（系统那时相信的）；过期时间 `expiration_date`（每个产品入口都排除；浏览原始数据的事实列表与命令行仍给出） | 记录时间；过期时间 `expiration_date` | 未见 | 有：边上记 `valid_at` / `invalid_at` 与 `created_at` / `expired_at` | 未见 | 未见 |
+| 两条时间轴 | 事件时间与记录时间分开回放：`valid_at`（那时现实中成立的）、`known_at`（系统那时相信的）；过期时间 `expiration_date`（召回、回答、记忆代理、MCP、画像、对话 Agent 与各集成都排除；浏览原始数据的事实列表、实体图、图库、`cuemem ask`、`cuemem inspect`、`get`、`history` 与导出仍给出） | 记录时间；过期时间 `expiration_date` | 未见 | 有：边上记 `valid_at` / `invalid_at` 与 `created_at` / `expired_at` | 未见 | 未见 |
 | 图片 | 存原图、上下文感知描述、以图搜图、回答时再看原图 | 视觉模型转成文字（`enable_vision`） | 未见 | 不支持（文本与 JSON） | 视觉或转写模型（细节未核实） | OCR |
 | 遗忘 | 删日志 + 重放，沿引用扩散，找没有引用的转述；**可预演**；`reset()` | `delete` / `delete_all` / `reset`；过期时间 | 编辑记忆 | `remove_episode` | `forget` | `forget_matching(dry_run)` |
 | 导出 / 导入 | `export` / `load`（原始日志 + 原图，派生记忆重建） | 只在付费平台 | Agent File（已从 Letta Code 去掉） | 未见 | COGX，可导入 Mem0 / Zep / Letta | 未见 |
@@ -182,6 +182,6 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070），可选的按令牌上限（`rate_per_minute`、`models`、`max_output_tokens`）是第四轮（D-071）。还缺：按令牌的每日花费预算；令牌文件只在启动时读，没有生成令牌的命令；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
 3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
-5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；第五轮体检起（D-072）过期也在 `answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、对话 Agent 与各集成里生效，浏览原始数据的事实列表、`cuemem ask` 与 `cuemem inspect` 仍给出过期的记忆；Supermemory 那样自动认出临时事实、让它过期的还没有。
+5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；第五轮体检起（D-072）过期也在 `answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、对话 Agent 与各集成里生效，浏览原始数据的事实列表、实体图、图库、`cuemem ask` 与 `cuemem inspect` 仍给出过期的记忆；Supermemory 那样自动认出临时事实、让它过期的还没有。
 6. **面向开发者的英文文字**：命令行的提示、核心模块抛出的大部分异常（包括 `/api` 的报错）与 SDK 的大部分文档字符串是中文，这一点有意不改；另写了一份英文的接口参考（[docs/en/api.md](en/api.md)，中文版 [docs/api.md](api.md)，D-069）。SDK 自己的报错、`/api/v1`、记忆代理、MCP 工具与界面是英文（N12 之后的体检，D-068）。
 7. **正式发布**：CueMem 还没有发布到 PyPI，也没有打版本标签，从 GitHub 安装（`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"`）；PyPI 上名叫 cuemem 的包不是这个项目（D-071）。

@@ -303,7 +303,7 @@ class MediaItem:  # 图片（视频 / 音频为扩展）：N3 定下结构，N6 
 
 **迟到的旧消息不覆盖新状态**：如果新事实的事件时间早于当前事实（例如后导入一段更早的对话），它直接作为历史版本写入。测试验证了"先导入新会话、再导入旧会话"与按时间顺序导入的结果一致。
 
-**SDK 的更正与过期**（N12 之后的第二轮体检，D-069）：`update(memory_id, data)` 不就地改写，而是在日志里记一句用户说的 "Correction: …"，原始层记下它更正的是哪条；对账从这句抽出的事实里取一条，以"认知变了"取代原来那条，不问 LLM（登记过的多值谓词只靠对账会一律新增）。过期时间（`expiration_date`）与 `metadata` 存在原始层，不进抽取提示；不改写 `valid_to`。第五轮体检起（D-072）规则在 `cuemem.expiry` 里，读路径有 `MemorySystem.retrieve` / `ask(hide_expired=False)`：产品的入口（`answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、`cuemem serve` 的对话 Agent、各集成）打开它，评测、命令行的 `ask` 与冻结的方法不打开。`expired_ids` 只做一次带索引的 `turn_meta` 查询，没有过期的行时别的都不变，请求逐字节相同。过期按现在的时钟算。浏览原始数据的事实列表仍列出过期的事实。
+**SDK 的更正与过期**（N12 之后的第二轮体检，D-069）：`update(memory_id, data)` 不就地改写，而是在日志里记一句用户说的 "Correction: …"，原始层记下它更正的是哪条；对账从这句抽出的事实里取一条，以"认知变了"取代原来那条，不问 LLM（登记过的多值谓词只靠对账会一律新增）。过期时间（`expiration_date`）与 `metadata` 存在原始层，不进抽取提示；不改写 `valid_to`。第五轮体检起（D-072）规则在 `cuemem.expiry` 里，读路径有 `MemorySystem.retrieve` / `ask(hide_expired=False)`：产品的入口（`answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、`cuemem serve` 的对话 Agent、各集成）打开它，评测、命令行的 `ask` 与冻结的方法不打开。`expired_ids` 只做一次带索引的 `turn_meta` 查询，没有过期的行时别的都不变，请求逐字节相同。过期按现在的时钟算。浏览原始数据的事实列表、实体图与图库仍给出过期的记忆。
 
 ### 5.4 遗忘与隐私
 
