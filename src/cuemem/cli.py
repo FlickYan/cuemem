@@ -865,6 +865,20 @@ def _host_policy(host: str, *, authenticated: bool = True) -> HostPolicy:
     return HostPolicy(list(dict.fromkeys(["localhost", *named, *extra])), extra, True)
 
 
+def _no_auth_warning(host: str, can: str) -> None:
+    """--insecure-no-auth 对外时的启动提示：监听非本机地址，或监听本机地址但
+    CUEMEM_ALLOWED_HOSTS 列了别的主机名（经反向代理对外，第五轮复审：以前这时什么都不提示）。"""
+    from cuemem.api.app import HOSTS_ENV
+    from cuemem.api.auth import TOKEN_ENV
+
+    exposed = _exposed_names() if _is_loopback(host) else []
+    via = f"，{HOSTS_ENV} 列出了 {escape('、'.join(exposed))}（经反向代理对外）" if exposed else ""
+    console.print(
+        f"[yellow]注意：[/yellow]监听 {escape(host)}{via}，但没有设置 {TOKEN_ENV}"
+        f"（--insecure-no-auth），能连到这台机器的人都能{can}"
+    )
+
+
 def _no_auth_hosts_note(hosts: HostPolicy) -> None:
     """--insecure-no-auth 监听非本机地址时的启动提示：只接受哪些 Host（别的回 400
     "Invalid host header"，局域网里用主机名访问的人不知道为什么）。"""
@@ -937,7 +951,7 @@ def serve(
     import uvicorn
 
     from cuemem.api.app import create_app
-    from cuemem.api.auth import TOKEN_ENV, Keys
+    from cuemem.api.auth import Keys
     from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits
     from cuemem.api.proxy import MemoryProxy
 
@@ -999,11 +1013,8 @@ def serve(
                 # 容器里总是 0.0.0.0：Docker 也提示；本机地址经反向代理对外时也提示
                 if not _is_loopback(host) or _exposed_names():
                     console.print(PLAIN_HTTP_NOTE)
-            elif not _is_loopback(host):  # 加了 --insecure-no-auth
-                console.print(
-                    f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
-                    "（--insecure-no-auth），能连到这台机器的人都能读写、删除记忆"
-                )
+            elif not _is_loopback(host) or _exposed_names():  # 加了 --insecure-no-auth
+                _no_auth_warning(host, "读写、删除记忆")
                 _no_auth_hosts_note(hosts)
             for line in _loose_modes():
                 console.print(line)
@@ -1036,7 +1047,6 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.auth import TOKEN_ENV
     from cuemem.api.limits import body_limits
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
@@ -1080,11 +1090,8 @@ def proxy(
             console.print(f"已启用访问令牌：{_keys_note(keys)}。OpenAI SDK 的 api_key 填令牌")
             if not _is_loopback(host) or _exposed_names():
                 console.print(PLAIN_HTTP_NOTE)
-        elif not _is_loopback(host):  # 加了 --insecure-no-auth
-            console.print(
-                f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
-                "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
-            )
+        elif not _is_loopback(host) or _exposed_names():  # 加了 --insecure-no-auth
+            _no_auth_warning(host, "用你的上游 Key、读写记忆")
             _no_auth_hosts_note(hosts)
         for line in _loose_modes():
             console.print(line)

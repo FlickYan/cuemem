@@ -601,6 +601,12 @@ def test_loopback_bind_behind_a_reverse_proxy_needs_a_token(
     flat = _flat(result.output)
     assert "CUEMEM_ALLOWED_HOSTS" in flat and "mem.example.com" in flat
     assert "--insecure-no-auth" in flat
+    # 加了 --insecure-no-auth 时照样启动，但要像监听 0.0.0.0 时一样提示（以前什么都不说）
+    bypass = runner.invoke(app, [*command, "--host", "127.0.0.1", "--insecure-no-auth"])
+    assert bypass.exit_code == 0 and len(served) == 1
+    said = _flat(bypass.output)
+    assert "注意" in said and "CUEMEM_ALLOWED_HOSTS" in said and "mem.example.com" in said
+    served.clear()
     monkeypatch.setenv("CUEMEM_API_TOKEN", "your-token")
     weak = runner.invoke(app, [*command, "--host", "127.0.0.1"])
     assert weak.exit_code == 2 and served == [] and "your-token" not in weak.output
