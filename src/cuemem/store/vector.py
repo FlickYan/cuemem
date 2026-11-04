@@ -11,6 +11,7 @@ import errno
 import functools
 import gc
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -82,6 +83,10 @@ class VectorStore:
                 # 以前原样抛出 sqlite3.OperationalError（不是 CueMemError）：cuemem serve、proxy
                 # 与 migrate-vectors 都打印调用栈退出，看不出是打开的文件太多
                 raise _open_failed(path, exc) from exc
+            except (ValueError, KeyError, TypeError) as exc:
+                # meta.json 读不出（多半是空的：qdrant-client 1.19 每次建、删集合都先清空它再写，
+                # 正好在这时被杀掉）。以前原样抛出 JSONDecodeError，cuemem export 也用不了
+                raise _meta_unreadable(path, exc) from exc
         # 统一加锁：本地模式不是线程安全的；服务端模式下同步客户端被多个线程同时使用也会出错
         # （N11 压测里出现 "Bad file descriptor"）
         self._lock = threading.RLock()
@@ -607,6 +612,146 @@ def _open_failed(
         f" ulimit -n（不够时连硬上限一起调）让它打得开，再用 {migrate} 把向量复制到 Qdrant"
         " 服务端，并设置 CUEMEM_VECTOR_STORE__URL（见 docs/design.md 的部署一节）"
     )
+
+
+def _meta_unreadable(path: Path, exc: Exception) -> VectorStoreOpenError:
+    """本地模式的 meta.json 读不出时的出错：向量还在，写明怎么修、不要删 meta.json。先放掉打开到
+    一半的集合（同 _open_failed）。"""
+    traceback.clear_frames(exc.__traceback__)
+    gc.collect()
+    return VectorStoreOpenError(
+        f"本地模式的向量库 {path / 'meta.json'} 读不出（{type(exc).__name__}: {exc}），向量还在"
+        f" {path / 'collection'} 下面：运行 {cli_command('doctor --repair-vectors')} 按这些集合"
+        "重写 meta.json。不要手动删掉 meta.json：Qdrant 会写一个空的，这些集合就再也找不到了"
+        f"（{cli_command('export')} 不用向量库，照样能导出）"
+    )
+
+
+def repair_local_meta(path: Path, *, text_dim: int, image_dim: int) -> dict[str, Any] | None:
+    """按 collection/ 下的集合重写本地模式的 meta.json（cuemem doctor --repair-vectors）。
+
+    只在 meta.json 读不出、不在了、或者漏了 collection/ 下的集合时动手，否则返回 None。直接删掉
+    meta.json 不行：Qdrant 会写一个空的，旧集合没人认，下次写入在同名目录上重新建集合。另一个
+    进程开着这个向量库时（.lock 被锁着）拒绝：StorageLockedError。
+
+    meta.json 读得出的部分原样保留；其余集合的配置照 VectorStore 建集合时的写：文字集合 dense
+    （余弦）加 sparse，图片集合（名字以 IMAGE_SUFFIX 结尾）只有 dense。dense 的维度从存着的一个
+    点读（只读打开；不同向量模型的构建可以并存，不能用现在的配置），空集合用 text_dim 或
+    image_dim。原来的 meta.json 改名为 meta.json.broken-<时间>，新文件先写临时文件、fsync 再
+    换上，写完重新打开核对一遍。返回补上的文字、图片与空集合数、点数与备份的位置。"""
+    import time
+
+    import portalocker
+    from qdrant_client._pydantic_compat import to_dict
+
+    meta = path / "meta.json"
+    root = path / "collection"
+    names = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+    try:
+        kept = dict(json.loads(meta.read_text("utf-8"))["collections"])
+    except FileNotFoundError:
+        kept = {}
+    except (ValueError, KeyError, TypeError):
+        kept = None  # 读不出：整个重写
+    if kept is not None and all(name in kept for name in names):
+        return None
+    lock_path = path / ".lock"
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as lock:  # 与 qdrant-client 打开时加的是同一把锁
+        flags = portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING
+        try:
+            portalocker.lock(lock, flags)
+        except portalocker.exceptions.LockException as exc:
+            raise StorageLockedError(
+                f"向量库 {path} 正被另一个进程使用：先停掉那个进程（比如正在运行的 cuemem serve）"
+                "再修"
+            ) from exc
+        try:
+            collections = dict(kept or {})
+            report = {"text": 0, "image": 0, "empty": 0, "points": 0}
+            for name in names:
+                if name in collections:
+                    continue
+                image = name.endswith(IMAGE_SUFFIX)
+                size, points = _stored_dim(root / name / "storage.sqlite")
+                if size is None:
+                    size = image_dim if image else text_dim
+                    report["empty"] += 1
+                report["image" if image else "text"] += 1
+                report["points"] += points
+                dense = models.VectorParams(size=size, distance=models.Distance.COSINE)
+                config = models.CreateCollection(
+                    vectors={DENSE: dense},
+                    sparse_vectors=None if image else {SPARSE: models.SparseVectorParams()},
+                    metadata=None,
+                )
+                collections[name] = to_dict(config)
+            # 与 qdrant-client 1.19 的 QdrantLocal._save 写的一样
+            text = json.dumps({"collections": collections, "aliases": {}})
+            backup = None
+            if meta.exists():
+                backup = meta.with_name(f"meta.json.broken-{time.strftime('%Y%m%d-%H%M%S')}")
+                meta.rename(backup)
+            tmp = meta.with_name("meta.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, meta)
+            with suppress(OSError):  # 目录项也落盘（Windows 上打不开目录，跳过）
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        finally:
+            portalocker.unlock(lock)
+    client = QdrantClient(path=str(path))  # 核对：打得开、集合都在
+    try:
+        found = {c.name for c in client.get_collections().collections}
+    finally:
+        client.close()
+    if found != set(collections):
+        raise VectorStoreOpenError(
+            f"重写 {meta} 之后集合对不上：{sorted(set(collections) ^ found)}"
+        )
+    return {**report, "backup": str(backup) if backup else None}
+
+
+def _stored_dim(storage: Path) -> tuple[int | None, int]:
+    """集合文件里一个点的 dense 维度（没有点时 None）与点数。只读打开；只读打不开时（被杀掉时留下
+    了回滚日志，只读模式回滚不了）照常打开，Qdrant 下次打开时也是这样回滚的。"""
+    if not storage.is_file():
+        return None, 0
+    try:
+        conn = sqlite3.connect(f"{storage.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row, count = _first_point(conn)
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(storage)
+        try:
+            row, count = _first_point(conn)
+        finally:
+            conn.close()
+    if row is None:
+        return None, 0
+    import pickle
+
+    point = pickle.loads(row)  # Qdrant 本地模式自己的格式（LocalCollection 也是这样读的）
+    vector = point.vector.get(DENSE) if isinstance(point.vector, dict) else None
+    if not isinstance(vector, list) or not vector:
+        raise VectorStoreOpenError(f"{storage} 里的点没有 {DENSE} 向量，不是 CueMem 建的集合")
+    return len(vector), count
+
+
+def _first_point(conn: sqlite3.Connection) -> tuple[bytes | None, int]:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'points'").fetchone():
+        return None, 0
+    count = int(conn.execute("SELECT COUNT(*) FROM points").fetchone()[0])
+    row = conn.execute("SELECT point FROM points LIMIT 1").fetchone()
+    return (bytes(row[0]) if row else None), count
 
 
 def _build_filter(

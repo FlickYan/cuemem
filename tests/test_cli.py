@@ -125,6 +125,91 @@ def test_doctor_counts_local_collections(
     assert "migrate-vectors--toURL" in flat and "CUEMEM_VECTOR_STORE__URL" in flat
 
 
+def test_empty_vector_meta_export_still_works_and_doctor_repairs_it(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """被杀掉时 qdrant-client 1.19 留下空的 meta.json：以前打开记忆系统、连 cuemem export 都
+    原样抛出 JSONDecodeError，doctor 只说读不出。现在打开时写明 doctor --repair-vectors；export
+    只打开数据库，照样导出；修好之后检索结果不变。"""
+    from cuemem.errors import VectorStoreOpenError
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    system = MemorySystem.from_settings(load_settings())
+    query = system.embedder.embed(["Where does Alice work?"], "query").dense[0]
+    before = [h.unit_id for h in system.vectors.search_dense("demo", query, 5)]
+    system.close()
+    system = MemorySystem.from_settings(load_settings())
+    assert [h.unit_id for h in system.vectors.search_dense("demo", query, 5)] == before
+    system.close()
+    meta = tmp_path / "qdrant" / "meta.json"
+    meta.write_text("", "utf-8")
+
+    with pytest.raises(VectorStoreOpenError, match="repair-vectors"):
+        MemorySystem.from_settings(load_settings())
+    result = runner.invoke(app, ["export", "--space", "demo", "-o", str(tmp_path / "out.json")])
+    assert result.exit_code == 0, result.output
+    data = json.loads((tmp_path / "out.json").read_text("utf-8"))
+    assert sum(len(s["turns"]) for s in data["sessions"]) == 18
+    result = runner.invoke(app, ["spaces"])
+    assert result.exit_code == 0 and "demo" in result.output
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "doctor--repair-vectors" in _flat(result.output)
+    assert "不要手动删掉meta.json" in _flat(result.output)
+
+    result = runner.invoke(app, ["doctor", "--repair-vectors"])
+    assert result.exit_code == 0, result.output
+    assert "补上1个文字集合、0个图片集合" in _flat(result.output)
+    system = MemorySystem.from_settings(load_settings())
+    try:
+        assert [h.unit_id for h in system.vectors.search_dense("demo", query, 5)] == before
+    finally:
+        system.close()
+    result = runner.invoke(app, ["doctor", "--repair-vectors"])
+    assert result.exit_code == 0 and "不用修" in _flat(result.output)
+
+
+def test_unopenable_database_is_one_line(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """目录只读、磁盘满了时 SQLite 在打开时出错：以前每个命令都打印 sqlite3.OperationalError 的
+    调用栈，现在一行说明与退出码 1。"""
+    import sqlite3
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    for command in (["ingest", str(TOY_CONVERSATION)], ["export", "--space", "demo"], ["spaces"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, (command, result.output)
+        assert not isinstance(result.exception, sqlite3.OperationalError)
+        assert "打不开（attemptto" in _flat(result.output), result.output
+        assert "检查目录权限与磁盘空间" in _flat(result.output)
+        assert "Traceback" not in result.output
+
+
+def test_doctor_reports_free_space(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor 写明数据目录还剩多少空间，不到 200 MB 时标黄（满了时打开数据库与写入都会失败）。"""
+    import shutil
+
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "剩余空间" in result.output and "空间不够" not in result.output
+
+    usage = shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: usage._replace(free=50 * 2**20))
+    result = runner.invoke(app, ["doctor"])
+    assert "剩余空间50MB" in _flat(result.output) and "空间不够" in result.output
+
+
 @pytest.mark.filterwarnings(
     "ignore:Api key is used with an insecure connection", "ignore:Failed to obtain server version"
 )

@@ -2,7 +2,7 @@
 
 cuemem [--preset openai|ollama] …     换模型供应商（也可设 CUEMEM_PRESET，N12）
 cuemem configure                      交互式填写 API Key（写入 .env）
-cuemem doctor [--live]                检查配置、API Key 与连通性
+cuemem doctor [--live]                检查配置、API Key 与连通性（--repair-vectors 修本地向量库）
 cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
 cuemem consolidate --space S          巩固：抽取事实与实体、对账、摘要、核心记忆
 cuemem ask "问题" --space S [--at T]  检索记忆并回答
@@ -30,6 +30,7 @@ import ipaddress
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import tempfile
 import time
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from cuemem.evals.datasets import EvalSet
     from cuemem.evals.runner import RunSummary
     from cuemem.memory import MemorySystem
+    from cuemem.store.sqlite import MemoryDB
     from cuemem.write.consolidate import ConsolidationReport
 
 app = typer.Typer(
@@ -76,6 +78,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+LOW_DISK = 200 * 2**20  # doctor 在数据目录剩余空间低于它时标黄
 
 
 @app.callback()
@@ -199,7 +202,11 @@ def _open_system() -> Iterator[MemorySystem]:
     try:
         settings = _settings(peak_policy="warn")
         _peak_note(settings)
-        system = MemorySystem.from_settings(settings)
+        try:
+            system = MemorySystem.from_settings(settings)
+        except sqlite3.OperationalError as exc:  # 只管打开时：用的时候出的错照常抛出
+            console.print(_unopenable(settings, exc))
+            raise typer.Exit(1) from exc
         yield system
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{exc}")
@@ -207,6 +214,37 @@ def _open_system() -> Iterator[MemorySystem]:
     finally:
         if system is not None:
             system.close()
+
+
+def _unopenable(settings: Settings, exc: sqlite3.OperationalError) -> str:
+    """打开数据库、账本或缓存时 SQLite 出错（目录只读、磁盘满了）：一行说明，不打印调用栈。"""
+    where = escape(str(settings.paths.db.parent))
+    return (
+        f"[red]错误：[/red]{where} 里的数据库打不开（{escape(str(exc))}）：检查目录权限与磁盘空间"
+    )
+
+
+@contextmanager
+def _open_db_only() -> Iterator[MemoryDB]:
+    """只打开数据库（cuemem export、spaces）：不用向量库、模型与缓存，向量库打不开、或者
+    cuemem serve 正开着它的时候也能用。"""
+    from cuemem.store.files import private_dirs, storage_dirs
+    from cuemem.store.sqlite import MemoryDB
+
+    settings = _settings()
+    private_dirs(*storage_dirs(settings))
+    try:
+        db = MemoryDB(settings.paths.db)
+    except sqlite3.OperationalError as exc:
+        console.print(_unopenable(settings, exc))
+        raise typer.Exit(1) from exc
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{exc}")
+        raise typer.Exit(1) from exc
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 @app.command()
@@ -256,11 +294,21 @@ def doctor(
     live: Annotated[
         bool, typer.Option("--live", help="实际调用每个模型与向量接口做连通性测试（费用极低）")
     ] = False,
+    repair_vectors: Annotated[
+        bool,
+        typer.Option(
+            "--repair-vectors",
+            help="本地向量库的 meta.json 读不出时，按 collection/ 下的集合重写它（先停掉 serve）",
+        ),
+    ] = False,
 ) -> None:
-    """检查配置、API Key、数据目录与密钥文件的权限，以及（可选）各模型的连通性。"""
+    """检查配置、API Key、数据目录与密钥文件的权限、剩余空间，以及（可选）各模型的连通性。"""
     settings = _settings()
+    if repair_vectors:
+        _repair_vectors(settings)
     _print_config(settings)
     _print_local_store(settings)
+    _print_disk(settings)
     for line in _loose_modes(settings):
         console.print(line)
     if live:
@@ -313,9 +361,9 @@ def export_cmd(
     """导出记忆空间（N12）：原始日志与图片原文件，可选附上事实与画像的快照。"""
     from cuemem.portable import export_space
 
-    with _open_system() as system:
+    with _open_db_only() as db:  # 不用向量库：向量库坏了（见 doctor --repair-vectors）也能导出
         try:
-            data = export_space(system, space, derived=not no_derived)
+            data = export_space(db, space, derived=not no_derived)
         except KeyError as exc:
             console.print(f"[red]没有记忆空间 {space}[/red]")
             raise typer.Exit(1) from exc
@@ -493,12 +541,8 @@ def search_image(
 @app.command()
 def spaces() -> None:
     """列出所有记忆空间。"""
-    from cuemem.store.sqlite import MemoryDB
-
-    settings = _settings()
-    db = MemoryDB(settings.paths.db)
-    rows = db.list_spaces()
-    db.close()
+    with _open_db_only() as db:
+        rows = db.list_spaces()
     if not rows:
         console.print("还没有任何记忆空间。先运行 cuemem ingest。")
         return
@@ -1775,12 +1819,23 @@ def _print_local_store(settings: Settings) -> None:
     一直开着一个文件、启动时全部打开。只读 meta.json、不打开向量库，cuemem serve 正在用它时也能
     查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端。"""
     meta = settings.paths.qdrant / "meta.json"
-    if settings.vector_store.url or not meta.is_file():
+    if settings.vector_store.url:
+        return
+    repair = (
+        f"运行 {cli_command('doctor --repair-vectors')} 按 collection/ 下的集合重写它（不要手动"
+        f"删掉 meta.json）；{cli_command('export')} 不用向量库，照样能导出"
+    )
+    if not meta.is_file():
+        root = settings.paths.qdrant / "collection"
+        if root.is_dir() and any(p.is_dir() for p in root.iterdir()):
+            console.print(f"[yellow]{escape(str(meta))} 不在了，集合还在[/yellow]：{repair}")
         return
     try:
         collections = len(json.loads(meta.read_text("utf-8"))["collections"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        console.print(f"[yellow]读不出 {escape(str(meta))}[/yellow]：{escape(str(exc))}")
+        console.print(
+            f"[yellow]读不出 {escape(str(meta))}[/yellow]：{escape(str(exc))}。向量还在：{repair}"
+        )
         return
     line = f"本地向量库：{collections} 个集合（每个一直开着一个文件，启动时全部打开）"
     limits = _raise_open_file_limit()
@@ -1799,6 +1854,53 @@ def _print_local_store(settings: Settings) -> None:
         f"[yellow]{line}：集合再多就打不开、建不了新的空间。用户多时改用 Qdrant 服务端："
         f"{cli_command('migrate-vectors --to URL')}，再设置 CUEMEM_VECTOR_STORE__URL[/yellow]"
     )
+
+
+def _repair_vectors(settings: Settings) -> None:
+    """doctor --repair-vectors：见 store/vector.py 的 repair_local_meta。"""
+    from cuemem.store.vector import repair_local_meta
+
+    if settings.vector_store.url:
+        console.print("用的是 Qdrant 服务端（CUEMEM_VECTOR_STORE__URL），没有本地的 meta.json 要修")
+        return
+    meta = settings.paths.qdrant / "meta.json"
+    try:
+        report = repair_local_meta(
+            settings.paths.qdrant,
+            text_dim=settings.embedding.dim,
+            image_dim=settings.multimodal_embedding.dim,
+        )
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{exc}")
+        raise typer.Exit(1) from exc
+    if report is None:
+        console.print(f"{escape(str(meta))} 读得出、集合都在，不用修")
+        return
+    backup = f"，原来的文件改名为 {escape(report['backup'])}" if report["backup"] else ""
+    console.print(
+        f"[green]已重写 {escape(str(meta))}[/green]：补上 {report['text']} 个文字集合、"
+        f"{report['image']} 个图片集合（其中 {report['empty']} 个是空的），共 {report['points']}"
+        f" 个点{backup}"
+    )
+
+
+def _print_disk(settings: Settings) -> None:
+    """数据目录写不写得进去、还剩多少空间：只读、满了时打开数据库与写入都会失败。"""
+    data = settings.paths.db.parent
+    probe = data
+    while not probe.exists() and probe != probe.parent:  # 还没建：看会建在哪里
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return
+    line = f"数据目录 {escape(str(data))}：剩余空间 {free / 2**20:,.0f} MB"
+    if not os.access(probe, os.W_OK):
+        console.print(f"[yellow]{line}，但没有写权限[/yellow]：写入、巩固与导入都会失败")
+    elif free < LOW_DISK:
+        console.print(f"[yellow]{line}[/yellow]：空间不够时写入、巩固与导入会失败")
+    else:
+        console.print(line)
 
 
 def _loose_modes(settings: Settings | None = None) -> list[str]:

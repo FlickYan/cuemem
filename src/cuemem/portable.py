@@ -50,6 +50,7 @@ from cuemem.core.models import SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.core.timeutil import normalize_expiry
 from cuemem.memory import MemorySystem
 from cuemem.store.media import ACCEPTED_FORMATS
+from cuemem.store.sqlite import MemoryDB
 
 FORMAT = "cuemem.space"
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
@@ -66,16 +67,22 @@ _FORMAT_SUFFIX = {
 }
 
 
-def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -> dict[str, Any]:
-    """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。"""
-    sessions = system.db.get_sessions(space_id)
+def export_space(
+    system: MemorySystem | MemoryDB, space_id: str, *, derived: bool = True
+) -> dict[str, Any]:
+    """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。
+
+    只读数据库与原图，不用向量库：cuemem export 只打开数据库（向量库打不开、或者 serve 正开着
+    它的时候也能导出）。"""
+    db = system if isinstance(system, MemoryDB) else system.db
+    sessions = db.get_sessions(space_id)
     if not sessions:
         raise KeyError(f"No memory space {space_id}")
-    media = {m.id: m for m in system.db.get_media(space_id)}
-    meta = system.db.get_turn_meta(space_id)
+    media = {m.id: m for m in db.get_media(space_id)}
+    meta = db.get_turn_meta(space_id)
     out_sessions = []
     for session_id, started_at in sorted(sessions.items(), key=lambda item: item[1]):
-        turns = system.db.get_turns(space_id, session_id)
+        turns = db.get_turns(space_id, session_id)
         out_sessions.append(
             {
                 "session_id": session_id,
@@ -91,11 +98,11 @@ def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -
         "sessions": out_sessions,
     }
     if derived:
-        core = system.core_memory(space_id)
+        core = db.get_core_memory(space_id)
         data["derived"] = {
             "facts": [
                 f.model_dump(mode="json", exclude={"space_id", "entity_ids"})
-                for f in system.facts(space_id)
+                for f in db.get_facts(space_id)
             ],
             "profile": core.text if core is not None else "",
         }

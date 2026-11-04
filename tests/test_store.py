@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 import threading
@@ -622,6 +623,87 @@ def test_memory_system_passes_the_configured_api_key(
             system.close()
         assert [key for _, path, key in qdrant.seen if path != "/"][:1] == ["k"]
     assert not (tmp_path / "data" / "qdrant").exists()  # 服务端模式不建本地向量库
+
+
+def _store_with_spaces(path: Path) -> tuple[VectorStore, Any]:
+    """文字集合（dense 加 sparse）、图片集合（另一个维度）与一个空集合。"""
+    store = VectorStore(path, dim=4)
+    dense = l2_normalize(np.eye(4, dtype=np.float32)[:3] + 0.1)
+    sparse = [SparseVector(indices=[i], values=[1.0]) for i in range(3)]
+    payloads = [{"kind": "round", "ts": float(i)} for i in range(3)]
+    store.upsert("s", ["a", "b", "c"], dense, sparse, payloads)
+    store.upsert_images("s", ["m1"], l2_normalize(np.ones((1, 2), dtype=np.float32)), [{}])
+    store.ensure_space("empty")
+    return store, dense
+
+
+def _hits(store: VectorStore, dense: Any) -> list[list[str]]:
+    return [
+        [h.unit_id for h in store.search_dense("s", dense[1], 3)],
+        [h.unit_id for h in store.search_sparse("s", SparseVector(indices=[2], values=[1.0]), 1)],
+        [h.unit_id for h in store.search_images("s", np.ones(2) / np.sqrt(2), 1)],
+    ]
+
+
+def test_unreadable_meta_names_the_repair_and_repair_restores_it(tmp_path: Path) -> None:
+    """qdrant-client 1.19 建、删集合时先清空 meta.json 再写，正好被杀掉时留下空文件：以前打开时
+    原样抛出 JSONDecodeError。现在是写明 doctor --repair-vectors 的 VectorStoreOpenError；修复按
+    collection/ 下的集合重写 meta.json（与 qdrant 自己写的一样），检索结果不变。"""
+    from cuemem.store.vector import repair_local_meta
+
+    path = tmp_path / "qdrant"
+    store, dense = _store_with_spaces(path)
+    store.close()
+    store = VectorStore(path, dim=4)  # 打开后的顺序（同分的点按读进来的顺序排）
+    before = _hits(store, dense)
+    store.close()
+    meta = path / "meta.json"
+    original = json.loads(meta.read_text("utf-8"))
+    assert repair_local_meta(path, text_dim=4, image_dim=2) is None  # 读得出：不动
+    meta.write_text("", "utf-8")
+
+    with pytest.raises(VectorStoreOpenError, match="repair-vectors") as info:
+        VectorStore(path, dim=4)
+    assert "不要手动删掉 meta.json" in str(info.value)
+
+    report = repair_local_meta(path, text_dim=99, image_dim=99)  # 维度从存着的点读
+    assert report is not None
+    assert (report["text"], report["image"], report["empty"], report["points"]) == (2, 1, 1, 4)
+    repaired = json.loads(meta.read_text("utf-8"))
+    empty = next(name for name in original["collections"] if name.startswith("space_empty_"))
+    assert repaired["collections"].pop(empty)["vectors"]["dense"]["size"] == 99  # 空集合：配置的
+    original["collections"].pop(empty)
+    assert repaired == original
+    meta.write_text("", "utf-8")
+    repair_local_meta(path, text_dim=4, image_dim=2)
+    original = json.loads(meta.read_text("utf-8"))
+    assert Path(report["backup"]).read_text("utf-8") == ""
+    reopened = VectorStore(path, dim=4)
+    assert _hits(reopened, dense) == before
+    assert reopened.count("empty") == 0
+    reopened.close()
+
+    meta.unlink()  # 不在了（例如手动删掉，还没被 qdrant 重写成空的）：照样补上
+    report = repair_local_meta(path, text_dim=4, image_dim=2)
+    assert report is not None and report["backup"] is None
+    assert json.loads(meta.read_text("utf-8")) == original
+
+
+def test_repair_refuses_while_the_store_is_open(tmp_path: Path) -> None:
+    """另一个进程（这里是另一个客户端）开着向量库时不修：它随后写 meta.json 会盖掉修好的。"""
+    from cuemem.store.vector import repair_local_meta
+
+    path = tmp_path / "qdrant"
+    store, _ = _store_with_spaces(path)
+    meta = path / "meta.json"
+    meta.write_text("{", "utf-8")
+    try:
+        with pytest.raises(StorageLockedError, match="另一个进程"):
+            repair_local_meta(path, text_dim=4, image_dim=2)
+        assert meta.read_text("utf-8") == "{"
+        assert [p.name for p in path.iterdir() if p.name.startswith("meta.json")] == ["meta.json"]
+    finally:
+        store.close()
 
 
 def test_copy_into_moves_every_collection(tmp_path: Path) -> None:
