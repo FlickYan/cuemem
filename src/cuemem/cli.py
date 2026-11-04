@@ -687,10 +687,13 @@ def _default_scenario() -> str:
 
 
 INSECURE_HELP = (
-    "监听非本机地址又没有设置 CUEMEM_API_TOKEN 时也照常启动（不鉴权：能连到这台机器的人都能"
-    "读写、删除记忆，用你的上游 Key）。只在可信的网络里用"
+    "监听非本机地址（或 CUEMEM_ALLOWED_HOSTS 列了别的主机名、经反向代理对外）又没有设置 "
+    "CUEMEM_API_TOKEN 时也照常启动（不鉴权：能连到这台机器的人都能读写、删除记忆，用你的上游 "
+    "Key）。只在可信的网络里用"
 )
-WEAK_TOKEN_HELP = "监听非本机地址时也接受短于 16 个字符的访问令牌"
+WEAK_TOKEN_HELP = (
+    "监听非本机地址（或 CUEMEM_ALLOWED_HOSTS 列了别的主机名）时也接受短于 16 个字符的访问令牌"
+)
 GRADIO_TEMP_ENV = "GRADIO_TEMP_DIR"
 PLAIN_HTTP_NOTE = (
     "[yellow]注意：[/yellow]服务是明文 HTTP：访问令牌（也是界面的密码）与记忆都不加密地经过网络。"
@@ -704,6 +707,30 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host.lower() == "localhost"
+
+
+def _allowed_hosts_env() -> list[str]:
+    """CUEMEM_ALLOWED_HOSTS 列出的主机名（逗号分隔，去空白、小写）。_host_policy 与
+    _exposed_names 共用这一个解析。"""
+    from cuemem.api.app import HOSTS_ENV
+
+    return [h.strip().lower() for h in os.environ.get(HOSTS_ENV, "").split(",") if h.strip()]
+
+
+def _loopback_name(name: str) -> bool:
+    """CUEMEM_ALLOWED_HOSTS 里的一项是不是只指本机：回环 IP（可带 [] 与端口）、localhost、
+    *.localhost（RFC 6761）。"""
+    if name.startswith("["):
+        name = name[1:].split("]", 1)[0]
+    elif name.count(":") == 1:
+        name = name.split(":", 1)[0]
+    return _is_loopback(name) or name.endswith(".localhost")
+
+
+def _exposed_names() -> list[str]:
+    """CUEMEM_ALLOWED_HOSTS 里不只指本机的项（含 "*"）。监听本机地址时列了这些就是经反向代理
+    对外（README 的 Public deployment / 公网部署），要和监听非本机地址一样设令牌（第五轮体检）。"""
+    return [h for h in _allowed_hosts_env() if h == "*" or not _loopback_name(h)]
 
 
 def _access_keys() -> Keys:
@@ -732,14 +759,26 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
     令牌也要够长（第四轮体检）：直接给出的令牌短于 16 个字符（Keys.weak；以前 README 的例子就是
     your-token）时同样拒绝启动，除非加 --insecure-weak-token（allow_weak）。信息里只有令牌的名字。
     sha256: 给出的量不出长度，不查。加了 --insecure-no-auth（insecure）时两项都不查：设了令牌时
-    照样鉴权，短的令牌也放过。"""
+    照样鉴权，短的令牌也放过。
+
+    监听本机地址但 CUEMEM_ALLOWED_HOSTS 列了别的主机名（或 "*"）时同样要查（第五轮体检）：
+    这是 README 公网部署的做法，TLS 反向代理转发进来的请求都会被接受。"""
+    from cuemem.api.app import HOSTS_ENV
     from cuemem.api.auth import KEYS_FILE_ENV, MIN_TOKEN_CHARS, TOKEN_ENV
 
-    if insecure or _is_loopback(host):
+    if insecure:
         return
+    exposed = _exposed_names() if _is_loopback(host) else []
+    if _is_loopback(host) and not exposed:
+        return
+    where = f"监听 {escape(host)}"
+    if exposed:
+        where += f"，但 {HOSTS_ENV} 列出了 {escape('、'.join(exposed))}（经反向代理对外），"
+    else:
+        where += " 但"
     if not keys.enabled:
         console.print(
-            f"[red]监听 {escape(host)} 但没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
+            f"[red]{where}没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
             f"读写、删除记忆，用你的上游 Key。[/red]\n在 .env 里设置 {TOKEN_ENV}（例如用 openssl "
             f"rand -hex 32 生成），或用 {KEYS_FILE_ENV} 给出限定作用域的令牌；只在可信的网络里"
             "使用时也可以加 --insecure-no-auth。"
@@ -747,7 +786,7 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
         raise typer.Exit(2)
     if keys.weak and not allow_weak:
         console.print(
-            f"[red]监听 {escape(host)} 但这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
+            f"[red]{where}这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
             f"{escape('、'.join(keys.weak))}。[/red]\n换成随机生成的长令牌（例如 openssl rand "
             f"-hex 32）；sha256: 给出的令牌不查长度。确实要用短令牌时加 --insecure-weak-token。"
         )
@@ -793,9 +832,9 @@ def _host_policy(host: str, *, authenticated: bool = True) -> HostPolicy:
       CUEMEM_ALLOWED_HOSTS 里。以前也不查：没有令牌，任何网页都能经重绑定读写记忆、花上游的额度。
 
     CUEMEM_ALLOWED_HOSTS 列出的主机名两边都放行，含 "*" 时不查 Host、不限 Origin。"""
-    from cuemem.api.app import HOSTS_ENV, LOOPBACK_HOSTS
+    from cuemem.api.app import LOOPBACK_HOSTS
 
-    extra = [h.strip().lower() for h in os.environ.get(HOSTS_ENV, "").split(",") if h.strip()]
+    extra = _allowed_hosts_env()
     if "*" in extra:
         return HostPolicy(None, extra, False)
     if _is_loopback(host):
@@ -942,7 +981,8 @@ def serve(
                 console.print(
                     f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录"
                 )
-                if not _is_loopback(host):  # 容器里总是 0.0.0.0：Docker 也提示
+                # 容器里总是 0.0.0.0：Docker 也提示；本机地址经反向代理对外时也提示
+                if not _is_loopback(host) or _exposed_names():
                     console.print(PLAIN_HTTP_NOTE)
             elif not _is_loopback(host):  # 加了 --insecure-no-auth
                 console.print(
@@ -1023,7 +1063,7 @@ def proxy(
         )
         if keys.enabled:
             console.print(f"已启用访问令牌：{_keys_note(keys)}。OpenAI SDK 的 api_key 填令牌")
-            if not _is_loopback(host):
+            if not _is_loopback(host) or _exposed_names():
                 console.print(PLAIN_HTTP_NOTE)
         elif not _is_loopback(host):  # 加了 --insecure-no-auth
             console.print(

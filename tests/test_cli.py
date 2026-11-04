@@ -462,6 +462,49 @@ def test_require_token(
         assert refused.value.exit_code == 2
 
 
+@pytest.mark.parametrize(
+    ("env", "host", "token", "insecure", "weak_ok", "starts"),
+    [
+        # README 公网部署：serve 监听 127.0.0.1，TLS 反向代理转发 mem.example.com 进来
+        ("mem.example.com", "127.0.0.1", None, False, False, False),
+        ("mem.example.com", "127.0.0.1", "your-token", False, False, False),
+        ("mem.example.com", "127.0.0.1", "your-token", False, True, True),
+        ("mem.example.com", "127.0.0.1", None, True, False, True),
+        ("mem.example.com", "127.0.0.1", "a" * 16, False, False, True),
+        ("mem.example.com", "localhost", None, False, False, False),
+        ("*", "127.0.0.1", None, False, False, False),
+        ("cuemem.localhost, 127.0.0.1", "127.0.0.1", None, False, False, True),
+        ("[::1]:7860, localhost, 127.0.0.2:80", "::1", "your-token", False, False, True),
+        ("", "127.0.0.1", None, False, False, True),
+        ("", "127.0.0.1", "your-token", False, False, True),
+    ],
+)
+def test_require_token_behind_a_reverse_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    env: str,
+    host: str,
+    token: str | None,
+    insecure: bool,
+    weak_ok: bool,
+    starts: bool,
+) -> None:
+    """监听本机地址但 CUEMEM_ALLOWED_HOSTS 列了别的主机名（或 "*"）：经反向代理对外，和监听
+    非本机地址一样要设够长的令牌（第五轮体检）。只指本机的项（回环地址、*.localhost）不算。"""
+    import typer
+
+    from cuemem.api.auth import Keys
+    from cuemem.cli import _require_token
+
+    monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", env)
+    keys = Keys.from_token(token)
+    if starts:
+        _require_token(host, keys, insecure, allow_weak=weak_ok)
+    else:
+        with pytest.raises(typer.Exit) as refused:
+            _require_token(host, keys, insecure, allow_weak=weak_ok)
+        assert refused.value.exit_code == 2
+
+
 def test_require_token_names_short_scoped_tokens(capsys: pytest.CaptureFixture[str]) -> None:
     """限定作用域的令牌直接写 token: 时同样要够长（按名字说是哪几个，不带令牌本身）；sha256:
     量不出长度，不查。"""
@@ -544,6 +587,27 @@ def test_non_loopback_bind_needs_a_token(
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_loopback_bind_behind_a_reverse_proxy_needs_a_token(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """README 公网部署的做法（监听 127.0.0.1、CUEMEM_ALLOWED_HOSTS=mem.example.com）没有令牌时
+    拒绝启动，信息说出是 CUEMEM_ALLOWED_HOSTS 列的主机名；设了令牌时提示服务是明文 HTTP。"""
+    monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", "mem.example.com")
+    result = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert result.exit_code == 2 and served == []
+    flat = _flat(result.output)
+    assert "CUEMEM_ALLOWED_HOSTS" in flat and "mem.example.com" in flat
+    assert "--insecure-no-auth" in flat
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "your-token")
+    weak = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert weak.exit_code == 2 and served == [] and "your-token" not in weak.output
+    assert "--insecure-weak-token" in _flat(weak.output)
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "fake-token-0123456789")
+    strong = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert strong.exit_code == 0 and "TLS" in _flat(strong.output) and len(served) == 1
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_loopback_bind_checks_the_host(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
@@ -556,7 +620,7 @@ def test_loopback_bind_checks_the_host(
     assert runner.invoke(app, command).exit_code == 0
     assert runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"]).exit_code == 0
     monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", "mem.example, cuemem.lan")
-    assert runner.invoke(app, command).exit_code == 0
+    assert runner.invoke(app, [*command, "--insecure-no-auth"]).exit_code == 0  # 经反向代理对外
     named = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"])
     assert named.exit_code == 0 and "CUEMEM_ALLOWED_HOSTS" in named.output
     monkeypatch.delenv("CUEMEM_ALLOWED_HOSTS")
