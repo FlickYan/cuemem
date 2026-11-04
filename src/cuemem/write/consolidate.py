@@ -76,6 +76,9 @@ logger = logging.getLogger(__name__)
 # 失败 MAX_ATTEMPTS 次就不再自动重试（显式的 consolidate 仍会重试全部失败的任务）
 MAX_ATTEMPTS = 3
 RETRY_BASE_S = 60.0
+# 清空重建删了向量、还没提交时留下的指纹（见 Consolidator.rebuild）：与任何配置的指纹都不同，
+# 进程在这之间被杀时 stale() 为真，下一次巩固把重建再做一遍
+REBUILD_PENDING = "rebuild-pending"
 # 跨巩固留着载入状态（_Mirror）的空间数，最近巩固过的优先；一个空间约是全部事实与实体，
 # 再加当前事实的陈述向量（1 万条、1024 维时约 40 MB）
 MIRRORED_SPACES = 4
@@ -292,13 +295,29 @@ class Consolidator:
 
         先删派生记忆的向量，再清空数据库（与遗忘相同：先删向量、后删记录）：向量库出错时数据库
         里什么都没改，会话又长了的那对任务还在，后台线程按退避把重放再做一遍。期间新写的派生
-        向量（通常没有）在提交之后、锁外删。"""
+        向量（通常没有）在提交之后、锁外删。
+
+        清空重建（replay=False）删向量之前先单独提交一个"重建没做完"的指纹（REBUILD_PENDING，
+        与任何配置的指纹都不同），事务里再改回原来的（第五轮复审）：向量删了、事务却没提交时
+        （进程被杀，重新登记出错）事实与"已完成"的任务都在、向量没了，以前 stale() 仍是 False，
+        后台线程、重启与下一次巩固都不会补，检索悄悄找不到这些事实。现在留下的指纹让 stale()
+        为真，下一次 consolidate 或 add(wait=True) 把重建再做一遍（也可以 cuemem reindex 按数据库
+        补齐向量）。会话又长了时的重放不需要：那对任务留着，后台线程会再做一遍。"""
+        key = f"consolidation:{space_id}"
+        recorded = None if replay else self.db.get_meta(key)
+        if not replay:
+            self.db.set_meta(key, REBUILD_PENDING)
         derived = self.db.derived_unit_ids(space_id)
         self.vectors.delete(space_id, derived)
         with self.holding_open(space_id) as skip, self.db.transaction():
             before = self.db.get_jobs(space_id) if replay else None
             removed = self.db.clear_derived(space_id)
             self.requeue(space_id, before, skip)  # 里层的事务是保存点
+            if not replay:  # 照旧：成功的 run 最后写这次的指纹
+                if recorded is None:
+                    self.db.delete_meta(key)
+                else:
+                    self.db.set_meta(key, recorded)
         self.vectors.delete(space_id, sorted(set(removed) - set(derived)))  # 通常没有
 
     def requeue(

@@ -941,13 +941,20 @@ def test_a_rebuild_clears_and_requeues_in_one_transaction(
         assert seen == [(jobs, facts)]  # 清空没有单独提交
         assert sorted((j["session_id"], j["status"]) for j in system.db.get_jobs("u")) == jobs
         assert statements(memory) == facts
+        # 清空重建出错之后：要么向量与数据库一致，要么看得出要重建（第五轮复审：派生记忆的向量
+        # 删了、事务却回滚时，以前 stale() 是 False，事实列得出来、检索却永远找不到）。重放靠留着
+        # 的那对任务（下面的 spaces_with_work）
+        units = {u.id for u in system.db.list_units("u")}
+        if not replay:
+            assert set(system.vectors.unit_ids("u")) == units or system.consolidator.stale("u")
         if replay:
             assert system.db.spaces_with_work(PIPELINE_VERSION, MAX_ATTEMPTS) == ["u"]
             system.consolidator.run("u")  # 后台线程按退避重试
             assert statements(memory) == ["I also play piano", "I live in Paris", "I play violin"]
         else:
-            system.consolidate("u", rebuild=True)
+            system.consolidate("u")  # 不用再要求重建：stale() 为真
             assert statements(memory) == facts
+            assert not system.consolidator.stale("u")
         assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
 
 
