@@ -913,6 +913,47 @@ def test_left_open_runs_survive_other_first_touches_under_serve(
         after.close()
 
 
+@pytest.mark.parametrize("how", ["rebuild", "stale"])
+def test_a_rebuild_under_serve_leaves_the_left_open_runs_to_the_client(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, how: str
+) -> None:
+    """cuemem serve 重启之后的闲置期里重建（显式的 rebuild=True，或者部署改了巩固配置、空间
+    过期时任何一次巩固）：留给调用方接着写的 run 不登记任务、不抽取，调用方接着写完结束时只抽取
+    一次、不重放。以前重建只跳过本进程里进行中的会话（open_sessions），把它们半段抽取了，结束
+    时整段再抽取、把整个空间重放一遍（第五轮体检）。"""
+    fake_api.chat_replies = [model]
+    if how == "stale":  # 之前的进程巩固过一个普通的会话，这个空间有任务、记着巩固配置的指纹
+        before = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+        Memory.from_system(before).add("I like tea", user_id="eve", run_id="s0", wait=True)
+        before.close()
+    _left_open_runs(n3_settings, fake_api, "r1", "r2")
+    settings = n3_settings
+    if how == "stale":  # 部署改了巩固配置：这个空间的指纹不对了
+        consolidation = n3_settings.consolidation.model_copy(update={"profile_max_chars": 1500})
+        settings = n3_settings.model_copy(update={"consolidation": consolidation})
+    after = MemorySystem.from_settings(settings, http_client=fake_api.client())
+    worker = after.start_worker()
+    _adopt_after(after, 60, clock=lambda: 0.0)
+    try:
+        mem = Memory.from_system(after)
+        if how == "rebuild":
+            assert mem.consolidate(user_id="eve", rebuild=True)["sessions"] == 0
+        else:
+            assert after.consolidator.stale("eve")
+            mem.add("I like jazz", user_id="eve", wait=True)
+            assert not after.consolidator.stale("eve")
+        assert not {"r1", "r2"} & {j["session_id"] for j in after.db.get_jobs("eve")}
+        extracted, replays = model.calls["extract"], _regrown_replays(after)
+        for text in ("I like rain", "I like snow", "I like hail"):
+            mem.add(text, user_id="eve", run_id="r2")
+            worker.wait()
+        assert mem.end_run("r2", user_id="eve", wait=True)["turns"] == 4
+        assert model.calls["extract"] - extracted == 1
+        assert _regrown_replays(after) == replays
+    finally:
+        after.close()
+
+
 def test_a_run_handed_over_after_the_idle_period_is_reopened_when_the_client_returns(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:

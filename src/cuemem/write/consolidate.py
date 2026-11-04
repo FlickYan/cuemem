@@ -145,7 +145,8 @@ class Consolidator:
         self.vectors = vectors
         self.embedder = embedder
         self.config = config
-        # 进行中的会话（MemorySystem.open_sessions）：重放时跳过，结束后再整体登记
+        # 为全部会话重新登记任务时跳过的会话（MemorySystem._held）：进行中的，以及之前的进程留下、
+        # 还没接手的（defer_adoption）；结束或接手时再整体登记
         self.open_sessions: Callable[[str], Collection[str]] = open_sessions or (lambda _: ())
         self.extractor = Extractor(
             llm,
@@ -266,9 +267,11 @@ class Consolidator:
         return self.db.has_jobs(space_id)
 
     def rebuild(self, space_id: str, *, replay: bool = False) -> None:
-        """清空派生记忆（数据库与向量），再为全部会话登记任务，进行中的会话（open_sessions）
-        除外。进行中的会话在清空之后才读：这期间结束的会话（close_session 先把它移出进行中、
-        再登记任务），任务要么在清空之后登记、不会被删，要么在这里登记。
+        """清空派生记忆（数据库与向量），再为全部会话登记任务，open_sessions 返回的会话
+        除外：进行中的，以及之前的进程留下、defer_adoption 还没接手的（MemorySystem._held；以前
+        只跳过前者，闲置期里一次重建就把后者抽取半段，调用方接着写完时又整段再抽取、重放一遍）。
+        进行中的会话在清空之后才读：这期间结束的会话（close_session 先把它移出进行中、再登记
+        任务），任务要么在清空之后登记、不会被删，要么在这里登记。
 
         replay=True（会话又长了时的重放，见 _replay_regrown）：只为原来有任务的会话登记，
         SDK 的 infer=False 只记了日志的会话照旧等显式的 consolidate；内容没变的会话保留原来的

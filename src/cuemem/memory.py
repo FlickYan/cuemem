@@ -370,7 +370,7 @@ class MemorySystem:
             db, vectors, embedder, media=media, image_embedder=image_embedder
         )
         self.consolidator = Consolidator(
-            db, vectors, embedder, llm, settings.consolidation, open_sessions=self.open_sessions
+            db, vectors, embedder, llm, settings.consolidation, open_sessions=self._held
         )
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
