@@ -29,6 +29,7 @@ from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingA
 from cuemem.store.media import MediaStore, StoredImage
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
+from cuemem.write.consolidate import unit_payload
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,11 @@ class IngestReport:
 def media_id(space_id: str, turn_id: str, index: int) -> str:
     """一次发言里第 index 张图的记录 ID（Agent 据此在检索时排除工作记忆里的图片）。"""
     return stable_id(space_id, "media", turn_id, index)
+
+
+def media_payload(item: MediaItem) -> dict[str, Any]:
+    """图片向量的 payload（点上另有 media_id，见 VectorStore.upsert_images）。"""
+    return {"turn_id": item.source_turn_id, "ts": to_epoch(item.ts)}
 
 
 def build_turns(space_id: str, session: SessionIn, first_idx: int = 0) -> list[Turn]:
@@ -230,7 +236,7 @@ class OnlineWriter:
                     space_id,
                     [m.id for m in new_media],
                     vectors,
-                    [{"turn_id": m.source_turn_id, "ts": to_epoch(m.ts)} for m in new_media],
+                    [media_payload(m) for m in new_media],
                 )
             else:
                 staged.media.extend(new_media)
@@ -368,9 +374,5 @@ class OnlineWriter:
             [u.id for u in units],
             batch.dense,
             batch.sparse,
-            [_payload(u) for u in units],
+            [unit_payload(u) for u in units],
         )
-
-
-def _payload(unit: MemoryUnit) -> dict[str, Any]:
-    return {"kind": unit.kind, "session_id": unit.session_id, "ts": to_epoch(unit.ts)}

@@ -619,9 +619,7 @@ class Consolidator:
         dense = _stack([vectors[u.text][0] for u in units])
         sparse_rows = [vectors[u.text][1] for u in units]
         sparse = None if any(v is None for v in sparse_rows) else [v for v in sparse_rows if v]
-        payloads = [
-            {"kind": u.kind, "session_id": u.session_id, "ts": to_epoch(u.ts)} for u in units
-        ]
+        payloads = [unit_payload(u) for u in units]
         self.vectors.upsert(space_id, [u.id for u in units], dense, sparse, payloads)
         self.db.add_units(units)
 
@@ -706,7 +704,7 @@ class Consolidator:
             unit = _fact_unit(fact)
             units.append(unit)
             if fact.id in added_ids:
-                index.append((unit, embedded[fact.statement], _fact_payload(fact)))
+                index.append((unit, embedded[fact.statement], unit_payload(unit, fact)))
         retired = [f.id for f in rec.changed.values() if not f.is_current and f.id not in added_ids]
         episodes: list[Episode] = []
         if ext.summary:
@@ -730,22 +728,19 @@ class Consolidator:
                 source_turn_ids=ext.turn_ids,
             )
             units.append(unit)
-            index.append((unit, embedded[ext.summary], {"kind": "summary"}))
+            index.append((unit, embedded[ext.summary], unit_payload(unit)))
         for entity in ents.changed.values():
             vec = embedded.get(entity.descriptor)
             if vec is None or entity.id not in ents.created_ids:  # 只索引新建且有描述向量的实体
                 continue
             unit = _entity_unit(entity, ext.session_id)
             units.append(unit)
-            index.append((unit, vec, {"kind": "entity"}))
+            index.append((unit, vec, unit_payload(unit)))
 
         if index:
             dense = _stack([vec[0] for _, vec, _ in index])
             sparse = [vec[1] or SparseVector(indices=[], values=[]) for _, vec, _ in index]
-            payloads = [
-                {"session_id": unit.session_id, "ts": to_epoch(unit.ts), **extra}
-                for unit, _, extra in index
-            ]
+            payloads = [payload for _, _, payload in index]
             self.vectors.upsert(space_id, [u.id for u, _, _ in index], dense, sparse, payloads)
         self.vectors.set_payload(space_id, retired, {"current": False})
         stats = {
@@ -1151,8 +1146,29 @@ def _fact_unit(fact: Fact) -> MemoryUnit:
     )
 
 
-def _fact_payload(fact: Fact) -> dict[str, Any]:
-    return {"kind": "fact", "current": fact.is_current, "subject_id": fact.subject_id}
+def unit_payload(unit: MemoryUnit, fact: Fact | None = None) -> dict[str, Any]:
+    """检索单元在向量库里的 payload（点上另有 unit_id，见 VectorStore.upsert），每种单元一种：
+
+    - "轮"与图片描述（round、image、image_iso）：kind、session_id、ts
+    - 事实：session_id、ts、kind、current、subject_id（fact 是这条事实，current 供只取现行事实
+      的检索过滤；被取代时巩固用 set_payload 改成 False）
+    - 摘要与实体（summary、entity）：session_id、ts、kind
+
+    在线写入、巩固与 reindex 都用它：以前在线写入与巩固各写一份，键的顺序也各不相同，这里照原样
+    保留（payload 一点都不变）。"""
+    if unit.kind == "fact":
+        if fact is None:
+            raise ValueError(f"事实 {unit.id} 的 payload 要有这条事实（current、subject_id）")
+        return {
+            "session_id": unit.session_id,
+            "ts": to_epoch(unit.ts),
+            "kind": "fact",
+            "current": fact.is_current,
+            "subject_id": fact.subject_id,
+        }
+    if unit.kind in ("summary", "entity"):
+        return {"session_id": unit.session_id, "ts": to_epoch(unit.ts), "kind": unit.kind}
+    return {"kind": unit.kind, "session_id": unit.session_id, "ts": to_epoch(unit.ts)}
 
 
 def _entity_unit(entity: Entity, session_id: str) -> MemoryUnit:
