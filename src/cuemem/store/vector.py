@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import errno
+import functools
 import gc
 import json
 import re
@@ -203,6 +204,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return 0
+            self._fast_kind_mask(name)
             return int(self._client.count(name, count_filter=_build_filter(kinds, None)).count)
 
     def delete(self, space_id: str, unit_ids: Sequence[str]) -> None:
@@ -272,6 +274,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return []
+            self._fast_kind_mask(name)
             response = self._client.query_points(
                 name, query=vector.tolist(), using=DENSE, limit=k, with_payload=["media_id"]
             )
@@ -326,6 +329,32 @@ class VectorStore:
             persistence.storage = real
             real.commit()
 
+    def _fast_kind_mask(self, name: str) -> None:
+        """给本地模式的这个集合换上按 kind 过滤的快速掩码（调用方持有 self._lock，见 _fast_mask）。
+
+        只改这一个集合对象（不改 LocalCollection 类：同一进程里别的 QdrantClient(path=...)，
+        例如 M0 基线的 mem0，照旧）；每次检索前看一眼，delete_space 之后重建的集合与启动时打开的
+        集合都会换上。用的是 qdrant-client 的内部属性：对不上时（服务端模式、以后的 qdrant-client
+        改了）什么都不做，照旧用上游的逐点过滤。"""
+        if self.remote:
+            return
+        local = getattr(self._client, "_client", None)
+        collection = getattr(local, "collections", {}).get(name)
+        if collection is None or getattr(collection, "_cuemem_fast_mask", False):
+            return
+        upstream = getattr(collection, "_payload_and_non_deleted_mask", None)
+        if not (
+            callable(upstream)
+            and isinstance(getattr(collection, "payload", None), list)
+            and isinstance(getattr(collection, "deleted", None), np.ndarray)
+            and isinstance(getattr(collection, "deleted_per_vector", None), dict)
+        ):
+            return
+        collection._payload_and_non_deleted_mask = functools.partial(
+            _fast_mask, collection, upstream
+        )
+        collection._cuemem_fast_mask = True
+
     @contextmanager
     def _creating(self) -> Iterator[None]:
         """建集合（调用方持有 self._lock）。本地模式下建不了时（多半是打开的文件用光了：每个集合
@@ -367,6 +396,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return out
+            self._fast_kind_mask(name)
             offset = None
             while True:
                 points, offset = self._client.scroll(
@@ -449,6 +479,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return []
+            self._fast_kind_mask(name)
             response = self._client.query_points(
                 name,
                 query=query,
@@ -475,6 +506,64 @@ class _NoCommit:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._conn, name)
+
+
+def _kind_only(query_filter: Any) -> frozenset[str] | None:
+    """过滤条件只有"kind 是其中之一"（_build_filter 只给 kinds 时的样子）时返回这几个 kind，
+    别的过滤条件（带 ts 范围、should、must_not 等）返回 None。"""
+    if not isinstance(query_filter, models.Filter):
+        return None
+    if query_filter.should or query_filter.must_not or query_filter.min_should:
+        return None
+    must = query_filter.must
+    conditions = must if isinstance(must, list) else [must]
+    if len(conditions) != 1:
+        return None
+    condition = conditions[0]
+    if not (
+        isinstance(condition, models.FieldCondition)
+        and condition.key == "kind"
+        and isinstance(condition.match, models.MatchAny)
+        and all(isinstance(kind, str) for kind in condition.match.any)
+        and condition.range is None
+        and condition.geo_bounding_box is None
+        and condition.geo_radius is None
+        and condition.geo_polygon is None
+        and condition.values_count is None
+        and condition.is_empty is None
+        and condition.is_null is None
+    ):
+        return None
+    return frozenset(str(kind) for kind in condition.match.any)
+
+
+def _fast_mask(
+    collection: Any,
+    upstream: Callable[..., Any],
+    payload_filter: models.Filter | None,
+    vector_name: str | None = None,
+) -> Any:
+    """本地模式 LocalCollection._payload_and_non_deleted_mask 的替身，结果与上游逐位相同。
+
+    上游对每个点在 Python 里跑一遍 check_filter（每个点约 10 微秒），L1 每种 kind 检索一次，
+    全程拿着 VectorStore 的全局锁：2 万个点的空间每次检索单是过滤就要 0.2 秒以上（第五轮体检）。
+    只按 kind 过滤、而且每个点的 kind 都是字符串时，这里直接比较字符串（与上游的 MatchAny 对
+    字符串的判断相同）；别的过滤条件、或者有点的 kind 不是字符串（上游对列表逐个元素匹配）时
+    照旧交给上游。"""
+    from qdrant_client.local.payload_filters import validate_filter
+
+    wanted = _kind_only(payload_filter)
+    if wanted is None:
+        return upstream(payload_filter, vector_name)
+    validate_filter(payload_filter)
+    kinds = [payload.get("kind") for payload in collection.payload]
+    if not all(isinstance(kind, str) for kind in kinds):
+        return upstream(payload_filter, vector_name)
+    mask = np.fromiter((kind in wanted for kind in kinds), dtype=bool, count=len(kinds))
+    mask = mask & ~collection.deleted
+    if vector_name is not None:
+        mask = mask & ~collection.deleted_per_vector[vector_name]
+    return mask
 
 
 def _safe(space_id: str) -> str:
