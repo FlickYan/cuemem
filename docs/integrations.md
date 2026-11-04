@@ -148,5 +148,5 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
 - 模型回答期间的遗忘：注入的记忆在模型还在回答时被遗忘了，记忆代理照样返回回答，但不存下（用户的话照样存下）。三个集成同样是"召回 → 模型 → 写回"，没有这项检查，这样的回答在那里仍可能写回（没有复现过）。
 - 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
 - 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。
-- 供应商出错与过期：各集成自己的记忆工具不像 MCP 那样把供应商的出错（限流、余额不足、超时）换成说明，出来的是供应商客户端的异常。带 `expiration_date` 的记忆只在 SDK 的 `search`、`get_all` 与画像里排除，各集成在删除之前仍看得到。
+- 供应商出错与过期：各集成自己的记忆工具不像 MCP 那样把供应商的出错（限流、余额不足、超时）换成说明，出来的是供应商客户端的异常。`expiration_date` 已过的记忆不出现在各集成的召回、自动召回与画像里，也不出现在 Claude memory tool 生成的 `profile.md`、`facts.md` 与 `history/` 里（D-072；以前只有 SDK 的 `search`、`get_all` 与画像排除它们）。过期按现在的时间算；后来又说过一次、没给过期时间的记忆照样留着。
 - 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉（提问里有 U+2028、U+2029、U+0085 时也一样），其中记着的子查询、追加查询与 Agent 自己检索的查询向量也删，`delete_all` 删掉这个空间的全部 trace。遗忘时重写不了的 trace 文件（磁盘满）整个删掉，记一条警告，遗忘照常成功。在那之前 trace 一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`：`cuemem serve` 与 `cuemem proxy` 每天按它删一遍，只用 SDK 的应用可以调 `memory.system.prune_traces(days)`。
