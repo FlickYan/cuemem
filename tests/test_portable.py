@@ -374,6 +374,74 @@ def test_cli_export_import_and_preset(
     assert "不需要Key" in _flat(result.output) and "llama3.1-8b" in result.output
 
 
+def test_cli_export_keeps_the_old_backup_when_the_write_fails(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """export -o 先写同一目录下的临时文件再换名：写失败（磁盘满）时旧的备份原样留着、临时文件
+    删掉，只打印一行原因、以 1 退出。以前 write_text 先截断旧文件，调用栈之后新旧两份都没了。
+    原来是 0644 的备份换成 0600（命令行收紧了 umask）；-o 是符号链接时替换它指向的文件。"""
+    import errno
+
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    out = backups / "out.json"
+    out.write_text("{}", encoding="utf-8")
+    out.chmod(0o644)
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", str(out)]).exit_code == 0
+    assert out.stat().st_mode & 0o777 == 0o600
+    good = out.read_bytes()
+    json.loads(good)
+
+    real_replace = os.replace
+
+    def full_disk(src: Any, dst: Any) -> None:
+        if Path(dst) == out:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", full_disk)
+    result = runner.invoke(app, ["export", "--space", "demo", "-o", str(out)])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    flat = _flat(result.output)
+    assert "导出失败" in flat and "Nospaceleftondevice" in flat and "未改动" in flat
+    assert out.read_bytes() == good and sorted(backups.iterdir()) == [out]
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    link = tmp_path / "link.json"
+    link.symlink_to(out)
+    out.write_text("{}", encoding="utf-8")
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", str(link)]).exit_code == 0
+    sessions = json.loads(good)["sessions"]
+    assert link.is_symlink() and json.loads(out.read_bytes())["sessions"] == sessions
+    # 不是普通文件（/dev/stdout、FIFO、/dev/null）的照旧直接写：不在 /dev 里建临时文件
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", os.devnull]).exit_code == 0
+
+
+@pytest.mark.parametrize("damage", ["truncated", "not-utf8"])
+def test_cli_import_of_a_damaged_file_is_one_line(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    """导入截断的或不是 UTF-8 的文件：一行原因、以 1 退出（以前是 JSONDecodeError /
+    UnicodeDecodeError 的调用栈），什么都不写。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    out = tmp_path / "demo.json"
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", str(out)]).exit_code == 0
+    whole = out.read_bytes()
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(whole[: len(whole) // 2] if damage == "truncated" else b"\xff\xfe" + whole)
+    result = runner.invoke(app, ["import", str(bad), "--space", "copy"])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    assert "不是有效的CueMem导出文件" in _flat(result.output)
+    assert "copy" not in runner.invoke(app, ["spaces"]).output
+
+
 @pytest.mark.parametrize(
     ("env", "command", "expected"),
     [

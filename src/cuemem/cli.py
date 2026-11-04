@@ -57,7 +57,7 @@ from cuemem.config import (
     load_settings,
 )
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
-from cuemem.envfile import mask, read_env, update_env
+from cuemem.envfile import atomic_write_text, mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
 
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
@@ -382,7 +382,17 @@ def export_cmd(
     if out is None:
         print(text)
         return
-    out.write_text(text, encoding="utf-8")
+    target = out.resolve()
+    atomic = not target.exists() or target.is_file()  # /dev/stdout、FIFO 之类直接写
+    try:
+        if atomic:  # 写到一半出错（磁盘满）时旧的备份不动；以前先截断，新旧两份都没了
+            atomic_write_text(out, text, fsync=True)
+        else:
+            out.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        kept = f"；{escape(str(out))} 未改动" if atomic else ""
+        console.print(f"[red]导出失败：{escape(str(exc))}{kept}[/red]")
+        raise typer.Exit(1) from exc
     turns = sum(len(s["turns"]) for s in data["sessions"])
     console.print(f"已导出 {len(data['sessions'])} 个会话、{turns} 条发言到 [bold]{out}[/bold]")
 
@@ -398,7 +408,11 @@ def import_cmd(
     """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。"""
     from cuemem.portable import import_space
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:  # 以前是调用栈
+        console.print(f"[red]不是有效的 CueMem 导出文件（被截断了？）：{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
     with _open_system() as system:
         try:
             report = import_space(system, data, space_id=space, consolidate=consolidate)
