@@ -48,6 +48,9 @@ if TYPE_CHECKING:  # 只用于类型注解：签名与 Memory 逐字相同（tes
 
 DEFAULT_URL = "http://127.0.0.1:7860"  # cuemem serve 的默认地址
 TOKEN_ENV = "CUEMEM_API_TOKEN"
+# wait() 让服务端比客户端的读超时早这么多秒放弃：先收到服务端的 504（TimeoutError），而不是
+# 客户端自己的读超时（见 MemoryClient.wait）
+WAIT_MARGIN_S = 5.0
 _BUILTIN_ERRORS: dict[str, type[Exception]] = {
     "KeyError": KeyError,
     "ValueError": ValueError,
@@ -199,7 +202,15 @@ class MemoryClient:
     ) -> None:
         """等服务端的后台线程把已登记的抽取做完（见 Memory.wait）。限定作用域的令牌不给 user_id、
         agent_id 时只等它能访问的用户。服务端最多等 300 秒（WAIT_TIMEOUT_S），没做完时抛
-        TimeoutError，同本地的 timeout。"""
+        TimeoutError，同本地的 timeout。
+
+        发给服务端的等待时间比这个客户端的读超时短 WAIT_MARGIN_S 秒（不给 timeout 时也是）：
+        以前两边都是 300 秒，服务端等满了才回 504，客户端的读超时差不多同时到，抛的多半是
+        MemoryAPIError（timeout，"may have been processed"），不是 TimeoutError。"""
+        read = getattr(getattr(self._http, "timeout", None), "read", None)
+        if isinstance(read, int | float):  # 读超时为 None（不限）时照旧
+            cap = max(read - WAIT_MARGIN_S, read / 2)
+            timeout = cap if timeout is None else min(timeout, cap)
         body = {"user_id": user_id, "agent_id": agent_id, "timeout": timeout}
         self._call("POST", "/wait", body=body)
 

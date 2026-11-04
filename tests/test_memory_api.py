@@ -225,7 +225,7 @@ ARGUMENTS: dict[str, Any] = {
     "dry_run": True,
     "rebuild": True,
     "derived": False,
-    "timeout": 5.0,
+    "timeout": 2.0,  # 比 TestClient 的读超时（5 秒）减去 WAIT_MARGIN_S 短，原样发出
 }
 PER_METHOD: dict[tuple[str, str], Any] = {("load", "data"): {"version": 2, "space_id": "alice"}}
 RETURNS: dict[str, Any] = {
@@ -839,6 +839,36 @@ def test_transport_errors_say_whether_the_request_was_sent(
     assert ("Cannot reach" in str(raised.value)) == (code == "unreachable")
     if error is httpx2.ReadTimeout:
         assert "within 7s" in str(raised.value) and "may have been processed" in str(raised.value)
+
+
+def test_wait_gives_up_on_the_server_before_the_client_read_timeout() -> None:
+    """第五轮复审：服务端的 /wait 最多等 WAIT_TIMEOUT_S（300 秒），MemoryClient 默认的读超时也是
+    300 秒，不给 timeout 时两边差不多同时到期，抛的多半是客户端自己的读超时（MemoryAPIError
+    timeout），不是说好的 TimeoutError。现在发出的等待时间比读超时短 WAIT_MARGIN_S。"""
+    from cuemem.api.memories import WAIT_TIMEOUT_S
+    from cuemem.client import WAIT_MARGIN_S
+
+    sent: list[Any] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content)["timeout"])
+        return httpx2.Response(200, json={})
+
+    default = inspect.signature(MemoryClient).parameters["timeout"].default
+    assert default - WAIT_MARGIN_S < WAIT_TIMEOUT_S <= default
+    for read, timeout, expected in (
+        (default, None, default - WAIT_MARGIN_S),
+        (default, 10.0, 10.0),
+        (default, 1000.0, default - WAIT_MARGIN_S),
+        (60.0, None, 55.0),
+        (4.0, None, 2.0),
+        (None, None, None),
+        (None, 1000.0, 1000.0),
+    ):
+        transport = httpx2.MockTransport(record)
+        with httpx2.Client(transport=transport, timeout=read) as http:
+            MemoryClient("http://127.0.0.1:9", http_client=http).wait(timeout=timeout)
+        assert sent.pop() == expected, (read, timeout)
 
 
 def test_images_reach_the_memory(mem: Mem, system: MemorySystem, tmp_path: Path) -> None:
