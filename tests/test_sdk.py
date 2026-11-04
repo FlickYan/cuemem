@@ -1042,6 +1042,27 @@ def test_mem0_reserved_filters(memory: Memory) -> None:
         "Where do I live?", user_id="alice", mode="l1", filters={"categories": "*"}
     )
     assert {r["type"] for r in only["results"]} == {"fact"}
+    # categories 是列表：eq、ne、in、nin 逐项对（以前 in 一条都不给，nin、ne 留下要排除的那条）
+    def ids(where: dict[str, Any]) -> list[str]:
+        return [f["id"] for f in memory.get_all(user_id="alice", filters=where)["results"]]
+
+    for where in (
+        {"categories": {"in": ["attribute", "event"]}},
+        {"categories": {"eq": "attribute"}},
+        {"categories": {"eq": ["attribute"]}},
+        {"categories": "attribute"},
+        {"categories": {"ne": "event"}},
+        {"categories": {"nin": ["event"]}},
+    ):
+        assert ids(where) == [fact["id"]], where
+    for where in (
+        {"categories": {"in": ["event"]}},
+        {"categories": {"nin": ["attribute"]}},
+        {"categories": {"ne": "attribute"}},
+        {"categories": {"eq": ["attribute", "event"]}},
+        {"NOT": [{"categories": {"in": ["attribute"]}}]},
+    ):
+        assert ids(where) == [], where
 
 
 def test_metadata_wins_over_the_reserved_filter_names(memory: Memory) -> None:

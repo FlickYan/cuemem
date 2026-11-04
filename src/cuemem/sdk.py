@@ -1322,6 +1322,7 @@ def _check_where(where: Mapping[str, Any]) -> None:
     - {"key": value}：等于；{"key": "*"}：有这个键；几个键并列时都要满足；
     - {"key": {"eq" | "ne" | "gt" | "gte" | "lt" | "lte": v, "in" | "nin": [...],
       "contains" | "icontains": v}}：几个运算并列时都要满足；没有这个键时只有 ne、nin 成立；
+      值是列表（如 categories）时 eq、ne、in、nin 逐项对（见 _compare）；
     - {"AND": [条件, ...]}、{"OR": [...]}、{"NOT": [...]}（NOT：一个都不满足）。
 
     条件里的 user_id、agent_id、run_id 指记忆所在的空间与会话，created_at、updated_at 与
@@ -1362,11 +1363,19 @@ def _match(key: str, cond: Any, record: Mapping[str, Any]) -> bool:
         return not any(_matches(c, record) for c in cond)
     present, value = key in record, record.get(key)
     if not isinstance(cond, Mapping):
-        return present and (cond == "*" or value == cond)
+        return present and (cond == "*" or _compare("eq", present, value, cond))
     return all(_compare(op, present, value, arg) for op, arg in cond.items())
 
 
 def _compare(op: str, present: bool, value: Any, arg: Any) -> bool:
+    if isinstance(value, list) and op in ("eq", "ne", "in", "nin"):
+        # 值是列表（categories 等）时逐项对：in 有一项在 arg 里，nin 一项都不在，eq / ne 对列表里
+        # 的项；参数本身是列表时 eq / ne 比整个列表，in / nin 也照旧认整个列表
+        if op in ("eq", "ne"):
+            hit = value == arg if isinstance(arg, list) else arg in value
+        else:
+            hit = value in arg or any(v in arg for v in value)
+        return not hit if op in ("ne", "nin") else bool(hit)
     if op == "ne":
         return not present or value != arg
     if op == "nin":
