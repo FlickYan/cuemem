@@ -565,6 +565,17 @@ class MemoryDB:
                 out[r[0]] = TurnMeta(metadata=json.loads(r[1]), expires_at=r[2], edit_of=r[3])
         return out
 
+    def expiring_turns(self, space_id: str) -> dict[str, str]:
+        """带过期时间的发言：轮 ID → 存下的过期时间（见 expiry.expired_ids）。走 turn_meta 的主键，
+        没有附加信息的空间什么都不读。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT turn_id, expires_at FROM turn_meta"
+                " WHERE space_id = ? AND expires_at IS NOT NULL",
+                (space_id,),
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     def get_turns(
         self,
         space_id: str,
@@ -1014,6 +1025,7 @@ class MemoryDB:
         current_only: bool = False,
         subject_id: str | None = None,
         superseded_by: Sequence[str] | None = None,
+        session_ids: Sequence[str] | None = None,
         valid_period: tuple[str, str] | None = None,
         known_at: datetime | None = None,
     ) -> list[Fact]:
@@ -1042,6 +1054,11 @@ class MemoryDB:
                 return []
             sql += f" AND superseded_by IN ({', '.join('?' for _ in superseded_by)})"
             args.extend(superseded_by)
+        if session_ids is not None:  # 这几个会话里抽出的事实
+            if not session_ids:
+                return []
+            sql += f" AND session_id IN ({', '.join('?' for _ in session_ids)})"
+            args.extend(session_ids)
         if valid_period is not None:
             # 与这段时间有重叠：起点不晚于段尾、终点晚于段首。存下的部分日期按字典序比较即可：
             # '2023-05' <= '2023-05-31'。查询的一端是部分日期时不行（'2023-05-07' <= '2023-05'

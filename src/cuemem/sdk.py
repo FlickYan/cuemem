@@ -44,7 +44,7 @@ import logging
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -69,9 +69,11 @@ from cuemem.core.models import (
     TurnIn,
     TurnMeta,
 )
-from cuemem.core.timeutil import expiry_instant, naive_local, normalize_expiry
+from cuemem.core.timeutil import naive_local, normalize_expiry
 from cuemem.core.types import PeakPolicy, Router
 from cuemem.errors import ConcurrentWriteError
+from cuemem.expiry import Sources as _Sources
+from cuemem.expiry import visible_core
 from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 
 # 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
@@ -509,7 +511,7 @@ class Memory:
             )
         if not data.strip():
             raise ValueError("text is empty: to remove a memory, call delete().")
-        sources = _Sources.load(self.system, space, fact.source_turn_ids)
+        sources = _Sources.load(self.system.db, space, fact.source_turn_ids)
         inherited = {**sources.metadata(fact.source_turn_ids), **dict(metadata or {})}
         info = _turn_meta(inherited, sources.expires(fact.source_turn_ids)) or TurnMeta()
         info = info.model_copy(update={"edit_of": memory_id})
@@ -701,14 +703,21 @@ class Memory:
         router: Router = "learned",
         lam: float | None = None,
     ) -> dict[str, Any]:
-        """检索并回答，回答里的引用指向具体的事实与对话片段。mode、router、lam 写错时 ValueError
-        （与 /api/v1 相同）：MemorySystem.ask 的 "naive"、"facts" 是评测用的基线，不经过 SDK。"""
+        """检索并回答，回答里的引用指向具体的事实与对话片段。过期的记忆（expiration_date 过了）
+        不用，画像里也去掉，同 search。mode、router、lam 写错时 ValueError（与 /api/v1 相同）：
+        MemorySystem.ask 的 "naive"、"facts" 是评测用的基线，不经过 SDK。"""
         _valid("mode", AnswerMode, mode)
         _valid("router", Router, router)
         lam = _valid("lam", Lam, lam)
         space = space_for(user_id, agent_id)
         answer = self.system.ask(
-            space, question, question_time=at, mode=mode, router=router, lam=lam
+            space,
+            question,
+            question_time=at,
+            mode=mode,
+            router=router,
+            lam=lam,
+            hide_expired=True,
         )
         return _answer_out(answer)
 
@@ -739,7 +748,9 @@ class Memory:
         space = space_for(user_id, agent_id)
         current = not include_superseded and valid_at is None and known_at is None
         facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
-        sources = _Sources.load(self.system, space, [t for f in facts for t in f.source_turn_ids])
+        sources = _Sources.load(
+            self.system.db, space, [t for f in facts for t in f.source_turn_ids]
+        )
         select = _Select(
             run_id, where, _scope_record(user_id, agent_id), datetime.now(), show_expired
         )
@@ -762,19 +773,19 @@ class Memory:
             units = self.system.db.get_units(space, [memory_id])
             if not units:  # 刚好被遗忘删掉了
                 return None
-            sources = _Sources.load(self.system, space, units[0].source_turn_ids)
+            sources = _Sources.load(self.system.db, space, units[0].source_turn_ids)
             return {**_unit_item(units[0], None, sources), "space_id": space}
         if kind == "image":
             image = self._image(memory_id)
             if image is None:
                 return None
-            sources = _Sources.load(self.system, space, [image.source_turn_id])
+            sources = _Sources.load(self.system.db, space, [image.source_turn_id])
             return {**_image_item(image, False, sources), "space_id": space}
         found = self._find(memory_id)
         if found is None:
             return None
         space, fact = found
-        sources = _Sources.load(self.system, space, fact.source_turn_ids)
+        sources = _Sources.load(self.system.db, space, fact.source_turn_ids)
         return _fact_item(fact, None, None, None, sources, space=space)
 
     def media(self, media_id: str) -> bytes | None:
@@ -805,7 +816,9 @@ class Memory:
                 break
             newer = nxt[0]
             chain.append(newer)
-        sources = _Sources.load(self.system, space, [t for f in chain for t in f.source_turn_ids])
+        sources = _Sources.load(
+            self.system.db, space, [t for f in chain for t in f.source_turn_ids]
+        )
         events = []
         for version in sorted(chain, key=lambda f: (f.recorded_at, f.id)):
             item = _fact_item(version, None, None, None, sources, space=space)
@@ -1372,41 +1385,6 @@ def _scope_record(user_id: str | None, agent_id: str | None) -> dict[str, str]:
 
 
 @dataclass
-class _Sources:
-    """一批记忆出处各句的附加信息（turn_meta）。事实与对话片段的 metadata 是出处各句的并集
-    （同一个键取后面那句的）；过期时间取出处里最晚的，有一句没给过期时间就不过期：同一件事
-    后来又说过一次、没说什么时候过期，它就一直有效。"""
-
-    meta: Mapping[str, TurnMeta]
-
-    @classmethod
-    def load(cls, system: MemorySystem, space: str, turn_ids: Iterable[str]) -> _Sources:
-        ids = list(dict.fromkeys(turn_ids))
-        return cls(system.db.get_turn_meta(space, ids) if ids else {})
-
-    def metadata(self, turn_ids: Sequence[str]) -> dict[str, Any]:
-        merged: dict[str, Any] = {}
-        for turn_id in turn_ids:
-            info = self.meta.get(turn_id)
-            if info is not None:
-                merged.update(info.metadata)
-        return merged
-
-    def expires(self, turn_ids: Sequence[str]) -> str | None:
-        stamps: list[str] = []
-        for turn_id in turn_ids:
-            info = self.meta.get(turn_id)
-            if info is None or info.expires_at is None:
-                return None
-            stamps.append(info.expires_at)
-        return max(stamps, key=expiry_instant) if stamps else None
-
-    def expired(self, turn_ids: Sequence[str], now: datetime) -> bool:
-        stamp = self.expires(turn_ids)
-        return stamp is not None and expiry_instant(stamp) <= now
-
-
-@dataclass
 class _Select:
     """search / get_all 的事后筛选：会话（run_id）、metadata 的条件与过期时间（show_expired 时
     不看过期时间；画像另算，总是去掉过期的）。"""
@@ -1431,21 +1409,9 @@ class _Select:
 
 
 def _profile(system: MemorySystem, space: str, core: CoreMemory | None, now: datetime) -> str:
-    """画像去掉已经过期的事实。画像是事实表的物化视图（write/profile.py）：每条事实一行
-    "- 陈述"，多人时前面有一行人名；某人名下的事实都过期了，人名那一行也去掉。"""
-    if core is None:
-        return ""
-    facts = system.db.get_facts(space, ids=core.fact_ids)
-    sources = _Sources.load(system, space, [t for f in facts for t in f.source_turn_ids])
-    gone = {f"- {f.statement}" for f in facts if sources.expired(f.source_turn_ids, now)}
-    if not gone:
-        return core.text
-    lines = [line for line in core.text.split("\n") if line not in gone]
-    return "\n".join(
-        line
-        for i, line in enumerate(lines)
-        if line.startswith("- ") or (i + 1 < len(lines) and lines[i + 1].startswith("- "))
-    )
+    """画像去掉已经过期的事实（规则见 expiry.visible_core）。"""
+    shown = visible_core(system.db, space, core, now)
+    return shown.text if shown is not None else ""
 
 
 def _as_datetime(value: datetime | str | float | None) -> datetime | None:
@@ -1548,7 +1514,7 @@ def _recall_out(
     view = recall.view
     media = list(view.media.values())
     sources = _Sources.load(
-        system,
+        system.db,
         space,
         [
             *(t for fh in view.facts for t in fh.fact.source_turn_ids),
@@ -1661,7 +1627,7 @@ def _events(
         f for i in range(0, len(wanted), 500) for f in db.get_facts(space, ids=wanted[i : i + 500])
     ]
     fresh = [t for f in after if f.id not in before for t in f.source_turn_ids]
-    sources = _Sources.load(system, space, fresh)
+    sources = _Sources.load(system.db, space, fresh)
     replaced: dict[str, list[Fact]] = {}
     for fact in after:
         old = before.get(fact.id)

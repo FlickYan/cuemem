@@ -1095,6 +1095,110 @@ def test_expired_memories_leave_search_get_all_and_the_profile(memory: Memory) -
         memory.add("I like snow", user_id="u", expiration_date="next week")
 
 
+def _expired_berlin(memory: Memory) -> None:
+    """过期的住址（昨天到期）与没有过期时间的爱好，都已巩固。"""
+    yesterday = date.today() - timedelta(days=1)
+    memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+    memory.add("I like jazz", user_id="u", wait=True)
+    assert "Berlin" in memory.system.core_memory("u").text  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("mode", ["auto", "l0", "l1", "l2"])
+def test_answer_does_not_use_expired_memories(
+    memory: Memory, model: ScriptedModel, mode: str
+) -> None:
+    """第五轮体检 P7：以前只有 search、get_all 与 profile 去掉过期的记忆，answer() 直接调用
+    MemorySystem.ask，过期的事实、对话片段与画像里的那一行都进了回答模型的提示（L0 也带着
+    画像）。"""
+    _expired_berlin(memory)
+    memory.answer("Where do I live? Do I like jazz?", user_id="u", mode=mode)  # type: ignore[arg-type]
+    (prompt,) = model.prompts["read"]
+    assert "Berlin" not in prompt and "jazz" in prompt
+
+
+def test_hatch_search_does_not_find_expired_memories(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """hatch：控制器召回的记忆与模型自己用 memory_search 补查的都不带过期的。"""
+    _expired_berlin(memory)
+    steps: list[dict[str, Any]] = []
+
+    def reply(body: dict[str, Any]) -> Any:
+        if not any(t["function"]["name"] == "memory_search" for t in body.get("tools", [])):
+            return model(body)
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": "Where do I live?"})
+            return {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": args}]}
+        answer = json.dumps({"answer": "x", "citations": [], "evidence_sufficient": False})
+        return {"tool_calls": [{"id": "c2", "name": "answer", "arguments": answer}]}
+
+    fake_api.chat_replies = [reply]
+    result = memory.answer("Where do I live? Do I like jazz?", user_id="u", mode="hatch")
+    assert result["answer"] == "x" and len(steps) == 2
+    sent = json.dumps(steps[1]["messages"], ensure_ascii=False)
+    assert "Berlin" not in sent and "jazz" in sent
+
+
+def test_recall_for_other_agents_drops_expired_memories(memory: Memory) -> None:
+    """记忆代理与各框架集成的证据块（recall_evidence）、MCP 与 /recall 的清单（recall_listing）
+    都不给过期的事实、对话片段与画像里的那一行；L0 只给画像时也一样。"""
+    from cuemem.evidence import recall_evidence
+
+    _expired_berlin(memory)
+    question = "Where do I live? Do I like jazz?"
+    for mode in ("auto", "l0", "l1", "l2"):
+        evidence = recall_evidence(memory.system, "u", question, mode=mode)  # type: ignore[arg-type]
+        assert "Berlin" not in evidence.block and "jazz" in evidence.block, mode
+        listing = recall_listing(memory.system, "u", question, mode=mode, at_least_l1=True)  # type: ignore[arg-type]
+        assert "Berlin" not in json.dumps(listing) and "jazz" in json.dumps(listing), mode
+        assert listing["facts"] and "jazz" in listing["profile"], mode
+
+
+def test_a_restated_memory_without_expiry_stays(memory: Memory, model: ScriptedModel) -> None:
+    """同一件事后来又说过一次、没给过期时间：它一直有效（同 search 的规则）。"""
+    memory.add("I like rain", user_id="u", expiration_date="2020-01-01", wait=True)
+    memory.add("I like rain", user_id="u", wait=True)
+    memory.answer("Do I like rain?", user_id="u", mode="l1")
+    assert "I like rain" in model.prompts["read"][0]
+
+
+def test_hiding_expired_memories_leaves_other_spaces_untouched(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有过期记忆的空间（评测的空间从不写过期时间，metadata 与还没到期的也算）：打开
+    hide_expired 时 exclude 还是调用方给的同一个对象，画像不动，请求逐字节相同。"""
+    memory.add("I live in Berlin", user_id="u", metadata={"k": "v"}, wait=True)
+    memory.add("I like jazz", user_id="u", expiration_date="2999-01-01", wait=True)
+    system = memory.system
+    excludes: list[Any] = []
+    search = system.l1.search
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        excludes.append(kwargs.get("exclude"))
+        return search(*args, **kwargs)
+
+    monkeypatch.setattr(system.l1, "search", spy)
+    assert system.llm.cache is not None
+    monkeypatch.setattr(system.llm.cache, "get", lambda key: None)  # 每遍都发出请求
+    question = "Where do I live? Do I like jazz?"
+
+    def run(mode: str, **hide: bool) -> tuple[list[str], str]:
+        before = len(fake_api.chat_requests)
+        answer = system.ask("u", question, mode=mode, **hide)  # type: ignore[arg-type]
+        sent = [json.dumps(b, sort_keys=True) for b in fake_api.chat_requests[before:]]
+        return sent, answer.answer
+
+    mine = ("x", "y")
+    for mode in ("auto", "l0", "l1", "l2"):
+        plain = run(mode)
+        assert plain[0] and run(mode, hide_expired=True) == plain, mode
+        mine_before = len(excludes)
+        system.retrieve("u", question, mode="l1", exclude=mine, hide_expired=True)
+        assert excludes[mine_before:] == [mine]
+    assert system.expired_ids("u", datetime.now()) == frozenset()
+
+
 def test_forgetting_deletes_the_metadata_of_forgotten_turns(memory: Memory) -> None:
     """metadata 属于原始层，可能也有个人信息：遗忘一段发言时一起删，delete_all 全删。"""
     pin = memory.add("My PIN is 4321", user_id="u", metadata={"note": "PIN-NOTE-4321"}, wait=True)

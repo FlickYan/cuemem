@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from fastapi.testclient import TestClient
 from scripted import ScriptedModel, echo_extraction
 from starlette.datastructures import Headers
 
+from cuemem import Memory
 from cuemem.agent import Agent
 from cuemem.api.app import LOOPBACK_HOSTS, create_app
 from cuemem.api.auth import Keys
@@ -138,6 +140,18 @@ def test_tokens_and_scopes_are_checked_before_mcp(app: FastAPI, service: ChatSer
             "dave": ["I like juice"],
         }
         assert "tea" in said(http.post("/mcp", json=call("recall", query="tea"), headers=alice))
+
+
+def test_recall_over_mcp_drops_expired_memories(app: FastAPI, service: ChatService) -> None:
+    """第五轮体检 P7：MCP 的 recall（与 /recall 同一份清单）不给过期的记忆，画像里也去掉。"""
+    memory = Memory.from_system(service.system)
+    yesterday = date.today() - timedelta(days=1)
+    memory.add("I live in Berlin", user_id="alice", expiration_date=yesterday, wait=True)
+    memory.add("I like jazz", user_id="alice", wait=True)
+    with TestClient(app, base_url=URL) as http:
+        alice = headers(ALICE_TOKEN)
+        found = said(http.post("/mcp", json=call("recall", query="Berlin jazz"), headers=alice))
+    assert "jazz" in found and "Berlin" not in found
 
 
 def test_non_ascii_user_ids_in_the_headers(service: ChatService, tmp_path: Path) -> None:

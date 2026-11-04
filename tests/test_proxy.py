@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +153,22 @@ def test_remembers_across_sessions(
     # 写回的是用户的原话，不带注入的记忆
     stored = system.db.get_turns("alice", third.headers["x-cuemem-session"])
     assert stored[0].text == "Where should I buy winter boots?"
+
+
+def test_expired_memories_are_not_injected(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """第五轮体检 P7：过期的记忆（SDK 写入时给了 expiration_date）不进注入的 <memory> 块，画像里
+    那一行也去掉。以前只有 SDK 的 search 与 profile 去掉它们，代理照样注入。"""
+    memory = Memory.from_system(system)
+    yesterday = date.today() - timedelta(days=1)
+    memory.add("I live in Berlin", user_id="alice", expiration_date=yesterday, wait=True)
+    memory.add("I like jazz", user_id="alice", wait=True)
+    response = chat(client, "Where do I live? Do I like jazz?", user="alice")
+    assert response.status_code == 200
+    content = upstream.proxied[-1]["messages"][-1]["content"]
+    assert content.startswith("<memory>\n") and "jazz" in content
+    assert "Berlin" not in content
 
 
 def test_a_new_conversation_starts_a_new_session(

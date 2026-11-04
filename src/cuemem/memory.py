@@ -41,6 +41,7 @@ from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder, ImageEmbedder
 from cuemem.errors import ConsolidationError
+from cuemem.expiry import expired_ids, visible_core
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
@@ -56,7 +57,7 @@ from cuemem.read.controller import (
     RuleController,
 )
 from cuemem.read.facts import FactAugmentedRetriever, ImageMode, MemoryView, Validity
-from cuemem.read.l1 import L1Candidates, L1Config, L1Retriever
+from cuemem.read.l1 import L1Candidates, L1Config, L1Result, L1Retriever
 from cuemem.read.l2 import L2Config, L2Retriever
 from cuemem.read.naive import NaiveRetriever
 from cuemem.read.plan import QueryPlan, rule_plan
@@ -1677,6 +1678,7 @@ class MemorySystem:
         notes: bool | None = None,
         router: Router = "learned",
         lam: float | None = None,
+        hide_expired: bool = False,
     ) -> Answer:
         """检索并回答。
 
@@ -1694,6 +1696,8 @@ class MemorySystem:
         notes：reader 先记笔记再回答（并按检索计划给阅读提示）；默认 L2 开、L1 关。
         还没巩固过的空间，l1 与 facts 模式也能用（只是没有事实可用）。
         question_time 带时区时换算成本机时间（与存下来的时间一致，见 core/timeutil.py）。
+        hide_expired：不用已经过期的记忆（见 retrieve；agent 与 hatch 的 memory_search 也不给），
+        SDK 的 answer 打开它；facts 与 naive 两种评测的基线不看它。
         """
         when = naive_local(question_time) if question_time is not None else datetime.now()
         cache_scope = scope(space_id, "ask")
@@ -1714,6 +1718,7 @@ class MemorySystem:
                     l1=l1,
                     l2=l2,
                     cache_scope=cache_scope,
+                    hide_expired=hide_expired,
                 )
             if recall is not None and recall.level == "l0":
                 answer = self.reader.answer_with_memory(
@@ -1770,12 +1775,32 @@ class MemorySystem:
                         l1=l1,
                         l2=l2,
                         cache_scope=cache_scope,
+                        hide_expired=hide_expired,
                     )
+                now = datetime.now()
+                gone = self.expired_ids(space_id, now) if hide_expired else frozenset()
+                core = self.db.get_core_memory(space_id)
+                if gone:  # 画像与 memory_search 同样不给过期的记忆
+                    core = self.visible_core(space_id, core, now)
+
+                def search(query: str, cfg: L1Config) -> L1Result:
+                    if not gone:
+                        return self.l1.search(space_id, query, when, cfg)
+                    found = self.l1.search(space_id, query, when, cfg, exclude=gone)
+                    media = {mid: m for mid, m in found.media.items() if mid not in gone}
+                    return replace(
+                        found,
+                        rounds=[h for h in found.rounds if h.unit.id not in gone],
+                        facts=[fh for fh in found.facts if fh.fact.id not in gone],
+                        media=media,
+                        attach=[mid for mid in found.attach if mid in media],
+                    )
+
                 answer = self.agent.answer(
                     question,
                     question_time=when,
-                    search=lambda query, cfg: self.l1.search(space_id, query, when, cfg),
-                    core=self.db.get_core_memory(space_id),
+                    search=search,
+                    core=core,
                     cache_scope=cache_scope,
                     recalled=recall.view if recall is not None else None,
                 )
@@ -1824,6 +1849,7 @@ class MemorySystem:
         exclude: Collection[str] = (),
         cache_scope: str | None = None,
         candidates: L1Candidates | None = None,
+        hide_expired: bool = False,
     ) -> Recall:
         """只检索、不回答：按 mode 取记忆（auto 由检索控制器选档），返回交给回答模型的材料。
 
@@ -1842,6 +1868,13 @@ class MemorySystem:
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
         _remove_traces）。ask、Agent 与评测在自己的 trace 里调用，不另记，trace 与用量统计不变。
         遗忘等进行中的检索写完 trace（reading）。
+
+        hide_expired：不给出已经过期的记忆（SDK 的 expiration_date，见 expiry.py）。过期的事实、
+        对话片段与图片加进 exclude（探针与各路检索都不看，名额留给别的），画像去掉过期的几行，
+        检索之后再筛一遍（版本链带出的旧事实、装入的轮里的图片）。过期按墙上时间算，不按
+        question_time，同 SDK 的 search。SDK 的 answer、记忆代理、MCP 与各框架集成打开它；评测、
+        命令行与冻结的方法不打开。空间里没有过期的记忆时（评测的空间从不写过期时间）只多查一次
+        turn_meta，exclude 与画像原样不动，请求逐字节不变。
         """
         tracing: AbstractContextManager[object] = (
             nullcontext()
@@ -1851,67 +1884,129 @@ class MemorySystem:
         if candidates is not None and not self._gate(space_id).held():
             candidates = None  # 在下面的 reading 里查就晚了：那时总是持有读
         with self.reading(space_id), tracing:
-            when = naive_local(question_time) if question_time is not None else datetime.now()
-            cache_scope = cache_scope or scope(space_id, "ask")
-            level: str = mode
-            decision: RouteDecision | None = None
-            used: Router | None = None
-            if mode != "l1":
-                candidates = None
-            if mode == "auto":
-                decision, candidates, used = self._route(
-                    space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
-                )
-                level = decision.level.lower()
-                if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
-                    l1 = replace(l1 or L1Config(), attach_images=3)
-                    base_l2 = l2 or L2Config()
-                    l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
-            if level == "l0":
-                view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
-                return Recall("l0", view, decision, used, candidates=candidates)
-            if level == "l1":
-                cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
-                if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
-                    result = self.l1.pack(space_id, candidates, cfg)
-                else:
-                    result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
-                view = MemoryView(
-                    rounds=result.rounds,
-                    facts=result.facts,
-                    core=result.core,
-                    media=result.media,
-                    image_mode=image_mode(cfg),
-                    attach=result.attach,
-                )
-                return Recall("l1", view, decision, used, candidates=candidates)
-            l2_cfg = l2 or L2Config()
-            deep = self.l2.search(
+            now = datetime.now()  # 过期按墙上时间算（同 SDK 的 search），不按 question_time
+            gone = self.expired_ids(space_id, now) if hide_expired else frozenset()
+            recall = self._retrieve(
                 space_id,
                 question,
-                when,
-                l2_cfg,
+                question_time=question_time,
+                mode=mode,
+                router=router,
+                lam=lam,
+                k=k,
+                l1=l1,
+                l2=l2,
+                exclude=frozenset(exclude) | gone if gone else exclude,
                 cache_scope=cache_scope,
-                exclude=exclude,
-                probe=candidates,
-            )
-            view = MemoryView(
-                rounds=deep.rounds,
-                facts=deep.facts,
-                core=deep.core,
-                media=deep.media,
-                image_mode=image_mode(l2_cfg.l1),
-                attach=deep.attach,
-            )
-            return Recall(
-                "l2",
-                view,
-                decision,
-                used,
-                plan=deep.plan,
-                details=deep.details(),
                 candidates=candidates,
             )
+            return self._without(space_id, recall, gone, now) if gone else recall
+
+    def _retrieve(
+        self,
+        space_id: str,
+        question: str,
+        *,
+        question_time: datetime | None,
+        mode: RecallMode,
+        router: Router,
+        lam: float | None,
+        k: int | None,
+        l1: L1Config | None,
+        l2: L2Config | None,
+        exclude: Collection[str],
+        cache_scope: str | None,
+        candidates: L1Candidates | None,
+    ) -> Recall:
+        """retrieve 的检索本身（调用方已经持有读、记着 trace）。"""
+        when = naive_local(question_time) if question_time is not None else datetime.now()
+        cache_scope = cache_scope or scope(space_id, "ask")
+        level: str = mode
+        decision: RouteDecision | None = None
+        used: Router | None = None
+        if mode != "l1":
+            candidates = None
+        if mode == "auto":
+            decision, candidates, used = self._route(
+                space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+            )
+            level = decision.level.lower()
+            if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
+                l1 = replace(l1 or L1Config(), attach_images=3)
+                base_l2 = l2 or L2Config()
+                l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
+        if level == "l0":
+            view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
+            return Recall("l0", view, decision, used, candidates=candidates)
+        if level == "l1":
+            cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
+            if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
+                result = self.l1.pack(space_id, candidates, cfg)
+            else:
+                result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
+            view = MemoryView(
+                rounds=result.rounds,
+                facts=result.facts,
+                core=result.core,
+                media=result.media,
+                image_mode=image_mode(cfg),
+                attach=result.attach,
+            )
+            return Recall("l1", view, decision, used, candidates=candidates)
+        l2_cfg = l2 or L2Config()
+        deep = self.l2.search(
+            space_id,
+            question,
+            when,
+            l2_cfg,
+            cache_scope=cache_scope,
+            exclude=exclude,
+            probe=candidates,
+        )
+        view = MemoryView(
+            rounds=deep.rounds,
+            facts=deep.facts,
+            core=deep.core,
+            media=deep.media,
+            image_mode=image_mode(l2_cfg.l1),
+            attach=deep.attach,
+        )
+        return Recall(
+            "l2",
+            view,
+            decision,
+            used,
+            plan=deep.plan,
+            details=deep.details(),
+            candidates=candidates,
+        )
+
+    def expired_ids(self, space_id: str, now: datetime) -> frozenset[str]:
+        """已经过期的检索单元、事实与图片的 ID（见 expiry.expired_ids）。"""
+        return expired_ids(self.db, space_id, now)
+
+    def visible_core(
+        self, space_id: str, core: CoreMemory | None, now: datetime
+    ) -> CoreMemory | None:
+        """画像去掉过期的事实（SDK 的 profile() 也用它）；没有过期的时原样返回。"""
+        return visible_core(self.db, space_id, core, now)
+
+    def _without(
+        self, space_id: str, recall: Recall, gone: frozenset[str], now: datetime
+    ) -> Recall:
+        """检索结果再去掉过期的：exclude 挡住了各路检索，版本链补上的旧事实与装入的轮里的图片
+        不经过它。"""
+        view = recall.view
+        media = {mid: m for mid, m in view.media.items() if mid not in gone}
+        view = replace(
+            view,
+            rounds=[h for h in view.rounds if h.unit.id not in gone],
+            facts=[fh for fh in view.facts if fh.fact.id not in gone],
+            core=self.visible_core(space_id, view.core, now),
+            media=media,
+            attach=[mid for mid in view.attach if mid in media],
+        )
+        return replace(recall, view=view)
 
     def _route(
         self,
