@@ -23,7 +23,7 @@ from cuemem.errors import ConfigMismatchError, StorageLockedError, VectorStoreOp
 from cuemem.store import MemoryDB, VectorStore, media
 from cuemem.store import sqlite as sqlite_module
 from cuemem.store.media import MediaStore, image_data_url
-from cuemem.store.sqlite import legacy_idx_key, next_idx_key
+from cuemem.store.sqlite import SCHEMA_VERSION, legacy_idx_key, next_idx_key
 from cuemem.write import build_rounds, build_turns
 
 
@@ -675,6 +675,38 @@ def test_v1_database_is_migrated(tmp_path: Path) -> None:
     assert db.get_turns("s")[0].speaker == "Alice"
 
 
+def test_newer_database_is_refused_and_left_untouched(tmp_path: Path) -> None:
+    """更新的 CueMem 写的库（user_version 更大）：拒绝打开，不切 WAL、不建表，也不把版本调低。
+    以前每次打开都设成 SCHEMA_VERSION，旧版本悄悄读不到新的集合名与 turn_meta。"""
+    import sqlite3
+
+    path = tmp_path / "memory.sqlite"
+    MemoryDB(path).close()
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigMismatchError, match=f"v{SCHEMA_VERSION + 1}"):
+        MemoryDB(path)
+    assert path.read_bytes() == before  # 连文件头都没改（没有切回 WAL）
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+
+    for older in (5, 6):  # 发布过的构建（v6 及更早）照常打开并升级
+        conn = sqlite3.connect(path)
+        conn.execute(f"PRAGMA user_version = {older}")
+        conn.commit()
+        conn.close()
+        db = MemoryDB(path)
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        db.close()
+
+
 def test_fact_indexes_are_added_to_existing_databases(tmp_path: Path) -> None:
     """每次读取都要沿版本链找被取代的旧版本、数当前有效的事实：以前只有 (space_id, subject_id,
     predicate) 一个索引，两个查询都扫整个空间。打开已有的库时自动补上两个索引，查询结果不变。"""
@@ -761,7 +793,7 @@ def test_v5_database_gains_turn_meta(tmp_path: Path) -> None:
     conn.close()
 
     db = MemoryDB(path)
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert db.get_turn_meta("s") == {} and [t.id for t in db.get_turns("s")] == ["t0"]
     tagged = TurnMeta(metadata={"topic": "food", "n": 1}, expires_at="2030-01-01")
     assert db.add_turns([turn("t1", 1)], {"t1": tagged}) == 1

@@ -41,8 +41,14 @@ MemoryKind = Literal["fact", "excerpt", "image"]  # 按 ID 找到的记忆的种
 # v2：turns 增加 speaker 列；v3：实体、事实、片段、核心记忆、任务队列；
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
 # v6：turn_meta（SDK 写入时附带的 metadata、过期时间与 update 的更正目标）。新表都用
-# CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上
-SCHEMA_VERSION = 6
+# CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上；v7：表不变，标出第三轮复审的 128 位
+# 集合名（VectorStore.collection_name）。
+#
+# 旧代码读不懂新代码写下的东西时就要升版本：不只是 SQLite 的表，也包括 Qdrant 的集合名与
+# payload。D-070 的 128 位集合名是在 v6 里改的、当时没升版本，所以 D-070 之前的 v6 提交读不到
+# 之后建的空间（检索为空）。打开比 SCHEMA_VERSION 新的库时拒绝（MemoryDB.__init__），
+# user_version 也从不调低：降级走导出再导入
+SCHEMA_VERSION = 7
 
 # 新增的索引不用升版本：每次打开都执行 _SCHEMA，已有的库自动补上。facts 的
 # (space_id, superseded_by) 与 (space_id, invalidated_at) 每次读取都用得到：沿版本链找被取代的
@@ -235,6 +241,17 @@ class MemoryDB:
         self._turn_generation = 0  # _turn_writes 清空过几次（见 _count_turn_writes）
         self._rollbacks = 0  # 回滚过的事务与保存点
         with self._lock:
+            # 先读版本，再切 WAL（切换就会写文件头）、建表、补列：更新的 CueMem 写的库原样不动。
+            # 以前每次打开都把 user_version 设成 SCHEMA_VERSION，旧版本打开新库时悄悄调低，
+            # 新的集合名与 turn_meta 都被忽略（检索为空）
+            stored = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            if stored > SCHEMA_VERSION:
+                self._conn.close()  # 不留句柄：serve、proxy 这样长时间运行的进程里会泄漏
+                raise ConfigMismatchError(
+                    f"{path} 是更新的 CueMem 写的（数据格式 v{stored}，这个版本只支持到"
+                    f" v{SCHEMA_VERSION}）：升级 CueMem，或者用新版本导出（cuemem export）再在"
+                    "这里导入"
+                )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
             self._conn.executescript(_SCHEMA)
@@ -249,7 +266,7 @@ class MemoryDB:
             ):
                 if column not in media_columns:  # 从 v3 升级
                     self._conn.execute(f"ALTER TABLE media ADD COLUMN {column} {ddl}")
-            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._conn.execute(f"PRAGMA user_version = {max(stored, SCHEMA_VERSION)}")  # 从不调低
             self._conn.commit()
 
     @contextmanager
