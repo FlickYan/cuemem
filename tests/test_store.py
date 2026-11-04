@@ -688,6 +688,20 @@ def test_unreadable_meta_names_the_repair_and_repair_restores_it(tmp_path: Path)
     assert report is not None and report["backup"] is None
     assert json.loads(meta.read_text("utf-8")) == original
 
+    # 读得出、某个集合的配置却不合法（第五轮复审：以前原样保留、返回 None，向量库一直打不开）
+    bogus = json.loads(meta.read_text("utf-8"))
+    text = next(n for n in bogus["collections"] if n.startswith("space_s_") and "_img" not in n)
+    bogus["collections"][text] = {"vectors": "bogus"}
+    meta.write_text(json.dumps(bogus), "utf-8")
+    with pytest.raises(VectorStoreOpenError, match="repair-vectors"):
+        VectorStore(path, dim=4)
+    report = repair_local_meta(path, text_dim=4, image_dim=2)
+    assert report is not None and (report["text"], report["image"]) == (1, 0)
+    assert json.loads(meta.read_text("utf-8")) == original
+    reopened = VectorStore(path, dim=4)
+    assert _hits(reopened, dense) == before
+    reopened.close()
+
 
 def test_repair_refuses_while_the_store_is_open(tmp_path: Path) -> None:
     """另一个进程（这里是另一个客户端）开着向量库时不修：它随后写 meta.json 会盖掉修好的。"""

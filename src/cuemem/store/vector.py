@@ -643,6 +643,16 @@ def _meta_unreadable(path: Path, exc: Exception) -> VectorStoreOpenError:
     )
 
 
+def _valid_collection(entry: Any) -> bool:
+    """meta.json 里一个集合的配置 Qdrant 打开时认不认（QdrantLocal 载入时同样构造
+    CreateCollection）。"""
+    try:
+        models.CreateCollection(**entry)
+    except (ValueError, TypeError):  # pydantic 的 ValidationError 是 ValueError
+        return False
+    return True
+
+
 def repair_local_meta(path: Path, *, text_dim: int, image_dim: int) -> dict[str, Any] | None:
     """按 collection/ 下的集合重写本地模式的 meta.json（cuemem doctor --repair-vectors）。
 
@@ -650,11 +660,12 @@ def repair_local_meta(path: Path, *, text_dim: int, image_dim: int) -> dict[str,
     meta.json 不行：Qdrant 会写一个空的，旧集合没人认，下次写入在同名目录上重新建集合。另一个
     进程开着这个向量库时（.lock 被锁着）拒绝：StorageLockedError。
 
-    meta.json 读得出的部分原样保留；其余集合的配置照 VectorStore 建集合时的写：文字集合 dense
-    （余弦）加 sparse，图片集合（名字以 IMAGE_SUFFIX 结尾）只有 dense。dense 的维度从存着的一个
-    点读（只读打开；不同向量模型的构建可以并存，不能用现在的配置），空集合用 text_dim 或
-    image_dim。原来的 meta.json 改名为 meta.json.broken-<时间>，新文件先写临时文件、fsync 再
-    换上，写完重新打开核对一遍。返回补上的文字、图片与空集合数、点数与备份的位置。"""
+    meta.json 读得出、Qdrant 认的部分原样保留（某个集合的配置不合法时当作漏了它）；其余集合的
+    配置照 VectorStore 建集合时的写：文字集合 dense（余弦）加 sparse，图片集合（名字以
+    IMAGE_SUFFIX 结尾）只有 dense。dense 的维度从存着的一个点读（只读打开；不同向量模型的构建
+    可以并存，不能用现在的配置），空集合用 text_dim 或 image_dim。原来的 meta.json 改名为
+    meta.json.broken-<时间>，新文件先写临时文件、fsync 再换上，写完重新打开核对一遍。返回补上
+    的文字、图片与空集合数、点数与备份的位置。"""
     import time
 
     import portalocker
@@ -669,7 +680,13 @@ def repair_local_meta(path: Path, *, text_dim: int, image_dim: int) -> dict[str,
         kept = {}
     except (ValueError, KeyError, TypeError):
         kept = None  # 读不出：整个重写
-    if kept is not None and all(name in kept for name in names):
+    # 读得出、某个集合的配置却不合法（Qdrant 打开时 ValidationError，VectorStore 报 meta.json
+    # 读不出）：当作漏了，照存着的点重写（第五轮复审：以前原样保留、返回 None，说好的修复什么
+    # 都不做，向量库一直打不开）
+    invalid = [name for name, entry in (kept or {}).items() if not _valid_collection(entry)]
+    if kept is not None:
+        kept = {name: entry for name, entry in kept.items() if name not in invalid}
+    if kept is not None and not invalid and all(name in kept for name in names):
         return None
     lock_path = path / ".lock"
     lock_path.touch(exist_ok=True)
