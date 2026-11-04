@@ -987,6 +987,37 @@ def test_a_run_handed_over_after_the_idle_period_is_reopened_when_the_client_ret
         after.close()
 
 
+@pytest.mark.parametrize("returns", ["open_run", "end_run"])
+def test_a_handed_over_run_the_client_ended_stays_ended(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, returns: str
+) -> None:
+    """_adopt_after 接手（交给抽取）之后调用方显式地 open_run、写完再 end_run，或者直接 end_run：
+    之后同名的 add 与 end_run 之后的一样是一个普通的会话，wait=True 照常抽取。以前接手的记录
+    （_handed_over）一直留着，这次 add 又把结束了的 run 重新打开，wait=True 时报 "still open"，
+    不带 wait 时悄悄开着、不抽取（第五轮体检）。"""
+    fake_api.chat_replies = [model]
+    _left_open_runs(n3_settings, fake_api, "r2")
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    worker = after.start_worker()
+    now = [0.0]
+    adopt = _adopt_after(after, 60, clock=lambda: now[0])
+    try:
+        now[0] += 60
+        adopt()
+        worker.wait()
+        mem = Memory.from_system(after)
+        if returns == "open_run":
+            mem.open_run("r2", user_id="eve")
+            mem.add("I like rain", user_id="eve", run_id="r2")
+        mem.end_run("r2", user_id="eve", wait=True)
+        assert after.open_sessions("eve") == set()
+        out = mem.add("I like snow", user_id="eve", run_id="r2", wait=True)
+        assert out["status"] == "consolidated"
+        assert after.open_sessions("eve") == set()
+    finally:
+        after.close()
+
+
 def test_a_scoped_reset_forgets_the_idle_runs_of_its_spaces_only(system: MemorySystem) -> None:
     """限定作用域的令牌 reset（/api/v1/reset）与闲置结束的 run：作用域里闲置结束过的 run 跟着
     忘掉，之后同名的 add 是一个普通的会话，不会把删掉的 run 重新打开；作用域外的照旧记着，接着

@@ -597,8 +597,11 @@ class MemorySystem:
         """标记会话进行中：每轮照常在线写入（可检索），但不登记巩固任务——
         否则半个会话会被抽取一遍，会话结束后整个会话又抽取一遍。
 
-        数据库里另外留一个标记：进程崩溃时没人再结束这个会话，下一个进程据此接手（adopt_open）。"""
+        数据库里另外留一个标记：进程崩溃时没人再结束这个会话，下一个进程据此接手（adopt_open）。
+        调用方显式地打开（或结束）之后，本进程接手过的记录（_handed_over）不再算数：否则结束之后
+        同名的 add 又被 resume_left_open 重新打开（第五轮体检）。"""
         with self._open_lock:
+            self._handed_over.pop((space_id, session_id), None)
             if (space_id, session_id) not in self._open:
                 self._open.add((space_id, session_id))
                 self.db.set_meta(_open_mark(space_id, session_id), datetime.now().isoformat())
@@ -610,6 +613,7 @@ class MemorySystem:
         （submit=False 时只登记，下次巩固或后台线程启动时完成）。"""
         with self._open_lock:
             self._open.discard((space_id, session_id))
+            self._handed_over.pop((space_id, session_id), None)  # 见 open_session
             self.db.delete_meta(_open_mark(space_id, session_id))
         self.consolidator.enqueue(space_id, [session_id])
         if wait:
