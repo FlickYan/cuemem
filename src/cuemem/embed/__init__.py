@@ -38,6 +38,7 @@ __all__ = [
     "TextEmbedder",
     "build_embedder",
     "build_image_embedder",
+    "image_vectors_enabled",
 ]
 _SOURCES = {
     "CachedEmbedder": "cuemem.embed.cache",
@@ -106,6 +107,18 @@ def build_embedder(
     return CachedEmbedder(
         inner, EmbeddingCache(settings.paths.embed_cache), instruct=cfg.query_instruct
     )
+
+
+def image_vectors_enabled(settings: Settings) -> bool:
+    """建不建图片向量：与 build_image_embedder 返回不返回 None 的判断相同（改一处时两处一起改），
+    只是不打开向量缓存、不建向量器。doctor --vectors 据此决定比不比图片向量。"""
+    cfg = settings.multimodal_embedding
+    if cfg.backend == "none":
+        return False
+    if cfg.backend == "hash" or settings.embedding.backend == "hash":
+        return True
+    provider = settings.providers.get(cfg.provider)
+    return provider is not None and provider.api_key() is not None
 
 
 def build_image_embedder(

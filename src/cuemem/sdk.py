@@ -818,8 +818,8 @@ class Memory:
         重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。
 
         一句发言都没删、这条事实却还在（它出处的发言已经不在日志里，例如之前的版本遗忘到一半
-        出错留下的）时 message 是 "Nothing deleted"，warning 让调用方 consolidate(rebuild=True)：
-        以前照样回 "Memory deleted"。"""
+        出错留下的）时 message 是 "Nothing deleted"，warning 让调用方 consolidate(rebuild=True)
+        （检索仍然缺对话片段时再 cuemem reindex 补齐向量）：以前照样回 "Memory deleted"。"""
         located = self._locate(memory_id)
         if located is not None and located[1] != "fact":
             return self._delete_source(located[0], located[1], memory_id, dry_run=dry_run)
@@ -842,7 +842,8 @@ class Memory:
                     "Nothing was deleted: none of the conversation turns this memory came from "
                     "are in the log any more (an earlier version can leave this behind when a "
                     "forget failed partway). Run consolidate(rebuild=True) to rebuild the "
-                    "memories from the log."
+                    "memories from the log; if search still misses conversation excerpts "
+                    "afterwards, `cuemem reindex` restores the vectors the log still has."
                 ),
             }
         return {"message": "Memory deleted", **_forget_out(report)}

@@ -29,6 +29,7 @@ import importlib.util
 import ipaddress
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -301,14 +302,24 @@ def doctor(
             help="本地向量库的 meta.json 读不出时，按 collection/ 下的集合重写它（先停掉 serve）",
         ),
     ] = False,
+    vectors: Annotated[
+        bool,
+        typer.Option(
+            "--vectors",
+            help="逐个空间比较数据库与向量库的点数（要打开向量库：本地模式下先停掉 serve）",
+        ),
+    ] = False,
 ) -> None:
-    """检查配置、API Key、数据目录与密钥文件的权限、剩余空间，以及（可选）各模型的连通性。"""
+    """检查配置、API Key、数据目录与密钥文件的权限、剩余空间，以及（可选）向量库与数据库是否
+    一致、各模型的连通性。"""
     settings = _settings()
     if repair_vectors:
         _repair_vectors(settings)
     _print_config(settings)
     _print_local_store(settings)
     _print_disk(settings)
+    if vectors:
+        _print_vector_gaps(settings)
     for line in _loose_modes(settings):
         console.print(line)
     if live:
@@ -415,6 +426,44 @@ def consolidate_cmd(
     with _open_system() as system:
         _print_consolidation(system.consolidate(space, rebuild=rebuild))
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+
+
+@app.command()
+def reindex(
+    space: Annotated[str | None, typer.Option(help="记忆空间 ID")] = None,
+    all_spaces: Annotated[bool, typer.Option("--all", help="数据库里的全部空间")] = False,
+    full: Annotated[
+        bool, typer.Option("--full", help="全部重新写一遍，不只补缺的（命中向量缓存）")
+    ] = False,
+) -> None:
+    """按数据库补齐向量库：补上缺的向量、删掉多余的点（不调用 LLM）。向量库丢了、坏了，或者与
+    数据库不是同一时刻的备份时用；先用 cuemem doctor --vectors 查哪些空间对不上。"""
+    if (space is None) == (not all_spaces):
+        console.print("[red]指定 --space 或 --all 其中一个[/red]")
+        raise typer.Exit(2)
+    with _open_system() as system:
+        targets = [s["space_id"] for s in system.db.list_spaces()]
+        if space is not None:
+            if space not in targets:
+                console.print(f"[red]没有记忆空间 {escape(space)}[/red]")
+                raise typer.Exit(1)
+            targets = [space]
+        for target in targets:
+            report = system.reindex(target, only_missing=not full)
+            added = {k: v for k, v in report.items() if k in _REINDEX_KINDS and v}
+            filled = "、".join(f"{k} {v}" for k, v in added.items())
+            line = f"补上 {filled}" if filled else "没有缺的"
+            line += f"；删掉多余的点 {report['orphans'] + report.get('image_orphans', 0)} 个"
+            if report.get("missing_files"):
+                line += f"；{report['missing_files']} 张图片的原图不在了，补不上"
+            if report.get("facts_missing"):
+                line += f"；{report['facts_missing']} 个事实单元在事实表里找不到，补不上"
+            console.print(f"记忆空间 [bold]{escape(target)}[/bold]：{line}")
+        _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+
+
+# reindex 的报告里按种类计数的几项（其余是删掉的点与补不上的原图）
+_REINDEX_KINDS = ("round", "fact", "summary", "entity", "image", "image_iso", "images")
 
 
 @app.command()
@@ -1882,6 +1931,62 @@ def _repair_vectors(settings: Settings) -> None:
         f"{report['image']} 个图片集合（其中 {report['empty']} 个是空的），共 {report['points']}"
         f" 个点{backup}"
     )
+
+
+def _print_vector_gaps(settings: Settings) -> None:
+    """doctor --vectors：每个空间按种类比较数据库里的记忆单元与向量库里的点（图片另比），对不上
+    的标黄、写明 cuemem reindex 的命令。向量库丢了、坏了，或者与数据库不是同一时刻的备份时，
+    检索悄悄少了结果（get_all 照样列得出），以前 doctor 看不出来。
+
+    要打开向量库：本地模式同一时间只允许一个进程打开，cuemem serve 正开着它时跳过（doctor 的
+    其余检查只读 meta.json，照样能做）。"""
+    from cuemem.embed import image_vectors_enabled
+    from cuemem.errors import StorageLockedError
+    from cuemem.memory import vector_gaps
+    from cuemem.store.vector import VectorStore
+
+    if not settings.paths.db.is_file():
+        console.print("向量库检查：还没有数据库，没有要比的")
+        return
+    with _open_db_only() as db:
+        try:
+            store = VectorStore(
+                settings.paths.qdrant,
+                dim=settings.embedding.dim,
+                url=settings.vector_store.url,
+                api_key=settings.vector_store.secret(),
+            )
+        except StorageLockedError:
+            console.print(
+                "[yellow]向量库检查跳过：本地向量库正被另一个进程使用（多半是 cuemem serve）"
+                "[/yellow]：先停掉它再查，或者改用 Qdrant 服务端"
+            )
+            return
+        except CueMemError as exc:
+            console.print(f"[yellow]向量库检查跳过：[/yellow]{exc}")
+            return
+        store.owned_units = db.some_unit_ids  # 与 MemorySystem 相同（见 collection_name）
+        images = image_vectors_enabled(settings)
+        spaces = [s["space_id"] for s in db.list_spaces()]
+        try:
+            gaps = {space: vector_gaps(db, store, space, images=images) for space in spaces}
+        except Exception as exc:  # 服务端连不上等：一行说明，doctor 的其余检查照常
+            console.print(f"[yellow]向量库检查没做完：[/yellow]{escape(str(exc))}")
+            return
+        finally:
+            store.close()
+    bad = {space: found for space, found in gaps.items() if found}
+    if not bad:
+        console.print(f"向量库：{len(spaces)} 个空间的点数与数据库一致")
+        return
+    for space, found in bad.items():
+        detail = "、".join(f"{kind} {want} → {got}" for kind, (want, got) in found.items())
+        command = escape(cli_command(f"reindex --space {shlex.quote(space)}"))
+        console.print(
+            f"[yellow]空间 {escape(space)} 的向量库与数据库对不上[/yellow]"
+            f"（数据库 → 向量库：{detail}）：运行 {command}"
+        )
+    console.print(f"全部补齐：{cli_command('reindex --all')}（不调用 LLM，命中向量缓存时不发请求）")
 
 
 def _print_disk(settings: Settings) -> None:

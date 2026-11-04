@@ -823,6 +823,7 @@ def test_sdk_delete_says_so_when_nothing_was_deleted(
 
         assert out["message"] == "Nothing deleted" and out["turns_deleted"] == 0
         assert "consolidate(rebuild=True)" in out["warning"]
+        assert "cuemem reindex" in out["warning"]  # 向量缺了时补齐（第五轮体检 P21）
         memory.consolidate(user_id="u", rebuild=True)
         assert _statements(memory) == ["I like jazz", "The user lives in Berlin."]
 

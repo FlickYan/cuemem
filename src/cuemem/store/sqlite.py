@@ -789,6 +789,15 @@ class MemoryDB:
             rows = self._conn.execute(sql, [space_id, *kinds_not]).fetchall()
         return [r[0] for r in rows]
 
+    def unit_counts(self, space_id: str) -> dict[str, int]:
+        """这个空间每种记忆单元各有几个（doctor --vectors 与向量库里的点数对比）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*) FROM units WHERE space_id = ? GROUP BY kind ORDER BY kind",
+                (space_id,),
+            ).fetchall()
+        return {str(kind): int(n) for kind, n in rows}
+
     def existing_texts(self, space_id: str, texts: Iterable[str]) -> set[str]:
         """texts 里还有记忆单元用着的那些（分批查）。"""
         unique = list(dict.fromkeys(texts))

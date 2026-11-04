@@ -395,7 +395,7 @@ class VectorStore:
         return out
 
     def unit_ids(self, space_id: str, *, kinds: Sequence[str] | None = None) -> list[str]:
-        """列出空间里的全部记忆单元 ID（测试与一致性检查用）。"""
+        """列出空间里的全部记忆单元 ID（测试、一致性检查与 reindex 用）。"""
         name = self.collection_name(space_id)
         out: list[str] = []
         with self._lock:
@@ -413,6 +413,22 @@ class VectorStore:
                     with_vectors=False,
                 )
                 out.extend(str(p.payload["unit_id"]) for p in points if p.payload)
+                if offset is None:
+                    return out
+
+    def media_ids(self, space_id: str) -> list[str]:
+        """列出空间的图片集合里的全部图片 ID（一致性检查与 reindex 用）。"""
+        name = self._image_collection(space_id)
+        out: list[str] = []
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return out
+            offset = None
+            while True:
+                points, offset = self._client.scroll(
+                    name, limit=256, offset=offset, with_payload=["media_id"], with_vectors=False
+                )
+                out.extend(str(p.payload["media_id"]) for p in points if p.payload)
                 if offset is None:
                     return out
 

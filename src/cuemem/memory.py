@@ -73,9 +73,10 @@ from cuemem.write.consolidate import (
     ConsolidationWorker,
     Consolidator,
     scope,
+    unit_payload,
 )
 from cuemem.write.extract import PIPELINE_VERSION
-from cuemem.write.online import IngestReport, OnlineWriter
+from cuemem.write.online import IngestReport, OnlineWriter, media_payload
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +335,31 @@ def _parse_open_mark(key: str) -> tuple[str, str] | None:
     return rest[: int(size)], rest[int(size) + 1 :]
 
 
+REINDEX_BATCH = 256  # reindex 每批向量化、写入几个单元（只影响内存，缓存按单条文本命中）
 HANDED_OVER_KEPT = 10_000  # 记着本进程接手过的多少个会话（见 adopt_open、resume_left_open）
+
+
+def vector_gaps(
+    db: MemoryDB, vectors: VectorStore, space_id: str, *, images: bool
+) -> dict[str, tuple[int, int]]:
+    """这个空间的数据库与向量库对不上的地方：种类 → （数据库里几个，向量库里几个），只列对不上
+    的。图片记作 "media"（images=False，没开图片向量时不比）；向量库里有、数据库里没有这一种的
+    点记作 "other"。只比个数（cuemem doctor --vectors），补齐用 MemorySystem.reindex。"""
+    gaps: dict[str, tuple[int, int]] = {}
+    counted = 0
+    for kind, expected in db.unit_counts(space_id).items():
+        got = vectors.count(space_id, kinds=[kind])
+        counted += got
+        if got != expected:
+            gaps[kind] = (expected, got)
+    rest = vectors.count(space_id) - counted
+    if rest:
+        gaps["other"] = (0, rest)
+    if images:
+        expected, got = len(db.get_media(space_id)), len(vectors.media_ids(space_id))
+        if got != expected:
+            gaps["media"] = (expected, got)
+    return gaps
 
 
 class MemorySystem:
@@ -808,6 +833,84 @@ class MemorySystem:
             trace.attrs.update(report.as_dict())
         if strict and report.failed:
             raise ConsolidationError(f"{len(report.failed)} 个会话抽取失败：{report.failed[:5]}")
+        return report
+
+    def reindex(self, space_id: str, *, only_missing: bool = True) -> dict[str, int]:
+        """按数据库补齐向量库：数据库里有、向量库里没有的记忆单元重新向量化写进去，向量库里有、
+        数据库里没有的点删掉；图片（开了图片向量时）同样处理。返回各项的个数：每种单元补上几个
+        （round、fact、summary、entity、image、image_iso）、images（图片）、orphans 与
+        image_orphans（删掉的多余的点）、missing_files（原图不在了、补不上的图片），以及事实表里
+        找不到、补不上的事实单元 facts_missing（没有时不列）。
+
+        向量库丢了、坏了，或者与数据库不是同一时刻的备份时用（cuemem reindex）：向量都能从
+        数据库推出来。以前只有 consolidate(rebuild=True)，它只重建派生记忆（"轮"的向量补不回来），
+        没有缓存时还要重新调用 LLM。这里不调用 LLM、不碰任务与事实表；向量化的是当初写入时的同样
+        文本（向量缓存按单条文本命中，不发请求）与同样的原图，payload 与写入时相同（unit_payload：
+        事实的 current 与 subject_id 取自事实表）。only_missing=False（--full）全部重新写一遍。
+
+        拿着与遗忘相同的独占（巩固锁与读写门）。在线写入不拿空间的锁、先写向量后提交：正在写
+        的点（OnlineWriter.in_flight）不算多余的。读取的顺序（先列向量库，再看正在写的，最后读
+        数据库）保证：列出来时还没提交的点，读数据库时要么已经提交，要么还登记着。
+
+        不能在这个空间的 reading 里调用（RuntimeError，与遗忘相同）。"""
+        with self._exclusive(space_id):
+            stored = set(self.vectors.unit_ids(space_id))
+            images = self.image_embedder is not None
+            stored_media = set(self.vectors.media_ids(space_id)) if images else set()
+            flying = self.writer.in_flight(space_id)
+            units = self.db.list_units(space_id)
+            media = self.db.get_media(space_id) if images else []
+
+            report: dict[str, int] = {}
+            todo = [u for u in units if not only_missing or u.id not in stored]
+            for start in range(0, len(todo), REINDEX_BATCH):
+                chunk = todo[start : start + REINDEX_BATCH]
+                # 事实的 current 与 subject_id 取自事实表（按批查：IN 列表有上限）；表里没有的
+                # 补不上（current 不能猜）
+                fact_ids = [u.id for u in chunk if u.kind == "fact"]
+                facts = {f.id: f for f in self.db.get_facts(space_id, ids=fact_ids)}
+                kept = [u for u in chunk if u.kind != "fact" or u.id in facts]
+                if len(kept) < len(chunk):
+                    report["facts_missing"] = (
+                        report.get("facts_missing", 0) + len(chunk) - len(kept)
+                    )
+                chunk = kept
+                if not chunk:
+                    continue
+                # sparse 照 batch 原样传：VectorStore.upsert 不写空的 sparse，与巩固把缺的换成空的
+                # SparseVector 写进去的结果相同
+                batch = self.embedder.embed([u.text for u in chunk], "document")
+                self.vectors.upsert(
+                    space_id,
+                    [u.id for u in chunk],
+                    batch.dense,
+                    batch.sparse,
+                    [unit_payload(u, facts.get(u.id)) for u in chunk],
+                )
+                for unit in chunk:
+                    report[unit.kind] = report.get(unit.kind, 0) + 1
+            known = {u.id for u in units}
+            orphans = sorted(stored - known - flying)
+            self.vectors.delete(space_id, orphans)
+            report["orphans"] = len(orphans)
+
+            if self.image_embedder is not None:
+                wanted = [m for m in media if not only_missing or m.id not in stored_media]
+                readable = [m for m in wanted if Path(m.path).is_file()]
+                report["missing_files"] = len(wanted) - len(readable)
+                for start in range(0, len(readable), REINDEX_BATCH):
+                    chunk_media = readable[start : start + REINDEX_BATCH]
+                    vectors = self.image_embedder.embed_images([Path(m.path) for m in chunk_media])
+                    self.vectors.upsert_images(
+                        space_id,
+                        [m.id for m in chunk_media],
+                        vectors,
+                        [media_payload(m) for m in chunk_media],
+                    )
+                report["images"] = len(readable)
+                stray = sorted(stored_media - {m.id for m in media} - flying)
+                self.vectors.delete_images(space_id, stray)
+                report["image_orphans"] = len(stray)
         return report
 
     def start_worker(self) -> ConsolidationWorker:
