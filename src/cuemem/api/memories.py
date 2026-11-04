@@ -66,7 +66,7 @@ from cuemem.api.failures import provider_failure
 from cuemem.core.models import FactCategory, SupersedeReason
 from cuemem.errors import ConcurrentWriteError, CueMemError, EmbeddingAPIError
 from cuemem.read.controller import Router
-from cuemem.sdk import AnswerMode, Memory, SearchMode, _scope, space_for
+from cuemem.sdk import AnswerMode, Lam, Memory, MinLevel, SearchMode, _scope, space_for
 from cuemem.store.media import ACCEPTED_FORMATS
 
 PREFIX = "/api/v1"
@@ -131,10 +131,10 @@ class SearchRequest(BaseModel):
     mode: SearchMode = "auto"
     at: datetime | None = None
     router: Router = "learned"
-    lam: float | None = None
+    lam: Lam = None
     filters: dict[str, Any] | None = None
     top_k: int | None = None
-    min_level: Literal["l0", "l1"] = "l1"
+    min_level: MinLevel = "l1"
     show_expired: bool = False
 
 
@@ -145,7 +145,7 @@ class AnswerRequest(BaseModel):
     mode: AnswerMode = "auto"
     at: datetime | None = None
     router: Router = "learned"
-    lam: float | None = None
+    lam: Lam = None
 
 
 class UpdateRequest(BaseModel):

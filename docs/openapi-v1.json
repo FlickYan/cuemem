@@ -3678,7 +3678,8 @@
           "lam": {
             "anyOf": [
               {
-                "type": "number"
+                "type": "number",
+                "minimum": 0.0
               },
               {
                 "type": "null"
@@ -5474,7 +5475,8 @@
           "lam": {
             "anyOf": [
               {
-                "type": "number"
+                "type": "number",
+                "minimum": 0.0
               },
               {
                 "type": "null"

@@ -10,6 +10,7 @@ import importlib.resources
 import inspect
 import io
 import json
+import math
 import subprocess
 import sys
 import time
@@ -403,6 +404,62 @@ def test_a_malformed_valid_at_is_a_400(system: MemorySystem) -> None:
         response = http.get("/api/v1/memories", params={"user_id": "a", "valid_at": "banana"})
     assert response.status_code == 400
     assert "YYYY-MM-DD" in response.json()["error"]["message"]
+
+
+BAD_READ_ARGUMENTS = [
+    ("search", {"mode": "l9"}),
+    ("search", {"mode": "naive"}),
+    ("search", {"router": "bogus"}),
+    ("search", {"min_level": "l2"}),
+    ("search", {"lam": -5.0}),
+    ("search", {"lam": float("nan")}),
+    ("search", {"lam": float("inf")}),
+    ("answer", {"mode": "bogus"}),
+    ("answer", {"mode": "naive"}),
+    ("answer", {"mode": "facts"}),
+    ("answer", {"router": "bogus"}),
+    ("answer", {"lam": -1}),
+]
+
+
+@pytest.mark.parametrize(("method", "bad"), BAD_READ_ARGUMENTS)
+def test_bad_read_arguments_raise_the_same_error_locally(
+    system: MemorySystem, method: str, bad: dict[str, Any]
+) -> None:
+    """第五轮体检 P17：以前本地的 Memory 不查 mode、router、min_level、lam（mode="l9" 悄悄走 L2，
+    router="bogus" 走学习版控制器，min_level="l2" 只给画像，answer 的 mode="naive" 跑评测的基线），
+    经 HTTP 的 MemoryClient 却 ValueError。现在两边都 ValueError，说的是同一句话（HTTP 的前面多
+    "Invalid request: body."）；空间还是空的时也报错，不先返回空结果。"""
+    local = Memory.from_system(system)
+    (name,) = bad
+    text = "Where do I live?"
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as remote,
+    ):
+        for _ in range(2):  # 先是空的空间，再是有记忆的
+            with pytest.raises(ValueError, match=f"^{name}: ") as ours:
+                getattr(local, method)(text, user_id="alice", **bad)
+            with pytest.raises(ValueError) as theirs:
+                getattr(remote, method)(text, user_id="alice", **bad)
+            finite = name != "lam" or math.isfinite(bad["lam"])
+            if finite:  # NaN 与无穷大 MemoryClient 发不出去（不是合法的 JSON），照样 ValueError
+                assert str(theirs.value) == f"Invalid request: body.{ours.value}"
+            local.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+        if not finite:  # 别的客户端写进请求体的 NaN、Infinity（Python 的 json 照收）同样拒绝
+            body = json.dumps({"query": text, "question": text, **bad})
+            path = "/api/v1/memories/search" if method == "search" else "/api/v1/answer"
+            response = http.post(path, content=body, headers={"content-type": "application/json"})
+            assert response.status_code == 422
+            assert response.json()["error"]["message"] == f"Invalid request: body.{ours.value}"
+
+
+def test_good_read_arguments_still_pass(mem: Mem) -> None:
+    """合法的值照旧：λ = 0、整数的 λ、min_level="l0"、answer 的 agent 模式。"""
+    mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    assert mem.search("Where do I live?", user_id="alice", lam=0, min_level="l0", router="rule")
+    assert mem.search("Where do I live?", user_id="alice", mode="l1", lam=2)["level"] == "L1"
+    assert mem.answer("Where do I live?", user_id="alice", mode="l1", lam=0.5)["answer"]
 
 
 def test_metadata_filters_and_expiration(mem: Mem) -> None:

@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import functools
 import json
 import logging
 import tempfile
@@ -49,9 +50,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import httpx2
+from pydantic import Field, TypeAdapter, ValidationError
 
 from cuemem._async import AsyncMethods
 from cuemem.config import Settings, load_settings, presets, unknown_keys
@@ -82,6 +84,9 @@ logger = logging.getLogger(__name__)
 IDLE_CLOSED_KEPT = 10_000  # 记着多少个闲置结束的 run（见 close_idle_runs），之后再 add 时重新打开
 SearchMode = Literal["auto", "l0", "l1", "l2"]
 AnswerMode = Literal["auto", "l0", "l1", "l2", "agent", "hatch"]
+MinLevel = Literal["l0", "l1"]  # search 的 min_level（签名里照写 Literal：客户端不导入这里）
+# 控制器的 λ（按需付费的权重）：不小于 0 的有限数。/api/v1 的请求模型用同一个类型
+Lam = Annotated[float | None, Field(ge=0, allow_inf_nan=False)]
 Message = Mapping[str, Any]
 MessagesIn = str | Message | Sequence[Message]
 
@@ -650,6 +655,11 @@ class Memory:
         score 只用来排序（L1 是排名融合的分数，第一名约 0.016），不是相似度：没有 Mem0 的
         threshold（按 Mem0 默认的 0.1 截断会什么都不剩）；Mem0 的 rerank 对应 mode="l2"。
         """
+        # 先于一切检查：空间还是空的时，写错的 mode 也要报错，而不是返回空结果
+        _valid("mode", SearchMode, mode)
+        _valid("router", Router, router)
+        _valid("min_level", MinLevel, min_level)
+        lam = _valid("lam", Lam, lam)
         _count("limit", limit)
         _count("top_k", top_k)
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
@@ -691,7 +701,11 @@ class Memory:
         router: Router = "learned",
         lam: float | None = None,
     ) -> dict[str, Any]:
-        """检索并回答，回答里的引用指向具体的事实与对话片段。"""
+        """检索并回答，回答里的引用指向具体的事实与对话片段。mode、router、lam 写错时 ValueError
+        （与 /api/v1 相同）：MemorySystem.ask 的 "naive"、"facts" 是评测用的基线，不经过 SDK。"""
+        _valid("mode", AnswerMode, mode)
+        _valid("router", Router, router)
+        lam = _valid("lam", Lam, lam)
         space = space_for(user_id, agent_id)
         answer = self.system.ask(
             space, question, question_time=at, mode=mode, router=router, lam=lam
@@ -1209,6 +1223,22 @@ def _correction(text: str | None, data: str | None) -> str:
             "from, so pass text= (the corrected memory) together with metadata=."
         )
     return chosen
+
+
+@functools.cache
+def _adapter(kind: Any) -> TypeAdapter[Any]:
+    return TypeAdapter(kind)
+
+
+def _valid(name: str, kind: Any, value: Any) -> Any:
+    """search / answer 的 mode、router、min_level、lam：与 /api/v1 的请求模型（SearchRequest、
+    AnswerRequest）同一个类型、同一句话（HTTP 的是 "Invalid request: body.mode: …"），本地与远程
+    抛同样的 ValueError。以前本地不查：mode="l9" 悄悄走 L2，router="bogus" 走学习版控制器，
+    min_level="l2" 只给画像。返回校验后的值（lam 的整数换成浮点数，同 HTTP）。"""
+    try:
+        return _adapter(kind).validate_python(value)
+    except ValidationError as exc:
+        raise ValueError(f"{name}: {exc.errors()[0]['msg']}") from None
 
 
 def _count(name: str, value: int | None) -> None:
