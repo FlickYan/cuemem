@@ -34,7 +34,7 @@ from cuemem.core.models import (
     Turn,
     TurnMeta,
 )
-from cuemem.core.timeutil import naive_local
+from cuemem.core.timeutil import naive_local, valid_period
 from cuemem.core.trace import TraceSink, current_trace, start_trace, trace_queries
 from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
@@ -1968,13 +1968,16 @@ class MemorySystem:
         space_id: str,
         *,
         current_only: bool = False,
-        valid_at: str | None = None,
+        valid_at: str | date | None = None,
         known_at: datetime | None = None,
     ) -> list[Fact]:
+        """valid_at：YYYY、YYYY-MM、YYYY-MM-DD（或 date）；一年、一个月指这段时间里任何时候成立
+        过的事实。别的写法 ValueError（SDK、/api/v1 的 400、CLI 都经过这里）。"""
+        period = valid_period(valid_at) if valid_at is not None else None
         if known_at is not None:  # 数据库里按字符串比较：带时区的先换算成本机时间
             known_at = naive_local(known_at)
         return self.db.get_facts(
-            space_id, current_only=current_only, valid_at=valid_at, known_at=known_at
+            space_id, current_only=current_only, valid_period=period, known_at=known_at
         )
 
     def entities(self, space_id: str) -> list[Entity]:

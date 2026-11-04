@@ -705,17 +705,19 @@ class Memory:
         agent_id: str | None = None,
         run_id: str | None = None,
         include_superseded: bool = False,
-        valid_at: str | None = None,
+        valid_at: str | date | None = None,
         known_at: datetime | None = None,
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
         show_expired: bool = False,
     ) -> dict[str, Any]:
-        """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at="2025-06" 是那时
-        现实中成立的事实，known_at 是系统在那一刻相信的事实。run_id：只要这个会话里记下的事实；
-        filters 里的其他键是 metadata 的条件（同 search）。过期的事实默认不给，show_expired=True
-        时也给（以前除了 export 与已知的 ID，没有办法列出过期的记忆）。limit 同 search。"""
+        """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at 是那时现实中成立的
+        事实，写成 "2025"、"2025-06"、"2025-06-07" 或 date；一年、一个月指这段时间里任何时候
+        成立过的，先后几个值可能都在（别的写法 ValueError）。known_at 是系统在那一刻相信的事实。
+        run_id：只要这个会话里记下的事实；filters 里的其他键是 metadata 的条件（同 search）。过期
+        的事实默认不给，show_expired=True 时也给（以前除了 export 与已知的 ID，没有办法列出过期的
+        记忆）。limit 同 search。"""
         _count("limit", limit)
         _count("top_k", top_k)
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)

@@ -1014,13 +1014,15 @@ class MemoryDB:
         current_only: bool = False,
         subject_id: str | None = None,
         superseded_by: Sequence[str] | None = None,
-        valid_at: str | None = None,
+        valid_period: tuple[str, str] | None = None,
         known_at: datetime | None = None,
     ) -> list[Fact]:
         """查询事实。两条时间轴可以分别查询：
 
-        - valid_at（事件时间，ISO 日期）："那时现实中什么是成立的"，例如"2025 年 6 月我在哪工作"。
-          不知道起始时间的事实，从它被说出的那天算起；被更正的事实从未成立，不会出现；
+        - valid_period（事件时间，(起, 止) 两个含在内的 YYYY-MM-DD，见 timeutil.valid_period）：
+          "那时现实中什么是成立的"，例如"2025 年 6 月我在哪工作"。给的是一段时间（一年、一个月）
+          时，这段时间里任何时候成立过的都算，先后几个值可能同时出现。不知道起始时间的事实，从它
+          被说出的那天算起；被更正的事实从未成立，不会出现；
         - known_at（记录时间）："系统在那一刻相信什么"，用来回放当时的认知、审计与调试。
         """
         sql = f"SELECT {_FACT_COLUMNS} FROM facts WHERE space_id = ?"
@@ -1040,13 +1042,16 @@ class MemoryDB:
                 return []
             sql += f" AND superseded_by IN ({', '.join('?' for _ in superseded_by)})"
             args.extend(superseded_by)
-        if valid_at is not None:
-            # 部分日期按字典序比较即可：'2023-05' <= '2023-05-07'
+        if valid_period is not None:
+            # 与这段时间有重叠：起点不晚于段尾、终点晚于段首。存下的部分日期按字典序比较即可：
+            # '2023-05' <= '2023-05-31'。查询的一端是部分日期时不行（'2023-05-07' <= '2023-05'
+            # 不成立），所以查询总是换成完整的日期；只查一天时两端相同，与以前的结果一样
+            lo, hi = valid_period
             sql += (
                 " AND COALESCE(valid_from, substr(recorded_at, 1, 10)) <= ?"
                 " AND (valid_to IS NULL OR ? < valid_to)"
             )
-            args.extend([valid_at, valid_at])
+            args.extend([hi, lo])
             sql += " AND (supersede_reason IS NULL OR supersede_reason != 'corrected')"
         if known_at is not None:
             sql += " AND recorded_at <= ? AND (invalidated_at IS NULL OR ? < invalidated_at)"

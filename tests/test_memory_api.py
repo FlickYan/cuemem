@@ -366,6 +366,45 @@ def test_add_events_history_and_time_travel(mem: Mem) -> None:
     assert "Munich" in mem.profile(user_id="alice")
 
 
+def test_valid_at_takes_a_year_month_or_day(mem: Mem) -> None:
+    """第五轮体检 P8：valid_at 以前按字符串比较。文档里的 "2026-08" 什么都查不到（'2026-08-01'
+    <= '2026-08' 不成立），'2026-8'、'banana' 之类不报错、给出 Munich。现在一年、一个月是这段
+    时间里成立过的事实，别的写法本地与远程都 ValueError。"""
+    mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    mem.add(
+        [
+            {"role": "user", "content": "I moved to Munich"},
+            {"role": "assistant", "content": "Nice!"},
+        ],
+        user_id="alice",
+        timestamp=SEP,
+        wait=True,
+    )
+
+    def then(valid_at: str | date) -> list[str]:
+        return sorted(
+            f["memory"] for f in mem.get_all(user_id="alice", valid_at=valid_at)["results"]
+        )
+
+    berlin, munich = ["The user lives in Berlin."], ["The user lives in Munich."]
+    assert then("2026-08") == berlin
+    assert then("2026-09") == munich
+    assert then("2026") == sorted(berlin + munich)
+    assert then("2026-08-15") == then(date(2026, 8, 15)) == berlin
+    assert then("2026-08-31T23:00") == berlin and then("2026-09-01") == munich
+    assert then("2025") == [] and then("2026-07") == []
+    for bad in ("2026-8", "2026/08/15", "Aug 2026", "banana", "2026-13", "2026-02-30", ""):
+        with pytest.raises(ValueError, match="valid_at"):
+            then(bad)
+
+
+def test_a_malformed_valid_at_is_a_400(system: MemorySystem) -> None:
+    with TestClient(v1_app(system)) as http:
+        response = http.get("/api/v1/memories", params={"user_id": "a", "valid_at": "banana"})
+    assert response.status_code == 400
+    assert "YYYY-MM-DD" in response.json()["error"]["message"]
+
+
 def test_metadata_filters_and_expiration(mem: Mem) -> None:
     tea = mem.add("I like green tea", user_id="dan", metadata={"topic": "food", "stars": 5})
     assert tea["status"] == "queued"

@@ -324,6 +324,9 @@ def test_consolidate_inspect_and_forget(
         app, ["inspect", "facts", "--space", "demo", "--valid-at", "2025-06-01", "--current"]
     )
     assert result.exit_code == 0, result.output
+    # 第五轮体检 P8：不是 ISO 的日期以前按字符串比较，给出错的结果而不报错
+    result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--valid-at", "2025/06"])
+    assert result.exit_code == 2 and "--valid-at" in result.output
 
     result = runner.invoke(app, ["inspect", "entities", "--space", "demo"])
     assert result.exit_code == 0 and "Max" in result.output

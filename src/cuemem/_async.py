@@ -193,7 +193,7 @@ class AsyncMethods:
         agent_id: str | None = None,
         run_id: str | None = None,
         include_superseded: bool = False,
-        valid_at: str | None = None,
+        valid_at: str | date | None = None,
         known_at: datetime | None = None,
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,

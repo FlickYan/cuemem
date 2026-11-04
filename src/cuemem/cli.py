@@ -56,6 +56,7 @@ from cuemem.config import (
     extra_remedy,
     load_settings,
 )
+from cuemem.core.timeutil import valid_period
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import atomic_write_text, mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
@@ -1328,7 +1329,12 @@ def inspect_facts(
     subject: Annotated[str | None, typer.Option(help="只看某个主语（实体名）")] = None,
     current: Annotated[bool, typer.Option("--current", help="只看当前有效的事实")] = False,
     valid_at: Annotated[
-        str | None, typer.Option("--valid-at", help="事件时间：那时现实中成立的事实，如 2025-06")
+        str | None,
+        typer.Option(
+            "--valid-at",
+            help="事件时间：那时现实中成立的事实，写成 2025、2025-06 或 2025-06-07；"
+            "一年、一个月指这段时间里任何时候成立过的",
+        ),
     ] = None,
     known_at: Annotated[
         datetime | None,
@@ -1336,6 +1342,14 @@ def inspect_facts(
     ] = None,
 ) -> None:
     """事实时间线：按主语分组、按时间排列，标出被取代的版本。"""
+    if valid_at is not None:
+        try:
+            valid_period(valid_at)
+        except ValueError:
+            raise typer.BadParameter(
+                f"{valid_at!r} 不是 ISO 日期：写成 YYYY、YYYY-MM 或 YYYY-MM-DD",
+                param_hint="--valid-at",
+            ) from None
     with _open_system() as system:
         facts = system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
         if subject:

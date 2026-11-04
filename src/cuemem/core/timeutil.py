@@ -11,10 +11,12 @@ datetime.now() 与 datetime.fromtimestamp() 的缺省值也是本机时间。带
 
 from __future__ import annotations
 
+import calendar
 import re
 from datetime import UTC, date, datetime, time, timedelta
 
 _PARTIAL_DATE = re.compile(r"^(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2}))?)?")
+_VALID_AT = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:[T ].*)?)?)?$")
 
 
 def naive_local(dt: datetime) -> datetime:
@@ -89,3 +91,31 @@ def expiry_instant(value: str) -> datetime:
     if len(value) == 10:
         return datetime.combine(date.fromisoformat(value), time()) + timedelta(days=1)
     return datetime.fromisoformat(value)
+
+
+def valid_period(value: str | date) -> tuple[str, str]:
+    """事实查询的 valid_at（事件时间）→ 它所指的时间段 (起, 止)，两端都是 YYYY-MM-DD、都含在内：
+    '2025' → 全年，'2025-06' → 整个六月，'2025-06-07'（或带时间的写法、date、datetime）→ 那一天。
+    只接受 ISO 写法：以前 '2025-6'、'2025/06/07'、'banana' 都不报错，按字符串比较给出错的结果。
+    报错是英文：调用方是 SDK、/api/v1 与 CLI。"""
+    if isinstance(value, datetime):  # 事件时间按天记，时刻不看
+        value = naive_local(value).date()
+    if isinstance(value, date):
+        return value.isoformat(), value.isoformat()
+    match = _VALID_AT.match(value.strip()) if isinstance(value, str) else None
+    try:
+        if match is None:
+            raise ValueError(value)
+        year, month, dom = match.groups()
+        if dom is not None:
+            one = date(int(year), int(month), int(dom)).isoformat()
+            return one, one
+        if month is not None:
+            first = date(int(year), int(month), 1)
+            last = first.replace(day=calendar.monthrange(first.year, first.month)[1])
+            return first.isoformat(), last.isoformat()
+        return f"{year}-01-01", f"{year}-12-31"
+    except ValueError:
+        raise ValueError(
+            f"Invalid valid_at {value!r}: valid_at must be an ISO date: YYYY, YYYY-MM or YYYY-MM-DD"
+        ) from None
