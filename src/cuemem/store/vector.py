@@ -525,6 +525,15 @@ class _NoCommit:
     def commit(self) -> None:
         pass
 
+    # 较新的 qdrant-client（1.20 起）在 persist 与 delete 里写 `with self.storage:`，用连接自己的
+    # 上下文管理器提交或回滚；特殊方法不经过 __getattr__，要在这里写出来。进入与退出都不提交：
+    # 和 commit 一样留给 _batched 最后提交一次（出错时也提交已经写下的，见 _batched）。
+    def __enter__(self) -> _NoCommit:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._conn, name)
 

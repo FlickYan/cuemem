@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -25,6 +26,7 @@ from cuemem.store import MemoryDB, VectorStore, media
 from cuemem.store import sqlite as sqlite_module
 from cuemem.store.media import MediaStore, image_data_url
 from cuemem.store.sqlite import SCHEMA_VERSION, legacy_idx_key, next_idx_key
+from cuemem.store.vector import _NoCommit
 from cuemem.write import build_rounds, build_turns
 
 
@@ -472,6 +474,25 @@ def test_local_writes_commit_once_per_call_and_persist(tmp_path: Path) -> None:
     reopened.close()
 
 
+def test_the_no_commit_stand_in_also_works_as_a_context_manager(tmp_path: Path) -> None:
+    """qdrant-client 1.20 起在 persist 与 delete 里写 `with self.storage:`（连接自己的上下文管理器
+    提交）：替身也要能这样用，而且进出都不提交，留给 _batched 最后提交一次（CI 的 package 任务装
+    的是不锁版本的 qdrant-client，曾在这里报 TypeError）。"""
+    conn = sqlite3.connect(tmp_path / "x.sqlite")
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    seen: list[str] = []
+    conn.set_trace_callback(lambda sql: seen.append(sql) if sql.upper() == "COMMIT" else None)
+    stand_in = _NoCommit(conn)
+    with stand_in as entered:
+        entered.execute("INSERT INTO t VALUES (1)")
+    stand_in.commit()
+    assert seen == [] and conn.in_transaction
+    conn.commit()
+    assert seen == ["COMMIT"]
+    conn.close()
+
+
 def test_local_writes_fall_back_when_qdrant_internals_differ(tmp_path: Path) -> None:
     """qdrant-client 的内部属性对不上时（这里集合的连接已经被换成别的对象）照旧每个点提交一次，
     写入照常、重新打开之后都在。"""
@@ -486,6 +507,13 @@ def test_local_writes_fall_back_when_qdrant_internals_differ(tmp_path: Path) -> 
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self.conn, name)
+
+        def __enter__(self) -> Any:  # qdrant-client 1.20 起用 `with` 提交
+            self.commits += 1
+            return self.conn.__enter__()
+
+        def __exit__(self, *exc: Any) -> Any:
+            return self.conn.__exit__(*exc)
 
     store = VectorStore(tmp_path / "qdrant", dim=4)
     store.ensure_space("s")
@@ -673,6 +701,9 @@ def test_unreadable_meta_names_the_repair_and_repair_restores_it(tmp_path: Path)
     empty = next(name for name in original["collections"] if name.startswith("space_empty_"))
     assert repaired["collections"].pop(empty)["vectors"]["dense"]["size"] == 99  # 空集合：配置的
     original["collections"].pop(empty)
+    # qdrant-client 1.20 起 meta.json 多一个 text_indexes（本地模式不建索引，总是空的；读的时候
+    # 缺了当作空）：修出来的文件不写它
+    assert original.pop("text_indexes", {}) == {}
     assert repaired == original
     meta.write_text("", "utf-8")
     repair_local_meta(path, text_dim=4, image_dim=2)

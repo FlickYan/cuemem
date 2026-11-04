@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -326,7 +327,8 @@ def test_consolidate_inspect_and_forget(
     assert result.exit_code == 0, result.output
     # 第五轮体检 P8：不是 ISO 的日期以前按字符串比较，给出错的结果而不报错
     result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--valid-at", "2025/06"])
-    assert result.exit_code == 2 and "--valid-at" in result.output
+    # CI 里 rich 给错误框上色，参数名会被颜色码拆开：去掉颜色码再找
+    assert result.exit_code == 2 and "--valid-at" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
 
     result = runner.invoke(app, ["inspect", "entities", "--space", "demo"])
     assert result.exit_code == 0 and "Max" in result.output
