@@ -54,7 +54,7 @@ from fastapi.exception_handlers import (
     request_validation_exception_handler,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.routing import APIRoute
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
@@ -86,6 +86,7 @@ _CODES = {
     502: "upstream_error",
     503: "unavailable",
     504: "timeout",
+    500: "internal_error",
 }
 
 
@@ -500,6 +501,20 @@ class SpaceRow(_Out):
 V1Json = Annotated[dict[str, Any], WithJsonSchema({})]
 V1JsonList = Annotated[list[dict[str, Any]], WithJsonSchema({})]
 _BINARY = {"type": "string", "format": "binary"}  # GET /api/v1/media/{id}：图片文件本身
+# 它的 Content-Type（_image_type）：媒体库收的格式（ACCEPTED_FORMATS）在 PIL 的 Image.MIME 里的
+# 类型，加上手机拍的 MPO（JPEG 的解码器认出来的格式是 MPO）与认不出时的通用二进制。写成具体的
+# 类型：以前写的是 image/*，openapi-python-client 不认、生成的客户端里没有这个响应。直接列出来，
+# 不在导入时调用 Image.init()（加载 PIL 的全部插件）；测试核对它与 PIL 的一致
+_MEDIA_TYPES = (
+    "application/octet-stream",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/mpo",
+    "image/png",
+    "image/tiff",
+    "image/webp",
+)
 
 _ERRORS = {
     400: "Invalid request (the SDK raised ValueError or TypeError).",
@@ -514,6 +529,7 @@ _ERRORS = {
     502: "The model or embedding provider failed.",
     503: "The model provider is temporarily unavailable; see Retry-After.",
     504: "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+    500: "Unexpected server error (a bug); the traceback is in the server log.",
 }
 
 
@@ -627,6 +643,9 @@ def memories_router(
         responses={
             status: {"model": V1ErrorBody, "description": text} for status, text in _ERRORS.items()
         },
+        # operationId 是 SDK 的方法名（add、get_all……）：按规范生成的客户端里方法名与 MemoryClient
+        # 相同。以前是 FastAPI 的缺省（add_api_v1_memories_post）。别的路由照旧（带路径，不会重名）
+        generate_unique_id_function=lambda route: route.name,
     )
 
     def allow(
@@ -764,7 +783,7 @@ def memories_router(
     @router.get(
         "/media/{media_id}",
         response_class=Response,
-        responses={200: {"content": {"image/*": {"schema": _BINARY}}}},
+        responses={200: {"content": {mime: {"schema": _BINARY} for mime in _MEDIA_TYPES}}},
         description="The original file of an image memory (the path in image items is on the "
         "server). Out-of-scope, non-image and unknown ids are 404.",
     )
@@ -915,8 +934,9 @@ def memories_router(
 
 
 def install_error_format(app: FastAPI) -> None:
-    """/api/v1 下的出错（包括 401、422、找不到接口）都写成 {"error": {"code", "type", "message"}}；
-    别的路径照 FastAPI 的默认（{"detail": …}）。"""
+    """/api/v1 下的出错（包括 401、422、找不到接口、没有处理的异常的 500）都写成
+    {"error": {"code", "type", "message"}}；别的路径照 FastAPI 的默认（{"detail": …}，500 是
+    text/plain）。"""
 
     async def http_error(request: Request, exc: Exception) -> Response:
         assert isinstance(exc, StarletteHTTPException)
@@ -941,8 +961,19 @@ def install_error_format(app: FastAPI) -> None:
         )
         return _error(422, f"Invalid request: {problems}", "ValueError")
 
+    async def server_error(request: Request, exc: Exception) -> Response:
+        # 没有处理的异常（程序错误）：/api/v1 下也是 {"error": …}，以前是 text/plain 的
+        # "Internal Server Error"。type 是 None：写异常的类名的话，MemoryClient 会把服务端的
+        # KeyError、ValueError 还原成同名的异常，看着像 404、400。消息里不带异常的内容（可能有
+        # 别人的记忆）。不在这里记日志：Starlette 的 ServerErrorMiddleware 送出这个响应之后照样
+        # 把异常抛出去，uvicorn 记下完整的 traceback
+        if not _v1(request):
+            return PlainTextResponse("Internal Server Error", status_code=500)  # 别的路径不变
+        return _error(500, "Internal server error", None)
+
     app.add_exception_handler(StarletteHTTPException, http_error)
     app.add_exception_handler(RequestValidationError, validation_error)
+    app.add_exception_handler(Exception, server_error)
 
 
 def _v1(request: Request) -> bool:

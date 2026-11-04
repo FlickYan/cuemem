@@ -61,6 +61,7 @@ from cuemem.errors import (
 )
 from cuemem.evidence import RAISED_REASON
 from cuemem.memory import MemorySystem
+from cuemem.store.media import ACCEPTED_FORMATS
 
 Mem = Memory | MemoryClient
 
@@ -99,7 +100,18 @@ def v1_app(system: MemorySystem, keys: Keys | None = None) -> FastAPI:
 
 # /api/v1 的接口（路由的元数据与包住的 Memory 无关）：按它们找响应在 OpenAPI 里写的模型
 V1_ROUTES = [r for r in memories_router(cast(Memory, None)).routes if isinstance(r, APIRoute)]
-V1_ERRORS = (400, 401, 402, 403, 404, 409, 413, 422, 429, 502, 503, 504)
+V1_ERRORS = (400, 401, 402, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504)
+# GET /api/v1/media/{id} 的 Content-Type：写死在这里，PIL 升级改了类型时快照不会悄悄跟着变
+MEDIA_TYPES = [
+    "application/octet-stream",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/mpo",
+    "image/png",
+    "image/tiff",
+    "image/webp",
+]
 
 
 def _undocumented(value: Any, where: str = "") -> list[str]:
@@ -1260,22 +1272,74 @@ def test_cuemem_serve_mounts_the_v1_api_behind_the_token(
 
 
 def test_the_openapi_documents_every_v1_response() -> None:
-    """/openapi.json 里 /api/v1 的每个接口：200 指向写明形状的模型（图片的原文件是 image/*），每个
-    出错的状态码都是 V1ErrorBody（422 也是）。以前 200 只写着"任意对象"，422 写的是 FastAPI 的
-    HTTPValidationError（实际不会出现），别的出错一个都没写。"""
+    """/openapi.json 里 /api/v1 的每个接口：200 指向写明形状的模型（图片的原文件是具体的图片类型
+    与 application/octet-stream），每个出错的状态码都是 V1ErrorBody（422、500 也是），operationId
+    是 SDK 的方法名。以前 200 只写着"任意对象"，422 写的是 FastAPI 的 HTTPValidationError（实际
+    不会出现），别的出错一个都没写；operationId 是 FastAPI 的缺省（add_api_v1_memories_post），
+    图片写的 image/* 生成客户端时被丢掉。"""
     spec = openapi_v1()
     operations = [(p, m, op) for p, ops in spec["paths"].items() for m, op in ops.items()]
     assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 20
+    ids = [op["operationId"] for _, _, op in operations]
+    assert len(set(ids)) == len(ids) and set(ids) == {r.name for r in V1_ROUTES}
+    assert set(ids) <= _methods(MemoryClient)
     for path, method, op in operations:
         for status in V1_ERRORS:
             schema = op["responses"][str(status)]["content"]["application/json"]["schema"]
             assert schema == {"$ref": "#/components/schemas/V1ErrorBody"}, (path, method, status)
         ok = op["responses"]["200"]["content"]
         if path == f"{PREFIX}/media/{{media_id}}":
-            assert list(ok) == ["image/*"]
+            assert list(ok) == MEDIA_TYPES and "application/octet-stream" in ok
         else:
             assert "#/components/schemas/" in json.dumps(ok["application/json"]["schema"]), path
     assert "HTTPValidationError" not in json.dumps(spec)
+
+
+def test_the_media_types_match_pil() -> None:
+    """图片接口写的 Content-Type 就是 _image_type 可能返回的：媒体库收的格式与 MPO 在 PIL 里的
+    类型，加上认不出时的 application/octet-stream。"""
+    Image.init()
+    expected = {Image.MIME[f] for f in (*ACCEPTED_FORMATS, "MPO")} | {"application/octet-stream"}
+    assert sorted(expected) == MEDIA_TYPES
+
+
+def test_unexpected_errors_keep_the_v1_shape(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/api/v1 下没有处理的异常（程序错误）：500 也是 {"error": …}，code internal_error，type 是
+    None（MemoryClient 不把它还原成 RuntimeError、KeyError 之类），消息里不带异常的内容。以前是
+    text/plain 的 "Internal Server Error"。别的路径照旧是 text/plain。"""
+
+    def broken(self: Memory) -> list[dict[str, Any]]:
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr(Memory, "spaces", broken)
+    app = v1_app(system)
+
+    @app.get("/elsewhere")
+    def elsewhere() -> None:
+        raise RuntimeError("secret")
+
+    with TestClient(app, raise_server_exceptions=False) as http:
+        response = http.get("/api/v1/spaces")
+        assert response.status_code == 500
+        assert response.headers["content-type"] == "application/json"
+        assert response.json()["error"] == {
+            "code": "internal_error",
+            "type": None,
+            "message": "Internal server error",
+        }
+        assert "secret" not in response.text
+        with pytest.raises(MemoryAPIError) as raised:
+            MemoryClient("http://testserver", http_client=http).spaces()
+        assert (raised.value.status, raised.value.code, raised.value.type) == (
+            500,
+            "internal_error",
+            None,
+        )
+        other = http.get("/elsewhere")
+        assert other.status_code == 500 and other.headers["content-type"].startswith("text/plain")
+        assert other.text == "Internal Server Error"
 
 
 def test_the_openapi_snapshot_is_current(
