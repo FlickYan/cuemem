@@ -250,7 +250,9 @@ class ChatService:
         return self.system.db.list_spaces()
 
     def profile(self, space_id: str) -> str:
-        core = self.system.core_memory(space_id)
+        """画像（MCP 的 profile、GET /api/profile 与界面的画像栏）：去掉已经过期的事实，同 SDK
+        的 profile() 与 recall 里的画像。"""
+        core = self.system.visible_core(space_id, self.system.core_memory(space_id), datetime.now())
         return core.text if core is not None else ""
 
     def facts(self, space_id: str, *, current_only: bool = False) -> list[dict[str, Any]]:

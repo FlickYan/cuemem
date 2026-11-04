@@ -1042,6 +1042,7 @@ def test_mem0_reserved_filters(memory: Memory) -> None:
         "Where do I live?", user_id="alice", mode="l1", filters={"categories": "*"}
     )
     assert {r["type"] for r in only["results"]} == {"fact"}
+
     # categories 是列表：eq、ne、in、nin 逐项对（以前 in 一条都不给，nin、ne 留下要排除的那条）
     def ids(where: dict[str, Any]) -> list[str]:
         return [f["id"] for f in memory.get_all(user_id="alice", filters=where)["results"]]
@@ -1225,6 +1226,36 @@ def test_recall_for_other_agents_drops_expired_memories(memory: Memory) -> None:
         listing = recall_listing(memory.system, "u", question, mode=mode, at_least_l1=True)  # type: ignore[arg-type]
         assert "Berlin" not in json.dumps(listing) and "jazz" in json.dumps(listing), mode
         assert listing["facts"] and "jazz" in listing["profile"], mode
+
+
+def test_served_profile_and_chat_drop_expired_memories(
+    memory: Memory, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """第五轮复审：MCP 的 profile 工具、GET /api/spaces/{space}/profile（界面的画像栏）与
+    cuemem serve 的对话（画像与召回）以前都读原样的核心记忆，同一个 MCP Server 上 recall
+    不给的过期住址 profile 照样给。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.agent import Agent
+    from cuemem.api.app import create_app
+    from cuemem.api.mcp import build_server
+    from cuemem.api.service import ChatService
+
+    _expired_berlin(memory)
+    agent = Agent(memory.system, router="rule")
+    service = ChatService(memory.system, agent)
+    assert service.profile("u") == "- I like jazz"
+    result = asyncio.run(build_server(service, "u").call_tool("profile", {}))
+    assert "".join(getattr(c, "text", "") for c in result.content) == "- I like jazz"
+    app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
+    with TestClient(app) as http:
+        assert http.get("/api/spaces/u/profile").json() == {"text": "- I like jazz"}
+    session = agent.start("u")
+    assert [text for _, _, text in session.profile] == ["I like jazz"]
+    before = len(fake_api.chat_requests)
+    agent.chat(session, "Where do I live? Do I like jazz?", mode="l1")
+    sent = json.dumps(fake_api.chat_requests[before:], ensure_ascii=False)
+    assert "Berlin" not in sent and "jazz" in sent
 
 
 def test_a_restated_memory_without_expiry_stays(memory: Memory, model: ScriptedModel) -> None:
