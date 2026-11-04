@@ -1915,7 +1915,7 @@
      - **评测**：只改了测试与 pytest 的配置。
 - **备选与取舍**：
   - **把 `max_completion_tokens` 改名为 `max_tokens`**（P5），给用 `max_tokens` 的模型，与 `_adapt` 反方向的做法一样：稍微干净一点，但改动调用方的请求体更多；现在两个名字都压到上限以内。
-  - **升到 qdrant-client 1.20**（P10 的 B 部分），它经临时文件写 `meta.json`：1.20 的 `local_collection.py` 改了约 836 行 diff，包括新的同分排序，而本地模式里同分的顺序影响检索，回答的提示词与 N2–N12 的缓存键都可能变。要先做 D-070 那样逐位的检索比对；留到以后。
+  - **升到 qdrant-client 1.20**（P10 的 B 部分），它经临时文件写 `meta.json`：1.20 的 `local_collection.py` 改了约 836 行 diff，包括新的同分排序，而本地模式里同分的顺序影响检索，回答的提示词与 N2–N12 的缓存键都可能变。要先做 D-070 那样逐位的检索比对；留到以后。要注意，钉住 1.19.1 的只有 `uv.lock`（`uv sync --locked`、Docker 镜像、CI 的 test 任务与评测重放）：`pyproject.toml` 只写了 `qdrant-client>=1.19.1`，从 GitHub 用 pip 安装已经装上 1.20。CI 的 package 任务就是这样装 wheel 的，第五轮第一次推送时它查出 P15 的提交替身不支持 1.20 用来提交的 `with` 写法；已经修好（`_NoCommit.__enter__`/`__exit__`，都不提交），向量库、掩码、重建索引、遗忘、导入导出与 SDK 的测试在 qdrant-client 1.20.0 下都通过。发表的数字按锁定的 1.19.1 重放，不受影响。
   - **一个 `cuemem backup` 命令**（P21）：安全的复制是每个数据库一次 SQLite 的 `.backup`（或者停掉之后复制整个数据目录），恢复之后反正要跑 `cuemem doctor --vectors` 与 `cuemem reindex`；改为写明做法。
   - **体检时 kind 过滤的原型**（P9）：它在 qdrant-client 的类上打补丁，对 kind 是列表的点与上游的匹配不同；**每个集合缓存一个 NumPy 的 kind 数组**会更快，但每次 upsert、delete、set_payload 都要让它失效。
   - **改本地向量库的 `journal_mode` 或打开 WAL**（P15）：改定的修法排除了它，让 qdrant-client 在磁盘上的设置保持原样；把一次调用的提交合成一次不用改设置。
