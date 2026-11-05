@@ -1255,6 +1255,36 @@ def test_ui_login_refuses_cross_origin_posts(service: ChatService, tmp_path: Pat
         assert client.get("/logout", follow_redirects=False).status_code != 403
 
 
+def test_ui_config_refuses_cross_origin_reads(service: ChatService, tmp_path: Path) -> None:
+    """界面的 /config 带着登录的密钥名：HTTPS 下 cookie 是 SameSite=None，以前别的网站的网页
+    带凭据读得到。现在同 /login 一样只接受同源与不带 Origin 的请求。/logout 是 GET、查 Origin
+    拦不住，浏览器标明 Sec-Fetch-Site: cross-site 时拒绝。"""
+    token = "mallory-token-0123456789"
+    keys = Keys.parse(f"keys: [{{name: mallory, token: {token}, scopes: [{{user: mallory}}]}}]")
+    app_ = create_app(service, upload_dir=tmp_path / "uploads", ui=True, keys=keys)
+    host = "mem.example.com"
+    with TestClient(app_, base_url=f"https://{host}") as client:
+        login = client.post("/login", data={"username": "mallory", "password": token})
+        assert login.status_code == 200 and client.cookies
+        for path in ("/config", "/config/", "/config?deep_link=x"):
+            refused = client.get(path, headers={"Origin": "https://evil.example"})
+            assert refused.status_code == 403, path
+            assert "mallory" not in refused.text
+            assert "access-control-allow-origin" not in refused.headers
+        for headers in ({"Origin": f"https://{host}"}, {}):
+            shown = client.get("/config", headers=headers)
+            assert shown.status_code == 200 and shown.json()["username"] == "mallory"
+        cross = {"Sec-Fetch-Site": "cross-site"}
+        for path in ("/logout", "/logout/"):
+            assert client.get(path, headers=cross, follow_redirects=False).status_code == 403
+        assert client.get("/config").json()["username"] == "mallory"  # 还登录着
+        same = client.get(
+            "/logout", headers={"Sec-Fetch-Site": "same-origin"}, follow_redirects=False
+        )
+        assert same.status_code == 302
+        assert client.get("/config").json().get("username") != "mallory"
+
+
 def test_http_api_trusted_hosts(service: ChatService, tmp_path: Path) -> None:
     """allowed_hosts（cuemem serve 监听本机地址时）：接口与界面都只接受这些 Host，
     防 DNS 重绑定。"""

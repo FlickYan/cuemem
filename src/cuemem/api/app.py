@@ -95,9 +95,18 @@ class SameOriginOnly:
 
     /login（第四轮体检）是 Gradio 在 /gradio_api 之外唯一改状态的接口：以前别的网站的网页自动提交
     一个表单，就能让访问者用攻击者（另一个租户）的令牌登录，之后访问者在界面里说的话都写进攻击者
-    的空间。按前缀匹配，也管 /login/；/logout 不在里面。"""
+    的空间。按前缀匹配，也管 /login/。
 
-    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp", "/login")
+    /config（第六轮体检）带着登录的密钥名：HTTPS 下登录 cookie 是 SameSite=None，Gradio 又允许带
+    凭据的跨域请求，别的网站的网页以前能读出访问者用哪个密钥登录。按前缀匹配，也管 /config/ 与
+    带查询参数的。
+
+    /logout 不按 Origin 判断：它是 GET，<img> 与页面跳转不带 Origin 头，查了也拦不住。浏览器带着
+    Sec-Fetch-Site: cross-site 时拒绝（别的网站的网页把访问者登出）；不带这个头的（旧浏览器、
+    curl）照常，hosts 里有 "*"（允许任何来源）时也照常。"""
+
+    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp", "/login", "/config")
+    LOGOUT = ("/logout", "/logout/")
 
     def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
         self.app = app
@@ -115,6 +124,15 @@ class SameOriginOnly:
                 )
                 await response(scope, receive, send)
                 return
+        if (
+            scope["type"] == "http"
+            and scope["path"] in self.LOGOUT
+            and "*" not in self.hosts
+            and Headers(scope=scope).get("sec-fetch-site") == "cross-site"
+        ):
+            response = JSONResponse({"detail": "不接受别的网站发来的浏览器请求"}, 403)
+            await response(scope, receive, send)
+            return
         await self.app(scope, receive, send)
 
     def _allowed(self, origin: str, host: str) -> bool:
