@@ -397,6 +397,15 @@ def test_accented_names_are_different_people(settings: Settings, fake_api: FakeA
     res._link(state, "z", ExtractedEntity(name="ZOË", type="person"), when, report)
     assert state.entities["z"].aliases == ["Zo"]
 
+    # 用户叫 'Müller'，另一个人 'Möller' 占着原来的键 'm ller'：照样记成用户的名字（第六轮
+    # 复审）。按原来的键查时以为是 Möller 的名字，悄悄不记
+    state, report = EntityState("s"), ResolutionReport()
+    res.ensure_people(state, ["Möller"], when, report)
+    res.name_user(state, "Müller", when, report)
+    uid = user_entity_id("s")
+    assert state.lookup("Müller") == uid and state.lookup("Möller") not in (None, uid)
+    assert "Müller" in state.entities[uid].aliases
+
 
 def test_reconcile_cost_is_not_quadratic(
     settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
