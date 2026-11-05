@@ -14,6 +14,8 @@
     GET    /api/v1/media/{id}                media（图片的原文件）
     POST   /api/v1/reset                     reset
     GET    /api/v1/status                    status（抽取的状态：待处理、失败的会话与原因）
+    POST   /api/v1/context                   context（放进提示词的 <memory> 证据块，与记忆代理
+                                             注入的相同；不调用模型）
     以及 answer、profile、runs（open_run）、runs/end（end_run）、consolidate、wait、export、
     import（load）、spaces。
 
@@ -146,6 +148,18 @@ class SearchRequest(BaseModel):
     top_k: int | None = None
     min_level: MinLevel = "l1"
     show_expired: bool = False
+
+
+class ContextRequest(BaseModel):
+    query: str
+    user_id: str | None = None
+    agent_id: str | None = None
+    at: datetime | None = None
+    mode: SearchMode = "auto"
+    router: Router = "learned"
+    lam: Lam = None
+    min_level: MinLevel = "l1"
+    wrap: bool = Field(True, description="Wrap the block in <memory>...</memory>")
 
 
 class AnswerRequest(BaseModel):
@@ -336,6 +350,20 @@ class SearchResult(_Out):
     level: Literal["L0", "L1", "L2"]
     see: bool
     reasons: list[str]
+
+
+class ContextResult(_Out):
+    """POST /context: the evidence block the memory proxy injects, ready for a prompt."""
+
+    context: str = Field(
+        description="The <memory> block (empty when there is nothing to add); without the "
+        "<memory> tags when wrap is false"
+    )
+    level: Literal["L0", "L1", "L2"]
+    reasons: list[str]
+    recalled: int = Field(description="Items in the block; the profile counts as one")
+    see: bool
+    refs: dict[str, str] = Field(description="Label in the block -> memory id (see GET)")
 
 
 class GetAllResult(_Out):
@@ -729,6 +757,22 @@ def memories_router(
                 top_k=request.top_k,
                 min_level=request.min_level,
                 show_expired=request.show_expired,
+            )
+
+    @router.post("/context", responses=_ok(ContextResult))
+    def context(http: Request, request: ContextRequest) -> V1Json:
+        with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
+            return memory.context(
+                request.query,
+                user_id=request.user_id,
+                agent_id=request.agent_id,
+                at=request.at,
+                mode=request.mode,
+                router=request.router,
+                lam=request.lam,
+                min_level=request.min_level,
+                wrap=request.wrap,
             )
 
     @router.get("/memories", responses=_ok(GetAllResult))

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -56,6 +56,8 @@ class Evidence:
     block: str
     see: bool = False  # 控制器想看原图（证据块只有描述，原图由调用方决定要不要附上）
     recall: Recall | None = None
+    # 证据块里的编号 → 记忆 ID（事实或对话片段，Memory.get 认得）；不影响 block 的文字
+    refs: dict[str, str] = field(default_factory=dict)
 
 
 def recall_evidence(
@@ -85,6 +87,51 @@ def recall_evidence(
     return evidence_from(recall, query, now)
 
 
+def context_evidence(
+    system: MemorySystem,
+    space: str,
+    query: str,
+    *,
+    at: datetime | None = None,
+    mode: RecallMode = "auto",
+    router: Router = "learned",
+    lam: float | None = None,
+    min_level: str = "l1",
+) -> Evidence:
+    """Memory.context 与 POST /api/v1/context 用的证据块（第六轮体检 P17）：与记忆代理注入的
+    同一段文字（evidence_from），只是控制器选了 L0、而 mode="auto" 且 min_level="l1" 时改走
+    L1，与 search、recall_listing 的 at_least_l1 相同：调用方已经决定要查记忆。改走 L1 时直接
+    打包探针打过分的候选（同一个问题时间），两次检索在同一次 reading 里（遗忘不能插在中间）。
+    min_level="l0" 时照控制器的决定，与 recall_evidence（记忆代理）逐字相同。过期的记忆不给。
+
+    不改 recall_evidence 与 inject_evidence：记忆代理与各框架集成的请求逐字不变。"""
+    now = naive_local(at) if at is not None else datetime.now()
+    with system.reading(space):
+        recall = system.retrieve(
+            space,
+            query,
+            question_time=now,
+            mode=mode,
+            router=router,
+            lam=lam,
+            hide_expired=True,
+        )
+        raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
+        if raised:
+            recall = system.retrieve(
+                space,
+                query,
+                question_time=now,
+                mode="l1",
+                candidates=recall.candidates,
+                hide_expired=True,
+            )
+        evidence = evidence_from(recall, query, now)
+    if raised:
+        evidence.reasons = [RAISED_REASON]
+    return evidence
+
+
 def evidence_from(recall: Recall, query: str, now: datetime) -> Evidence:
     view = recall.view
     if recall.level == "l0":  # 不需要回忆：只给画像（没有画像就什么都不加）
@@ -102,6 +149,7 @@ def evidence_from(recall: Recall, query: str, now: datetime) -> Evidence:
         block="\n\n".join([MEMORY_NOTE, *map(quote_memory, blocks)]) if blocks else "",
         see=bool(decision and decision.see),
         recall=recall,
+        refs=dict(refs),
     )
 
 

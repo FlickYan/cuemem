@@ -265,6 +265,33 @@ class MemoryClient:
         }
         return self._call("POST", "/memories/search", body=body)
 
+    def context(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        at: datetime | None = None,
+        mode: SearchMode = "auto",
+        router: Router = "learned",
+        lam: float | None = None,
+        min_level: Literal["l0", "l1"] = "l1",
+        wrap: bool = True,
+    ) -> dict[str, Any]:
+        """放进提示词的记忆（见 Memory.context）。"""
+        body = {
+            "query": query,
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "at": _iso(at),
+            "mode": mode,
+            "router": router,
+            "lam": lam,
+            "min_level": min_level,
+            "wrap": wrap,
+        }
+        return self._call("POST", "/context", body=body)
+
     def answer(
         self,
         question: str,

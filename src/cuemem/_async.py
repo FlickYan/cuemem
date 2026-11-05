@@ -171,6 +171,33 @@ class AsyncMethods:
             show_expired=show_expired,
         )
 
+    async def context(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        at: datetime | None = None,
+        mode: SearchMode = "auto",
+        router: Router = "learned",
+        lam: float | None = None,
+        min_level: Literal["l0", "l1"] = "l1",
+        wrap: bool = True,
+    ) -> dict[str, Any]:
+        """见 Memory.context。"""
+        return await asyncio.to_thread(
+            self.sync.context,
+            query,
+            user_id=user_id,
+            agent_id=agent_id,
+            at=at,
+            mode=mode,
+            router=router,
+            lam=lam,
+            min_level=min_level,
+            wrap=wrap,
+        )
+
     async def answer(
         self,
         question: str,
