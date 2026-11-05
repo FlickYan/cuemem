@@ -42,7 +42,7 @@ from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store import MemoryDB
 from cuemem.write import consolidate as consolidate_module
-from cuemem.write.consolidate import MAX_ATTEMPTS
+from cuemem.write.consolidate import MAX_ATTEMPTS, REBUILD_PENDING
 from cuemem.write.extract import PIPELINE_VERSION, session_content_hash
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
@@ -986,6 +986,70 @@ def test_a_worker_run_without_jobs_finishes_an_interrupted_rebuild(
         assert not system.consolidator.stale("u")
         assert statements(memory) == ["I live in Paris"]
         assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def _interrupt_rebuild(system: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """consolidate(rebuild=True) 在重新登记时出错：标记 REBUILD_PENDING 留在库里。"""
+    requeue = system.consolidator.requeue
+
+    def locked(space: str, before: Any, skip: Any) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(system.consolidator, "requeue", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        system.consolidate("u", rebuild=True)
+    monkeypatch.setattr(system.consolidator, "requeue", requeue)
+    assert system.db.get_meta("consolidation:u") == REBUILD_PENDING
+
+
+def test_a_resumed_rebuild_drops_the_marker_once_it_commits(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """接着做的重建一提交，标记就删了（第六轮复审）：之后的重放途中进程被杀，下一次不会从头
+    再重建一遍。以前事务里把标记原样写回，要等 _run 做完整个空间才换掉。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        _interrupt_rebuild(system, monkeypatch)
+        replay = system.consolidator._replay_regrown
+
+        def killed(space: str) -> None:
+            raise KeyboardInterrupt  # 进程在接着做的重建提交之后被杀
+
+        monkeypatch.setattr(system.consolidator, "_replay_regrown", killed)
+        with pytest.raises(KeyboardInterrupt):
+            system.consolidator.run("u")
+        assert system.db.get_meta("consolidation:u") != REBUILD_PENDING
+        assert system.db.get_jobs("u", status="pending")  # 剩下的事在任务里
+        monkeypatch.setattr(system.consolidator, "_replay_regrown", replay)
+        system.consolidator.run("u")
+        assert not system.consolidator.stale("u")
+        assert statements(memory) == ["I live in Paris"]
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def test_consolidate_after_an_interrupted_rebuild_rebuilds_once(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """中断之后的 consolidate() 只重建一次（第六轮复审）：以前 stale() 重建一次、写回标记，
+    run 看见标记又重建一次。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        _interrupt_rebuild(system, monkeypatch)
+        rebuild, calls = system.consolidator.rebuild, []
+
+        def counted(space: str, *, replay: bool = False) -> None:
+            calls.append(replay)
+            rebuild(space, replay=replay)
+
+        monkeypatch.setattr(system.consolidator, "rebuild", counted)
+        system.consolidate("u")
+        assert calls == [False]
+        assert not system.consolidator.stale("u")
+        assert statements(memory) == ["I live in Paris"]
 
 
 def said(

@@ -304,9 +304,16 @@ class Consolidator:
         后台线程、重启与下一次巩固都不会补，检索悄悄找不到这些事实。现在留下的指纹让 stale()
         为真，下一次 consolidate 或 add(wait=True) 把重建再做一遍，后台线程的下一次 run 也会
         （见 run；也可以 cuemem reindex 按数据库补齐向量）。会话又长了时的重放不需要：那对任务
-        留着，后台线程会再做一遍。"""
+        留着，后台线程会再做一遍。
+
+        原来的指纹就是这个标记（接着做之前没做完的重建）时，事务里把它删掉、不写回（第六轮
+        复审）：清空与重新登记一提交，剩下的事都在任务里，_run 做完时写这次的指纹。以前写回
+        标记：重放途中进程再被杀，下一次又整个重建一遍、已经重放的会话白做；consolidate() 在
+        中断之后也会重建两次（stale() 一次，run 看见标记又一次）。"""
         key = f"consolidation:{space_id}"
         recorded = None if replay else self.db.get_meta(key)
+        if recorded == REBUILD_PENDING:
+            recorded = None
         if not replay:
             self.db.set_meta(key, REBUILD_PENDING)
         derived = self.db.derived_unit_ids(space_id)
@@ -393,7 +400,8 @@ class Consolidator:
 
         之前的清空重建没做完（指纹是 REBUILD_PENDING，见 rebuild）时先把它做完（第六轮体检）：
         以前后台线程这里不看，_run 最后照样写这次的指纹，标记被抹掉，派生记忆的向量从此缺着。
-        只看这个标记、不看 stale()：配置或版本变了时的重建照旧留给显式的 consolidate。"""
+        只看这个标记、不看 stale()：配置或版本变了时的重建照旧留给显式的 consolidate。接着做的
+        重建一提交，标记就删了（见 rebuild）：之后被杀不会再从头重建。"""
         with self._lock_for(space_id):
             if self.db.get_meta(f"consolidation:{space_id}") == REBUILD_PENDING:
                 record_event("consolidate_resume_rebuild")
