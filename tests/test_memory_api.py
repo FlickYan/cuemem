@@ -420,6 +420,20 @@ def test_valid_at_takes_a_year_month_or_day(mem: Mem) -> None:
             then(bad)
 
 
+def test_valid_at_before_a_correction_finds_the_corrected_value(mem: Mem) -> None:
+    """第六轮体检 P5：更正（update()）指旧值从未成立。以前更正版从更正那天算起，查 Berlin 说出
+    的那天、那个月什么都查不到（Berlin 被更正，Hamburg 还没开始）。"""
+    first = mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    mem.update(first["results"][0]["id"], "I live in Hamburg")
+
+    def then(valid_at: str | date) -> list[str]:
+        return [f["memory"] for f in mem.get_all(user_id="alice", valid_at=valid_at)["results"]]
+
+    hamburg = ["The user lives in Hamburg."]
+    assert then("2026-08") == then(AUG.date()) == hamburg
+    assert then("2025") == []
+
+
 def test_a_malformed_valid_at_is_a_400(system: MemorySystem) -> None:
     with TestClient(v1_app(system)) as http:
         response = http.get("/api/v1/memories", params={"user_id": "a", "valid_at": "banana"})

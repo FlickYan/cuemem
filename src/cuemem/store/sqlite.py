@@ -201,6 +201,26 @@ _FACT_COLUMNS = (
     " negated, valid_from, valid_to, recorded_at, invalidated_at, superseded_by,"
     " supersede_reason, importance, entity_ids, session_id, source_turn_ids"
 )
+# 按事件时间查事实（get_facts 的 valid_period）时，没有自己起点的更正版的起点。更正指旧值从未
+# 成立（见 write/reconcile.py），新值从旧值的起点起就成立；以前从更正那天算起，查更正之前的
+# 日期新旧两版都查不到。corrected_chain(id, anc)：anc 是 id 沿"被更正"一路往前的各版（只经过
+# 没有自己起点的版本）；起点取链上到头的那些版（自己有起点，或不再更正过别的）里最早的。
+# 参数：space_id 一个，放在整句最前
+_CORRECTED_CHAIN = (
+    "WITH RECURSIVE corrected_chain(id, anc) AS ("
+    "SELECT p.superseded_by, p.id FROM facts p JOIN facts f ON f.id = p.superseded_by"
+    " WHERE p.space_id = ? AND p.supersede_reason = 'corrected' AND f.valid_from IS NULL"
+    " UNION SELECT c.id, p.id FROM corrected_chain c JOIN facts a ON a.id = c.anc"
+    " JOIN facts p ON p.space_id = a.space_id AND p.superseded_by = a.id"
+    " AND p.supersede_reason = 'corrected' WHERE a.valid_from IS NULL)"
+)
+_CORRECTED_START = (
+    "(SELECT MIN(COALESCE(a.valid_from, substr(a.recorded_at, 1, 10)))"
+    " FROM corrected_chain c JOIN facts a ON a.id = c.anc WHERE c.id = facts.id"
+    " AND (a.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
+    " WHERE q.space_id = a.space_id AND q.superseded_by = a.id"
+    " AND q.supersede_reason = 'corrected')))"
+)
 _UNIT_COLUMNS = "id, space_id, kind, session_id, text, ts, source_turn_ids, meta"
 _ENTITY_COLUMNS = "id, space_id, name, type, aliases, description, first_seen, last_seen, mentions"
 _MEDIA_COLUMNS = (
@@ -1051,8 +1071,9 @@ class MemoryDB:
 
         - valid_period（事件时间，(起, 止) 两个含在内的 YYYY-MM-DD，见 timeutil.valid_period）：
           "那时现实中什么是成立的"，例如"2025 年 6 月我在哪工作"。给的是一段时间（一年、一个月）
-          时，这段时间里任何时候成立过的都算，先后几个值可能同时出现。不知道起始时间的事实，从它
-          被说出的那天算起；被更正的事实从未成立，不会出现；
+          时，这段时间里任何时候成立过的都算，先后几个值可能同时出现（终点是部分日期时，终点所在
+          的那一年、那个月也算）。不知道起始时间的事实，从它被说出的那天算起；被更正的事实从未
+          成立，不会出现，没有自己起点的更正版沿用它更正的那一版的起点；
         - known_at（记录时间）："系统在那一刻相信什么"，用来回放当时的认知、审计与调试。
         """
         sql = f"SELECT {_FACT_COLUMNS} FROM facts WHERE space_id = ?"
@@ -1079,11 +1100,23 @@ class MemoryDB:
             # '2023-05' <= '2023-05-31'。查询的一端是部分日期时不行（'2023-05-07' <= '2023-05'
             # 不成立），所以查询总是换成完整的日期；只查一天时两端相同，与以前的结果一样
             lo, hi = valid_period
-            sql += (
-                " AND COALESCE(valid_from, substr(recorded_at, 1, 10)) <= ?"
-                " AND (valid_to IS NULL OR ? < valid_to)"
-            )
-            args.extend([hi, lo])
+            # 没有自己起点的更正版，起点沿版本链取它更正的那一版的（见 _CORRECTED_START）
+            sql = f"{_CORRECTED_CHAIN} {sql}"
+            args.insert(0, space_id)
+            sql += f" AND COALESCE(valid_from, {_CORRECTED_START}, substr(recorded_at, 1, 10)) <= ?"
+            args.append(hi)
+            if lo == hi:
+                sql += " AND (valid_to IS NULL OR ? < valid_to)"
+                args.append(lo)
+            else:
+                # 终点常是部分日期（取代时记成新值的起点，'2026'、'2026-06'）：'2026-01-01' <
+                # '2026' 不成立，以前查 2026 年就没有换走的旧值。终点是这段时间开头所在的年、月时
+                # 也算重叠。只能用 =：用 >= 的话旧值在以后每一年、每个月都会出现
+                sql += (
+                    " AND (valid_to IS NULL OR ? < valid_to"
+                    " OR (length(valid_to) < 10 AND substr(?, 1, length(valid_to)) = valid_to))"
+                )
+                args.extend([lo, lo])
             sql += " AND (supersede_reason IS NULL OR supersede_reason != 'corrected')"
         if known_at is not None:
             sql += " AND recorded_at <= ? AND (invalidated_at IS NULL OR ? < invalidated_at)"
