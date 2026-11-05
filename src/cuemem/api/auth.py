@@ -7,7 +7,8 @@
   与不是由 user_id、agent_id 得来的空间（评测、手工起的名字）；
 - 限定作用域的令牌：环境变量 CUEMEM_API_KEYS_FILE 指向的 YAML 文件，或环境变量 CUEMEM_API_KEYS
   里同样内容的 YAML / JSON 文本（只能设一个）。环境变量里的文本启动时读一次；文件在 cuemem
-  serve / proxy 运行期间改了会重新读入（KeyRing，第六轮体检），不用重启：
+  serve / proxy 运行期间改了会重新读入（KeyRing，第六轮体检），不用重启。cuemem keys
+  add|list|revoke 管理这个文件（生成令牌、只存摘要）：
 
     keys:
       - name: alice-app               # 名字：界面登录的用户名
@@ -63,6 +64,7 @@ cuemem serve / proxy 监听非本机地址时拒绝启动（cli._require_token�
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -527,6 +529,136 @@ def _patterns(value: str | list[str] | None, where: str) -> tuple[str, ...] | No
                 f'{where}: {pattern!r} 不行：写一个 ID，"*"（任何 ID），或以 "*" 结尾的前缀'
             )
     return tuple(patterns)
+
+
+# ---------- cuemem keys：改令牌文件（第六轮体检） ----------
+# 按文本改，不用 yaml.safe_dump 重写：文件里的注释与写法留着。改完由调用方用 Keys.parse 核对
+# 结果（cli 的 keys add、keys revoke），对不上时不写
+
+
+def _keys_node(text: str) -> yaml.SequenceNode | None:
+    """顶层 keys: 的列表节点（带行列位置）；不是 YAML、没有这一项时 None。"""
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(root, yaml.MappingNode):
+        return None
+    for key, value in root.value:
+        if isinstance(key, yaml.ScalarNode) and key.value == "keys":
+            return value if isinstance(value, yaml.SequenceNode) else None
+    return None
+
+
+def _yaml_value(values: Sequence[str]) -> str:
+    """一个值（或几个值的列表）的 YAML：JSON 的双引号写法，"*" 与带冒号的 ID 也不会写错。"""
+    items = [json.dumps(v, ensure_ascii=False) for v in values]
+    return items[0] if len(items) == 1 else f"[{', '.join(items)}]"
+
+
+def key_entry(
+    name: str,
+    sha256: str,
+    *,
+    users: Sequence[str] = (),
+    agents: Sequence[str] = (),
+    rate_per_minute: int | None = None,
+    models: Sequence[str] | None = None,
+    max_output_tokens: int | None = None,
+    indent: str = "  ",
+) -> str:
+    """一个限定作用域的令牌的 YAML（块状写法，列表项缩进 indent，以换行结尾）：一项作用域，
+    users、agents 至少给一个（格式见模块说明）。只写摘要，不写令牌本身。"""
+    pad = indent + "  "
+    scope = [f"user: {_yaml_value(users)}"] if users else []
+    scope += [f"agent: {_yaml_value(agents)}"] if agents else []
+    lines = [
+        f"{indent}- name: {_yaml_value([name])}",
+        f'{pad}sha256: "{sha256}"',  # 带引号：全是数字（或像 1e5…）的摘要不加引号会读成数
+        f"{pad}scopes:",
+        f"{pad}  - {scope[0]}",
+        *(f"{pad}    {item}" for item in scope[1:]),
+    ]
+    if rate_per_minute is not None:
+        lines.append(f"{pad}rate_per_minute: {rate_per_minute}")
+    if models is not None:
+        lines.append(f"{pad}models: [{', '.join(_yaml_value([m]) for m in models)}]")
+    if max_output_tokens is not None:
+        lines.append(f"{pad}max_output_tokens: {max_output_tokens}")
+    return "\n".join(lines) + "\n"
+
+
+def append_key(text: str, entry: Callable[[str], str]) -> str | None:
+    """在块状写法的 keys: 列表末尾加上 entry(列表项的缩进) 的文本，返回整个文件的文本。keys: 不是
+    块状写法的列表（keys: [] 或 [{...}] 这样的流式写法）、没有一项时 None：由调用方打印出来让运营者
+    自己贴。keys 是文件里唯一的顶层项（Keys.parse 不收别的），所以文件末尾还在这个列表里。"""
+    node = _keys_node(text)
+    if node is None or node.flow_style or not node.value:
+        return None
+    return (text if text.endswith("\n") else text + "\n") + entry(" " * node.start_mark.column)
+
+
+def _end(node: yaml.Node) -> tuple[int, int | None]:
+    """节点的内容到哪一行（从 0 起）的哪一列为止（None：到行尾）。块状的映射与列表的 end_mark
+    在下一个记号（下一个列表项的 "-"）那里，所以找最后一个值。"""
+    while isinstance(node, yaml.MappingNode | yaml.SequenceNode) and not node.flow_style:
+        if not node.value:
+            break
+        last = node.value[-1]
+        node = last[1] if isinstance(node, yaml.MappingNode) else last
+    mark = node.end_mark
+    return (mark.line - 1, None) if mark.column == 0 else (mark.line, mark.column)
+
+
+def _find(node: yaml.SequenceNode, name: str) -> yaml.MappingNode | None:
+    for item in node.value:
+        if isinstance(item, yaml.MappingNode) and any(
+            isinstance(key, yaml.ScalarNode)
+            and key.value == "name"
+            and isinstance(value, yaml.ScalarNode)
+            and value.value == name
+            for key, value in item.value
+        ):
+            return item
+    return None
+
+
+def key_lines(text: str, name: str) -> tuple[int, int] | None:
+    """名叫 name 的令牌在文件里的行（从 0 起，含两端，不含它后面的注释与空行）；找不到时 None。"""
+    node = _keys_node(text)
+    item = _find(node, name) if node is not None else None
+    if item is None:
+        return None
+    first, lines = item.start_mark.line, text.splitlines()
+    while first > 0 and lines[first - 1].strip() == "-":  # "-" 单独一行的写法：从 "-" 算起
+        first -= 1
+    return first, _end(item)[0]
+
+
+def remove_key(text: str, name: str) -> str | None:
+    """删掉名叫 name 的令牌那几行（key_lines），返回整个文件的文本；它不是自成几行的列表项（与
+    别的内容挤在同一行、"-" 单独一行这样的写法）时 None，由调用方让运营者自己删。删的是最后一个
+    时 keys: 改成 keys: []（keys: 后面什么都没有是 null，Keys.parse 不收）。"""
+    node = _keys_node(text)
+    item = _find(node, name) if node is not None else None
+    if node is None or item is None or node.flow_style:
+        return None
+    lines = text.splitlines(keepends=True)
+    first, (last, column) = item.start_mark.line, _end(item)
+    tail = lines[last][column:] if column is not None else ""
+    if (
+        not lines[first].startswith(" " * node.start_mark.column + "- ")
+        or lines[first][: item.start_mark.column].strip() != "-"
+        or (tail.strip() and not tail.lstrip().startswith("#"))
+    ):
+        return None
+    kept = lines[:first] + lines[last + 1 :]
+    if len(node.value) == 1:  # 删的是最后一个
+        heads = [i for i, line in enumerate(lines[:first]) if line.startswith("keys:")]
+        if len(heads) != 1:
+            return None
+        kept[heads[0]] = "keys: []" + lines[heads[0]][len("keys:") :]
+    return "".join(kept)
 
 
 # ---------- FastAPI ----------

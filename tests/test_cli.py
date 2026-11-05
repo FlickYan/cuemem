@@ -800,6 +800,149 @@ def test_scoped_keys_from_the_environment(
     assert result.exit_code == 1 and "只能设一个" in result.output
 
 
+KEYS_WITH_COMMENTS = """# 运营者写的说明
+keys:
+  # alice 的应用
+  - name: alice-app
+    token: alice-0123456789   # 以后换成摘要
+    scopes:
+      - user: alice
+"""
+
+
+def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cuemem keys add：生成令牌，只把它打到标准输出一次（文件里只有 sha256），文件里原来的注释
+    与写法留着，改完是 0600、Keys.parse 解得出、新的令牌认得出。新建文件也行。"""
+    from cuemem.api.auth import Keys
+
+    path = tmp_path / "keys.yaml"
+    path.write_text(KEYS_WITH_COMMENTS, encoding="utf-8")
+    path.chmod(0o644)
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
+    command = ["keys", "add", "shop", "--user", "*", "--agent", "shop", "--rate-per-minute", "60"]
+    result = runner.invoke(app, [*command, "--models", "qwen3.8-flash", "--max-output-tokens", "9"])
+    assert result.exit_code == 0, result.output
+    token = result.stdout.strip()
+    assert result.stdout == token + "\n" and len(token) >= 40 and token not in result.stderr
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith(KEYS_WITH_COMMENTS) and token not in text
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    assert digest in text and digest not in result.output
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    keys = Keys.parse(text)
+    principal = keys.resolve(token)
+    assert keys.names == ["alice-app", "shop"] and principal is not None
+    assert principal.allows("shop/bob") and not principal.allows("bob")
+    assert (principal.rate_per_minute, principal.models, principal.max_output_tokens) == (
+        60,
+        ("qwen3.8-flash",),
+        9,
+    )
+    again = runner.invoke(app, ["keys", "add", "shop", "--user", "x"])
+    assert again.exit_code == 1 and "已经有" in again.stderr and again.stdout == ""
+    assert path.read_text(encoding="utf-8") == text
+    fresh = tmp_path / "new" / "keys.yaml"
+    result = runner.invoke(app, ["keys", "add", "a", "--agent", "bot", "--file", str(fresh)])
+    assert result.exit_code == 0, result.output
+    agent_key = Keys.parse(fresh.read_text(encoding="utf-8")).resolve(result.stdout.strip())
+    assert agent_key is not None and agent_key.allows("agent/bot")
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
+    assert runner.invoke(app, ["keys", "add", "b", "--file", str(fresh)]).exit_code == 1
+
+
+def test_keys_add_refuses_inline_keys_and_leaves_flow_style_files_alone(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """令牌写在 CUEMEM_API_KEYS 里时 add、revoke 拒绝（改了文件服务也不读）；没有设文件时报错。
+    keys: 是流式写法的文件不改，打印要加的几行（令牌照样只在标准输出）。"""
+    monkeypatch.setenv("CUEMEM_API_KEYS", KEYS_WITH_COMMENTS)
+    for command in (["keys", "add", "x", "--user", "x"], ["keys", "revoke", "alice-app"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1 and "CUEMEM_API_KEYS" in result.stderr
+    monkeypatch.delenv("CUEMEM_API_KEYS")
+    result = runner.invoke(app, ["keys", "add", "x", "--user", "x"])
+    assert result.exit_code == 1 and "CUEMEM_API_KEYS_FILE" in result.stderr
+    flow = "keys: [{name: a, token: aaaaaaaaaaaaaaaaaaaa, scopes: [{user: a}]}]\n"
+    path = tmp_path / "flow.yaml"
+    path.write_text(flow, encoding="utf-8")
+    result = runner.invoke(app, ["keys", "add", "x", "--user", "x", "--file", str(path)])
+    assert result.exit_code == 0 and path.read_text(encoding="utf-8") == flow
+    token = result.stdout.strip()
+    assert "- name: " in result.stderr and token not in result.stderr
+    assert hashlib.sha256(token.encode()).hexdigest() in result.stderr
+
+
+def test_keys_list_and_revoke(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """keys list 只列名字、作用域与限制，不显示令牌与摘要；keys revoke 只删那一项的几行，别的
+    行与注释不动；删到最后一个时写成 keys: []，并提醒运行中的服务不会因此关掉鉴权。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(KEYS_WITH_COMMENTS, encoding="utf-8")
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
+    added = runner.invoke(app, ["keys", "add", "bob-app", "--user", "bob", "--models", "m1"])
+    token = added.stdout.strip()
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    listed = runner.invoke(app, ["keys", "list"])
+    assert listed.exit_code == 0, listed.output
+    flat = _flat(listed.output)
+    assert "alice-app" in flat and "bob-app" in flat and "user=bob" in flat and "m1" in flat
+    assert digest not in flat and token not in flat and "alice-0123456789" not in flat
+    assert digest[:16] not in flat
+
+    missing = runner.invoke(app, ["keys", "revoke", "carol"])
+    assert missing.exit_code == 1 and "carol" in missing.stderr
+    result = runner.invoke(app, ["keys", "revoke", "alice-app"])
+    assert result.exit_code == 0, result.output
+    text = path.read_text(encoding="utf-8")
+    assert "alice" not in text.replace("# alice 的应用", "") and digest in text
+    assert text.startswith("# 运营者写的说明\nkeys:\n  # alice 的应用\n")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    result = runner.invoke(app, ["keys", "revoke", "bob-app"])
+    assert result.exit_code == 0 and "最后一个令牌" in result.stderr
+    assert path.read_text(encoding="utf-8") == "# 运营者写的说明\nkeys: []\n  # alice 的应用\n"
+    # 删不干净的写法：不改文件，说明手工删哪几行
+    odd = "keys:\n  -\n    name: a\n    token: aaaaaaaaaaaaaaaaaaaa\n    scopes: [{user: a}]\n"
+    path.write_text(odd, encoding="utf-8")
+    result = runner.invoke(app, ["keys", "revoke", "a"])
+    assert result.exit_code == 1 and "第2–5行" in _flat(result.stderr)
+    assert path.read_text(encoding="utf-8") == odd
+    inline = "keys:\n  - {name: z, token: zzzzzzzzzzzzzzzzzzzz, scopes: [{user: z}]}\n"
+    monkeypatch.delenv("CUEMEM_API_KEYS_FILE")
+    monkeypatch.setenv("CUEMEM_API_KEYS", inline)
+    listed = runner.invoke(app, ["keys", "list"])
+    assert listed.exit_code == 0 and "z" in listed.output and "zzzz" not in listed.output
+
+
+def test_serve_picks_up_keys_add_and_revoke_without_restart(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """cuemem serve 用会重新读入的令牌（KeyRing）：运行期间 keys add 的令牌马上能用，keys revoke
+    的令牌马上 401，不用重启。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.api import auth
+
+    path = tmp_path / "keys.yaml"
+    path.write_text(KEYS_WITH_COMMENTS, encoding="utf-8")
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
+    assert runner.invoke(app, ["serve", "--no-ui", "--scenario", "plain"]).exit_code == 0
+    client = TestClient(served[-1], base_url="http://127.0.0.1:7860")
+    monkeypatch.setattr(auth, "RELOAD_INTERVAL_S", 0.0)
+
+    def status(token: str) -> int:  # 命令已经退出、记忆系统已关：作用域之外 403，令牌不对 401
+        headers = {"Authorization": f"Bearer {token}"}
+        return client.get("/api/spaces/carol/facts", headers=headers).status_code
+
+    added = runner.invoke(app, ["keys", "add", "bob-app", "--user", "bob"])
+    token = added.stdout.strip()
+    assert status(token) == 403 and status("alice-0123456789") == 403
+    assert runner.invoke(app, ["keys", "revoke", "alice-app"]).exit_code == 0
+    assert status("alice-0123456789") == 401 and status(token) == 403
+
+
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_body_limits_from_the_environment(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
