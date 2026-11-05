@@ -30,6 +30,12 @@ jobs:
       - name: 安装依赖
         # 界面与评测的测试要 ui、eval（开发依赖组里也有）；框架集成的测试与类型检查也要跑（N12）
         run: uv sync --locked --extra ui --extra eval --extra integrations
+      - name: 锁文件在 Intel Mac 上解得出 local（只解析，不下载、不安装）
+        # onnxruntime 1.24 起没有 Intel macOS 的 wheel，pyproject.toml 的 constraint-dependencies
+        # 让那里停在 1.23.2；Dependabot 升级时又丢掉这个平台的话，这里变红
+        run: >-
+          uv sync --locked --dry-run --no-install-project --extra local --python 3.12
+          --python-platform x86_64-apple-darwin
       - name: 代码风格
         run: |
           uv run ruff check .

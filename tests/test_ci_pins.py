@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 from fakes import PROJECT_ROOT
+from packaging.markers import Marker
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
@@ -148,6 +149,64 @@ def test_dependency_audit_reads_hashed_exports_and_is_not_required() -> None:
     ci_jobs = set(_workflow(PROJECT_ROOT / ".github" / "workflows" / "ci.yml")["jobs"])
     assert required == {"test", "package", "docker", "qdrant-server"} <= ci_jobs
     assert "audit" not in required and "audit" not in ci_jobs
+
+
+def _platform(system: str, machine: str, python: str) -> dict[str, str]:
+    return {
+        "sys_platform": system,
+        "platform_system": {"darwin": "Darwin", "linux": "Linux", "win32": "Windows"}[system],
+        "platform_machine": machine,
+        "python_version": python,
+        "python_full_version": f"{python}.0",
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+        "os_name": "nt" if system == "win32" else "posix",
+    }
+
+
+def _locked_onnxruntime(env: dict[str, str]) -> dict[str, Any]:
+    """锁文件里 fastembed（local）在这个平台上装的 onnxruntime。"""
+    lock = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text("utf-8"))
+    packages = [p for p in lock["package"] if p["name"] == "onnxruntime"]
+    [fastembed] = [p for p in lock["package"] if p["name"] == "fastembed"]
+    [dep] = [
+        d
+        for d in fastembed["dependencies"]
+        if d["name"] == "onnxruntime"
+        and Marker(d.get("marker", "python_version > '0'")).evaluate(env)
+    ]
+    if "version" not in dep:
+        [package] = packages
+        return package
+    [package] = [p for p in packages if p["version"] == dep["version"]]
+    return package
+
+
+def test_lock_installs_local_on_intel_macs_and_keeps_other_platforms() -> None:
+    """onnxruntime 从 1.24 起没有 Intel macOS 的 wheel，也没有源码包：以前锁文件只有 1.31.0，
+    Intel Mac 上 uv sync --extra local 解不出来。[tool.uv] constraint-dependencies 让那里（3.14
+    以下）停在 1.23.2，别的平台照旧是新版本；ci.yml 的 test 任务用 --dry-run 核对。"""
+    for python in ("3.12", "3.13"):
+        intel = _locked_onnxruntime(_platform("darwin", "x86_64", python))
+        tag = "-cp" + python.replace(".", "") + "-"
+        names = [w["url"].rsplit("/", 1)[1] for w in intel["wheels"]]
+        assert any(tag in n and "macosx" in n and "x86_64" in n for n in names), names
+    newest = _locked_onnxruntime(_platform("linux", "x86_64", "3.12"))
+    for env in (
+        _platform("linux", "aarch64", "3.12"),
+        _platform("win32", "AMD64", "3.12"),
+        _platform("darwin", "arm64", "3.12"),
+        _platform("darwin", "x86_64", "3.14"),  # 1.23.2 没有 cp314 的 wheel
+    ):
+        assert _locked_onnxruntime(env)["version"] == newest["version"], env
+    assert newest["version"] != intel["version"]
+
+    steps = _steps(PROJECT_ROOT / ".github" / "workflows" / "ci.yml")
+    commands = [shlex.split(step["run"]) for step in steps if "--dry-run" in step.get("run", "")]
+    assert any(
+        c[:3] == ["uv", "sync", "--locked"] and "x86_64-apple-darwin" in c and "local" in c
+        for c in commands
+    ), commands
 
 
 def test_compat_job_runs_unlocked_versions_weekly_and_is_not_required() -> None:
