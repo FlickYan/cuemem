@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,7 +42,8 @@ MemoryKind = Literal["fact", "excerpt", "image"]  # 按 ID 找到的记忆的种
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
 # v6：turn_meta（SDK 写入时附带的 metadata、过期时间与 update 的更正目标）。新表都用
 # CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上；v7：表不变，标出第二轮复审的 128 位
-# 集合名（VectorStore.collection_name，D-069）。
+# 集合名（VectorStore.collection_name，D-069）。add_keys（第六轮体检，add 的 idempotency_key）
+# 也是这样补上的，不升版本：旧代码不读它，只是 delete_space 时不删它的行。
 #
 # 旧代码读不懂新代码写下的东西时就要升版本：不只是 SQLite 的表，也包括 Qdrant 的集合名与
 # payload。D-069 的 128 位集合名（第二轮复审）是在 v6 里改的、当时没升版本，所以那次复审
@@ -182,6 +183,15 @@ CREATE TABLE IF NOT EXISTS turn_meta (
     edit_of TEXT,
     PRIMARY KEY (space_id, turn_id)
 );
+CREATE TABLE IF NOT EXISTS add_keys (
+    space_id TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    request_hash TEXT,
+    session_id TEXT,
+    turn_ids TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (space_id, key_hash)
+);
 CREATE INDEX IF NOT EXISTS idx_provenance_target ON provenance (space_id, target);
 CREATE INDEX IF NOT EXISTS idx_turns_space ON turns (space_id, session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id);
@@ -244,6 +254,9 @@ def next_idx_key(space_id: str, session_id: str) -> str:
 def legacy_idx_key(space_id: str, session_id: str) -> str:
     """以前的 next_idx 的键（有歧义，见 next_idx_key）：只读，不再写。"""
     return f"{_LEGACY_IDX}{space_id}:{session_id}"
+
+
+ADD_KEY_TTL = timedelta(hours=24)  # add 的 idempotency_key 记多久（与 Stripe 相同）
 
 
 class MemoryDB:
@@ -710,6 +723,78 @@ class MemoryDB:
                 (space_id, space_id),
             )
         return deleted
+
+    # ---------- add 的 idempotency_key（第六轮体检） ----------
+
+    def add_key_lookup(self, space_id: str, key_hash: str) -> dict[str, Any] | None:
+        """这个空间里这个键（调用方给的键的 sha256）记下的那次写入：request_hash、session_id、
+        turn_ids；遗忘过的（墓碑）三者都是 None。没有记过、或者记了超过 ADD_KEY_TTL 时 None。"""
+        cutoff = (datetime.now() - ADD_KEY_TTL).isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT request_hash, session_id, turn_ids FROM add_keys"
+                " WHERE space_id = ? AND key_hash = ? AND created_at >= ?",
+                (space_id, key_hash, cutoff),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "request_hash": row[0],
+            "session_id": row[1],
+            "turn_ids": json.loads(row[2]) if row[2] is not None else None,
+        }
+
+    def add_key_insert(
+        self,
+        conn: sqlite3.Connection,
+        space_id: str,
+        key_hash: str,
+        request_hash: str,
+        session_id: str,
+        turn_ids: Sequence[str],
+    ) -> None:
+        """记下一次带键的写入（在调用方写发言的事务里）。先删掉超过 ADD_KEY_TTL 的行（全部空间）；
+        再用普通的 INSERT：同一个键已经由并发的另一次写入提交时 sqlite3.IntegrityError，调用方的
+        事务整个回滚（连同这次的发言与向量），再按 add_key_lookup 返回先提交的那次。"""
+        now = datetime.now()
+        conn.execute(
+            "DELETE FROM add_keys WHERE created_at < ?", ((now - ADD_KEY_TTL).isoformat(),)
+        )
+        conn.execute(
+            "INSERT INTO add_keys"
+            " (space_id, key_hash, request_hash, session_id, turn_ids, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                space_id,
+                key_hash,
+                request_hash,
+                session_id,
+                json.dumps(list(turn_ids)),
+                now.isoformat(),
+            ),
+        )
+
+    def add_key_forget(
+        self, conn: sqlite3.Connection, space_id: str, turn_ids: Iterable[str]
+    ) -> int:
+        """遗忘这些发言时（在遗忘的事务里）：写下过其中任何一句的键只留下墓碑——request_hash、
+        session_id 与 turn_ids 都置空，只剩调用方随机的键的 sha256。请求的摘要由被遗忘的内容算出，
+        不能留着；晚到的重试按墓碑返回 forgotten，不再写一遍。返回改了几行。"""
+        doomed = set(turn_ids)
+        if not doomed:
+            return 0
+        rows = conn.execute(
+            "SELECT key_hash, turn_ids FROM add_keys WHERE space_id = ? AND turn_ids IS NOT NULL",
+            (space_id,),
+        ).fetchall()
+        hit = [key for key, ids in rows if doomed.intersection(json.loads(ids))]
+        for key in hit:
+            conn.execute(
+                "UPDATE add_keys SET request_hash = NULL, session_id = NULL, turn_ids = NULL"
+                " WHERE space_id = ? AND key_hash = ?",
+                (space_id, key),
+            )
+        return len(hit)
 
     def _drop_idle_idx(self, conn: sqlite3.Connection, space_id: str) -> None:
         """删掉这个空间里已经没有发言的会话的 next_idx（next_idx_key，在调用方的事务里）：会话
@@ -1461,7 +1546,7 @@ class MemoryDB:
         with self.transaction() as conn:
             self._bump([space_id])
             self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
-            raw = ("units", "turns", "sessions", "media", "provenance", "turn_meta")
+            raw = ("units", "turns", "sessions", "media", "provenance", "turn_meta", "add_keys")
             for table in (*raw, *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))

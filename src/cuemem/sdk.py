@@ -39,8 +39,10 @@ import asyncio
 import base64
 import binascii
 import functools
+import hashlib
 import json
 import logging
+import sqlite3
 import tempfile
 import threading
 import time
@@ -71,7 +73,7 @@ from cuemem.core.models import (
 )
 from cuemem.core.timeutil import naive_local, normalize_expiry
 from cuemem.core.types import PeakPolicy, Router
-from cuemem.errors import ConcurrentWriteError
+from cuemem.errors import ConcurrentWriteError, IdempotencyConflictError
 from cuemem.expiry import Sources as _Sources
 from cuemem.expiry import visible_core
 from cuemem.store.sqlite import legacy_idx_key, next_idx_key
@@ -256,6 +258,7 @@ class Memory:
         timestamp: datetime | str | float | None = None,
         infer: bool = True,
         wait: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """写入对话。messages 可以是一句话、一条消息或 OpenAI 格式的消息列表（内容块里的
         image_url 可以是 data URL 或本地路径，图片会存进记忆）；system / tool 消息不写入。
@@ -276,8 +279,25 @@ class Memory:
         "consolidated"、没有 error）。写进去之前出错（向量接口不可用等）时照常抛出，什么都没写，
         可以原样重试；写进去之后 trace 写不进去时只记一条警告（见 core/trace.py 的 start_trace）。
         后台抽取的状态与出错见 status()。
+        idempotency_key：调用方给的键（1 到 255 个可打印的 ASCII 字符，例如 uuid4），重试时原样
+        再给（第六轮体检，默认不用）。同一个用户下 24 小时内这个键已经写过同样的请求时不再写，
+        返回 status "duplicate"、那次的 session_id 与 turn_ids、replayed True（results 是空的，
+        wait=True 也不抽取）；那次写下的发言已经遗忘时 status 是 "forgotten"；同一个键用于不同的
+        请求（消息或别的参数不同，wait 不算）时抛 IdempotencyConflictError，什么都不写。并发的
+        同一个键只有一个写进去，别的回滚、按 duplicate 返回。
         """
         space = space_for(user_id, agent_id)
+        keyed: tuple[str, str] | None = None
+        if idempotency_key is not None:  # 不给键时与以前完全相同，不多一次查询
+            keyed = (
+                _key_hash(idempotency_key),
+                _request_hash(
+                    messages, user_id, agent_id, run_id, metadata, expiration_date, timestamp, infer
+                ),
+            )
+            replayed = self._replayed(space, *keyed)
+            if replayed is not None:
+                return replayed
         if run_id is not None:
             self._resume(space, run_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
@@ -309,10 +329,27 @@ class Memory:
                     extra = {(sid, first + i): info for i in range(len(turns))}
                 # 下一句的序号与发言在同一个事务里提交：以前另起一个事务写，出错时发言已经写进去，
                 # 调用方原样重试就写了两遍
-                with self.system.appending(
-                    space, [(session, first)], enqueue=infer, meta=extra
-                ) as written:
-                    self.system.db.set_meta(next_idx_key(space, sid), str(first + len(turns)))
+                try:
+                    with self.system.appending(
+                        space, [(session, first)], enqueue=infer, meta=extra
+                    ) as written:
+                        db = self.system.db
+                        db.set_meta(next_idx_key(space, sid), str(first + len(turns)))
+                        if keyed is not None:  # 与发言在同一个事务里：一起提交，一起回滚
+                            with db.transaction() as conn:
+                                db.add_key_insert(
+                                    conn,
+                                    space,
+                                    *keyed,
+                                    sid,
+                                    [stable_id(space, sid, first + i) for i in range(len(turns))],
+                                )
+                except sqlite3.IntegrityError:
+                    # 并发的同一个键先提交了：这次的发言与暂存的向量已经随事务回滚
+                    replayed = self._replayed(space, *keyed) if keyed is not None else None
+                    if replayed is None:
+                        raise
+                    return replayed
             if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
                 raise ConcurrentWriteError(
                     f"Only {written.turns_added} of {len(turns)} messages were written to session "
@@ -341,6 +378,32 @@ class Memory:
         else:
             out["status"] = "queued"
         return out
+
+    def _replayed(self, space: str, key_hash: str, request_hash: str) -> dict[str, Any] | None:
+        """这个键已经写过时 add 的返回值（见 add 的 idempotency_key）；没写过时 None。"""
+        found = self.system.db.add_key_lookup(space, key_hash)
+        if found is None:
+            return None
+        if found["request_hash"] is None:  # 墓碑：那次写下的发言已经遗忘
+            return {
+                "results": [],
+                "session_id": None,
+                "turn_ids": [],
+                "status": "forgotten",
+                "replayed": True,
+            }
+        if found["request_hash"] != request_hash:
+            raise IdempotencyConflictError(
+                "This idempotency_key was already used for a different add request for this "
+                "user; repeat the original request unchanged, or use a new key."
+            )
+        return {
+            "results": [],
+            "session_id": found["session_id"],
+            "turn_ids": found["turn_ids"],
+            "status": "duplicate",
+            "replayed": True,
+        }
 
     def open_run(
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
@@ -1224,6 +1287,50 @@ def _image_file(url: str) -> tuple[Path, bool]:
     if not path.is_file():
         raise ValueError(f"Image not found: {url}")
     return path, False
+
+
+IDEMPOTENCY_KEY_MAX = 255  # idempotency_key 最多这么多个字符（Idempotency-Key 头同）
+
+
+def _key_hash(key: str) -> str:
+    """idempotency_key 的 sha256（库里只存它）。键要是 1 到 255 个可打印的 ASCII 字符：它也要能
+    放进 HTTP 头（MemoryClient 的 Idempotency-Key），否则 ValueError。"""
+    if (
+        not isinstance(key, str)
+        or not 0 < len(key) <= IDEMPOTENCY_KEY_MAX
+        or not all(" " <= c <= "~" for c in key)
+    ):
+        raise ValueError(
+            f"idempotency_key must be 1 to {IDEMPOTENCY_KEY_MAX} printable ASCII characters."
+        )
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _request_hash(
+    messages: Any,
+    user_id: str | None,
+    agent_id: str | None,
+    run_id: str | None,
+    metadata: Mapping[str, Any] | None,
+    expiration_date: date | datetime | str | None,
+    timestamp: datetime | str | float | None,
+    infer: bool,
+) -> str:
+    """一次 add 的请求的摘要（wait 不算）：同一个 idempotency_key 再来时据此判断是不是同一个请求。
+    日期与时间按 ISO 写法算：本地调用的 datetime 与 MemoryClient 发来的 ISO 文本相同。"""
+
+    def plain(value: Any) -> Any:
+        if isinstance(value, date):  # datetime 也是 date
+            return value.isoformat()
+        if isinstance(value, Mapping):
+            return dict(value)
+        if isinstance(value, Path):
+            return str(value)
+        raise TypeError(f"cannot hash {type(value).__name__}")
+
+    request = [messages, user_id, agent_id, run_id, metadata, expiration_date, timestamp, infer]
+    text = json.dumps(request, sort_keys=True, ensure_ascii=False, default=plain)
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _turn_meta(

@@ -50,7 +50,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
 import anyio
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -66,7 +66,12 @@ from cuemem import __version__
 from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of
 from cuemem.api.failures import provider_failure
 from cuemem.core.models import FactCategory, SupersedeReason
-from cuemem.errors import ConcurrentWriteError, CueMemError, EmbeddingAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    CueMemError,
+    EmbeddingAPIError,
+    IdempotencyConflictError,
+)
 from cuemem.read.controller import Router
 from cuemem.sdk import AnswerMode, Lam, Memory, MinLevel, SearchMode, _scope, space_for
 from cuemem.store.media import ACCEPTED_FORMATS
@@ -318,9 +323,10 @@ class AddResult(_Out):
     results: list[FactEvent]
     session_id: str | None
     turn_ids: list[str]
-    status: Literal["empty", "logged", "queued", "consolidated"]
+    status: Literal["empty", "logged", "queued", "consolidated", "duplicate", "forgotten"]
     error: str | None = None
     consolidation: ConsolidationReport | None = None
+    replayed: bool | None = None  # Idempotency-Key 已经写过：duplicate 或 forgotten
 
 
 class SearchResult(_Out):
@@ -554,7 +560,7 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(404, str(exc.args[0] if exc.args else exc), error_type="KeyError") from exc
     except (ValueError, TypeError) as exc:
         raise V1Error(400, str(exc), error_type=type(exc).__name__) from exc
-    except ConcurrentWriteError as exc:
+    except (ConcurrentWriteError, IdempotencyConflictError) as exc:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
     except Exception as exc:
         failure = provider_failure(exc)
@@ -673,7 +679,22 @@ def memories_router(
         return V1Error(404, f"No memory with id {memory_id}", error_type="KeyError")
 
     @router.post("/memories", responses=_ok(AddResult))
-    def add(http: Request, request: AddRequest) -> V1Json:
+    def add(
+        http: Request,
+        request: AddRequest,
+        idempotency_key: Annotated[
+            str | None,
+            Header(
+                alias="Idempotency-Key",
+                description=(
+                    "Optional key (1-255 printable ASCII characters, e.g. a UUID) for retrying "
+                    "an add safely: within 24 hours the same key and request for the same user "
+                    "is written once and answered with status 'duplicate' (or 'forgotten'); the "
+                    "same key with a different request is a 409 IdempotencyConflictError."
+                ),
+            ),
+        ] = None,
+    ) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             _no_server_files(request.messages)
@@ -687,6 +708,7 @@ def memories_router(
                 timestamp=request.timestamp,
                 infer=request.infer,
                 wait=request.wait,
+                idempotency_key=idempotency_key,
             )
 
     @router.post("/memories/search", responses=_ok(SearchResult))

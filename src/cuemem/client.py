@@ -114,8 +114,11 @@ class MemoryClient:
         timestamp: datetime | str | float | None = None,
         infer: bool = True,
         wait: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """写入对话（见 Memory.add）。内容块里的本地图片先读成 data URL。"""
+        """写入对话（见 Memory.add）。内容块里的本地图片先读成 data URL。idempotency_key 作为
+        Idempotency-Key 头发送（不给时不发，请求与以前相同）：超时或连接断开（MemoryAPIError 的
+        code 为 timeout、disconnected）之后用同一个键原样重发，服务端只写一次。"""
         body = {
             "messages": _inline_images(messages),
             "user_id": user_id,
@@ -127,7 +130,11 @@ class MemoryClient:
             "infer": infer,
             "wait": wait,
         }
-        return self._call("POST", "/memories", body=body)
+        if idempotency_key is None:
+            return self._call("POST", "/memories", body=body)
+        _check_key(idempotency_key)
+        headers = {"Idempotency-Key": idempotency_key}
+        return self._call("POST", "/memories", body=body, headers=headers)
 
     def open_run(
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
@@ -402,8 +409,9 @@ class MemoryClient:
         *,
         body: Any = None,
         params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> Any:
-        return self._send(method, path, body=body, params=params).json()
+        return self._send(method, path, body=body, params=params, headers=headers).json()
 
     def _send(
         self,
@@ -412,7 +420,9 @@ class MemoryClient:
         *,
         body: Any = None,
         params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> httpx2.Response:
+        """headers：这次请求另加的头（add 的 Idempotency-Key）；不给时与以前完全相同。"""
         query = {k: v for k, v in (params or {}).items() if v is not None}  # None 不发
         try:
             response = self._http.request(
@@ -420,7 +430,7 @@ class MemoryClient:
                 f"{self.base_url}/api/v1{path}",
                 json=body,
                 params=query,
-                headers=self._headers,
+                headers={**self._headers, **headers} if headers else self._headers,
             )
         except httpx2.HTTPError as exc:
             raise self._transport_error(exc) from exc
@@ -448,14 +458,14 @@ class MemoryClient:
             within = f" within {seconds:g}s" if isinstance(seconds, int | float) else ""
             return MemoryAPIError(
                 f"No response from {self.base_url}{within}; the request may have been processed "
-                "(do not repeat a write blindly; check get_all/history)",
+                "(repeat it with the same idempotency_key, or check export)",
                 code="timeout",
                 sent=True,
             )
         if isinstance(exc, httpx2.RemoteProtocolError | httpx2.ReadError | httpx2.WriteError):
             return MemoryAPIError(
                 f"Connection to {self.base_url} broke off: {exc}; the request may have been "
-                "processed (do not repeat a write blindly; check get_all/history)",
+                "processed (repeat it with the same idempotency_key, or check export)",
                 code="disconnected",
                 sent=True,
             )
@@ -482,6 +492,13 @@ class AsyncMemoryClient(AsyncMethods):
         self.sync = MemoryClient(
             base_url, api_key=api_key, host=host, timeout=timeout, http_client=http_client
         )
+
+
+def _check_key(key: str) -> None:
+    """idempotency_key 写错时在发送之前 ValueError，与本地的 Memory.add 相同（sdk._key_hash；
+    这里不加载 SDK）：1 到 255 个可打印的 ASCII 字符，要能放进 HTTP 头。"""
+    if not isinstance(key, str) or not 0 < len(key) <= 255 or not all(" " <= c <= "~" for c in key):
+        raise ValueError("idempotency_key must be 1 to 255 printable ASCII characters.")
 
 
 def _error(response: httpx2.Response, base_url: str) -> Exception:

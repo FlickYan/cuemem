@@ -43,6 +43,7 @@ class AsyncMethods:
         timestamp: datetime | str | float | None = None,
         infer: bool = True,
         wait: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """见 Memory.add。"""
         return await asyncio.to_thread(
@@ -56,6 +57,7 @@ class AsyncMethods:
             timestamp=timestamp,
             infer=infer,
             wait=wait,
+            idempotency_key=idempotency_key,
         )
 
     async def open_run(

@@ -57,6 +57,7 @@ from cuemem.errors import (
     ConcurrentWriteError,
     ContentFilteredError,
     EmbeddingAPIError,
+    IdempotencyConflictError,
     MemoryAPIError,
 )
 from cuemem.evidence import RAISED_REASON
@@ -226,6 +227,7 @@ ARGUMENTS: dict[str, Any] = {
     "dry_run": True,
     "rebuild": True,
     "derived": False,
+    "idempotency_key": "retry-0001",
     "timeout": 2.0,  # 比 TestClient 的读超时（5 秒）减去 WAIT_MARGIN_S 短，原样发出
 }
 PER_METHOD: dict[tuple[str, str], Any] = {
@@ -790,6 +792,50 @@ def test_concurrent_write_conflicts_are_409(
         with pytest.raises(ConcurrentWriteError, match="chat"):
             client.add("I like jazz", user_id="alice", run_id="chat", infer=False)
     assert [t.text for t in system.db.get_turns("alice", "chat")] == ["I live in Berlin"]
+
+
+def test_idempotency_keys_work_the_same_remotely(mem: Mem, system: MemorySystem) -> None:
+    """add 的 idempotency_key（第六轮体检）：本地与经 /api/v1（Idempotency-Key 头）相同。同一个
+    键原样重试只写一次（duplicate），不同的请求抛 IdempotencyConflictError（409），写错的键
+    ValueError（400）。"""
+    first = mem.add("I live in Berlin", user_id="alice", timestamp=AUG, idempotency_key="u-1")
+    again = mem.add("I live in Berlin", user_id="alice", timestamp=AUG, idempotency_key="u-1")
+    assert (again["status"], again["replayed"]) == ("duplicate", True)
+    assert again["turn_ids"] == first["turn_ids"]
+    with pytest.raises(IdempotencyConflictError):
+        mem.add("I live in Rome", user_id="alice", timestamp=AUG, idempotency_key="u-1")
+    with pytest.raises(ValueError, match="idempotency_key"):
+        mem.add("I live in Rome", user_id="alice", idempotency_key="x" * 256)
+    assert len(system.db.get_turns("alice")) == 1
+
+
+def test_the_idempotency_key_header(system: MemorySystem) -> None:
+    """POST /api/v1/memories 的 Idempotency-Key 头：重试是 200 duplicate，同一个键的不同请求是
+    409（code conflict，type IdempotencyConflictError），超过 255 个字符是 400。不带这个头时与
+    以前相同。"""
+    body = {"messages": "I live in Berlin", "user_id": "alice"}
+    keyed = {"Idempotency-Key": "4f0c-retry"}
+    with TestClient(v1_app(system)) as http:
+        first = http.post("/api/v1/memories", json=body, headers=keyed)
+        assert first.status_code == 200 and first.json()["status"] == "queued"
+        again = http.post("/api/v1/memories", json=body, headers=keyed)
+        assert again.status_code == 200
+        assert again.json() == {
+            "results": [],
+            "session_id": first.json()["session_id"],
+            "turn_ids": first.json()["turn_ids"],
+            "status": "duplicate",
+            "replayed": True,
+        }
+        other = http.post("/api/v1/memories", json={**body, "messages": "Rome"}, headers=keyed)
+        assert other.status_code == 409
+        error = other.json()["error"]
+        assert (error["code"], error["type"]) == ("conflict", "IdempotencyConflictError")
+        long = http.post("/api/v1/memories", json=body, headers={"Idempotency-Key": "x" * 256})
+        assert long.status_code == 400 and long.json()["error"]["type"] == "ValueError"
+        plain = http.post("/api/v1/memories", json=body)
+        assert plain.status_code == 200 and "replayed" not in plain.json()
+    assert len(system.db.get_turns("alice")) == 2
 
 
 @pytest.mark.parametrize("broken", ["disk full", "cut line", "embed cache full"])

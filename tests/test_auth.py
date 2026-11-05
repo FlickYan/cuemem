@@ -1044,6 +1044,22 @@ def test_key_limits_are_validated() -> None:
     assert ADMIN.max_concurrent is None
 
 
+def test_idempotency_keys_stay_in_their_space(world: World) -> None:
+    """Idempotency-Key 按记忆空间分开：bob 的空间用过的键，alice 的令牌在自己的空间照常写入，
+    看不到 bob 那次的会话与发言 ID，也不会因为请求不同而 409；用这个键写 bob 的空间仍是 403，
+    在查键之前。"""
+    keyed = {"Idempotency-Key": "shared-key"}
+    body = {"messages": "My locker code is 1234", "user_id": "bob"}
+    first = world.http.post("/api/v1/memories", json=body, headers={**bearer(ADMIN_TOKEN), **keyed})
+    assert first.status_code == 200, first.text
+    mine = {"messages": "I like tea", "user_id": "alice"}
+    own = world.http.post("/api/v1/memories", json=mine, headers={**bearer(ALICE_TOKEN), **keyed})
+    assert own.status_code == 200 and own.json()["status"] == "queued"
+    assert own.json()["session_id"] != first.json()["session_id"]
+    other = world.http.post("/api/v1/memories", json=body, headers={**bearer(ALICE_TOKEN), **keyed})
+    assert other.status_code == 403
+
+
 # ---------- 同时在处理的请求（第六轮体检） ----------
 
 
