@@ -5,7 +5,8 @@ API Key 不写进配置文件，而是从环境变量或数据目录的 .env 中
 
 默认配置随包发布（cuemem/configs/default.yaml），pip 安装后也能用（N12，D-060）。
 数据目录：CUEMEM_HOME 优先；在源码仓库里运行时是仓库根目录（与之前一样），否则是 ~/.cuemem。
-预设（presets/*.yaml）叠加在默认配置上，换掉模型供应商：openai、ollama（本地，不要 Key）。
+预设（presets/*.yaml）叠加在默认配置上，换掉模型供应商：openai、ollama（本地，不要 Key）、
+deepseek、qwen。
 """
 
 from __future__ import annotations

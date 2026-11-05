@@ -1,6 +1,6 @@
 """命令行入口。
 
-cuemem [--preset openai|ollama] …     换模型供应商（也可设 CUEMEM_PRESET，N12）
+cuemem [--preset openai|ollama|deepseek|qwen] …   换模型供应商（也可设 CUEMEM_PRESET，N12）
 cuemem configure                      交互式填写 API Key（写入 .env）
 cuemem doctor [--live]                检查配置、API Key 与连通性（--repair-vectors 修本地向量库）
 cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
@@ -89,8 +89,8 @@ def main(
         str | None,
         typer.Option(
             "--preset",
-            help="换模型供应商的预设：openai、ollama（本地，不要 Key），或预设 YAML 的路径；"
-            "也可以设环境变量 CUEMEM_PRESET",
+            help="换模型供应商的预设：openai、ollama（本地，不要 Key）、deepseek、qwen，"
+            "或预设 YAML 的路径；也可以设环境变量 CUEMEM_PRESET",
         ),
     ] = None,
 ) -> None:
