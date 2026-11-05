@@ -952,9 +952,39 @@ def test_a_rebuild_clears_and_requeues_in_one_transaction(
             system.consolidator.run("u")  # 后台线程按退避重试
             assert statements(memory) == ["I also play piano", "I live in Paris", "I play violin"]
         else:
-            system.consolidate("u")  # 不用再要求重建：stale() 为真
-            assert statements(memory) == facts
+            # serve、代理与 MCP 的写法：不等巩固，后台线程接着 run。它要先把没做完的重建做完
+            # （第六轮体检：以前 run 最后照样写这次的指纹，标记被抹掉，缺的向量再没人补）
+            memory.add("I like tea", user_id="u", run_id="s3", timestamp=SEP)
+            system.consolidator.run("u")
+            assert statements(memory) == ["I like tea", *facts]
             assert not system.consolidator.stale("u")
+            hits = memory.search("Paris", user_id="u", mode="l1")["results"]
+            assert "I live in Paris" in [h["memory"] for h in hits]
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def test_a_worker_run_without_jobs_finishes_an_interrupted_rebuild(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """清空重建出错之后，没有新任务的一次后台 run 也把重建做完（第六轮体检）：以前标记留着、
+    向量缺着，要等显式的 consolidate。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        requeue = system.consolidator.requeue
+
+        def locked(space: str, before: Any, skip: Any) -> int:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(system.consolidator, "requeue", locked)
+        with pytest.raises(sqlite3.OperationalError):
+            system.consolidate("u", rebuild=True)
+        monkeypatch.setattr(system.consolidator, "requeue", requeue)
+        assert system.consolidator.stale("u")
+        system.consolidator.run("u")
+        assert not system.consolidator.stale("u")
+        assert statements(memory) == ["I live in Paris"]
         assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
 
 
