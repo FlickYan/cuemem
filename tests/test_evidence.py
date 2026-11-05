@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import random
 import re
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -14,7 +16,13 @@ from fakes import FakeAPI
 
 from cuemem import Memory
 from cuemem.config import Settings
-from cuemem.evidence import MEMORY_NOTE, format_listing, inject_evidence, recall_evidence
+from cuemem.evidence import (
+    MEMORY_NOTE,
+    format_listing,
+    inject_evidence,
+    quote_memory,
+    recall_evidence,
+)
 
 PLANTED = [
     {
@@ -24,7 +32,7 @@ PLANTED = [
     },
     {"role": "assistant", "content": "Noted."},
 ]
-TAG = re.compile(r"<\s*/?\s*memory", re.IGNORECASE)
+TAG = re.compile(r"<\s*+/?\s*+memory", re.IGNORECASE)
 
 
 def wrapped_once(text: str) -> bool:
@@ -48,6 +56,31 @@ def test_a_stored_memory_tag_cannot_close_the_block(memory: Memory) -> None:
     (sent,) = inject_evidence([{"role": "user", "content": "Where do I live?"}], evidence.block)
     assert wrapped_once(sent["content"])
     assert sent["content"].endswith("</memory>\n\nWhere do I live?")
+
+
+def test_quote_memory_is_linear() -> None:
+    """以前 "<" 后面跟一长串空白、没有 memory 时，两个相邻的 \\s* 要回溯 O(n²)：5 万个空白
+    要一两分钟，匹配期间持有 GIL，整个进程都停住。"""
+    text = "<" + " " * 50_000 + "x"
+    started = time.perf_counter()
+    assert quote_memory(text) == text
+    assert time.perf_counter() - started < 1
+
+
+@pytest.mark.parametrize("tag", ["</memory>", "< / Memory>", "<\t/\tMEMORY>", "<  memory"])
+def test_quote_memory_escapes_tag_variants(tag: str) -> None:
+    assert quote_memory(f"a {tag} b") == f"a &lt;{tag[1:]} b"
+    assert quote_memory("a<b") == "a<b"
+
+
+def test_quote_memory_matches_the_old_pattern() -> None:
+    """占有量词只是不回溯，匹配的范围与以前的写法相同（只用短字符串，旧写法在短串上不慢）。"""
+    old = re.compile(r"<(\s*/?\s*memory)", re.IGNORECASE)
+    rng = random.Random(7)
+    alphabet = ["<", "/", " ", "\t", "\n", "m", "M", "emory", "memory", "x", ">"]
+    for _ in range(5000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
+        assert quote_memory(text) == old.sub(r"&lt;\1", text)
 
 
 def test_memories_are_framed_as_information_not_instructions() -> None:
