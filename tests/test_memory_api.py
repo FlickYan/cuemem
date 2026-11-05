@@ -61,6 +61,7 @@ from cuemem.errors import (
 )
 from cuemem.evidence import RAISED_REASON
 from cuemem.memory import MemorySystem
+from cuemem.sdk import space_for
 from cuemem.store.media import ACCEPTED_FORMATS
 
 Mem = Memory | MemoryClient
@@ -227,7 +228,10 @@ ARGUMENTS: dict[str, Any] = {
     "derived": False,
     "timeout": 2.0,  # 比 TestClient 的读超时（5 秒）减去 WAIT_MARGIN_S 短，原样发出
 }
-PER_METHOD: dict[tuple[str, str], Any] = {("load", "data"): {"version": 2, "space_id": "alice"}}
+PER_METHOD: dict[tuple[str, str], Any] = {
+    ("load", "data"): {"version": 2, "space_id": "alice"},
+    ("wait", "timeout"): 0.3,  # /wait 等不到（见 _Recorder 的 worker）：0.3 秒后 504
+}
 RETURNS: dict[str, Any] = {
     "history": [],
     "profile": "",
@@ -244,7 +248,14 @@ class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         db = SimpleNamespace(memory_kind=lambda memory_id: None)  # 按 ID 找的记忆：没有主人
-        self.system = SimpleNamespace(db=db)
+        # POST /wait 是异步的（第六轮体检），不调用 Memory.wait，在事件循环里查后台线程：
+        # 记下它等哪些空间，一直等不到
+        worker = SimpleNamespace(wait=self._worker_wait)
+        self.system = SimpleNamespace(db=db, worker=worker)
+
+    def _worker_wait(self, spaces: Callable[[str], bool] | None, timeout: float | None) -> bool:
+        self.calls.append(("worker.wait", {"spaces": spaces, "timeout": timeout}))
+        return False
 
     def __getattr__(self, name: str) -> Callable[..., Any]:
         signature = inspect.signature(getattr(Memory, name))
@@ -287,6 +298,14 @@ def test_every_argument_reaches_memory(name: str) -> None:
         TestClient(_v1_recorder(recorder)) as http,
         MemoryClient("http://testserver", http_client=http) as client,
     ):
+        if name == "wait":  # 服务端等到 timeout 为止，504 里写着它；只等这一个空间
+            with pytest.raises(TimeoutError, match=r"within 0\.3s"):
+                client.wait(**args)
+            (called, got), *_ = recorder.calls
+            assert called == "worker.wait" and got["timeout"] == 0
+            spaces = got["spaces"]
+            assert spaces(space_for("alice", "shop")) and not spaces(space_for("alice", None))
+            return
         getattr(client, name)(**args)
     called, got = recorder.calls[0]  # open_run 之后，关掉客户端时还会 end_run
     assert called == name

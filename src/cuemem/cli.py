@@ -952,7 +952,7 @@ def serve(
 
     from cuemem.api.app import create_app
     from cuemem.api.auth import Keys
-    from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits
+    from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy
 
     if not idle_minutes > 0:  # 在打开记忆系统之前检查
@@ -973,6 +973,7 @@ def serve(
         nonlocal keys, limits
         keys = _access_keys()
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
+        concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
         _require_token(host, keys, insecure_no_auth, insecure_weak_token)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
@@ -1047,7 +1048,7 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.limits import body_limits
+    from cuemem.api.limits import body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -1059,6 +1060,7 @@ def proxy(
     try:
         keys = _access_keys()  # load_settings 已读入 .env
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
+        concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc

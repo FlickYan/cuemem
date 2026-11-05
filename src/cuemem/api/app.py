@@ -55,7 +55,13 @@ from cuemem import __version__
 from cuemem.agent import Reply
 from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of, ui_login
 from cuemem.api.failures import provider_failure
-from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, BodyLimit, _v1
+from cuemem.api.limits import (
+    MAX_BODY_BYTES,
+    MAX_IMPORT_BYTES,
+    BodyLimit,
+    _v1,
+    concurrency_limit,
+)
 from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
@@ -200,9 +206,15 @@ def _guard(
     """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
     先于 Origin，再是请求体的上限（api/limits.py；keys：限定作用域的令牌导入也用 max_body_bytes，
     同时在处理的请求体加起来有上限）。这三项都不读请求体。allow_ip_hosts：allowed_hosts 之外
-    另外接受任何 IP 地址作为 Host（TrustedHosts 的 ip_literals）。"""
+    另外接受任何 IP 地址作为 Host（TrustedHosts 的 ip_literals）。一个限定作用域的令牌同时在
+    处理的请求数的上限这时从环境变量 CUEMEM_MAX_CONCURRENT_PER_KEY 读（limits.concurrency_limit，
+    写错时 CueMemError）。"""
     app.add_middleware(
-        BodyLimit, max_body_bytes=max_body_bytes, max_import_bytes=max_import_bytes, keys=keys
+        BodyLimit,
+        max_body_bytes=max_body_bytes,
+        max_import_bytes=max_import_bytes,
+        keys=keys,
+        max_concurrent=concurrency_limit(),
     )
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:

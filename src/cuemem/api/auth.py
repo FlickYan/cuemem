@@ -31,6 +31,8 @@
                                      # 每分钟最多这么多个（429）；GET 不算
         models: [qwen3.8-flash]      # 记忆代理只能用这些模型（目录里的别名或模型 ID，之外 403）
         max_output_tokens: 2000      # 记忆代理转发的 max_tokens 不超过它，n 只能是 1
+        max_concurrent: 4            # /api、/api/v1、/v1、/mcp 同时在处理的请求最多这么多个
+                                     # （429；不写时是 CUEMEM_MAX_CONCURRENT_PER_KEY，默认 8）
 
   后两项只管记忆代理（/v1/chat/completions、/v1/responses）；别的接口用配置里的角色与模型。
   models 里的别名只放行这个别名（连同目录里它的 extra_body）：写 deepseek-flash 的令牌不能用
@@ -120,7 +122,8 @@ class Principal:
     """一个令牌是谁、能访问什么。admin：不受作用域限制（管理令牌；没配令牌时的本机演示）。
 
     rate_per_minute、models、max_output_tokens：限定作用域的令牌可选的用量限制（见模块说明），
-    None 是不限。"""
+    None 是不限。max_concurrent：同时在处理的请求数的上限（api/limits.py），None 时用
+    CUEMEM_MAX_CONCURRENT_PER_KEY（默认 8）；管理令牌不限。"""
 
     name: str
     admin: bool = False
@@ -128,6 +131,7 @@ class Principal:
     rate_per_minute: int | None = None
     models: tuple[str, ...] | None = None
     max_output_tokens: int | None = None
+    max_concurrent: int | None = None
 
     def allows(self, space: str | None) -> bool:
         """能不能访问这个记忆空间：空间解回的（user_id，agent_id）要在作用域里。"""
@@ -292,6 +296,7 @@ class _KeyIn(BaseModel):
     rate_per_minute: _PositiveInt | None = None
     models: list[str] | None = None
     max_output_tokens: _PositiveInt | None = None
+    max_concurrent: _PositiveInt | None = None
 
 
 class _KeysIn(BaseModel):
@@ -322,6 +327,7 @@ def _key(entry: _KeyIn, where: str) -> tuple[bytes, Principal]:
         rate_per_minute=entry.rate_per_minute,
         models=tuple(entry.models) if entry.models is not None else None,
         max_output_tokens=entry.max_output_tokens,
+        max_concurrent=entry.max_concurrent,
     )
 
 

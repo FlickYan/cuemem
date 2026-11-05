@@ -12,7 +12,9 @@ import io
 import json
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1021,6 +1023,8 @@ def test_key_limits_are_validated() -> None:
         ("models: []", "models"),
         ("models: ['']", "models"),
         ("models: qwen3.8-flash", "models"),
+        ("max_concurrent: 0", "max_concurrent"),
+        ("max_concurrent: '4'", "max_concurrent"),
     ):
         with pytest.raises(AccessKeysError) as caught:
             Keys.parse(_keys(f"name: a, token: t, scopes: [{{user: a}}], {entry}"))
@@ -1028,14 +1032,114 @@ def test_key_limits_are_validated() -> None:
     keys = Keys.parse(
         _keys(
             "name: a, token: t, scopes: [{user: a}], rate_per_minute: 60, "
-            "models: [qwen3.8-flash, deepseek-flash], max_output_tokens: 2000"
+            "models: [qwen3.8-flash, deepseek-flash], max_output_tokens: 2000, max_concurrent: 4"
         )
     )
     principal = keys.resolve("t")
     assert principal is not None and principal.rate_per_minute == 60
     assert principal.models == ("qwen3.8-flash", "deepseek-flash")
     assert principal.max_output_tokens == 2000
+    assert principal.max_concurrent == 4
     assert ADMIN.rate_per_minute is None and ADMIN.models is None
+    assert ADMIN.max_concurrent is None
+
+
+# ---------- 同时在处理的请求（第六轮体检） ----------
+
+
+@contextmanager
+def _held(world: World, space: str) -> Iterator[threading.Event]:
+    """在另一个线程里拿着这个空间的巩固锁（RLock 只能由拿到它的线程释放），并让后台线程开始
+    抽取这个空间（卡在锁上）；返回的 Event 被 set 或离开时放开。"""
+    lock = world.system.consolidator.exclusive(space)
+    got, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with lock:
+            got.set()
+            release.wait(60)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert got.wait(10)
+    assert world.system.worker is not None
+    world.system.worker.submit(space)
+    try:
+        yield release
+    finally:
+        release.set()
+        thread.join(10)
+
+
+def _flood(world: World, path: str, body: dict[str, Any], n: int) -> tuple[float, list[int]]:
+    """alice 的令牌并发 n 个请求（都卡在 alice 的巩固锁上）期间，管理令牌查 bob 的状态要多久；
+    返回（秒数，alice 的请求的状态码）。"""
+    codes: list[int] = []
+    with _held(world, "alice") as release:
+
+        def one() -> None:
+            codes.append(world.http.post(path, json=body, headers=bearer(ALICE_TOKEN)).status_code)
+
+        threads = [threading.Thread(target=one) for _ in range(n)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.5)  # 让它们都进到接口里
+        start = time.monotonic()
+        status = world.http.get(
+            "/api/v1/status", params={"user_id": "bob"}, headers=bearer(ADMIN_TOKEN)
+        )
+        took = time.monotonic() - start
+        assert status.status_code == 200, status.text
+        release.set()
+        for thread in threads:
+            thread.join(30)
+    return took, codes
+
+
+def test_a_scoped_key_cannot_take_every_thread(world: World) -> None:
+    """一个限定作用域的令牌同时在处理的请求最多 8 个（CUEMEM_MAX_CONCURRENT_PER_KEY），多的 429：
+    以前 alice 并发 45 个卡住的 POST /api/v1/consolidate 就占满 AnyIO 的 40 个线程，管理令牌查别人
+    的状态也要等到它们做完。"""
+    took, codes = _flood(world, "/api/v1/consolidate", {"user_id": "alice"}, 45)
+    assert took < 1.0, took
+    assert codes.count(429) >= 45 - 8 and set(codes) <= {200, 429}, codes
+
+
+@pytest.fixture
+def raised_cap(n3_settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """建应用之前把每个令牌同时在处理的请求数调高（在清掉环境变量的 clean_env 之后，world 在它
+    之后建应用）。"""
+    monkeypatch.setenv("CUEMEM_MAX_CONCURRENT_PER_KEY", "100")
+
+
+def test_waits_hold_no_thread(raised_cap: None, world: World) -> None:
+    """POST /api/v1/wait 是异步的，等着时不占线程：上限调到 100，alice 并发 45 个等不到的 wait，
+    管理令牌查 bob 的状态照样马上回。以前每个 wait 占着一个线程，状态要等到它们超时（4 秒）。
+    放开之后它们都 200。"""
+    took, codes = _flood(world, "/api/v1/wait", {"user_id": "alice", "timeout": 4}, 45)
+    assert took < 1.0, took
+    assert codes == [200] * 45, codes
+
+
+def test_scoped_wait_times_out_with_504(world: World) -> None:
+    """等不到时仍是 504（type TimeoutError），出错的文字不变；不给 ID 时限定作用域的令牌只等它能
+    访问的空间：bob 的抽取卡着不影响 alice 的令牌。"""
+    with _held(world, "alice"):
+        late = world.http.post(
+            "/api/v1/wait", json={"user_id": "alice", "timeout": 0.3}, headers=bearer(ALICE_TOKEN)
+        )
+        assert late.status_code == 504, late.text
+        assert late.json()["error"]["type"] == "TimeoutError"
+        assert late.json()["error"]["message"] == (
+            "Extraction did not finish within 0.3s; it continues in the background."
+        )
+    with _held(world, "bob"):
+        mine = world.http.post("/api/v1/wait", json={"timeout": 1}, headers=bearer(ALICE_TOKEN))
+        assert mine.status_code == 200, mine.text
+        everyone = world.http.post(
+            "/api/v1/wait", json={"timeout": 0.3}, headers=bearer(ADMIN_TOKEN)
+        )
+        assert everyone.status_code == 504
 
 
 # ---------- 界面 ----------

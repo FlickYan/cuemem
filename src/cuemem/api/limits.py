@@ -33,6 +33,14 @@ api.auth.authenticated_route），界面（Gradio）的登录与事件接口也�
 抽取碰到的会话）同样调用上游，第四轮复审之前只算 POST，它们不受限。管不到界面（登录的会话不带
 Bearer 令牌，用 agent 角色固定的模型与 max_tokens）；一次写入有多大（抽取约按每字节两个字符发给
 上游）由 CUEMEM_MAX_BODY_BYTES 管。
+
+同时在处理的请求数（第六轮体检）：限定作用域的令牌在 /api/、/v1/ 与 /mcp 同时在处理的请求（任何
+方法）最多 max_concurrent 个，默认 8，环境变量 CUEMEM_MAX_CONCURRENT_PER_KEY，令牌也可以自己写
+max_concurrent（api/auth.py，写了时用它）。超过时 429（带 Retry-After: 1，/api/v1 下 code 为
+rate_limited）。同步的接口在 AnyIO 的 40 个线程里跑，consolidate、add(wait=True) 这样的请求一直
+占着一个线程：以前一个令牌并发 41 个就占满全部线程，别的令牌、管理令牌与界面的同步接口都要等。
+现在默认的 8 下四个令牌最多占 32 个线程。管理令牌与没配令牌的本机演示不限。管不到的：好几个令牌
+加起来仍可能占满，共用的服务可以调小这个数。
 """
 
 from __future__ import annotations
@@ -53,6 +61,8 @@ from cuemem.errors import CueMemError
 
 MAX_BODY_ENV = "CUEMEM_MAX_BODY_BYTES"
 MAX_IMPORT_ENV = "CUEMEM_MAX_IMPORT_BYTES"
+MAX_CONCURRENT_ENV = "CUEMEM_MAX_CONCURRENT_PER_KEY"
+MAX_CONCURRENT = 8  # 一个限定作用域的令牌同时在处理的请求数（线程池共 40 个线程）
 MAX_BODY_BYTES = 64 << 20
 MAX_IMPORT_BYTES = 1 << 30
 OTHER_BODY_BYTES = 8 << 20  # 界面的登录与事件（不可配置）
@@ -71,6 +81,8 @@ class BodyLimit:
     不用 max_import_bytes，同时在处理的请求体加起来有上限，写了 rate_per_minute 的写的请求（GET、
     HEAD、OPTIONS 之外的方法）还有次数的上限（见模块说明）。令牌不对的请求不算：接口在读请求体
     之前就 401（auth.authenticated_route）。
+    max_concurrent：一个限定作用域的令牌在 RATE_PATHS 同时在处理的请求数的上限（令牌自己写了
+    max_concurrent 时用它的），见模块说明。
     clock：次数上限用的时钟（秒，测试里换掉）。"""
 
     def __init__(
@@ -80,17 +92,21 @@ class BodyLimit:
         max_body_bytes: int = MAX_BODY_BYTES,
         max_import_bytes: int = MAX_IMPORT_BYTES,
         keys: Keys | None = None,
+        max_concurrent: int = MAX_CONCURRENT,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.max_import_bytes = max_import_bytes
         self.keys = keys
+        self.max_concurrent = max_concurrent
         self.clock = clock
         # 限定作用域的令牌（名字）→ 正在读、在处理的请求体的字节数。只在事件循环里读写
         self.in_flight: dict[str, int] = {}
         # 写了 rate_per_minute 的令牌（名字）→ 令牌桶记下的时间（见 _wait）。只在事件循环里读写
         self.next_free: dict[str, float] = {}
+        # 限定作用域的令牌（名字）→ 在 RATE_PATHS 正在处理的请求数。只在事件循环里读写
+        self.requests_in_flight: dict[str, int] = {}
 
     def limit(self, path: str, tenant: str | None = None) -> tuple[int, str | None]:
         """这个路径的（上限，设置它的环境变量）；固定的那一档没有环境变量。tenant：限定作用域的
@@ -148,6 +164,37 @@ class BodyLimit:
                 )
                 await response(scope, receive, send)
                 return
+        counted_request = principal is not None and path.startswith(RATE_PATHS)
+        if counted_request:
+            assert principal is not None
+            most = principal.max_concurrent or self.max_concurrent
+            if self.requests_in_flight.get(principal.name, 0) >= most:
+                message = _too_busy(path, most)
+                response = (
+                    _error(429, message, None, RETRY)
+                    if _v1(path)
+                    else JSONResponse({"detail": message}, 429, RETRY)
+                )
+                await response(scope, receive, send)
+                return
+            self.requests_in_flight[principal.name] = (
+                self.requests_in_flight.get(principal.name, 0) + 1
+            )
+        try:
+            await self._limited(scope, receive, send, path, tenant)
+        finally:
+            if counted_request:
+                assert principal is not None
+                left = self.requests_in_flight.get(principal.name, 0) - 1
+                if left > 0:
+                    self.requests_in_flight[principal.name] = left
+                else:
+                    self.requests_in_flight.pop(principal.name, None)
+
+    async def _limited(
+        self, scope: Scope, receive: Receive, send: Send, path: str, tenant: str | None
+    ) -> None:
+        """请求体的上限（413）与一个令牌同时在处理的请求体的字节数（429），再交给应用。"""
         cap, env = self.limit(path, tenant)
         length = Headers(scope=scope).get("content-length", "")
         declared = int(length) if length.isascii() and length.isdigit() else 0
@@ -237,6 +284,19 @@ def _too_many(path: str, budget: int) -> str:
     )
 
 
+def _too_busy(path: str, most: int) -> str:
+    """一个限定作用域的令牌同时在处理的请求已经有 max_concurrent 个（429）。"""
+    if path.startswith("/api/") and not _v1(path):
+        return (
+            f"这个访问令牌同时在处理的请求太多：最多 {most} 个"
+            f"（环境变量 {MAX_CONCURRENT_ENV}，或令牌的 max_concurrent），请稍后重试"
+        )
+    return (
+        f"Too many concurrent requests for this access key: at most {most} at once "
+        f"(set with {MAX_CONCURRENT_ENV} or the key's max_concurrent); retry shortly."
+    )
+
+
 def _too_often(path: str, rate: int, wait: float) -> str:
     """一个限定作用域的令牌超过了 rate_per_minute（429）。"""
     seconds = max(1, math.ceil(wait - 1e-6))
@@ -262,3 +322,18 @@ def body_limits(environ: Mapping[str, str] | None = None) -> tuple[int, int]:
             raise CueMemError(f"{name} 要是正整数（字节数，默认 {default}），现在是 {raw!r}")
         values.append(int(raw))
     return values[0], values[1]
+
+
+def concurrency_limit(environ: Mapping[str, str] | None = None) -> int:
+    """环境变量 CUEMEM_MAX_CONCURRENT_PER_KEY 给出的、一个限定作用域的令牌同时在处理的请求数的
+    上限；没设或是空的时默认 8。不是正整数时 CueMemError（cuemem serve / proxy 打印原因、
+    退出码 1）。"""
+    env = os.environ if environ is None else environ
+    raw = (env.get(MAX_CONCURRENT_ENV) or "").strip()
+    if not raw:
+        return MAX_CONCURRENT
+    if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
+        raise CueMemError(
+            f"{MAX_CONCURRENT_ENV} 要是正整数（请求数，默认 {MAX_CONCURRENT}），现在是 {raw!r}"
+        )
+    return int(raw)
