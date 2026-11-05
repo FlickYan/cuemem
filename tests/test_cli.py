@@ -822,7 +822,8 @@ def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
     path.chmod(0o644)
     monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
     command = ["keys", "add", "shop", "--user", "*", "--agent", "shop", "--rate-per-minute", "60"]
-    result = runner.invoke(app, [*command, "--models", "qwen3.8-flash", "--max-output-tokens", "9"])
+    limits = ["--models", "qwen3.8-flash", "--max-output-tokens", "9", "--max-concurrent", "3"]
+    result = runner.invoke(app, [*command, *limits])
     assert result.exit_code == 0, result.output
     token = result.stdout.strip()
     assert result.stdout == token + "\n" and len(token) >= 40 and token not in result.stderr
@@ -835,11 +836,14 @@ def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
     principal = keys.resolve(token)
     assert keys.names == ["alice-app", "shop"] and principal is not None
     assert principal.allows("shop/bob") and not principal.allows("bob")
-    assert (principal.rate_per_minute, principal.models, principal.max_output_tokens) == (
-        60,
-        ("qwen3.8-flash",),
-        9,
-    )
+    assert (
+        principal.rate_per_minute,
+        principal.models,
+        principal.max_output_tokens,
+        principal.max_concurrent,
+    ) == (60, ("qwen3.8-flash",), 9, 3)
+    listed = runner.invoke(app, ["keys", "list"], terminal_width=200)
+    assert listed.exit_code == 0 and "同时处理" in listed.stdout
     again = runner.invoke(app, ["keys", "add", "shop", "--user", "x"])
     assert again.exit_code == 1 and "已经有" in again.stderr and again.stdout == ""
     assert path.read_text(encoding="utf-8") == text

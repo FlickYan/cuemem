@@ -1646,3 +1646,38 @@ def test_rate_bucket_survives_reload(tmp_path: Path) -> None:
     clock.now += 1.5  # 重新读入；令牌桶只补回 0.05 个
     assert http.post("/api/x", headers=bearer(B_TOKEN)).status_code == 429
     assert ring.current() is not before  # 确实换上了新的快照
+
+
+def test_new_v1_endpoints_follow_a_reloaded_key_file(ring_app: Ring) -> None:
+    """第六轮两条线合起来：POST /api/v1/context、/api/v1/wait 与带 Idempotency-Key 的写都按
+    KeyRing 当前的快照认令牌：作用域外 403，吊销之后一秒内 401；文件里改了 max_concurrent，
+    BodyLimit 认出的令牌也跟着换。"""
+    from cuemem.api.limits import BodyLimit
+
+    http, path, clock, ring = ring_app
+    auth_b = bearer(B_TOKEN)
+    body = {"messages": "I like tea", "user_id": "bob", "infer": False}
+    keyed = {**auth_b, "Idempotency-Key": "k-1"}
+    first = http.post("/api/v1/memories", json=body, headers=keyed)
+    again = http.post("/api/v1/memories", json=body, headers=keyed)
+    assert first.status_code == 200 and again.json()["status"] == "duplicate"
+    ask = {"query": "tea", "user_id": "bob", "min_level": "l0"}
+    context = http.post("/api/v1/context", json=ask, headers=auth_b)
+    assert context.status_code == 200, context.text
+    outside = {**ask, "user_id": "alice"}
+    assert http.post("/api/v1/context", json=outside, headers=auth_b).status_code == 403
+    wait = {"user_id": "bob", "timeout": 1}
+    assert http.post("/api/v1/wait", json=wait, headers=auth_b).status_code == 200
+    scope = {"type": "http", "headers": [(b"authorization", f"Bearer {B_TOKEN}".encode())]}
+    limit = BodyLimit(http.app, keys=ring)
+    tenant = limit._tenant(scope)
+    assert tenant is not None and tenant.max_concurrent is None
+    _replace(path, RING_KEYS + "    max_concurrent: 2\n")
+    clock.now += 2
+    tenant = limit._tenant(scope)
+    assert tenant is not None and tenant.max_concurrent == 2
+    _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+    clock.now += 2
+    assert http.post("/api/v1/memories", json=body, headers=keyed).status_code == 401
+    assert http.post("/api/v1/context", json=ask, headers=auth_b).status_code == 401
+    assert http.post("/api/v1/wait", json=wait, headers=auth_b).status_code == 401

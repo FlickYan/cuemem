@@ -565,6 +565,7 @@ def key_entry(
     rate_per_minute: int | None = None,
     models: Sequence[str] | None = None,
     max_output_tokens: int | None = None,
+    max_concurrent: int | None = None,
     indent: str = "  ",
 ) -> str:
     """一个限定作用域的令牌的 YAML（块状写法，列表项缩进 indent，以换行结尾）：一项作用域，
@@ -585,6 +586,8 @@ def key_entry(
         lines.append(f"{pad}models: [{', '.join(_yaml_value([m]) for m in models)}]")
     if max_output_tokens is not None:
         lines.append(f"{pad}max_output_tokens: {max_output_tokens}")
+    if max_concurrent is not None:
+        lines.append(f"{pad}max_concurrent: {max_concurrent}")
     return "\n".join(lines) + "\n"
 
 

@@ -1211,6 +1211,13 @@ def keys_add(
     max_output_tokens: Annotated[
         int | None, typer.Option(min=1, help="记忆代理转发的 max_tokens 上限")
     ] = None,
+    max_concurrent: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="同时在处理的请求最多这么多个（429）；不给时用 CUEMEM_MAX_CONCURRENT_PER_KEY",
+        ),
+    ] = None,
     file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
 ) -> None:
     """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
@@ -1245,6 +1252,7 @@ def keys_add(
             rate_per_minute=rate_per_minute,
             models=models,
             max_output_tokens=max_output_tokens,
+            max_concurrent=max_concurrent,
             indent=indent,
         )
 
@@ -1305,13 +1313,14 @@ def keys_list(
         console.print("没有设置限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）")
         return
     table = Table(title=f"{escape(where)}：{len(keys.names)} 个令牌")
-    for column in ("名字", "作用域", "每分钟写", "模型", "max_output_tokens"):
+    for column in ("名字", "作用域", "每分钟写", "同时处理", "模型", "max_output_tokens"):
         table.add_column(column)
     for _, p in keys.scoped:
         table.add_row(
             escape(p.name),
             escape("；".join(_scope_text(s) for s in p.scopes)),
             str(p.rate_per_minute or "—"),
+            str(p.max_concurrent or "—"),
             escape(", ".join(p.models)) if p.models is not None else "—",
             str(p.max_output_tokens or "—"),
         )
