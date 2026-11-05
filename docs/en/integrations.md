@@ -164,6 +164,7 @@ delete_all(memory, user_id="alice")  # memories and Claude's files, together
 - **Removing a line from a file** records "this no longer holds"; extraction and reconciliation decide what follows. Only deleting the whole file is a guaranteed forget.
 - **Provider failures after the note is logged:** if extraction fails once a change has been written as a note (say, the provider is out of balance), the file change still succeeds and the note is logged once; extraction finishes on the next consolidation. A delete whose rebuild fails after the deletion also succeeds, and says that the rebuild finishes later.
 - **Export:** Claude's files are not in `Memory.export`, which only has the notes in the raw log.
+- **anthropic 2.3 and later:** `tool_runner` keeps the conversation in a thread the server holds by default, so the requests within one turn after the first send only the new messages (the earlier ones, evidence block included, stay as sent). The pattern above still starts each turn from the full `history`. Pass `thread=False` to `tool_runner` to send the whole history with every request, as 1.x did.
 
 ## Limitations
 
