@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import errno
+import functools
 import gc
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -81,6 +83,10 @@ class VectorStore:
                 # 以前原样抛出 sqlite3.OperationalError（不是 CueMemError）：cuemem serve、proxy
                 # 与 migrate-vectors 都打印调用栈退出，看不出是打开的文件太多
                 raise _open_failed(path, exc) from exc
+            except (ValueError, KeyError, TypeError) as exc:
+                # meta.json 读不出（多半是空的：qdrant-client 1.19 每次建、删集合都先清空它再写，
+                # 正好在这时被杀掉）。以前原样抛出 JSONDecodeError，cuemem export 也用不了
+                raise _meta_unreadable(path, exc) from exc
         # 统一加锁：本地模式不是线程安全的；服务端模式下同步客户端被多个线程同时使用也会出错
         # （N11 压测里出现 "Bad file descriptor"）
         self._lock = threading.RLock()
@@ -160,7 +166,9 @@ class VectorStore:
             )
         with self._lock:
             self.ensure_space(space_id)
-            self._client.upsert(self.collection_name(space_id), points=points)
+            name = self.collection_name(space_id)
+            with self._batched(name):
+                self._client.upsert(name, points=points)
 
     def search_dense(
         self,
@@ -201,6 +209,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return 0
+            self._fast_kind_mask(name)
             return int(self._client.count(name, count_filter=_build_filter(kinds, None)).count)
 
     def delete(self, space_id: str, unit_ids: Sequence[str]) -> None:
@@ -211,10 +220,11 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return
-            self._client.delete(
-                name,
-                points_selector=models.PointIdsList(points=[point_uuid(u) for u in unit_ids]),
-            )
+            with self._batched(name):
+                self._client.delete(
+                    name,
+                    points_selector=models.PointIdsList(points=[point_uuid(u) for u in unit_ids]),
+                )
 
     def set_payload(self, space_id: str, unit_ids: Sequence[str], payload: dict[str, Any]) -> None:
         """更新若干点的 payload，例如事实被取代后把 current 改为 False，供过滤检索使用。"""
@@ -224,9 +234,10 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return
-            self._client.set_payload(
-                name, payload=payload, points=[point_uuid(u) for u in unit_ids]
-            )
+            with self._batched(name):
+                self._client.set_payload(
+                    name, payload=payload, points=[point_uuid(u) for u in unit_ids]
+                )
 
     # ---------- 图片向量（N6）：每个空间另建一个集合，维度与文本向量不同 ----------
 
@@ -259,7 +270,8 @@ class VectorStore:
                             )
                         },
                     )
-            self._client.upsert(name, points=points)
+            with self._batched(name):
+                self._client.upsert(name, points=points)
 
     def search_images(self, space_id: str, vector: FloatArray, k: int) -> list[VectorHit]:
         """以文搜图 / 以图搜图：返回（图片 ID，余弦相似度）。"""
@@ -267,6 +279,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return []
+            self._fast_kind_mask(name)
             response = self._client.query_points(
                 name, query=vector.tolist(), using=DENSE, limit=k, with_payload=["media_id"]
             )
@@ -283,13 +296,69 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return
-            self._client.delete(
-                name,
-                points_selector=models.PointIdsList(points=[point_uuid(m) for m in media_ids]),
-            )
+            with self._batched(name):
+                self._client.delete(
+                    name,
+                    points_selector=models.PointIdsList(points=[point_uuid(m) for m in media_ids]),
+                )
 
     def _image_collection(self, space_id: str) -> str:
         return f"{self.collection_name(space_id)}{IMAGE_SUFFIX}"
+
+    @contextmanager
+    def _batched(self, name: str) -> Iterator[None]:
+        """一次写入（upsert、delete、set_payload）只提交一次本地模式的 SQLite（调用方持有
+        self._lock）。qdrant-client 的本地模式每写一个点提交一次（CollectionPersistence.persist
+        与 delete），默认的回滚日志加 synchronous=FULL，每个点一次 fsync：遗忘一次删掉 1 万个
+        派生向量，全程拿着 self._lock，别的用户的检索最多等了 13.6 秒（第五轮体检）。这里把
+        这个集合的连接换成 commit 什么都不做的替身，做完再提交一次；点、顺序与内容都不变。
+
+        出错时也提交：内存里的集合已经改了，写下已经写的，磁盘与内存才一致（与以前每个点一提交
+        相同）。进程中途被杀时这一次写入在磁盘上整个没有（以前留下前面一部分点）：遗忘先删向量、
+        后删记录，这等于什么都没删，正是遗忘当作安全的状态。
+
+        用的是 qdrant-client 的内部属性（QdrantLocal.collections、LocalCollection.storage、
+        CollectionPersistence.storage）：对不上时（服务端模式、只放在内存里、以后的 qdrant-client
+        改了）照旧每个点提交一次。"""
+        local = getattr(self._client, "_client", None) if not self.remote and self._path else None
+        collection = getattr(local, "collections", {}).get(name) if local is not None else None
+        persistence: Any = getattr(collection, "storage", None)
+        real = getattr(persistence, "storage", None)
+        if not isinstance(real, sqlite3.Connection):
+            yield
+            return
+        persistence.storage = _NoCommit(real)
+        try:
+            yield
+        finally:
+            persistence.storage = real
+            real.commit()
+
+    def _fast_kind_mask(self, name: str) -> None:
+        """给本地模式的这个集合换上按 kind 过滤的快速掩码（调用方持有 self._lock，见 _fast_mask）。
+
+        只改这一个集合对象（不改 LocalCollection 类：同一进程里别的 QdrantClient(path=...)，
+        例如 M0 基线的 mem0，照旧）；每次检索前看一眼，delete_space 之后重建的集合与启动时打开的
+        集合都会换上。用的是 qdrant-client 的内部属性：对不上时（服务端模式、以后的 qdrant-client
+        改了）什么都不做，照旧用上游的逐点过滤。"""
+        if self.remote:
+            return
+        local = getattr(self._client, "_client", None)
+        collection = getattr(local, "collections", {}).get(name)
+        if collection is None or getattr(collection, "_cuemem_fast_mask", False):
+            return
+        upstream = getattr(collection, "_payload_and_non_deleted_mask", None)
+        if not (
+            callable(upstream)
+            and isinstance(getattr(collection, "payload", None), list)
+            and isinstance(getattr(collection, "deleted", None), np.ndarray)
+            and isinstance(getattr(collection, "deleted_per_vector", None), dict)
+        ):
+            return
+        collection._payload_and_non_deleted_mask = functools.partial(
+            _fast_mask, collection, upstream
+        )
+        collection._cuemem_fast_mask = True
 
     @contextmanager
     def _creating(self) -> Iterator[None]:
@@ -326,12 +395,13 @@ class VectorStore:
         return out
 
     def unit_ids(self, space_id: str, *, kinds: Sequence[str] | None = None) -> list[str]:
-        """列出空间里的全部记忆单元 ID（测试与一致性检查用）。"""
+        """列出空间里的全部记忆单元 ID（测试、一致性检查与 reindex 用）。"""
         name = self.collection_name(space_id)
         out: list[str] = []
         with self._lock:
             if not self._client.collection_exists(name):
                 return out
+            self._fast_kind_mask(name)
             offset = None
             while True:
                 points, offset = self._client.scroll(
@@ -343,6 +413,22 @@ class VectorStore:
                     with_vectors=False,
                 )
                 out.extend(str(p.payload["unit_id"]) for p in points if p.payload)
+                if offset is None:
+                    return out
+
+    def media_ids(self, space_id: str) -> list[str]:
+        """列出空间的图片集合里的全部图片 ID（一致性检查与 reindex 用）。"""
+        name = self._image_collection(space_id)
+        out: list[str] = []
+        with self._lock:
+            if not self._client.collection_exists(name):
+                return out
+            offset = None
+            while True:
+                points, offset = self._client.scroll(
+                    name, limit=256, offset=offset, with_payload=["media_id"], with_vectors=False
+                )
+                out.extend(str(p.payload["media_id"]) for p in points if p.payload)
                 if offset is None:
                     return out
 
@@ -382,7 +468,7 @@ class VectorStore:
                     for r in records
                 ]
                 if points:
-                    with target._lock:
+                    with target._lock, target._batched(name):
                         target._client.upsert(name, points=points)
                 counts[name] += len(points)
                 if offset is None:
@@ -414,6 +500,7 @@ class VectorStore:
         with self._lock:
             if not self._client.collection_exists(name):
                 return []
+            self._fast_kind_mask(name)
             response = self._client.query_points(
                 name,
                 query=query,
@@ -427,6 +514,86 @@ class VectorStore:
             for point in response.points
             if point.payload
         ]
+
+
+class _NoCommit:
+    """本地模式集合的 SQLite 连接的替身：commit 什么都不做，其余原样交给连接（见 _batched）。"""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def commit(self) -> None:
+        pass
+
+    # 较新的 qdrant-client（1.20 起）在 persist 与 delete 里写 `with self.storage:`，用连接自己的
+    # 上下文管理器提交或回滚；特殊方法不经过 __getattr__，要在这里写出来。进入与退出都不提交：
+    # 和 commit 一样留给 _batched 最后提交一次（出错时也提交已经写下的，见 _batched）。
+    def __enter__(self) -> _NoCommit:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def _kind_only(query_filter: Any) -> frozenset[str] | None:
+    """过滤条件只有"kind 是其中之一"（_build_filter 只给 kinds 时的样子）时返回这几个 kind，
+    别的过滤条件（带 ts 范围、should、must_not 等）返回 None。"""
+    if not isinstance(query_filter, models.Filter):
+        return None
+    if query_filter.should or query_filter.must_not or query_filter.min_should:
+        return None
+    must = query_filter.must
+    conditions = must if isinstance(must, list) else [must]
+    if len(conditions) != 1:
+        return None
+    condition = conditions[0]
+    if not (
+        isinstance(condition, models.FieldCondition)
+        and condition.key == "kind"
+        and isinstance(condition.match, models.MatchAny)
+        and all(isinstance(kind, str) for kind in condition.match.any)
+        and condition.range is None
+        and condition.geo_bounding_box is None
+        and condition.geo_radius is None
+        and condition.geo_polygon is None
+        and condition.values_count is None
+        and condition.is_empty is None
+        and condition.is_null is None
+    ):
+        return None
+    return frozenset(str(kind) for kind in condition.match.any)
+
+
+def _fast_mask(
+    collection: Any,
+    upstream: Callable[..., Any],
+    payload_filter: models.Filter | None,
+    vector_name: str | None = None,
+) -> Any:
+    """本地模式 LocalCollection._payload_and_non_deleted_mask 的替身，结果与上游逐位相同。
+
+    上游对每个点在 Python 里跑一遍 check_filter（每个点约 10 微秒），L1 每种 kind 检索一次，
+    全程拿着 VectorStore 的全局锁：2 万个点的空间每次检索单是过滤就要 0.2 秒以上（第五轮体检）。
+    只按 kind 过滤、而且每个点的 kind 都是字符串时，这里直接比较字符串（与上游的 MatchAny 对
+    字符串的判断相同）；别的过滤条件、或者有点的 kind 不是字符串（上游对列表逐个元素匹配）时
+    照旧交给上游。"""
+    from qdrant_client.local.payload_filters import validate_filter
+
+    wanted = _kind_only(payload_filter)
+    if wanted is None:
+        return upstream(payload_filter, vector_name)
+    validate_filter(payload_filter)
+    kinds = [payload.get("kind") for payload in collection.payload]
+    if not all(isinstance(kind, str) for kind in kinds):
+        return upstream(payload_filter, vector_name)
+    mask = np.fromiter((kind in wanted for kind in kinds), dtype=bool, count=len(kinds))
+    mask = mask & ~collection.deleted
+    if vector_name is not None:
+        mask = mask & ~collection.deleted_per_vector[vector_name]
+    return mask
 
 
 def _safe(space_id: str) -> str:
@@ -470,6 +637,163 @@ def _open_failed(
         f" ulimit -n（不够时连硬上限一起调）让它打得开，再用 {migrate} 把向量复制到 Qdrant"
         " 服务端，并设置 CUEMEM_VECTOR_STORE__URL（见 docs/design.md 的部署一节）"
     )
+
+
+def _meta_unreadable(path: Path, exc: Exception) -> VectorStoreOpenError:
+    """本地模式的 meta.json 读不出时的出错：向量还在，写明怎么修、不要删 meta.json。先放掉打开到
+    一半的集合（同 _open_failed）。"""
+    traceback.clear_frames(exc.__traceback__)
+    gc.collect()
+    return VectorStoreOpenError(
+        f"本地模式的向量库 {path / 'meta.json'} 读不出（{type(exc).__name__}: {exc}），向量还在"
+        f" {path / 'collection'} 下面：运行 {cli_command('doctor --repair-vectors')} 按这些集合"
+        "重写 meta.json。不要手动删掉 meta.json：Qdrant 会写一个空的，这些集合就再也找不到了"
+        f"（{cli_command('export')} 不用向量库，照样能导出）"
+    )
+
+
+def _valid_collection(entry: Any) -> bool:
+    """meta.json 里一个集合的配置 Qdrant 打开时认不认（QdrantLocal 载入时同样构造
+    CreateCollection）。"""
+    try:
+        models.CreateCollection(**entry)
+    except (ValueError, TypeError):  # pydantic 的 ValidationError 是 ValueError
+        return False
+    return True
+
+
+def repair_local_meta(path: Path, *, text_dim: int, image_dim: int) -> dict[str, Any] | None:
+    """按 collection/ 下的集合重写本地模式的 meta.json（cuemem doctor --repair-vectors）。
+
+    只在 meta.json 读不出、不在了、或者漏了 collection/ 下的集合时动手，否则返回 None。直接删掉
+    meta.json 不行：Qdrant 会写一个空的，旧集合没人认，下次写入在同名目录上重新建集合。另一个
+    进程开着这个向量库时（.lock 被锁着）拒绝：StorageLockedError。
+
+    meta.json 读得出、Qdrant 认的部分原样保留（某个集合的配置不合法时当作漏了它）；其余集合的
+    配置照 VectorStore 建集合时的写：文字集合 dense（余弦）加 sparse，图片集合（名字以
+    IMAGE_SUFFIX 结尾）只有 dense。dense 的维度从存着的一个点读（只读打开；不同向量模型的构建
+    可以并存，不能用现在的配置），空集合用 text_dim 或 image_dim。原来的 meta.json 改名为
+    meta.json.broken-<时间>，新文件先写临时文件、fsync 再换上，写完重新打开核对一遍。返回补上
+    的文字、图片与空集合数、点数与备份的位置。"""
+    import time
+
+    import portalocker
+    from qdrant_client._pydantic_compat import to_dict
+
+    meta = path / "meta.json"
+    root = path / "collection"
+    names = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+    try:
+        kept = dict(json.loads(meta.read_text("utf-8"))["collections"])
+    except FileNotFoundError:
+        kept = {}
+    except (ValueError, KeyError, TypeError):
+        kept = None  # 读不出：整个重写
+    # 读得出、某个集合的配置却不合法（Qdrant 打开时 ValidationError，VectorStore 报 meta.json
+    # 读不出）：当作漏了，照存着的点重写（第五轮复审：以前原样保留、返回 None，说好的修复什么
+    # 都不做，向量库一直打不开）
+    invalid = [name for name, entry in (kept or {}).items() if not _valid_collection(entry)]
+    if kept is not None:
+        kept = {name: entry for name, entry in kept.items() if name not in invalid}
+    if kept is not None and not invalid and all(name in kept for name in names):
+        return None
+    lock_path = path / ".lock"
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as lock:  # 与 qdrant-client 打开时加的是同一把锁
+        flags = portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING
+        try:
+            portalocker.lock(lock, flags)
+        except portalocker.exceptions.LockException as exc:
+            raise StorageLockedError(
+                f"向量库 {path} 正被另一个进程使用：先停掉那个进程（比如正在运行的 cuemem serve）"
+                "再修"
+            ) from exc
+        try:
+            collections = dict(kept or {})
+            report = {"text": 0, "image": 0, "empty": 0, "points": 0}
+            for name in names:
+                if name in collections:
+                    continue
+                image = name.endswith(IMAGE_SUFFIX)
+                size, points = _stored_dim(root / name / "storage.sqlite")
+                if size is None:
+                    size = image_dim if image else text_dim
+                    report["empty"] += 1
+                report["image" if image else "text"] += 1
+                report["points"] += points
+                dense = models.VectorParams(size=size, distance=models.Distance.COSINE)
+                config = models.CreateCollection(
+                    vectors={DENSE: dense},
+                    sparse_vectors=None if image else {SPARSE: models.SparseVectorParams()},
+                    metadata=None,
+                )
+                collections[name] = to_dict(config)
+            # 与 qdrant-client 1.19 的 QdrantLocal._save 写的一样
+            text = json.dumps({"collections": collections, "aliases": {}})
+            backup = None
+            if meta.exists():
+                backup = meta.with_name(f"meta.json.broken-{time.strftime('%Y%m%d-%H%M%S')}")
+                meta.rename(backup)
+            tmp = meta.with_name("meta.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, meta)
+            with suppress(OSError):  # 目录项也落盘（Windows 上打不开目录，跳过）
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        finally:
+            portalocker.unlock(lock)
+    client = QdrantClient(path=str(path))  # 核对：打得开、集合都在
+    try:
+        found = {c.name for c in client.get_collections().collections}
+    finally:
+        client.close()
+    if found != set(collections):
+        raise VectorStoreOpenError(
+            f"重写 {meta} 之后集合对不上：{sorted(set(collections) ^ found)}"
+        )
+    return {**report, "backup": str(backup) if backup else None}
+
+
+def _stored_dim(storage: Path) -> tuple[int | None, int]:
+    """集合文件里一个点的 dense 维度（没有点时 None）与点数。只读打开；只读打不开时（被杀掉时留下
+    了回滚日志，只读模式回滚不了）照常打开，Qdrant 下次打开时也是这样回滚的。"""
+    if not storage.is_file():
+        return None, 0
+    try:
+        conn = sqlite3.connect(f"{storage.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row, count = _first_point(conn)
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(storage)
+        try:
+            row, count = _first_point(conn)
+        finally:
+            conn.close()
+    if row is None:
+        return None, 0
+    import pickle
+
+    point = pickle.loads(row)  # Qdrant 本地模式自己的格式（LocalCollection 也是这样读的）
+    vector = point.vector.get(DENSE) if isinstance(point.vector, dict) else None
+    if not isinstance(vector, list) or not vector:
+        raise VectorStoreOpenError(f"{storage} 里的点没有 {DENSE} 向量，不是 CueMem 建的集合")
+    return len(vector), count
+
+
+def _first_point(conn: sqlite3.Connection) -> tuple[bytes | None, int]:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'points'").fetchone():
+        return None, 0
+    count = int(conn.execute("SELECT COUNT(*) FROM points").fetchone()[0])
+    row = conn.execute("SELECT point FROM points LIMIT 1").fetchone()
+    return (bytes(row[0]) if row else None), count
 
 
 def _build_filter(

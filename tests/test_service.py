@@ -802,6 +802,47 @@ def test_forget_restatement_does_not_take_its_round_along(
     assert not any("October 3" in s for s in statements)
 
 
+def _out_of_range(header: str) -> Any:
+    """复述检查回答了列表之外的编号（从 1 开始编号，0 与 99 都不在里面）。"""
+    return lambda prompt: {"same": [0, 99]} if header in prompt else {"same": []}
+
+
+def test_out_of_range_verdict_numbers_delete_nothing(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """在日志里找转述时模型回答了列表之外的编号：一条都不算。守卫写错成 n <= len 时，编号 0
+    取到列表的最后一条（turns[-1]），删掉一条无关的发言（第五轮体检的变异测试）。"""
+    replies = ["Happy early birthday!", "Great pick. Ana turns 30 on October 3.", "Nice!"]
+    fact_id = _birthday_chat(service, model, replies)
+    asked: list[str] = []
+    check = _out_of_range("Conversation excerpts:")
+
+    def regrown(prompt: str) -> dict[str, Any]:
+        asked.append(prompt)
+        return dict(check(prompt))
+
+    model.regrown = regrown
+    before = len(service.system.db.get_turns("shop"))
+    report = service.forget("shop", fact_ids=[fact_id])
+    assert any("Conversation excerpts:" in p for p in asked)  # 真的问过
+    assert report.restated == 0 and report.turns_deleted == 2  # 只删出处那一轮
+    assert len(service.system.db.get_turns("shop")) == before - 2
+
+
+def test_out_of_range_regrown_numbers_delete_nothing(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """重建之后的兜底检查同样只认列表里的编号：0 不能取到最后一个候选、删掉它的出处。"""
+    fact_id = _birthday_chat(
+        service, model, ["Happy early birthday!", "Great pick. Ana turns 30 on October 3.", "Nice!"]
+    )
+    model.regrown = _out_of_range("Remaining facts:")
+    report = service.forget("shop", fact_ids=[fact_id])
+    assert report.regrown == 0 and report.turns_deleted == 2
+    statements = [f["statement"] for f in service.facts("shop")]
+    assert "Great pick. Ana turns 30 on October 3." in statements  # 兜底没有认出它
+
+
 # ---------- HTTP 接口 ----------
 
 

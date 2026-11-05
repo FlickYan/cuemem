@@ -45,17 +45,29 @@ def _replace_private(path: Path, text: str) -> None:
     以前就地重写之后才 chmod 0600：cp .env.example .env 得到的是 0644，别的本地用户在这之前打开
     的文件描述符照样读到新写的 Key。换名之后 Key 从来不在别人能读的 inode 里，之前打开的描述符
     只看得到旧内容。path 是符号链接时替换它指向的文件，链接留着。"""
+    path.resolve().parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(atomic_write_text(path, text), 0o600)
+
+
+def atomic_write_text(path: Path, text: str, *, fsync: bool = False) -> Path:
+    """把 text 写进同一目录下的临时文件（mkstemp：0600），再换名替换 path，返回替换的文件。
+
+    写到一半出错（磁盘满、EIO）时 path 原样不动，临时文件删掉。fsync 时换名之前先落盘（备份
+    要的是能恢复）。path 是符号链接时替换它指向的文件，链接留着。只用于普通文件：/dev/stdout、
+    FIFO 之类由调用方直接写。"""
     target = path.resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, target)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
-    os.chmod(target, 0o600)
+    return target
 
 
 def mask(secret: str) -> str:

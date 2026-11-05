@@ -665,7 +665,7 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
 
     def _generated(self, state: _State) -> dict[str, str]:
         """生成的只读文件：profile.md、facts.md，以及 history/ 里有过变化的事实。"""
-        facts = self.memory.system.facts(self.space)
+        facts = self._facts()
         chains = _chains(facts)
         source = {n.turn_id: n.path for n in state.notes}
         source.update({n.turn_id: f"{n.path} (removed)" for n in state.orphans})
@@ -676,15 +676,24 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
             out[f"{HISTORY}/{chain[-1].id}.md"] = _history_file(chain)
         return out
 
+    def _facts(self) -> list[Fact]:
+        """这个空间的事实，去掉已经过期的（facts.md 与 history/ 不给，同 recall；空间里没有
+        过期的记忆时原样不动）。"""
+        system = self.memory.system
+        facts = system.facts(self.space)
+        gone = system.expired_ids(self.space, datetime.now())
+        return [f for f in facts if f.id not in gone] if gone else facts
+
     def _profile(self) -> str:
-        core = self.memory.system.core_memory(self.space)
+        system = self.memory.system
+        core = system.visible_core(self.space, system.core_memory(self.space), datetime.now())
         text = core.text if core is not None and core.text else ""
         return PROFILE_HEAD + (text or "Nothing is known about the user yet.") + "\n"
 
     def _history(self, path: str) -> str:
         """history/<事实 ID>.md：这条事实所在的整条版本链（只认这个空间的事实）。"""
         fact_id = path[len(HISTORY) + 1 : -len(".md")]
-        chains = _chains(self.memory.system.facts(self.space))
+        chains = _chains(self._facts())
         if fact_id not in chains:
             raise ToolError(f"The path {path} does not exist. Please provide a valid path.")
         return _history_file(chains[fact_id])

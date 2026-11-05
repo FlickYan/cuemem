@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import email.utils
+import json
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -130,6 +131,78 @@ def test_structured_output_gives_up(settings: Settings, fake_api: FakeAPI) -> No
     with pytest.raises(StructuredOutputError):
         make_client(settings, fake_api).structured("extractor", HELLO, Pet, max_attempts=2)
     assert len(fake_api.chat_requests) == 2
+
+
+def _structured_schemas() -> list[type[BaseModel]]:
+    """各调用方传给 structured() 的 Schema 类（都是模块级的静态类）。"""
+    from cuemem.memory import RegrownOutput
+    from cuemem.read.controller import RouterOutput
+    from cuemem.read.l2 import CheckOutput
+    from cuemem.read.plan import PlanOutput
+    from cuemem.read.reader import NotedReaderOutput, ReaderOutput
+    from cuemem.write.caption import CaptionOutput
+    from cuemem.write.entities import EntityMatches
+    from cuemem.write.extract import ExtractionOutput
+    from cuemem.write.reconcile import LLMDecisions
+
+    return [
+        CaptionOutput,
+        ExtractionOutput,
+        LLMDecisions,
+        EntityMatches,
+        RegrownOutput,
+        RouterOutput,
+        PlanOutput,
+        ReaderOutput,
+        NotedReaderOutput,
+        CheckOutput,
+    ]
+
+
+@pytest.mark.parametrize("schema", _structured_schemas(), ids=lambda s: s.__name__)
+def test_schema_instruction_text_is_unchanged(schema: type[BaseModel]) -> None:
+    # 缓存的 Schema 文本与每次现算的逐字节相同：请求字节、缓存键不变（发表的数字从缓存重放）
+    text = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    instruction = (
+        "Output format: reply with one JSON object only, without markdown fences, "
+        f"conforming to this JSON Schema:\n{text}"
+    )
+    with_system = [{"role": "system", "content": "S"}, *HELLO]
+    for _ in range(2):  # 第二次走缓存
+        assert llm_client._with_schema_instruction(with_system, schema) == [
+            {"role": "system", "content": f"S\n\n{instruction}"},
+            *HELLO,
+        ]
+        assert llm_client._with_schema_instruction(HELLO, schema) == [
+            {"role": "system", "content": instruction},
+            *HELLO,
+        ]
+
+
+def test_schema_text_is_built_once_per_class(
+    settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # pydantic 每次调用 model_json_schema() 都重新生成（约 2 ms），缓存命中的请求也要付
+    from cuemem.write.extract import ExtractionOutput
+
+    original = ExtractionOutput.model_json_schema
+    calls: list[int] = []
+
+    def counting(cls: type[BaseModel], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ExtractionOutput, "model_json_schema", classmethod(counting))
+    llm_client._schema_text.cache_clear()
+    try:
+        fake_api.chat_replies = ['{"summary": "s"}']
+        client = make_client(settings, fake_api)
+        for _ in range(2):  # 第二次命中回复缓存，不发请求，但以前仍要重新生成 Schema
+            client.structured("extractor", HELLO, ExtractionOutput)
+        assert len(fake_api.chat_requests) == 1
+        assert len(calls) == 1
+    finally:
+        llm_client._schema_text.cache_clear()
 
 
 def test_missing_api_key(

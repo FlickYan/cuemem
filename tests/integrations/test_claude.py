@@ -251,6 +251,17 @@ def test_edits_supersede_facts_and_history_keeps_every_version(
     assert "jazz" not in run(tool, command="view", path="/memories/about_me.md")
 
 
+def test_generated_files_leave_out_expired_memories(memory: Memory, tool: CueMemMemoryTool) -> None:
+    """第五轮复审：profile.md 与 facts.md 以前读原样的画像与全部事实，SDK 写入时给了过期时间、
+    已经过期的事实照样列着（recall 不给）。"""
+    memory.add("I live in Berlin", user_id="alice", expiration_date="2020-01-01", wait=True)
+    memory.add("I like jazz", user_id="alice", wait=True)
+    assert "Berlin" in memory.system.core_memory("alice").text  # type: ignore[union-attr]
+    for path in ("/memories/profile.md", "/memories/facts.md"):
+        shown = run(tool, command="view", path=path)
+        assert "Berlin" not in shown and "jazz" in shown, path
+
+
 def test_history_only_shows_facts_of_this_user(memory: Memory, tool: CueMemMemoryTool) -> None:
     with CueMemMemoryTool(memory, user_id="bob", wait=True) as bob:
         run(bob, command="create", path="/memories/me.md", file_text="- The user likes tea.\n")

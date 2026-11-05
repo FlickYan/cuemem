@@ -22,6 +22,11 @@ version 1 的文件照样能导入（没有附加信息）。edit_of 指向的�
 到同名的空间、抽取结果相同时对得上，更正照样取代原来那条；导入到别的空间或换了抽取模型时对不上，
 那句 "Correction: …" 就按普通的话对账（单值的事实交给 LLM 判断是不是更正）。
 
+会话可以带 "infer": false（只在为 false 时写）：源空间里只写了原始日志、没有登记巩固任务的会话
+（SDK 的 add(infer=False)）。导入时同样不登记任务，后台线程不去抽取它，显式的巩固（consolidate、
+load(wait=True)、cuemem import --consolidate）照样抽取，与源空间相同。进行中的会话不带这个键。
+version 仍是 2：导入时只拒绝更新的 version，旧版本的 CueMem 忽略这个键（照样抽取）。
+
 derived 只是给别的系统读的快照（带版本链的事实与画像），导入时不用它。没有导出的：回复引用了
 哪些记忆的溯源表（导入后事实 ID 会重新生成，对不上）；遗忘时沿引用扩散因此对导入的空间不起作用，
 按内容找转述（D-051）照常工作。
@@ -48,8 +53,9 @@ from PIL import Image
 
 from cuemem.core.models import SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.core.timeutil import normalize_expiry
-from cuemem.memory import MemorySystem
+from cuemem.memory import MemorySystem, _open_mark
 from cuemem.store.media import ACCEPTED_FORMATS
+from cuemem.store.sqlite import MemoryDB
 
 FORMAT = "cuemem.space"
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
@@ -66,23 +72,31 @@ _FORMAT_SUFFIX = {
 }
 
 
-def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -> dict[str, Any]:
-    """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。"""
-    sessions = system.db.get_sessions(space_id)
+def export_space(
+    system: MemorySystem | MemoryDB, space_id: str, *, derived: bool = True
+) -> dict[str, Any]:
+    """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。
+
+    只读数据库与原图，不用向量库：cuemem export 只打开数据库（向量库打不开、或者 serve 正开着
+    它的时候也能导出）。"""
+    db = system if isinstance(system, MemoryDB) else system.db
+    sessions = db.get_sessions(space_id)
     if not sessions:
         raise KeyError(f"No memory space {space_id}")
-    media = {m.id: m for m in system.db.get_media(space_id)}
-    meta = system.db.get_turn_meta(space_id)
+    media = {m.id: m for m in db.get_media(space_id)}
+    meta = db.get_turn_meta(space_id)
+    log_only = _log_only(system, space_id)
     out_sessions = []
     for session_id, started_at in sorted(sessions.items(), key=lambda item: item[1]):
-        turns = system.db.get_turns(space_id, session_id)
-        out_sessions.append(
-            {
-                "session_id": session_id,
-                "started_at": started_at.isoformat(),
-                "turns": [_turn_out(t, media, meta.get(t.id)) for t in turns],
-            }
-        )
+        turns = db.get_turns(space_id, session_id)
+        out: dict[str, Any] = {
+            "session_id": session_id,
+            "started_at": started_at.isoformat(),
+            "turns": [_turn_out(t, media, meta.get(t.id)) for t in turns],
+        }
+        if turns and session_id in log_only:
+            out["infer"] = False
+        out_sessions.append(out)
     data: dict[str, Any] = {
         "format": FORMAT,
         "version": VERSION,
@@ -91,15 +105,28 @@ def export_space(system: MemorySystem, space_id: str, *, derived: bool = True) -
         "sessions": out_sessions,
     }
     if derived:
-        core = system.core_memory(space_id)
+        core = db.get_core_memory(space_id)
         data["derived"] = {
             "facts": [
                 f.model_dump(mode="json", exclude={"space_id", "entity_ids"})
-                for f in system.facts(space_id)
+                for f in db.get_facts(space_id)
             ],
             "profile": core.text if core is not None else "",
         }
     return data
+
+
+def _log_only(system: MemorySystem | MemoryDB, space_id: str) -> set[str]:
+    """只写了原始日志、没有登记过巩固任务的会话（SDK 的 add(infer=False)）。进行中的会话与崩溃时
+    留下标记的会话除外：它们在导入的空间里不再进行中，照常登记任务、抽取。只给了数据库时（cuemem
+    export）进行中的会话只看数据库里的标记：别的进程开着的 run 都留了标记。"""
+    db = system if isinstance(system, MemoryDB) else system.db
+    jobbed = {job["session_id"] for job in db.get_jobs(space_id)}
+    prefix = _open_mark(space_id)
+    held = {key.removeprefix(prefix) for key in db.meta_keys(prefix)}
+    if isinstance(system, MemorySystem):
+        held |= system._held(space_id)
+    return set(db.get_sessions(space_id)) - jobbed - held
 
 
 def import_space(
@@ -121,14 +148,17 @@ def import_space(
     turns_added = images_added = 0
     with tempfile.TemporaryDirectory(prefix="cuemem-import-") as scratch:
         try:
-            target, chunks, meta = _parse_export(data, space_id, Path(scratch))
+            target, chunks, meta, log_only = _parse_export(data, space_id, Path(scratch))
         except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError(f"Malformed export: {type(exc).__name__}: {exc}") from exc
         # 整个文件在一个事务里提交：向量化中途出错时一条都不写，重试从头开始（每段各向量化一次，
         # 与以前逐段写入时的请求相同）
         if chunks:
             extra = meta if any(m is not None for m in meta.values()) else None
-            with system.appending(target, chunks, meta=extra) as report:
+            # 目标空间里已经有任务的会话照常登记（又多了发言时要重新抽取）
+            if log_only:
+                log_only -= {job["session_id"] for job in system.db.get_jobs(target)}
+            with system.appending(target, chunks, meta=extra, log_only=log_only) as report:
                 turns_added, images_added = report.turns_added, report.images_added
     out: dict[str, Any] = {
         "space_id": target,
@@ -143,10 +173,11 @@ def import_space(
 
 def _parse_export(
     data: Mapping[str, Any], space_id: str | None, scratch: Path
-) -> tuple[str, list[tuple[SessionIn, int]], dict[tuple[str, int], TurnMeta | None]]:
+) -> tuple[str, list[tuple[SessionIn, int]], dict[tuple[str, int], TurnMeta | None], set[str]]:
     """导入的第一步：检查格式、读完整个文件（图片写进 scratch），还什么都不写。返回（目标空间，
-    按连续序号分好的段，（会话，序号）→ 附加信息）。文件不可信：缺键、类型不对时抛出 KeyError、
-    TypeError 或 AttributeError，由 import_space 统一改成 ValueError。"""
+    按连续序号分好的段，（会话，序号）→ 附加信息，只写日志、不登记巩固任务的会话）。文件不可信：
+    缺键、类型不对时抛出 KeyError、TypeError 或 AttributeError，由 import_space 统一改成
+    ValueError。"""
     if data.get("format") != FORMAT:
         raise ValueError(f"Not a CueMem export (format must be {FORMAT!r})")
     if int(data.get("version", 0)) > VERSION:
@@ -157,7 +188,13 @@ def _parse_export(
     # 先读完、校验完整个文件再写：有一张坏图时一条发言也不写，不留下导入了一半的空间
     chunks: list[tuple[SessionIn, int]] = []
     meta: dict[tuple[str, int], TurnMeta | None] = {}  # （会话，序号）→ 附加信息
+    log_only: set[str] = set()
     for session in data.get("sessions", []):
+        infer = session.get("infer", True)
+        if not isinstance(infer, bool):  # 文件不可信："no" 之类不当成 False
+            raise TypeError(f"session infer must be a boolean, not {type(infer).__name__}")
+        if infer is False:
+            log_only.add(session["session_id"])
         started = datetime.fromisoformat(session["started_at"])
         # 遗忘留下的序号空缺照原样保留（重新抽取时要标出来，D-059）：按连续的序号分段写入
         ordered = sorted(session["turns"], key=lambda t: int(t["idx"]))
@@ -168,7 +205,7 @@ def _parse_export(
             chunks.append((piece, int(chunk[0]["idx"])))
             for t in chunk:  # 序号重复时与发言一样先写的算（INSERT OR IGNORE）
                 meta.setdefault((piece.session_id, int(t["idx"])), _meta_in(t))
-    return target, chunks, meta
+    return target, chunks, meta, log_only
 
 
 def _turn_out(turn: Turn, media: Mapping[str, Any], meta: TurnMeta | None) -> dict[str, Any]:

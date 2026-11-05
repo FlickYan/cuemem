@@ -11,8 +11,10 @@ import hashlib
 import io
 import json
 import re
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ from cuemem.api.auth import ADMIN, Keys, Principal, Scope
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
+from cuemem.core.models import SessionIn, TurnIn
 from cuemem.errors import AccessKeysError, MemoryAPIError
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for, space_owner
@@ -644,6 +647,53 @@ def test_v1_reset_stays_in_scope(world: World) -> None:
     assert admin.spaces() == [] and world.system.open_sessions("shop/bob") == set()
 
 
+def _finishes(call: Callable[[], Any], seconds: float = 10.0) -> Any:
+    """在另一个线程里调用，seconds 秒内要返回（或抛出）：返回它的结果，抛出的异常照样抛出。"""
+    out: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            out["value"] = call()
+        except BaseException as exc:
+            out["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "still waiting"
+    if "error" in out:
+        raise out["error"]
+    return out["value"]
+
+
+def test_v1_wait_stays_in_scope(world: World) -> None:
+    """POST /api/v1/wait：bob 的抽取还在做时，alice 的令牌不给 user_id 时只等它能访问的空间
+    （马上返回），点名 bob 时 403；管理令牌照样等 bob（timeout 到了是 TimeoutError，同本地的
+    Memory.wait）。以前不看作用域、等全部用户的抽取：alice 的令牌也被 bob 的抽取挡住。"""
+    alice = MemoryClient("http://testserver", api_key=ALICE_TOKEN, http_client=world.http)
+    admin = MemoryClient("http://testserver", api_key=ADMIN_TOKEN, http_client=world.http)
+    worker = world.system.worker
+    assert worker is not None
+    held = world.system.consolidator.exclusive("bob")
+    held.acquire()  # bob 的抽取卡在巩固锁上：一直在 _running 里
+    try:
+        worker.submit("bob")
+        assert _finishes(lambda: alice.wait()) is None
+        assert _finishes(lambda: alice.wait(user_id="alice", timeout=1)) is None
+        _forbidden(lambda: _finishes(lambda: alice.wait(user_id="bob")))
+        with pytest.raises(TimeoutError):
+            _finishes(lambda: admin.wait(timeout=0.2))
+        with pytest.raises(TimeoutError):
+            _finishes(lambda: admin.wait(user_id="bob", timeout=0.2))
+        response = world.http.post(
+            "/api/v1/wait", json={"timeout": 0.1}, headers=bearer(ADMIN_TOKEN)
+        )
+        assert response.status_code == 504 and response.json()["error"]["code"] == "timeout"
+    finally:
+        held.release()
+    assert _finishes(lambda: admin.wait()) is None
+
+
 def test_v1_excerpt_and_image_ids_stay_in_scope(world: World) -> None:
     """按 ID 找的对话片段与图片（search 给出的另外两种 ID）：别人的与不存在的一样，alice 的令牌
     get、media 是 None，delete（含预演）与 update 是 KeyError，bob 的发言一句不少；管理令牌照常
@@ -908,6 +958,13 @@ def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI])
     assert reasoning.status_code == 200
     sent = fake_api.chat_requests[-1]
     assert sent["max_completion_tokens"] == 1000 and sent["max_tokens"] == 1000
+    # 只给 max_completion_tokens：目录里这个模型写 max_tokens，上限也按 max_tokens 写上
+    assert _chat(http, CAPPED_TOKEN, max_completion_tokens=5000).status_code == 200
+    sent = fake_api.chat_requests[-1]
+    assert sent["max_tokens"] == 1000 and sent["max_completion_tokens"] == 1000
+    assert _chat(http, CAPPED_TOKEN, max_completion_tokens=200).status_code == 200
+    sent = fake_api.chat_requests[-1]
+    assert sent["max_tokens"] == 200 and sent["max_completion_tokens"] == 200
     responses = _chat(http, CAPPED_TOKEN, path="/v1/responses", max_output_tokens=9000)
     assert responses.status_code == 200 and fake_api.chat_requests[-1]["max_tokens"] == 1000
     seen = len(fake_api.chat_requests)
@@ -919,6 +976,27 @@ def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI])
     assert _chat(http, PLAIN_TOKEN, **EXPENSIVE).status_code == 200  # 没写的照旧
     assert fake_api.chat_requests[-1]["max_tokens"] == 32768
     assert fake_api.chat_requests[-1]["n"] == 16
+
+
+def test_cap_output_for_max_completion_tokens_models() -> None:
+    """目录里写 max_completion_tokens 的模型（OpenAI 推理模型）：_adapt 把 max_tokens 改名之后
+    _cap_output 压的是 max_completion_tokens，不再补一份 max_tokens。"""
+    from cuemem.api.proxy import _adapt, _cap_output
+    from cuemem.config import ModelSpec, Price
+
+    spec = ModelSpec(
+        provider="openai",
+        model_id="o-test",
+        price=Price(input=1.0, output=1.0),
+        max_tokens_param="max_completion_tokens",
+    )
+    body: dict[str, Any] = {"model": "o-test", "max_tokens": 5000}
+    _adapt(body, spec)
+    _cap_output(body, spec, 1000)
+    assert body == {"model": "o-test", "max_completion_tokens": 1000}
+    body = {"model": "o-test"}
+    _cap_output(body, spec, 1000)
+    assert body == {"model": "o-test", "max_completion_tokens": 1000}
 
 
 def test_scoped_keys_without_limits_forward_the_same_bytes(
@@ -963,9 +1041,13 @@ def test_key_limits_are_validated() -> None:
 # ---------- 界面 ----------
 
 
-def _ui_call(http: TestClient, name: str, data: list[Any]) -> str:
-    """调用界面的一个事件（与浏览器里的界面走同一条路），返回 SSE 的全文。"""
-    posted = http.post(f"/gradio_api/call/{name}", json={"data": data})
+def _ui_call(http: TestClient, name: str, data: list[Any], session: str | None = None) -> str:
+    """调用界面的一个事件（与浏览器里的界面走同一条路），返回 SSE 的全文。session：同一个页面
+    （Gradio 的 session_hash），事件改过的组件（例如下拉框的选项）在同一个页面的后续事件里有效。"""
+    body: dict[str, Any] = {"data": data}
+    if session is not None:
+        body["session_hash"] = session
+    posted = http.post(f"/gradio_api/call/{name}", json=body)
     assert posted.status_code == 200, posted.text
     return http.get(f"/gradio_api/call/{name}/{posted.json()['event_id']}").text
 
@@ -1127,6 +1209,49 @@ def test_ui_rejects_server_side_paths(
     copies = [*(tmp_path / "gradio").rglob(".env"), *(tmp_path / "gradio").rglob("secret.png")]
     assert copies == []  # 没有复制进 Gradio 的缓存
     assert system.db.get_media("alice") == []
+
+
+@pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
+def test_ui_forget(
+    ui_alice: tuple[TestClient, MemorySystem], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """界面的遗忘：按事实、按会话删，什么都没选时提示先选，重建失败时说明删了、只是重建没做完。
+    以前只测了作用域之外的拒绝。"""
+    http, system = ui_alice
+    for n, text in enumerate(("My PIN is 4321.", "I live in Lisbon.", "I play the cello.")):
+        when = datetime(2025, 6, 1 + n)
+        turns = [TurnIn(role="user", text=text, ts=when)]
+        system.append("alice", SessionIn(session_id=f"s{n}", started_at=when, turns=turns), 0)
+    system.consolidate("alice")
+    pin = next(f.id for f in system.facts("alice") if "4321" in f.statement)
+
+    def forget(kind: str, target: str | None) -> str:
+        # 与页面上一样：先按种类列出可选的（下拉框只接受列出来的），再遗忘
+        assert "event: error" not in _ui_call(http, "choices", ["alice", kind], "page")
+        out = _ui_call(http, "forget", ["alice", kind, target], "page")
+        assert "event: error" not in out, out
+        [reply] = _last_data(out)
+        return str(reply)
+
+    out = forget("fact", pin)
+    assert "Forgot 1 conversation turn(s); facts 3 → 2" in out
+    assert not any("4321" in f.statement for f in system.facts("alice"))
+
+    out = forget("session", "s1")
+    assert "Forgot 1 conversation turn(s)" in out and system.db.get_turns("alice", "s1") == []
+
+    out = forget("session", None)
+    assert "Pick something to forget first." in out
+    assert system.db.get_turns("alice", "s2")
+
+    def broken(space_id: str) -> Any:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(system.consolidator, "run", broken)
+    out = forget("session", "s2")
+    assert "Forgot 1 conversation turn(s). Rebuilding the memory" in out
+    assert "failed (" in out and "provider down" in out
+    assert system.db.get_turns("alice", "s2") == []
 
 
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")

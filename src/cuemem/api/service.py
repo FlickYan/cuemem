@@ -250,7 +250,9 @@ class ChatService:
         return self.system.db.list_spaces()
 
     def profile(self, space_id: str) -> str:
-        core = self.system.core_memory(space_id)
+        """画像（MCP 的 profile、GET /api/profile 与界面的画像栏）：去掉已经过期的事实，同 SDK
+        的 profile() 与 recall 里的画像。"""
+        core = self.system.visible_core(space_id, self.system.core_memory(space_id), datetime.now())
         return core.text if core is not None else ""
 
     def facts(self, space_id: str, *, current_only: bool = False) -> list[dict[str, Any]]:
@@ -361,12 +363,12 @@ class ChatService:
     def status(self, space_id: str) -> dict[str, Any]:
         """巩固任务的状态与后台线程最近的出错，都只是这个空间的：以前 errors 是全部空间的最近
         3 条，限定作用域的令牌借自己的空间就看得到别的用户的空间 ID 与出错里引着的模型输出。"""
-        jobs = self.system.db.get_jobs(space_id)
+        counts = self.system.db.job_counts(space_id)  # 只数，不解出每个任务（界面每条消息查一次）
         worker = self.system.worker
         return {
-            "pending": sum(1 for j in jobs if j["status"] == "pending"),
-            "failed": sum(1 for j in jobs if j["status"] == "failed"),
-            "done": sum(1 for j in jobs if j["status"] == "done"),
+            "pending": counts.get("pending", 0),
+            "failed": counts.get("failed", 0),
+            "done": counts.get("done", 0),
             "errors": worker.errors_for(space_id)[-3:] if worker is not None else [],
         }
 

@@ -48,10 +48,14 @@ if TYPE_CHECKING:  # 只用于类型注解：签名与 Memory 逐字相同（tes
 
 DEFAULT_URL = "http://127.0.0.1:7860"  # cuemem serve 的默认地址
 TOKEN_ENV = "CUEMEM_API_TOKEN"
+# wait() 让服务端比客户端的读超时早这么多秒放弃：先收到服务端的 504（TimeoutError），而不是
+# 客户端自己的读超时（见 MemoryClient.wait）
+WAIT_MARGIN_S = 5.0
 _BUILTIN_ERRORS: dict[str, type[Exception]] = {
     "KeyError": KeyError,
     "ValueError": ValueError,
     "TypeError": TypeError,
+    "TimeoutError": TimeoutError,  # POST /wait 的 timeout 到了（504），同本地的 Memory.wait
 }
 
 
@@ -189,9 +193,26 @@ class MemoryClient:
         body = {"user_id": user_id, "agent_id": agent_id, "rebuild": rebuild}
         return self._call("POST", "/consolidate", body=body)
 
-    def wait(self) -> None:
-        """等服务端的后台线程把已登记的抽取做完。"""
-        self._call("POST", "/wait")
+    def wait(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """等服务端的后台线程把已登记的抽取做完（见 Memory.wait）。限定作用域的令牌不给 user_id、
+        agent_id 时只等它能访问的用户。服务端最多等 300 秒（WAIT_TIMEOUT_S），没做完时抛
+        TimeoutError，同本地的 timeout。
+
+        发给服务端的等待时间比这个客户端的读超时短 WAIT_MARGIN_S 秒（不给 timeout 时也是）：
+        以前两边都是 300 秒，服务端等满了才回 504，客户端的读超时差不多同时到，抛的多半是
+        MemoryAPIError（timeout，"may have been processed"），不是 TimeoutError。"""
+        read = getattr(getattr(self._http, "timeout", None), "read", None)
+        if isinstance(read, int | float):  # 读超时为 None（不限）时照旧
+            cap = max(read - WAIT_MARGIN_S, read / 2)
+            timeout = cap if timeout is None else min(timeout, cap)
+        body = {"user_id": user_id, "agent_id": agent_id, "timeout": timeout}
+        self._call("POST", "/wait", body=body)
 
     def status(self, *, user_id: str | None = None, agent_id: str | None = None) -> dict[str, Any]:
         """抽取的状态：待处理与失败的会话、失败的原因（见 Memory.status）。"""
@@ -266,7 +287,7 @@ class MemoryClient:
         agent_id: str | None = None,
         run_id: str | None = None,
         include_superseded: bool = False,
-        valid_at: str | None = None,
+        valid_at: str | date | None = None,
         known_at: datetime | None = None,
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
@@ -281,7 +302,7 @@ class MemoryClient:
             "agent_id": agent_id,
             "run_id": run_id,
             "include_superseded": include_superseded,
-            "valid_at": valid_at,
+            "valid_at": _iso(valid_at),
             "known_at": _iso(known_at),
             "limit": limit,
             "filters": _json_param(filters),
@@ -402,12 +423,45 @@ class MemoryClient:
                 headers=self._headers,
             )
         except httpx2.HTTPError as exc:
-            refused = isinstance(exc, httpx2.ConnectError)
-            hint = "; is `cuemem serve` running there?" if refused else ""
-            raise MemoryAPIError(f"Cannot reach {self.base_url}: {exc}{hint}") from exc
+            raise self._transport_error(exc) from exc
         if response.status_code >= 400:
             raise _error(response, self.base_url)
         return response
+
+    def _transport_error(self, exc: httpx2.HTTPError) -> MemoryAPIError:
+        """没有拿到响应时的出错，按请求有没有送到服务端分开（code 与 sent）：连不上（unreachable，
+        sent=False）时写入一定没做，可以重发；超时（timeout）与连接中途断开（disconnected）时
+        sent=True，写入可能已经提交（add(wait=True) 要等抽取做完，超时多半在发言写下之后），
+        不要盲目重发。以前一律是 "Cannot reach"，只能看 __cause__ 分辨。"""
+        if isinstance(exc, httpx2.ConnectError | httpx2.ConnectTimeout | httpx2.PoolTimeout):
+            hint = (
+                "; is `cuemem serve` running there?" if isinstance(exc, httpx2.ConnectError) else ""
+            )
+            return MemoryAPIError(
+                f"Cannot reach {self.base_url}: {exc}{hint}", code="unreachable", sent=False
+            )
+        if isinstance(exc, httpx2.ReadTimeout | httpx2.WriteTimeout):
+            limit = getattr(self._http, "timeout", None)
+            seconds = getattr(
+                limit, "read" if isinstance(exc, httpx2.ReadTimeout) else "write", None
+            )
+            within = f" within {seconds:g}s" if isinstance(seconds, int | float) else ""
+            return MemoryAPIError(
+                f"No response from {self.base_url}{within}; the request may have been processed "
+                "(do not repeat a write blindly; check get_all/history)",
+                code="timeout",
+                sent=True,
+            )
+        if isinstance(exc, httpx2.RemoteProtocolError | httpx2.ReadError | httpx2.WriteError):
+            return MemoryAPIError(
+                f"Connection to {self.base_url} broke off: {exc}; the request may have been "
+                "processed (do not repeat a write blindly; check get_all/history)",
+                code="disconnected",
+                sent=True,
+            )
+        return MemoryAPIError(
+            f"Request to {self.base_url} failed: {exc}", code="transport", sent=True
+        )
 
 
 class AsyncMemoryClient(AsyncMethods):

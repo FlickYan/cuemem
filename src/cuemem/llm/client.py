@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import email.utils
+import functools
 import json
 import math
 import random
@@ -709,9 +710,18 @@ def _parse_usage(usage: Any) -> Usage:
     )
 
 
+@functools.cache
+def _schema_text(schema: type[BaseModel]) -> str:
+    """Schema 的 JSON 文本，按类缓存：pydantic 每次调用 model_json_schema() 都重新生成
+    （ExtractionOutput 约 2 ms），缓存命中的请求也要付这笔钱，重放、遗忘时成了大头。
+    文本只由类决定，缓存不改变请求字节与缓存键；结构化输出的类都是模块级的静态类，
+    缓存不会无限增长。测试里改了某个 Schema 类时要调用 _schema_text.cache_clear()。"""
+    return json.dumps(schema.model_json_schema(), ensure_ascii=False)
+
+
 def _with_schema_instruction(messages: list[Message], schema: type[BaseModel]) -> list[Message]:
     """把输出格式要求追加到系统提示中（DeepSeek 的 JSON 模式要求提示里出现 "json" 字样）。"""
-    schema_text = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    schema_text = _schema_text(schema)
     instruction = (
         "Output format: reply with one JSON object only, without markdown fences, "
         f"conforming to this JSON Schema:\n{schema_text}"

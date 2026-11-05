@@ -29,17 +29,19 @@ from cuemem.core.models import (
     Fact,
     Hit,
     MediaItem,
+    MemoryUnit,
     SessionIn,
     Turn,
     TurnMeta,
 )
-from cuemem.core.timeutil import naive_local
+from cuemem.core.timeutil import naive_local, valid_period
 from cuemem.core.trace import TraceSink, current_trace, start_trace, trace_queries
 from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder, ImageEmbedder
 from cuemem.errors import ConsolidationError
+from cuemem.expiry import expired_ids, visible_core
 from cuemem.llm.cache import ResponseCache
 from cuemem.llm.client import LLMClient
 from cuemem.llm.ledger import Ledger
@@ -55,7 +57,7 @@ from cuemem.read.controller import (
     RuleController,
 )
 from cuemem.read.facts import FactAugmentedRetriever, ImageMode, MemoryView, Validity
-from cuemem.read.l1 import L1Candidates, L1Config, L1Retriever
+from cuemem.read.l1 import L1Candidates, L1Config, L1Result, L1Retriever
 from cuemem.read.l2 import L2Config, L2Retriever
 from cuemem.read.naive import NaiveRetriever
 from cuemem.read.plan import QueryPlan, rule_plan
@@ -72,9 +74,10 @@ from cuemem.write.consolidate import (
     ConsolidationWorker,
     Consolidator,
     scope,
+    unit_payload,
 )
 from cuemem.write.extract import PIPELINE_VERSION
-from cuemem.write.online import IngestReport, OnlineWriter
+from cuemem.write.online import IngestReport, OnlineWriter, media_payload
 
 logger = logging.getLogger(__name__)
 
@@ -333,7 +336,31 @@ def _parse_open_mark(key: str) -> tuple[str, str] | None:
     return rest[: int(size)], rest[int(size) + 1 :]
 
 
+REINDEX_BATCH = 256  # reindex 每批向量化、写入几个单元（只影响内存，缓存按单条文本命中）
 HANDED_OVER_KEPT = 10_000  # 记着本进程接手过的多少个会话（见 adopt_open、resume_left_open）
+
+
+def vector_gaps(
+    db: MemoryDB, vectors: VectorStore, space_id: str, *, images: bool
+) -> dict[str, tuple[int, int]]:
+    """这个空间的数据库与向量库对不上的地方：种类 → （数据库里几个，向量库里几个），只列对不上
+    的。图片记作 "media"（images=False，没开图片向量时不比）；向量库里有、数据库里没有这一种的
+    点记作 "other"。只比个数（cuemem doctor --vectors），补齐用 MemorySystem.reindex。"""
+    gaps: dict[str, tuple[int, int]] = {}
+    counted = 0
+    for kind, expected in db.unit_counts(space_id).items():
+        got = vectors.count(space_id, kinds=[kind])
+        counted += got
+        if got != expected:
+            gaps[kind] = (expected, got)
+    rest = vectors.count(space_id) - counted
+    if rest:
+        gaps["other"] = (0, rest)
+    if images:
+        expected, got = len(db.get_media(space_id)), len(vectors.media_ids(space_id))
+        if got != expected:
+            gaps["media"] = (expected, got)
+    return gaps
 
 
 class MemorySystem:
@@ -370,7 +397,13 @@ class MemorySystem:
             db, vectors, embedder, media=media, image_embedder=image_embedder
         )
         self.consolidator = Consolidator(
-            db, vectors, embedder, llm, settings.consolidation, open_sessions=self.open_sessions
+            db,
+            vectors,
+            embedder,
+            llm,
+            settings.consolidation,
+            open_sessions=self._held,
+            holding_open=self._holding_held,
         )
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
@@ -572,11 +605,13 @@ class MemorySystem:
         *,
         enqueue: bool = True,
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+        log_only: Collection[str] = (),
     ) -> Iterator[IngestReport]:
         """同 append，pieces 是若干段（会话，第一句的序号），每段各向量化一次（导入文件时每段
         连续的发言一段，与以前逐段追加时的请求相同）。with 块里的写入（Agent 的溯源）与发言、
         巩固任务在同一个事务里提交，块里出错时一起撤销（块里只做数据库的写入：事务持有数据库
-        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。"""
+        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。log_only：只写日志、
+        不登记巩固任务的会话（导入文件里 "infer": false 的会话，同 SDK 的 add(infer=False)）。"""
         sessions = list(dict.fromkeys(s.session_id for s, _ in pieces))
         names = {"session": sessions[0]} if len(sessions) == 1 else {"sessions": sessions}
         skip = self.open_sessions(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
@@ -586,7 +621,7 @@ class MemorySystem:
             self.writer.writing(space_id, [[piece] for piece in pieces], meta) as report,
         ):
             if enqueue:
-                queued = self.consolidator.enqueue(space_id, sessions, skip=skip)
+                queued = self.consolidator.enqueue(space_id, sessions, skip=skip | set(log_only))
             yield report
         if queued and self.worker is not None:
             self.worker.submit(space_id)
@@ -597,8 +632,11 @@ class MemorySystem:
         """标记会话进行中：每轮照常在线写入（可检索），但不登记巩固任务——
         否则半个会话会被抽取一遍，会话结束后整个会话又抽取一遍。
 
-        数据库里另外留一个标记：进程崩溃时没人再结束这个会话，下一个进程据此接手（adopt_open）。"""
+        数据库里另外留一个标记：进程崩溃时没人再结束这个会话，下一个进程据此接手（adopt_open）。
+        调用方显式地打开（或结束）之后，本进程接手过的记录（_handed_over）不再算数：否则结束之后
+        同名的 add 又被 resume_left_open 重新打开（第五轮体检）。"""
         with self._open_lock:
+            self._handed_over.pop((space_id, session_id), None)
             if (space_id, session_id) not in self._open:
                 self._open.add((space_id, session_id))
                 self.db.set_meta(_open_mark(space_id, session_id), datetime.now().isoformat())
@@ -610,6 +648,7 @@ class MemorySystem:
         （submit=False 时只登记，下次巩固或后台线程启动时完成）。"""
         with self._open_lock:
             self._open.discard((space_id, session_id))
+            self._handed_over.pop((space_id, session_id), None)  # 见 open_session
             self.db.delete_meta(_open_mark(space_id, session_id))
         self.consolidator.enqueue(space_id, [session_id])
         if wait:
@@ -629,6 +668,14 @@ class MemorySystem:
         相同。"""
         with self._open_lock:
             return {sid for space, sid in self._open | self._deferred if space == space_id}
+
+    @contextmanager
+    def _holding_held(self, space_id: str) -> Iterator[set[str]]:
+        """与 _held 相同的会话，拿着进行中会话的锁给出、直到退出：重建在里面清空派生层、重新
+        登记任务（Consolidator.rebuild），期间打开、结束的会话等它提交。锁不可重入，里面不能再
+        调用 _held 或 open_sessions。"""
+        with self._open_lock:
+            yield {sid for space, sid in self._open | self._deferred if space == space_id}
 
     def session_lock(self, space_id: str, session_id: str) -> threading.Lock:
         """往这个会话里写入时持有的锁：从分配发言序号到写完为止。放在系统上而不是 SDK 的
@@ -791,6 +838,84 @@ class MemorySystem:
             raise ConsolidationError(f"{len(report.failed)} 个会话抽取失败：{report.failed[:5]}")
         return report
 
+    def reindex(self, space_id: str, *, only_missing: bool = True) -> dict[str, int]:
+        """按数据库补齐向量库：数据库里有、向量库里没有的记忆单元重新向量化写进去，向量库里有、
+        数据库里没有的点删掉；图片（开了图片向量时）同样处理。返回各项的个数：每种单元补上几个
+        （round、fact、summary、entity、image、image_iso）、images（图片）、orphans 与
+        image_orphans（删掉的多余的点）、missing_files（原图不在了、补不上的图片），以及事实表里
+        找不到、补不上的事实单元 facts_missing（没有时不列）。
+
+        向量库丢了、坏了，或者与数据库不是同一时刻的备份时用（cuemem reindex）：向量都能从
+        数据库推出来。以前只有 consolidate(rebuild=True)，它只重建派生记忆（"轮"的向量补不回来），
+        没有缓存时还要重新调用 LLM。这里不调用 LLM、不碰任务与事实表；向量化的是当初写入时的同样
+        文本（向量缓存按单条文本命中，不发请求）与同样的原图，payload 与写入时相同（unit_payload：
+        事实的 current 与 subject_id 取自事实表）。only_missing=False（--full）全部重新写一遍。
+
+        拿着与遗忘相同的独占（巩固锁与读写门）。在线写入不拿空间的锁、先写向量后提交：正在写
+        的点（OnlineWriter.in_flight）不算多余的。读取的顺序（先列向量库，再看正在写的，最后读
+        数据库）保证：列出来时还没提交的点，读数据库时要么已经提交，要么还登记着。
+
+        不能在这个空间的 reading 里调用（RuntimeError，与遗忘相同）。"""
+        with self._exclusive(space_id):
+            stored = set(self.vectors.unit_ids(space_id))
+            images = self.image_embedder is not None
+            stored_media = set(self.vectors.media_ids(space_id)) if images else set()
+            flying = self.writer.in_flight(space_id)
+            units = self.db.list_units(space_id)
+            media = self.db.get_media(space_id) if images else []
+
+            report: dict[str, int] = {}
+            todo = [u for u in units if not only_missing or u.id not in stored]
+            for start in range(0, len(todo), REINDEX_BATCH):
+                chunk = todo[start : start + REINDEX_BATCH]
+                # 事实的 current 与 subject_id 取自事实表（按批查：IN 列表有上限）；表里没有的
+                # 补不上（current 不能猜）
+                fact_ids = [u.id for u in chunk if u.kind == "fact"]
+                facts = {f.id: f for f in self.db.get_facts(space_id, ids=fact_ids)}
+                kept = [u for u in chunk if u.kind != "fact" or u.id in facts]
+                if len(kept) < len(chunk):
+                    report["facts_missing"] = (
+                        report.get("facts_missing", 0) + len(chunk) - len(kept)
+                    )
+                chunk = kept
+                if not chunk:
+                    continue
+                # sparse 照 batch 原样传：VectorStore.upsert 不写空的 sparse，与巩固把缺的换成空的
+                # SparseVector 写进去的结果相同
+                batch = self.embedder.embed([u.text for u in chunk], "document")
+                self.vectors.upsert(
+                    space_id,
+                    [u.id for u in chunk],
+                    batch.dense,
+                    batch.sparse,
+                    [unit_payload(u, facts.get(u.id)) for u in chunk],
+                )
+                for unit in chunk:
+                    report[unit.kind] = report.get(unit.kind, 0) + 1
+            known = {u.id for u in units}
+            orphans = sorted(stored - known - flying)
+            self.vectors.delete(space_id, orphans)
+            report["orphans"] = len(orphans)
+
+            if self.image_embedder is not None:
+                wanted = [m for m in media if not only_missing or m.id not in stored_media]
+                readable = [m for m in wanted if Path(m.path).is_file()]
+                report["missing_files"] = len(wanted) - len(readable)
+                for start in range(0, len(readable), REINDEX_BATCH):
+                    chunk_media = readable[start : start + REINDEX_BATCH]
+                    vectors = self.image_embedder.embed_images([Path(m.path) for m in chunk_media])
+                    self.vectors.upsert_images(
+                        space_id,
+                        [m.id for m in chunk_media],
+                        vectors,
+                        [media_payload(m) for m in chunk_media],
+                    )
+                report["images"] = len(readable)
+                stray = sorted(stored_media - {m.id for m in media} - flying)
+                self.vectors.delete_images(space_id, stray)
+                report["image_orphans"] = len(stray)
+        return report
+
     def start_worker(self) -> ConsolidationWorker:
         """启动后台巩固线程（consolidation.background_workers 个，同时巩固几个空间）：此后
         ingest 只登记任务，巩固在后台完成。
@@ -877,11 +1002,13 @@ class MemorySystem:
             if not targets:
                 return ForgetReport(space_id, 0, [], 0, 0, 0, 0, 0.0)
             facts = self.db.get_facts(space_id)
-            units_now = self.db.list_units(space_id)
-            texts_before = {u.text for u in units_now}
+            # 只读受影响会话的"轮"与派生记忆的文本（以前每次遗忘把整个空间的记忆单元解出来两遍：
+            # 5 万轮的空间删一个会话 4.2 秒）。别的会话的"轮"这次不动，它们的文本一直在，
+            # 本来就不会被清理
+            old_rounds = self.db.list_units(space_id, kinds=["round"], session_ids=affected)
+            texts_before = {u.text for u in old_rounds}
+            texts_before.update(self.db.unit_texts(space_id, kinds_not=["round"]))
             doomed = {t.id for t in targets}
-            touched = set(affected)
-            old_rounds = [u for u in units_now if u.kind == "round" and u.session_id in touched]
             doomed_media = self.db.get_media(space_id, turn_ids=[t.id for t in targets])
             # 被删内容的记忆 ID：含有被删发言的轮、由它们抽出的事实、其中的图片（trace 按 ID
             # 记着回答模型看过哪些记忆）
@@ -893,7 +1020,7 @@ class MemorySystem:
             #    记录的向量（与以前删旧"轮"相同，先删向量、后删记录）。出错时什么都没删
             new_rounds = self.writer.prepare_rounds(space_id, affected, doomed)
             kept = {u.id for u in new_rounds}
-            derived = [u.id for u in units_now if u.kind != "round"]
+            derived = self.db.derived_unit_ids(space_id)
             self.vectors.delete(space_id, [u.id for u in old_rounds if u.id not in kept] + derived)
             self.vectors.delete_images(space_id, [m.id for m in doomed_media])
 
@@ -970,9 +1097,18 @@ class MemorySystem:
                     #    （提问只记在那里），这些向量再也清不掉。没清理的不重试
                     embed_purged = 0
                     try:
-                        units_after = {u.text for u in self.db.list_units(space_id)}
+                        # 不再出现的文本：先去掉重放之后的派生记忆与受影响会话的"轮"里还有的，
+                        # 剩下的（通常只是被删的那几轮与事实）再到整个空间里查一遍
+                        gone = texts_before - set(self.db.unit_texts(space_id, kinds_not=["round"]))
+                        gone -= {
+                            u.text
+                            for u in self.db.list_units(
+                                space_id, kinds=["round"], session_ids=affected
+                            )
+                        }
+                        gone -= self.db.existing_texts(space_id, gone)
                         if isinstance(self.embedder, CachedEmbedder):
-                            embed_purged = self.embedder.purge(sorted(texts_before - units_after))
+                            embed_purged = self.embedder.purge(sorted(gone))
                         embed_purged += self._purge_queries([*texts, *questions])
                         if isinstance(self.image_embedder, DashScopeMultimodalEmbedder):
                             unused = {m.sha256 for m in doomed_media}
@@ -1069,18 +1205,18 @@ class MemorySystem:
         follow_citations: bool,
         restated_turn_ids: Sequence[str],
     ) -> tuple[list[Turn], int]:
-        """要删的发言（按日志顺序）与沿引用扩散多出来的条数。遗忘与预览共用。"""
-        all_turns = self.db.get_turns(space_id)
-        asked, sessions = set(turn_ids), set(session_ids)
-        wanted_turns = {t.id for t in all_turns if t.id in asked or t.session_id in sessions}
+        """要删的发言（按日志顺序）与沿引用扩散多出来的条数。遗忘与预览共用。
+
+        只读要删的会话与发言（以前读整个空间的日志）。"""
+        asked, sessions = sorted(set(turn_ids)), sorted(set(session_ids))
+        wanted_turns = {t.id for t in self.db.turns_of(space_id, ids=asked, session_ids=sessions)}
         cascaded = 0
         if follow_citations and wanted_turns:
             expanded = self._follow_citations(space_id, wanted_turns)
             cascaded = len(expanded - wanted_turns)
             wanted_turns = expanded
-        restated = set(restated_turn_ids)
-        wanted_turns |= {t.id for t in all_turns if t.id in restated}
-        return [t for t in all_turns if t.id in wanted_turns], cascaded
+        wanted_turns |= set(restated_turn_ids)  # 不在日志里的 ID 下面读不到，与以前相同
+        return self.db.get_turns(space_id, ids=sorted(wanted_turns)), cascaded
 
     def _remove_traces(
         self, space_id: str, texts: Sequence[str], refs: Collection[str] = ()
@@ -1119,18 +1255,32 @@ class MemorySystem:
 
     def _follow_citations(self, space_id: str, turns: set[str]) -> set[str]:
         """沿引用扩散：要删的发言所在的轮、由它们抽取的事实、其中的图片，凡是被后来的回复
-        引用过，那一轮也要删；新删的轮又可能被更后来的回复引用，直到没有新的为止。"""
-        rounds = self.db.list_units(space_id, kinds=["round"])
-        round_of = {t: u for u in rounds for t in u.source_turn_ids}
+        引用过，那一轮也要删；新删的轮又可能被更后来的回复引用，直到没有新的为止。
+
+        "轮"只读用到的发言所在的会话（一轮的发言都在这一轮的会话里），读过的会话记下来，不再
+        读整个空间的"轮"。事实与图片照旧整个读（没有派生记忆时什么都没有）。"""
+        round_of: dict[str, MemoryUnit] = {}
+        loaded: set[str] = set()
+
+        def load(turn_ids: Collection[str]) -> None:
+            found = self.db.get_turns(space_id, ids=sorted(turn_ids)) if turn_ids else []
+            fresh = sorted({t.session_id for t in found} - loaded)
+            for unit in self.db.list_units(space_id, kinds=["round"], session_ids=fresh):
+                for turn_id in unit.source_turn_ids:
+                    round_of[turn_id] = unit
+            loaded.update(fresh)
+
         facts = self.db.get_facts(space_id)
         media = self.db.get_media(space_id)
         doomed = set(turns)
         frontier = set(turns)
         while frontier:
+            load(frontier)
             items = {round_of[t].id for t in frontier if t in round_of}
             items |= {f.id for f in facts if frontier & set(f.source_turn_ids)}
             items |= {m.id for m in media if m.source_turn_id in frontier}
             citing = set(self.db.citing_turns(space_id, sorted(items))) - doomed
+            load(citing)
             fresh: set[str] = set()
             for turn_id in citing:  # 整轮删除：用户的问话里也可能带着同样的信息
                 unit = round_of.get(turn_id)
@@ -1240,7 +1390,11 @@ class MemorySystem:
         之后照样检索得到。"""
         wanted = set(turn_ids)
         out = list(dict.fromkeys(turn_ids))
-        for unit in self.db.list_units(space_id, kinds=["round"]):
+        if not wanted:  # 只删会话或发言时（以前照样读一遍整个空间的"轮"）
+            return out
+        # 只读这些发言所在的会话的"轮"（一轮的发言都在这一轮的会话里）
+        sessions = {t.session_id for t in self.db.get_turns(space_id, ids=sorted(wanted))}
+        for unit in self.db.list_units(space_id, kinds=["round"], session_ids=sorted(sessions)):
             if wanted & set(unit.source_turn_ids):
                 out.extend(t for t in unit.source_turn_ids if t not in out)
         return out
@@ -1526,6 +1680,7 @@ class MemorySystem:
         notes: bool | None = None,
         router: Router = "learned",
         lam: float | None = None,
+        hide_expired: bool = False,
     ) -> Answer:
         """检索并回答。
 
@@ -1543,6 +1698,8 @@ class MemorySystem:
         notes：reader 先记笔记再回答（并按检索计划给阅读提示）；默认 L2 开、L1 关。
         还没巩固过的空间，l1 与 facts 模式也能用（只是没有事实可用）。
         question_time 带时区时换算成本机时间（与存下来的时间一致，见 core/timeutil.py）。
+        hide_expired：不用已经过期的记忆（见 retrieve；agent 与 hatch 的 memory_search 也不给），
+        SDK 的 answer 打开它；facts 与 naive 两种评测的基线不看它。
         """
         when = naive_local(question_time) if question_time is not None else datetime.now()
         cache_scope = scope(space_id, "ask")
@@ -1563,6 +1720,7 @@ class MemorySystem:
                     l1=l1,
                     l2=l2,
                     cache_scope=cache_scope,
+                    hide_expired=hide_expired,
                 )
             if recall is not None and recall.level == "l0":
                 answer = self.reader.answer_with_memory(
@@ -1619,12 +1777,32 @@ class MemorySystem:
                         l1=l1,
                         l2=l2,
                         cache_scope=cache_scope,
+                        hide_expired=hide_expired,
                     )
+                now = datetime.now()
+                gone = self.expired_ids(space_id, now) if hide_expired else frozenset()
+                core = self.db.get_core_memory(space_id)
+                if gone:  # 画像与 memory_search 同样不给过期的记忆
+                    core = self.visible_core(space_id, core, now)
+
+                def search(query: str, cfg: L1Config) -> L1Result:
+                    if not gone:
+                        return self.l1.search(space_id, query, when, cfg)
+                    found = self.l1.search(space_id, query, when, cfg, exclude=gone)
+                    media = {mid: m for mid, m in found.media.items() if mid not in gone}
+                    return replace(
+                        found,
+                        rounds=[h for h in found.rounds if h.unit.id not in gone],
+                        facts=[fh for fh in found.facts if fh.fact.id not in gone],
+                        media=media,
+                        attach=[mid for mid in found.attach if mid in media],
+                    )
+
                 answer = self.agent.answer(
                     question,
                     question_time=when,
-                    search=lambda query, cfg: self.l1.search(space_id, query, when, cfg),
-                    core=self.db.get_core_memory(space_id),
+                    search=search,
+                    core=core,
                     cache_scope=cache_scope,
                     recalled=recall.view if recall is not None else None,
                 )
@@ -1673,6 +1851,7 @@ class MemorySystem:
         exclude: Collection[str] = (),
         cache_scope: str | None = None,
         candidates: L1Candidates | None = None,
+        hide_expired: bool = False,
     ) -> Recall:
         """只检索、不回答：按 mode 取记忆（auto 由检索控制器选档），返回交给回答模型的材料。
 
@@ -1691,6 +1870,13 @@ class MemorySystem:
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
         _remove_traces）。ask、Agent 与评测在自己的 trace 里调用，不另记，trace 与用量统计不变。
         遗忘等进行中的检索写完 trace（reading）。
+
+        hide_expired：不给出已经过期的记忆（SDK 的 expiration_date，见 expiry.py）。过期的事实、
+        对话片段与图片加进 exclude（探针与各路检索都不看，名额留给别的），画像去掉过期的几行，
+        检索之后再筛一遍（版本链带出的旧事实、装入的轮里的图片）。过期按墙上时间算，不按
+        question_time，同 SDK 的 search。SDK 的 answer、记忆代理、MCP 与各框架集成打开它；评测、
+        命令行与冻结的方法不打开。空间里没有过期的记忆时（评测的空间从不写过期时间）只多查一次
+        turn_meta，exclude 与画像原样不动，请求逐字节不变。
         """
         tracing: AbstractContextManager[object] = (
             nullcontext()
@@ -1700,67 +1886,129 @@ class MemorySystem:
         if candidates is not None and not self._gate(space_id).held():
             candidates = None  # 在下面的 reading 里查就晚了：那时总是持有读
         with self.reading(space_id), tracing:
-            when = naive_local(question_time) if question_time is not None else datetime.now()
-            cache_scope = cache_scope or scope(space_id, "ask")
-            level: str = mode
-            decision: RouteDecision | None = None
-            used: Router | None = None
-            if mode != "l1":
-                candidates = None
-            if mode == "auto":
-                decision, candidates, used = self._route(
-                    space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
-                )
-                level = decision.level.lower()
-                if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
-                    l1 = replace(l1 or L1Config(), attach_images=3)
-                    base_l2 = l2 or L2Config()
-                    l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
-            if level == "l0":
-                view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
-                return Recall("l0", view, decision, used, candidates=candidates)
-            if level == "l1":
-                cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
-                if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
-                    result = self.l1.pack(space_id, candidates, cfg)
-                else:
-                    result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
-                view = MemoryView(
-                    rounds=result.rounds,
-                    facts=result.facts,
-                    core=result.core,
-                    media=result.media,
-                    image_mode=image_mode(cfg),
-                    attach=result.attach,
-                )
-                return Recall("l1", view, decision, used, candidates=candidates)
-            l2_cfg = l2 or L2Config()
-            deep = self.l2.search(
+            now = datetime.now()  # 过期按墙上时间算（同 SDK 的 search），不按 question_time
+            gone = self.expired_ids(space_id, now) if hide_expired else frozenset()
+            recall = self._retrieve(
                 space_id,
                 question,
-                when,
-                l2_cfg,
+                question_time=question_time,
+                mode=mode,
+                router=router,
+                lam=lam,
+                k=k,
+                l1=l1,
+                l2=l2,
+                exclude=frozenset(exclude) | gone if gone else exclude,
                 cache_scope=cache_scope,
-                exclude=exclude,
-                probe=candidates,
-            )
-            view = MemoryView(
-                rounds=deep.rounds,
-                facts=deep.facts,
-                core=deep.core,
-                media=deep.media,
-                image_mode=image_mode(l2_cfg.l1),
-                attach=deep.attach,
-            )
-            return Recall(
-                "l2",
-                view,
-                decision,
-                used,
-                plan=deep.plan,
-                details=deep.details(),
                 candidates=candidates,
             )
+            return self._without(space_id, recall, gone, now) if gone else recall
+
+    def _retrieve(
+        self,
+        space_id: str,
+        question: str,
+        *,
+        question_time: datetime | None,
+        mode: RecallMode,
+        router: Router,
+        lam: float | None,
+        k: int | None,
+        l1: L1Config | None,
+        l2: L2Config | None,
+        exclude: Collection[str],
+        cache_scope: str | None,
+        candidates: L1Candidates | None,
+    ) -> Recall:
+        """retrieve 的检索本身（调用方已经持有读、记着 trace）。"""
+        when = naive_local(question_time) if question_time is not None else datetime.now()
+        cache_scope = cache_scope or scope(space_id, "ask")
+        level: str = mode
+        decision: RouteDecision | None = None
+        used: Router | None = None
+        if mode != "l1":
+            candidates = None
+        if mode == "auto":
+            decision, candidates, used = self._route(
+                space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+            )
+            level = decision.level.lower()
+            if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
+                l1 = replace(l1 or L1Config(), attach_images=3)
+                base_l2 = l2 or L2Config()
+                l2 = replace(base_l2, l1=replace(base_l2.l1, attach_images=3))
+        if level == "l0":
+            view = MemoryView(rounds=[], facts=[], core=self.db.get_core_memory(space_id))
+            return Recall("l0", view, decision, used, candidates=candidates)
+        if level == "l1":
+            cfg = l1 or L1Config(k=k or self.settings.retrieval.naive_k)
+            if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
+                result = self.l1.pack(space_id, candidates, cfg)
+            else:
+                result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
+            view = MemoryView(
+                rounds=result.rounds,
+                facts=result.facts,
+                core=result.core,
+                media=result.media,
+                image_mode=image_mode(cfg),
+                attach=result.attach,
+            )
+            return Recall("l1", view, decision, used, candidates=candidates)
+        l2_cfg = l2 or L2Config()
+        deep = self.l2.search(
+            space_id,
+            question,
+            when,
+            l2_cfg,
+            cache_scope=cache_scope,
+            exclude=exclude,
+            probe=candidates,
+        )
+        view = MemoryView(
+            rounds=deep.rounds,
+            facts=deep.facts,
+            core=deep.core,
+            media=deep.media,
+            image_mode=image_mode(l2_cfg.l1),
+            attach=deep.attach,
+        )
+        return Recall(
+            "l2",
+            view,
+            decision,
+            used,
+            plan=deep.plan,
+            details=deep.details(),
+            candidates=candidates,
+        )
+
+    def expired_ids(self, space_id: str, now: datetime) -> frozenset[str]:
+        """已经过期的检索单元、事实与图片的 ID（见 expiry.expired_ids）。"""
+        return expired_ids(self.db, space_id, now)
+
+    def visible_core(
+        self, space_id: str, core: CoreMemory | None, now: datetime
+    ) -> CoreMemory | None:
+        """画像去掉过期的事实（SDK 的 profile() 也用它）；没有过期的时原样返回。"""
+        return visible_core(self.db, space_id, core, now)
+
+    def _without(
+        self, space_id: str, recall: Recall, gone: frozenset[str], now: datetime
+    ) -> Recall:
+        """检索结果再去掉过期的：exclude 挡住了各路检索，版本链补上的旧事实与装入的轮里的图片
+        不经过它。"""
+        view = recall.view
+        media = {mid: m for mid, m in view.media.items() if mid not in gone}
+        view = replace(
+            view,
+            rounds=[h for h in view.rounds if h.unit.id not in gone],
+            facts=[fh for fh in view.facts if fh.fact.id not in gone],
+            core=self.visible_core(space_id, view.core, now),
+            media=media,
+            attach=[mid for mid in view.attach if mid in media],
+        )
+        return replace(recall, view=view)
 
     def _route(
         self,
@@ -1817,13 +2065,16 @@ class MemorySystem:
         space_id: str,
         *,
         current_only: bool = False,
-        valid_at: str | None = None,
+        valid_at: str | date | None = None,
         known_at: datetime | None = None,
     ) -> list[Fact]:
+        """valid_at：YYYY、YYYY-MM、YYYY-MM-DD（或 date）；一年、一个月指这段时间里任何时候成立
+        过的事实。别的写法 ValueError（SDK、/api/v1 的 400、CLI 都经过这里）。"""
+        period = valid_period(valid_at) if valid_at is not None else None
         if known_at is not None:  # 数据库里按字符串比较：带时区的先换算成本机时间
             known_at = naive_local(known_at)
         return self.db.get_facts(
-            space_id, current_only=current_only, valid_at=valid_at, known_at=known_at
+            space_id, current_only=current_only, valid_period=period, known_at=known_at
         )
 
     def entities(self, space_id: str) -> list[Entity]:

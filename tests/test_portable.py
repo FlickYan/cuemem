@@ -187,6 +187,80 @@ def test_export_v2_carries_metadata_and_v1_files_still_import(memory: Memory) ->
         memory.load(newer, user_id="dave")
 
 
+def test_infer_false_survives_export_and_import(
+    memory: Memory, n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """add(infer=False) 的会话没有巩固任务：导出时带 "infer": false，导入时同样不登记，后台线程
+    不去抽取它（以前导入时为每个会话登记任务，多花 LLM 请求）；显式的巩固照样抽取，同源空间。
+    还开着的 run 不带这个键，导入时照常登记任务。"""
+    memory.add("raw diary line", user_id="alice", run_id="log", timestamp=DAY, infer=False)
+    memory.add("I like green tea", user_id="alice", run_id="chat", timestamp=DAY)
+    memory.open_run("live", user_id="alice")
+    memory.add("half a conversation", user_id="alice", run_id="live", timestamp=DAY)
+    data = json.loads(json.dumps(memory.export(user_id="alice", derived=False)))
+    flags = {s["session_id"]: s.get("infer") for s in data["sessions"]}
+    assert flags == {"log": False, "chat": None, "live": None}
+    assert "infer" not in next(s for s in data["sessions"] if s["session_id"] == "chat")
+
+    other = n3_settings.model_copy(
+        update={"paths": PathsConfig().resolve_against(tmp_path / "other")}
+    )
+    fake_api.chat_requests.clear()
+    with Memory(other, http_client=fake_api.client(), background=True) as fresh:
+        fresh.load(data, user_id="bob")
+        fresh.wait()
+        assert {j["session_id"] for j in fresh.system.db.get_jobs("bob")} == {"chat", "live"}
+        assert "raw diary line" not in json.dumps(fake_api.chat_requests)
+        assert "green tea" in json.dumps(fake_api.chat_requests)
+        # 显式的巩固照样抽取它（同源空间）
+        fresh.consolidate(user_id="bob")
+        assert "raw diary line" in {f["memory"] for f in fresh.get_all(user_id="bob")["results"]}
+        # 目标空间里已有任务的会话：再导入时照常登记
+        log = next(s for s in data["sessions"] if s["session_id"] == "log")
+        log["turns"].append({**log["turns"][0], "idx": 5, "text": "another raw line"})
+        before = len(fresh.system.db.get_jobs("bob"))
+        assert import_space(fresh.system, data, space_id="bob")["turns_added"] == 1
+        assert len(fresh.system.db.get_jobs("bob")) == before + 1
+
+    bad = json.loads(json.dumps(data))
+    next(s for s in bad["sessions"] if s["session_id"] == "log")["infer"] = "no"
+    with pytest.raises(ValueError, match="Malformed export"):
+        memory.load(bad, user_id="dave")
+    assert memory.system.db.get_turns("dave") == []
+
+
+def test_cli_export_reads_infer_false_from_the_database_alone(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cuemem export 只打开数据库（向量库坏了也能导出）：只写了日志的会话照样带 "infer": false，
+    上一个进程没结束的 run 凭数据库里的标记认出来、不带这个键；导入后只给后者与普通会话登记任务。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    settings = load_settings()
+    with Memory(settings, background=False) as memory:
+        memory.add("raw diary line", user_id="alice", run_id="log", timestamp=DAY, infer=False)
+        memory.add("I like green tea", user_id="alice", run_id="chat", timestamp=DAY)
+        memory.open_run("live", user_id="alice")  # 进程结束时还开着：数据库里留着标记
+        memory.add("half a conversation", user_id="alice", run_id="live", timestamp=DAY)
+    (settings.paths.qdrant / "meta.json").write_text("", "utf-8")
+
+    out = tmp_path / "alice.json"
+    result = runner.invoke(app, ["export", "--space", "alice", "-o", str(out)])
+    assert result.exit_code == 0, result.output
+    data = json.loads(out.read_text("utf-8"))
+    assert {s["session_id"]: s.get("infer") for s in data["sessions"]} == {
+        "log": False,
+        "chat": None,
+        "live": None,
+    }
+    assert runner.invoke(app, ["doctor", "--repair-vectors"]).exit_code == 0
+    result = runner.invoke(app, ["import", str(out), "--space", "copy"])
+    assert result.exit_code == 0, result.output
+    with Memory(load_settings(), background=False) as memory:
+        assert {j["session_id"] for j in memory.system.db.get_jobs("copy")} == {"chat", "live"}
+
+
 def test_updates_survive_export_to_the_same_space(
     memory: Memory, n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
 ) -> None:
@@ -372,6 +446,74 @@ def test_cli_export_import_and_preset(
     assert result.exit_code == 0, result.output
     assert os.environ["CUEMEM_PRESET"] == "ollama"
     assert "不需要Key" in _flat(result.output) and "llama3.1-8b" in result.output
+
+
+def test_cli_export_keeps_the_old_backup_when_the_write_fails(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """export -o 先写同一目录下的临时文件再换名：写失败（磁盘满）时旧的备份原样留着、临时文件
+    删掉，只打印一行原因、以 1 退出。以前 write_text 先截断旧文件，调用栈之后新旧两份都没了。
+    原来是 0644 的备份换成 0600（命令行收紧了 umask）；-o 是符号链接时替换它指向的文件。"""
+    import errno
+
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    out = backups / "out.json"
+    out.write_text("{}", encoding="utf-8")
+    out.chmod(0o644)
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", str(out)]).exit_code == 0
+    assert out.stat().st_mode & 0o777 == 0o600
+    good = out.read_bytes()
+    json.loads(good)
+
+    real_replace = os.replace
+
+    def full_disk(src: Any, dst: Any) -> None:
+        if Path(dst) == out:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", full_disk)
+    result = runner.invoke(app, ["export", "--space", "demo", "-o", str(out)])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    flat = _flat(result.output)
+    assert "导出失败" in flat and "Nospaceleftondevice" in flat and "未改动" in flat
+    assert out.read_bytes() == good and sorted(backups.iterdir()) == [out]
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    link = tmp_path / "link.json"
+    link.symlink_to(out)
+    out.write_text("{}", encoding="utf-8")
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", str(link)]).exit_code == 0
+    sessions = json.loads(good)["sessions"]
+    assert link.is_symlink() and json.loads(out.read_bytes())["sessions"] == sessions
+    # 不是普通文件（/dev/stdout、FIFO、/dev/null）的照旧直接写：不在 /dev 里建临时文件
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", os.devnull]).exit_code == 0
+
+
+@pytest.mark.parametrize("damage", ["truncated", "not-utf8"])
+def test_cli_import_of_a_damaged_file_is_one_line(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    """导入截断的或不是 UTF-8 的文件：一行原因、以 1 退出（以前是 JSONDecodeError /
+    UnicodeDecodeError 的调用栈），什么都不写。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    out = tmp_path / "demo.json"
+    assert runner.invoke(app, ["export", "--space", "demo", "-o", str(out)]).exit_code == 0
+    whole = out.read_bytes()
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(whole[: len(whole) // 2] if damage == "truncated" else b"\xff\xfe" + whole)
+    result = runner.invoke(app, ["import", str(bad), "--space", "copy"])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    assert "不是有效的CueMem导出文件" in _flat(result.output)
+    assert "copy" not in runner.invoke(app, ["spaces"]).output
 
 
 @pytest.mark.parametrize(

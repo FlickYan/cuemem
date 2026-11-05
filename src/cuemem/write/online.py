@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import Counter
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -29,6 +31,7 @@ from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingA
 from cuemem.store.media import MediaStore, StoredImage
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
+from cuemem.write.consolidate import unit_payload
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,12 @@ class IngestReport:
 def media_id(space_id: str, turn_id: str, index: int) -> str:
     """一次发言里第 index 张图的记录 ID（Agent 据此在检索时排除工作记忆里的图片）。"""
     return stable_id(space_id, "media", turn_id, index)
+
+
+def media_payload(item: MediaItem) -> dict[str, Any]:
+    """图片向量的 payload（点上另有 media_id，见 VectorStore.upsert_images）：在线写入与 reindex
+    共用。"""
+    return {"turn_id": item.source_turn_id, "ts": to_epoch(item.ts)}
 
 
 def build_turns(space_id: str, session: SessionIn, first_idx: int = 0) -> list[Turn]:
@@ -138,6 +147,7 @@ class _Staged:
     media: list[MediaItem] = field(default_factory=list)  # 新的图片记录
     units: list[MemoryUnit] = field(default_factory=list)  # 新的"轮"
     stored: list[StoredImage] = field(default_factory=list)  # 存进媒体库的原图（每次 put）
+    flying: list[str] = field(default_factory=list)  # 登记在 OnlineWriter.in_flight 里的点
     tokens: int = 0
 
 
@@ -156,6 +166,27 @@ class OnlineWriter:
         self.embedder = embedder
         self.media = media  # 为空时忽略图片（文本里的 "<image>" 标记照常保留）
         self.image_embedder = image_embedder
+        # 已经（或马上要）写进向量库、数据库里还没有记录的点：（空间，单元或图片 ID）→ 几次写入
+        self._flying: Counter[tuple[str, str]] = Counter()
+        self._flying_lock = threading.Lock()
+
+    def in_flight(self, space_id: str) -> set[str]:
+        """这个空间里正在写的点（"轮"与图片的 ID）：向量已经写了、数据库还没提交。reindex 据此
+        不把它们当作多余的点删掉（在线写入不拿空间的锁，见 MemorySystem.reindex）。"""
+        with self._flying_lock:
+            return {i for space, i in self._flying if space == space_id}
+
+    def _fly(self, space_id: str, ids: Sequence[str]) -> None:
+        with self._flying_lock:
+            self._flying.update((space_id, i) for i in ids)
+
+    def _land(self, space_id: str, ids: Sequence[str]) -> None:
+        with self._flying_lock:
+            for i in ids:
+                key = (space_id, i)
+                self._flying[key] -= 1
+                if self._flying[key] <= 0:
+                    del self._flying[key]
 
     @contextmanager
     def writing(
@@ -182,14 +213,17 @@ class OnlineWriter:
         started = time.perf_counter()
         staged = _Staged(space_id)
         try:
-            for pieces in batches:
-                self._stage(staged, pieces, meta)
-            with self.db.transaction():
-                report = self._commit(staged, started)
-                yield report
-        except BaseException:
-            self._discard(staged)
-            raise
+            try:
+                for pieces in batches:
+                    self._stage(staged, pieces, meta)
+                with self.db.transaction():
+                    report = self._commit(staged, started)
+                    yield report
+            except BaseException:
+                self._discard(staged)
+                raise
+        finally:
+            self._land(space_id, staged.flying)
         if self.media is not None:  # 图片记录提交了：之后遗忘时按记录删原图
             for image in staged.stored:
                 self.media.release(image)
@@ -226,11 +260,13 @@ class OnlineWriter:
                 with span("embed_images", images=len(new_media)):
                     vectors = self.image_embedder.embed_images([Path(m.path) for m in new_media])
                 staged.media.extend(new_media)
+                self._fly(space_id, [m.id for m in new_media])
+                staged.flying.extend(m.id for m in new_media)
                 self.vectors.upsert_images(
                     space_id,
                     [m.id for m in new_media],
                     vectors,
-                    [{"turn_id": m.source_turn_id, "ts": to_epoch(m.ts)} for m in new_media],
+                    [media_payload(m) for m in new_media],
                 )
             else:
                 staged.media.extend(new_media)
@@ -242,6 +278,8 @@ class OnlineWriter:
             embedded = self._embed(new_units)
             staged.units.extend(new_units)
             staged.tokens += embedded.tokens
+            self._fly(space_id, [u.id for u in new_units])
+            staged.flying.extend(u.id for u in new_units)
             self._upsert(space_id, new_units, embedded)
 
     def _commit(self, staged: _Staged, started: float) -> IngestReport:
@@ -346,12 +384,17 @@ class OnlineWriter:
         gone = set(stale)
         missing = set(self.db.missing_unit_ids(space_id, [u.id for u in rounds])) | gone
         fresh = [u for u in rounds if u.id in missing]
-        if fresh:
-            self._upsert(space_id, fresh, self._embed(fresh))
-        with self.db.transaction():
-            self.db.delete_units(space_id, sorted(gone))
+        flying = [u.id for u in fresh]
+        self._fly(space_id, flying)
+        try:
             if fresh:
-                self.db.add_units(fresh)
+                self._upsert(space_id, fresh, self._embed(fresh))
+            with self.db.transaction():
+                self.db.delete_units(space_id, sorted(gone))
+                if fresh:
+                    self.db.add_units(fresh)
+        finally:
+            self._land(space_id, flying)
         try:
             self.vectors.delete(space_id, sorted(gone - {u.id for u in fresh}))
         except Exception:
@@ -368,9 +411,5 @@ class OnlineWriter:
             [u.id for u in units],
             batch.dense,
             batch.sparse,
-            [_payload(u) for u in units],
+            [unit_payload(u) for u in units],
         )
-
-
-def _payload(unit: MemoryUnit) -> dict[str, Any]:
-    return {"kind": unit.kind, "session_id": unit.session_id, "ts": to_epoch(unit.ts)}

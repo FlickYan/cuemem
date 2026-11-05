@@ -31,8 +31,9 @@ utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id�
 转发。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求逐字节不变）：
 models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的；列出的别名只放行它自己，
 不放行同一个模型 ID 的别的别名，见 _upstream）与 max_output_tokens（max_tokens、
-max_completion_tokens 不超过它，没给时补上；n 只能是 1，否则 400）。都在检索、开会话与转发之前
-查。max_output_tokens 管不住调用方的开关（enable_thinking、thinking），只有 models 管得住。
+max_completion_tokens 不超过它，并且总按这个模型在目录里的写法 max_tokens_param 写上一份；n 只能
+是 1，否则 400）。都在检索、开会话与转发之前查。max_output_tokens 管不住调用方的开关
+（enable_thinking、thinking），只有 models 管得住。
 
 另外两个 OpenAI 兼容的接口：
 - /v1/responses：Responses API 的一个子集——非流式、纯文字输入（字符串或 input_text 的消息），
@@ -695,14 +696,16 @@ def _adapt(upstream: dict[str, Any], spec: ModelSpec, *, override: bool = False)
 
 def _cap_output(upstream: dict[str, Any], spec: ModelSpec, cap: int) -> None:
     """令牌的 max_output_tokens：max_tokens 与 max_completion_tokens 不超过它（不是整数的也换成
-    它），两个都没给时按这个模型的写法（max_tokens_param）补上。"""
+    它），并且总按这个模型的写法（max_tokens_param）写上一份：没给的时候是 cap，只给了另一个名字
+    时取给了的（已经压过的）值。以前只给 max_completion_tokens 时目录里写 max_tokens 的模型
+    （DeepSeek、Qwen）收不到 max_tokens，供应商不认这个名字时上限就不起作用（第五轮体检）。"""
     given = [key for key in ("max_tokens", "max_completion_tokens") if key in upstream]
     for key in given:
         value = upstream[key]
         if not isinstance(value, int) or isinstance(value, bool) or value > cap:
             upstream[key] = cap
-    if not given:
-        upstream[spec.max_tokens_param] = cap
+    if spec.max_tokens_param not in upstream:
+        upstream[spec.max_tokens_param] = min((upstream[key] for key in given), default=cap)
 
 
 def _storable(message: dict[str, Any]) -> dict[str, Any]:

@@ -207,8 +207,9 @@ class Agent:
         )
 
     def _profile(self, space_id: str) -> list[tuple[str, str, str]]:
-        """画像（核心记忆）里的事实，按画像里的顺序编号 p1、p2……，回答时可以引用。"""
-        core = self.system.core_memory(space_id)
+        """画像（核心记忆）里的事实，按画像里的顺序编号 p1、p2……，回答时可以引用。已经过期的
+        事实不在里面（expiry.visible_core；空间里没有过期的记忆时原样不动）。"""
+        core = self.system.visible_core(space_id, self.system.core_memory(space_id), datetime.now())
         if core is None or not core.fact_ids:
             return []
         facts = {f.id: f for f in self.system.db.get_facts(space_id, ids=core.fact_ids)}
@@ -319,6 +320,9 @@ class Agent:
             if session.forget_epoch != self.system.forget_epoch(space):
                 self._prune_locked(session)
             exclude = self._window_ids(session)
+            # 过期的记忆不给（同 SDK 的 search 与 MCP 的 recall）：召回打开 hide_expired，
+            # memory_search 也不看它们。空间里没有过期的记忆时 gone 是空的，请求不变
+            gone = self.system.expired_ids(space, datetime.now())
             l1 = L1Config(budget_tokens=self.budget.recalled)
             with span("recall"):
                 recall = self.system.retrieve(
@@ -331,6 +335,7 @@ class Agent:
                     l1=l1,
                     exclude=exclude,
                     cache_scope=cache_scope,
+                    hide_expired=True,
                 )
             timings["recall"] = _ms(started)
             schemas = [t.schema() for t in self.tools.values()]
@@ -349,7 +354,7 @@ class Agent:
             memory = SearchSession(
                 question_time=when,
                 search=lambda query, cfg: self.system.l1.search(
-                    space, query, when, cfg, exclude=exclude
+                    space, query, when, cfg, exclude=exclude | gone if gone else exclude
                 ),
                 config=replace(L1Config(), budget_tokens=2000),
                 rounds=list(recall.view.rounds),

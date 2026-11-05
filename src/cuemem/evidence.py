@@ -69,10 +69,18 @@ def recall_evidence(
     lam: float | None = None,
     exclude: Collection[str] = (),
 ) -> Evidence:
-    """控制器选档、取回记忆、排成证据块。exclude：已经原样在上下文里的轮与图片的 ID。"""
+    """控制器选档、取回记忆、排成证据块。exclude：已经原样在上下文里的轮与图片的 ID。过期的
+    记忆（SDK 的 expiration_date）不给，画像里也去掉（MemorySystem.retrieve 的 hide_expired）。"""
     now = naive_local(at) if at is not None else datetime.now()  # 证据块里的"几天前"也按本机时间
     recall = system.retrieve(
-        space, query, question_time=now, mode=mode, router=router, lam=lam, exclude=exclude
+        space,
+        query,
+        question_time=now,
+        mode=mode,
+        router=router,
+        lam=lam,
+        exclude=exclude,
+        hide_expired=True,
     )
     return evidence_from(recall, query, now)
 
@@ -194,17 +202,28 @@ def recall_listing(
     at_least_l1：调用方已经决定要查记忆（例如 MCP 的 recall），控制器选了 L0 时改走 L1，
     控制器只决定要不要查得更深。改走 L1 时直接打包探针已经打过分的候选（两次用同一个问题
     时间），不再检索一遍。两次检索都在同一次 reading 里：遗忘不能插在中间，否则打包的是它
-    已经删掉的记忆（见 MemorySystem.retrieve）。
+    已经删掉的记忆（见 MemorySystem.retrieve）。过期的记忆不给，画像里也去掉（hide_expired）。
     """
     when = naive_local(at) if at is not None else datetime.now()
     with system.reading(space):
         recall = system.retrieve(
-            space, query, question_time=when, mode=mode, router=router, lam=lam
+            space,
+            query,
+            question_time=when,
+            mode=mode,
+            router=router,
+            lam=lam,
+            hide_expired=True,
         )
         raised = at_least_l1 and recall.level == "l0"
         if raised:
             recall = system.retrieve(
-                space, query, question_time=when, mode="l1", candidates=recall.candidates
+                space,
+                query,
+                question_time=when,
+                mode="l1",
+                candidates=recall.candidates,
+                hide_expired=True,
             )
     view = recall.view
     decision = recall.decision

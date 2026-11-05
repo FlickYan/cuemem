@@ -19,7 +19,13 @@ from cuemem.config import Settings
 from cuemem.core.models import Conversation, Entity
 from cuemem.evals import routing as R
 from cuemem.memory import MemorySystem
-from cuemem.read.controller import ControllerModel, LearnedController, LLMRouter, english_reason
+from cuemem.read.controller import (
+    IMAGE_FLOOR_REASON,
+    ControllerModel,
+    LearnedController,
+    LLMRouter,
+    english_reason,
+)
 from cuemem.read.probe import Probe, query_features
 from cuemem.store import MemoryDB
 
@@ -203,6 +209,10 @@ def test_outlier_features_are_clipped(tmp_path: Path) -> None:
     ctrl = toy_controller(tmp_path, clip=1.0)
     _, p_none = ctrl.model.parts({"q_aggregation": 0.0, "p_round_top1": -50.0})
     assert p_none == pytest.approx(1 / (1 + np.exp(-(5.0 + 20.0))))  # 相当于 z = −1
+    # 上面的 approx 分不出截断与否（σ(25) 与 σ(1005) 只差 1e-11）：截断后与边界值逐位相同
+    assert ctrl.model.parts({"p_round_top1": 3.0}) == ctrl.model.parts({"p_round_top1": 1.0})
+    assert ctrl.model.parts({"p_round_top1": -50.0}) == ctrl.model.parts({"p_round_top1": -1.0})
+    assert ctrl.model.parts({"p_round_top1": 0.5}) != ctrl.model.parts({"p_round_top1": 1.0})
 
 
 def synthetic_items(n: int = 90, seed: int = 0) -> list[R.Item]:
@@ -319,6 +329,52 @@ def test_image_floor_lifts_visual_questions_out_of_l0(tmp_path: Path) -> None:
     assert ctrl.decide(visual, has_images=False).level == "L0"  # 没有图的空间不保底
     # v1 的模型文件没有 image_floor：行为不变
     assert toy_controller(tmp_path).decide(visual, has_images=True).level == "L0"
+
+
+def test_image_floor_only_lifts_l0(tmp_path: Path) -> None:
+    """保底只把 L0 抬到 L1 + 看图：控制器本来选了 L2（或 L2 + 看图）时不降档。"""
+    images = {
+        t: {"L0": 0.0, "L1": 0.4, "L2": 0.95, "L1+see": 0.5, "L2+see": 0.6}
+        for t in ("multi", "single")
+    }
+    images["none"] = dict.fromkeys(("L0", "L1", "L2", "L1+see", "L2+see"), 1.0)
+    ctrl = toy_controller(tmp_path, accuracy_images=images, image_floor=["q_scene"])
+    memory = {"q_aggregation": 1.0, "p_round_top1": 1.0, "q_scene": 1.0}  # 记忆题，带画面线索
+    decision = ctrl.decide(memory, has_images=True, lam=0.0)
+    assert decision.action == "L2"
+    assert IMAGE_FLOOR_REASON not in decision.reasons
+    see = {t: {**row, "L2+see": 0.99} for t, row in images.items()}
+    decision = toy_controller(tmp_path, accuracy_images=see, image_floor=["q_scene"]).decide(
+        memory, has_images=True, lam=0.0
+    )
+    assert decision.action == "L2+see" and IMAGE_FLOOR_REASON not in decision.reasons
+
+
+def test_with_tables_overrides_the_old_accuracy(tmp_path: Path) -> None:
+    """换回答模型重新标定（N11）：传入的表盖过原表，缺的类型、缺的动作沿用原表。"""
+    model = toy_controller(tmp_path).model
+    fresh = model.with_tables({"multi": {"L1": 0.1}})
+    assert fresh.accuracy["multi"] == {"L0": 0.0, "L1": 0.1, "L2": 0.9}
+    assert fresh.accuracy["single"] == model.accuracy["single"] == TOY_MODEL["accuracy"]["single"]
+    assert fresh.accuracy_images is None and fresh.gate_coef is model.gate_coef
+    assert model.accuracy["multi"]["L1"] == 0.5  # 原模型不变
+    # 原模型没有看图的表：传入的表原样用上
+    table = {"multi": {"L1+see": 0.7}}
+    assert model.with_tables({}, table).accuracy_images == table
+    # 原模型有看图的表：传入的值盖过原值，缺的类型沿用原表
+    images = {
+        t: {"L0": 0.0, "L1": 0.4, "L2": 0.45, "L1+see": 0.65, "L2+see": 0.8}
+        for t in ("multi", "single")
+    }
+    images["none"] = dict.fromkeys(("L0", "L1", "L2", "L1+see", "L2+see"), 1.0)
+    old = toy_controller(tmp_path, accuracy_images=images).model
+    new = old.with_tables({}, {"single": {"L2+see": 0.3}})
+    assert new.accuracy_images is not None
+    assert new.accuracy_images["single"] == {**images["single"], "L2+see": 0.3}
+    assert new.accuracy_images["multi"] == images["multi"]
+    assert new.accuracy_images["none"] == images["none"]
+    assert new.accuracy == old.accuracy
+    assert old.with_tables({}).accuracy_images == images  # 不传看图的表：原表不变
 
 
 def test_see_gate_keeps_pictures_out_of_unrelated_questions(tmp_path: Path) -> None:
@@ -472,6 +528,18 @@ def test_controller_model_file_matches_its_schema(name: str) -> None:
     assert model.gate_coef.shape == (len(model.features),)
     assert set(model.accuracy) == set(model.types)
     assert model.lam > 0
+
+
+@pytest.mark.parametrize("name", CONTROLLER_FILES)
+def test_controller_model_file_clips_outliers(name: str) -> None:
+    """仓库里的控制器都把标准化后的特征截在 ±5 以内：远在分布外的输入与 5 倍标准差逐位相同。"""
+    model = ControllerModel.load(Path(__file__).parents[1] / "src/cuemem/read" / name)
+    assert model.clip == 5.0
+    columns = list(zip(model.features, model.mean, model.scale, strict=True))
+    for sign in (1, -1):
+        far = {n: mu + sign * 50 * s for n, mu, s in columns}
+        edge = {n: mu + sign * 6 * s for n, mu, s in columns}  # z = ±6，截到 ±5
+        assert model.parts(far) == model.parts(edge)
 
 
 def test_controller_drift_ignores_the_date_and_float_noise() -> None:

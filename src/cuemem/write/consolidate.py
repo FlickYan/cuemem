@@ -26,6 +26,7 @@ import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -75,6 +76,9 @@ logger = logging.getLogger(__name__)
 # 失败 MAX_ATTEMPTS 次就不再自动重试（显式的 consolidate 仍会重试全部失败的任务）
 MAX_ATTEMPTS = 3
 RETRY_BASE_S = 60.0
+# 清空重建删了向量、还没提交时留下的指纹（见 Consolidator.rebuild）：与任何配置的指纹都不同，
+# 进程在这之间被杀时 stale() 为真，下一次巩固把重建再做一遍
+REBUILD_PENDING = "rebuild-pending"
 # 跨巩固留着载入状态（_Mirror）的空间数，最近巩固过的优先；一个空间约是全部事实与实体，
 # 再加当前事实的陈述向量（1 万条、1024 维时约 40 MB）
 MIRRORED_SPACES = 4
@@ -140,13 +144,20 @@ class Consolidator:
         *,
         extractor_model: str | None = None,
         open_sessions: Callable[[str], Collection[str]] | None = None,
+        holding_open: Callable[[str], AbstractContextManager[Collection[str]]] | None = None,
     ) -> None:
         self.db = db
         self.vectors = vectors
         self.embedder = embedder
         self.config = config
-        # 进行中的会话（MemorySystem.open_sessions）：重放时跳过，结束后再整体登记
+        # 为全部会话重新登记任务时跳过的会话（MemorySystem._held）：进行中的，以及之前的进程留下、
+        # 还没接手的（defer_adoption）；结束或接手时再整体登记
         self.open_sessions: Callable[[str], Collection[str]] = open_sessions or (lambda _: ())
+        # 重建在这里面清空、重新登记：给出要跳过的会话，并挡住期间的打开与结束（MemorySystem
+        # 拿着进行中会话的锁）。没给时只是读一下 open_sessions，不加锁（单独使用 Consolidator）
+        self.holding_open: Callable[[str], AbstractContextManager[Collection[str]]] = (
+            holding_open or (lambda space_id: nullcontext(self.open_sessions(space_id)))
+        )
         self.extractor = Extractor(
             llm,
             model=extractor_model,
@@ -266,26 +277,47 @@ class Consolidator:
         return self.db.has_jobs(space_id)
 
     def rebuild(self, space_id: str, *, replay: bool = False) -> None:
-        """清空派生记忆（数据库与向量），再为全部会话登记任务，进行中的会话（open_sessions）
-        除外。进行中的会话在清空之后才读：这期间结束的会话（close_session 先把它移出进行中、
-        再登记任务），任务要么在清空之后登记、不会被删，要么在这里登记。
+        """清空派生记忆（数据库与向量），再为全部会话登记任务，open_sessions 返回的会话
+        除外：进行中的，以及之前的进程留下、defer_adoption 还没接手的（MemorySystem._held；以前
+        只跳过前者，闲置期里一次重建就把后者抽取半段，调用方接着写完时又整段再抽取、重放一遍）。
+
+        清空与重新登记在同一个事务里（与遗忘相同），要跳过的会话在 holding_open 里读、拿着它
+        直到提交（MemorySystem 的进行中会话的锁；先这把锁、后数据库，与 open_session、
+        close_session 和遗忘的顺序相同）：期间结束的会话（close_session 拿着这把锁把它移出进行中）
+        要么在这之前结束、在这里登记，要么等提交之后才登记、不会被清空。以前清空单独提交、之后
+        才重新登记：重新登记时出错（另一个进程拿着数据库，"database is locked"）或进程被杀，空间
+        既没有事实也没有任务，后台线程的重试与重启都找不到要做的事，直到这个用户再写一次。
 
         replay=True（会话又长了时的重放，见 _replay_regrown）：只为原来有任务的会话登记，
         SDK 的 infer=False 只记了日志的会话照旧等显式的 consolidate；内容没变的会话保留原来的
-        结局（_keeps_outcome，见 requeue）。清空前的任务与清空在同一个事务里读：期间别的线程
-        登记的任务不会被删掉而没人补上。
+        结局（_keeps_outcome，见 requeue）。清空前的任务也在这个事务里读：期间别的线程登记的任务
+        不会被删掉而没人补上。
 
         先删派生记忆的向量，再清空数据库（与遗忘相同：先删向量、后删记录）：向量库出错时数据库
-        里什么都没改，会话又长了的那对任务还在，后台线程按退避把重放再做一遍。以前先提交清空
-        （任务也清空了）、再删向量、最后才重新登记：删向量时出错，任务一个不剩，后台线程的重试与
-        重启都找不到要做的事，整个空间的事实、实体与画像都没了，直到有人显式地巩固。现在清空与
-        重新登记之间只有本地的读写。"""
+        里什么都没改，会话又长了的那对任务还在，后台线程按退避把重放再做一遍。期间新写的派生
+        向量（通常没有）在提交之后、锁外删。
+
+        清空重建（replay=False）删向量之前先单独提交一个"重建没做完"的指纹（REBUILD_PENDING，
+        与任何配置的指纹都不同），事务里再改回原来的（第五轮复审）：向量删了、事务却没提交时
+        （进程被杀，重新登记出错）事实与"已完成"的任务都在、向量没了，以前 stale() 仍是 False，
+        后台线程、重启与下一次巩固都不会补，检索悄悄找不到这些事实。现在留下的指纹让 stale()
+        为真，下一次 consolidate 或 add(wait=True) 把重建再做一遍（也可以 cuemem reindex 按数据库
+        补齐向量）。会话又长了时的重放不需要：那对任务留着，后台线程会再做一遍。"""
+        key = f"consolidation:{space_id}"
+        recorded = None if replay else self.db.get_meta(key)
+        if not replay:
+            self.db.set_meta(key, REBUILD_PENDING)
         derived = self.db.derived_unit_ids(space_id)
         self.vectors.delete(space_id, derived)
-        with self.db.transaction():
+        with self.holding_open(space_id) as skip, self.db.transaction():
             before = self.db.get_jobs(space_id) if replay else None
             removed = self.db.clear_derived(space_id)
-        self.requeue(space_id, before, self.open_sessions(space_id))
+            self.requeue(space_id, before, skip)  # 里层的事务是保存点
+            if not replay:  # 照旧：成功的 run 最后写这次的指纹
+                if recorded is None:
+                    self.db.delete_meta(key)
+                else:
+                    self.db.set_meta(key, recorded)
         self.vectors.delete(space_id, sorted(set(removed) - set(derived)))  # 通常没有
 
     def requeue(
@@ -295,6 +327,7 @@ class Consolidator:
         skip: Collection[str],
     ) -> int:
         """清空派生记忆（clear_derived，任务也清空了）之后重新登记任务，返回新登记的个数。
+        调用方在清空的同一个事务里调用（rebuild 与遗忘），这里的事务是保存点。
 
         before：清空之前的任务（与清空在同一个事务里读）。只为其中有任务的会话登记：SDK 的
         infer=False 只记了日志的会话照旧不抽取；内容没变（任务键相同）的会话保留原来的结局
@@ -605,9 +638,7 @@ class Consolidator:
         dense = _stack([vectors[u.text][0] for u in units])
         sparse_rows = [vectors[u.text][1] for u in units]
         sparse = None if any(v is None for v in sparse_rows) else [v for v in sparse_rows if v]
-        payloads = [
-            {"kind": u.kind, "session_id": u.session_id, "ts": to_epoch(u.ts)} for u in units
-        ]
+        payloads = [unit_payload(u) for u in units]
         self.vectors.upsert(space_id, [u.id for u in units], dense, sparse, payloads)
         self.db.add_units(units)
 
@@ -692,7 +723,7 @@ class Consolidator:
             unit = _fact_unit(fact)
             units.append(unit)
             if fact.id in added_ids:
-                index.append((unit, embedded[fact.statement], _fact_payload(fact)))
+                index.append((unit, embedded[fact.statement], unit_payload(unit, fact)))
         retired = [f.id for f in rec.changed.values() if not f.is_current and f.id not in added_ids]
         episodes: list[Episode] = []
         if ext.summary:
@@ -716,22 +747,19 @@ class Consolidator:
                 source_turn_ids=ext.turn_ids,
             )
             units.append(unit)
-            index.append((unit, embedded[ext.summary], {"kind": "summary"}))
+            index.append((unit, embedded[ext.summary], unit_payload(unit)))
         for entity in ents.changed.values():
             vec = embedded.get(entity.descriptor)
             if vec is None or entity.id not in ents.created_ids:  # 只索引新建且有描述向量的实体
                 continue
             unit = _entity_unit(entity, ext.session_id)
             units.append(unit)
-            index.append((unit, vec, {"kind": "entity"}))
+            index.append((unit, vec, unit_payload(unit)))
 
         if index:
             dense = _stack([vec[0] for _, vec, _ in index])
             sparse = [vec[1] or SparseVector(indices=[], values=[]) for _, vec, _ in index]
-            payloads = [
-                {"session_id": unit.session_id, "ts": to_epoch(unit.ts), **extra}
-                for unit, _, extra in index
-            ]
+            payloads = [payload for _, _, payload in index]
             self.vectors.upsert(space_id, [u.id for u, _, _ in index], dense, sparse, payloads)
         self.vectors.set_payload(space_id, retired, {"current": False})
         stats = {
@@ -939,11 +967,26 @@ class ConsolidationWorker:
             self._enqueue(space_id)
             self._cond.notify_all()
 
-    def wait(self) -> None:
-        """等待已提交的空间全部处理完（其间到期的重试也等；还没到期的不等）。"""
+    def wait(
+        self, spaces: Callable[[str], bool] | None = None, timeout: float | None = None
+    ) -> bool:
+        """等待已提交的空间全部处理完（其间到期的重试也等；还没到期的不等）。spaces：只等让它返回
+        True 的空间（SDK 的 wait(user_id=...)、/api/v1/wait 只等令牌能访问的空间）；None 是全部。
+        timeout 秒内没等到时返回 False，否则 True。"""
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
-            while self._pending or self._running or self._again:
-                self._cond.wait()
+            while any(
+                spaces is None or spaces(space)
+                for space in (*self._pending, *self._running, *self._again)
+            ):
+                if deadline is None:
+                    self._cond.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+        return True
 
     def stop(self) -> None:
         """已经排着的空间做完再退出（之后到期的重试不再排），所有线程一共最多等 stop_timeout_s
@@ -1137,8 +1180,29 @@ def _fact_unit(fact: Fact) -> MemoryUnit:
     )
 
 
-def _fact_payload(fact: Fact) -> dict[str, Any]:
-    return {"kind": "fact", "current": fact.is_current, "subject_id": fact.subject_id}
+def unit_payload(unit: MemoryUnit, fact: Fact | None = None) -> dict[str, Any]:
+    """检索单元在向量库里的 payload（点上另有 unit_id，见 VectorStore.upsert），每种单元一种：
+
+    - "轮"与图片描述（round、image、image_iso）：kind、session_id、ts
+    - 事实：session_id、ts、kind、current、subject_id（fact 是这条事实，current 供只取现行事实
+      的检索过滤；被取代时巩固用 set_payload 改成 False）
+    - 摘要与实体（summary、entity）：session_id、ts、kind
+
+    在线写入、巩固与 reindex 都用它：以前在线写入与巩固各写一份，键的顺序也各不相同，这里照原样
+    保留（payload 一点都不变）。"""
+    if unit.kind == "fact":
+        if fact is None:
+            raise ValueError(f"事实 {unit.id} 的 payload 要有这条事实（current、subject_id）")
+        return {
+            "session_id": unit.session_id,
+            "ts": to_epoch(unit.ts),
+            "kind": "fact",
+            "current": fact.is_current,
+            "subject_id": fact.subject_id,
+        }
+    if unit.kind in ("summary", "entity"):
+        return {"session_id": unit.session_id, "ts": to_epoch(unit.ts), "kind": unit.kind}
+    return {"kind": unit.kind, "session_id": unit.session_id, "ts": to_epoch(unit.ts)}
 
 
 def _entity_unit(entity: Entity, session_id: str) -> MemoryUnit:

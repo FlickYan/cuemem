@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -23,7 +25,8 @@ from cuemem.errors import ConfigMismatchError, StorageLockedError, VectorStoreOp
 from cuemem.store import MemoryDB, VectorStore, media
 from cuemem.store import sqlite as sqlite_module
 from cuemem.store.media import MediaStore, image_data_url
-from cuemem.store.sqlite import legacy_idx_key, next_idx_key
+from cuemem.store.sqlite import SCHEMA_VERSION, legacy_idx_key, next_idx_key
+from cuemem.store.vector import _NoCommit
 from cuemem.write import build_rounds, build_turns
 
 
@@ -44,6 +47,43 @@ def test_db_writes_are_idempotent(tmp_path: Path) -> None:
     assert [u.id for u in fetched] == [units[1].id, units[0].id]  # 保持请求的顺序
     assert db.get_units("other-space", [units[0].id]) == []  # 记忆空间之间互相隔离
     assert db.list_spaces()[0]["turns"] == len(turns)
+
+
+def test_turn_and_unit_lookups_by_id_or_session_keep_log_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """按发言 ID、会话取发言与"轮"（遗忘只读要删的会话）：分批查的结果与一次查完相同，顺序是日志的
+    顺序（ts, session_id, idx）；以前写进去的带时区的时间按存的原文排，与 ORDER BY 相同。"""
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    conv = Conversation.model_validate_json(TOY_CONVERSATION.read_text("utf-8"))
+    db.ensure_space("demo")
+    for session in reversed(conv.sessions):  # 写入的先后与日志顺序相反
+        db.add_session("demo", session.session_id, session.started_at)
+        turns = build_turns("demo", session)
+        db.add_turns(turns)
+        db.add_units(build_rounds(turns))
+    with db.transaction() as conn:  # 以前带时区写进去的一行
+        conn.execute("UPDATE turns SET ts = ts || '+00:00' WHERE session_id = 's3' AND idx = 1")
+    everything = db.get_turns("demo")
+    rounds = db.list_units("demo", kinds=["round"])
+    ids = [*[t.id for t in everything][::-1], "no-such-turn"]
+    sessions = ["s4", "s2", "s3"]
+    expected = {
+        "ids": [t for t in everything if t.id in ids],
+        "sessions": [t for t in everything if t.session_id in sessions],
+        "both": [t for t in everything if t.id in ids[:7] or t.session_id in sessions],
+        "units": [u for u in rounds if u.session_id in sessions],
+    }
+    for chunk in (900, 2):
+        monkeypatch.setattr(sqlite_module, "IN_CHUNK", chunk)
+        assert db.get_turns("demo", ids=ids) == expected["ids"]
+        assert db.get_turns("demo", session_ids=sessions) == expected["sessions"]
+        assert db.turns_of("demo", ids=ids[:7], session_ids=sessions) == expected["both"]
+        assert db.list_units("demo", kinds=["round"], session_ids=sessions) == expected["units"]
+        texts = [u.text for u in rounds[:5]] + ["no such text"]
+        assert db.existing_texts("demo", texts) == set(texts[:5])
+    assert db.get_turns("demo", ids=[]) == db.get_turns("demo", session_ids=[]) == []
+    assert db.unit_texts("demo", kinds_not=["round"]) == []
 
 
 def test_nested_transactions_commit_only_at_the_outermost(tmp_path: Path) -> None:
@@ -396,6 +436,99 @@ def test_vector_store_search_and_filters(tmp_path: Path) -> None:
     reopened.close()
 
 
+def _commits(store: VectorStore, name: str) -> list[str]:
+    """记下这个本地模式集合的 SQLite 连接上执行的 COMMIT（qdrant-client 的内部属性）。"""
+    seen: list[str] = []
+    conn = store._client._client.collections[name].storage.storage
+    conn.set_trace_callback(lambda sql: seen.append(sql) if sql.upper() == "COMMIT" else None)
+    return seen
+
+
+def test_local_writes_commit_once_per_call_and_persist(tmp_path: Path) -> None:
+    """本地模式一次写入只提交一次 SQLite：qdrant-client 每写一个点提交一次（每次一个 fsync），
+    遗忘删 1 万个向量时全程拿着向量库的锁，别的用户的检索最多等了 13.6 秒（第五轮体检）。重新
+    打开之后点数、payload 与图片都在。"""
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    ids = [f"u{i}" for i in range(300)]
+    dense = l2_normalize(np.random.default_rng(0).random((300, 4)).astype(np.float32))
+    payloads = [{"kind": "round", "ts": float(i)} for i in range(300)]
+    store.ensure_space("s")
+    commits = _commits(store, store.collection_name("s"))
+    store.upsert("s", ids, dense, None, payloads)
+    assert len(commits) <= 2  # 以前 300 次
+    store.set_payload("s", ids[:100], {"kind": "fact"})
+    store.delete("s", ids[150:])
+    assert len(commits) <= 6
+    image = l2_normalize(np.ones((3, 2), dtype=np.float32))
+    store.upsert_images("s", ["m1", "m2", "m3"], image, [{}, {}, {}])
+    store.delete_images("s", ["m2"])
+    store.close()
+
+    reopened = VectorStore(tmp_path / "qdrant", dim=4)
+    assert reopened.count("s") == 150 and reopened.count("s", kinds=["fact"]) == 100
+    assert sorted(reopened.unit_ids("s"), key=lambda u: int(u[1:])) == ids[:150]
+    hits = reopened.search_dense("s", dense[120], 1, kinds=["round"], ts_range=(120.0, 120.0))
+    assert [h.unit_id for h in hits] == ["u120"]
+    images = reopened.search_images("s", np.ones(2) / np.sqrt(2), 3)
+    assert sorted(h.unit_id for h in images) == ["m1", "m3"]
+    reopened.close()
+
+
+def test_the_no_commit_stand_in_also_works_as_a_context_manager(tmp_path: Path) -> None:
+    """qdrant-client 1.20 起在 persist 与 delete 里写 `with self.storage:`（连接自己的上下文管理器
+    提交）：替身也要能这样用，而且进出都不提交，留给 _batched 最后提交一次（CI 的 package 任务装
+    的是不锁版本的 qdrant-client，曾在这里报 TypeError）。"""
+    conn = sqlite3.connect(tmp_path / "x.sqlite")
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    seen: list[str] = []
+    conn.set_trace_callback(lambda sql: seen.append(sql) if sql.upper() == "COMMIT" else None)
+    stand_in = _NoCommit(conn)
+    with stand_in as entered:
+        entered.execute("INSERT INTO t VALUES (1)")
+    stand_in.commit()
+    assert seen == [] and conn.in_transaction
+    conn.commit()
+    assert seen == ["COMMIT"]
+    conn.close()
+
+
+def test_local_writes_fall_back_when_qdrant_internals_differ(tmp_path: Path) -> None:
+    """qdrant-client 的内部属性对不上时（这里集合的连接已经被换成别的对象）照旧每个点提交一次，
+    写入照常、重新打开之后都在。"""
+
+    class Counting:
+        def __init__(self, conn: Any) -> None:
+            self.conn, self.commits = conn, 0
+
+        def commit(self) -> None:
+            self.commits += 1
+            self.conn.commit()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.conn, name)
+
+        def __enter__(self) -> Any:  # qdrant-client 1.20 起用 `with` 提交
+            self.commits += 1
+            return self.conn.__enter__()
+
+        def __exit__(self, *exc: Any) -> Any:
+            return self.conn.__exit__(*exc)
+
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    store.ensure_space("s")
+    persistence = store._client._client.collections[store.collection_name("s")].storage
+    counting = persistence.storage = Counting(persistence.storage)
+    dense = l2_normalize(np.ones((5, 4), dtype=np.float32))
+    store.upsert("s", [f"u{i}" for i in range(5)], dense, None, [{"kind": "round"}] * 5)
+    store.delete("s", ["u0"])
+    assert counting.commits == 6 and persistence.storage is counting
+    store.close()
+    reopened = VectorStore(tmp_path / "qdrant", dim=4)
+    assert reopened.count("s") == 4
+    reopened.close()
+
+
 def test_locked_local_store_explains_itself(tmp_path: Path) -> None:
     """Qdrant 本地模式一次只允许一个进程打开：第二个打开者得到能看懂的报错，而不是库内部的异常。"""
     first = VectorStore(tmp_path / "qdrant", dim=4)
@@ -520,6 +653,104 @@ def test_memory_system_passes_the_configured_api_key(
     assert not (tmp_path / "data" / "qdrant").exists()  # 服务端模式不建本地向量库
 
 
+def _store_with_spaces(path: Path) -> tuple[VectorStore, Any]:
+    """文字集合（dense 加 sparse）、图片集合（另一个维度）与一个空集合。"""
+    store = VectorStore(path, dim=4)
+    dense = l2_normalize(np.eye(4, dtype=np.float32)[:3] + 0.1)
+    sparse = [SparseVector(indices=[i], values=[1.0]) for i in range(3)]
+    payloads = [{"kind": "round", "ts": float(i)} for i in range(3)]
+    store.upsert("s", ["a", "b", "c"], dense, sparse, payloads)
+    store.upsert_images("s", ["m1"], l2_normalize(np.ones((1, 2), dtype=np.float32)), [{}])
+    store.ensure_space("empty")
+    return store, dense
+
+
+def _hits(store: VectorStore, dense: Any) -> list[list[str]]:
+    return [
+        [h.unit_id for h in store.search_dense("s", dense[1], 3)],
+        [h.unit_id for h in store.search_sparse("s", SparseVector(indices=[2], values=[1.0]), 1)],
+        [h.unit_id for h in store.search_images("s", np.ones(2) / np.sqrt(2), 1)],
+    ]
+
+
+def test_unreadable_meta_names_the_repair_and_repair_restores_it(tmp_path: Path) -> None:
+    """qdrant-client 1.19 建、删集合时先清空 meta.json 再写，正好被杀掉时留下空文件：以前打开时
+    原样抛出 JSONDecodeError。现在是写明 doctor --repair-vectors 的 VectorStoreOpenError；修复按
+    collection/ 下的集合重写 meta.json（与 qdrant 自己写的一样），检索结果不变。"""
+    from cuemem.store.vector import repair_local_meta
+
+    path = tmp_path / "qdrant"
+    store, dense = _store_with_spaces(path)
+    store.close()
+    store = VectorStore(path, dim=4)  # 打开后的顺序（同分的点按读进来的顺序排）
+    before = _hits(store, dense)
+    store.close()
+    meta = path / "meta.json"
+    original = json.loads(meta.read_text("utf-8"))
+    assert repair_local_meta(path, text_dim=4, image_dim=2) is None  # 读得出：不动
+    meta.write_text("", "utf-8")
+
+    with pytest.raises(VectorStoreOpenError, match="repair-vectors") as info:
+        VectorStore(path, dim=4)
+    assert "不要手动删掉 meta.json" in str(info.value)
+
+    report = repair_local_meta(path, text_dim=99, image_dim=99)  # 维度从存着的点读
+    assert report is not None
+    assert (report["text"], report["image"], report["empty"], report["points"]) == (2, 1, 1, 4)
+    repaired = json.loads(meta.read_text("utf-8"))
+    empty = next(name for name in original["collections"] if name.startswith("space_empty_"))
+    assert repaired["collections"].pop(empty)["vectors"]["dense"]["size"] == 99  # 空集合：配置的
+    original["collections"].pop(empty)
+    # qdrant-client 1.20 起 meta.json 多一个 text_indexes（本地模式不建索引，总是空的；读的时候
+    # 缺了当作空）：修出来的文件不写它
+    assert original.pop("text_indexes", {}) == {}
+    assert repaired == original
+    meta.write_text("", "utf-8")
+    repair_local_meta(path, text_dim=4, image_dim=2)
+    original = json.loads(meta.read_text("utf-8"))
+    assert Path(report["backup"]).read_text("utf-8") == ""
+    reopened = VectorStore(path, dim=4)
+    assert _hits(reopened, dense) == before
+    assert reopened.count("empty") == 0
+    reopened.close()
+
+    meta.unlink()  # 不在了（例如手动删掉，还没被 qdrant 重写成空的）：照样补上
+    report = repair_local_meta(path, text_dim=4, image_dim=2)
+    assert report is not None and report["backup"] is None
+    assert json.loads(meta.read_text("utf-8")) == original
+
+    # 读得出、某个集合的配置却不合法（第五轮复审：以前原样保留、返回 None，向量库一直打不开）
+    bogus = json.loads(meta.read_text("utf-8"))
+    text = next(n for n in bogus["collections"] if n.startswith("space_s_") and "_img" not in n)
+    bogus["collections"][text] = {"vectors": "bogus"}
+    meta.write_text(json.dumps(bogus), "utf-8")
+    with pytest.raises(VectorStoreOpenError, match="repair-vectors"):
+        VectorStore(path, dim=4)
+    report = repair_local_meta(path, text_dim=4, image_dim=2)
+    assert report is not None and (report["text"], report["image"]) == (1, 0)
+    assert json.loads(meta.read_text("utf-8")) == original
+    reopened = VectorStore(path, dim=4)
+    assert _hits(reopened, dense) == before
+    reopened.close()
+
+
+def test_repair_refuses_while_the_store_is_open(tmp_path: Path) -> None:
+    """另一个进程（这里是另一个客户端）开着向量库时不修：它随后写 meta.json 会盖掉修好的。"""
+    from cuemem.store.vector import repair_local_meta
+
+    path = tmp_path / "qdrant"
+    store, _ = _store_with_spaces(path)
+    meta = path / "meta.json"
+    meta.write_text("{", "utf-8")
+    try:
+        with pytest.raises(StorageLockedError, match="另一个进程"):
+            repair_local_meta(path, text_dim=4, image_dim=2)
+        assert meta.read_text("utf-8") == "{"
+        assert [p.name for p in path.iterdir() if p.name.startswith("meta.json")] == ["meta.json"]
+    finally:
+        store.close()
+
+
 def test_copy_into_moves_every_collection(tmp_path: Path) -> None:
     """迁到服务端：文字与图片集合连同向量、payload 原样复制，检索结果不变。"""
     source = VectorStore(tmp_path / "local", dim=4)
@@ -569,6 +800,38 @@ def test_v1_database_is_migrated(tmp_path: Path) -> None:
     )
     assert db.add_turns([turn]) == 1
     assert db.get_turns("s")[0].speaker == "Alice"
+
+
+def test_newer_database_is_refused_and_left_untouched(tmp_path: Path) -> None:
+    """更新的 CueMem 写的库（user_version 更大）：拒绝打开，不切 WAL、不建表，也不把版本调低。
+    以前每次打开都设成 SCHEMA_VERSION，旧版本悄悄读不到新的集合名与 turn_meta。"""
+    import sqlite3
+
+    path = tmp_path / "memory.sqlite"
+    MemoryDB(path).close()
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigMismatchError, match=f"v{SCHEMA_VERSION + 1}"):
+        MemoryDB(path)
+    assert path.read_bytes() == before  # 连文件头都没改（没有切回 WAL）
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+
+    for older in (5, 6):  # 发布过的构建（v6 及更早）照常打开并升级
+        conn = sqlite3.connect(path)
+        conn.execute(f"PRAGMA user_version = {older}")
+        conn.commit()
+        conn.close()
+        db = MemoryDB(path)
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        db.close()
 
 
 def test_fact_indexes_are_added_to_existing_databases(tmp_path: Path) -> None:
@@ -657,7 +920,7 @@ def test_v5_database_gains_turn_meta(tmp_path: Path) -> None:
     conn.close()
 
     db = MemoryDB(path)
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert db.get_turn_meta("s") == {} and [t.id for t in db.get_turns("s")] == ["t0"]
     tagged = TurnMeta(metadata={"topic": "food", "n": 1}, expires_at="2030-01-01")
     assert db.add_turns([turn("t1", 1)], {"t1": tagged}) == 1

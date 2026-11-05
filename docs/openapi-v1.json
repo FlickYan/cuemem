@@ -12,7 +12,7 @@
           "memories (v1)"
         ],
         "summary": "Add",
-        "operationId": "add_api_v1_memories_post",
+        "operationId": "add",
         "security": [
           {
             "HTTPBearer": []
@@ -34,7 +34,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Add Api V1 Memories Post",
+                  "title": "Response Add",
                   "$ref": "#/components/schemas/AddResult"
                 }
               }
@@ -151,7 +151,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -167,7 +177,7 @@
           "memories (v1)"
         ],
         "summary": "Get All",
-        "operationId": "get_all_api_v1_memories_get",
+        "operationId": "get_all",
         "security": [
           {
             "HTTPBearer": []
@@ -330,7 +340,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Get All Api V1 Memories Get",
+                  "title": "Response Get All",
                   "$ref": "#/components/schemas/GetAllResult"
                 }
               }
@@ -447,7 +457,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -463,7 +483,7 @@
           "memories (v1)"
         ],
         "summary": "Delete All",
-        "operationId": "delete_all_api_v1_memories_delete",
+        "operationId": "delete_all",
         "security": [
           {
             "HTTPBearer": []
@@ -525,7 +545,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Delete All Api V1 Memories Delete",
+                  "title": "Response Delete All",
                   "$ref": "#/components/schemas/ForgetResult"
                 }
               }
@@ -642,7 +662,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -660,7 +690,7 @@
           "memories (v1)"
         ],
         "summary": "Search",
-        "operationId": "search_api_v1_memories_search_post",
+        "operationId": "search",
         "requestBody": {
           "content": {
             "application/json": {
@@ -678,7 +708,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SearchResult",
-                  "title": "Response Search Api V1 Memories Search Post"
+                  "title": "Response Search"
                 }
               }
             }
@@ -794,7 +824,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -817,7 +857,7 @@
           "memories (v1)"
         ],
         "summary": "Get",
-        "operationId": "get_api_v1_memories__memory_id__get",
+        "operationId": "get",
         "security": [
           {
             "HTTPBearer": []
@@ -840,7 +880,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response 200 Get Api V1 Memories  Memory Id  Get",
+                  "title": "Response 200 Get",
                   "oneOf": [
                     {
                       "$ref": "#/components/schemas/FactItem"
@@ -975,7 +1015,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -991,7 +1041,7 @@
           "memories (v1)"
         ],
         "summary": "Update",
-        "operationId": "update_api_v1_memories__memory_id__put",
+        "operationId": "update",
         "security": [
           {
             "HTTPBearer": []
@@ -1024,7 +1074,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Update Api V1 Memories  Memory Id  Put",
+                  "title": "Response Update",
                   "$ref": "#/components/schemas/UpdateResult"
                 }
               }
@@ -1141,7 +1191,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1157,7 +1217,7 @@
           "memories (v1)"
         ],
         "summary": "Delete",
-        "operationId": "delete_api_v1_memories__memory_id__delete",
+        "operationId": "delete",
         "security": [
           {
             "HTTPBearer": []
@@ -1190,7 +1250,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response 200 Delete Api V1 Memories  Memory Id  Delete",
+                  "title": "Response 200 Delete",
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/ForgetResult"
@@ -1314,7 +1374,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1332,7 +1402,7 @@
           "memories (v1)"
         ],
         "summary": "History",
-        "operationId": "history_api_v1_memories__memory_id__history_get",
+        "operationId": "history",
         "security": [
           {
             "HTTPBearer": []
@@ -1355,7 +1425,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response 200 History Api V1 Memories  Memory Id  History Get",
+                  "title": "Response 200 History",
                   "type": "array",
                   "items": {
                     "$ref": "#/components/schemas/HistoryItem"
@@ -1475,7 +1545,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1494,7 +1574,7 @@
         ],
         "summary": "Media",
         "description": "The original file of an image memory (the path in image items is on the server). Out-of-scope, non-image and unknown ids are 404.",
-        "operationId": "media_api_v1_media__media_id__get",
+        "operationId": "media",
         "security": [
           {
             "HTTPBearer": []
@@ -1515,7 +1595,49 @@
           "200": {
             "description": "Successful Response",
             "content": {
-              "image/*": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/bmp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/gif": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/mpo": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/tiff": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
                 "schema": {
                   "type": "string",
                   "format": "binary"
@@ -1634,7 +1756,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1653,7 +1785,7 @@
         ],
         "summary": "Reset",
         "description": "The admin token deletes every memory; a scoped key deletes the memory spaces in its scope.",
-        "operationId": "reset_api_v1_reset_post",
+        "operationId": "reset",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1661,7 +1793,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ResetResult",
-                  "title": "Response Reset Api V1 Reset Post"
+                  "title": "Response Reset"
                 }
               }
             }
@@ -1777,7 +1909,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1800,7 +1942,7 @@
           "memories (v1)"
         ],
         "summary": "Answer",
-        "operationId": "answer_api_v1_answer_post",
+        "operationId": "answer",
         "requestBody": {
           "content": {
             "application/json": {
@@ -1818,7 +1960,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AnswerResult",
-                  "title": "Response Answer Api V1 Answer Post"
+                  "title": "Response Answer"
                 }
               }
             }
@@ -1934,7 +2076,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1957,7 +2109,7 @@
           "memories (v1)"
         ],
         "summary": "Profile",
-        "operationId": "profile_api_v1_profile_get",
+        "operationId": "profile",
         "security": [
           {
             "HTTPBearer": []
@@ -2003,7 +2155,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Profile Api V1 Profile Get",
+                  "title": "Response Profile",
                   "$ref": "#/components/schemas/ProfileResult"
                 }
               }
@@ -2120,7 +2272,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2138,7 +2300,7 @@
           "memories (v1)"
         ],
         "summary": "Open Run",
-        "operationId": "open_run_api_v1_runs_post",
+        "operationId": "open_run",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2156,7 +2318,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RunResult",
-                  "title": "Response Open Run Api V1 Runs Post"
+                  "title": "Response Open Run"
                 }
               }
             }
@@ -2272,7 +2434,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2295,7 +2467,7 @@
           "memories (v1)"
         ],
         "summary": "End Run",
-        "operationId": "end_run_api_v1_runs_end_post",
+        "operationId": "end_run",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2313,7 +2485,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/EndRunResult",
-                  "title": "Response End Run Api V1 Runs End Post"
+                  "title": "Response End Run"
                 }
               }
             }
@@ -2429,7 +2601,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2452,7 +2634,7 @@
           "memories (v1)"
         ],
         "summary": "Consolidate",
-        "operationId": "consolidate_api_v1_consolidate_post",
+        "operationId": "consolidate",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2470,7 +2652,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ConsolidationReport",
-                  "title": "Response Consolidate Api V1 Consolidate Post"
+                  "title": "Response Consolidate"
                 }
               }
             }
@@ -2586,7 +2768,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2609,7 +2801,25 @@
           "memories (v1)"
         ],
         "summary": "Wait",
-        "operationId": "wait_api_v1_wait_post",
+        "description": "给了 user_id、agent_id 时只等这个空间（要在作用域里）；不给时管理令牌（没配令牌时的\n本机演示）等全部，限定作用域的令牌只等它能访问的空间。以前不看作用域、等全部用户的抽取：\n限定作用域的令牌也能占着一个线程，还能从等了多久看出别的用户排着多少抽取。最多等\nWAIT_TIMEOUT_S 秒，没做完时 504（timeout，type TimeoutError）。",
+        "operationId": "wait",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/WaitRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2617,7 +2827,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/WaitResult",
-                  "title": "Response Wait Api V1 Wait Post"
+                  "title": "Response Wait"
                 }
               }
             }
@@ -2733,7 +2943,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2756,7 +2976,7 @@
           "memories (v1)"
         ],
         "summary": "Status",
-        "operationId": "status_api_v1_status_get",
+        "operationId": "status",
         "security": [
           {
             "HTTPBearer": []
@@ -2802,7 +3022,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Status Api V1 Status Get",
+                  "title": "Response Status",
                   "$ref": "#/components/schemas/StatusResult"
                 }
               }
@@ -2919,7 +3139,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2937,7 +3167,7 @@
           "memories (v1)"
         ],
         "summary": "Export",
-        "operationId": "export_api_v1_export_get",
+        "operationId": "export",
         "security": [
           {
             "HTTPBearer": []
@@ -2993,7 +3223,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Export Api V1 Export Get",
+                  "title": "Response Export",
                   "$ref": "#/components/schemas/ExportDocument"
                 }
               }
@@ -3110,7 +3340,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3128,7 +3368,7 @@
           "memories (v1)"
         ],
         "summary": "Load",
-        "operationId": "load_api_v1_import_post",
+        "operationId": "load",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3146,7 +3386,7 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ImportReport",
-                  "title": "Response Load Api V1 Import Post"
+                  "title": "Response Load"
                 }
               }
             }
@@ -3262,7 +3502,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3285,7 +3535,7 @@
           "memories (v1)"
         ],
         "summary": "Spaces",
-        "operationId": "spaces_api_v1_spaces_get",
+        "operationId": "spaces",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -3296,7 +3546,7 @@
                     "$ref": "#/components/schemas/SpaceRow"
                   },
                   "type": "array",
-                  "title": "Response 200 Spaces Api V1 Spaces Get"
+                  "title": "Response 200 Spaces"
                 }
               }
             }
@@ -3412,7 +3662,17 @@
             }
           },
           "504": {
-            "description": "The model provider timed out.",
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3678,7 +3938,8 @@
           "lam": {
             "anyOf": [
               {
-                "type": "number"
+                "type": "number",
+                "minimum": 0.0
               },
               {
                 "type": "null"
@@ -5474,7 +5735,8 @@
           "lam": {
             "anyOf": [
               {
-                "type": "number"
+                "type": "number",
+                "minimum": 0.0
               },
               {
                 "type": "null"
@@ -5795,6 +6057,47 @@
         ],
         "title": "V1ErrorBody",
         "description": "Every /api/v1 error has this shape, including 401, 404 and 422."
+      },
+      "WaitRequest": {
+        "properties": {
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout",
+            "description": "Seconds; at most 300"
+          }
+        },
+        "type": "object",
+        "title": "WaitRequest"
       },
       "WaitResult": {
         "properties": {

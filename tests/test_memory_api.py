@@ -10,11 +10,12 @@ import importlib.resources
 import inspect
 import io
 import json
+import math
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -60,6 +61,7 @@ from cuemem.errors import (
 )
 from cuemem.evidence import RAISED_REASON
 from cuemem.memory import MemorySystem
+from cuemem.store.media import ACCEPTED_FORMATS
 
 Mem = Memory | MemoryClient
 
@@ -98,7 +100,18 @@ def v1_app(system: MemorySystem, keys: Keys | None = None) -> FastAPI:
 
 # /api/v1 的接口（路由的元数据与包住的 Memory 无关）：按它们找响应在 OpenAPI 里写的模型
 V1_ROUTES = [r for r in memories_router(cast(Memory, None)).routes if isinstance(r, APIRoute)]
-V1_ERRORS = (400, 401, 402, 403, 404, 409, 413, 422, 429, 502, 503, 504)
+V1_ERRORS = (400, 401, 402, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504)
+# GET /api/v1/media/{id} 的 Content-Type：写死在这里，PIL 升级改了类型时快照不会悄悄跟着变
+MEDIA_TYPES = [
+    "application/octet-stream",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/mpo",
+    "image/png",
+    "image/tiff",
+    "image/webp",
+]
 
 
 def _undocumented(value: Any, where: str = "") -> list[str]:
@@ -212,6 +225,7 @@ ARGUMENTS: dict[str, Any] = {
     "dry_run": True,
     "rebuild": True,
     "derived": False,
+    "timeout": 2.0,  # 比 TestClient 的读超时（5 秒）减去 WAIT_MARGIN_S 短，原样发出
 }
 PER_METHOD: dict[tuple[str, str], Any] = {("load", "data"): {"version": 2, "space_id": "alice"}}
 RETURNS: dict[str, Any] = {
@@ -364,6 +378,109 @@ def test_add_events_history_and_time_travel(mem: Mem) -> None:
     ]
     assert mem.get("no-such-id") is None and mem.history("no-such-id") == []
     assert "Munich" in mem.profile(user_id="alice")
+
+
+def test_valid_at_takes_a_year_month_or_day(mem: Mem) -> None:
+    """第五轮体检 P8：valid_at 以前按字符串比较。文档里的 "2026-08" 什么都查不到（'2026-08-01'
+    <= '2026-08' 不成立），'2026-8'、'banana' 之类不报错、给出 Munich。现在一年、一个月是这段
+    时间里成立过的事实，别的写法本地与远程都 ValueError。"""
+    mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    mem.add(
+        [
+            {"role": "user", "content": "I moved to Munich"},
+            {"role": "assistant", "content": "Nice!"},
+        ],
+        user_id="alice",
+        timestamp=SEP,
+        wait=True,
+    )
+
+    def then(valid_at: str | date) -> list[str]:
+        return sorted(
+            f["memory"] for f in mem.get_all(user_id="alice", valid_at=valid_at)["results"]
+        )
+
+    berlin, munich = ["The user lives in Berlin."], ["The user lives in Munich."]
+    assert then("2026-08") == berlin
+    assert then("2026-09") == munich
+    assert then("2026") == sorted(berlin + munich)
+    assert then("2026-08-15") == then(date(2026, 8, 15)) == berlin
+    assert then("2026-08-31T23:00") == berlin and then("2026-09-01") == munich
+    assert then("2025") == [] and then("2026-07") == []
+    # 带时区的时刻先换算成本机时间再取日期，本地（datetime）与远程（发带时区的 ISO 字符串）
+    # 相同：本机 8 月 31 日 23:30 往前两个时区的时刻，在本机已是 9 月 1 日 01:30。以前远程只取
+    # 字符串里的日期（8 月 31 日，Berlin），本地是 9 月 1 日（Munich）
+    local = datetime(2026, 8, 31, 23, 30).astimezone().utcoffset()
+    assert local is not None
+    late = datetime(2026, 8, 31, 23, 30, tzinfo=timezone(local - timedelta(hours=2)))
+    assert then(late) == then(late.isoformat()) == munich
+    bad_values = ("2026-8", "2026/08/15", "Aug 2026", "banana", "2026-13", "2026-02-30", "")
+    for bad in (*bad_values, "2026-08-15Tbanana", "2026-08-15 25:00"):
+        with pytest.raises(ValueError, match="valid_at"):
+            then(bad)
+
+
+def test_a_malformed_valid_at_is_a_400(system: MemorySystem) -> None:
+    with TestClient(v1_app(system)) as http:
+        response = http.get("/api/v1/memories", params={"user_id": "a", "valid_at": "banana"})
+    assert response.status_code == 400
+    assert "YYYY-MM-DD" in response.json()["error"]["message"]
+
+
+BAD_READ_ARGUMENTS = [
+    ("search", {"mode": "l9"}),
+    ("search", {"mode": "naive"}),
+    ("search", {"router": "bogus"}),
+    ("search", {"min_level": "l2"}),
+    ("search", {"lam": -5.0}),
+    ("search", {"lam": float("nan")}),
+    ("search", {"lam": float("inf")}),
+    ("answer", {"mode": "bogus"}),
+    ("answer", {"mode": "naive"}),
+    ("answer", {"mode": "facts"}),
+    ("answer", {"router": "bogus"}),
+    ("answer", {"lam": -1}),
+]
+
+
+@pytest.mark.parametrize(("method", "bad"), BAD_READ_ARGUMENTS)
+def test_bad_read_arguments_raise_the_same_error_locally(
+    system: MemorySystem, method: str, bad: dict[str, Any]
+) -> None:
+    """第五轮体检 P17：以前本地的 Memory 不查 mode、router、min_level、lam（mode="l9" 悄悄走 L2，
+    router="bogus" 走学习版控制器，min_level="l2" 只给画像，answer 的 mode="naive" 跑评测的基线），
+    经 HTTP 的 MemoryClient 却 ValueError。现在两边都 ValueError，说的是同一句话（HTTP 的前面多
+    "Invalid request: body."）；空间还是空的时也报错，不先返回空结果。"""
+    local = Memory.from_system(system)
+    (name,) = bad
+    text = "Where do I live?"
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as remote,
+    ):
+        for _ in range(2):  # 先是空的空间，再是有记忆的
+            with pytest.raises(ValueError, match=f"^{name}: ") as ours:
+                getattr(local, method)(text, user_id="alice", **bad)
+            with pytest.raises(ValueError) as theirs:
+                getattr(remote, method)(text, user_id="alice", **bad)
+            finite = name != "lam" or math.isfinite(bad["lam"])
+            if finite:  # NaN 与无穷大 MemoryClient 发不出去（不是合法的 JSON），照样 ValueError
+                assert str(theirs.value) == f"Invalid request: body.{ours.value}"
+            local.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+        if not finite:  # 别的客户端写进请求体的 NaN、Infinity（Python 的 json 照收）同样拒绝
+            body = json.dumps({"query": text, "question": text, **bad})
+            path = "/api/v1/memories/search" if method == "search" else "/api/v1/answer"
+            response = http.post(path, content=body, headers={"content-type": "application/json"})
+            assert response.status_code == 422
+            assert response.json()["error"]["message"] == f"Invalid request: body.{ours.value}"
+
+
+def test_good_read_arguments_still_pass(mem: Mem) -> None:
+    """合法的值照旧：λ = 0、整数的 λ、min_level="l0"、answer 的 agent 模式。"""
+    mem.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    assert mem.search("Where do I live?", user_id="alice", lam=0, min_level="l0", router="rule")
+    assert mem.search("Where do I live?", user_id="alice", mode="l1", lam=2)["level"] == "L1"
+    assert mem.answer("Where do I live?", user_id="alice", mode="l1", lam=0.5)["answer"]
 
 
 def test_metadata_filters_and_expiration(mem: Mem) -> None:
@@ -697,6 +814,71 @@ def test_the_client_explains_a_wrong_base_url(system: MemorySystem) -> None:
         assert raised.value.status is None
 
 
+@pytest.mark.parametrize(
+    ("error", "code", "sent"),
+    [
+        (httpx2.ConnectError, "unreachable", False),
+        (httpx2.ConnectTimeout, "unreachable", False),
+        (httpx2.PoolTimeout, "unreachable", False),
+        (httpx2.ReadTimeout, "timeout", True),
+        (httpx2.WriteTimeout, "timeout", True),
+        (httpx2.RemoteProtocolError, "disconnected", True),
+        (httpx2.ReadError, "disconnected", True),
+        (httpx2.WriteError, "disconnected", True),
+        (httpx2.ProxyError, "transport", True),
+    ],
+)
+def test_transport_errors_say_whether_the_request_was_sent(
+    error: type[httpx2.TransportError], code: str, sent: bool
+) -> None:
+    """没有拿到响应时 code 与 sent 说清请求有没有送到：连不上（unreachable，sent=False）可以
+    重发；超时与中途断开（timeout、disconnected，sent=True）时写入可能已经提交。以前一律是
+    "Cannot reach"、code 为 None，只能看 __cause__。"""
+
+    def fail(request: httpx2.Request) -> httpx2.Response:
+        raise error("boom", request=request)
+
+    with (
+        httpx2.Client(transport=httpx2.MockTransport(fail), timeout=7.0) as http,
+        pytest.raises(MemoryAPIError) as raised,
+    ):
+        MemoryClient("http://127.0.0.1:9", http_client=http).add("hi", user_id="alice")
+    assert (raised.value.code, raised.value.sent, raised.value.status) == (code, sent, None)
+    assert ("Cannot reach" in str(raised.value)) == (code == "unreachable")
+    if error is httpx2.ReadTimeout:
+        assert "within 7s" in str(raised.value) and "may have been processed" in str(raised.value)
+
+
+def test_wait_gives_up_on_the_server_before_the_client_read_timeout() -> None:
+    """第五轮复审：服务端的 /wait 最多等 WAIT_TIMEOUT_S（300 秒），MemoryClient 默认的读超时也是
+    300 秒，不给 timeout 时两边差不多同时到期，抛的多半是客户端自己的读超时（MemoryAPIError
+    timeout），不是说好的 TimeoutError。现在发出的等待时间比读超时短 WAIT_MARGIN_S。"""
+    from cuemem.api.memories import WAIT_TIMEOUT_S
+    from cuemem.client import WAIT_MARGIN_S
+
+    sent: list[Any] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content)["timeout"])
+        return httpx2.Response(200, json={})
+
+    default = inspect.signature(MemoryClient).parameters["timeout"].default
+    assert default - WAIT_MARGIN_S < WAIT_TIMEOUT_S <= default
+    for read, timeout, expected in (
+        (default, None, default - WAIT_MARGIN_S),
+        (default, 10.0, 10.0),
+        (default, 1000.0, default - WAIT_MARGIN_S),
+        (60.0, None, 55.0),
+        (4.0, None, 2.0),
+        (None, None, None),
+        (None, 1000.0, 1000.0),
+    ):
+        transport = httpx2.MockTransport(record)
+        with httpx2.Client(transport=transport, timeout=read) as http:
+            MemoryClient("http://127.0.0.1:9", http_client=http).wait(timeout=timeout)
+        assert sent.pop() == expected, (read, timeout)
+
+
 def test_images_reach_the_memory(mem: Mem, system: MemorySystem, tmp_path: Path) -> None:
     """add 的本地图片路径：本地 SDK 直接读；MemoryClient 先在客户端读成 data URL，服务器不读它
     自己磁盘上的文件。网络图片两边都报同样的错。"""
@@ -913,6 +1095,47 @@ def test_left_open_runs_survive_other_first_touches_under_serve(
         after.close()
 
 
+@pytest.mark.parametrize("how", ["rebuild", "stale"])
+def test_a_rebuild_under_serve_leaves_the_left_open_runs_to_the_client(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, how: str
+) -> None:
+    """cuemem serve 重启之后的闲置期里重建（显式的 rebuild=True，或者部署改了巩固配置、空间
+    过期时任何一次巩固）：留给调用方接着写的 run 不登记任务、不抽取，调用方接着写完结束时只抽取
+    一次、不重放。以前重建只跳过本进程里进行中的会话（open_sessions），把它们半段抽取了，结束
+    时整段再抽取、把整个空间重放一遍（第五轮体检）。"""
+    fake_api.chat_replies = [model]
+    if how == "stale":  # 之前的进程巩固过一个普通的会话，这个空间有任务、记着巩固配置的指纹
+        before = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+        Memory.from_system(before).add("I like tea", user_id="eve", run_id="s0", wait=True)
+        before.close()
+    _left_open_runs(n3_settings, fake_api, "r1", "r2")
+    settings = n3_settings
+    if how == "stale":  # 部署改了巩固配置：这个空间的指纹不对了
+        consolidation = n3_settings.consolidation.model_copy(update={"profile_max_chars": 1500})
+        settings = n3_settings.model_copy(update={"consolidation": consolidation})
+    after = MemorySystem.from_settings(settings, http_client=fake_api.client())
+    worker = after.start_worker()
+    _adopt_after(after, 60, clock=lambda: 0.0)
+    try:
+        mem = Memory.from_system(after)
+        if how == "rebuild":
+            assert mem.consolidate(user_id="eve", rebuild=True)["sessions"] == 0
+        else:
+            assert after.consolidator.stale("eve")
+            mem.add("I like jazz", user_id="eve", wait=True)
+            assert not after.consolidator.stale("eve")
+        assert not {"r1", "r2"} & {j["session_id"] for j in after.db.get_jobs("eve")}
+        extracted, replays = model.calls["extract"], _regrown_replays(after)
+        for text in ("I like rain", "I like snow", "I like hail"):
+            mem.add(text, user_id="eve", run_id="r2")
+            worker.wait()
+        assert mem.end_run("r2", user_id="eve", wait=True)["turns"] == 4
+        assert model.calls["extract"] - extracted == 1
+        assert _regrown_replays(after) == replays
+    finally:
+        after.close()
+
+
 def test_a_run_handed_over_after_the_idle_period_is_reopened_when_the_client_returns(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
 ) -> None:
@@ -941,6 +1164,37 @@ def test_a_run_handed_over_after_the_idle_period_is_reopened_when_the_client_ret
         assert _regrown_replays(after) - replays == 1
         mem.delete_all(user_id="eve")
         mem.add("I like fog", user_id="eve", run_id="r3")
+        assert after.open_sessions("eve") == set()
+    finally:
+        after.close()
+
+
+@pytest.mark.parametrize("returns", ["open_run", "end_run"])
+def test_a_handed_over_run_the_client_ended_stays_ended(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, returns: str
+) -> None:
+    """_adopt_after 接手（交给抽取）之后调用方显式地 open_run、写完再 end_run，或者直接 end_run：
+    之后同名的 add 与 end_run 之后的一样是一个普通的会话，wait=True 照常抽取。以前接手的记录
+    （_handed_over）一直留着，这次 add 又把结束了的 run 重新打开，wait=True 时报 "still open"，
+    不带 wait 时悄悄开着、不抽取（第五轮体检）。"""
+    fake_api.chat_replies = [model]
+    _left_open_runs(n3_settings, fake_api, "r2")
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    worker = after.start_worker()
+    now = [0.0]
+    adopt = _adopt_after(after, 60, clock=lambda: now[0])
+    try:
+        now[0] += 60
+        adopt()
+        worker.wait()
+        mem = Memory.from_system(after)
+        if returns == "open_run":
+            mem.open_run("r2", user_id="eve")
+            mem.add("I like rain", user_id="eve", run_id="r2")
+        mem.end_run("r2", user_id="eve", wait=True)
+        assert after.open_sessions("eve") == set()
+        out = mem.add("I like snow", user_id="eve", run_id="r2", wait=True)
+        assert out["status"] == "consolidated"
         assert after.open_sessions("eve") == set()
     finally:
         after.close()
@@ -1056,22 +1310,74 @@ def test_cuemem_serve_mounts_the_v1_api_behind_the_token(
 
 
 def test_the_openapi_documents_every_v1_response() -> None:
-    """/openapi.json 里 /api/v1 的每个接口：200 指向写明形状的模型（图片的原文件是 image/*），每个
-    出错的状态码都是 V1ErrorBody（422 也是）。以前 200 只写着"任意对象"，422 写的是 FastAPI 的
-    HTTPValidationError（实际不会出现），别的出错一个都没写。"""
+    """/openapi.json 里 /api/v1 的每个接口：200 指向写明形状的模型（图片的原文件是具体的图片类型
+    与 application/octet-stream），每个出错的状态码都是 V1ErrorBody（422、500 也是），operationId
+    是 SDK 的方法名。以前 200 只写着"任意对象"，422 写的是 FastAPI 的 HTTPValidationError（实际
+    不会出现），别的出错一个都没写；operationId 是 FastAPI 的缺省（add_api_v1_memories_post），
+    图片写的 image/* 生成客户端时被丢掉。"""
     spec = openapi_v1()
     operations = [(p, m, op) for p, ops in spec["paths"].items() for m, op in ops.items()]
     assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 20
+    ids = [op["operationId"] for _, _, op in operations]
+    assert len(set(ids)) == len(ids) and set(ids) == {r.name for r in V1_ROUTES}
+    assert set(ids) <= _methods(MemoryClient)
     for path, method, op in operations:
         for status in V1_ERRORS:
             schema = op["responses"][str(status)]["content"]["application/json"]["schema"]
             assert schema == {"$ref": "#/components/schemas/V1ErrorBody"}, (path, method, status)
         ok = op["responses"]["200"]["content"]
         if path == f"{PREFIX}/media/{{media_id}}":
-            assert list(ok) == ["image/*"]
+            assert list(ok) == MEDIA_TYPES and "application/octet-stream" in ok
         else:
             assert "#/components/schemas/" in json.dumps(ok["application/json"]["schema"]), path
     assert "HTTPValidationError" not in json.dumps(spec)
+
+
+def test_the_media_types_match_pil() -> None:
+    """图片接口写的 Content-Type 就是 _image_type 可能返回的：媒体库收的格式与 MPO 在 PIL 里的
+    类型，加上认不出时的 application/octet-stream。"""
+    Image.init()
+    expected = {Image.MIME[f] for f in (*ACCEPTED_FORMATS, "MPO")} | {"application/octet-stream"}
+    assert sorted(expected) == MEDIA_TYPES
+
+
+def test_unexpected_errors_keep_the_v1_shape(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/api/v1 下没有处理的异常（程序错误）：500 也是 {"error": …}，code internal_error，type 是
+    None（MemoryClient 不把它还原成 RuntimeError、KeyError 之类），消息里不带异常的内容。以前是
+    text/plain 的 "Internal Server Error"。别的路径照旧是 text/plain。"""
+
+    def broken(self: Memory) -> list[dict[str, Any]]:
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr(Memory, "spaces", broken)
+    app = v1_app(system)
+
+    @app.get("/elsewhere")
+    def elsewhere() -> None:
+        raise RuntimeError("secret")
+
+    with TestClient(app, raise_server_exceptions=False) as http:
+        response = http.get("/api/v1/spaces")
+        assert response.status_code == 500
+        assert response.headers["content-type"] == "application/json"
+        assert response.json()["error"] == {
+            "code": "internal_error",
+            "type": None,
+            "message": "Internal server error",
+        }
+        assert "secret" not in response.text
+        with pytest.raises(MemoryAPIError) as raised:
+            MemoryClient("http://testserver", http_client=http).spaces()
+        assert (raised.value.status, raised.value.code, raised.value.type) == (
+            500,
+            "internal_error",
+            None,
+        )
+        other = http.get("/elsewhere")
+        assert other.status_code == 500 and other.headers["content-type"].startswith("text/plain")
+        assert other.text == "Internal Server Error"
 
 
 def test_the_openapi_snapshot_is_current(

@@ -1007,6 +1007,79 @@ def test_filter_operators_at_their_edges(where: dict[str, Any], expected: bool) 
     assert _matches(where, RECORD) is expected
 
 
+def test_mem0_reserved_filters(memory: Memory) -> None:
+    """filters 里 Mem0 保留的 created_at、updated_at 与 categories 也对记忆自己的字段（照 Mem0
+    写的筛选不再悄悄什么都不给）；以前只对 metadata，三个都是 0 条。"""
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    (fact,) = memory.get_all(user_id="alice")["results"]
+    assert fact["category"] == "attribute"
+    for where in (
+        {"categories": {"contains": "attribute"}},
+        {"created_at": {"gte": "2000-01-01"}},
+        {"updated_at": {"gte": "2000-01-01"}},
+    ):
+        assert [f["id"] for f in memory.get_all(user_id="alice", filters=where)["results"]] == [
+            fact["id"]
+        ], where
+        found = memory.search("Where do I live?", user_id="alice", mode="l1", filters=where)
+        assert fact["id"] in {r["id"] for r in found["results"]}, where
+    assert memory.get_all(user_id="alice", filters={"created_at": {"lt": "2000-01-01"}}) == {
+        "results": []
+    }
+    early = memory.search(
+        "Where do I live?", user_id="alice", mode="l1", filters={"created_at": {"lt": "2000"}}
+    )
+    assert early["results"] == [] and early["images"] == []
+    assert memory.get_all(user_id="alice", filters={"categories": {"contains": "event"}}) == {
+        "results": []
+    }
+    # 对话片段有 created_at，没有 categories
+    excerpts = memory.search(
+        "Where do I live?", user_id="alice", mode="l1", filters={"created_at": {"gte": "2000"}}
+    )
+    assert any(r["type"] == "excerpt" for r in excerpts["results"])
+    only = memory.search(
+        "Where do I live?", user_id="alice", mode="l1", filters={"categories": "*"}
+    )
+    assert {r["type"] for r in only["results"]} == {"fact"}
+
+    # categories 是列表：eq、ne、in、nin 逐项对（以前 in 一条都不给，nin、ne 留下要排除的那条）
+    def ids(where: dict[str, Any]) -> list[str]:
+        return [f["id"] for f in memory.get_all(user_id="alice", filters=where)["results"]]
+
+    for where in (
+        {"categories": {"in": ["attribute", "event"]}},
+        {"categories": {"eq": "attribute"}},
+        {"categories": {"eq": ["attribute"]}},
+        {"categories": "attribute"},
+        {"categories": {"ne": "event"}},
+        {"categories": {"nin": ["event"]}},
+    ):
+        assert ids(where) == [fact["id"]], where
+    for where in (
+        {"categories": {"in": ["event"]}},
+        {"categories": {"nin": ["attribute"]}},
+        {"categories": {"ne": "attribute"}},
+        {"categories": {"eq": ["attribute", "event"]}},
+        {"NOT": [{"categories": {"in": ["attribute"]}}]},
+    ):
+        assert ids(where) == [], where
+
+
+def test_metadata_wins_over_the_reserved_filter_names(memory: Memory) -> None:
+    """metadata 里有同名的键时以 metadata 为准：以前能筛出来的照样筛出来（category 本来就不是
+    保留的名字，照旧只对 metadata）。"""
+    memory.add("I like tea", user_id="bob", metadata={"category": "food"}, wait=True)
+    (tea,) = memory.get_all(user_id="bob", filters={"category": "food"})["results"]
+    assert tea["category"] != "food"  # 事实自己的 category 不同，按 metadata 筛出来
+    assert memory.get_all(user_id="bob", filters={"category": tea["category"]}) == {"results": []}
+    memory.add("I like chess", user_id="carol", metadata={"created_at": "x"}, wait=True)
+    assert len(memory.get_all(user_id="carol", filters={"created_at": "x"})["results"]) == 1
+    # 记忆自己的 created_at（2026-…）在这个范围里，metadata 的 "x" 不在：按 metadata 筛
+    dated = {"created_at": {"gte": "2000", "lt": "3000"}}
+    assert memory.get_all(user_id="carol", filters=dated) == {"results": []}
+
+
 def test_metadata_and_expiration_stay_out_of_extraction(
     n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, tmp_path: Path
 ) -> None:
@@ -1093,6 +1166,140 @@ def test_expired_memories_leave_search_get_all_and_the_profile(memory: Memory) -
     assert [v["id"] for v in memory.history(berlin)] == [berlin]
     with pytest.raises(ValueError, match="expiration date"):
         memory.add("I like snow", user_id="u", expiration_date="next week")
+
+
+def _expired_berlin(memory: Memory) -> None:
+    """过期的住址（昨天到期）与没有过期时间的爱好，都已巩固。"""
+    yesterday = date.today() - timedelta(days=1)
+    memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+    memory.add("I like jazz", user_id="u", wait=True)
+    assert "Berlin" in memory.system.core_memory("u").text  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("mode", ["auto", "l0", "l1", "l2"])
+def test_answer_does_not_use_expired_memories(
+    memory: Memory, model: ScriptedModel, mode: str
+) -> None:
+    """第五轮体检 P7：以前只有 search、get_all 与 profile 去掉过期的记忆，answer() 直接调用
+    MemorySystem.ask，过期的事实、对话片段与画像里的那一行都进了回答模型的提示（L0 也带着
+    画像）。"""
+    _expired_berlin(memory)
+    memory.answer("Where do I live? Do I like jazz?", user_id="u", mode=mode)  # type: ignore[arg-type]
+    (prompt,) = model.prompts["read"]
+    assert "Berlin" not in prompt and "jazz" in prompt
+
+
+def test_hatch_search_does_not_find_expired_memories(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """hatch：控制器召回的记忆与模型自己用 memory_search 补查的都不带过期的。"""
+    _expired_berlin(memory)
+    steps: list[dict[str, Any]] = []
+
+    def reply(body: dict[str, Any]) -> Any:
+        if not any(t["function"]["name"] == "memory_search" for t in body.get("tools", [])):
+            return model(body)
+        steps.append(body)
+        if len(steps) == 1:
+            args = json.dumps({"query": "Where do I live?"})
+            return {"tool_calls": [{"id": "c1", "name": "memory_search", "arguments": args}]}
+        answer = json.dumps({"answer": "x", "citations": [], "evidence_sufficient": False})
+        return {"tool_calls": [{"id": "c2", "name": "answer", "arguments": answer}]}
+
+    fake_api.chat_replies = [reply]
+    result = memory.answer("Where do I live? Do I like jazz?", user_id="u", mode="hatch")
+    assert result["answer"] == "x" and len(steps) == 2
+    sent = json.dumps(steps[1]["messages"], ensure_ascii=False)
+    assert "Berlin" not in sent and "jazz" in sent
+
+
+def test_recall_for_other_agents_drops_expired_memories(memory: Memory) -> None:
+    """记忆代理与各框架集成的证据块（recall_evidence）、MCP 与 /recall 的清单（recall_listing）
+    都不给过期的事实、对话片段与画像里的那一行；L0 只给画像时也一样。"""
+    from cuemem.evidence import recall_evidence
+
+    _expired_berlin(memory)
+    question = "Where do I live? Do I like jazz?"
+    for mode in ("auto", "l0", "l1", "l2"):
+        evidence = recall_evidence(memory.system, "u", question, mode=mode)  # type: ignore[arg-type]
+        assert "Berlin" not in evidence.block and "jazz" in evidence.block, mode
+        listing = recall_listing(memory.system, "u", question, mode=mode, at_least_l1=True)  # type: ignore[arg-type]
+        assert "Berlin" not in json.dumps(listing) and "jazz" in json.dumps(listing), mode
+        assert listing["facts"] and "jazz" in listing["profile"], mode
+
+
+def test_served_profile_and_chat_drop_expired_memories(
+    memory: Memory, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """第五轮复审：MCP 的 profile 工具、GET /api/spaces/{space}/profile（界面的画像栏）与
+    cuemem serve 的对话（画像与召回）以前都读原样的核心记忆，同一个 MCP Server 上 recall
+    不给的过期住址 profile 照样给。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.agent import Agent
+    from cuemem.api.app import create_app
+    from cuemem.api.mcp import build_server
+    from cuemem.api.service import ChatService
+
+    _expired_berlin(memory)
+    agent = Agent(memory.system, router="rule")
+    service = ChatService(memory.system, agent)
+    assert service.profile("u") == "- I like jazz"
+    result = asyncio.run(build_server(service, "u").call_tool("profile", {}))
+    assert "".join(getattr(c, "text", "") for c in result.content) == "- I like jazz"
+    app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
+    with TestClient(app) as http:
+        assert http.get("/api/spaces/u/profile").json() == {"text": "- I like jazz"}
+    session = agent.start("u")
+    assert [text for _, _, text in session.profile] == ["I like jazz"]
+    before = len(fake_api.chat_requests)
+    agent.chat(session, "Where do I live? Do I like jazz?", mode="l1")
+    sent = json.dumps(fake_api.chat_requests[before:], ensure_ascii=False)
+    assert "Berlin" not in sent and "jazz" in sent
+
+
+def test_a_restated_memory_without_expiry_stays(memory: Memory, model: ScriptedModel) -> None:
+    """同一件事后来又说过一次、没给过期时间：它一直有效（同 search 的规则）。"""
+    memory.add("I like rain", user_id="u", expiration_date="2020-01-01", wait=True)
+    memory.add("I like rain", user_id="u", wait=True)
+    memory.answer("Do I like rain?", user_id="u", mode="l1")
+    assert "I like rain" in model.prompts["read"][0]
+
+
+def test_hiding_expired_memories_leaves_other_spaces_untouched(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有过期记忆的空间（评测的空间从不写过期时间，metadata 与还没到期的也算）：打开
+    hide_expired 时 exclude 还是调用方给的同一个对象，画像不动，请求逐字节相同。"""
+    memory.add("I live in Berlin", user_id="u", metadata={"k": "v"}, wait=True)
+    memory.add("I like jazz", user_id="u", expiration_date="2999-01-01", wait=True)
+    system = memory.system
+    excludes: list[Any] = []
+    search = system.l1.search
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        excludes.append(kwargs.get("exclude"))
+        return search(*args, **kwargs)
+
+    monkeypatch.setattr(system.l1, "search", spy)
+    assert system.llm.cache is not None
+    monkeypatch.setattr(system.llm.cache, "get", lambda key: None)  # 每遍都发出请求
+    question = "Where do I live? Do I like jazz?"
+
+    def run(mode: str, **hide: bool) -> tuple[list[str], str]:
+        before = len(fake_api.chat_requests)
+        answer = system.ask("u", question, mode=mode, **hide)  # type: ignore[arg-type]
+        sent = [json.dumps(b, sort_keys=True) for b in fake_api.chat_requests[before:]]
+        return sent, answer.answer
+
+    mine = ("x", "y")
+    for mode in ("auto", "l0", "l1", "l2"):
+        plain = run(mode)
+        assert plain[0] and run(mode, hide_expired=True) == plain, mode
+        mine_before = len(excludes)
+        system.retrieve("u", question, mode="l1", exclude=mine, hide_expired=True)
+        assert excludes[mine_before:] == [mine]
+    assert system.expired_ids("u", datetime.now()) == frozenset()
 
 
 def test_forgetting_deletes_the_metadata_of_forgotten_turns(memory: Memory) -> None:
@@ -1236,6 +1443,27 @@ def naming(memory: Memory, user: str) -> tuple[list[str], bool, int]:
     ]
     traces = [r for r in records if r["attrs"].get("space") == user]
     return keys, user.encode() in paths.db.read_bytes(), len(traces)
+
+
+def test_deleting_a_user_with_more_turns_than_sqlite_takes_parameters(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第五轮复审：遗忘整个用户时 get_media(turn_ids=…) 与 citing_turns 一条 SQL 带上全部的轮、
+    事实与图片，超过 SQLite 的参数上限（3.32 起 32766：几万句的用户）就 "too many SQL
+    variables"、什么都没删。这里把上限降到 600（别处的分批是 500 个），批次降到 100。"""
+    import cuemem.store.sqlite as sqlite_module
+
+    memory.add("I live in Berlin", user_id="u", wait=True)
+    talk = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(700)]
+    memory.add(talk, user_id="u", infer=False)
+    db = memory.system.db
+    monkeypatch.setattr(sqlite_module, "IN_CHUNK", 100)
+    db._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 600)
+    many = [f"x{i}" for i in range(700)]
+    assert db.get_media("u", turn_ids=many) == [] and db.citing_turns("u", many) == []
+    assert db.get_facts("u", session_ids=many) == []
+    memory.delete_all(user_id="u")
+    assert memory.get_all(user_id="u") == {"results": []} and db.get_turns("u") == []
 
 
 @pytest.mark.parametrize("how", ["delete_all", "reset"])
@@ -1777,3 +2005,73 @@ def test_async_run(n3_settings: Settings, fake_api: FakeAPI, model: ScriptedMode
             return during, [f["memory"] for f in found["results"]]
 
     assert asyncio.run(run()) == ([], ["The user lives in Berlin."])
+
+
+def test_status_counts_jobs_without_reading_them_all(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """status() 只数待处理的、只读失败的任务（以前读出并解开每个任务：1 万个任务时 40 毫秒，界面
+    每发一条消息查一次，第五轮体检）。结果与以前相同，失败的仍按以前的顺序（按会话，同一会话的按
+    写入的先后）；HTTP 服务的状态同样只数。"""
+    from cuemem.agent import Agent
+    from cuemem.api.service import ChatService
+
+    db = memory.system.db
+    space = space_for("alice", None)
+    db.ensure_space(space)
+    db.enqueue_jobs(
+        space,
+        [
+            ("j1", "zz", "v", "h1"),
+            ("j2", "aa", "v", "h2"),
+            ("j3", "mm", "v", "h3"),
+            ("j4", "dd", "v", "h4"),
+            ("j5", "ss", "v", "h5"),
+            ("j6", "ss", "v", "h6"),  # j5 被取代
+            ("j7", "aa", "old", "h7"),  # j2 被取代，下面再改回失败：同一会话两个失败的
+        ],
+    )
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', attempts = 2, error = 'boom\nmore'"
+            " WHERE id IN ('j1', 'j2', 'j7')"
+        )
+        conn.execute("UPDATE jobs SET status = 'done' WHERE id = 'j4'")
+
+    def reference() -> dict[str, Any]:  # 以前的写法：读出全部任务再挑
+        jobs = db.get_jobs(space)
+        failed = [
+            {
+                "session_id": j["session_id"],
+                "attempts": j["attempts"],
+                "error": (j["error"] or "").splitlines()[0][:300],
+                "retry_at": None,
+            }
+            for j in jobs
+            if j["status"] == "failed"
+        ]
+        counts = {s: sum(1 for j in jobs if j["status"] == s) for s in ("pending", "done")}
+        return {"failed": failed, **counts}
+
+    expected = reference()
+    assert [f["session_id"] for f in expected["failed"]] == ["aa", "aa", "zz"]
+    chat = ChatService(memory.system, Agent(memory.system, router="rule"))
+    calls: list[str | None] = []
+    real = type(db).get_jobs
+
+    def spy(self: Any, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
+        calls.append(status)
+        return real(self, space_id, status)
+
+    monkeypatch.setattr(type(db), "get_jobs", spy)
+    state = memory.status(user_id="alice")
+    served = chat.status(space)
+    assert None not in calls
+    assert state["pending"] == expected["pending"] == 2
+    assert state["failed"] == expected["failed"]
+    assert {k: served[k] for k in ("pending", "failed", "done")} == {
+        "pending": 2,
+        "failed": 3,
+        "done": expected["done"],
+    }
+    assert db.job_counts(space) == {"pending": 2, "failed": 3, "done": 1, "superseded": 1}

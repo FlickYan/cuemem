@@ -13,6 +13,7 @@ import warnings
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -237,6 +238,22 @@ def test_rounds_already_in_the_thread_are_not_recalled(memory: Memory) -> None:
         "Recommend a coat",
     ]
     assert len(turns(memory, "alice", "t1")) == 4
+
+
+def test_expired_memories_and_rounds_in_the_thread_are_both_left_out(memory: Memory) -> None:
+    """第五轮体检 P7：过期的记忆不再召回，调用方的 exclude（已经在线程里的轮）照样排除：两者
+    合在一起，不是一个顶掉另一个。"""
+    yesterday = date.today() - timedelta(days=1)
+    memory.add("I like jazz", user_id="alice", expiration_date=yesterday, wait=True)
+    model = Recorder(responses=[AIMessage("Noted!"), AIMessage("A warm one.")])
+    agent = create_agent(
+        model, middleware=[CueMemMiddleware(memory, mode="l1")], checkpointer=InMemorySaver()
+    )
+    config = thread("t1", user_id="alice")
+    agent.invoke(ask("I live in Berlin"), config)
+    out = agent.invoke(ask("Recommend a coat"), config)
+    assert out["cuemem"]["level"] == "L1" and out["cuemem"]["recalled"] == 0
+    assert model.seen[-1][-1].content == "Recommend a coat"
 
 
 def test_tool_calls_reuse_the_evidence_and_only_the_answer_is_saved(

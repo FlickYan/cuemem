@@ -2,7 +2,7 @@
 
 cuemem [--preset openai|ollama] …     换模型供应商（也可设 CUEMEM_PRESET，N12）
 cuemem configure                      交互式填写 API Key（写入 .env）
-cuemem doctor [--live]                检查配置、API Key 与连通性
+cuemem doctor [--live]                检查配置、API Key 与连通性（--repair-vectors 修本地向量库）
 cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
 cuemem consolidate --space S          巩固：抽取事实与实体、对账、摘要、核心记忆
 cuemem ask "问题" --space S [--at T]  检索记忆并回答
@@ -29,7 +29,9 @@ import importlib.util
 import ipaddress
 import json
 import os
+import shlex
 import shutil
+import sqlite3
 import stat
 import tempfile
 import time
@@ -54,8 +56,9 @@ from cuemem.config import (
     extra_remedy,
     load_settings,
 )
+from cuemem.core.timeutil import valid_period
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
-from cuemem.envfile import mask, read_env, update_env
+from cuemem.envfile import atomic_write_text, mask, read_env, update_env
 from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
 
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
@@ -68,6 +71,7 @@ if TYPE_CHECKING:
     from cuemem.evals.datasets import EvalSet
     from cuemem.evals.runner import RunSummary
     from cuemem.memory import MemorySystem
+    from cuemem.store.sqlite import MemoryDB
     from cuemem.write.consolidate import ConsolidationReport
 
 app = typer.Typer(
@@ -76,6 +80,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+LOW_DISK = 200 * 2**20  # doctor 在数据目录剩余空间低于它时标黄
 
 
 @app.callback()
@@ -199,7 +204,11 @@ def _open_system() -> Iterator[MemorySystem]:
     try:
         settings = _settings(peak_policy="warn")
         _peak_note(settings)
-        system = MemorySystem.from_settings(settings)
+        try:
+            system = MemorySystem.from_settings(settings)
+        except sqlite3.OperationalError as exc:  # 只管打开时：用的时候出的错照常抛出
+            console.print(_unopenable(settings, exc))
+            raise typer.Exit(1) from exc
         yield system
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{exc}")
@@ -207,6 +216,37 @@ def _open_system() -> Iterator[MemorySystem]:
     finally:
         if system is not None:
             system.close()
+
+
+def _unopenable(settings: Settings, exc: sqlite3.OperationalError) -> str:
+    """打开数据库、账本或缓存时 SQLite 出错（目录只读、磁盘满了）：一行说明，不打印调用栈。"""
+    where = escape(str(settings.paths.db.parent))
+    return (
+        f"[red]错误：[/red]{where} 里的数据库打不开（{escape(str(exc))}）：检查目录权限与磁盘空间"
+    )
+
+
+@contextmanager
+def _open_db_only() -> Iterator[MemoryDB]:
+    """只打开数据库（cuemem export、spaces）：不用向量库、模型与缓存，向量库打不开、或者
+    cuemem serve 正开着它的时候也能用。"""
+    from cuemem.store.files import private_dirs, storage_dirs
+    from cuemem.store.sqlite import MemoryDB
+
+    settings = _settings()
+    private_dirs(*storage_dirs(settings))
+    try:
+        db = MemoryDB(settings.paths.db)
+    except sqlite3.OperationalError as exc:
+        console.print(_unopenable(settings, exc))
+        raise typer.Exit(1) from exc
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{exc}")
+        raise typer.Exit(1) from exc
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 @app.command()
@@ -256,11 +296,31 @@ def doctor(
     live: Annotated[
         bool, typer.Option("--live", help="实际调用每个模型与向量接口做连通性测试（费用极低）")
     ] = False,
+    repair_vectors: Annotated[
+        bool,
+        typer.Option(
+            "--repair-vectors",
+            help="本地向量库的 meta.json 读不出时，按 collection/ 下的集合重写它（先停掉 serve）",
+        ),
+    ] = False,
+    vectors: Annotated[
+        bool,
+        typer.Option(
+            "--vectors",
+            help="逐个空间比较数据库与向量库的点数（要打开向量库：本地模式下先停掉 serve）",
+        ),
+    ] = False,
 ) -> None:
-    """检查配置、API Key、数据目录与密钥文件的权限，以及（可选）各模型的连通性。"""
+    """检查配置、API Key、数据目录与密钥文件的权限、剩余空间，以及（可选）向量库与数据库是否
+    一致、各模型的连通性。"""
     settings = _settings()
+    if repair_vectors:
+        _repair_vectors(settings)
     _print_config(settings)
     _print_local_store(settings)
+    _print_disk(settings)
+    if vectors:
+        _print_vector_gaps(settings)
     for line in _loose_modes(settings):
         console.print(line)
     if live:
@@ -313,9 +373,9 @@ def export_cmd(
     """导出记忆空间（N12）：原始日志与图片原文件，可选附上事实与画像的快照。"""
     from cuemem.portable import export_space
 
-    with _open_system() as system:
+    with _open_db_only() as db:  # 不用向量库：向量库坏了（见 doctor --repair-vectors）也能导出
         try:
-            data = export_space(system, space, derived=not no_derived)
+            data = export_space(db, space, derived=not no_derived)
         except KeyError as exc:
             console.print(f"[red]没有记忆空间 {space}[/red]")
             raise typer.Exit(1) from exc
@@ -323,7 +383,17 @@ def export_cmd(
     if out is None:
         print(text)
         return
-    out.write_text(text, encoding="utf-8")
+    target = out.resolve()
+    atomic = not target.exists() or target.is_file()  # /dev/stdout、FIFO 之类直接写
+    try:
+        if atomic:  # 写到一半出错（磁盘满）时旧的备份不动；以前先截断，新旧两份都没了
+            atomic_write_text(out, text, fsync=True)
+        else:
+            out.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        kept = f"；{escape(str(out))} 未改动" if atomic else ""
+        console.print(f"[red]导出失败：{escape(str(exc))}{kept}[/red]")
+        raise typer.Exit(1) from exc
     turns = sum(len(s["turns"]) for s in data["sessions"])
     console.print(f"已导出 {len(data['sessions'])} 个会话、{turns} 条发言到 [bold]{out}[/bold]")
 
@@ -339,7 +409,11 @@ def import_cmd(
     """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。"""
     from cuemem.portable import import_space
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:  # 以前是调用栈
+        console.print(f"[red]不是有效的 CueMem 导出文件（被截断了？）：{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
     with _open_system() as system:
         try:
             report = import_space(system, data, space_id=space, consolidate=consolidate)
@@ -367,6 +441,44 @@ def consolidate_cmd(
     with _open_system() as system:
         _print_consolidation(system.consolidate(space, rebuild=rebuild))
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+
+
+@app.command()
+def reindex(
+    space: Annotated[str | None, typer.Option(help="记忆空间 ID")] = None,
+    all_spaces: Annotated[bool, typer.Option("--all", help="数据库里的全部空间")] = False,
+    full: Annotated[
+        bool, typer.Option("--full", help="全部重新写一遍，不只补缺的（命中向量缓存）")
+    ] = False,
+) -> None:
+    """按数据库补齐向量库：补上缺的向量、删掉多余的点（不调用 LLM）。向量库丢了、坏了，或者与
+    数据库不是同一时刻的备份时用；先用 cuemem doctor --vectors 查哪些空间对不上。"""
+    if (space is None) == (not all_spaces):
+        console.print("[red]指定 --space 或 --all 其中一个[/red]")
+        raise typer.Exit(2)
+    with _open_system() as system:
+        targets = [s["space_id"] for s in system.db.list_spaces()]
+        if space is not None:
+            if space not in targets:
+                console.print(f"[red]没有记忆空间 {escape(space)}[/red]")
+                raise typer.Exit(1)
+            targets = [space]
+        for target in targets:
+            report = system.reindex(target, only_missing=not full)
+            added = {k: v for k, v in report.items() if k in _REINDEX_KINDS and v}
+            filled = "、".join(f"{k} {v}" for k, v in added.items())
+            line = f"补上 {filled}" if filled else "没有缺的"
+            line += f"；删掉多余的点 {report['orphans'] + report.get('image_orphans', 0)} 个"
+            if report.get("missing_files"):
+                line += f"；{report['missing_files']} 张图片的原图不在了，补不上"
+            if report.get("facts_missing"):
+                line += f"；{report['facts_missing']} 个事实单元在事实表里找不到，补不上"
+            console.print(f"记忆空间 [bold]{escape(target)}[/bold]：{line}")
+        _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+
+
+# reindex 的报告里按种类计数的几项（其余是删掉的点与补不上的原图）
+_REINDEX_KINDS = ("round", "fact", "summary", "entity", "image", "image_iso", "images")
 
 
 @app.command()
@@ -493,12 +605,8 @@ def search_image(
 @app.command()
 def spaces() -> None:
     """列出所有记忆空间。"""
-    from cuemem.store.sqlite import MemoryDB
-
-    settings = _settings()
-    db = MemoryDB(settings.paths.db)
-    rows = db.list_spaces()
-    db.close()
+    with _open_db_only() as db:
+        rows = db.list_spaces()
     if not rows:
         console.print("还没有任何记忆空间。先运行 cuemem ingest。")
         return
@@ -594,10 +702,13 @@ def _default_scenario() -> str:
 
 
 INSECURE_HELP = (
-    "监听非本机地址又没有设置 CUEMEM_API_TOKEN 时也照常启动（不鉴权：能连到这台机器的人都能"
-    "读写、删除记忆，用你的上游 Key）。只在可信的网络里用"
+    "监听非本机地址（或 CUEMEM_ALLOWED_HOSTS 列了别的主机名、经反向代理对外）又没有设置 "
+    "CUEMEM_API_TOKEN 时也照常启动（不鉴权：能连到这台机器的人都能读写、删除记忆，用你的上游 "
+    "Key）。只在可信的网络里用"
 )
-WEAK_TOKEN_HELP = "监听非本机地址时也接受短于 16 个字符的访问令牌"
+WEAK_TOKEN_HELP = (
+    "监听非本机地址（或 CUEMEM_ALLOWED_HOSTS 列了别的主机名）时也接受短于 16 个字符的访问令牌"
+)
 GRADIO_TEMP_ENV = "GRADIO_TEMP_DIR"
 PLAIN_HTTP_NOTE = (
     "[yellow]注意：[/yellow]服务是明文 HTTP：访问令牌（也是界面的密码）与记忆都不加密地经过网络。"
@@ -611,6 +722,30 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host.lower() == "localhost"
+
+
+def _allowed_hosts_env() -> list[str]:
+    """CUEMEM_ALLOWED_HOSTS 列出的主机名（逗号分隔，去空白、小写）。_host_policy 与
+    _exposed_names 共用这一个解析。"""
+    from cuemem.api.app import HOSTS_ENV
+
+    return [h.strip().lower() for h in os.environ.get(HOSTS_ENV, "").split(",") if h.strip()]
+
+
+def _loopback_name(name: str) -> bool:
+    """CUEMEM_ALLOWED_HOSTS 里的一项是不是只指本机：回环 IP（可带 [] 与端口）、localhost、
+    *.localhost（RFC 6761）。"""
+    if name.startswith("["):
+        name = name[1:].split("]", 1)[0]
+    elif name.count(":") == 1:
+        name = name.split(":", 1)[0]
+    return _is_loopback(name) or name.endswith(".localhost")
+
+
+def _exposed_names() -> list[str]:
+    """CUEMEM_ALLOWED_HOSTS 里不只指本机的项（含 "*"）。监听本机地址时列了这些就是经反向代理
+    对外（README 的 Public deployment / 公网部署），要和监听非本机地址一样设令牌（第五轮体检）。"""
+    return [h for h in _allowed_hosts_env() if h == "*" or not _loopback_name(h)]
 
 
 def _access_keys() -> Keys:
@@ -639,14 +774,26 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
     令牌也要够长（第四轮体检）：直接给出的令牌短于 16 个字符（Keys.weak；以前 README 的例子就是
     your-token）时同样拒绝启动，除非加 --insecure-weak-token（allow_weak）。信息里只有令牌的名字。
     sha256: 给出的量不出长度，不查。加了 --insecure-no-auth（insecure）时两项都不查：设了令牌时
-    照样鉴权，短的令牌也放过。"""
+    照样鉴权，短的令牌也放过。
+
+    监听本机地址但 CUEMEM_ALLOWED_HOSTS 列了别的主机名（或 "*"）时同样要查（第五轮体检）：
+    这是 README 公网部署的做法，TLS 反向代理转发进来的请求都会被接受。"""
+    from cuemem.api.app import HOSTS_ENV
     from cuemem.api.auth import KEYS_FILE_ENV, MIN_TOKEN_CHARS, TOKEN_ENV
 
-    if insecure or _is_loopback(host):
+    if insecure:
         return
+    exposed = _exposed_names() if _is_loopback(host) else []
+    if _is_loopback(host) and not exposed:
+        return
+    where = f"监听 {escape(host)}"
+    if exposed:
+        where += f"，但 {HOSTS_ENV} 列出了 {escape('、'.join(exposed))}（经反向代理对外），"
+    else:
+        where += " 但"
     if not keys.enabled:
         console.print(
-            f"[red]监听 {escape(host)} 但没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
+            f"[red]{where}没有设置 {TOKEN_ENV}，拒绝启动：能连到这台机器的人都能"
             f"读写、删除记忆，用你的上游 Key。[/red]\n在 .env 里设置 {TOKEN_ENV}（例如用 openssl "
             f"rand -hex 32 生成），或用 {KEYS_FILE_ENV} 给出限定作用域的令牌；只在可信的网络里"
             "使用时也可以加 --insecure-no-auth。"
@@ -654,7 +801,7 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
         raise typer.Exit(2)
     if keys.weak and not allow_weak:
         console.print(
-            f"[red]监听 {escape(host)} 但这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
+            f"[red]{where}这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
             f"{escape('、'.join(keys.weak))}。[/red]\n换成随机生成的长令牌（例如 openssl rand "
             f"-hex 32）；sha256: 给出的令牌不查长度。确实要用短令牌时加 --insecure-weak-token。"
         )
@@ -700,9 +847,9 @@ def _host_policy(host: str, *, authenticated: bool = True) -> HostPolicy:
       CUEMEM_ALLOWED_HOSTS 里。以前也不查：没有令牌，任何网页都能经重绑定读写记忆、花上游的额度。
 
     CUEMEM_ALLOWED_HOSTS 列出的主机名两边都放行，含 "*" 时不查 Host、不限 Origin。"""
-    from cuemem.api.app import HOSTS_ENV, LOOPBACK_HOSTS
+    from cuemem.api.app import LOOPBACK_HOSTS
 
-    extra = [h.strip().lower() for h in os.environ.get(HOSTS_ENV, "").split(",") if h.strip()]
+    extra = _allowed_hosts_env()
     if "*" in extra:
         return HostPolicy(None, extra, False)
     if _is_loopback(host):
@@ -716,6 +863,20 @@ def _host_policy(host: str, *, authenticated: bool = True) -> HostPolicy:
     except ValueError:
         named = [host.lower()] if host else []
     return HostPolicy(list(dict.fromkeys(["localhost", *named, *extra])), extra, True)
+
+
+def _no_auth_warning(host: str, can: str) -> None:
+    """--insecure-no-auth 对外时的启动提示：监听非本机地址，或监听本机地址但
+    CUEMEM_ALLOWED_HOSTS 列了别的主机名（经反向代理对外，第五轮复审：以前这时什么都不提示）。"""
+    from cuemem.api.app import HOSTS_ENV
+    from cuemem.api.auth import TOKEN_ENV
+
+    exposed = _exposed_names() if _is_loopback(host) else []
+    via = f"，{HOSTS_ENV} 列出了 {escape('、'.join(exposed))}（经反向代理对外）" if exposed else ""
+    console.print(
+        f"[yellow]注意：[/yellow]监听 {escape(host)}{via}，但没有设置 {TOKEN_ENV}"
+        f"（--insecure-no-auth），能连到这台机器的人都能{can}"
+    )
 
 
 def _no_auth_hosts_note(hosts: HostPolicy) -> None:
@@ -790,7 +951,7 @@ def serve(
     import uvicorn
 
     from cuemem.api.app import create_app
-    from cuemem.api.auth import TOKEN_ENV, Keys
+    from cuemem.api.auth import Keys
     from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits
     from cuemem.api.proxy import MemoryProxy
 
@@ -849,13 +1010,11 @@ def serve(
                 console.print(
                     f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录"
                 )
-                if not _is_loopback(host):  # 容器里总是 0.0.0.0：Docker 也提示
+                # 容器里总是 0.0.0.0：Docker 也提示；本机地址经反向代理对外时也提示
+                if not _is_loopback(host) or _exposed_names():
                     console.print(PLAIN_HTTP_NOTE)
-            elif not _is_loopback(host):  # 加了 --insecure-no-auth
-                console.print(
-                    f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
-                    "（--insecure-no-auth），能连到这台机器的人都能读写、删除记忆"
-                )
+            elif not _is_loopback(host) or _exposed_names():  # 加了 --insecure-no-auth
+                _no_auth_warning(host, "读写、删除记忆")
                 _no_auth_hosts_note(hosts)
             for line in _loose_modes():
                 console.print(line)
@@ -888,7 +1047,6 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.auth import TOKEN_ENV
     from cuemem.api.limits import body_limits
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
@@ -930,13 +1088,10 @@ def proxy(
         )
         if keys.enabled:
             console.print(f"已启用访问令牌：{_keys_note(keys)}。OpenAI SDK 的 api_key 填令牌")
-            if not _is_loopback(host):
+            if not _is_loopback(host) or _exposed_names():
                 console.print(PLAIN_HTTP_NOTE)
-        elif not _is_loopback(host):  # 加了 --insecure-no-auth
-            console.print(
-                f"[yellow]注意：[/yellow]监听 {escape(host)} 但没有设置 {TOKEN_ENV}"
-                "（--insecure-no-auth），能连到这台机器的人都能用你的上游 Key、读写记忆"
-            )
+        elif not _is_loopback(host) or _exposed_names():  # 加了 --insecure-no-auth
+            _no_auth_warning(host, "用你的上游 Key、读写记忆")
             _no_auth_hosts_note(hosts)
         for line in _loose_modes():
             console.print(line)
@@ -1181,7 +1336,12 @@ def inspect_facts(
     subject: Annotated[str | None, typer.Option(help="只看某个主语（实体名）")] = None,
     current: Annotated[bool, typer.Option("--current", help="只看当前有效的事实")] = False,
     valid_at: Annotated[
-        str | None, typer.Option("--valid-at", help="事件时间：那时现实中成立的事实，如 2025-06")
+        str | None,
+        typer.Option(
+            "--valid-at",
+            help="事件时间：那时现实中成立的事实，写成 2025、2025-06 或 2025-06-07；"
+            "一年、一个月指这段时间里任何时候成立过的",
+        ),
     ] = None,
     known_at: Annotated[
         datetime | None,
@@ -1189,6 +1349,14 @@ def inspect_facts(
     ] = None,
 ) -> None:
     """事实时间线：按主语分组、按时间排列，标出被取代的版本。"""
+    if valid_at is not None:
+        try:
+            valid_period(valid_at)
+        except ValueError:
+            raise typer.BadParameter(
+                f"{valid_at!r} 不是 ISO 日期：写成 YYYY、YYYY-MM 或 YYYY-MM-DD",
+                param_hint="--valid-at",
+            ) from None
     with _open_system() as system:
         facts = system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
         if subject:
@@ -1775,12 +1943,23 @@ def _print_local_store(settings: Settings) -> None:
     一直开着一个文件、启动时全部打开。只读 meta.json、不打开向量库，cuemem serve 正在用它时也能
     查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端。"""
     meta = settings.paths.qdrant / "meta.json"
-    if settings.vector_store.url or not meta.is_file():
+    if settings.vector_store.url:
+        return
+    repair = (
+        f"运行 {cli_command('doctor --repair-vectors')} 按 collection/ 下的集合重写它（不要手动"
+        f"删掉 meta.json）；{cli_command('export')} 不用向量库，照样能导出"
+    )
+    if not meta.is_file():
+        root = settings.paths.qdrant / "collection"
+        if root.is_dir() and any(p.is_dir() for p in root.iterdir()):
+            console.print(f"[yellow]{escape(str(meta))} 不在了，集合还在[/yellow]：{repair}")
         return
     try:
         collections = len(json.loads(meta.read_text("utf-8"))["collections"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        console.print(f"[yellow]读不出 {escape(str(meta))}[/yellow]：{escape(str(exc))}")
+        console.print(
+            f"[yellow]读不出 {escape(str(meta))}[/yellow]：{escape(str(exc))}。向量还在：{repair}"
+        )
         return
     line = f"本地向量库：{collections} 个集合（每个一直开着一个文件，启动时全部打开）"
     limits = _raise_open_file_limit()
@@ -1799,6 +1978,109 @@ def _print_local_store(settings: Settings) -> None:
         f"[yellow]{line}：集合再多就打不开、建不了新的空间。用户多时改用 Qdrant 服务端："
         f"{cli_command('migrate-vectors --to URL')}，再设置 CUEMEM_VECTOR_STORE__URL[/yellow]"
     )
+
+
+def _repair_vectors(settings: Settings) -> None:
+    """doctor --repair-vectors：见 store/vector.py 的 repair_local_meta。"""
+    from cuemem.store.vector import repair_local_meta
+
+    if settings.vector_store.url:
+        console.print("用的是 Qdrant 服务端（CUEMEM_VECTOR_STORE__URL），没有本地的 meta.json 要修")
+        return
+    meta = settings.paths.qdrant / "meta.json"
+    try:
+        report = repair_local_meta(
+            settings.paths.qdrant,
+            text_dim=settings.embedding.dim,
+            image_dim=settings.multimodal_embedding.dim,
+        )
+    except CueMemError as exc:
+        console.print(f"[red]错误：[/red]{exc}")
+        raise typer.Exit(1) from exc
+    if report is None:
+        console.print(f"{escape(str(meta))} 读得出、集合都在，不用修")
+        return
+    backup = f"，原来的文件改名为 {escape(report['backup'])}" if report["backup"] else ""
+    console.print(
+        f"[green]已重写 {escape(str(meta))}[/green]：补上 {report['text']} 个文字集合、"
+        f"{report['image']} 个图片集合（其中 {report['empty']} 个是空的），共 {report['points']}"
+        f" 个点{backup}"
+    )
+
+
+def _print_vector_gaps(settings: Settings) -> None:
+    """doctor --vectors：每个空间按种类比较数据库里的记忆单元与向量库里的点（图片另比），对不上
+    的标黄、写明 cuemem reindex 的命令。向量库丢了、坏了，或者与数据库不是同一时刻的备份时，
+    检索悄悄少了结果（get_all 照样列得出），以前 doctor 看不出来。
+
+    要打开向量库：本地模式同一时间只允许一个进程打开，cuemem serve 正开着它时跳过（doctor 的
+    其余检查只读 meta.json，照样能做）。"""
+    from cuemem.embed import image_vectors_enabled
+    from cuemem.errors import StorageLockedError
+    from cuemem.memory import vector_gaps
+    from cuemem.store.vector import VectorStore
+
+    if not settings.paths.db.is_file():
+        console.print("向量库检查：还没有数据库，没有要比的")
+        return
+    with _open_db_only() as db:
+        try:
+            store = VectorStore(
+                settings.paths.qdrant,
+                dim=settings.embedding.dim,
+                url=settings.vector_store.url,
+                api_key=settings.vector_store.secret(),
+            )
+        except StorageLockedError:
+            console.print(
+                "[yellow]向量库检查跳过：本地向量库正被另一个进程使用（多半是 cuemem serve）"
+                "[/yellow]：先停掉它再查，或者改用 Qdrant 服务端"
+            )
+            return
+        except CueMemError as exc:
+            console.print(f"[yellow]向量库检查跳过：[/yellow]{exc}")
+            return
+        store.owned_units = db.some_unit_ids  # 与 MemorySystem 相同（见 collection_name）
+        images = image_vectors_enabled(settings)
+        spaces = [s["space_id"] for s in db.list_spaces()]
+        try:
+            gaps = {space: vector_gaps(db, store, space, images=images) for space in spaces}
+        except Exception as exc:  # 服务端连不上等：一行说明，doctor 的其余检查照常
+            console.print(f"[yellow]向量库检查没做完：[/yellow]{escape(str(exc))}")
+            return
+        finally:
+            store.close()
+    bad = {space: found for space, found in gaps.items() if found}
+    if not bad:
+        console.print(f"向量库：{len(spaces)} 个空间的点数与数据库一致")
+        return
+    for space, found in bad.items():
+        detail = "、".join(f"{kind} {want} → {got}" for kind, (want, got) in found.items())
+        command = escape(cli_command(f"reindex --space {shlex.quote(space)}"))
+        console.print(
+            f"[yellow]空间 {escape(space)} 的向量库与数据库对不上[/yellow]"
+            f"（数据库 → 向量库：{detail}）：运行 {command}"
+        )
+    console.print(f"全部补齐：{cli_command('reindex --all')}（不调用 LLM，命中向量缓存时不发请求）")
+
+
+def _print_disk(settings: Settings) -> None:
+    """数据目录写不写得进去、还剩多少空间：只读、满了时打开数据库与写入都会失败。"""
+    data = settings.paths.db.parent
+    probe = data
+    while not probe.exists() and probe != probe.parent:  # 还没建：看会建在哪里
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return
+    line = f"数据目录 {escape(str(data))}：剩余空间 {free / 2**20:,.0f} MB"
+    if not os.access(probe, os.W_OK):
+        console.print(f"[yellow]{line}，但没有写权限[/yellow]：写入、巩固与导入都会失败")
+    elif free < LOW_DISK:
+        console.print(f"[yellow]{line}[/yellow]：空间不够时写入、巩固与导入会失败")
+    else:
+        console.print(line)
 
 
 def _loose_modes(settings: Settings | None = None) -> list[str]:

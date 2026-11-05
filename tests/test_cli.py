@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -125,6 +126,91 @@ def test_doctor_counts_local_collections(
     assert "migrate-vectors--toURL" in flat and "CUEMEM_VECTOR_STORE__URL" in flat
 
 
+def test_empty_vector_meta_export_still_works_and_doctor_repairs_it(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """被杀掉时 qdrant-client 1.19 留下空的 meta.json：以前打开记忆系统、连 cuemem export 都
+    原样抛出 JSONDecodeError，doctor 只说读不出。现在打开时写明 doctor --repair-vectors；export
+    只打开数据库，照样导出；修好之后检索结果不变。"""
+    from cuemem.errors import VectorStoreOpenError
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    system = MemorySystem.from_settings(load_settings())
+    query = system.embedder.embed(["Where does Alice work?"], "query").dense[0]
+    before = [h.unit_id for h in system.vectors.search_dense("demo", query, 5)]
+    system.close()
+    system = MemorySystem.from_settings(load_settings())
+    assert [h.unit_id for h in system.vectors.search_dense("demo", query, 5)] == before
+    system.close()
+    meta = tmp_path / "qdrant" / "meta.json"
+    meta.write_text("", "utf-8")
+
+    with pytest.raises(VectorStoreOpenError, match="repair-vectors"):
+        MemorySystem.from_settings(load_settings())
+    result = runner.invoke(app, ["export", "--space", "demo", "-o", str(tmp_path / "out.json")])
+    assert result.exit_code == 0, result.output
+    data = json.loads((tmp_path / "out.json").read_text("utf-8"))
+    assert sum(len(s["turns"]) for s in data["sessions"]) == 18
+    result = runner.invoke(app, ["spaces"])
+    assert result.exit_code == 0 and "demo" in result.output
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "doctor--repair-vectors" in _flat(result.output)
+    assert "不要手动删掉meta.json" in _flat(result.output)
+
+    result = runner.invoke(app, ["doctor", "--repair-vectors"])
+    assert result.exit_code == 0, result.output
+    assert "补上1个文字集合、0个图片集合" in _flat(result.output)
+    system = MemorySystem.from_settings(load_settings())
+    try:
+        assert [h.unit_id for h in system.vectors.search_dense("demo", query, 5)] == before
+    finally:
+        system.close()
+    result = runner.invoke(app, ["doctor", "--repair-vectors"])
+    assert result.exit_code == 0 and "不用修" in _flat(result.output)
+
+
+def test_unopenable_database_is_one_line(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """目录只读、磁盘满了时 SQLite 在打开时出错：以前每个命令都打印 sqlite3.OperationalError 的
+    调用栈，现在一行说明与退出码 1。"""
+    import sqlite3
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    for command in (["ingest", str(TOY_CONVERSATION)], ["export", "--space", "demo"], ["spaces"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, (command, result.output)
+        assert not isinstance(result.exception, sqlite3.OperationalError)
+        assert "打不开（attemptto" in _flat(result.output), result.output
+        assert "检查目录权限与磁盘空间" in _flat(result.output)
+        assert "Traceback" not in result.output
+
+
+def test_doctor_reports_free_space(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor 写明数据目录还剩多少空间，不到 200 MB 时标黄（满了时打开数据库与写入都会失败）。"""
+    import shutil
+
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "剩余空间" in result.output and "空间不够" not in result.output
+
+    usage = shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: usage._replace(free=50 * 2**20))
+    result = runner.invoke(app, ["doctor"])
+    assert "剩余空间50MB" in _flat(result.output) and "空间不够" in result.output
+
+
 @pytest.mark.filterwarnings(
     "ignore:Api key is used with an insecure connection", "ignore:Failed to obtain server version"
 )
@@ -239,6 +325,10 @@ def test_consolidate_inspect_and_forget(
         app, ["inspect", "facts", "--space", "demo", "--valid-at", "2025-06-01", "--current"]
     )
     assert result.exit_code == 0, result.output
+    # 第五轮体检 P8：不是 ISO 的日期以前按字符串比较，给出错的结果而不报错
+    result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--valid-at", "2025/06"])
+    # CI 里 rich 给错误框上色，参数名会被颜色码拆开：去掉颜色码再找
+    assert result.exit_code == 2 and "--valid-at" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
 
     result = runner.invoke(app, ["inspect", "entities", "--space", "demo"])
     assert result.exit_code == 0 and "Max" in result.output
@@ -258,6 +348,19 @@ def test_consolidate_inspect_and_forget(
     assert "走L2" in flat and "检索计划（LLM）" in flat and "充分性检查1：够了" in flat
     assert runner.invoke(app, [*args, "--mode", "bogus"]).exit_code == 1
 
+    result = runner.invoke(app, ["forget", "--space", "demo"])  # 没说删什么
+    assert result.exit_code == 1 and "请用--session、--turn或--fact指定" in _flat(result.output)
+    with MemorySystem.from_settings(load_settings()) as system:
+        turns = len(system.db.get_turns("demo"))
+    # 预演：列出会删的发言，什么都不删
+    result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "预演：将删除4条发言（什么都还没删）" in flat and "会话s4" in flat
+    with MemorySystem.from_settings(load_settings()) as system:
+        assert len(system.db.get_turns("demo")) == turns
+    result = runner.invoke(app, ["forget", "--space", "demo", "--session", "nope", "--yes"])
+    assert result.exit_code == 0 and "没有找到要删除的内容。" in result.output
     result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4"], input="n\n")
     assert result.exit_code == 1  # 没有确认，不删除
     result = runner.invoke(app, ["forget", "--space", "demo", "--session", "s4", "--yes"])
@@ -364,6 +467,49 @@ def test_require_token(
         assert refused.value.exit_code == 2
 
 
+@pytest.mark.parametrize(
+    ("env", "host", "token", "insecure", "weak_ok", "starts"),
+    [
+        # README 公网部署：serve 监听 127.0.0.1，TLS 反向代理转发 mem.example.com 进来
+        ("mem.example.com", "127.0.0.1", None, False, False, False),
+        ("mem.example.com", "127.0.0.1", "your-token", False, False, False),
+        ("mem.example.com", "127.0.0.1", "your-token", False, True, True),
+        ("mem.example.com", "127.0.0.1", None, True, False, True),
+        ("mem.example.com", "127.0.0.1", "a" * 16, False, False, True),
+        ("mem.example.com", "localhost", None, False, False, False),
+        ("*", "127.0.0.1", None, False, False, False),
+        ("cuemem.localhost, 127.0.0.1", "127.0.0.1", None, False, False, True),
+        ("[::1]:7860, localhost, 127.0.0.2:80", "::1", "your-token", False, False, True),
+        ("", "127.0.0.1", None, False, False, True),
+        ("", "127.0.0.1", "your-token", False, False, True),
+    ],
+)
+def test_require_token_behind_a_reverse_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    env: str,
+    host: str,
+    token: str | None,
+    insecure: bool,
+    weak_ok: bool,
+    starts: bool,
+) -> None:
+    """监听本机地址但 CUEMEM_ALLOWED_HOSTS 列了别的主机名（或 "*"）：经反向代理对外，和监听
+    非本机地址一样要设够长的令牌（第五轮体检）。只指本机的项（回环地址、*.localhost）不算。"""
+    import typer
+
+    from cuemem.api.auth import Keys
+    from cuemem.cli import _require_token
+
+    monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", env)
+    keys = Keys.from_token(token)
+    if starts:
+        _require_token(host, keys, insecure, allow_weak=weak_ok)
+    else:
+        with pytest.raises(typer.Exit) as refused:
+            _require_token(host, keys, insecure, allow_weak=weak_ok)
+        assert refused.value.exit_code == 2
+
+
 def test_require_token_names_short_scoped_tokens(capsys: pytest.CaptureFixture[str]) -> None:
     """限定作用域的令牌直接写 token: 时同样要够长（按名字说是哪几个，不带令牌本身）；sha256:
     量不出长度，不查。"""
@@ -446,6 +592,33 @@ def test_non_loopback_bind_needs_a_token(
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_loopback_bind_behind_a_reverse_proxy_needs_a_token(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """README 公网部署的做法（监听 127.0.0.1、CUEMEM_ALLOWED_HOSTS=mem.example.com）没有令牌时
+    拒绝启动，信息说出是 CUEMEM_ALLOWED_HOSTS 列的主机名；设了令牌时提示服务是明文 HTTP。"""
+    monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", "mem.example.com")
+    result = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert result.exit_code == 2 and served == []
+    flat = _flat(result.output)
+    assert "CUEMEM_ALLOWED_HOSTS" in flat and "mem.example.com" in flat
+    assert "--insecure-no-auth" in flat
+    # 加了 --insecure-no-auth 时照样启动，但要像监听 0.0.0.0 时一样提示（以前什么都不说）
+    bypass = runner.invoke(app, [*command, "--host", "127.0.0.1", "--insecure-no-auth"])
+    assert bypass.exit_code == 0 and len(served) == 1
+    said = _flat(bypass.output)
+    assert "注意" in said and "CUEMEM_ALLOWED_HOSTS" in said and "mem.example.com" in said
+    served.clear()
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "your-token")
+    weak = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert weak.exit_code == 2 and served == [] and "your-token" not in weak.output
+    assert "--insecure-weak-token" in _flat(weak.output)
+    monkeypatch.setenv("CUEMEM_API_TOKEN", "fake-token-0123456789")
+    strong = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert strong.exit_code == 0 and "TLS" in _flat(strong.output) and len(served) == 1
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_loopback_bind_checks_the_host(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
@@ -458,7 +631,7 @@ def test_loopback_bind_checks_the_host(
     assert runner.invoke(app, command).exit_code == 0
     assert runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"]).exit_code == 0
     monkeypatch.setenv("CUEMEM_ALLOWED_HOSTS", "mem.example, cuemem.lan")
-    assert runner.invoke(app, command).exit_code == 0
+    assert runner.invoke(app, [*command, "--insecure-no-auth"]).exit_code == 0  # 经反向代理对外
     named = runner.invoke(app, [*command, "--host", "0.0.0.0", "--insecure-no-auth"])
     assert named.exit_code == 0 and "CUEMEM_ALLOWED_HOSTS" in named.output
     monkeypatch.delenv("CUEMEM_ALLOWED_HOSTS")
