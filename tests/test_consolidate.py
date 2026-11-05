@@ -1074,6 +1074,70 @@ def test_names_and_values_in_other_scripts(n3_settings: Settings, fake_api: Fake
         assert model.calls["reconcile"] == 1 and "서울" in model.prompts["reconcile"][0]
 
 
+ACCENTS: dict[str, Any] = {
+    "2026-01-10": {
+        "summary": "",
+        "facts": [
+            said("The user's budget is ８０００ yuan.", "User", "budget", "８０００ yuan", 0),
+            said("Müller likes chess.", "Müller", "likes", "chess", 0, "multi"),
+            said("Möller likes tennis.", "Möller", "likes", "tennis", 1, "multi"),
+        ],
+        "entities": [],
+    },
+    "2026-02-01": {
+        "summary": "",
+        "facts": [
+            said("The user's budget is ６０００ yuan.", "User", "budget", "６０００ yuan", 0),
+            said("The user has a friend named Zoë.", "User", "has_friend", "Zoë", 0, "multi"),
+            said("The user has a friend named Zoé.", "User", "has_friend", "Zoé", 0, "multi"),
+            said("The user has a friend named Zoà.", "User", "has_friend", "Zoà", 0, "multi"),
+        ],
+        "entities": [],
+    },
+}
+
+
+def test_accented_letters_and_fullwidth_digits(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """原来的键删掉带重音的拉丁字母与全角数字：'Müller' 与 'Möller' 两位说话人成了一个实体，
+    预算从 ８０００ 改成 ６０００ 被当成重复丢掉，同一会话里 'Zoë' 与 'Zoà' 两句的事实 ID 相同、
+    后一句被丢掉。现在都分开；折叠重音后相同的 'Zoé' 仍与 'Zoë' 是同一个值。"""
+    model = ScriptedModel(
+        ACCENTS,
+        reconcile=lambda prompt: {"decisions": [{"new": 1, "action": "update", "target": "e1"}]},
+    )
+    fake_api.chat_replies = [model]
+    first = SessionIn(
+        session_id="a",
+        started_at=datetime(2026, 1, 10),
+        turns=[
+            TurnIn(
+                role="user", speaker="Müller", text="Mein Budget: ８０００ yuan. Ich mag Schach."
+            ),
+            TurnIn(role="user", speaker="Möller", text="Ich spiele Tennis."),
+        ],
+    )
+    second = SessionIn(
+        session_id="b",
+        started_at=datetime(2026, 2, 1),
+        turns=[TurnIn(role="user", text="Budget now ６０００ yuan. Friends: Zoë, Zoé, Zoà.")],
+    )
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
+        memory.ingest(Conversation(space_id="de", sessions=[first, second]), consolidate=True)
+        people = {e.name: e.id for e in memory.entities("de") if e.type == "person"}
+        assert {"Müller", "Möller"} <= set(people) and people["Müller"] != people["Möller"]
+        assert people["Müller"] == stable_id("de", "entity", "m ller", "person")  # 原来的 ID
+        facts = memory.facts("de")
+        assert by_statement(facts, "chess").subject_id == people["Müller"]
+        assert by_statement(facts, "tennis").subject_id == people["Möller"]
+        old, new = by_statement(facts, "８０００"), by_statement(facts, "６０００")
+        assert new.is_current and old.superseded_by == new.id
+        assert model.calls["reconcile"] == 1
+        friends = [f for f in facts if f.predicate == "has_friend" and f.is_current]
+        assert sorted(f.object for f in friends) == ["Zoà", "Zoë"]
+        zoe = by_statement(facts, "Zoë")
+        assert zoe.id == stable_id("de", "fact", "b", "user has a friend named zo")  # 原来的 ID
+
+
 # ---------- 跨巩固复用载入的状态（R6） ----------
 
 

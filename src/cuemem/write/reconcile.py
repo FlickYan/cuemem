@@ -41,7 +41,7 @@ from cuemem.core.trace import span
 from cuemem.embed.base import FloatArray
 from cuemem.errors import ContentFilteredError
 from cuemem.llm.client import LLMClient
-from cuemem.write.predicates import normalize_value, registered_cardinality
+from cuemem.write.predicates import normalize_value, registered_cardinality, strict_key
 
 Action = Literal["add", "supersede", "merge", "noop"]
 
@@ -90,7 +90,9 @@ class Operation:
     rule: str = ""  # duplicate / similar / single_valued / negation / llm / late_arrival / default
 
 
-ValueKey = tuple[str, str, str, bool]  # （主语，谓词，宾语的规范形式，是否否定）
+# 宾语的两个键：normalize_value 与 strict_key（只有原来的键相同时它才可能不同，见 strict_key）
+ObjectKey = tuple[str, str]
+ValueKey = tuple[str, str, ObjectKey, bool]  # （主语，谓词，宾语的两个键，是否否定）
 
 
 @dataclass
@@ -99,7 +101,7 @@ class FactState:
 
     另有几个随写入更新的索引，对账查候选时不用每条新事实都扫一遍全部事实（以前遗忘与重建的
     重放在 CPU 上是平方级）：每个主语的当前事实（按 facts 的插入顺序）与它们的向量矩阵、
-    按（主语，谓词，规范化的宾语，否定）分组的当前事实、宾语规范形式的备忘。查出来的候选、
+    按（主语，谓词，宾语的两个键，否定）分组的当前事实、宾语两个键的备忘。查出来的候选、
     先后与相似度都与逐条扫描相同。所以 facts 与 vectors 只能经 put 改动。
     """
 
@@ -109,7 +111,7 @@ class FactState:
     _subjects: dict[str, _Current] = field(default_factory=dict, repr=False)
     _values: dict[ValueKey, dict[str, int]] = field(default_factory=dict, repr=False)
     _codes: dict[str, int] = field(default_factory=dict, repr=False)  # 谓词 → 编号
-    _norms: dict[str, str] = field(default_factory=dict, repr=False)  # 宾语 → normalize_value
+    _norms: dict[str, ObjectKey] = field(default_factory=dict, repr=False)  # 宾语 → 两个键
 
     def put(self, fact: Fact, vector: FloatArray | None = None) -> None:
         """写入或替换一条事实；vector 不为 None 时同时设它的陈述向量。索引随之更新。"""
@@ -131,10 +133,9 @@ class FactState:
         return [self.facts[i] for i in current.order] if current else []
 
     def first_current(
-        self, subject_id: str, predicate: str, value: str, negated: bool
+        self, subject_id: str, predicate: str, value: ObjectKey, negated: bool
     ) -> Fact | None:
-        """current_of 里第一条谓词相同、宾语的规范形式（normalize_value）是 value、否定与否
-        相同的事实。"""
+        """current_of 里第一条谓词相同、宾语的两个键（norm）都是 value、否定与否相同的事实。"""
         ids = self._values.get((subject_id, predicate, value, negated))
         return self.facts[next(iter(ids))] if ids else None
 
@@ -152,11 +153,11 @@ class FactState:
         code = self._codes.get(predicate, -1)
         return current.codes[: len(current.rows)] == code
 
-    def norm(self, text: str) -> str:
-        """normalize_value(text)，算过的记下来：一条事实的宾语不会变，每次对账却都要比。"""
+    def norm(self, text: str) -> ObjectKey:
+        """object_keys(text)，算过的记下来：一条事实的宾语不会变，每次对账却都要比。"""
         value = self._norms.get(text)
         if value is None:
-            value = self._norms[text] = normalize_value(text)
+            value = self._norms[text] = object_keys(text)
         return value
 
     def _value_key(self, fact: Fact) -> ValueKey:
@@ -546,9 +547,18 @@ def _by_similarity(scores: npt.NDArray[np.float64], wanted: npt.NDArray[np.bool_
     return [int(i) for i in rows[np.argsort(-scores[rows], kind="stable")]]
 
 
-def _same_object(a: str, b: str, norm: Callable[[str], str] = normalize_value) -> bool:
-    na, nb = norm(a), norm(b)
-    return na == nb or bool(na and nb and (na in nb or nb in na))
+def object_keys(text: str) -> ObjectKey:
+    """宾语的两个键：原来的 normalize_value 与更严的 strict_key。"""
+    return normalize_value(text), strict_key(text)
+
+
+def _same_object(a: str, b: str, norm: Callable[[str], ObjectKey] = object_keys) -> bool:
+    """两个键分别相同、或一个包含另一个，两个都成立才算同一个宾语。不能把两个键拼成一个
+    字符串再比：那样"包含"就不成立了。"""
+    return all(
+        x == y or bool(x and y and (x in y or y in x))
+        for x, y in zip(norm(a), norm(b), strict=True)
+    )
 
 
 def _effective(fact: Fact) -> str:
