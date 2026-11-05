@@ -1126,7 +1126,10 @@ def test_http_api_refuses_cross_origin_requests(service: ChatService, tmp_path: 
     same = client.post("/api/sessions", json={}, headers={"Host": lan, "Origin": f"http://{lan}"})
     assert same.status_code == 200
     assert client.get("/api/spaces").status_code == 200
-    assert client.get("/", headers={"Host": lan, "Origin": evil}).status_code == 200  # 界面
+    # 界面：在地址栏打开（不带 Origin）照常；别的网站的网页 fetch 首页 403（第六轮复审：首页的
+    # HTML 里有登录的密钥名，见 test_ui_config_refuses_cross_origin_reads）
+    assert client.get("/", headers={"Host": lan}).status_code == 200
+    assert client.get("/", headers={"Host": lan, "Origin": evil}).status_code == 403
 
 
 @pytest.mark.parametrize("bind", ["::1", "127.0.0.2", "127.0.0.1"])
@@ -1266,7 +1269,8 @@ def test_ui_config_refuses_cross_origin_reads(service: ChatService, tmp_path: Pa
     with TestClient(app_, base_url=f"https://{host}") as client:
         login = client.post("/login", data={"username": "mallory", "password": token})
         assert login.status_code == 200 and client.cookies
-        for path in ("/config", "/config/", "/config?deep_link=x"):
+        # 首页把同样的配置写在 HTML 里（第六轮复审）
+        for path in ("/config", "/config/", "/config?deep_link=x", "/", "/?x=1"):
             refused = client.get(path, headers={"Origin": "https://evil.example"})
             assert refused.status_code == 403, path
             assert "mallory" not in refused.text
@@ -1274,6 +1278,8 @@ def test_ui_config_refuses_cross_origin_reads(service: ChatService, tmp_path: Pa
         for headers in ({"Origin": f"https://{host}"}, {}):
             shown = client.get("/config", headers=headers)
             assert shown.status_code == 200 and shown.json()["username"] == "mallory"
+            page = client.get("/", headers=headers)
+            assert page.status_code == 200 and '"username":"mallory"' in page.text
         cross = {"Sec-Fetch-Site": "cross-site"}
         for path in ("/logout", "/logout/"):
             assert client.get(path, headers=cross, follow_redirects=False).status_code == 403

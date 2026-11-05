@@ -107,13 +107,16 @@ class SameOriginOnly:
 
     /config（第六轮体检）带着登录的密钥名：HTTPS 下登录 cookie 是 SameSite=None，Gradio 又允许带
     凭据的跨域请求，别的网站的网页以前能读出访问者用哪个密钥登录。按前缀匹配，也管 /config/ 与
-    带查询参数的。
+    带查询参数的。界面的首页 /（第六轮复审）把同样的配置写在 HTML 里，也只接受同源与不带 Origin
+    的请求；只管正好是 / 的路径（PATHS 按前缀匹配，不能放 "/"）。在地址栏打开、点链接跳过来时
+    浏览器不带 Origin，照常。
 
     /logout 不按 Origin 判断：它是 GET，<img> 与页面跳转不带 Origin 头，查了也拦不住。浏览器带着
     Sec-Fetch-Site: cross-site 时拒绝（别的网站的网页把访问者登出）；不带这个头的（旧浏览器、
     curl）照常，hosts 里有 "*"（允许任何来源）时也照常。"""
 
     PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp", "/login", "/config")
+    INDEX = "/"
     LOGOUT = ("/logout", "/logout/")
 
     def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
@@ -121,7 +124,9 @@ class SameOriginOnly:
         self.hosts = {h.lower() for h in hosts}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"].startswith(self.PATHS):
+        if scope["type"] == "http" and (
+            scope["path"].startswith(self.PATHS) or scope["path"] == self.INDEX
+        ):
             headers = Headers(scope=scope)
             origin = headers.get("origin")
             if origin is not None and not self._allowed(origin, headers.get("host", "")):
