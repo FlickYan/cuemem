@@ -966,6 +966,11 @@ def memories_router(
                     "it continues in the background.",
                     error_type="TimeoutError",
                 )
+            # 客户端断开了（第六轮复审）：不再等，放开这个令牌同时在处理的名额（BodyLimit 在接口
+            # 返回时才放开）。以前一直等到 timeout，丢下的 wait 最多占着名额 300 秒，8 个就让这个
+            # 令牌的每个请求都 429。回的内容没人收
+            if await http.is_disconnected():
+                return cast(V1Json, Response(status_code=499))
             await anyio.sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
         return {"ok": True}
 

@@ -1138,6 +1138,65 @@ def test_waits_hold_no_thread(raised_cap: None, world: World) -> None:
     assert codes == [200] * 45, codes
 
 
+def _body_limit(app: Any) -> Any:
+    """应用的中间件栈里的 BodyLimit（建好栈之后）。"""
+    from cuemem.api.limits import BodyLimit
+
+    while not isinstance(app, BodyLimit):
+        app = app.app
+    return app
+
+
+def test_an_abandoned_wait_frees_its_slot(world: World) -> None:
+    """客户端断开（Ctrl-C、客户端的超时比服务端短）之后，POST /api/v1/wait 在 WAIT_POLL_S 秒内
+    结束、放开这个令牌的名额（第六轮复审）。以前一直等到 timeout（最多 300 秒），8 个丢下的 wait
+    就让这个令牌的每个请求都 429。"""
+    import anyio
+
+    world.http.get("/api/v1/status", params={"user_id": "alice"}, headers=bearer(ALICE_TOKEN))
+    limit = _body_limit(world.app.middleware_stack)
+    body = json.dumps({"user_id": "alice", "timeout": 30}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/v1/wait",
+        "raw_path": b"/api/v1/wait",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"authorization", f"Bearer {ALICE_TOKEN}".encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}  # 读完请求体之后客户端就走了
+
+    async def send(message: dict[str, Any]) -> None:
+        pass
+
+    async def call() -> float:
+        start = time.monotonic()
+        with anyio.fail_after(10):
+            await world.app(scope, receive, send)
+        return time.monotonic() - start
+
+    with _held(world, "alice"):
+        took = anyio.run(call)
+    assert took < 2.0, took
+    assert limit.requests_in_flight == {}
+
+
 def test_scoped_wait_times_out_with_504(world: World) -> None:
     """等不到时仍是 504（type TimeoutError），出错的文字不变；不给 ID 时限定作用域的令牌只等它能
     访问的空间：bob 的抽取卡着不影响 alice 的令牌。"""
