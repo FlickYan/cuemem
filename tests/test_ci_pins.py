@@ -148,3 +148,39 @@ def test_dependency_audit_reads_hashed_exports_and_is_not_required() -> None:
     ci_jobs = set(_workflow(PROJECT_ROOT / ".github" / "workflows" / "ci.yml")["jobs"])
     assert required == {"test", "package", "docker", "qdrant-server"} <= ci_jobs
     assert "audit" not in required and "audit" not in ci_jobs
+
+
+def test_compat_job_runs_unlocked_versions_weekly_and_is_not_required() -> None:
+    """兼容性任务（compat.yml）：锁文件之外的版本——可选依赖取最新的、取下限（lowest-direct），
+    以及锁文件在 Python 3.14 上——每周跑一次。不读 [tool.uv]（--no-config，与 pip 用户相同）；
+    pytest 写着下限（lowest-direct 下不写时解到 pytest 2.0.0，构建失败）；不用 setup-uv 的缓存
+    （缓存键不分任务，最新、最低版本的包不能流进必需的任务）；不在规则集的必需检查里。"""
+    path = PROJECT_ROOT / ".github" / "workflows" / "compat.yml"
+    workflow = _workflow(path)
+    triggers = workflow[True]  # PyYAML 把 "on" 读成 True
+    assert triggers["schedule"] and "workflow_dispatch" in triggers
+    assert {"pyproject.toml", "uv.lock"} <= set(triggers["pull_request"]["paths"])
+    [job] = workflow["jobs"].values()
+    assert job["strategy"]["fail-fast"] is False
+    cells = {cell["name"]: cell.get("resolution") for cell in job["strategy"]["matrix"]["include"]}
+    assert cells == {"newest-3.12": "highest", "floors-3.12": "lowest-direct", "locked-3.14": None}
+    [setup] = [s for s in _steps(path) if s.get("uses", "").startswith("astral-sh/setup-uv@")]
+    assert setup["with"]["enable-cache"] is False
+    commands = [
+        shlex.split(line)
+        for step in _steps(path)
+        for line in step.get("run", "").replace("\\\n", " ").splitlines()
+        if line.strip()
+    ]
+    [install] = [c for c in commands if c[:3] == ["uv", "pip", "install"]]
+    assert "--no-config" in install and "--resolution" in install, install
+    [pytest] = [Requirement(a) for a in install if a.startswith("pytest")]
+    assert any(s.operator == ">=" for s in pytest.specifier), pytest
+    assert ["uv", "sync", "--locked", "--all-extras", "--python", "3.14"] in commands
+
+    ruleset = json.loads(
+        (PROJECT_ROOT / ".github" / "rulesets" / "protect-main.json").read_text("utf-8")
+    )
+    [checks] = [r for r in ruleset["rules"] if r["type"] == "required_status_checks"]
+    required = {c["context"] for c in checks["parameters"]["required_status_checks"]}
+    assert not required & {"compat", *cells}, required

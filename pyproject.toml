@@ -6,8 +6,15 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_prompts/LICENSE"]
 requires-python = ">=3.12"
-# 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用
-classifiers = ["Typing :: Typed"]
+# 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用。锁文件、Docker
+# 镜像与发表的结果用 3.12；3.14 由 .github/workflows/compat.yml 每周跑一次（不是必需检查）
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
 keywords = ["llm", "agents", "agent-memory", "long-term-memory", "multimodal", "rag", "mcp"]
 # 核心依赖：SDK、命令行、HTTP 接口、记忆代理与 MCP。界面、评测与本机向量是可选依赖
 dependencies = [
