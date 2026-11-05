@@ -719,6 +719,14 @@ class Consolidator:
         # SDK 的 Memory.update 写下的更正（原始层的 edit_of）：由它抽出的事实取代指定的那条
         edits = self.db.get_turn_meta(space_id, [t.id for t in turns])
         corrections = {t: m.edit_of for t, m in edits.items() if m.edit_of}
+        # 按说出的先后对账（第六轮体检）：同一天里时间不同的发言（run()、LangGraph 的线程、代理
+        # 指定的会话），以前按抽取模型列出的顺序，先说的反倒取代后说的。按出处最晚一句的完整时间
+        # （不是 _said_at 那样只分到天）稳定排序；只有一个时间的会话（评测的会话都是）顺序不变
+        new_facts.sort(
+            key=lambda item: max(
+                (said_on[t] for t in item[0].source_turn_ids if t in said_on), default=ts
+            )
+        )
         rec = self.reconciler.reconcile(
             fact_state, new_facts, cache_scope=cache_scope, sources=said, corrections=corrections
         )

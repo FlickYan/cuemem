@@ -1435,3 +1435,27 @@ def test_state_is_not_reused_after_another_connection_wrote_during_the_run(
         m.add("I moved to Paris", user_id="u", run_id="s3", wait=True)
     assert len(prompts) == 2
     assert "Munich" in prompts[1] and "Berlin" not in prompts[1]
+
+
+@pytest.mark.parametrize("later", [timedelta(hours=5), timedelta(days=2)], ids=["same-day", "days"])
+def test_facts_reconcile_in_the_order_they_were_said(
+    n3_settings: Settings, fake_api: FakeAPI, later: timedelta
+) -> None:
+    """一个会话里先说住在 Berlin、几小时后说搬到 Munich，抽取模型却把 Munich 列在前面：Munich
+    是当前的、取代了 Berlin（第六轮体检）。以前同一天里的事实记录时间都是会话开始的时间，对账按
+    模型列出的顺序走，Berlin 反倒成了当前的；跨了天时以前就对，现在照样对。"""
+
+    def reversed_order(prompt: str) -> dict[str, Any]:
+        out = where_i_live(prompt)
+        out["facts"] = out["facts"][::-1]  # 模型先列后说的
+        return out
+
+    fake_api.chat_replies = [ScriptedModel(reversed_order, reconcile=moved)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        with memory.run(user_id="u", wait=True) as run_id:
+            memory.add("I live in Berlin", user_id="u", run_id=run_id, timestamp=AUG)
+            memory.add("I moved to Munich", user_id="u", run_id=run_id, timestamp=AUG + later)
+        facts = {f.object: f for f in memory.system.facts("u")}
+        assert facts.keys() == {"Berlin", "Munich"}
+        assert facts["Munich"].is_current and not facts["Berlin"].is_current
+        assert facts["Berlin"].superseded_by == facts["Munich"].id
