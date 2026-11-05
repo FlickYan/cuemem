@@ -72,7 +72,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
-from cuemem.api.auth import Keys, Principal, guard, identity_headers, principal_of
+from cuemem.api.auth import AnyKeys, Keys, Principal, guard, identity_headers, principal_of
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import MAX_BODY_BYTES
 from cuemem.config import ModelSpec, UnknownModel
@@ -1077,7 +1077,7 @@ def create_proxy_app(
     proxy: MemoryProxy,
     *,
     token: str | None = None,
-    keys: Keys | None = None,
+    keys: AnyKeys | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
     allow_ip_hosts: bool = False,

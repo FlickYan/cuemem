@@ -55,7 +55,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from cuemem.api.auth import Keys, Principal, bearer_principal
+from cuemem.api.auth import AnyKeys, Principal, bearer_principal
 from cuemem.api.memories import PREFIX, _error
 from cuemem.errors import CueMemError
 
@@ -91,7 +91,7 @@ class BodyLimit:
         *,
         max_body_bytes: int = MAX_BODY_BYTES,
         max_import_bytes: int = MAX_IMPORT_BYTES,
-        keys: Keys | None = None,
+        keys: AnyKeys | None = None,
         max_concurrent: int = MAX_CONCURRENT,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:

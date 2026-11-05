@@ -65,7 +65,7 @@ from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
 if TYPE_CHECKING:
     from cuemem.agent import Reply
-    from cuemem.api.auth import Keys
+    from cuemem.api.auth import AnyKeys, KeyRing
     from cuemem.api.service import ChatService
     from cuemem.core.models import Answer, Fact
     from cuemem.evals.datasets import EvalSet
@@ -748,16 +748,26 @@ def _exposed_names() -> list[str]:
     return [h for h in _allowed_hosts_env() if h == "*" or not _loopback_name(h)]
 
 
-def _access_keys() -> Keys:
+def _access_keys(allow_weak: bool = True) -> KeyRing:
     """访问令牌：CUEMEM_API_TOKEN 与限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS，
     见 api/auth.py）。在读完配置（数据目录的 .env 已加载）之后、打开记忆系统之前调用；写错时
-    AccessKeysError（CueMemError），由调用方打印原因。"""
-    from cuemem.api.auth import Keys
+    AccessKeysError（CueMemError），由调用方打印原因。
 
-    return Keys.from_env()
+    设了 CUEMEM_API_KEYS_FILE 时运行期间改了文件会重新读入（KeyRing，第六轮体检）；allow_weak 为
+    False（_weak_refused）时新的文件里有短令牌就不换，与启动时的检查一致。"""
+    from cuemem.api.auth import KeyRing
+
+    return KeyRing.from_env(allow_weak=allow_weak)
 
 
-def _keys_note(keys: Keys) -> str:
+def _weak_refused(host: str, insecure: bool, allow_weak: bool) -> bool:
+    """_require_token 会不会因为短令牌拒绝启动（运行期间重新读入令牌文件时也按它查）。"""
+    if insecure or allow_weak:
+        return False
+    return not _is_loopback(host) or bool(_exposed_names())
+
+
+def _keys_note(keys: AnyKeys) -> str:
     from cuemem.api.auth import TOKEN_ENV
 
     parts = [f"管理令牌（{TOKEN_ENV}）"] if keys.admin is not None else []
@@ -766,7 +776,7 @@ def _keys_note(keys: Keys) -> str:
     return "、".join(parts)
 
 
-def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = False) -> None:
+def _require_token(host: str, keys: AnyKeys, insecure: bool, allow_weak: bool = False) -> None:
     """监听非本机地址时必须设访问令牌：没有令牌时拒绝启动，除非显式加 --insecure-no-auth。
     容器里总是监听 0.0.0.0（看不出宿主机只映射到了本机），所以镜像也要设令牌。只有限定作用域的
     令牌、没有管理令牌也算设了。
@@ -799,7 +809,7 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
             "使用时也可以加 --insecure-no-auth。"
         )
         raise typer.Exit(2)
-    if keys.weak and not allow_weak:
+    if keys.weak and _weak_refused(host, insecure, allow_weak):
         console.print(
             f"[red]{where}这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
             f"{escape('、'.join(keys.weak))}。[/red]\n换成随机生成的长令牌（例如 openssl rand "
@@ -951,7 +961,7 @@ def serve(
     import uvicorn
 
     from cuemem.api.app import create_app
-    from cuemem.api.auth import Keys
+    from cuemem.api.auth import KeyRing, Keys
     from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy
 
@@ -966,12 +976,12 @@ def serve(
         )
         ui = False
     unknown = _unknown_model(unknown_model)
-    keys = Keys()
+    keys = KeyRing(Keys())
     limits = MAX_BODY_BYTES, MAX_IMPORT_BYTES
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
         nonlocal keys, limits
-        keys = _access_keys()
+        keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
         _require_token(host, keys, insecure_no_auth, insecure_weak_token)
@@ -1058,7 +1068,8 @@ def proxy(
     unknown = _unknown_model(unknown_model)
     settings = _settings(peak_policy="warn")
     try:
-        keys = _access_keys()  # load_settings 已读入 .env
+        # load_settings 已读入 .env
+        keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
     except CueMemError as exc:

@@ -6,7 +6,8 @@
 - 管理令牌：环境变量 CUEMEM_API_TOKEN（N11 起就有），不受作用域限制，包括 /api/v1/reset 删全部
   与不是由 user_id、agent_id 得来的空间（评测、手工起的名字）；
 - 限定作用域的令牌：环境变量 CUEMEM_API_KEYS_FILE 指向的 YAML 文件，或环境变量 CUEMEM_API_KEYS
-  里同样内容的 YAML / JSON 文本（只能设一个），启动时读一次：
+  里同样内容的 YAML / JSON 文本（只能设一个）。环境变量里的文本启动时读一次；文件在 cuemem
+  serve / proxy 运行期间改了会重新读入（KeyRing，第六轮体检），不用重启：
 
     keys:
       - name: alice-app               # 名字：界面登录的用户名
@@ -62,9 +63,12 @@ cuemem serve / proxy 监听非本机地址时拒绝启动（cli._require_token�
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import secrets
+import threading
+import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +84,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cuemem.errors import AccessKeysError
 from cuemem.sdk import space_for, space_owner
+
+logger = logging.getLogger(__name__)
 
 TOKEN_ENV = "CUEMEM_API_TOKEN"
 KEYS_FILE_ENV = "CUEMEM_API_KEYS_FILE"
@@ -275,6 +281,178 @@ class Keys:
         return ADMIN if self.admin is not None else None
 
 
+# KeyRing 最多隔这么多秒看一次文件有没有变（stat，单调时钟）
+RELOAD_INTERVAL_S = 1.0
+
+
+class KeyRing:
+    """会重新读入的令牌（第六轮体检）：读的接口与 Keys 相同（enabled、admin、scoped、names、
+    weak、resolve、login、by_username），交给当前的 Keys 快照。cuemem serve 与 proxy 用它：吊销、
+    新增限定作用域的令牌改 CUEMEM_API_KEYS_FILE 的文件就行，不用重启（重启时进行中的 run 只能等
+    下一个进程接手）。
+
+    path 为 None 时是静态的（没设 CUEMEM_API_KEYS_FILE：只有管理令牌，或 CUEMEM_API_KEYS 里的
+    文本），从不 stat，与直接用 Keys 完全相同。给了 path 时 current() 最多每 RELOAD_INTERVAL_S 秒
+    stat 一次文件，(st_ino, st_mtime_ns, st_size) 变了就重新读、解析，用一次赋值换上新的快照
+    （原子地改名换上的文件 inode 不同，修改时间与大小相同也看得出来）。管理令牌
+    （CUEMEM_API_TOKEN）是启动时的那个，不重新读。
+
+    下面这些时候不换，留着原来的快照，日志里记一条警告（只写令牌的名字），文件再变时再试：读不
+    出（文件不在了）、解析出错、新的一个令牌都没有而原来有（不让清空的文件关掉鉴权），以及有短于
+    MIN_TOKEN_CHARS 个字符的令牌而 allow_weak 为 False（cuemem serve / proxy 这时会拒绝启动，见
+    cli._require_token）。限速的令牌桶按令牌的名字记（api/limits.py），重新读入后照旧。
+
+    假定一个进程（uvicorn 一个 worker，cuemem serve 与 proxy 都这样启动）；不处理 SIGHUP。"""
+
+    def __init__(
+        self,
+        keys: Keys,
+        path: Path | None = None,
+        *,
+        admin_token: str | None = None,
+        allow_weak: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._keys = keys
+        self.path = path
+        self._admin_token = admin_token
+        self.allow_weak = allow_weak
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._retired: frozenset[str] = frozenset()  # 重新读入时去掉了的令牌的名字（by_username）
+        self._checked = clock()
+        self._signature = self._stat() if path is not None else None
+
+    @classmethod
+    def from_env(
+        cls, environ: Mapping[str, str] | None = None, *, allow_weak: bool = True
+    ) -> KeyRing:
+        """同 Keys.from_env；设了 CUEMEM_API_KEYS_FILE 时会重新读入那个文件。先 stat 再读：读的
+        时候文件又变了，下一次 current() 看得出来。"""
+        env = os.environ if environ is None else environ
+        path = env.get(KEYS_FILE_ENV) or None
+        if path is None:
+            return cls(Keys.from_env(env), allow_weak=allow_weak)
+        resolved = Path(path).expanduser()
+        signature = _signature(resolved)
+        ring = cls(
+            Keys.from_env(env),
+            resolved,
+            admin_token=env.get(TOKEN_ENV) or None,
+            allow_weak=allow_weak,
+        )
+        ring._signature = signature
+        return ring
+
+    def _stat(self) -> tuple[int, int, int] | None:
+        return _signature(self.path) if self.path is not None else None
+
+    def current(self) -> Keys:
+        """当前的令牌；到了时间就看一眼文件（见类的说明）。另一个线程正在看时直接用原来的。"""
+        if self.path is None or self._clock() - self._checked < RELOAD_INTERVAL_S:
+            return self._keys
+        if not self._lock.acquire(blocking=False):
+            return self._keys
+        try:
+            self._checked = self._clock()
+            signature = self._stat()
+            if signature != self._signature:
+                self._signature = signature
+                self._reload(signature is not None)
+        finally:
+            self._lock.release()
+        return self._keys
+
+    def _reload(self, exists: bool) -> None:
+        old, where = self._keys, f"{KEYS_FILE_ENV}={self.path}"
+        keep = "，仍用原来的令牌"
+        if not exists:
+            logger.warning("%s 不在了%s", where, keep)
+            return
+        assert self.path is not None
+        try:
+            new = Keys.parse(
+                self.path.read_text(encoding="utf-8"), self._admin_token, source=str(self.path)
+            )
+        except OSError as exc:
+            logger.warning("读不出 %s：%s%s", where, exc.strerror or type(exc).__name__, keep)
+            return
+        except AccessKeysError as exc:  # 出错信息里不带令牌本身（Keys.parse）
+            logger.warning("%s 重新读入失败：%s%s", where, exc, keep)
+            return
+        if old.enabled and not new.enabled:
+            logger.warning("%s 里一个令牌都没有了：不会因此关掉鉴权%s", where, keep)
+            return
+        if new.weak and not self.allow_weak:
+            logger.warning(
+                "%s 里这些令牌短于 %d 个字符：%s%s",
+                where,
+                MIN_TOKEN_CHARS,
+                "、".join(new.weak),
+                keep,
+            )
+            return
+        gone = [n for n in old.names if n not in new.names]
+        self._retired = (self._retired | set(gone)) - set(new.names)
+        self._keys = new  # 一次赋值：别的线程拿到的不是旧的就是新的
+        added = [n for n in new.names if n not in old.names]
+        logger.warning(
+            "已重新读入 %s：%d 个限定作用域的令牌（新增：%s；去掉：%s）",
+            where,
+            len(new.names),
+            "、".join(added) or "无",
+            "、".join(gone) or "无",
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.current().enabled
+
+    @property
+    def admin(self) -> bytes | None:
+        return self.current().admin
+
+    @property
+    def scoped(self) -> tuple[tuple[bytes, Principal], ...]:
+        return self.current().scoped
+
+    @property
+    def names(self) -> list[str]:
+        return self.current().names
+
+    @property
+    def weak(self) -> tuple[str, ...]:
+        return self.current().weak
+
+    def resolve(self, token: str) -> Principal | None:
+        return self.current().resolve(token)
+
+    def login(self, username: str, password: str) -> bool:
+        return self.current().login(username, password)
+
+    def by_username(self, username: str | None) -> Principal | None:
+        """同 Keys.by_username，只是去掉了的令牌的名字不再算任何令牌：界面里用它登录、还没退出的
+        人不能接着用（Keys.by_username 会把不认识的用户名当成用管理令牌登录的）。管理令牌登录时
+        也不能用这些名字做用户名。"""
+        keys = self.current()
+        if username is not None and username in self._retired and keys.enabled:
+            return None
+        return keys.by_username(username)
+
+
+def _signature(path: Path) -> tuple[int, int, int] | None:
+    """文件的 (st_ino, st_mtime_ns, st_size)；不在、读不出时 None。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_size
+
+
+# 认令牌的函数都收这两种（KeyRing 读的接口与 Keys 相同）
+AnyKeys = Keys | KeyRing
+
+
 class _ScopeIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -357,7 +535,7 @@ def _patterns(value: str | list[str] | None, where: str) -> tuple[str, ...] | No
 UNAUTHORIZED = "缺少或错误的访问令牌"
 
 
-def bearer_principal(keys: Keys, authorization: str | None) -> Principal | None:
+def bearer_principal(keys: AnyKeys, authorization: str | None) -> Principal | None:
     """Authorization 头（与 HTTPBearer 一样解析）→ Principal；令牌不对时 None。没有配任何令牌时
     不鉴权，按管理令牌算。authenticate 与 /mcp（api/mcp.py）共用。"""
     if not keys.enabled:
@@ -422,7 +600,7 @@ def identity_headers(headers: Mapping[str, str]) -> tuple[str | None, str | None
     return ids[0], ids[1]
 
 
-def authenticate(keys: Keys, request: Request) -> Principal:
+def authenticate(keys: AnyKeys, request: Request) -> Principal:
     """认出 Bearer 令牌（bearer_principal），记在 request.state.principal 上（principal_of
     读它）。令牌不对时 401。"""
     principal = bearer_principal(keys, request.headers.get("Authorization"))
@@ -432,7 +610,7 @@ def authenticate(keys: Keys, request: Request) -> Principal:
     return principal
 
 
-def guard(keys: Keys) -> list[Any]:
+def guard(keys: AnyKeys) -> list[Any]:
     """路由的依赖：authenticate。FastAPI 先读完、解析完请求体才执行依赖，所以带请求体的路由还要
     用 authenticated_route 做路由类（令牌不对时不读请求体）；这个依赖照样挂着，OpenAPI 的安全
     方案（/docs 的 Authorize）由它的 HTTPBearer 而来。"""
@@ -446,7 +624,7 @@ def guard(keys: Keys) -> list[Any]:
     return [Depends(check)]
 
 
-def authenticated_route(keys: Keys) -> type[APIRoute]:
+def authenticated_route(keys: AnyKeys) -> type[APIRoute]:
     """路由类：先 authenticate，再交给 FastAPI 读请求体、解析参数、执行依赖。以前令牌只由 guard
     检查，而 FastAPI 在执行依赖之前就把请求体读完、解析完：不带令牌的请求也能让服务器解析任意大的
     JSON（内存是请求体的二十多倍），表单里的文件先写进临时文件，写坏的 JSON 回 422 而不是 401。
@@ -473,6 +651,6 @@ def principal_of(request: Request) -> Principal:
     return principal
 
 
-def ui_login(keys: Keys) -> Callable[[str, str], bool] | None:
+def ui_login(keys: AnyKeys) -> Callable[[str, str], bool] | None:
     """界面（Gradio）的登录检查；没有配令牌时 None（不登录）。"""
     return keys.login if keys.enabled else None

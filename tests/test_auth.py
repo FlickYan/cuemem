@@ -10,6 +10,7 @@ import functools
 import hashlib
 import io
 import json
+import os
 import re
 import threading
 import time
@@ -1457,3 +1458,191 @@ def test_ui_starts_a_new_session_after_an_idle_end(
         assert [t.session_id for t in system.db.get_turns("alice")] == [sid, sid]
     finally:
         service.close()
+
+
+# ---------- 重新读入令牌文件（KeyRing，第六轮体检） ----------
+
+
+B_TOKEN = "bob-token-0123456789"
+RING_KEYS = f"""# 运营者的注释
+keys:
+  - name: alice-app
+    sha256: "{_sha256(ALICE_TOKEN)}"
+    scopes:
+      - user: alice
+  - name: bob-app   # B
+    sha256: "{_sha256(B_TOKEN)}"
+    scopes:
+      - user: bob
+"""
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _replace(path: Path, text: str) -> None:
+    """与 cuemem keys 一样换名替换（inode 变了）。"""
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+Ring = tuple[TestClient, Path, FakeClock, Any]  # 最后一项是 auth.KeyRing
+
+
+@pytest.fixture
+def ring_app(n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path) -> Iterator[Ring]:
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="shop-demo")
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, keys=ring)
+    try:
+        with TestClient(app) as http:
+            yield http, path, clock, ring
+    finally:
+        service.close()
+
+
+def _status(http: TestClient, token: str | None) -> int:
+    return http.get("/api/spaces", headers=bearer(token) if token else {}).status_code
+
+
+def test_revoked_key_rejected_without_restart(ring_app: Ring) -> None:
+    """改了 CUEMEM_API_KEYS_FILE 的文件：运行中的服务一秒内按新的文件认令牌，不用重启（以前只在
+    启动时读一次，吊销泄露的令牌要重启，进行中的 run 只能等下一个进程接手）。一秒之内不看文件。"""
+    http, path, clock, _ = ring_app
+    assert _status(http, ALICE_TOKEN) == 200 and _status(http, B_TOKEN) == 200
+    _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+    clock.now += 0.5
+    assert _status(http, B_TOKEN) == 200  # 还不到一秒：不 stat
+    clock.now += 0.6
+    assert _status(http, B_TOKEN) == 401 and _status(http, ALICE_TOKEN) == 200
+    assert _status(http, None) == 401
+
+
+def test_reload_notices_a_rename_with_the_same_mtime_and_size(tmp_path: Path) -> None:
+    """换名替换的文件修改时间与大小都相同时也看得出来（签名里有 inode）。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    st = path.stat()
+    tmp = tmp_path / "keys.new"
+    tmp.write_text(RING_KEYS.replace("bob-app", "bob-xyz"), encoding="utf-8")
+    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.replace(tmp, path)
+    assert path.stat().st_size == st.st_size and path.stat().st_mtime_ns == st.st_mtime_ns
+    clock.now += 2
+    assert ring.names == ["alice-app", "bob-xyz"]
+
+
+def test_reload_parse_error_keeps_old_keys(
+    ring_app: Ring, caplog: pytest.LogCaptureFixture
+) -> None:
+    """新的文件写错了（或不在了）：留着原来的令牌，日志里记一条警告（不带令牌本身）；改好之后
+    照常换上。"""
+    http, path, clock, ring = ring_app
+    secret = "s3cr3t-value-0123456789"
+    _replace(path, RING_KEYS + f"  - {{name: c, token: [{secret}], scopes: [{{user: c}}]}}\n")
+    clock.now += 2
+    with caplog.at_level("WARNING", logger="cuemem.api.auth"):
+        assert _status(http, B_TOKEN) == 200 and _status(http, ALICE_TOKEN) == 200
+        assert "重新读入失败" in caplog.text and secret not in caplog.text
+        path.unlink()
+        clock.now += 2
+        assert _status(http, B_TOKEN) == 200 and "不在了" in caplog.text
+    path.write_text(RING_KEYS.replace("bob-app", "bob-2"), encoding="utf-8")
+    clock.now += 2
+    assert _status(http, B_TOKEN) == 200 and ring.names == ["alice-app", "bob-2"]
+
+
+@pytest.mark.parametrize("emptied", ["keys: []\n", "# 全删了\nkeys: []\n"])
+def test_reload_to_empty_file_does_not_disable_auth(
+    ring_app: Ring, caplog: pytest.LogCaptureFixture, emptied: str
+) -> None:
+    """新的文件一个令牌都没有、又没有管理令牌：不换（换上就是不鉴权，谁都能进来）。有管理令牌
+    时照常换上（仍然鉴权）。"""
+    http, path, clock, ring = ring_app
+    with caplog.at_level("WARNING", logger="cuemem.api.auth"):
+        _replace(path, emptied)
+        clock.now += 2
+        assert _status(http, None) == 401 and _status(http, B_TOKEN) == 200
+    assert ring.enabled and "一个令牌都没有" in caplog.text
+    with_admin = auth.KeyRing(
+        Keys.parse(RING_KEYS, ADMIN_TOKEN), path, admin_token=ADMIN_TOKEN, clock=clock
+    )
+    _replace(path, emptied + "\n")
+    clock.now += 2
+    assert with_admin.names == [] and with_admin.resolve(ADMIN_TOKEN) == ADMIN
+
+
+def test_revoked_key_name_does_not_fall_back_to_admin_in_the_ui(tmp_path: Path) -> None:
+    """界面里用吊销了的令牌登录、还没退出的人：用户名不再是哪个令牌的名字，Keys.by_username 会
+    把它当成用管理令牌登录的（ADMIN）。KeyRing 记着去掉了的名字，这时不给任何权限。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(
+        Keys.parse(RING_KEYS, ADMIN_TOKEN), path, admin_token=ADMIN_TOKEN, clock=clock
+    )
+    bob = ring.by_username("bob-app")
+    assert bob is not None and bob.name == "bob-app"
+    _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+    clock.now += 2
+    assert ring.by_username("bob-app") is None and not ring.login("bob-app", B_TOKEN)
+    assert ring.by_username("anyone") == ADMIN and ring.login("anyone", ADMIN_TOKEN)
+    _replace(path, RING_KEYS)  # 又加回来：照常
+    clock.now += 2
+    assert ring.by_username("bob-app") == bob
+
+
+def test_reload_refuses_weak_tokens_when_startup_would(tmp_path: Path) -> None:
+    """cuemem serve / proxy 启动时因为短令牌拒绝的情形（allow_weak=False），重新读入时也不换。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    strict = auth.KeyRing(Keys.parse(RING_KEYS), path, allow_weak=False, clock=clock)
+    loose = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    _replace(path, RING_KEYS + "  - {name: short, token: abc, scopes: [{user: c}]}\n")
+    clock.now += 2
+    assert "short" not in strict.names and loose.names[-1] == "short"
+
+
+def test_static_ring_never_looks_at_a_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """没设 CUEMEM_API_KEYS_FILE：与直接用 Keys 一样，不 stat。"""
+    ring = auth.KeyRing.from_env({"CUEMEM_API_TOKEN": ADMIN_TOKEN, "CUEMEM_API_KEYS": KEYS})
+    monkeypatch.setattr(auth, "_signature", lambda path: pytest.fail("stat"))
+    monkeypatch.setattr(auth, "RELOAD_INTERVAL_S", 0.0)
+    assert ring.path is None and ring.current() == Keys.parse(KEYS, ADMIN_TOKEN)
+    assert ring.resolve(ADMIN_TOKEN) == ADMIN and ring.names == Keys.parse(KEYS).names
+
+
+def test_rate_bucket_survives_reload(tmp_path: Path) -> None:
+    """限速的令牌桶按令牌的名字记：重新读入文件之后不重新装满。"""
+    from starlette.responses import PlainTextResponse
+
+    from cuemem.api.limits import BodyLimit
+
+    limited = RING_KEYS.replace(
+        "      - user: bob\n", "      - user: bob\n    rate_per_minute: 2\n"
+    )
+    path = tmp_path / "keys.yaml"
+    path.write_text(limited, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(limited), path, clock=clock)
+    http = TestClient(BodyLimit(PlainTextResponse("ok"), keys=ring, clock=clock))
+    codes = [http.post("/api/x", headers=bearer(B_TOKEN)).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+    before = ring.current()
+    _replace(path, limited.replace("# 运营者的注释", "# 改过的注释"))
+    clock.now += 1.5  # 重新读入；令牌桶只补回 0.05 个
+    assert http.post("/api/x", headers=bearer(B_TOKEN)).status_code == 429
+    assert ring.current() is not before  # 确实换上了新的快照

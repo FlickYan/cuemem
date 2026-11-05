@@ -53,7 +53,15 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
-from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of, ui_login
+from cuemem.api.auth import (
+    AnyKeys,
+    Keys,
+    Principal,
+    authenticated_route,
+    guard,
+    principal_of,
+    ui_login,
+)
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import (
     MAX_BODY_BYTES,
@@ -218,7 +226,7 @@ def _guard(
     *,
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
-    keys: Keys | None = None,
+    keys: AnyKeys | None = None,
     allow_ip_hosts: bool = False,
 ) -> None:
     """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
@@ -378,7 +386,7 @@ def create_app(
     upload_dir: Path,
     ui: bool = True,
     token: str | None = None,
-    keys: Keys | None = None,
+    keys: AnyKeys | None = None,
     proxy: MemoryProxy | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
@@ -692,7 +700,7 @@ def create_app(
     return app
 
 
-def _serve_mcp(app: FastAPI, service: ChatService, keys: Keys) -> None:
+def _serve_mcp(app: FastAPI, service: ChatService, keys: AnyKeys) -> None:
     """/mcp：McpEndpoint 挂成一个路由，它的会话管理器接在应用的 lifespan 上（Gradio 挂载时
     接着套在外面）。不用 app.mount：挂载的子应用的 lifespan 不运行（每个请求 500），/mcp 还
     被 307 重定向到 /mcp/。MCP 的 SDK 在这里才导入（cuemem serve 的启动不多加载它）。"""

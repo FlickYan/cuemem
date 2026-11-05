@@ -36,7 +36,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
-from cuemem.api.auth import UNAUTHORIZED, Keys, bearer_principal, identity_headers
+from cuemem.api.auth import UNAUTHORIZED, AnyKeys, bearer_principal, identity_headers
 from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
 from cuemem.evidence import forget_summary, format_listing
@@ -109,7 +109,7 @@ class McpEndpoint:
     端口的 Host 都是 421。是 ASGI 的可调用对象（不是函数）：Starlette 把普通函数当成请求处理函数。
     """
 
-    def __init__(self, service: ChatService, keys: Keys) -> None:
+    def __init__(self, service: ChatService, keys: AnyKeys) -> None:
         self.server = build_server(service)
         self.keys = keys
         self._manager: StreamableHTTPSessionManager | None = None
