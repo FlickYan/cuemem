@@ -1663,6 +1663,50 @@ def test_revoked_key_name_does_not_fall_back_to_admin_in_the_ui(tmp_path: Path) 
     assert ring.by_username("bob-app") == bob
 
 
+@pytest.mark.parametrize("how", ["rotate", "revoke-then-add"])
+def test_rotating_a_key_signs_out_its_ui_sessions(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, how: str
+) -> None:
+    """令牌换了（同名改 sha256，或 cuemem keys revoke 之后又 keys add 回来）：用旧令牌在界面里
+    登录的会话退出（第六轮复审）。以前 Gradio 记着 cookie → 用户名，by_username 只按名字找令牌，
+    泄露的旧令牌在 /api 上 401、在界面里照旧有 bob 的作用域，直到重启。别的令牌的会话照常。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="shop-demo")
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=True, keys=ring)
+    new_token = "bob-token-rotated-0123456789"
+    rotated = RING_KEYS.replace(_sha256(B_TOKEN), _sha256(new_token))
+    try:
+        with TestClient(app) as attacker, TestClient(app) as alice:
+            for http, name, token in (
+                (attacker, "bob-app", B_TOKEN),
+                (alice, "alice-app", ALICE_TOKEN),
+            ):
+                assert http.post("/login", data={"username": name, "password": token}).is_success
+                assert http.get("/config").json()["username"] == name
+            if how == "revoke-then-add":
+                _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+                clock.now += 2
+                assert _status(attacker, B_TOKEN) == 401
+            _replace(path, rotated)
+            clock.now += 2
+            assert _status(attacker, B_TOKEN) == 401
+            assert attacker.get("/config").json().get("username") != "bob-app"
+            assert alice.get("/config").json()["username"] == "alice-app"
+            assert not attacker.post(
+                "/login", data={"username": "bob-app", "password": B_TOKEN}
+            ).is_success
+            assert attacker.post(
+                "/login", data={"username": "bob-app", "password": new_token}
+            ).is_success
+            assert attacker.get("/config").json()["username"] == "bob-app"
+    finally:
+        service.close()
+
+
 def test_reload_refuses_weak_tokens_when_startup_would(tmp_path: Path) -> None:
     """cuemem serve / proxy 启动时因为短令牌拒绝的情形（allow_weak=False），重新读入时也不换。"""
     path = tmp_path / "keys.yaml"

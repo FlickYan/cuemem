@@ -55,6 +55,7 @@ from cuemem import __version__
 from cuemem.agent import Reply
 from cuemem.api.auth import (
     AnyKeys,
+    KeyRing,
     Keys,
     Principal,
     authenticated_route,
@@ -692,6 +693,8 @@ def create_app(
         # Gradio 都在事件函数之前把它复制进缓存，再经 /gradio_api/file= 交出去。不在 ui.py 的事件
         # 函数里查：它拿到的已经是缓存里的副本，聊天记录这个输入也不经过它
         demo.has_launched = True
+        if isinstance(keys, KeyRing):
+            keys.on_rotate(_ui_sign_out(app, demo))
     # 中间件：落到界面的预检请求也先过这里；请求体的上限也管界面的登录与事件接口
     _guard(
         app,
@@ -703,6 +706,29 @@ def create_app(
         allow_ip_hosts=allow_ip_hosts,
     )
     return app
+
+
+def _ui_sign_out(app: FastAPI, demo: Any) -> Callable[[frozenset[str]], None]:
+    """KeyRing.on_rotate 的回调：令牌换了或去掉了的名字在界面里的登录全部退出（第六轮复审）。
+    Gradio 在挂载的子应用的 tokens 里记着 cookie → 用户名，删掉之后这些 cookie 回到登录页。
+    以前换了令牌（同名改 sha256，或 revoke 之后又 add 回来）时，用旧令牌登录的界面会话照旧能用
+    这个名字的令牌的作用域，直到重启。"""
+    from starlette.routing import Mount
+
+    mounted: list[Any] = [  # gradio.routes.App
+        r.app
+        for r in app.routes
+        if isinstance(r, Mount) and getattr(r.app, "get_blocks", lambda: None)() is demo
+    ]
+    (ui,) = mounted
+    tokens: dict[str, str] = ui.tokens
+
+    def sign_out(names: frozenset[str]) -> None:
+        for token, user in list(tokens.items()):  # 事件循环里同时在读：只逐个删
+            if user in names:
+                tokens.pop(token, None)
+
+    return sign_out
 
 
 def _serve_mcp(app: FastAPI, service: ChatService, keys: AnyKeys) -> None:

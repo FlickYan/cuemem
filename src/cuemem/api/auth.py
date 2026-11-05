@@ -304,7 +304,12 @@ class KeyRing:
     MIN_TOKEN_CHARS 个字符的令牌而 allow_weak 为 False（cuemem serve / proxy 这时会拒绝启动，见
     cli._require_token）。限速的令牌桶按令牌的名字记（api/limits.py），重新读入后照旧。
 
-    假定一个进程（uvicorn 一个 worker，cuemem serve 与 proxy 都这样启动）；不处理 SIGHUP。"""
+    假定一个进程（uvicorn 一个 worker，cuemem serve 与 proxy 都这样启动）；不处理 SIGHUP。
+
+    换上新的快照时，令牌换了（同一个名字的 sha256 变了）或去掉了的名字交给 on_rotate 登记的
+    回调（第六轮复审）：挂着界面时 create_app 用它把这些名字在界面里的登录退出（Gradio 在内存里
+    记着 cookie → 用户名，by_username 只按名字找令牌）。以前同名换了令牌、或 cuemem keys revoke
+    之后又 keys add 回来，用泄露的旧令牌登录的界面会话照旧能用这个令牌的作用域。"""
 
     def __init__(
         self,
@@ -322,6 +327,7 @@ class KeyRing:
         self._clock = clock
         self._lock = threading.Lock()
         self._retired: frozenset[str] = frozenset()  # 重新读入时去掉了的令牌的名字（by_username）
+        self._on_rotate: list[Callable[[frozenset[str]], None]] = []
         self._checked = clock()
         self._signature = self._stat() if path is not None else None
 
@@ -348,6 +354,12 @@ class KeyRing:
 
     def _stat(self) -> tuple[int, int, int] | None:
         return _signature(self.path) if self.path is not None else None
+
+    def on_rotate(self, callback: Callable[[frozenset[str]], None]) -> None:
+        """换上新的快照之后调用 callback(名字)：令牌换了或去掉了的限定作用域的令牌的名字（有
+        这样的名字时才调用）。在重新读入的那个线程里调用，拿着重新读入的锁：不能再调用 current()
+        等会重新读入的方法。"""
+        self._on_rotate.append(callback)
 
     def current(self) -> Keys:
         """当前的令牌；到了时间就看一眼文件（见类的说明）。另一个线程正在看时直接用原来的。"""
@@ -397,6 +409,11 @@ class KeyRing:
         gone = [n for n in old.names if n not in new.names]
         self._retired = (self._retired | set(gone)) - set(new.names)
         self._keys = new  # 一次赋值：别的线程拿到的不是旧的就是新的
+        digests = {p.name: digest for digest, p in new.scoped}
+        rotated = frozenset(p.name for digest, p in old.scoped if digests.get(p.name) != digest)
+        if rotated:
+            for callback in self._on_rotate:
+                callback(rotated)
         added = [n for n in new.names if n not in old.names]
         logger.warning(
             "已重新读入 %s：%d 个限定作用域的令牌（新增：%s；去掉：%s）",
