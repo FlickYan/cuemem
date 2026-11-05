@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import gradio as gr
 import httpx2
 import pytest
 from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
@@ -32,7 +33,7 @@ from cuemem.api.mcp import build_server
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.replay import DemoScript, check, replay
 from cuemem.api.service import ChatService
-from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
+from cuemem.api.ui import _assistant, _profile_markdown, build_ui, render_graph, render_trace
 from cuemem.config import Settings
 from cuemem.errors import ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem, _open_mark
@@ -1442,6 +1443,26 @@ def test_citations_render_as_superscripts(service: ChatService, model: ScriptedM
     assert _assistant(reply)[0] == 'Your budget is $180<sup class="cite">f1, m2</sup>.'
     reply.text = "From $120 [f1][m2] to $180."
     assert _assistant(reply)[0] == 'From $120<sup class="cite">f1, m2</sup> to $180.'
+
+
+def test_replies_and_the_profile_render_no_remote_images(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """回答与画像按 Markdown 显示：记忆里存下的话能诱导模型写出外站图片，浏览器一显示就把
+    记忆内容带到第三方。图片语法（行内、引用式）与画像里的 <img> 都只显示成文字。"""
+    model.agent = lambda body: (
+        "See ![a](https://x.example/p.png?d=1) and ![b][r] Great![f1]\n\n[r]: https://x.example/q"
+    )
+    session = service.start("shop", at=DAY)
+    reply = service.chat(session.session_id, "budget?", mode="l0")
+    reply.citations = ["f1"]
+    rendered = _assistant(reply)[0]
+    assert "![" not in rendered and "See" in rendered and "x.example/p.png" in rendered
+    assert 'Great!<sup class="cite">f1</sup>' in rendered  # "!" 后面的引用照样是上标
+    assert "![" not in _profile_markdown("![x](https://x.example/q?u=alice)")
+    assert "<img" not in _profile_markdown('<img src="https://x.example/q">')
+    shown = gr.Markdown().postprocess(_profile_markdown("- likes tea ![x](https://x.example/q)"))
+    assert shown is not None and "![" not in str(shown)
 
 
 def test_replay_checks_expectations(
