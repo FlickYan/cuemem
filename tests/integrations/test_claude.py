@@ -1108,6 +1108,7 @@ def test_history_stays_append_only_across_turns(tool: CueMemMemoryTool, memory: 
         max_retries=0,
     )
     history: list[Any] = []
+    sent: list[Any] = []  # 每个请求的回复（与 requests 一一对应）
     for text in ("Hi, it's me again.", "Where do I live?"):
         user = {"role": "user", "content": text}
         history, evidence = with_recall([*history, user], memory, user_id="alice", mode="l1")
@@ -1116,11 +1117,32 @@ def test_history_stays_append_only_across_turns(tool: CueMemMemoryTool, memory: 
             model="test-model", max_tokens=1024, tools=[tool], messages=history
         )
         for reply in runner:
+            sent.append(reply.to_param())
             history.append(reply.to_param())
             response = runner.generate_tool_call_response()
             if response is not None:
                 history.append(response)
-    first, last = requests[1]["messages"], requests[2]["messages"]
+    # anthropic 2.3 起 tool_runner 默认用服务端保存的会话（thread）：同一轮里接着发的请求只带
+    # 新消息（thread.type == "continue"），模型看到的是服务端存着的前文加上它们。按这个还原出
+    # 模型每次看到的完整历史再比；更早的版本每次都发完整历史，还原结果就是请求本身
+    seen: list[list[Any]] = []
+    for index, request in enumerate(requests):
+        thread = request.get("thread") or {}
+        if thread.get("type") == "continue":
+            # 2.3 的 to_param() 里内容块还是模型对象：按发出去的样子（省掉 None 字段）转成字典
+            reply = {
+                **sent[index - 1],
+                "content": [
+                    block.model_dump(mode="json", exclude_none=True)
+                    if hasattr(block, "model_dump")
+                    else block
+                    for block in sent[index - 1]["content"]
+                ],
+            }
+            seen.append([*seen[-1], reply, *request["messages"]])
+        else:
+            seen.append(request["messages"])
+    first, last = seen[1], seen[2]
     assert last[: len(first)] == first  # 前缀不变
     assert first[0]["content"].startswith("<memory>")  # 第一轮的证据还在原处
     assert last[len(first)]["content"][0]["text"] == "Welcome back!"
