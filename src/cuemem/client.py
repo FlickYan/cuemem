@@ -503,7 +503,8 @@ class MemoryClient:
 
 class AsyncMemoryClient(AsyncMethods):
     """MemoryClient 的异步版本（与 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
-    （cuemem/_async.py）。self.sync 是包着的 MemoryClient；别的属性（.base_url）取它的。"""
+    （cuemem/_async.py）。self.sync 是包着的 MemoryClient；别的属性（.base_url）取它的。
+    取消一次调用停不下已经发出的请求，见 AsyncMethods。"""
 
     sync: MemoryClient
 

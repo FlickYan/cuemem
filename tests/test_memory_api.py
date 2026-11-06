@@ -14,6 +14,7 @@ import json
 import math
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta, timezone
@@ -1845,3 +1846,26 @@ def test_v1_explains_provider_errors(
         # 换成 MemoryClient 就不退避了
         assert (remote.value.status, remote.value.retry_after) == (429, "3")
         assert (local.value.status, local.value.retry_after) == (429, "3")
+
+
+def test_cancelling_an_async_call_does_not_stop_it() -> None:
+    """第七轮体检 P19（AsyncMethods 的说明）：asyncio.wait_for 超时只停下 await，请求照样在
+    线程池里发出、执行到返回，被取消的 add 照样可能生效；所以要传 idempotency_key 再试。"""
+    seen: list[str | None] = []
+    release = threading.Event()
+
+    def slow(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request.headers.get("Idempotency-Key"))
+        release.wait(10)
+        return httpx2.Response(503)
+
+    async def run() -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.add("hi", user_id="u", idempotency_key="k"), 0.05)
+        release.set()
+        await asyncio.to_thread(lambda: None)  # 默认线程池还在，取消的调用不报错
+
+    with httpx2.Client(transport=httpx2.MockTransport(slow)) as http:
+        client = AsyncMemoryClient("http://127.0.0.1:9", http_client=http)
+        asyncio.run(run())
+    assert seen == ["k"]

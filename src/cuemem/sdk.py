@@ -1191,7 +1191,8 @@ class Memory:
 
 class AsyncMemory(AsyncMethods):
     """Memory 的异步版本（与 Mem0 的 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
-    （cuemem/_async.py）。self.sync 是包着的 Memory；别的属性（.system、.settings）取它的。"""
+    （cuemem/_async.py）。self.sync 是包着的 Memory；别的属性（.system、.settings）取它的。
+    取消一次调用停不下它，被取消的写入照样可能生效，见 AsyncMethods。"""
 
     sync: Memory
 

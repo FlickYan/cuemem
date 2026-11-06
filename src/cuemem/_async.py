@@ -25,7 +25,13 @@ if TYPE_CHECKING:  # 只用于类型注解
 
 
 class AsyncMethods:
-    """异步方法的公共部分；子类在 __init__ 里设置 self.sync。"""
+    """异步方法的公共部分；子类在 __init__ 里设置 self.sync。
+
+    取消（task.cancel()、asyncio.wait_for、asyncio.timeout）只停下 await，停不下调用本身：
+    同步方法在事件循环默认的线程池里接着执行到返回，一直占着其中一个线程。所以取消了的 add、
+    update、delete、forget 照样可能生效（第七轮体检 P19）。要限定一次调用最长多久，用
+    MemoryClient / AsyncMemoryClient 的 timeout= 与 wait(timeout=...)，不用 wait_for；add 传
+    idempotency_key，取消或超时之后用同一个键再调一次，服务端或本地只写一次（D-073）。"""
 
     sync: Memory | MemoryClient
 
