@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import logging
+import math
 import shutil
 import threading
 import time
@@ -336,6 +337,10 @@ AllowedSpace = Annotated[str, Depends(_allowed_space)]
 
 
 SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话与过期的 trace（见 _sweep_jobs）
+# 清理线程多久收拾一次媒体库里被杀掉的操作留下的原图（见 MemorySystem.recover_media）：写标记的
+# 进程在别的主机、或者进程号被复用时，标记要过 store.media.RECOVER_AFTER_S 才算数，启动时那一遍
+# 收拾不到
+RECOVER_MEDIA_INTERVAL_S = 3600.0
 
 
 def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]) -> None:
@@ -353,16 +358,36 @@ def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]
 
 
 def _sweep_jobs(system: MemorySystem, *idle: Callable[[], object]) -> list[Callable[[], object]]:
-    """清理线程要做的事：结束闲置的会话（idle），设了 traces_retention_days 时再加上删过期的
-    trace（启动时与之后每天一次，见 MemorySystem.expire_traces），设了 expired_retention_days 时
-    再加上删过期的记忆（同样每天一次，见 MemorySystem.expire_memories）。cuemem serve 与
-    cuemem proxy 共用。"""
+    """清理线程要做的事：结束闲置的会话（idle），收拾被杀掉的写入与遗忘留在媒体库里的原图
+    （启动时与之后每小时一次，见 MemorySystem.recover_media），设了 traces_retention_days 时再
+    加上删过期的 trace（启动时与之后每天一次，见 MemorySystem.expire_traces），设了
+    expired_retention_days 时再加上删过期的记忆（同样每天一次，见 MemorySystem.expire_memories）。
+    cuemem serve 与 cuemem proxy 共用。"""
     jobs = list(idle)
+    if system.media is not None and system.media.owner is not None:  # 写标记的媒体库
+        jobs.append(_every(RECOVER_MEDIA_INTERVAL_S, system.recover_media))
     if system.settings.traces_retention_days is not None:
         jobs.append(system.expire_traces)
     if system.settings.expired_retention_days is not None:
         jobs.append(system.expire_memories)
     return jobs
+
+
+def _every(
+    interval_s: float, job: Callable[[], object], clock: Callable[[], float] = time.monotonic
+) -> Callable[[], None]:
+    """清理线程的一项：第一遍就做，之后隔 interval_s 秒以上才再做（清理线程每分钟一遍）。"""
+    due = -math.inf
+
+    def run() -> None:
+        nonlocal due
+        now = clock()
+        if now < due:
+            return
+        due = now + interval_s  # 出错时同样等到下一次，不每分钟重试
+        job()
+
+    return run
 
 
 def _adopt_after(

@@ -220,8 +220,9 @@ def test_idle_chat_sessions_are_ended(service: ChatService, tmp_path: Path) -> N
 
 
 def test_the_app_sweeps_idle_sessions_while_it_runs(service: ChatService, tmp_path: Path) -> None:
-    """create_app 的清理线程只在应用运行期间（lifespan）跑，idle_minutes=None 时不起；一项出错不影响
-    别的，线程也不退出。"""
+    """create_app 的清理线程只在应用运行期间（lifespan）跑；idle_minutes=None 时不结束会话，但还是
+    要起：收拾媒体库里被杀掉的操作留下的原图（第七轮体检 P8），媒体库不写标记时才不起。一项出错
+    不影响别的，线程也不退出。"""
 
     def sweepers() -> int:
         return sum(t.name == "cuemem-api-sweep" for t in threading.enumerate())
@@ -232,7 +233,12 @@ def test_the_app_sweeps_idle_sessions_while_it_runs(service: ChatService, tmp_pa
     assert sweepers() == before
     service.idle_minutes = None
     with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)):
-        assert sweepers() == before and service.idle_minutes is None
+        assert sweepers() == before + 1 and service.idle_minutes is None
+    assert service.system.media is not None
+    owner, service.system.media.owner = service.system.media.owner, None
+    with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)):
+        assert sweepers() == before
+    service.system.media.owner = owner
 
     calls: list[str] = []
     stop = threading.Event()

@@ -499,7 +499,9 @@ class MemorySystem:
             tracer=TraceSink(paths.traces),
             owns_caches=True,
             reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
-            media=MediaStore(paths.media),
+            # 写入与遗忘在媒体库里留标记（见 store/media.py）：进程被杀时 recover_media 收拾原图。
+            # 评测空间（ephemeral、on_disk）不写：它们的图片记录不在这个数据库里
+            media=MediaStore(paths.media, owner=str(paths.db.absolute())),
             image_embedder=build_image_embedder(
                 settings, ledger=ledger, http_client=http_client, cache=cache
             ),
@@ -1067,6 +1069,17 @@ class MemorySystem:
                 llm_purged = sum(cache.delete_scope(scope(space_id, p)) for p in parts)
                 if not fast:  # 快速路径不重放：对账与消歧的条目都还是剩下的日志算得出来的
                     cache.hold(held)
+            # 要删的原图先记下标记（第七轮体检）：提交之后、删原图之前进程被杀掉时，之后的
+            # recover_media 按它删掉；不然记录没了，再也找不到这个文件
+            marks: list[Path] = []
+            if self.media is not None and doomed_media:
+                try:
+                    marks = self.media.mark_deleting((m.sha256, Path(m.path)) for m in doomed_media)
+                except BaseException:  # 写不了标记（磁盘满）：什么都没删，标记的缓存条目原样留下
+                    if cache is not None and not fast:
+                        cache.release(held)
+                    raise
+            images_done = False  # 原图都删掉了（没删掉的标记留给 recover_media）
             committed = False
             try:
                 # 3. 一个事务：换上新的"轮"，删发言，清空派生层，按原来的任务重新登记。进行中的
@@ -1102,6 +1115,7 @@ class MemorySystem:
                 images_deleted = images_left = 0
                 try:
                     images_deleted, images_left = self._delete_image_files(doomed_media)
+                    images_done = images_left == 0
                     self.vectors.delete(space_id, sorted(set(removed) - set(derived)))
                     if not fast:
                         with cache.recording(reused) if cache is not None else nullcontext():
@@ -1173,6 +1187,8 @@ class MemorySystem:
                             exc_info=True,
                         )
             finally:  # 中途出错时重放用到的更少，删得更多
+                if self.media is not None:  # 没提交时记录都在，标记也不要了
+                    self.media.unmark_deleting(marks, done=images_done or not committed)
                 if cache is None or fast:
                     pass
                 elif committed:
@@ -1321,6 +1337,17 @@ class MemorySystem:
                     exc_info=True,
                 )
         return deleted, left
+
+    def recover_media(self) -> tuple[int, int]:
+        """收拾被杀掉的写入与遗忘留在媒体库里的原图（MediaStore.recover，第七轮体检）：标记点名、
+        这个数据库里没有记录引用的原图删掉。cuemem serve 与 cuemem proxy 启动时与之后每小时
+        （api.app._sweep_jobs）、cuemem reindex 调用。返回（删掉的，有记录、留着的）张数。"""
+        if self.media is None:
+            return 0, 0
+        deleted, kept = self.media.recover(self.db.media_sha_in_use)
+        if deleted:
+            logger.info("媒体库：删掉 %d 张没有提交的写入或遗忘留下的原图", deleted)
+        return deleted, kept
 
     def _hand_over(self, space_id: str) -> None:
         """遗忘提交之后还有没做完的巩固（重放抛出了异常，或有会话抽取失败）：有后台线程时交给它，

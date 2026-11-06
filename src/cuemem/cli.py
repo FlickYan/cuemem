@@ -319,6 +319,7 @@ def doctor(
     _print_config(settings)
     _print_local_store(settings)
     _print_disk(settings)
+    _print_media_journal(settings)
     if vectors:
         _print_vector_gaps(settings)
     for line in _loose_modes(settings):
@@ -452,7 +453,8 @@ def reindex(
     ] = False,
 ) -> None:
     """按数据库补齐向量库：补上缺的向量、删掉多余的点（不调用 LLM）。向量库丢了、坏了，或者与
-    数据库不是同一时刻的备份时用；先用 cuemem doctor --vectors 查哪些空间对不上。"""
+    数据库不是同一时刻的备份时用；先用 cuemem doctor --vectors 查哪些空间对不上。顺带删掉进程
+    被杀掉时没有提交的写入、没做完的遗忘留在媒体库里的原图（cuemem doctor 提示有没有）。"""
     if (space is None) == (not all_spaces):
         console.print("[red]指定 --space 或 --all 其中一个[/red]")
         raise typer.Exit(2)
@@ -474,6 +476,10 @@ def reindex(
             if report.get("facts_missing"):
                 line += f"；{report['facts_missing']} 个事实单元在事实表里找不到，补不上"
             console.print(f"记忆空间 [bold]{escape(target)}[/bold]：{line}")
+        # 被杀掉的写入与遗忘留在媒体库里的原图（第七轮体检）：只删标记点名、没有记录引用的
+        recovered, _ = system.recover_media()
+        if recovered:
+            console.print(f"媒体库：删掉 {recovered} 张没有提交的写入或遗忘留下的原图")
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
 
 
@@ -2420,6 +2426,23 @@ def _print_disk(settings: Settings) -> None:
         console.print(f"[yellow]{line}[/yellow]：空间不够时写入、巩固与导入会失败")
     else:
         console.print(line)
+
+
+def _print_media_journal(settings: Settings) -> None:
+    """进程被杀掉时没有提交的写入、没做完的遗忘留在媒体库里的原图（第七轮体检，见
+    store/media.py）：有的话提示 cuemem reindex 删掉。只读标记，不打开数据库。"""
+    from cuemem.store.media import MediaStore
+
+    media = MediaStore(settings.paths.media, owner=str(settings.paths.db.absolute()))
+    try:
+        stale = media.pending()
+    except OSError:
+        return
+    if stale:
+        console.print(
+            f"[yellow]媒体库里有 {stale} 个被中断的写入或遗忘[/yellow]：可能留下了没有记录的原图，"
+            "运行 [bold]cuemem reindex --all[/bold] 删掉（cuemem serve 与 proxy 启动时也会删）"
+        )
 
 
 def _loose_modes(settings: Settings | None = None) -> list[str]:

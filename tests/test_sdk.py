@@ -1378,14 +1378,14 @@ def test_expired_retention_is_a_daily_opt_in_sweep_job(
 
     system = memory.system
     assert system.settings.expired_retention_days is None
-    assert _sweep_jobs(system) == []
+    assert len(_sweep_jobs(system)) == 1  # 只有收拾媒体库（第七轮体检 P8）
     calls: list[timedelta] = []
     monkeypatch.setattr(
         system, "purge_expired", lambda *a, older_than, **kw: calls.append(older_than) or {}
     )
     assert system.expire_memories() == {} and calls == []  # 没设：什么都不做
     system.settings = system.settings.model_copy(update={"expired_retention_days": 3})
-    assert _sweep_jobs(system) == [system.expire_memories]
+    assert _sweep_jobs(system)[1:] == [system.expire_memories]
     today = date(2026, 11, 6)
     system.expire_memories(today=today)
     system.expire_memories(today=today)  # 同一天只删一次
