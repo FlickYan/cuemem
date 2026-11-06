@@ -16,7 +16,7 @@ import re
 import sqlite3
 import threading
 import traceback
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,8 +178,12 @@ class VectorStore:
         *,
         kinds: Sequence[str] | None = None,
         ts_range: tuple[float | None, float | None] | None = None,
+        hidden_ids: Collection[str] = (),
     ) -> list[VectorHit]:
-        return self._query(space_id, vector.tolist(), DENSE, k, _build_filter(kinds, ts_range))
+        """hidden_ids：不参与检索的单元（过期的记忆，见 MemorySystem.retrieve 的 hide_expired）：
+        在检索里就排除，前 k 条都是别的单元。空的时过滤条件与以前完全相同。"""
+        query_filter = _build_filter(kinds, ts_range, hidden_ids)
+        return self._query(space_id, vector.tolist(), DENSE, k, query_filter)
 
     def search_sparse(
         self,
@@ -189,11 +193,14 @@ class VectorStore:
         *,
         kinds: Sequence[str] | None = None,
         ts_range: tuple[float | None, float | None] | None = None,
+        hidden_ids: Collection[str] = (),
     ) -> list[VectorHit]:
+        """hidden_ids 同 search_dense。"""
         if len(vector) == 0:
             return []
         query = models.SparseVector(indices=vector.indices, values=vector.values)
-        return self._query(space_id, query, SPARSE, k, _build_filter(kinds, ts_range))
+        query_filter = _build_filter(kinds, ts_range, hidden_ids)
+        return self._query(space_id, query, SPARSE, k, query_filter)
 
     def indexed(self, space_id: str) -> bool:
         """服务端是否已建完索引（大批写入后后台建 HNSW，期间检索变慢）；本地模式总是 True。"""
@@ -273,15 +280,24 @@ class VectorStore:
             with self._batched(name):
                 self._client.upsert(name, points=points)
 
-    def search_images(self, space_id: str, vector: FloatArray, k: int) -> list[VectorHit]:
-        """以文搜图 / 以图搜图：返回（图片 ID，余弦相似度）。"""
+    def search_images(
+        self, space_id: str, vector: FloatArray, k: int, *, hidden_ids: Collection[str] = ()
+    ) -> list[VectorHit]:
+        """以文搜图 / 以图搜图：返回（图片 ID，余弦相似度）。hidden_ids：不参与检索的图片
+        （过期的，同 search_dense）；空的时请求与以前相同（不带过滤条件）。"""
         name = self._image_collection(space_id)
+        query_filter = _build_filter(None, None, hidden_ids)
         with self._lock:
             if not self._client.collection_exists(name):
                 return []
             self._fast_kind_mask(name)
             response = self._client.query_points(
-                name, query=vector.tolist(), using=DENSE, limit=k, with_payload=["media_id"]
+                name,
+                query=vector.tolist(),
+                using=DENSE,
+                limit=k,
+                query_filter=query_filter,
+                with_payload=["media_id"],
             )
         return [
             VectorHit(unit_id=str(point.payload["media_id"]), score=float(point.score))
@@ -545,7 +561,34 @@ def _kind_only(query_filter: Any) -> frozenset[str] | None:
         return None
     if query_filter.should or query_filter.must_not or query_filter.min_should:
         return None
-    must = query_filter.must
+    return _kinds_in(query_filter.must)
+
+
+def _kind_and_hidden(query_filter: Any) -> tuple[frozenset[str] | None, list[str]] | None:
+    """_build_filter 给了 hidden_ids 时的样子：must 只有"kind 是其中之一"或者没有，must_not
+    只有一个 HasIdCondition。返回（这几个 kind，没有时 None；要排除的点 ID），别的样子返回
+    None。"""
+    if not isinstance(query_filter, models.Filter):
+        return None
+    if query_filter.should or query_filter.min_should:
+        return None
+    must_not = query_filter.must_not
+    if not isinstance(must_not, list) or len(must_not) != 1:
+        return None
+    condition = must_not[0]
+    if not isinstance(condition, models.HasIdCondition):
+        return None
+    if not all(isinstance(point, str) for point in condition.has_id):
+        return None
+    hidden = [str(point) for point in condition.has_id]
+    if query_filter.must is None or query_filter.must == []:
+        return None, hidden
+    kinds = _kinds_in(query_filter.must)
+    return (kinds, hidden) if kinds is not None else None
+
+
+def _kinds_in(must: Any) -> frozenset[str] | None:
+    """must 只有一条"kind 是其中之一"时返回这几个 kind，否则 None。"""
     conditions = must if isinstance(must, list) else [must]
     if len(conditions) != 1:
         return None
@@ -579,17 +622,32 @@ def _fast_mask(
     全程拿着 VectorStore 的全局锁：2 万个点的空间每次检索单是过滤就要 0.2 秒以上（第五轮体检）。
     只按 kind 过滤、而且每个点的 kind 都是字符串时，这里直接比较字符串（与上游的 MatchAny 对
     字符串的判断相同）；别的过滤条件、或者有点的 kind 不是字符串（上游对列表逐个元素匹配）时
-    照旧交给上游。"""
+    照旧交给上游。
+
+    再排除一批点（hidden_ids，过期的记忆：must_not 一个 HasIdCondition）时，上游每个点都把整个
+    ID 列表重新组成元组、查一遍缓存，几千个过期的点就是几秒；这里按点 ID 直接找到下标、置为
+    不要。存下的点 ID 是规范写法的 UUID 字符串（point_uuid），与上游的 normalize_point_id 相同。"""
     from qdrant_client.local.payload_filters import validate_filter
 
+    hidden: list[str] = []
     wanted = _kind_only(payload_filter)
     if wanted is None:
-        return upstream(payload_filter, vector_name)
+        parsed = _kind_and_hidden(payload_filter)
+        if parsed is None or not isinstance(getattr(collection, "ids", None), dict):
+            return upstream(payload_filter, vector_name)
+        wanted, hidden = parsed
     validate_filter(payload_filter)
-    kinds = [payload.get("kind") for payload in collection.payload]
-    if not all(isinstance(kind, str) for kind in kinds):
-        return upstream(payload_filter, vector_name)
-    mask = np.fromiter((kind in wanted for kind in kinds), dtype=bool, count=len(kinds))
+    if wanted is None:
+        mask = np.ones(len(collection.payload), dtype=bool)
+    else:
+        kinds = [payload.get("kind") for payload in collection.payload]
+        if not all(isinstance(kind, str) for kind in kinds):
+            return upstream(payload_filter, vector_name)
+        mask = np.fromiter((kind in wanted for kind in kinds), dtype=bool, count=len(kinds))
+    for point in hidden:
+        index = collection.ids.get(point)
+        if index is not None:
+            mask[index] = False
     mask = mask & ~collection.deleted
     if vector_name is not None:
         mask = mask & ~collection.deleted_per_vector[vector_name]
@@ -797,12 +855,24 @@ def _first_point(conn: sqlite3.Connection) -> tuple[bytes | None, int]:
 
 
 def _build_filter(
-    kinds: Sequence[str] | None, ts_range: tuple[float | None, float | None] | None
+    kinds: Sequence[str] | None,
+    ts_range: tuple[float | None, float | None] | None,
+    hidden_ids: Collection[str] = (),
 ) -> models.Filter | None:
+    """hidden_ids 不为空时再加一条 must_not（这些单元的点 ID）；空的时与以前完全相同。"""
     conditions: list[models.Condition] = []
     if kinds:
         conditions.append(models.FieldCondition(key="kind", match=models.MatchAny(any=list(kinds))))
     if ts_range is not None:
         low, high = ts_range
         conditions.append(models.FieldCondition(key="ts", range=models.Range(gte=low, lte=high)))
-    return models.Filter(must=conditions) if conditions else None
+    if not hidden_ids:
+        return models.Filter(must=conditions) if conditions else None
+    hidden: list[models.ExtendedPointId] = list(_hidden_points(frozenset(hidden_ids)))
+    return models.Filter(must=conditions or None, must_not=[models.HasIdCondition(has_id=hidden)])
+
+
+@functools.lru_cache(maxsize=8)
+def _hidden_points(unit_ids: frozenset[str]) -> tuple[str, ...]:
+    """单元 ID → 点 ID（排好序）。同一次检索的几路用同一批过期的记忆，只算一次。"""
+    return tuple(sorted(point_uuid(u) for u in unit_ids))

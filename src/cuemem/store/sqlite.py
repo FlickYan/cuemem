@@ -198,10 +198,12 @@ CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id)
 CREATE INDEX IF NOT EXISTS idx_facts_space ON facts (space_id, subject_id, predicate);
 CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts (space_id, superseded_by);
 CREATE INDEX IF NOT EXISTS idx_facts_current ON facts (space_id, invalidated_at);
+CREATE INDEX IF NOT EXISTS idx_facts_session ON facts (space_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (space_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_media_space ON media (space_id, source_turn_id);
+CREATE INDEX IF NOT EXISTS idx_add_keys_created ON add_keys (created_at);
 """
 
 # 派生数据所在的表：forget 与重建时整体清空，再从原始轮次重放
@@ -213,24 +215,24 @@ _FACT_COLUMNS = (
 )
 # 按事件时间查事实（get_facts 的 valid_period）时，没有自己起点的更正版的起点。更正指旧值从未
 # 成立（见 write/reconcile.py），新值从旧值的起点起就成立；以前从更正那天算起，查更正之前的
-# 日期新旧两版都查不到。corrected_chain(id, anc)：anc 是 id 沿"被更正"一路往前的各版（只经过
-# 没有自己起点的版本）；起点取链上到头的那些版（自己有起点，或不再更正过别的）里最早的。
-# 参数：space_id 一个，放在整句最前
+# 日期新旧两版都查不到。corrected_start(id, start)：start 是 id 往前那条更正链到头的一版（自己有
+# 起点，或不再更正过别的）的起点，从链头往后传：种子是这样到头的被更正版，起点只传给没有自己
+# 起点的后继版；起点取各条链头里最早的。UNION 按 (id, start) 去重，行数不超过事实数 × 不同的
+# 起点数。以前存每一版与它所有祖先的对（深 d 的链约 d²/2 行），反复 update 同一条记忆时，深
+# 1000 的链一次查询约 4 秒、期间占着全库的锁。参数：space_id 一个，放在整句最前
 _CORRECTED_CHAIN = (
-    "WITH RECURSIVE corrected_chain(id, anc) AS ("
-    "SELECT p.superseded_by, p.id FROM facts p JOIN facts f ON f.id = p.superseded_by"
+    "WITH RECURSIVE corrected_start(id, start) AS ("
+    "SELECT f.id, COALESCE(p.valid_from, substr(p.recorded_at, 1, 10))"
+    " FROM facts p JOIN facts f ON f.id = p.superseded_by"
     " WHERE p.space_id = ? AND p.supersede_reason = 'corrected' AND f.valid_from IS NULL"
-    " UNION SELECT c.id, p.id FROM corrected_chain c JOIN facts a ON a.id = c.anc"
-    " JOIN facts p ON p.space_id = a.space_id AND p.superseded_by = a.id"
-    " AND p.supersede_reason = 'corrected' WHERE a.valid_from IS NULL)"
+    " AND (p.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
+    " WHERE q.space_id = p.space_id AND q.superseded_by = p.id"
+    " AND q.supersede_reason = 'corrected'))"
+    " UNION SELECT f.id, c.start FROM corrected_start c JOIN facts a ON a.id = c.id"
+    " JOIN facts f ON f.id = a.superseded_by"
+    " WHERE a.supersede_reason = 'corrected' AND f.valid_from IS NULL)"
 )
-_CORRECTED_START = (
-    "(SELECT MIN(COALESCE(a.valid_from, substr(a.recorded_at, 1, 10)))"
-    " FROM corrected_chain c JOIN facts a ON a.id = c.anc WHERE c.id = facts.id"
-    " AND (a.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
-    " WHERE q.space_id = a.space_id AND q.superseded_by = a.id"
-    " AND q.supersede_reason = 'corrected')))"
-)
+_CORRECTED_START = "(SELECT MIN(c.start) FROM corrected_start c WHERE c.id = facts.id)"
 _UNIT_COLUMNS = "id, space_id, kind, session_id, text, ts, source_turn_ids, meta"
 _ENTITY_COLUMNS = "id, space_id, name, type, aliases, description, first_seen, last_seen, mentions"
 _MEDIA_COLUMNS = (
@@ -451,6 +453,15 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: _dt(r[1]) for r in rows}
 
+    def session_turn_counts(self, space_id: str) -> dict[str, int]:
+        """会话 ID → 发言条数（记忆浏览器的会话列表）：只数，不解出每句发言。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, COUNT(*) FROM turns WHERE space_id = ? GROUP BY session_id",
+                (space_id,),
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     def has_sessions(self, space_id: str) -> bool:
         """这个空间有没有会话（检索之前判断空间是不是空的）。"""
         with self._lock:
@@ -483,15 +494,18 @@ class MemoryDB:
                 found.update((r[0], _dt(r[1])) for r in rows)
         return found
 
-    def speakers(self, space_id: str) -> list[str]:
-        """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。"""
+    def speakers(self, space_id: str, *, without_sessions: Sequence[str] = ()) -> list[str]:
+        """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。
+        without_sessions：不算这几个会话（遗忘的快速路径比较删掉它们之后会不会变）。"""
+        sql = "SELECT speaker, MIN(ts) FROM turns WHERE space_id = ? AND speaker IS NOT NULL"
+        args: list[Any] = [space_id]
+        if without_sessions:
+            sql += f" AND session_id NOT IN ({', '.join('?' * len(without_sessions))})"
+            args += list(without_sessions)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT speaker, MIN(ts) FROM turns WHERE space_id = ? AND speaker IS NOT NULL"
-                " GROUP BY speaker ORDER BY MIN(ts), speaker",
-                (space_id,),
-            ).fetchall()
-        return [r[0] for r in rows]
+            rows = self._conn.execute(sql + " GROUP BY speaker ORDER BY MIN(ts), speaker", args)
+            fetched = rows.fetchall()
+        return [r[0] for r in fetched]
 
     def add_turns(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta] | None = None) -> int:
         """写入原始轮次，返回实际新增的条数。
@@ -608,6 +622,34 @@ class MemoryDB:
                 (space_id,),
             ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    def spaces_with_expiring(self) -> list[str]:
+        """有带过期时间的发言的空间（定时删过期的记忆用，见 MemorySystem.purge_expired）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT space_id FROM turn_meta WHERE expires_at IS NOT NULL"
+                " ORDER BY space_id"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def turn_sessions(self, space_id: str, turn_ids: Sequence[str]) -> set[str]:
+        """这几句发言所在的会话（只读 session_id 一列，见 expiry.expired_ids）。"""
+        sql = "SELECT session_id FROM turns WHERE space_id = ?"
+        return {r[0] for r in self._in_chunks(sql, [space_id], "id", turn_ids)}
+
+    def sources_in(self, space_id: str, session_ids: Sequence[str]) -> list[tuple[str, list[str]]]:
+        """这几个会话里的检索单元与事实：（ID，出处的发言），只读这两列、不构造模型（过期的记忆
+        每次检索都要算一遍，见 expiry.expired_ids）。"""
+        rows: list[Sequence[Any]] = []
+        for table in ("units", "facts"):
+            sql = f"SELECT id, source_turn_ids FROM {table} WHERE space_id = ?"
+            rows.extend(self._in_chunks(sql, [space_id], "session_id", session_ids))
+        return [(r[0], json.loads(r[1])) for r in rows]
+
+    def media_of_turns(self, space_id: str, turn_ids: Sequence[str]) -> list[str]:
+        """这几句发言里的图片 ID（只读 id 一列，见 expiry.expired_ids）。"""
+        sql = "SELECT id FROM media WHERE space_id = ?"
+        return [r[0] for r in self._in_chunks(sql, [space_id], "source_turn_id", turn_ids)]
 
     def get_turns(
         self,
@@ -753,9 +795,12 @@ class MemoryDB:
         session_id: str,
         turn_ids: Sequence[str],
     ) -> None:
-        """记下一次带键的写入（在调用方写发言的事务里）。先删掉超过 ADD_KEY_TTL 的行（全部空间）；
-        再用普通的 INSERT：同一个键已经由并发的另一次写入提交时 sqlite3.IntegrityError，调用方的
-        事务整个回滚（连同这次的发言与向量），再按 add_key_lookup 返回先提交的那次。"""
+        """记下一次带键的写入（在调用方写发言的事务里）。先删掉超过 ADD_KEY_TTL 的行（全部空间，
+        按 idx_add_keys_created 只找过期的行：以前每次扫一遍整张表，50 万个键时约 33 毫秒，持着
+        写锁，第七轮体检）。每次都删，不隔一段时间才删：同一个键过期之后再用时，过期的那一行得先
+        删掉，否则下面的 INSERT 撞上主键、这次写入整个回滚。再用普通的 INSERT：同一个键已经由
+        并发的另一次写入提交时 sqlite3.IntegrityError，调用方的事务整个回滚（连同这次的发言与
+        向量），再按 add_key_lookup 返回先提交的那次。"""
         now = datetime.now()
         conn.execute(
             "DELETE FROM add_keys WHERE created_at < ?", ((now - ADD_KEY_TTL).isoformat(),)
@@ -1361,6 +1406,50 @@ class MemoryDB:
                 (space_id,),
             )
         return ids
+
+    def drop_inert_sessions(self, space_id: str, session_ids: Sequence[str]) -> list[str]:
+        """遗忘的快速路径（第七轮体检，见 MemorySystem._inert_sessions）：整段删掉的会话什么都
+        没留下（没有事实、没有新建或关联的实体），派生层里只有它们的片段与摘要单元、任务。删掉
+        这些，连同这个空间里被取代的任务（重放时清空派生层，它们也不在了），别的已完成任务的
+        失败次数清零（与重放相同），返回删掉的摘要单元 ID，供调用方删向量。在调用方的事务里
+        调用（这里的事务是保存点）。"""
+        ids = list(dict.fromkeys(session_ids))
+        removed: list[str] = []
+        with self.transaction() as conn:
+            self._bump([space_id])
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                marks = ", ".join("?" * len(chunk))
+                args = [space_id, *chunk]
+                removed += [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT id FROM units WHERE space_id = ? AND kind = 'summary'"
+                        f" AND session_id IN ({marks})",
+                        args,
+                    )
+                ]
+                conn.execute(
+                    "DELETE FROM units WHERE space_id = ? AND kind = 'summary'"
+                    f" AND session_id IN ({marks})",
+                    args,
+                )
+                for table in ("episodes", "jobs"):
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE space_id = ? AND session_id IN ({marks})", args
+                    )
+            conn.execute(
+                "DELETE FROM jobs WHERE space_id = ? AND status = 'superseded'", (space_id,)
+            )
+            # 别的会话已完成的任务：重放重新登记、重新执行（命中缓存），失败过几次的记录随之
+            # 清零；内容审核跳过的保留原来的结局（write.consolidate._keeps_outcome）。与重放一致
+            conn.execute(
+                "UPDATE jobs SET attempts = 0, error = NULL WHERE space_id = ? AND status = 'done'"
+                " AND (attempts != 0 OR error IS NOT NULL)"
+                " AND COALESCE(json_extract(stats, '$.skipped'), '') != 'content_filter'",
+                (space_id,),
+            )
+        return removed
 
     # ---------- 巩固任务队列 ----------
 

@@ -497,3 +497,26 @@ def test_forget_removes_traces_with_the_text(system: MemorySystem, model: Script
     assert report.traces_removed == 1
     traces = "".join(p.read_text("utf-8") for p in system.tracer.directory.glob("*.jsonl"))
     assert secret not in traces and "今天天气不错。" in traces
+
+
+def test_forget_removes_chat_traces_built_from_the_profile(
+    system: MemorySystem, model: ScriptedModel
+) -> None:
+    """聊天的系统提示里总有画像：回复转述了画像里的一行、又没有引用时，以前遗忘这条事实留着
+    这一轮的 trace（第七轮体检 P4）。现在 chat trace 记下画像快照出自哪些事实。"""
+    model.agent = lambda body: "zzqq 一句没有引用的转述。"
+    agent = Agent(system, router="rule")
+    session = agent.start("demo", at=DAY)
+    agent.chat(session, "早上好", mode="l0")
+    assert system.tracer is not None
+    _, fid, _ = session.profile[0]
+    fact = system.db.get_facts("demo", ids=[fid])[0]
+
+    def traces() -> str:
+        assert system.tracer is not None
+        return "".join(p.read_text("utf-8") for p in system.tracer.directory.glob("*.jsonl"))
+
+    assert "zzqq" in traces()
+    report = system.forget("demo", turn_ids=fact.source_turn_ids)
+    assert report.traces_removed >= 1
+    assert "zzqq" not in traces()

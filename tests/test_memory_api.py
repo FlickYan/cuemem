@@ -14,9 +14,10 @@ import json
 import math
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -60,6 +61,7 @@ from cuemem.errors import (
     EmbeddingAPIError,
     IdempotencyConflictError,
     MemoryAPIError,
+    SessionLimitError,
 )
 from cuemem.evidence import MEMORY_NOTE, RAISED_REASON, inject_evidence, recall_evidence
 from cuemem.memory import MemorySystem
@@ -223,6 +225,8 @@ ARGUMENTS: dict[str, Any] = {
     "valid_at": "2026-01-01",
     "known_at": WHEN,
     "memory_id": "m1",
+    "memory_ids": ["m1", "m2"],
+    "memories": [{"memory_id": "m1"}, {"memory_id": "m2"}],  # batch_delete（Mem0 的写法）
     "media_id": "0123456789abcdef",
     "text": "new text",
     "data": "new text",  # update 的 data 与 text 是同一个参数
@@ -312,6 +316,8 @@ def test_every_argument_reaches_memory(name: str) -> None:
             return
         getattr(client, name)(**args)
     called, got = recorder.calls[0]  # open_run 之后，关掉客户端时还会 end_run
+    if name == "batch_delete":  # 客户端换成 delete_many 的请求，服务端照样调用 delete_many
+        name, args = "delete_many", {"memory_ids": ["m1", "m2"], "dry_run": False}
     assert called == name
     assert _meaning(name, got) == _meaning(name, args)
 
@@ -516,6 +522,90 @@ def test_bad_read_arguments_raise_the_same_error_locally(
             response = http.post(path, content=body, headers={"content-type": "application/json"})
             assert response.status_code == 422
             assert response.json()["error"]["message"] == f"Invalid request: body.{ours.value}"
+
+
+# 与 at=datetime(2030, 1, 1) 同一个时刻的别的写法（第七轮体检；known_at 要在写入之后）
+# 第七轮复审：毫秒、只有数字的文本、紧凑的与按周的 ISO 写法两边也是同一个时刻（以前服务端由
+# Pydantic 解析，'20300101' 读成 1970 年的秒数；毫秒与数字文本本地报错，按周的写法远程 422）
+MOMENTS = [
+    "2030-01-01",
+    date(2030, 1, 1),
+    datetime(2030, 1, 1, 0, 0).astimezone(UTC).isoformat(),
+    datetime(2030, 1, 1, 0, 0).timestamp(),
+    datetime(2030, 1, 1, 0, 0).timestamp() * 1000,
+    str(int(datetime(2030, 1, 1, 0, 0).timestamp())),
+    "20300101",
+    "2030-W01-2",
+]
+
+
+@pytest.mark.parametrize(
+    "moment",
+    MOMENTS,
+    ids=["iso-date", "date", "iso-utc", "epoch", "epoch-ms", "epoch-text", "compact", "week"],
+)
+def test_read_times_take_the_same_forms_locally(system: MemorySystem, moment: Any) -> None:
+    """search、context、answer 的 at 与 get_all 的 known_at：MemoryClient 收 ISO 文本、date 与
+    Unix 时间戳（服务端的 Pydantic 解析），本地的 Memory 以前只认 datetime，空间里有记忆时
+    AttributeError。现在两边收同样的写法，结果与给 datetime 时相同。"""
+    local = Memory.from_system(system)
+    local.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    when = datetime(2030, 1, 1)
+    text = "Where do I live?"
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as remote,
+    ):
+        for method in ("search", "context", "answer"):
+            expected = getattr(local, method)(text, user_id="alice", at=when)
+            assert getattr(local, method)(text, user_id="alice", at=moment) == expected, method
+            assert getattr(remote, method)(text, user_id="alice", at=moment) == expected, method
+        expected = local.get_all(user_id="alice", known_at=when)
+        assert expected["results"]
+        assert local.get_all(user_id="alice", known_at=moment) == expected
+        assert remote.get_all(user_id="alice", known_at=moment) == expected
+
+
+BAD_TIMES = [
+    ("search", {"at": "banana"}),
+    ("context", {"at": "banana"}),
+    ("answer", {"at": "banana"}),
+    ("search", {"at": True}),
+    ("get_all", {"known_at": "banana"}),
+    ("search", {"at": "1e9"}),
+    ("get_all", {"known_at": "1e9"}),
+    ("add", {"user_id": 42}),
+    ("search", {"user_id": 42}),
+    ("wait", {"timeout": -1}),
+]
+
+
+@pytest.mark.parametrize(("method", "bad"), BAD_TIMES)
+def test_bad_times_and_ids_raise_value_error_on_both_sides(
+    system: MemorySystem, method: str, bad: dict[str, Any]
+) -> None:
+    """写错的时间、不是字符串的 user_id 与负的 timeout：本地与 MemoryClient 都 ValueError（以前
+    本地 AttributeError，wait 什么都不做）。服务端的话由 Pydantic 写，两边的文字不同；本地的以
+    参数名开头。空间还是空的时也报错。"""
+    local = Memory.from_system(system)
+    (name,) = bad
+    args: dict[str, Any] = {"user_id": "alice", **bad}
+    if method in ("search", "context", "answer"):
+        args["query" if method != "answer" else "question"] = "Where do I live?"
+    if method == "add":
+        args["messages"] = "I live in Berlin"
+    if method == "wait":
+        del args["user_id"]
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as remote,
+    ):
+        for _ in range(2):  # 先是空的空间，再是有记忆的
+            with pytest.raises(ValueError, match=f"^{name}"):
+                getattr(local, method)(**args)
+            with pytest.raises(ValueError, match=name):
+                getattr(remote, method)(**args)
+            local.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
 
 
 def test_good_read_arguments_still_pass(mem: Mem) -> None:
@@ -769,6 +859,60 @@ def test_context_leaves_out_expired_memories(mem: Mem) -> None:
     assert "snow" in text and "rain" not in text
 
 
+def test_expired_memories_do_not_take_recall_slots(system: MemorySystem) -> None:
+    """过期的近似说法不再占召回的名额（第七轮体检 P5）：以前它们加进 exclude，各路先取前 30 条、
+    再去掉它们，有效的记忆被挤出候选（300 条过期的近似说法时装入的对话片段从 33 条降到 29 条）；
+    现在在检索里就排除，各路的前 30 条都是有效的记忆，召回的不比没有过期记忆的空间少。"""
+    mem = Memory.from_system(system)
+    question = "what is the daily special at the cafe?"
+    yesterday = date.today() - timedelta(days=1)
+    for user, expired in (("plain", 0), ("crowded", 300)):
+        lunch = "I had lunch at the cafe, their daily special is pasta carbonara"
+        mem.add(lunch, user_id=user, infer=False)
+        for i in range(50):
+            note = f"note {i} about gardening tomatoes and bicycles number {i}"
+            mem.add(note, user_id=user, infer=False)
+        for i in range(expired):
+            text = f"what is the daily special at the cafe? it is the soup {i}"
+            mem.add(text, user_id=user, infer=False, expiration_date=yesterday)
+        mem.consolidate(user_id=user)
+    plain = mem.context(question, user_id="plain", mode="l1")
+    crowded = mem.context(question, user_id="crowded", mode="l1")
+    assert crowded["recalled"] >= plain["recalled"]
+    assert "pasta" in crowded["context"] and "soup" not in crowded["context"]
+    recall = system.retrieve("crowded", question, mode="l1", hide_expired=True)
+    rounds = [h.unit.text for h in recall.view.rounds]
+    plain_rounds = system.retrieve("plain", question, mode="l1", hide_expired=True).view.rounds
+    assert len(rounds) >= len(plain_rounds) and not any("soup" in t for t in rounds)
+    # 改走 L1 的第二次检索用第一次算出的过期记忆，不再算一遍
+    assert recall.expired is not None and len(recall.expired) >= 300
+
+
+def test_raising_l0_computes_the_expired_memories_once(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """控制器选了 L0、context 与 recall_listing 改走 L1 时，第二次检索用第一次算出的过期记忆
+    （Recall.expired），不再算一遍（第七轮体检 P5：以前每次 context 算两遍）。"""
+    import cuemem.memory as memory_module
+
+    mem = Memory.from_system(system)
+    yesterday = date.today() - timedelta(days=1)
+    mem.add("I work at Acme", user_id="ann", timestamp=AUG, wait=True)
+    mem.add("I like rain", user_id="ann", expiration_date=yesterday, wait=True)
+    calls: list[str] = []
+    real = memory_module.expired_ids
+
+    def counting(db: Any, space: str, now: datetime) -> frozenset[str]:
+        calls.append(space)
+        return real(db, space, now)
+
+    monkeypatch.setattr(memory_module, "expired_ids", counting)
+    raised = mem.context("Hi there", user_id="ann")
+    assert raised["level"] == "L1" and raised["reasons"] == [RAISED_REASON]
+    assert "I like rain" not in raised["context"]
+    assert len(calls) == 1
+
+
 def test_context_respects_the_key_scope(system: MemorySystem) -> None:
     """限定作用域的令牌：POST /api/v1/context 点名作用域之外的用户时 403，与 search 相同。"""
     eve_token = "eve-token-0123456789"
@@ -841,6 +985,127 @@ def test_runs_scopes_export_and_load(mem: Mem) -> None:
     mem.wait()
     mem.delete_all(user_id="carol", agent_id="travel/bot")
     assert {s["space_id"] for s in mem.spaces()} == {"carol", "dave"}
+
+
+def test_delete_all_of_a_run_has_a_dry_run_and_reports_an_unknown_run(
+    mem: Mem, system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮体检 P16：delete_all(run_id=, dry_run=True) 列出这个会话会删的发言，什么都不删
+    （以前没有这个参数，TypeError）；dry_run 不带 run_id 时 ValueError（HTTP 400）：删整个用户
+    没有预演。写错的 run_id 回 "No such run: nothing deleted"，不重放（以前照样回 "Memories of
+    this run deleted"）。本地与经 /api/v1 的 MemoryClient 相同。"""
+    mem.add("I like tea", user_id="carol", run_id="r1", wait=True)
+    mem.add("I like chess", user_id="carol", run_id="r2", wait=True)
+    before = current(mem, "carol")
+    preview = mem.delete_all(user_id="carol", run_id="r1", dry_run=True)
+    assert preview["message"] == "Dry run: nothing was deleted"
+    assert [t["text"] for t in preview["turns"]] == ["I like tea"]
+    assert preview["sessions_affected"] == ["r1"] and preview["facts"]
+    assert current(mem, "carol") == before
+    with pytest.raises(ValueError, match="dry_run needs run_id"):
+        mem.delete_all(user_id="carol", dry_run=True)
+    assert current(mem, "carol") == before
+
+    replays: list[Any] = []
+    forget = system.forget
+    monkeypatch.setattr(system, "forget", lambda *a, **k: replays.append(a) or forget(*a, **k))
+    out = mem.delete_all(user_id="carol", run_id="r9")
+    assert out["message"] == "No such run: nothing deleted"
+    assert (out["turns_deleted"], out["sessions_affected"]) == (0, [])
+    assert replays == [] and current(mem, "carol") == before
+    out = mem.delete_all(user_id="carol", run_id="r1")
+    assert out["message"] == "Memories of this run deleted" and len(replays) == 1
+    assert current(mem, "carol") == ["I like chess"]
+
+
+def test_the_client_sends_delete_all_dry_run_only_when_set(system: MemorySystem) -> None:
+    """MemoryClient.delete_all 只在 dry_run=True 时带上 dry_run：不预演的请求与以前逐字相同。"""
+    urls: list[str] = []
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as client,
+    ):
+        http.event_hooks = {"request": [lambda r: urls.append(str(r.url))], "response": []}
+        client.delete_all(user_id="carol", run_id="r1")
+        client.delete_all(user_id="carol", run_id="r1", dry_run=True)
+    assert urls == [
+        "http://testserver/api/v1/memories?user_id=carol&run_id=r1",
+        "http://testserver/api/v1/memories?user_id=carol&run_id=r1&dry_run=true",
+    ]
+
+
+def _likes(mem: Mem, user_id: str) -> dict[str, str]:
+    return {f["memory"]: f["id"] for f in mem.get_all(user_id=user_id)["results"]}
+
+
+def test_delete_many_replays_once_and_matches_deleting_one_by_one(
+    mem: Mem, system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮体检 P16：delete_many 先认出全部 ID，每个空间只遗忘、重放一次。留下的事实与逐条
+    delete 的相同（逐条删时每次按文字重新找 ID：重放可能给留下的事实换 ID）。重复的 ID 只算
+    一次，不认识的放进 missing，不报错。"""
+    for user in ("alice", "bob"):
+        for n in range(6):
+            mem.add(f"I like thing{n}", user_id=user, run_id=f"s{n}", wait=True)
+    doomed = ["I like thing1", "I like thing3", "I like thing4"]
+    for text in doomed:  # 逐条删
+        mem.delete(_likes(mem, "bob")[text])
+
+    calls: list[str] = []
+    forget = system.forget_memories
+    monkeypatch.setattr(
+        system, "forget_memories", lambda space, **k: calls.append(space) or forget(space, **k)
+    )
+    ids = [_likes(mem, "alice")[text] for text in doomed]
+    out = mem.delete_many([*ids, ids[0], "no-such-id"])
+    assert calls == ["alice"]  # 一次，不是三次
+    assert (out["message"], out["deleted"], out["missing"]) == (
+        "Memories deleted",
+        ids,
+        ["no-such-id"],
+    )
+    assert out["turns_deleted"] == 3 and sorted(out["sessions_affected"]) == ["s1", "s3", "s4"]
+    assert current(mem, "alice") == current(mem, "bob")
+    assert sorted(_likes(mem, "alice")) == ["I like thing0", "I like thing2", "I like thing5"]
+
+    nothing = mem.delete_many(["no-such-id"])
+    assert (nothing["message"], nothing["deleted"], nothing["turns_deleted"]) == (
+        "Nothing deleted",
+        [],
+        0,
+    )
+    assert calls == ["alice"]
+
+
+def test_delete_many_of_one_round_dry_run_and_its_limits(mem: Mem, system: MemorySystem) -> None:
+    """同一轮的事实与对话片段一起删不出错（逐条删时第二个 KeyError）；dry_run 什么都不删；
+    超过 100 个 ID 是 ValueError（HTTP 400），单个字符串是 TypeError；batch_delete 是 Mem0 的
+    写法。本地与经 /api/v1 的 MemoryClient 相同。"""
+    mem.add("I like tea", user_id="carol", wait=True)
+    mem.add("I like chess", user_id="carol", wait=True)
+    tea = _likes(mem, "carol")["I like tea"]
+    (fact,) = system.db.get_facts("carol", ids=[tea])
+    (excerpt,) = [
+        u.id
+        for u in system.db.list_units("carol", kinds=["round"])
+        if set(fact.source_turn_ids) <= set(u.source_turn_ids)
+    ]
+    preview = mem.delete_many([tea, excerpt], dry_run=True)
+    assert preview["message"] == "Dry run: nothing was deleted"
+    assert (preview["deleted"], preview["missing"]) == ([tea, excerpt], [])
+    assert [t["text"] for t in preview["turns"]] == ["I like tea"]
+    assert [f["memory"] for f in preview["facts"]] == ["I like tea"]
+    assert current(mem, "carol") == ["I like chess", "I like tea"]
+
+    with pytest.raises(ValueError, match="At most 100"):
+        mem.delete_many([f"id{i}" for i in range(101)])
+    with pytest.raises(TypeError):
+        mem.delete_many(tea)
+    assert current(mem, "carol") == ["I like chess", "I like tea"]
+
+    out = mem.batch_delete([{"memory_id": tea}, {"memory_id": excerpt}])
+    assert (out["deleted"], out["missing"], out["turns_deleted"]) == ([tea, excerpt], [], 1)
+    assert current(mem, "carol") == ["I like chess"]
 
 
 def test_export_and_load_errors_are_the_same_remotely(system: MemorySystem) -> None:
@@ -1145,6 +1410,35 @@ def test_closing_the_client_ends_its_runs(system: MemorySystem) -> None:
         client.close()
         assert system.open_sessions("eve") == set()
         assert [j["session_id"] for j in system.db.get_jobs("eve")] == [run_id]
+
+
+def test_open_runs_per_space_are_capped_on_the_server(system: MemorySystem) -> None:
+    """第七轮复审 P14：max_open_runs 给了时（cuemem serve 给 /api/v1 设成 CUEMEM_MAX_OPEN_SESSIONS，
+    默认 64）一个空间开着的 run 最多这么多个：再 open_run 新的时 SessionLimitError，/api/v1 回 429
+    （Retry-After: 60），MemoryClient 抛同样的异常；不替调用方结束别的 run。以前 /api/v1 不限。
+    已经开着的 run 再 open_run（接着写）不算新的；本地的 SDK 默认不限。"""
+    assert Memory.from_system(system).max_open_runs is None
+    server = Memory.from_system(system)
+    server.max_open_runs = 2
+    app = FastAPI()
+    app.include_router(memories_router(server, dependencies=guard(Keys())))
+    install_error_format(app)
+    with TestClient(app) as http:
+        client = MemoryClient("http://testserver", http_client=http)
+        a = client.open_run(user_id="eve")
+        b = client.open_run(user_id="eve")
+        assert client.open_run(a, user_id="eve") == a
+        refused = http.post("/api/v1/runs", json={"user_id": "eve"})
+        assert refused.status_code == 429 and refused.headers["retry-after"] == "60"
+        assert refused.json()["error"]["code"] == "rate_limited"
+        with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            client.open_run(user_id="eve")
+        assert system.open_sessions("eve") == {a, b}
+        assert client.open_run(user_id="bob")  # 别的空间各算各的
+        client.end_run(a, user_id="eve")
+        c = client.open_run(user_id="eve")
+        assert system.open_sessions("eve") == {b, c}
+        client.close()
 
 
 @pytest.mark.parametrize("where", ["local", "remote"])
@@ -1500,7 +1794,7 @@ def test_the_openapi_documents_every_v1_response() -> None:
     图片写的 image/* 生成客户端时被丢掉。"""
     spec = openapi_v1()
     operations = [(p, m, op) for p, ops in spec["paths"].items() for m, op in ops.items()]
-    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 21
+    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 22
     ids = [op["operationId"] for _, _, op in operations]
     assert len(set(ids)) == len(ids) and set(ids) == {r.name for r in V1_ROUTES}
     assert set(ids) <= _methods(MemoryClient)
@@ -1647,6 +1941,10 @@ def test_every_v1_response_matches_its_documented_model(
         dump = mem.export(user_id="alice")
         assert mem.load(dump, user_id="carol", wait=True)["consolidation"]
         assert mem.spaces() and mem.delete_all(user_id="carol")["turns_deleted"]
+        assert mem.delete_all(user_id="bob", run_id=run_id, dry_run=True)["turns"]
+        facts = [f["id"] for f in mem.get_all(user_id="alice")["results"]]
+        assert mem.delete_many([*facts, "no-such-id"], dry_run=True)["missing"] == ["no-such-id"]
+        assert facts and mem.delete_many(facts)["deleted"] == facts
         for call in (lambda: mem.update("no-such-id", "x"), lambda: mem.export(user_id="nobody")):
             with pytest.raises(KeyError):
                 call()
@@ -1791,3 +2089,26 @@ def test_v1_explains_provider_errors(
         # 换成 MemoryClient 就不退避了
         assert (remote.value.status, remote.value.retry_after) == (429, "3")
         assert (local.value.status, local.value.retry_after) == (429, "3")
+
+
+def test_cancelling_an_async_call_does_not_stop_it() -> None:
+    """第七轮体检 P19（AsyncMethods 的说明）：asyncio.wait_for 超时只停下 await，请求照样在
+    线程池里发出、执行到返回，被取消的 add 照样可能生效；所以要传 idempotency_key 再试。"""
+    seen: list[str | None] = []
+    release = threading.Event()
+
+    def slow(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request.headers.get("Idempotency-Key"))
+        release.wait(10)
+        return httpx2.Response(503)
+
+    async def run() -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.add("hi", user_id="u", idempotency_key="k"), 0.05)
+        release.set()
+        await asyncio.to_thread(lambda: None)  # 默认线程池还在，取消的调用不报错
+
+    with httpx2.Client(transport=httpx2.MockTransport(slow)) as http:
+        client = AsyncMemoryClient("http://127.0.0.1:9", http_client=http)
+        asyncio.run(run())
+    assert seen == ["k"]

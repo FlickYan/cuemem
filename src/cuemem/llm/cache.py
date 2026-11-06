@@ -17,6 +17,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
+from cuemem.store.files import spare_write
+
 logger = logging.getLogger(__name__)
 
 # 正在记录命中的缓存键（见 ResponseCache.recording）。放在上下文里：巩固在线程池里抽取时复制
@@ -74,7 +76,13 @@ class _HoldLock:
 
 
 class ResponseCache:
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | None, *, best_effort: bool = False) -> None:
+        """best_effort：磁盘满了、只读时 put 记一条警告、不抛出（见 store.files.spare_write），
+        这次的回复照样返回，只是没有缓存。只有 MemorySystem.from_settings（SDK、服务与命令行）
+        打开；评测与脚本用默认的 False，写不进缓存时照样出错（缓存是复现结果的依据）。"""
+        self._path = path
+        self.best_effort = best_effort
+        self.failing = False  # 上一次 put 因为磁盘写不进去（接连失败只记一次警告）
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
         # 几个评测进程共用一份缓存：写锁多等一会儿（默认 5 秒），免得忙时报 "database is locked"
@@ -214,12 +222,25 @@ class ResponseCache:
         """scope 标记这条缓存属于哪个记忆空间，遗忘时据此清理（见 delete_scope、hold）。"""
         payload = json.dumps(response, ensure_ascii=False)
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO llm_cache (key, model, response, scope)"
-                " VALUES (?, ?, ?, ?)",
-                (key, model, payload, scope),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO llm_cache (key, model, response, scope)"
+                    " VALUES (?, ?, ?, ?)",
+                    (key, model, payload, scope),
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                spare_write(
+                    self._conn,
+                    exc,
+                    best_effort=self.best_effort,
+                    failing=self.failing,
+                    what="LLM 缓存",
+                    path=self._path,
+                )
+                self.failing = True
+            else:
+                self.failing = False
 
     def delete_scope(self, scope: str) -> int:
         """删除某个记忆空间产生的全部缓存条目：回复里可能含有被遗忘的个人信息。

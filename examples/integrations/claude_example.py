@@ -25,6 +25,8 @@
 模型由 ANTHROPIC_MODEL 指定，要支持记忆工具（memory_20250818）、effort 与服务端的拒答兜底
 （fallbacks="default"，安全分类器误拒时换模型重答）。保留思考块的模型把思考块绑定在对话上：
 历史只能往后加（见 Conversation.send），改动已经发出去的消息会被拒绝。
+
+需要 anthropic>=2.3（betas、fallbacks 与 thread=False）。
 """
 
 from __future__ import annotations
@@ -65,6 +67,9 @@ class Conversation:
             fallbacks="default",
             tools=[self.tool],
             messages=self.history,
+            # 每一步发出整段历史：发出去的都在这里的历史里，CueMem 的 forget / delete_all 管得到。
+            # 默认的服务端线程（anthropic 2.3 起）把带证据块的消息留在供应商那边，遗忘管不到
+            thread=False,
         )
         final = None
         for message in runner:  # 每一步：Claude 用记忆工具，或者给出回答

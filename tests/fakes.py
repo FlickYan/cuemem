@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -314,3 +315,21 @@ class KeyedQdrant:
         elif method == "PUT" and path.count("/") == 2:  # 建集合
             result = True
         return 200, json.dumps({"result": result, "status": "ok", "time": 0.0}).encode()
+
+
+def fill_to_capacity(conn: sqlite3.Connection) -> None:
+    """模拟磁盘满了：把这个连接的库封顶在现有页数加一页（max_page_count），再塞满空闲的空间。
+    之后要多占一页的写入都是 SQLITE_FULL（database or disk is full）；调高上限就恢复。"""
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("CREATE TABLE IF NOT EXISTS filler (x BLOB)")
+    conn.commit()
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    conn.execute(f"PRAGMA max_page_count = {pages + 1}")
+    for size in (4000, 1000, 200, 50, 10, 1):
+        while True:
+            try:
+                conn.execute("INSERT INTO filler VALUES (zeroblob(?))", (size,))
+                conn.commit()
+            except sqlite3.OperationalError:
+                conn.rollback()
+                break

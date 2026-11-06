@@ -285,8 +285,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string",
-                  "format": "date-time"
+                  "type": "string"
                 },
                 {
                   "type": "null"
@@ -503,6 +502,7 @@
           "memories (v1)"
         ],
         "summary": "Delete All",
+        "description": "Delete all memories of a user (or agent), or only one run with run_id. dry_run=true needs run_id and only lists what would be deleted. A run_id with no conversation turns deletes nothing and answers 'No such run: nothing deleted'.",
         "operationId": "delete_all",
         "security": [
           {
@@ -557,6 +557,16 @@
               ],
               "title": "Run Id"
             }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Dry Run"
+            }
           }
         ],
         "responses": {
@@ -565,8 +575,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Delete All",
-                  "$ref": "#/components/schemas/ForgetResult"
+                  "title": "Response 200 Delete All",
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ForgetResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunResult"
+                    }
+                  ]
                 }
               }
             }
@@ -1752,6 +1769,181 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/memories/batch-delete": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Delete Many",
+        "description": "Delete several memories (fact, excerpt or image ids) with one rebuild per memory space; at most 100 ids. Unknown ids and ids outside this key's scope are listed in missing, not an error. dry_run=true only lists what would be deleted.",
+        "operationId": "delete_many",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchDeleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BatchForgetResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/BatchDryRunResult"
+                    }
+                  ],
+                  "title": "Response 200 Delete Many"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
       }
     },
     "/api/v1/media/{media_id}": {
@@ -4115,14 +4307,20 @@
           "at": {
             "anyOf": [
               {
-                "type": "string",
-                "format": "date-time"
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "At"
+            "title": "At",
+            "description": "ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"
           },
           "router": {
             "type": "string",
@@ -4200,6 +4398,172 @@
           "reasons"
         ],
         "title": "AnswerResult"
+      },
+      "BatchDeleteRequest": {
+        "properties": {
+          "memory_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Memory Ids"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "memory_ids"
+        ],
+        "title": "BatchDeleteRequest"
+      },
+      "BatchDryRunResult": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/DryRunTurn"
+            },
+            "type": "array",
+            "title": "Turns"
+          },
+          "sessions_affected": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sessions Affected"
+          },
+          "cascaded": {
+            "type": "integer",
+            "title": "Cascaded"
+          },
+          "restated": {
+            "type": "integer",
+            "title": "Restated"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/DryRunFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "images": {
+            "type": "integer",
+            "title": "Images"
+          },
+          "deleted": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Deleted"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Missing"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "message",
+          "turns",
+          "sessions_affected",
+          "cascaded",
+          "restated",
+          "facts",
+          "images",
+          "deleted",
+          "missing"
+        ],
+        "title": "BatchDryRunResult",
+        "description": "delete_many with dry_run=true: deleted lists the ids that would be deleted; nothing is."
+      },
+      "BatchForgetResult": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "turns_deleted": {
+            "type": "integer",
+            "title": "Turns Deleted"
+          },
+          "sessions_affected": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sessions Affected"
+          },
+          "facts_before": {
+            "type": "integer",
+            "title": "Facts Before"
+          },
+          "facts_after": {
+            "type": "integer",
+            "title": "Facts After"
+          },
+          "images_deleted": {
+            "type": "integer",
+            "title": "Images Deleted"
+          },
+          "restated": {
+            "type": "integer",
+            "title": "Restated"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          },
+          "deleted": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Deleted"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Missing"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "message",
+          "turns_deleted",
+          "sessions_affected",
+          "facts_before",
+          "facts_after",
+          "images_deleted",
+          "restated",
+          "deleted",
+          "missing"
+        ],
+        "title": "BatchForgetResult",
+        "description": "delete_many: deleted lists the ids that were deleted; missing lists unknown ids and ids\noutside this key's scope."
       },
       "Citation": {
         "properties": {
@@ -4372,14 +4736,20 @@
           "at": {
             "anyOf": [
               {
-                "type": "string",
-                "format": "date-time"
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "At"
+            "title": "At",
+            "description": "ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"
           },
           "mode": {
             "type": "string",
@@ -6062,14 +6432,20 @@
           "at": {
             "anyOf": [
               {
-                "type": "string",
-                "format": "date-time"
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "At"
+            "title": "At",
+            "description": "ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"
           },
           "router": {
             "type": "string",

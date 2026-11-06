@@ -69,8 +69,10 @@ def build_embedder(
     ledger: Ledger | None = None,
     http_client: httpx2.Client | None = None,
     use_cache: bool = True,
+    cache_best_effort: bool = False,
 ) -> TextEmbedder:
-    """按配置构造向量器；默认外面包一层内容哈希缓存。"""
+    """按配置构造向量器；默认外面包一层内容哈希缓存。cache_best_effort：缓存写不进去（磁盘满了、
+    只读）时只记警告（见 EmbeddingCache），MemorySystem.from_settings 打开，评测与脚本不打开。"""
     from cuemem.embed.cache import CachedEmbedder, EmbeddingCache
 
     cfg = settings.embedding
@@ -104,9 +106,11 @@ def build_embedder(
             inner = DashScopeTextEmbedder(cfg, api_key, http_client=http_client, ledger=ledger)
     if not use_cache:
         return inner
-    return CachedEmbedder(
-        inner, EmbeddingCache(settings.paths.embed_cache), instruct=cfg.query_instruct
-    )
+    from cuemem.store.files import opening
+
+    with opening(settings.paths.embed_cache):  # 打不开时 DatabaseOpenError（一行说明）
+        cache = EmbeddingCache(settings.paths.embed_cache, best_effort=cache_best_effort)
+    return CachedEmbedder(inner, cache, instruct=cfg.query_instruct)
 
 
 def image_vectors_enabled(settings: Settings) -> bool:

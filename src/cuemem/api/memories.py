@@ -10,7 +10,10 @@
     PUT    /api/v1/memories/{id}             update（text 或 data、metadata）
     GET    /api/v1/memories/{id}/history     history
     DELETE /api/v1/memories/{id}             delete（dry_run）
-    DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id）
+    POST   /api/v1/memories/batch-delete     delete_many（memory_ids、dry_run；MemoryClient 的
+                                             batch_delete 也发到这里）
+    DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id、dry_run：
+                                             预演只能与 run_id 一起）
     GET    /api/v1/media/{id}                media（图片的原文件）
     POST   /api/v1/reset                     reset
     GET    /api/v1/status                    status（抽取的状态：待处理、失败的会话与原因）
@@ -48,7 +51,6 @@ import json
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
 import anyio
@@ -61,7 +63,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.routing import APIRoute
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, WithJsonSchema
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cuemem import __version__
@@ -73,9 +75,19 @@ from cuemem.errors import (
     CueMemError,
     EmbeddingAPIError,
     IdempotencyConflictError,
+    SessionLimitError,
 )
 from cuemem.read.controller import Router
-from cuemem.sdk import AnswerMode, Lam, Memory, MinLevel, SearchMode, _scope, space_for
+from cuemem.sdk import (
+    AnswerMode,
+    Lam,
+    Memory,
+    MinLevel,
+    SearchMode,
+    _moment,
+    _scope,
+    space_for,
+)
 from cuemem.store.media import ACCEPTED_FORMATS
 
 PREFIX = "/api/v1"
@@ -134,6 +146,15 @@ class AddRequest(BaseModel):
     wait: bool = False
 
 
+# 时刻（search、context、answer 的 at，get_all 的 known_at）：原样交给接口，与本地的 Memory 用同一个
+# sdk._moment 解析（第七轮复审）。以前由 Pydantic 解析：'20300101' 读成 1970 年的秒数，本地读成
+# 2030-01-01；毫秒与只有数字的文本本地报错、这里照收。不收 true、false
+Moment = Annotated[
+    str | StrictInt | StrictFloat | None,
+    Field(description="ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"),
+]
+
+
 class SearchRequest(BaseModel):
     query: str
     user_id: str | None = None
@@ -141,7 +162,7 @@ class SearchRequest(BaseModel):
     run_id: str | None = None
     limit: int | None = None
     mode: SearchMode = "auto"
-    at: datetime | None = None
+    at: Moment = None
     router: Router = "learned"
     lam: Lam = None
     filters: dict[str, Any] | None = None
@@ -154,7 +175,7 @@ class ContextRequest(BaseModel):
     query: str
     user_id: str | None = None
     agent_id: str | None = None
-    at: datetime | None = None
+    at: Moment = None
     mode: SearchMode = "auto"
     router: Router = "learned"
     lam: Lam = None
@@ -167,7 +188,7 @@ class AnswerRequest(BaseModel):
     user_id: str | None = None
     agent_id: str | None = None
     mode: AnswerMode = "auto"
-    at: datetime | None = None
+    at: Moment = None
     router: Router = "learned"
     lam: Lam = None
 
@@ -177,6 +198,11 @@ class UpdateRequest(BaseModel):
     text: str | None = None
     data: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+class BatchDeleteRequest(BaseModel):
+    memory_ids: list[str]
+    dry_run: bool = False
 
 
 class RunRequest(BaseModel):
@@ -415,6 +441,21 @@ class DryRunResult(_Out):
     images: int
 
 
+class BatchForgetResult(ForgetResult):
+    """delete_many: deleted lists the ids that were deleted; missing lists unknown ids and ids
+    outside this key's scope."""
+
+    deleted: list[str]
+    missing: list[str]
+
+
+class BatchDryRunResult(DryRunResult):
+    """delete_many with dry_run=true: deleted lists the ids that would be deleted; nothing is."""
+
+    deleted: list[str]
+    missing: list[str]
+
+
 class ResetResult(_Out):
     message: str
     spaces_deleted: list[str]
@@ -590,6 +631,10 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(400, str(exc), error_type=type(exc).__name__) from exc
     except (ConcurrentWriteError, IdempotencyConflictError) as exc:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
+    except SessionLimitError as exc:  # open_run 到了上限：结束一个 run 或等闲置的被结束
+        raise V1Error(
+            429, str(exc), error_type="SessionLimitError", headers={"Retry-After": "60"}
+        ) from exc
     except Exception as exc:
         failure = provider_failure(exc)
         if failure is not None:
@@ -750,7 +795,7 @@ def memories_router(
                 run_id=request.run_id,
                 limit=request.limit,
                 mode=request.mode,
-                at=request.at,
+                at=_moment("at", request.at),
                 router=request.router,
                 lam=request.lam,
                 filters=request.filters,
@@ -767,7 +812,7 @@ def memories_router(
                 request.query,
                 user_id=request.user_id,
                 agent_id=request.agent_id,
-                at=request.at,
+                at=_moment("at", request.at),
                 mode=request.mode,
                 router=request.router,
                 lam=request.lam,
@@ -783,7 +828,7 @@ def memories_router(
         run_id: str | None = None,
         include_superseded: bool = False,
         valid_at: str | None = None,
-        known_at: datetime | None = None,
+        known_at: str | None = None,  # 时刻，见 Moment
         limit: int | None = None,
         filters: str | None = None,
         top_k: int | None = None,
@@ -798,23 +843,32 @@ def memories_router(
                 run_id=run_id,
                 include_superseded=include_superseded,
                 valid_at=valid_at,
-                known_at=known_at,
+                known_at=_moment("known_at", known_at),
                 limit=limit,
                 filters=where,
                 top_k=top_k,
                 show_expired=show_expired,
             )
 
-    @router.delete("/memories", responses=_ok(ForgetResult))
+    @router.delete(
+        "/memories",
+        responses=_ok(ForgetResult | DryRunResult),
+        description="Delete all memories of a user (or agent), or only one run with run_id. "
+        "dry_run=true needs run_id and only lists what would be deleted. A run_id with no "
+        "conversation turns deletes nothing and answers 'No such run: nothing deleted'.",
+    )
     def delete_all(
         http: Request,
         user_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        dry_run: bool = False,
     ) -> V1Json:
         with _sdk_errors():
             allow(http, user_id, agent_id)
-            return memory.delete_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
+            return memory.delete_all(
+                user_id=user_id, agent_id=agent_id, run_id=run_id, dry_run=dry_run
+            )
 
     @router.get("/memories/{memory_id}", responses=_ok(MemoryItem))
     def get(http: Request, memory_id: str) -> V1Json:
@@ -848,6 +902,22 @@ def memories_router(
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
             return memory.delete(memory_id, dry_run=dry_run)
+
+    @router.post(
+        "/memories/batch-delete",
+        responses=_ok(BatchForgetResult | BatchDryRunResult),
+        description="Delete several memories (fact, excerpt or image ids) with one rebuild per "
+        "memory space; at most 100 ids. Unknown ids and ids outside this key's scope are listed "
+        "in missing, not an error. dry_run=true only lists what would be deleted.",
+    )
+    def delete_many(http: Request, request: BatchDeleteRequest) -> V1Json:
+        # 一次写入（rate_per_minute 算一个）。管理令牌照 SDK；限定作用域的令牌只删作用域里的，
+        # 别的 ID 与不存在的一样进 missing（与 reset 同样的分法）
+        who = principal_of(http)
+        with _sdk_errors():
+            if who.admin:
+                return memory.delete_many(request.memory_ids, dry_run=request.dry_run)
+            return memory._delete_many(request.memory_ids, dry_run=request.dry_run, keep=who.allows)
 
     @router.get(
         "/media/{media_id}",
@@ -893,7 +963,7 @@ def memories_router(
                 user_id=request.user_id,
                 agent_id=request.agent_id,
                 mode=request.mode,
-                at=request.at,
+                at=_moment("at", request.at),
                 router=request.router,
                 lam=request.lam,
             )

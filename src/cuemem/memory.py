@@ -10,12 +10,12 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 import httpx2
 from pydantic import BaseModel, Field
@@ -34,8 +34,14 @@ from cuemem.core.models import (
     Turn,
     TurnMeta,
 )
-from cuemem.core.timeutil import naive_local, valid_period
-from cuemem.core.trace import TraceSink, current_trace, start_trace, trace_queries
+from cuemem.core.timeutil import expiry_instant, naive_local, valid_period
+from cuemem.core.trace import (
+    TraceSink,
+    current_trace,
+    record_event,
+    start_trace,
+    trace_queries,
+)
 from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
@@ -64,12 +70,19 @@ from cuemem.read.plan import QueryPlan, rule_plan
 from cuemem.read.probe import Probe
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
-from cuemem.store.files import private_dirs, storage_dirs
+from cuemem.store.files import (
+    lock_database,
+    opening,
+    private_dirs,
+    storage_dirs,
+    unlock_database,
+)
 from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 from cuemem.write.consolidate import (
     MAX_ATTEMPTS,
+    REBUILD_PENDING,
     ConsolidationReport,
     ConsolidationWorker,
     Consolidator,
@@ -96,6 +109,8 @@ class Recall:
     details: dict[str, Any] = field(default_factory=dict)  # L2 的计划、充分性检查等
     # 学到的控制器的探针打过分的候选（mode="auto" 时）：L0 改走 L1 时直接打包（见 retrieve）
     candidates: L1Candidates | None = None
+    # hide_expired 时算出的过期记忆（没打开时 None）：改走 L1 的第二次检索传回去，不再算一遍
+    expired: frozenset[str] | None = None
 
 
 @dataclass
@@ -229,6 +244,15 @@ def _strings(value: Any) -> Iterator[str]:
 
 def _error_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:300]}"
+
+
+def _record_profile(core: CoreMemory | None) -> None:
+    """往当前 trace 记下交给模型的画像出自哪些事实（profile 事件）：回答常常只是转述画像里的
+    一行，trace 里没有原话也没有 ID，遗忘这条事实时就找不到它（第七轮体检 P4）。有了 ID，
+    _remove_traces 按 ID 删掉这些 trace。画像几乎每次都给，遗忘画像里的事实会删掉这个空间
+    几乎所有问答的 trace（宁可多删，同 D-046、D-051）。不在 trace 里时什么也不做。"""
+    if core is not None and core.fact_ids:
+        record_event("profile", facts=list(core.fact_ids))
 
 
 def _without_images(text: str) -> str:
@@ -379,9 +403,11 @@ class MemorySystem:
         reranker: Reranker | None = None,
         media: MediaStore | None = None,
         image_embedder: ImageEmbedder | None = None,
+        db_lock: IO[str] | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
+        self._db_lock = db_lock  # from_settings 给数据库加的锁（见 lock_database），close 时放掉
         self.vectors = vectors
         vectors.owned_units = db.some_unit_ids  # 旧名字的集合按数据库核对归属（见 collection_name）
         self.embedder = embedder
@@ -435,6 +461,7 @@ class MemorySystem:
         self._gates_guard = threading.Lock()
         self._forget_epochs: dict[str, int] = {}  # 空间 → 遗忘过几次（见 forget_epoch），同上一把锁
         self._traces_expired: date | None = None  # 哪天删过过期的 trace（见 expire_traces）
+        self._memories_expired: date | None = None  # 哪天删过过期的记忆（见 expire_memories）
 
     @classmethod
     def from_settings(
@@ -447,44 +474,72 @@ class MemorySystem:
         """按配置组装各组件。http_client 用于测试时注入模拟的网络层；on_peak_wait：wait 策略下
         遇到高峰、开始暂停时通知调用方（每段高峰每个供应商一次）。
 
-        新建的数据目录只给本人（0700，第四轮体检），已经存在的不改：见 store/files.py。"""
+        新建的数据目录只给本人（0700，第四轮体检），已经存在的不改：见 store/files.py。
+
+        账本与两个缓存是 best_effort（第七轮体检）：磁盘满了、只读时少记一笔、少缓存一条，记一条
+        警告，检索与回答照样返回（以前每个没见过的问题都抛出 database or disk is full，已经付费的
+        回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。"""
         private_dirs(*storage_dirs(settings))
         paths = settings.paths
-        ledger = Ledger(paths.ledger)
-        embedder = build_embedder(settings, ledger=ledger, http_client=http_client)
-        db = MemoryDB(paths.db)
-        # 记录建库时的向量模型，防止换模型后新旧向量混在一起
-        db.check_or_set_meta("embedder", f"{embedder.name}:{embedder.dim}")
-        llm = LLMClient(
-            settings,
-            cache=ResponseCache(paths.llm_cache),
-            ledger=ledger,
-            http_client=http_client,
-            on_peak_wait=on_peak_wait,
-        )
-        # 图片向量与文本向量共用一个缓存连接：另开一个连接写缓存，文本那边就当缓存被别人改过，
-        # 巩固丢掉跨运行留着的镜像（见 build_image_embedder）
-        cache = embedder.cache if isinstance(embedder, CachedEmbedder) else None
-        return cls(
-            settings,
-            db=db,
-            vectors=VectorStore(
+        # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
+        # 关掉已经打开的：以前账本打开了、数据库打不开时账本的连接一直开着（长期运行的 SDK 进程）
+        with ExitStack() as opened:
+            # 先拿数据库的锁：另一个进程开着它时什么都不打开，本地模式下也先于 Qdrant 的锁报错
+            db_lock = lock_database(paths.db)
+            opened.callback(unlock_database, db_lock)
+            with opening(paths.ledger):
+                ledger = Ledger(paths.ledger, best_effort=True)
+            opened.callback(ledger.close)
+            embedder = build_embedder(
+                settings, ledger=ledger, http_client=http_client, cache_best_effort=True
+            )
+            if isinstance(embedder, CachedEmbedder):
+                opened.callback(embedder.cache.close)
+            with opening(paths.db):
+                db = MemoryDB(paths.db)
+            opened.callback(db.close)
+            # 记录建库时的向量模型，防止换模型后新旧向量混在一起
+            db.check_or_set_meta("embedder", f"{embedder.name}:{embedder.dim}")
+            with opening(paths.llm_cache):
+                response_cache = ResponseCache(paths.llm_cache, best_effort=True)
+            opened.callback(response_cache.close)
+            llm = LLMClient(
+                settings,
+                cache=response_cache,
+                ledger=ledger,
+                http_client=http_client,
+                on_peak_wait=on_peak_wait,
+            )
+            vectors = VectorStore(
                 paths.qdrant,
                 dim=embedder.dim,
                 url=settings.vector_store.url,
                 api_key=settings.vector_store.secret(),
-            ),
-            embedder=embedder,
-            llm=llm,
-            ledger=ledger,
-            tracer=TraceSink(paths.traces),
-            owns_caches=True,
-            reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
-            media=MediaStore(paths.media),
-            image_embedder=build_image_embedder(
-                settings, ledger=ledger, http_client=http_client, cache=cache
-            ),
-        )
+            )
+            opened.callback(vectors.close)
+            # 图片向量与文本向量共用一个缓存连接：另开一个连接写缓存，文本那边就当缓存被别人改过，
+            # 巩固丢掉跨运行留着的镜像（见 build_image_embedder）
+            cache = embedder.cache if isinstance(embedder, CachedEmbedder) else None
+            system = cls(
+                settings,
+                db=db,
+                vectors=vectors,
+                embedder=embedder,
+                llm=llm,
+                ledger=ledger,
+                tracer=TraceSink(paths.traces),
+                owns_caches=True,
+                reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
+                # 写入与遗忘在媒体库里留标记（见 store/media.py）：进程被杀时 recover_media
+                # 收拾原图。评测空间（ephemeral、on_disk）不写：它们的图片记录不在这个数据库里
+                media=MediaStore(paths.media, owner=str(paths.db.absolute())),
+                image_embedder=build_image_embedder(
+                    settings, ledger=ledger, http_client=http_client, cache=cache
+                ),
+                db_lock=db_lock,
+            )
+            opened.pop_all()  # 都打开了：之后由 close 关
+        return system
 
     @classmethod
     def ephemeral(
@@ -988,6 +1043,12 @@ class MemorySystem:
           report_rebuild_errors=True 时不抛出，写在报告的 rebuild_error 里：HTTP 接口、MCP、SDK 与
           各集成据此说明删除已经做了、只是派生记忆要等下次巩固（以前它们把供应商的出错照搬成
           "遗忘失败"，调用方以为没删）。
+
+        快速路径（第七轮体检）：整段删掉的会话在派生层里什么都没留下（_inert_sessions：没有事实、
+        没有新建或关联的实体，空间里没有待处理的任务；update() 抽不出事实的更正就是这样）时，
+        事务里不清空派生层，只删这几个会话的片段、摘要与任务（MemoryDB.drop_inert_sessions），
+        不重放；对账与消歧的缓存原样留着。结果与重放相同（tests/test_forget_fast.py），trace
+        记 fast_path。
         """
         started = time.perf_counter()
         with (
@@ -1015,12 +1076,18 @@ class MemorySystem:
             refs = {u.id for u in old_rounds if doomed & set(u.source_turn_ids)}
             refs |= {f.id for f in facts if doomed & set(f.source_turn_ids)}
             refs |= {m.id for m in doomed_media}
+            # 整段删掉的会话什么都没留下时不重放（第七轮体检）：只删它们的片段、摘要与任务
+            fast = self._inert_sessions(space_id, affected, doomed, facts, doomed_media, refs)
 
             # 1. 联网的几步，数据库不动：先写新"轮"的向量（库里有记录，向量就一定在），再删要失去
             #    记录的向量（与以前删旧"轮"相同，先删向量、后删记录）。出错时什么都没删
             new_rounds = self.writer.prepare_rounds(space_id, affected, doomed)
             kept = {u.id for u in new_rounds}
-            derived = self.db.derived_unit_ids(space_id)
+            if fast:  # 只有这几个会话的摘要要失去记录，别的派生记忆都留着
+                summaries = self.db.list_units(space_id, kinds=["summary"], session_ids=affected)
+                derived = [u.id for u in summaries]
+            else:
+                derived = self.db.derived_unit_ids(space_id)
             self.vectors.delete(space_id, [u.id for u in old_rounds if u.id not in kept] + derived)
             self.vectors.delete_images(space_id, [m.id for m in doomed_media])
 
@@ -1034,7 +1101,19 @@ class MemorySystem:
             if cache is not None:
                 parts = [f"session:{sid}" for sid in affected] + ["ask", "forget"]
                 llm_purged = sum(cache.delete_scope(scope(space_id, p)) for p in parts)
-                cache.hold(held)
+                if not fast:  # 快速路径不重放：对账与消歧的条目都还是剩下的日志算得出来的
+                    cache.hold(held)
+            # 要删的原图先记下标记（第七轮体检）：提交之后、删原图之前进程被杀掉时，之后的
+            # recover_media 按它删掉；不然记录没了，再也找不到这个文件
+            marks: list[Path] = []
+            if self.media is not None and doomed_media:
+                try:
+                    marks = self.media.mark_deleting((m.sha256, Path(m.path)) for m in doomed_media)
+                except BaseException:  # 写不了标记（磁盘满）：什么都没删，标记的缓存条目原样留下
+                    if cache is not None and not fast:
+                        cache.release(held)
+                    raise
+            images_done = False  # 原图都删掉了（没删掉的标记留给 recover_media）
             committed = False
             try:
                 # 3. 一个事务：换上新的"轮"，删发言，清空派生层，按原来的任务重新登记。进行中的
@@ -1043,16 +1122,21 @@ class MemorySystem:
                 with self._open_lock:
                     skip = {sid for space, sid in self._open if space == space_id}
                     with self.db.transaction() as conn:
-                        before = self.db.get_jobs(space_id)
+                        before = [] if fast else self.db.get_jobs(space_id)
                         self.db.delete_units(space_id, [u.id for u in old_rounds])
                         if new_rounds:
                             self.db.add_units(new_rounds)
                         deleted = self.db.delete_turns(space_id, [t.id for t in targets])
                         # add 的 idempotency_key 写下过这些发言的只留墓碑（第六轮体检）
                         self.db.add_key_forget(conn, space_id, doomed)
-                        removed = self.db.clear_derived(space_id)
-                        self.consolidator.requeue(space_id, before, skip)
+                        if fast:
+                            removed = self.db.drop_inert_sessions(space_id, affected)
+                        else:
+                            removed = self.db.clear_derived(space_id)
+                            self.consolidator.requeue(space_id, before, skip)
                 committed = True
+                if fast:
+                    trace.attrs.update(fast_path=True)
                 # 还在独占里：之后的读取（进行中的会话的下一轮）都看得到这次遗忘。之后重建出错
                 # 抛出时也已经加过：日志已经删了。重放之后再加一次（见下面的 finally）
                 self._bump_forget_epoch(space_id)
@@ -1065,9 +1149,11 @@ class MemorySystem:
                 images_deleted = images_left = 0
                 try:
                     images_deleted, images_left = self._delete_image_files(doomed_media)
+                    images_done = images_left == 0
                     self.vectors.delete(space_id, sorted(set(removed) - set(derived)))
-                    with cache.recording(reused) if cache is not None else nullcontext():
-                        self.consolidator.run(space_id)  # 没有待处理的任务时什么都不做
+                    if not fast:
+                        with cache.recording(reused) if cache is not None else nullcontext():
+                            self.consolidator.run(space_id)  # 没有待处理的任务时什么都不做
                 except Exception as exc:  # 清理照样做完（下面的 finally），之后再抛出或写进报告
                     failed = exc
                 finally:
@@ -1123,6 +1209,9 @@ class MemorySystem:
                             exc_info=True,
                         )
                         trace.attrs.update(embed_cache_left=True)
+                    # 7. Claude 记忆工具的文件（第七轮体检）：笔记被删了的文件去掉，与工具下次
+                    #    打开时（_own）做的相同；以前要等工具再打开这个空间，不再打开就一直留着
+                    self._prune_claude_store(space_id, doomed, trace)
                     try:  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
                         self.db.scrub()
                     except Exception:
@@ -1132,9 +1221,13 @@ class MemorySystem:
                             exc_info=True,
                         )
             finally:  # 中途出错时重放用到的更少，删得更多
-                if cache is not None and committed:
+                if self.media is not None:  # 没提交时记录都在，标记也不要了
+                    self.media.unmark_deleting(marks, done=images_done or not committed)
+                if cache is None or fast:
+                    pass
+                elif committed:
                     llm_purged += cache.settle(held, reused)
-                elif cache is not None:  # 事务没提交：日志与派生层都没动，标记的条目原样留下
+                else:  # 事务没提交：日志与派生层都没动，标记的条目原样留下
                     cache.release(held)
                 if committed:
                     # 重放之后再加一次（还在独占里）：提交时加过的那次之后、重放做完之前，不在
@@ -1169,6 +1262,94 @@ class MemorySystem:
                 trace.attrs.update(rebuild_error=report.rebuild_error)
         return report
 
+    def _prune_claude_store(
+        self, space_id: str, turn_ids: Collection[str] | None, trace: Any | None
+    ) -> None:
+        """清理数据目录下 Claude 记忆工具的存储（claude_memory.sqlite，第七轮体检）：turn_ids
+        为 None 时删掉这个空间的一切（删除空间），否则去掉笔记在这些发言里的文件。存储不存在时
+        什么都不做（不建）。在提交之后调用：出错时记警告、不抛出，trace 记 claude_memory_left。"""
+        from cuemem.integrations._claude_store import STORE_NAME, prune_turns, purge_space
+
+        store = self.settings.paths.db.parent / STORE_NAME
+        try:
+            if turn_ids is None:
+                purge_space(store, space_id)
+            else:
+                prune_turns(store, space_id, turn_ids)
+        except Exception:
+            logger.warning(
+                "遗忘 %s：Claude 记忆工具的文件没能清理，%s 里可能还有被删的内容",
+                space_id,
+                store,
+                exc_info=True,
+            )
+            if trace is not None:
+                trace.attrs.update(claude_memory_left=True)
+            else:
+                record_event("claude_memory_left", space=space_id)
+
+    def _inert_sessions(
+        self,
+        space_id: str,
+        affected: Sequence[str],
+        doomed: set[str],
+        facts: Sequence[Fact],
+        doomed_media: Sequence[MediaItem],
+        refs: Collection[str],
+    ) -> bool:
+        """遗忘能不能走快速路径（第七轮体检）：要删的会话整段删掉，而且它们在派生层里什么都
+        没留下，从剩下的日志重放得到的派生记忆与现在的只差它们的片段、摘要与任务。以前 update()
+        的更正抽不出事实时也把整个空间清空重放（2 万轮的空间约 59 秒，期间这个用户的读取都在
+        等）。在遗忘的独占里调用。全部成立才是 True：
+
+        - 受影响的会话的每一句都在要删的里面（只删一部分时剩下的要重新抽取）；
+        - 没有要删的图片，没有事实出自要删的发言；
+        - 每个受影响的会话恰好有一个没被取代的任务：已完成，统计里没有事实（facts 为 0，合并与
+          重复也不算），没有新建或关联实体，不是内容审核跳过的；
+        - 整个空间没有待处理或失败的任务，派生记忆没有过期（stale），之前的重建做完了：重放
+          除了跳过这几个会话不会做别的；
+        - 没有别的发言引用过被删的记忆（沿引用扩散的已经在要删的里面，只删一部分会话不成立）；
+        - 删掉之后说话人（核心记忆按他们挑实体）不变；没有巩固过的会话正在进行中。
+
+        与重放的差别只在 LLM 缓存：重放用不到的对账与消歧条目留着。这几个会话没有发过对账与
+        消歧请求（没有事实、没有关联实体），条目里不会有它们的内容。"""
+        if not affected or doomed_media:
+            return False
+        if any(doomed.intersection(f.source_turn_ids) for f in facts):
+            return False
+        if any(t.id not in doomed for t in self.db.turns_of(space_id, session_ids=affected)):
+            return False
+        sessions = set(affected)
+        own: dict[str, list[dict[str, Any]]] = {}
+        with_jobs: set[str] = set()
+        for job in self.db.get_jobs(space_id):
+            if job["status"] not in ("done", "superseded"):
+                return False
+            with_jobs.add(job["session_id"])
+            if job["session_id"] in sessions and job["status"] == "done":
+                own.setdefault(job["session_id"], []).append(job)
+        for sid in affected:
+            jobs = own.get(sid, [])
+            if len(jobs) != 1:
+                return False
+            stats = jobs[0]["stats"]
+            if "skipped" in stats or any(
+                stats.get(k, 1) != 0 for k in ("facts", "entities_created", "entities_linked")
+            ):
+                return False
+        if self.consolidator.stale(space_id):
+            return False
+        if self.db.get_meta(f"consolidation:{space_id}") == REBUILD_PENDING:
+            return False
+        if any(t not in doomed for t in self.db.citing_turns(space_id, sorted(refs))):
+            return False
+        if self.db.speakers(space_id) != self.db.speakers(space_id, without_sessions=affected):
+            return False
+        # 进行中、巩固过的会话：重放时跳过它（requeue 的 skip），它的派生记忆暂时没了；这里
+        # 不碰它会不一样，所以照旧重放
+        with self._open_lock:
+            return not any(space == space_id and sid in with_jobs for space, sid in self._open)
+
     def _delete_image_files(self, items: Sequence[MediaItem]) -> tuple[int, int]:
         """遗忘提交之后删掉被删图片的原图文件：没有别的记录引用、本进程里也没有正在写入它的。
         返回（删掉的，没删掉的）张数。删不掉（没有权限、只读的文件系统）时记一条警告、接着删
@@ -1190,6 +1371,17 @@ class MemorySystem:
                     exc_info=True,
                 )
         return deleted, left
+
+    def recover_media(self) -> tuple[int, int]:
+        """收拾被杀掉的写入与遗忘留在媒体库里的原图（MediaStore.recover，第七轮体检）：标记点名、
+        这个数据库里没有记录引用的原图删掉。cuemem serve 与 cuemem proxy 启动时与之后每小时
+        （api.app._sweep_jobs）、cuemem reindex 调用。返回（删掉的，有记录、留着的）张数。"""
+        if self.media is None:
+            return 0, 0
+        deleted, kept = self.media.recover(self.db.media_sha_in_use)
+        if deleted:
+            logger.info("媒体库：删掉 %d 张没有提交的写入或遗忘留下的原图", deleted)
+        return deleted, kept
 
     def _hand_over(self, space_id: str) -> None:
         """遗忘提交之后还有没做完的巩固（重放抛出了异常，或有会话抽取失败）：有后台线程时交给它，
@@ -1541,6 +1733,8 @@ class MemorySystem:
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.vectors.delete_space(space_id)  # 先于数据库：旧名字的集合按库里的记忆单元核对归属
             self.db.delete_space(space_id)
+            # Claude 记忆工具在这个空间里的一切（没有笔记的文件、spaces 里的那一行也在内）
+            self._prune_claude_store(space_id, None, None)
             self._bump_forget_epoch(space_id)  # 画像等派生记忆也没了（空间里没有会话时遗忘不加）
             prefix = _open_mark(space_id)
             with self._open_lock:  # 与 open_session 的顺序相同：先这把锁、后数据库
@@ -1635,6 +1829,63 @@ class MemorySystem:
                 "删掉了 %d 个 %d 天之前的 trace 文件，清掉 %d 个查询向量", files, days, purged
             )
         return files, purged
+
+    def purge_expired(
+        self,
+        space_id: str | None = None,
+        *,
+        older_than: timedelta,
+        now: datetime | None = None,
+    ) -> dict[str, ForgetReport]:
+        """真的删掉过期了 older_than 以上的发言（SDK 的 expiration_date）：按空间各遗忘一次
+        （forget，连同派生的事实、摘要、向量、图片、缓存与 trace，再从剩下的日志重放）。
+        space_id 为 None 时是所有有过期时间的空间。返回空间 → 遗忘的报告，没有要删的空间不在里面
+        （不重放、不发请求）。
+
+        只删过期的发言本身（follow_citations=False）：后来没给过期时间、引用了它的回复留着，
+        同读取时的规则（一条记忆的出处各句都过期了才过期）；同一件事后来又说过一次的，重放时
+        从那一句重新抽出来。已经导出的文件不在 CueMem 里，删不到。
+
+        一个空间出错不影响别的空间，都做完之后把第一个出错抛出去（删掉的不会再删一遍）。"""
+        cutoff = (now or datetime.now()) - older_than
+        spaces = [space_id] if space_id is not None else self.db.spaces_with_expiring()
+        reports: dict[str, ForgetReport] = {}
+        failed: Exception | None = None
+        for space in spaces:
+            stamps = self.db.expiring_turns(space)
+            doomed = sorted(t for t, stamp in stamps.items() if expiry_instant(stamp) <= cutoff)
+            if not doomed:
+                continue
+            try:
+                reports[space] = self.forget(
+                    space, turn_ids=doomed, follow_citations=False, report_rebuild_errors=True
+                )
+            except Exception as exc:
+                logger.warning("删空间 %s 里过期的记忆出错", space, exc_info=True)
+                failed = failed or exc
+        if failed is not None:
+            raise failed
+        return reports
+
+    def expire_memories(self, *, today: date | None = None) -> dict[str, ForgetReport]:
+        """按配置的 expired_retention_days 删过期的记忆（purge_expired）：cuemem serve 与 cuemem
+        proxy 启动时与之后每分钟调用一次（见 api.app._sweep），每天只在第一次真的去删。没设时
+        什么都不做（默认）：过期的记忆只是读取时不给出，要 delete 才删。每个要删的空间重放一遍
+        （巩固的请求大多由 LLM 缓存给出），重放期间这个空间的读写都要等。"""
+        days = self.settings.expired_retention_days
+        today = today or date.today()
+        if days is None or self._memories_expired == today:
+            return {}
+        reports = self.purge_expired(older_than=timedelta(days=days))
+        self._memories_expired = today  # 出错时下一分钟再试（已经删掉的不会再删）
+        if reports:
+            logger.info(
+                "删掉了 %d 个空间里过期 %d 天以上的 %d 条发言",
+                len(reports),
+                days,
+                sum(r.turns_deleted for r in reports.values()),
+            )
+        return reports
 
     # ---------- 读取 ----------
 
@@ -1786,11 +2037,12 @@ class MemorySystem:
                 core = self.db.get_core_memory(space_id)
                 if gone:  # 画像与 memory_search 同样不给过期的记忆
                     core = self.visible_core(space_id, core, now)
+                _record_profile(core)
 
                 def search(query: str, cfg: L1Config) -> L1Result:
                     if not gone:
                         return self.l1.search(space_id, query, when, cfg)
-                    found = self.l1.search(space_id, query, when, cfg, exclude=gone)
+                    found = self.l1.search(space_id, query, when, cfg, hidden=gone)
                     media = {mid: m for mid, m in found.media.items() if mid not in gone}
                     return replace(
                         found,
@@ -1822,6 +2074,8 @@ class MemorySystem:
                     current_only=validity == "current",
                     chain=validity == "full",
                 )
+                if profile:
+                    _record_profile(view.core)
                 answer = self.reader.answer_with_memory(
                     question,
                     view,
@@ -1854,6 +2108,7 @@ class MemorySystem:
         cache_scope: str | None = None,
         candidates: L1Candidates | None = None,
         hide_expired: bool = False,
+        expired: frozenset[str] | None = None,
     ) -> Recall:
         """只检索、不回答：按 mode 取记忆（auto 由检索控制器选档），返回交给回答模型的材料。
 
@@ -1863,10 +2118,10 @@ class MemorySystem:
         探针打过分的候选不丢：控制器选 L1 时直接打包；选 L2 时原问题的召回用探针的结果（见
         L2Retriever.search）；返回的 Recall 带着它们，调用方把 L0 改走 L1 时（recall_listing 的
         at_least_l1）以 mode="l1" 与 candidates 传回来、直接打包，不再检索一遍。candidates 必须
-        是同一个问题、同一个问题时间、同样的 exclude 与 L1 配置下的探针结果，调用方还要在两次
-        检索期间一直持有这个空间的读（with reading(space_id)）：候选是探针取到内存里的轮与事实，
-        两次之间插进来的遗忘删掉了它们，打包出来的却还是它们。没有持有读时不用 candidates、
-        重新检索（R5 之前的做法，结果相同，只是多检索一遍）。
+        是同一个问题、同一个问题时间、同样的 exclude、同样的过期记忆与 L1 配置下的探针结果，
+        调用方还要在两次检索期间一直持有这个空间的读（with reading(space_id)）：候选是探针取到
+        内存里的轮与事实，两次之间插进来的遗忘删掉了它们，打包出来的却还是它们。没有持有读时
+        不用 candidates、重新检索（R5 之前的做法，结果相同，只是多检索一遍）。
 
         不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
@@ -1874,11 +2129,14 @@ class MemorySystem:
         遗忘等进行中的检索写完 trace（reading）。
 
         hide_expired：不给出已经过期的记忆（SDK 的 expiration_date，见 expiry.py）。过期的事实、
-        对话片段与图片加进 exclude（探针与各路检索都不看，名额留给别的），画像去掉过期的几行，
-        检索之后再筛一遍（版本链带出的旧事实、装入的轮里的图片）。过期按墙上时间算，不按
-        question_time，同 SDK 的 search。SDK 的 answer、记忆代理、MCP 与各框架集成打开它；评测、
-        命令行与冻结的方法不打开。空间里没有过期的记忆时（评测的空间从不写过期时间）只多查一次
-        turn_meta，exclude 与画像原样不动，请求逐字节不变。
+        对话片段与图片作为 hidden 交给探针与各路检索，在检索里就排除，名额留给别的记忆（第七轮
+        体检 P5：以前加进 exclude，各路先取前 pool 条再去掉，过期的照样占着名额）；exclude 本身
+        不变（N8 的 Agent 的工作记忆照旧取完再去掉）。画像去掉过期的几行，检索之后再筛一遍
+        （版本链带出的旧事实、装入的轮里的图片）。过期按墙上时间算，不按 question_time，同 SDK 的
+        search。SDK 的 answer、记忆代理、MCP 与各框架集成打开它；评测、命令行与冻结的方法不打开。
+        空间里没有过期的记忆时（评测的空间从不写过期时间）只多查一次 turn_meta，hidden 是空的，
+        画像原样不动，请求逐字节不变。返回的 Recall.expired 是这次算出的过期记忆；同一次 reading
+        里带着 candidates 再检索一次时把它作为 expired 传回来，不再算一遍。
         """
         tracing: AbstractContextManager[object] = (
             nullcontext()
@@ -1889,7 +2147,9 @@ class MemorySystem:
             candidates = None  # 在下面的 reading 里查就晚了：那时总是持有读
         with self.reading(space_id), tracing:
             now = datetime.now()  # 过期按墙上时间算（同 SDK 的 search），不按 question_time
-            gone = self.expired_ids(space_id, now) if hide_expired else frozenset()
+            gone: frozenset[str] = frozenset()
+            if hide_expired:
+                gone = expired if expired is not None else self.expired_ids(space_id, now)
             recall = self._retrieve(
                 space_id,
                 question,
@@ -1900,11 +2160,16 @@ class MemorySystem:
                 k=k,
                 l1=l1,
                 l2=l2,
-                exclude=frozenset(exclude) | gone if gone else exclude,
+                exclude=exclude,
+                hidden=gone,
                 cache_scope=cache_scope,
                 candidates=candidates,
             )
-            return self._without(space_id, recall, gone, now) if gone else recall
+            out = self._without(space_id, recall, gone, now) if gone else recall
+            if hide_expired:
+                out = replace(out, expired=gone)
+            _record_profile(out.view.core)  # 去掉过期的几行之后：记下的是交给模型的画像
+            return out
 
     def _retrieve(
         self,
@@ -1921,6 +2186,7 @@ class MemorySystem:
         exclude: Collection[str],
         cache_scope: str | None,
         candidates: L1Candidates | None,
+        hidden: frozenset[str] = frozenset(),
     ) -> Recall:
         """retrieve 的检索本身（调用方已经持有读、记着 trace）。"""
         when = naive_local(question_time) if question_time is not None else datetime.now()
@@ -1932,7 +2198,15 @@ class MemorySystem:
             candidates = None
         if mode == "auto":
             decision, candidates, used = self._route(
-                space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+                space_id,
+                question,
+                when,
+                l1 or L1Config(),
+                router,
+                lam,
+                cache_scope,
+                exclude,
+                hidden,
             )
             level = decision.level.lower()
             if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
@@ -1947,7 +2221,9 @@ class MemorySystem:
             if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
                 result = self.l1.pack(space_id, candidates, cfg)
             else:
-                result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
+                result = self.l1.search(
+                    space_id, question, when, cfg, exclude=exclude, hidden=hidden
+                )
             view = MemoryView(
                 rounds=result.rounds,
                 facts=result.facts,
@@ -1965,6 +2241,7 @@ class MemorySystem:
             l2_cfg,
             cache_scope=cache_scope,
             exclude=exclude,
+            hidden=hidden,
             probe=candidates,
         )
         view = MemoryView(
@@ -1998,7 +2275,7 @@ class MemorySystem:
     def _without(
         self, space_id: str, recall: Recall, gone: frozenset[str], now: datetime
     ) -> Recall:
-        """检索结果再去掉过期的：exclude 挡住了各路检索，版本链补上的旧事实与装入的轮里的图片
+        """检索结果再去掉过期的：hidden 挡住了各路检索，版本链补上的旧事实与装入的轮里的图片
         不经过它。"""
         view = recall.view
         media = {mid: m for mid, m in view.media.items() if mid not in gone}
@@ -2022,6 +2299,7 @@ class MemorySystem:
         lam: float | None,
         cache_scope: str,
         exclude: Collection[str] = (),
+        hidden: frozenset[str] = frozenset(),
     ) -> tuple[RouteDecision, L1Candidates | None, Router]:
         """检索控制器选档；学到的控制器先跑探针，选了 L1 时把探针的候选交回去直接打包。
 
@@ -2031,7 +2309,7 @@ class MemorySystem:
             return self.router.decide(question, cache_scope=cache_scope), None, "llm"
         if router == "rule" or self.learned is None:
             return self.controller.decide(question, when), None, "rule"
-        probe = self.probe.run(space_id, question, when, cfg, exclude=exclude)
+        probe = self.probe.run(space_id, question, when, cfg, exclude=exclude, hidden=hidden)
         has_images = probe.features.get("m_media", 0.0) > 0
         p_none: float | None = None
         asked = False
@@ -2107,6 +2385,8 @@ class MemorySystem:
                 image.cache.close()
         if self._owns_ledger:
             self.ledger.close()
+        lock, self._db_lock = self._db_lock, None
+        unlock_database(lock)  # 最后放：之后另一个进程才能打开这个数据库
 
     def __enter__(self) -> MemorySystem:
         return self

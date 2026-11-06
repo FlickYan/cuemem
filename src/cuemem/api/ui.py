@@ -29,10 +29,11 @@ from typing import Any, cast, get_args
 import gradio as gr
 from PIL import Image
 
-from cuemem.agent import Reply
+from cuemem.agent import ChatSession, Reply
 from cuemem.agent.runtime import RecalledItem, TurnTrace
 from cuemem.api.auth import ADMIN, Principal
 from cuemem.api.service import ChatService
+from cuemem.errors import SessionLimitError
 from cuemem.memory import RecallMode
 from cuemem.read.controller import Router, english_reason
 from cuemem.store.media import decoding
@@ -250,6 +251,7 @@ def build_ui(
                 with gr.Row():
                     refresh = gr.Button("Refresh", scale=0)
                     current_only = gr.Checkbox(label="Current facts only", value=False)
+                    show_expired = gr.Checkbox(label="Show expired", value=False)
                 with gr.Row():
                     with gr.Column(scale=2):
                         profile = gr.Markdown()
@@ -301,7 +303,7 @@ def build_ui(
             notice = ""
             if sid := mine(request, sid):
                 notice = _end(service, sid)
-            session = service.start(space, at=_parse_date(date))
+            session = _start(service, space, date)
             return (
                 session.session_id,
                 [],
@@ -341,7 +343,7 @@ def build_ui(
             if sid and not service.is_open(sid):  # 闲置太久，清理线程结束了它（已经交给抽取）
                 sid, notice = None, _ended_notice(service)
             if not sid:
-                sid = service.start(space, at=_parse_date(date)).session_id
+                sid = _start(service, space, date).session_id
             user: list[Any] = [text] if text else []
             user += [{"path": f} for f in files]
             history = [*history, {"role": "user", "content": user}]
@@ -392,15 +394,16 @@ def build_ui(
         )
 
         def load_memory(
-            space_id: str, current: bool, kind: str, request: gr.Request
+            space_id: str, current: bool, expired: bool, kind: str, request: gr.Request
         ) -> tuple[Any, ...]:
             sid = allowed(request, space_id)
-            rows = service.facts(sid, current_only=current)
+            # 过期的记忆（expiration_date）默认不显示，同画像；勾上 Show expired 时也显示
+            rows = service.facts(sid, current_only=current, show_expired=expired)
             table = [
                 [r["said_on"][:10], r["statement"], r["status"], r["replaced_by"] or ""]
                 for r in rows
             ]
-            media = service.media(sid)
+            media = service.media(sid, show_expired=expired)
             pictures = [
                 (m["path"], f"{m['ts'][:10]} · {m['caption'] or 'not described yet'}")
                 for m in media
@@ -412,7 +415,7 @@ def build_ui(
             ]
             return (
                 _profile_markdown(service.profile(sid)),
-                render_graph(service.graph(sid)),
+                render_graph(service.graph(sid, show_expired=expired)),
                 table,
                 pictures,
                 listed,
@@ -420,10 +423,11 @@ def build_ui(
             )
 
         memory_outputs = [profile, graph, facts, gallery, sessions, forget_target]
-        memory_inputs = [space, current_only, forget_kind]
+        memory_inputs = [space, current_only, show_expired, forget_kind]
         refresh.click(load_memory, memory_inputs, memory_outputs)
         memory_tab.select(load_memory, memory_inputs, memory_outputs)
         current_only.change(load_memory, memory_inputs, memory_outputs)
+        show_expired.change(load_memory, memory_inputs, memory_outputs)
 
         def choices(space_id: str, kind: str, request: gr.Request) -> Any:
             options = _forget_choices(service, allowed(request, space_id), kind)
@@ -746,12 +750,12 @@ def _forget_choices(service: ChatService, space_id: str, kind: str) -> list[tupl
     if kind == "fact":
         return [
             (f"{r['said_on'][:10]} · {r['statement'][:90]}", r["id"])
-            for r in service.facts(sid, current_only=True)
+            for r in service.facts(sid, current_only=True, show_expired=True)
         ]
     if kind == "image":
         return [
             (f"{m['ts'][:10]} · {(m['caption'] or 'image')[:80]}", m["id"])
-            for m in service.media(sid)
+            for m in service.media(sid, show_expired=True)
         ]
     return [
         (f"{s.started_at:%Y-%m-%d %H:%M} · {s.turns} turns · {s.session_id}", s.session_id)
@@ -802,6 +806,19 @@ def _end(service: ChatService, sid: str) -> str:
             "descriptions, profile)."
         )
     return "Session ended (it was empty)."
+
+
+def _start(service: ChatService, space: str, date: str) -> ChatSession:
+    """开一个会话；这个空间进行中的会话到了上限（SessionLimitError）时给出说明，而不是 Gradio
+    笼统的 "Error"（第七轮复审）。"""
+    try:
+        return service.start(space, at=_parse_date(date))
+    except SessionLimitError as exc:
+        raise gr.Error(
+            f"The memory space {space!r} has too many open sessions "
+            f"(the limit is {service.max_open_sessions}): end one, or wait until idle sessions "
+            "are cleaned up."
+        ) from exc
 
 
 def _parse_date(text: str) -> datetime | None:

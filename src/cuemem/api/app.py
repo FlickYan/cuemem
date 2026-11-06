@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import logging
+import math
 import shutil
 import threading
 import time
@@ -74,7 +75,7 @@ from cuemem.api.limits import (
 from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
-from cuemem.errors import CueMemError
+from cuemem.errors import CueMemError, SessionLimitError
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router
@@ -336,6 +337,10 @@ AllowedSpace = Annotated[str, Depends(_allowed_space)]
 
 
 SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话与过期的 trace（见 _sweep_jobs）
+# 清理线程多久收拾一次媒体库里被杀掉的操作留下的原图（见 MemorySystem.recover_media）：写标记的
+# 进程在别的主机、或者进程号被复用时，标记要过 store.media.RECOVER_AFTER_S 才算数，启动时那一遍
+# 收拾不到
+RECOVER_MEDIA_INTERVAL_S = 3600.0
 
 
 def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]) -> None:
@@ -353,13 +358,36 @@ def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]
 
 
 def _sweep_jobs(system: MemorySystem, *idle: Callable[[], object]) -> list[Callable[[], object]]:
-    """清理线程要做的事：结束闲置的会话（idle），设了 traces_retention_days 时再加上删过期的
-    trace（启动时与之后每天一次，见 MemorySystem.expire_traces）。cuemem serve 与 cuemem proxy
-    共用。"""
+    """清理线程要做的事：结束闲置的会话（idle），收拾被杀掉的写入与遗忘留在媒体库里的原图
+    （启动时与之后每小时一次，见 MemorySystem.recover_media），设了 traces_retention_days 时再
+    加上删过期的 trace（启动时与之后每天一次，见 MemorySystem.expire_traces），设了
+    expired_retention_days 时再加上删过期的记忆（同样每天一次，见 MemorySystem.expire_memories）。
+    cuemem serve 与 cuemem proxy 共用。"""
     jobs = list(idle)
+    if system.media is not None and system.media.owner is not None:  # 写标记的媒体库
+        jobs.append(_every(RECOVER_MEDIA_INTERVAL_S, system.recover_media))
     if system.settings.traces_retention_days is not None:
         jobs.append(system.expire_traces)
+    if system.settings.expired_retention_days is not None:
+        jobs.append(system.expire_memories)
     return jobs
+
+
+def _every(
+    interval_s: float, job: Callable[[], object], clock: Callable[[], float] = time.monotonic
+) -> Callable[[], None]:
+    """清理线程的一项：第一遍就做，之后隔 interval_s 秒以上才再做（清理线程每分钟一遍）。"""
+    due = -math.inf
+
+    def run() -> None:
+        nonlocal due
+        now = clock()
+        if now < due:
+            return
+        due = now + interval_s  # 出错时同样等到下一次，不每分钟重试
+        job()
+
+    return run
 
 
 def _adopt_after(
@@ -430,11 +458,13 @@ def create_app(
     （Memory.close_idle_runs）与记忆代理的会话（MemoryProxy.close_idle，按它自己的 idle_minutes）。
     以前关掉的标签页、崩溃的客户端留下的会话一直开着，服务运行期间一直不抽取；与记忆代理和各个
     框架集成一样，默认 30 分钟。启动这么久之后，这个线程还把之前的进程留下、没人接着写的进行中
-    的会话交给抽取（一次，见 _adopt_after）。设了 traces_retention_days 时这个线程还删过期的 trace
-    （启动时与之后每天一次，见 _sweep_jobs），idle_minutes 为 None 时也起。
+    的会话交给抽取（一次，见 _adopt_after）。设了 traces_retention_days、expired_retention_days 时
+    这个线程还删过期的 trace、过期的记忆（启动时与之后每天一次，见 _sweep_jobs），idle_minutes 为
+    None 时也起。
     """
     _clear_uploads(upload_dir)
     v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
+    v1.max_open_runs = service.max_open_sessions  # 一个空间开着的 run 与对话会话同一个上限
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -451,7 +481,7 @@ def create_app(
                 idle.append(proxy.close_idle)
             # 之前的进程留下、过了一个闲置期还没人接着写的会话交给抽取（从启动时算起）
             idle.append(_adopt_after(service.system, idle_s))
-        jobs = _sweep_jobs(service.system, *idle)  # 只设了 traces_retention_days 时也要起线程
+        jobs = _sweep_jobs(service.system, *idle)  # 只设了保留天数时也要起线程
         if not jobs:
             yield
             return
@@ -500,7 +530,10 @@ def create_app(
     @api.post("/api/sessions")
     def start(http: Request, request: StartRequest) -> SessionOut:
         _check_space(principal_of(http), request.space or service.default_space)
-        session = service.start(request.space, at=request.at)
+        try:
+            session = service.start(request.space, at=request.at)
+        except SessionLimitError as exc:  # 结束一个会话或等闲置的会话被清理（每分钟一次）
+            raise HTTPException(429, str(exc), headers={"Retry-After": "60"}) from exc
         return SessionOut(
             session_id=session.session_id, space=session.space_id, started_at=session.started_at
         )
@@ -558,20 +591,23 @@ def create_app(
         return {"text": service.profile(space)}
 
     @api.get("/api/spaces/{space:path}/facts")
-    def facts(space: AllowedSpace, current_only: bool = False) -> list[dict[str, Any]]:
-        return service.facts(space, current_only=current_only)
+    def facts(
+        space: AllowedSpace, current_only: bool = False, show_expired: bool = False
+    ) -> list[dict[str, Any]]:
+        # 已经过期的记忆（expiration_date）默认不列出，同画像；show_expired=true 时也列出
+        return service.facts(space, current_only=current_only, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/entities")
     def entities(space: AllowedSpace) -> list[dict[str, Any]]:
         return service.entities(space)
 
     @api.get("/api/spaces/{space:path}/graph")
-    def graph(space: AllowedSpace) -> dict[str, Any]:
-        return service.graph(space)
+    def graph(space: AllowedSpace, show_expired: bool = False) -> dict[str, Any]:
+        return service.graph(space, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/media")
-    def media(space: AllowedSpace) -> list[dict[str, Any]]:
-        return service.media(space)
+    def media(space: AllowedSpace, show_expired: bool = False) -> list[dict[str, Any]]:
+        return service.media(space, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/media/{media_id}")
     def media_file(space: AllowedSpace, media_id: str) -> FileResponse:

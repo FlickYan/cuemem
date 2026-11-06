@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from cuemem.config import Price
 from cuemem.llm.types import Usage
+from cuemem.store.files import spare_write
 
 
 class UsageRecord(BaseModel):
@@ -56,7 +57,15 @@ _COLUMNS = list(UsageRecord.model_fields)
 
 
 class Ledger:
-    def __init__(self, path: Path | None, *, run_id: str | None = None) -> None:
+    def __init__(
+        self, path: Path | None, *, run_id: str | None = None, best_effort: bool = False
+    ) -> None:
+        """best_effort：磁盘满了、只读时 record 记一条警告、不抛出（见 store.files.spare_write）：
+        已经付费的回复照样返回，只是少记一笔。只有 MemorySystem.from_settings 打开；评测与脚本
+        用默认的 False。"""
+        self._path = path
+        self.best_effort = best_effort
+        self.failing = False  # 上一次 record 因为磁盘写不进去（接连失败只记一次警告）
         # run_id 标识一次运行（一次 CLI 调用或一次评测），汇总时可以按它过滤
         self.run_id = run_id or f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
         if path is not None:
@@ -87,11 +96,24 @@ class Ledger:
         columns = ", ".join(_COLUMNS)
         placeholders = ", ".join("?" for _ in _COLUMNS)
         with self._lock:
-            self._conn.execute(
-                f"INSERT INTO usage ({columns}) VALUES ({placeholders})",
-                [row[c] for c in _COLUMNS],
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    f"INSERT INTO usage ({columns}) VALUES ({placeholders})",
+                    [row[c] for c in _COLUMNS],
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                spare_write(
+                    self._conn,
+                    exc,
+                    best_effort=self.best_effort,
+                    failing=self.failing,
+                    what="用量账本",
+                    path=self._path,
+                )
+                self.failing = True
+            else:
+                self.failing = False
 
     def summary(
         self, *, run_id: str | None = None, since: datetime | None = None

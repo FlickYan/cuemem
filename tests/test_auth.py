@@ -208,6 +208,29 @@ def test_key_errors_never_echo_a_token() -> None:
         Keys.parse(f"keys:\n  - {{name: a, token: {secret}, scopes: [{{user: a}}]}}", secret)
 
 
+def test_keys_parse_uses_the_c_safe_loader_with_the_same_result() -> None:
+    """装了 libyaml 时 Keys.parse 用 CSafeLoader（运行中的服务在事件循环上重新读入，几百个令牌
+    时快近十倍）：解出的对象与 safe_load 一样，照样不认 Python 标签，写错的文件照样说第几行。"""
+    import yaml
+
+    from cuemem.api import auth
+
+    if yaml.__with_libyaml__:
+        assert auth._SAFE_LOADER is yaml.CSafeLoader
+    entries = [
+        f"name: k{i}, token: '{i:064x}', scopes: [{{user: 'u{i}'}}, {{agent: 'a{i}'}}]"
+        for i in range(200)
+    ]
+    text = "# 说明\n" + _keys(*entries) + "\n  - name: 'é ü 中'\n    token: tttttttttttttttttt\n"
+    text += '    scopes:\n      - {user: "x\\ty"}\n    rate_per_minute: 0x10\n'
+    assert yaml.load(text, Loader=auth._SAFE_LOADER) == yaml.safe_load(text)
+    assert Keys.parse(text).names[-1] == "é ü 中"
+    with pytest.raises(AccessKeysError):
+        Keys.parse("keys: !!python/object/apply:os.getcwd []\n")
+    with pytest.raises(AccessKeysError, match="第 4 行"):
+        Keys.parse("keys:\n  - name: a\n    token: [x\n", source="f")
+
+
 def test_keys_from_the_environment(tmp_path: Path) -> None:
     path = tmp_path / "keys.yaml"
     path.write_text(KEYS, encoding="utf-8")
@@ -609,6 +632,14 @@ def test_v1_api_stays_in_scope(world: World) -> None:
     theirs = world.http.get(f"/api/v1/memories/{bob}", headers=bearer(ALICE_TOKEN)).json()
     none = world.http.get("/api/v1/memories/0000000000000000", headers=bearer(ALICE_TOKEN)).json()
     assert theirs["error"] | {"message": ""} == none["error"] | {"message": ""}
+    # 一次删好几条（第七轮体检 P16）：别人的 ID 与不存在的一样放进 missing，预演也不透露什么
+    unknown = "0000000000000000"
+    preview = alice.delete_many([bob, unknown], dry_run=True)
+    assert (preview["deleted"], preview["missing"]) == ([], [bob, unknown])
+    assert preview["turns"] == [] and preview["facts"] == []
+    out = alice.delete_many([unknown, bob])
+    assert out["message"] == "Nothing deleted"
+    assert (out["deleted"], out["missing"]) == ([], [unknown, bob])
     kept = admin.get(bob)
     assert kept is not None and kept["memory"] == "Secret of bob" and kept["status"] == "current"
 
@@ -1253,11 +1284,13 @@ def test_ui_stays_in_scope(n3_settings: Settings, fake_api: FakeAPI, tmp_path: P
             ok = {"username": "alice-app", "password": ALICE_TOKEN}
             assert http.post("/login", data=ok).status_code == 200
 
-            assert "Secret of alice" in _ui_call(http, "load_memory", ["alice", False, "fact"])
+            assert "Secret of alice" in _ui_call(
+                http, "load_memory", ["alice", False, False, "fact"]
+            )
             for name, data in (
-                ("load_memory", ["bob", False, "fact"]),
-                ("load_memory", ["agent/alice", False, "fact"]),
-                ("load_memory", ["", False, "fact"]),  # 默认空间 shop-demo
+                ("load_memory", ["bob", False, False, "fact"]),
+                ("load_memory", ["agent/alice", False, False, "fact"]),
+                ("load_memory", ["", False, False, "fact"]),  # 默认空间 shop-demo
                 ("choices", ["bob", "fact"]),
                 ("forget", ["bob", "fact", None]),  # 在看要遗忘什么之前就拒绝
                 ("start", ["bob", "", None]),
@@ -1272,7 +1305,7 @@ def test_ui_stays_in_scope(n3_settings: Settings, fake_api: FakeAPI, tmp_path: P
             admin = TestClient(app)
             login = admin.post("/login", data={"username": "me", "password": ADMIN_TOKEN})
             assert login.status_code == 200
-            assert "Secret of bob" in _ui_call(admin, "load_memory", ["bob", False, "fact"])
+            assert "Secret of bob" in _ui_call(admin, "load_memory", ["bob", False, False, "fact"])
             admin.close()
     finally:
         service.close()
@@ -1454,7 +1487,7 @@ def test_ui_uploads_pass_the_path_checks(ui_alice: tuple[TestClient, MemorySyste
     second = _ui_call(http, "send", [again, history, sid, "alice", "", "l0", "rule", 30])
     assert "event: error" not in second, second
     assert len(system.db.get_media("alice")) == 1
-    panel = _ui_call(http, "load_memory", ["alice", False, "fact"])
+    panel = _ui_call(http, "load_memory", ["alice", False, False, "fact"])
     assert "event: error" not in panel, panel
 
 

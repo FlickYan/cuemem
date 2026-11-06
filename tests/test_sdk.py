@@ -7,6 +7,7 @@ import base64
 import io
 import itertools
 import json
+import os
 import re
 import sqlite3
 import tempfile
@@ -27,9 +28,9 @@ from cuemem.config import PathsConfig, Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
-from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
+from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, stored_text
 from cuemem.memory import _open_mark
-from cuemem.sdk import _matches, parse_messages, space_for
+from cuemem.sdk import _key_hash, _matches, parse_messages, space_for
 from cuemem.store.vector import VectorStore
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -1246,7 +1247,9 @@ def test_served_profile_and_chat_drop_expired_memories(
     service = ChatService(memory.system, agent)
     assert service.profile("u") == "- I like jazz"
     result = asyncio.run(build_server(service, "u").call_tool("profile", {}))
-    assert "".join(getattr(c, "text", "") for c in result.content) == "- I like jazz"
+    assert "".join(getattr(c, "text", "") for c in result.content) == format_profile(
+        "- I like jazz"
+    )
     app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
     with TestClient(app) as http:
         assert http.get("/api/spaces/u/profile").json() == {"text": "- I like jazz"}
@@ -1256,6 +1259,141 @@ def test_served_profile_and_chat_drop_expired_memories(
     agent.chat(session, "Where do I live? Do I like jazz?", mode="l1")
     sent = json.dumps(fake_api.chat_requests[before:], ensure_ascii=False)
     assert "Berlin" not in sent and "jazz" in sent
+
+
+def test_memory_browser_hides_expired_memories(memory: Memory, tmp_path: Path) -> None:
+    """第七轮体检 P17：记忆浏览器的事实表、实体图与图库以前列出过期的记忆，同一个页面的画像
+    栏却不给：过期的住址在事实表里、在实体图里算一条边。默认不列出，show_expired 时列出、
+    标着 expired；遗忘的候选（界面的下拉框、演示脚本）照样列出：删除之前它还在日志里。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.agent import Agent
+    from cuemem.api.app import create_app
+    from cuemem.api.replay import _forget
+    from cuemem.api.service import ChatService
+    from cuemem.api.ui import _forget_choices
+
+    _expired_berlin(memory)
+    picture = tmp_path / "flat.png"
+    Image.new("RGB", (16, 16), "green").save(picture)
+    content = [
+        {"type": "text", "text": "My old flat"},
+        {"type": "image_url", "image_url": {"url": str(picture)}},
+    ]
+    memory.add(
+        [{"role": "user", "content": content}],
+        user_id="u",
+        expiration_date=date.today() - timedelta(days=1),
+        infer=False,
+    )
+    service = ChatService(memory.system, Agent(memory.system, router="rule"))
+    berlin = "The user lives in Berlin."
+
+    def statements(rows: list[dict[str, Any]]) -> list[str]:
+        return [r["statement"] for r in rows]
+
+    assert statements(service.facts("u")) == ["I like jazz"]
+    shown = service.facts("u", show_expired=True)
+    assert statements(shown) == [berlin, "I like jazz"]
+    assert [r["expired"] for r in shown] == [True, False]
+    assert [n["facts"] for n in service.graph("u")["nodes"]] == [1]
+    assert [n["facts"] for n in service.graph("u", show_expired=True)["nodes"]] == [2]
+    assert service.media("u") == []
+    (image,) = service.media("u", show_expired=True)
+    assert image["expired"] is True
+    assert berlin in [
+        label.split(" · ", 1)[1] for label, _ in _forget_choices(service, "u", "fact")
+    ]
+    assert [i for _, i in _forget_choices(service, "u", "image")] == [image["id"]]
+
+    app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
+    with TestClient(app) as http:
+        assert statements(http.get("/api/spaces/u/facts").json()) == ["I like jazz"]
+        listed = http.get("/api/spaces/u/facts", params={"show_expired": "true"}).json()
+        assert statements(listed) == [berlin, "I like jazz"]
+        (user,) = http.get("/api/spaces/u/graph").json()["nodes"]
+        assert user["facts"] == 1
+        (user,) = http.get("/api/spaces/u/graph?show_expired=true").json()["nodes"]
+        assert user["facts"] == 2
+        assert http.get("/api/spaces/u/media").json() == []
+        assert len(http.get("/api/spaces/u/media?show_expired=true").json()) == 1
+    assert _forget(service, "u", "Berlin")["facts"] == [berlin]
+    assert berlin not in statements(service.facts("u", show_expired=True))
+
+
+def test_purge_expired_deletes_expired_memories(memory: Memory, fake_api: FakeAPI) -> None:
+    """第七轮体检 P20：expiration_date 以前只是读取时不给出，过期的发言、事实、向量与缓存一直
+    留着，要逐条 delete。purge_expired 真的删掉过期的发言（遗忘），同一件事后来又说过一次、
+    没给过期时间的留着、重放时重新抽出来；还没过期、过期没那么久的不动。"""
+    yesterday = date.today() - timedelta(days=1)
+    berlin = memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+    berlin_id = berlin["results"][0]["id"]
+    memory.add("I like rain", user_id="v", expiration_date="2020-01-01", wait=True)
+    memory.add("I like rain", user_id="v", wait=True)  # 又说了一次，没给过期时间
+    memory.add("I like jazz", user_id="v", expiration_date="2999-01-01", wait=True)
+    system = memory.system
+    kept = system.db.get_turns("v")[1:]
+
+    # 过期 30 天以上的：只有 2020 年到期的那一句，昨天到期的住址还留着
+    reports = system.purge_expired(older_than=timedelta(days=30))
+    assert sorted(reports) == ["v"] and reports["v"].turns_deleted == 1
+    assert memory.get(berlin_id) is not None
+    reports = system.purge_expired(older_than=timedelta(0))
+    assert sorted(reports) == ["u"] and reports["u"].turns_deleted == 1
+    assert memory.get(berlin_id) is None
+    assert memory.get_all(user_id="u", show_expired=True)["results"] == []
+    assert system.db.expiring_turns("u") == {} and not system.db.get_turns("u")
+    assert "Berlin" not in (system.core_memory("u").text if system.core_memory("u") else "")
+    # 后来又说过一次的留着，那一句与没过期的一句原样不动
+    assert system.db.get_turns("v") == kept
+    assert sorted(f["memory"] for f in memory.get_all(user_id="v")["results"]) == [
+        "I like jazz",
+        "I like rain",
+    ]
+    assert list(system.db.expiring_turns("v").values()) == ["2999-01-01"]
+    before = len(fake_api.chat_requests)
+    assert system.purge_expired(older_than=timedelta(0)) == {}  # 都删过了：不重放、不发请求
+    assert len(fake_api.chat_requests) == before
+
+
+def test_purge_expired_leaves_spaces_without_expiry_alone(
+    memory: Memory, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有带过期时间的发言的空间（评测的空间都是）：不遗忘、不发请求、库不动。"""
+    memory.add("I live in Berlin", user_id="w", metadata={"k": "v"}, wait=True)
+    system = memory.system
+    turns, facts = system.db.get_turns("w"), system.facts("w")
+    calls: list[str] = []
+    monkeypatch.setattr(system, "forget", lambda space, **kw: calls.append(space))
+    before = (len(fake_api.chat_requests), len(fake_api.embed_requests))
+    assert system.purge_expired(older_than=timedelta(0)) == {}
+    assert system.purge_expired("w", older_than=timedelta(0)) == {}
+    assert calls == [] and (len(fake_api.chat_requests), len(fake_api.embed_requests)) == before
+    assert system.db.get_turns("w") == turns and system.facts("w") == facts
+
+
+def test_expired_retention_is_a_daily_opt_in_sweep_job(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CUEMEM_EXPIRED_RETENTION_DAYS 没设时（默认）cuemem serve / proxy 的清理线程不删过期的
+    记忆、要做的事不变；设了时启动时与之后每天删一遍过期这么多天以上的。"""
+    from cuemem.api.app import _sweep_jobs
+
+    system = memory.system
+    assert system.settings.expired_retention_days is None
+    assert len(_sweep_jobs(system)) == 1  # 只有收拾媒体库（第七轮体检 P8）
+    calls: list[timedelta] = []
+    monkeypatch.setattr(
+        system, "purge_expired", lambda *a, older_than, **kw: calls.append(older_than) or {}
+    )
+    assert system.expire_memories() == {} and calls == []  # 没设：什么都不做
+    system.settings = system.settings.model_copy(update={"expired_retention_days": 3})
+    assert _sweep_jobs(system)[1:] == [system.expire_memories]
+    today = date(2026, 11, 6)
+    system.expire_memories(today=today)
+    system.expire_memories(today=today)  # 同一天只删一次
+    system.expire_memories(today=today + timedelta(days=1))
+    assert calls == [timedelta(days=3)] * 2
 
 
 def test_a_restated_memory_without_expiry_stays(memory: Memory, model: ScriptedModel) -> None:
@@ -1552,9 +1690,62 @@ def test_a_retry_with_the_same_key_writes_once(memory: Memory) -> None:
         "replayed": True,
     }
     assert _turn_count(memory) == 1
-    assert memory.system.db.get_jobs("alice", status="pending")  # wait=True 也没有抽取
+    # wait=True 的重试等抽取做完（第七轮体检）：以前立即返回，紧接着的 get_all 是空的
+    assert memory.system.db.get_jobs("alice", status="pending") == []
+    (berlin,) = memory.get_all(user_id="alice")["results"]
+    assert berlin["memory"] == "The user lives in Berlin."
     memory.add("I live in Berlin", user_id="alice")
     assert _turn_count(memory) == 2
+
+
+def test_a_waiting_retry_reports_a_failed_extraction(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """wait=True 的重试遇上这次会话的抽取失败：仍是 duplicate、results 是空的，加上 error。"""
+    first = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1")
+    without_balance_for_extracting(model, fake_api)
+    again = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1", wait=True)
+    assert again["status"] == "duplicate" and again["replayed"] is True
+    assert again["results"] == [] and again["session_id"] == first["session_id"]
+    assert "Error code: 402" in again["error"] and "Do not add them again" in again["error"]
+
+
+def test_a_waiting_retry_into_an_open_run_returns_the_duplicate(memory: Memory) -> None:
+    """那次写进的是还开着的 run：wait=True 的重试不报 ValueError、不抽取，照旧返回 duplicate。"""
+    memory.open_run("r", user_id="alice")
+    first = memory.add("I live in Berlin", user_id="alice", run_id="r", idempotency_key="k1")
+    again = memory.add(
+        "I live in Berlin", user_id="alice", run_id="r", idempotency_key="k1", wait=True
+    )
+    assert again == {
+        "results": [],
+        "session_id": "r",
+        "turn_ids": first["turn_ids"],
+        "status": "duplicate",
+        "replayed": True,
+    }
+    assert memory.system.db.get_jobs("alice") == []  # 结束时才抽取
+
+
+def test_a_keyed_add_that_collides_writes_nothing_and_its_retry_writes(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带键的 add 撞号（另一个进程先写了这些序号）：ConcurrentWriteError，键与发言都不留；
+    原样重试写进这次的发言。以前提交之后才查：键已经记下，重试返回 duplicate 与别人的发言 ID，
+    这次的发言丢了。"""
+    db = memory.system.db
+    memory.add("I like tea", user_id="alice", run_id="r", infer=False)
+    real = Memory._next_idx
+    monkeypatch.setattr(Memory, "_next_idx", lambda self, space, session_id: 0)
+    with pytest.raises(ConcurrentWriteError, match="Nothing was written"):
+        memory.add("I like coffee", user_id="alice", run_id="r", infer=False, idempotency_key="k")
+    assert [t.text for t in db.get_turns("alice", "r")] == ["I like tea"]
+    assert db.add_key_lookup("alice", _key_hash("k")) is None
+    monkeypatch.setattr(Memory, "_next_idx", real)
+    out = memory.add("I like coffee", user_id="alice", run_id="r", infer=False, idempotency_key="k")
+    assert out["status"] == "logged"
+    text = {t.id: t.text for t in db.get_turns("alice", "r")}
+    assert [text[tid] for tid in out["turn_ids"]] == ["I like coffee"]
 
 
 def test_the_same_key_for_another_request_is_refused(memory: Memory) -> None:
@@ -2241,3 +2432,172 @@ def test_status_counts_jobs_without_reading_them_all(
         "done": expected["done"],
     }
     assert db.job_counts(space) == {"pending": 2, "failed": 3, "done": 1, "superseded": 1}
+
+
+def test_unopenable_database_raises_database_open_error(
+    offline_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """数据库打不开（路径上是个目录）：以前抛出不带路径的 sqlite3.OperationalError，账本的连接也
+    一直开着；现在 DatabaseOpenError 说明是哪个文件，它同时是 CueMemError 与
+    sqlite3.OperationalError（按后者捕获的调用方照样捕获得到），已经打开的账本关掉。"""
+    from cuemem.errors import CueMemError, DatabaseOpenError
+    from cuemem.llm.ledger import Ledger
+
+    offline_settings.paths.db.mkdir(parents=True)
+    closed: list[str] = []
+    original = Ledger.close
+
+    def close(self: Ledger) -> None:
+        closed.append("ledger")
+        original(self)
+
+    monkeypatch.setattr(Ledger, "close", close)
+    with pytest.raises(DatabaseOpenError) as caught:
+        Memory(offline_settings, background=False)
+    assert isinstance(caught.value, sqlite3.OperationalError)
+    assert isinstance(caught.value, CueMemError)
+    assert str(offline_settings.paths.db) in str(caught.value)
+    assert "打不开" in str(caught.value)
+    assert closed == ["ledger"]
+
+
+def test_data_path_blocked_by_a_file_raises_database_open_error(
+    offline_settings: Settings,
+) -> None:
+    """数据库的上级目录是个文件：以前 mkdir 抛出 FileExistsError（不是 CueMemError），现在也是
+    DatabaseOpenError。"""
+    from cuemem.errors import DatabaseOpenError
+
+    blocker = offline_settings.paths.db.parent / "plain-file"
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.write_text("", encoding="utf-8")
+    paths = offline_settings.paths.model_copy(update={"db": blocker / "cuemem.sqlite"})
+    with pytest.raises(DatabaseOpenError, match="plain-file"):
+        Memory(offline_settings.model_copy(update={"paths": paths}), background=False)
+
+
+def _second_vector_dir(settings: Settings) -> Settings:
+    """同一个数据库、另一个向量库目录：两个进程共用数据库、向量在 Qdrant 服务端时的样子
+    （本地模式的 Qdrant 锁挡不住它们）。"""
+    paths = settings.paths.model_copy(update={"qdrant": settings.paths.qdrant.parent / "qdrant-b"})
+    return settings.model_copy(update={"paths": paths})
+
+
+def test_second_system_on_one_database_is_refused(offline_settings: Settings) -> None:
+    """一个数据库同一时间只能有一个进程写：以前向量在服务端时第二个 Memory() 照样打开，接手第一个
+    还在写的会话（这里 B 的 add 把 A 进行中的 r1 登记成待抽取）。现在第二个打开者
+    StorageLockedError，说明拿着锁的进程；第一个关掉之后就能打开。"""
+    from cuemem.errors import StorageLockedError
+
+    first = Memory(offline_settings, background=False)
+    try:
+        first.open_run("r1", user_id="u")
+        first.add("I live in Berlin.", user_id="u", run_id="r1", infer=False)
+        with pytest.raises(StorageLockedError) as caught:
+            Memory(_second_vector_dir(offline_settings), background=False)
+        message = str(caught.value)
+        assert str(offline_settings.paths.db) in message and f"pid {os.getpid()}" in message
+        assert "CUEMEM_ALLOW_SHARED_DB=1" in message
+    finally:
+        first.close()
+    with Memory(_second_vector_dir(offline_settings), background=False) as second:
+        second.add("Hello", user_id="u", infer=False)
+
+
+def test_database_lock_holds_across_processes(offline_settings: Settings, tmp_path: Path) -> None:
+    """另一个进程也拿不到这把锁（flock），报错里是这个进程的 pid。"""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from cuemem.errors import StorageLockedError\n"
+        "from cuemem.store.files import lock_database\n"
+        "try:\n"
+        "    lock_database(Path(sys.argv[1]))\n"
+        "except StorageLockedError as exc:\n"
+        "    print(exc)\n"
+        "else:\n"
+        "    print('locked')\n"
+    )
+    with Memory(offline_settings, background=False):
+        out = subprocess.run(
+            [sys.executable, "-c", script, str(offline_settings.paths.db)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            check=True,
+            env={k: v for k, v in os.environ.items() if k != "CUEMEM_ALLOW_SHARED_DB"},
+        ).stdout
+    assert "正被另一个进程使用" in out and f"pid {os.getpid()}" in out, out
+
+
+def test_shared_database_opt_out_warns(
+    offline_settings: Settings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """CUEMEM_ALLOW_SHARED_DB=1：不加锁，两个都打开，并记一条警告说明风险。"""
+    monkeypatch.setenv("CUEMEM_ALLOW_SHARED_DB", "1")
+    with (
+        caplog.at_level("WARNING", logger="cuemem.store.files"),
+        Memory(offline_settings, background=False),
+        Memory(_second_vector_dir(offline_settings), background=False),
+    ):
+        pass
+    warned = [r.getMessage() for r in caplog.records if "CUEMEM_ALLOW_SHARED_DB" in r.getMessage()]
+    assert len(warned) == 2 and "reindex" in warned[0]
+
+
+def test_full_embedding_cache_does_not_break_search(
+    memory: Memory, caplog: pytest.LogCaptureFixture
+) -> None:
+    """向量缓存所在的磁盘满了：以前每个没见过的问题都抛出 database or disk is full（检索用不了）；
+    现在照样检索，只是问题的向量没有缓存，接连失败只记一条警告。"""
+    from fakes import fill_to_capacity
+
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    embedder = memory.system.embedder
+    assert isinstance(embedder, CachedEmbedder)
+    fill_to_capacity(embedder.cache._conn)
+    with caplog.at_level("WARNING", logger="cuemem.store.files"):
+        for question in ("Where do I live these days?", "Which city is my home now?"):
+            found = memory.search(question, user_id="alice", mode="l1")
+            assert any(r["memory"] == "The user lives in Berlin." for r in found["results"])
+    warned = [r.getMessage() for r in caplog.records if "向量缓存写不进" in r.getMessage()]
+    assert len(warned) == 1
+
+
+def test_full_llm_cache_still_answers_and_accounts(
+    n3_settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """LLM 缓存所在的磁盘满了：以前付费拿到的回答写不进缓存就抛出，账本也没记这笔（先写缓存后
+    记账）；现在回答照样返回、每次付费的调用都记了账，只记一条警告。"""
+    from fakes import fill_to_capacity
+
+    model = ScriptedModel(
+        where_i_live,
+        reader=lambda prompt: {
+            "answer": "Berlin. " * 2500,
+            "citations": ["f1"],
+            "evidence_sufficient": True,
+        },
+    )
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+        system = memory.system
+        assert system.llm.cache is not None
+        fill_to_capacity(system.llm.cache._conn)
+
+        def rows() -> int:
+            return int(system.ledger._conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0])
+
+        before, paid = rows(), len(fake_api.chat_requests)
+        with caplog.at_level("WARNING", logger="cuemem.store.files"):
+            for question in ("Where do I live?", "Which city do I live in?"):
+                answer = memory.answer(question, user_id="alice", mode="l1")
+                assert answer["answer"].startswith("Berlin.")
+        assert len(fake_api.chat_requests) - paid == 2
+        assert rows() - before == 2
+    warned = [r.getMessage() for r in caplog.records if "LLM 缓存写不进" in r.getMessage()]
+    assert len(warned) == 1

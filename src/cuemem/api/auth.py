@@ -95,6 +95,8 @@ KEYS_ENV = "CUEMEM_API_KEYS"
 # 放在模块级：注解是字符串（from __future__ import annotations），FastAPI 解析不到函数里的局部变量
 _BEARER = HTTPBearer(auto_error=False)
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}")
+# Keys.parse 用的加载器：只认安全的标签；装了 libyaml 时用 C 写的那个
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 # 监听非本机地址时令牌至少这么多个字符：仓库与文档里的占位符（your-token、fake-token、
 # 换成你的令牌）都更短；secrets.token_urlsafe(16) 是 22 个，openssl rand -hex 32 是 64 个
 MIN_TOKEN_CHARS = 16
@@ -232,7 +234,9 @@ class Keys:
     def parse(cls, text: str, admin_token: str | None = None, *, source: str = "keys") -> Keys:
         """限定作用域的令牌的 YAML / JSON 文本（格式见模块说明）。出错信息里不带令牌本身。"""
         try:
-            raw = yaml.safe_load(text)
+            # 有 libyaml 时用 C 写的加载器（解出的对象一样，几百个令牌时快近十倍）：运行中的服务在
+            # 事件循环上重新读入改过的文件
+            raw = yaml.load(text, Loader=_SAFE_LOADER)
         except yaml.YAMLError as exc:
             mark = getattr(exc, "problem_mark", None)
             where = f"（第 {mark.line + 1} 行）" if mark is not None else ""

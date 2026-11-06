@@ -17,13 +17,16 @@
    都支持，响应原样返回；控制器的决定与实际用的模型（X-CueMem-Model）放在响应头里；
 4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）；上游出错时不写，流式
    回答中途断开（客户端停下）只写用户的话。写不进去（向量接口暂时不可用等）时留着，这个会话
-   下一次写回或结束之前再写（见 Run）。会话进行中不抽取事实，
+   下一次写回或结束之前再写（见 Run；一个会话最多留 MAX_UNSAVED 次、MAX_UNSAVED_BYTES，超出的
+   丢掉最早的、记警告）。会话进行中不抽取事实，
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-045）。
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent；不是 ASCII 的 ID 写成
 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id，或者放进 user 字段）；
 会话：请求头 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）
 或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
+一个用户（记忆空间）同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时先结束
+最久没有请求的那个（与闲置结束相同，交给抽取）；都留着没写进去的写回时 429（见 _make_room）。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
@@ -74,7 +77,7 @@ from starlette.types import Receive, Scope, Send
 from cuemem import __version__
 from cuemem.api.auth import AnyKeys, Keys, Principal, guard, identity_headers, principal_of
 from cuemem.api.failures import provider_failure
-from cuemem.api.limits import MAX_BODY_BYTES
+from cuemem.api.limits import MAX_BODY_BYTES, MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
@@ -84,6 +87,7 @@ from cuemem.evidence import (
     in_context_rounds,
     inject_evidence,
     message_text,
+    payload_size,
     recall_evidence,
     stored_text,
 )
@@ -95,6 +99,10 @@ logger = logging.getLogger(__name__)
 
 _SESSION_ID = re.compile(r"[^A-Za-z0-9_.:-]")
 MAX_EMBED_INPUTS = 2048  # 与 OpenAI 的上限相同
+# 一个会话写不进去、留着重试的写回最多这么多次、这么大（文字与图片 data URL 的字符数，
+# evidence.payload_size）：长时间故障而调用方一直在说话时，超出的丢掉最早的，不让内存一直长
+MAX_UNSAVED = 100
+MAX_UNSAVED_BYTES = 32 * 1024 * 1024
 
 
 class ProxyError(Exception):
@@ -127,6 +135,7 @@ class Unsaved:
     messages: list[dict[str, Any]]
     when: datetime
     epoch: int
+    size: int = 0  # evidence.payload_size(messages)
 
 
 @dataclass
@@ -136,7 +145,8 @@ class Run:
     unsaved：写回失败（向量接口暂时不可用等，见 write.online.worth_retrying）、留着重试的写回，
     按先后排。之后每次写回这个会话时先写它们，会话结束（空闲、开了新的一段、close_all）之前
     再试一次，还是写不进去才丢掉、记警告。在线写入要么全写、要么不写（R1），以前丢下它们就永远
-    丢了：之后的请求只写各自最后一句用户消息。"""
+    丢了：之后的请求只写各自最后一句用户消息。最多留 MAX_UNSAVED 次、MAX_UNSAVED_BYTES
+    （unsaved_bytes 是它们的 size 之和），超出时丢掉最早的、记警告（MemoryProxy._trim）。"""
 
     space: str
     session_id: str
@@ -145,6 +155,16 @@ class Run:
     user_id: str | None = None
     agent_id: str | None = None
     unsaved: list[Unsaved] = field(default_factory=list)
+    unsaved_bytes: int = 0
+
+    def keep(self, unsaved: Unsaved) -> None:
+        self.unsaved.append(unsaved)
+        self.unsaved_bytes += unsaved.size
+
+    def drop(self, count: int = 1) -> None:
+        """丢掉最早的 count 次写回。"""
+        self.unsaved_bytes -= sum(u.size for u in self.unsaved[:count])
+        del self.unsaved[:count]
 
 
 @dataclass
@@ -175,8 +195,11 @@ class MemoryProxy:
         unknown_model: UnknownModel | None = None,
         http_client: httpx2.Client | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_open_runs: int | None = None,
     ) -> None:
         self.system = system
+        # 一个记忆空间同时进行中的会话数的上限（见 _make_room）；不给时读 CUEMEM_MAX_OPEN_SESSIONS
+        self.max_open_runs = max_open_runs if max_open_runs is not None else open_session_limit()
         self.memory = Memory.from_system(system)
         self.default_user = default_user
         self.role = role
@@ -358,24 +381,48 @@ class MemoryProxy:
         self.close_idle()
         self._adopt(space, explicit)
         key = (space, explicit)
+        ended: list[Run] = []
         with self._lock:
             run = self._runs.get(key)
             if run is not None and fresh and explicit is None:
-                self._runs.pop(key)
-                ended: Run | None = run
+                ended.append(self._runs.pop(key))
                 run = None
-            else:
-                ended = None
             if run is None:
+                evicted = self._make_room(space)
+                if evicted is not None:
+                    ended.append(evicted)
                 when = datetime.now()
                 sid = explicit or sortable_session_id("proxy", when)
                 run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
                 self._runs[key] = run
                 self.system.open_session(space, sid)  # 进行中：每轮照常写入，但不抽取
             run.last_seen = now
-        if ended is not None:
-            self._finish(ended)
+        for done in ended:
+            self._finish(done)
         return run
+
+    def _make_room(self, space: str) -> Run | None:
+        """_run 开新会话之前（调用方持有 self._lock）：这个空间进行中的会话没到 max_open_runs 个时
+        None；到了时取走其中最久没有请求、没有留着重试的写回、也没在写回的那个（调用方结束它，与
+        闲置结束相同：交给抽取），没有这样的会话时 ProxyError 429。以前不限：调用方每换一个
+        X-CueMem-Session 就多一个会话，故障期间每个会话还能留 MAX_UNSAVED_BYTES 的写回，内存跟着
+        会话数一直长。"""
+        mine = [k for k, r in self._runs.items() if r.space == space]
+        if len(mine) < self.max_open_runs:
+            return None
+        idle = [k for k in mine if not self._runs[k].unsaved and not self._runs[k].lock.locked()]
+        if not idle:
+            raise ProxyError(
+                429,
+                f"This user already has {len(mine)} open memory sessions (the limit is "
+                f"{self.max_open_runs}, set by {MAX_OPEN_SESSIONS_ENV}) and none can be ended "
+                "now: retry later.",
+                kind="rate_limit_error",
+                code="rate_limited",
+                headers={"Retry-After": "60"},
+            )
+        oldest = min(idle, key=lambda k: self._runs[k].last_seen)
+        return self._runs.pop(oldest)
 
     def _adopt(self, space: str, explicit: str | None) -> None:
         """这个进程第一次碰到这个空间：之前的进程崩溃时还在进行中的会话（正常退出时 close_all
@@ -604,8 +651,30 @@ class MemoryProxy:
                 messages.append({"role": "assistant", "content": answer})
             if not messages:
                 return
-            run.unsaved.append(Unsaved(messages, datetime.now(), epoch))
+            run.keep(Unsaved(messages, datetime.now(), epoch, payload_size(messages)))
             self._save(run)
+            self._trim(run)  # 写得进去时先写：只限写完之后还留着的
+
+    @staticmethod
+    def _trim(run: Run) -> None:
+        """留着重试的写回超过 MAX_UNSAVED 次或 MAX_UNSAVED_BYTES 时丢掉最早的（调用方持有
+        run.lock）。最新的这一次总留着：单个请求已经由 MAX_BODY_BYTES 限住。"""
+        dropped: list[Unsaved] = []
+        while len(run.unsaved) > 1 and (
+            len(run.unsaved) > MAX_UNSAVED or run.unsaved_bytes > MAX_UNSAVED_BYTES
+        ):
+            dropped.append(run.unsaved[0])
+            run.drop()
+            record_event("proxy_write_dropped", space=run.space, reason="backlog")
+        if dropped:
+            logger.warning(
+                "CueMem could not store %d message(s) of proxy session %s for a long time and "
+                "dropped them (more than %d write-backs or %d bytes were waiting).",
+                sum(len(u.messages) for u in dropped),
+                run.session_id,
+                MAX_UNSAVED,
+                MAX_UNSAVED_BYTES,
+            )
 
     def _save(self, run: Run, *, final: bool = False) -> None:
         """把这个会话还没写进去的写回按先后写进记忆，各用各自的时间（调用方持有 run.lock）。
@@ -616,7 +685,7 @@ class MemoryProxy:
             if head.epoch != self.system.db.turn_epoch(run.space):
                 # 之后这个空间遗忘过发言（例如调用方删了这个用户的记忆）：这是遗忘之前说的话
                 record_event("proxy_write_dropped", space=run.space, reason="forgotten")
-                del run.unsaved[0]
+                run.drop()
                 continue
             try:
                 self.memory.add(
@@ -640,9 +709,9 @@ class MemoryProxy:
                     run.session_id,
                     error,
                 )
-                del run.unsaved[: len(lost)]
+                run.drop(len(lost))
                 continue
-            del run.unsaved[0]
+            run.drop()
 
 
 class _Relay(Iterator[bytes]):
@@ -1098,7 +1167,8 @@ def create_proxy_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         # 每分钟把空闲的会话交给后台抽取；启动一个闲置期之后，把之前的进程（崩溃时）留下、没人
-        # 接着写的会话交给抽取（一次）；设了 traces_retention_days 时再删过期的 trace
+        # 接着写的会话交给抽取（一次）；设了 traces_retention_days、expired_retention_days 时再删
+        # 过期的 trace、过期的记忆
         adopt = _adopt_after(proxy.system, proxy.idle_s)
         jobs = _sweep_jobs(proxy.system, proxy.close_idle, adopt)
         threading.Thread(

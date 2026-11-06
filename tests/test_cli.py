@@ -195,6 +195,44 @@ def test_unopenable_database_is_one_line(
         assert "Traceback" not in result.output
 
 
+@pytest.mark.parametrize("blocker", ["directory", "file"])
+@pytest.mark.parametrize(
+    "command",
+    [["serve", "--no-ui", "--scenario", "plain"], ["chat", "--space", "s"], ["proxy"], ["mcp"]],
+)
+def test_unopenable_database_is_one_line_for_servers(
+    isolated_paths: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: list[str],
+    blocker: str,
+) -> None:
+    """数据库打不开（路径上是个目录：SQLite 的 unable to open database file；上级目录是个文件：
+    mkdir 的 OSError）：serve、chat、proxy 与 mcp 以前打印几十行调用栈、不说是哪个文件，现在与别的
+    命令一样一行说明（DatabaseOpenError），退出码 1。mcp 写到 stderr：stdout 是 MCP 的通道。"""
+    import sqlite3
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    if blocker == "directory":
+        db = tmp_path / "db"
+        db.mkdir()
+    else:
+        (tmp_path / "plain-file").write_text("", encoding="utf-8")
+        db = tmp_path / "plain-file" / "cuemem.sqlite"
+        monkeypatch.setenv("CUEMEM_PATHS__DB", str(db))
+    calls: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
+    result = runner.invoke(app, command, input="/quit\n")
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, sqlite3.OperationalError | OSError), result.exception
+    flat = _flat(result.output)
+    assert "Traceback" not in result.output
+    assert _flat(str(db)) in flat and "打不开（" in flat and "检查目录权限与磁盘空间" in flat
+    assert calls == []
+    if command == ["mcp"]:
+        assert result.stdout == "" and "打不开" in result.stderr
+
+
 def test_doctor_reports_free_space(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -368,6 +406,129 @@ def test_consolidate_inspect_and_forget(
     assert "已删除4条轮次" in _flat(result.output)
     result = runner.invoke(app, ["inspect", "facts", "--space", "demo", "--current"])
     assert "新加坡一家电商公司" not in _flat(result.output)
+
+
+def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """一个用户 u：昨天到期的住址与没有过期时间的爱好，都已巩固（离线的脚本化模型）。返回模型。"""
+    from datetime import date, timedelta
+
+    from fakes import FakeAPI
+    from scripted import ScriptedModel
+
+    from cuemem import Memory, cli
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake-qwen")
+
+    def said(prompt: str) -> dict[str, Any]:
+        lines = re.findall(r"\[t(\d+)\] User: (.*)", prompt)
+        facts = [
+            {"statement": text, "predicate": "said", "object": text[:40],
+             "cardinality": "multi", "importance": 4, "turns": [int(n)]}
+            for n, text in lines
+        ]  # fmt: skip
+        return {"summary": "", "facts": facts, "entities": []}
+
+    model = ScriptedModel(said)
+    api = FakeAPI()
+    api.chat_replies = [model]
+    original = MemorySystem.from_settings
+    monkeypatch.setattr(
+        MemorySystem,
+        "from_settings",
+        lambda settings, **kw: original(settings, http_client=api.client()),
+    )
+    monkeypatch.setattr(cli.console, "width", 300)  # 表格不折行，便于断言
+    with Memory(load_settings(), background=False) as memory:
+        yesterday = date.today() - timedelta(days=1)
+        memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+        memory.add("I like jazz", user_id="u", wait=True)
+    return model
+
+
+def test_ask_and_inspect_leave_out_expired_memories(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮体检 P17：cuemem ask 以前不打开 hide_expired，过期的住址照样进回答模型的提示
+    （SDK 的 answer 不给）；--show-expired 时才用。inspect facts 是检查用的：照样列出，标"已过期"，
+    --hide-expired 时不列出。"""
+    model = _expired_space(monkeypatch)
+    question = "Where do I live? Do I like jazz?"
+    result = runner.invoke(app, ["ask", question, "--space", "u"])
+    assert result.exit_code == 0, result.output
+    (prompt,) = model.prompts["read"]
+    assert "Berlin" not in prompt and "jazz" in prompt
+    result = runner.invoke(app, ["ask", question, "--space", "u", "--show-expired"])
+    assert result.exit_code == 0, result.output
+    assert "Berlin" in model.prompts["read"][-1]
+
+    result = runner.invoke(app, ["inspect", "facts", "--space", "u"])
+    assert result.exit_code == 0, result.output
+    rows = [line for line in result.output.splitlines() if "Berlin" in line or "jazz" in line]
+    assert len(rows) == 2
+    assert all(("已过期" in line) == ("Berlin" in line) for line in rows), rows
+    result = runner.invoke(app, ["inspect", "facts", "--space", "u", "--hide-expired"])
+    assert result.exit_code == 0, result.output
+    assert "Berlin" not in result.output and "jazz" in result.output
+
+
+def test_inspect_reads_next_to_a_running_server(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮复审 P9：cuemem inspect 只读数据库（_open_db_only），另一个进程（例如向量在 Qdrant
+    服务端时 docker compose exec 进 cuemem serve 的容器）拿着数据库锁的时候也能用，与 export、
+    spaces 相同。以前经 MemorySystem.from_settings 打开，被数据库锁挡住（StorageLockedError）。"""
+    from cuemem.store.files import lock_database, unlock_database
+    from cuemem.store.sqlite import MemoryDB
+
+    _expired_space(monkeypatch)
+    settings = load_settings()
+    db = MemoryDB(settings.paths.db)
+    [berlin] = [f for f in db.get_facts("u") if "Berlin" in f.statement]
+    db.close()
+    held = lock_database(settings.paths.db)  # 同一进程的另一个文件描述符也互斥（flock）
+    try:
+        result = runner.invoke(app, ["inspect", "facts", "--space", "u", "--hide-expired"])
+        assert result.exit_code == 0, result.output
+        assert "Berlin" not in result.output and "jazz" in result.output
+        result = runner.invoke(
+            app, ["inspect", "facts", "--space", "u", "--known-at", "2000-01-01"]
+        )
+        assert result.exit_code == 0 and "没有符合条件的事实" in result.output
+        result = runner.invoke(app, ["inspect", "sources", berlin.id, "--space", "u"])
+        assert result.exit_code == 0 and "I live in Berlin" in result.output, result.output
+        for command in ("entities", "profile"):
+            result = runner.invoke(app, ["inspect", command, "--space", "u"])
+            assert result.exit_code == 0, result.output
+        result = runner.invoke(app, ["consolidate", "--space", "u"])  # 要写的命令照样被挡住
+        assert result.exit_code == 1 and "正被另一个进程使用" in _flat(result.output)
+    finally:
+        unlock_database(held)
+
+
+def test_forget_expired(isolated_paths: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """第七轮体检 P20：只用 SDK 时用 cuemem forget --expired 删过期的记忆（cuemem serve / proxy
+    设了 CUEMEM_EXPIRED_RETENTION_DAYS 时每天自己删）；--older-than-days 只删过期这么久的。"""
+    from cuemem.memory import MemorySystem
+
+    _expired_space(monkeypatch)
+    result = runner.invoke(app, ["forget", "--expired", "--session", "x"])
+    assert result.exit_code == 1 and "不能与" in result.output
+    result = runner.invoke(app, ["forget", "--fact", "x"])
+    assert result.exit_code == 1 and "--space" in result.output
+    result = runner.invoke(app, ["forget", "--expired", "--older-than-days", "5", "--yes"])
+    assert result.exit_code == 0 and "没有找到要删除的内容。" in result.output
+    result = runner.invoke(app, ["forget", "--expired", "--space", "u"], input="n\n")
+    assert result.exit_code == 1  # 没有确认，不删除
+    result = runner.invoke(app, ["forget", "--expired", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "空间u：已删除1条轮次" in _flat(result.output)
+    with MemorySystem.from_settings(load_settings()) as system:
+        assert [t.text for t in system.db.get_turns("u")] == ["I like jazz"]
+        assert system.db.expiring_turns("u") == {}
 
 
 def test_demo_and_chat_commands(
@@ -546,6 +707,23 @@ def served(isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     calls: list[Any] = []
     monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
     return calls
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_servers_bound_the_graceful_shutdown(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """serve 与 proxy 收到 SIGTERM 后等进行中的请求最多 GRACEFUL_SHUTDOWN_S 秒（以前不限：一个
+    流式响应就能拖住收尾，过了 docker-compose.yml 的 stop_grace_period 被 SIGKILL，见第七轮体检
+    P8）。"""
+    from cuemem.cli import GRACEFUL_SHUTDOWN_S
+
+    options: list[dict[str, Any]] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: options.append(kwargs))
+    result = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert result.exit_code == 0, result.output
+    [kwargs] = options
+    assert kwargs["timeout_graceful_shutdown"] == GRACEFUL_SHUTDOWN_S == 20
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
@@ -847,13 +1025,42 @@ def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
     again = runner.invoke(app, ["keys", "add", "shop", "--user", "x"])
     assert again.exit_code == 1 and "已经有" in again.stderr and again.stdout == ""
     assert path.read_text(encoding="utf-8") == text
-    fresh = tmp_path / "new" / "keys.yaml"
+    fresh = tmp_path / "new.yaml"
     result = runner.invoke(app, ["keys", "add", "a", "--agent", "bot", "--file", str(fresh)])
     assert result.exit_code == 0, result.output
     agent_key = Keys.parse(fresh.read_text(encoding="utf-8")).resolve(result.stdout.strip())
     assert agent_key is not None and agent_key.allows("agent/bot")
     assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
     assert runner.invoke(app, ["keys", "add", "b", "--file", str(fresh)]).exit_code == 1
+
+
+def test_keys_add_says_where_the_file_is_and_never_makes_directories(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """keys add 不替人建目录：文件与它所在的目录都不在时报错退出（多半是路径写错了，或者用了容器
+    里的路径），什么都不建，也不打印令牌。新建文件时给出绝对路径，说服务要用指向它的
+    CUEMEM_API_KEYS_FILE 启动才读它，不说一秒内认；文件原来就有时才说一秒内认。"""
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "typo" / "nested" / "keys.yml"
+    result = runner.invoke(app, ["keys", "add", "a", "--user", "a", "--file", str(missing)])
+    assert result.exit_code == 1 and result.stdout == ""
+    assert str(missing.parent) in _flat(result.stderr)
+    assert not (tmp_path / "typo").exists()
+
+    result = runner.invoke(app, ["keys", "add", "a", "--user", "a", "--file", "new.yml"])
+    assert result.exit_code == 0, result.output
+    created = str(tmp_path / "new.yml")
+    flat = _flat(result.stderr)
+    assert f"CUEMEM_API_KEYS_FILE={created}" in flat and "重启" in flat
+    assert "一秒内" not in flat and result.stdout.strip() not in result.stderr
+    assert stat.S_IMODE((tmp_path / "new.yml").stat().st_mode) == 0o600
+
+    result = runner.invoke(app, ["keys", "add", "b", "--user", "b", "--file", "new.yml"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.stderr)
+    assert created in flat and "一秒内开始认它" in flat and "重启" not in flat
+    result = runner.invoke(app, ["keys", "revoke", "b", "--file", "new.yml"])
+    assert result.exit_code == 0 and created in _flat(result.stderr)
 
 
 def test_keys_add_refuses_inline_keys_and_leaves_flow_style_files_alone(
@@ -978,6 +1185,20 @@ def test_body_limits_from_the_environment(
         assert "错误" in result.output and name in result.output
         monkeypatch.delenv(name)
     assert len(served) == 1
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_serve_refuses_a_bad_open_session_limit(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """CUEMEM_MAX_OPEN_SESSIONS 写错时 cuemem serve 与 proxy 在打开记忆系统之前报错（退出码 1；
+    记忆代理的会话也按它限数，第七轮复审）。"""
+    monkeypatch.setenv("CUEMEM_MAX_OPEN_SESSIONS", "0")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1 and "CUEMEM_MAX_OPEN_SESSIONS" in result.output
+    assert served == []
+    monkeypatch.setenv("CUEMEM_MAX_OPEN_SESSIONS", "3")
+    assert runner.invoke(app, command).exit_code == 0 and len(served) == 1
 
 
 def test_serve_offers_mcp_over_http(served: list[Any]) -> None:

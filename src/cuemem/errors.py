@@ -1,5 +1,7 @@
 """CueMem 的异常类型。"""
 
+import sqlite3
+
 
 class CueMemError(RuntimeError):
     """所有 CueMem 异常的基类。"""
@@ -48,7 +50,8 @@ class ContentFilteredError(CueMemError):
 
 
 class ConcurrentWriteError(CueMemError):
-    """要写入的发言没有全部写进去：序号与会话里已有的发言撞上了（同一会话的并发写入没有串行）。"""
+    """要写入的发言没有全部写进去：序号与会话里已有的发言撞上了（同一会话的并发写入没有串行）。
+    这次什么都没写（发言、idempotency_key 与暂存的向量一起撤销），可以重试。"""
 
 
 class IdempotencyConflictError(CueMemError):
@@ -57,11 +60,26 @@ class IdempotencyConflictError(CueMemError):
 
 
 class StorageLockedError(CueMemError):
-    """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
+    """数据库或本地模式的向量库已被另一个进程打开：一个数据库同一时间只允许一个进程写
+    （store.files.lock_database，向量在 Qdrant 服务端时也一样），Qdrant 本地模式同一时间只允许
+    一个进程访问。"""
+
+
+class DatabaseOpenError(CueMemError, sqlite3.OperationalError):
+    """数据库、账本或缓存打不开（目录只读、磁盘满了、路径被占）。
+
+    同时是 sqlite3.OperationalError：以前打开时原样抛出它，按它捕获的调用方照样捕获得到。"""
 
 
 class VectorStoreOpenError(CueMemError):
     """本地模式的向量库打不开或建不了集合：多半是打开的文件太多（每个集合一直开着一个文件）。"""
+
+
+class SessionLimitError(CueMemError):
+    """这个记忆空间进行中的对话会话（/api/sessions、界面）已经到了 CUEMEM_MAX_OPEN_SESSIONS，又都
+    说过话：没有开新的会话（HTTP 429）。结束一个会话（/api/sessions/{id}/end）或等闲置的会话被
+    清理之后再开。/api/v1/runs 开的 run 同样（Memory.max_open_runs，MemoryClient.open_run 抛出
+    它）：end_run 一个或等闲置的 run 被结束。"""
 
 
 class AccessKeysError(CueMemError):

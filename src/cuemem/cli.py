@@ -37,7 +37,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args
 
@@ -56,10 +56,15 @@ from cuemem.config import (
     extra_remedy,
     load_settings,
 )
-from cuemem.core.timeutil import valid_period
+from cuemem.core.timeutil import naive_local, valid_period
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import atomic_write_text, mask, read_env, update_env
-from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
+from cuemem.errors import (
+    ConfigMismatchError,
+    CueMemError,
+    DatabaseOpenError,
+    DatasetChecksumError,
+)
 
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
@@ -70,7 +75,7 @@ if TYPE_CHECKING:
     from cuemem.core.models import Answer, Fact
     from cuemem.evals.datasets import EvalSet
     from cuemem.evals.runner import RunSummary
-    from cuemem.memory import MemorySystem
+    from cuemem.memory import ForgetReport, MemorySystem
     from cuemem.store.sqlite import MemoryDB
     from cuemem.write.consolidate import ConsolidationReport
 
@@ -206,6 +211,9 @@ def _open_system() -> Iterator[MemorySystem]:
         _peak_note(settings)
         try:
             system = MemorySystem.from_settings(settings)
+        except DatabaseOpenError as exc:  # 已经说明了哪个文件：不再包一层 _unopenable
+            console.print(f"[red]错误：[/red]{escape(str(exc))}")
+            raise typer.Exit(1) from exc
         except sqlite3.OperationalError as exc:  # 只管打开时：用的时候出的错照常抛出
             console.print(_unopenable(settings, exc))
             raise typer.Exit(1) from exc
@@ -228,8 +236,8 @@ def _unopenable(settings: Settings, exc: sqlite3.OperationalError) -> str:
 
 @contextmanager
 def _open_db_only() -> Iterator[MemoryDB]:
-    """只打开数据库（cuemem export、spaces）：不用向量库、模型与缓存，向量库打不开、或者
-    cuemem serve 正开着它的时候也能用。"""
+    """只打开数据库（cuemem export、spaces、inspect）：不用向量库、模型与缓存，向量库打不开、
+    或者 cuemem serve 正开着它的时候也能用（不拿 MemorySystem.from_settings 的数据库锁）。"""
     from cuemem.store.files import private_dirs, storage_dirs
     from cuemem.store.sqlite import MemoryDB
 
@@ -319,6 +327,7 @@ def doctor(
     _print_config(settings)
     _print_local_store(settings)
     _print_disk(settings)
+    _print_media_journal(settings)
     if vectors:
         _print_vector_gaps(settings)
     for line in _loose_modes(settings):
@@ -452,7 +461,8 @@ def reindex(
     ] = False,
 ) -> None:
     """按数据库补齐向量库：补上缺的向量、删掉多余的点（不调用 LLM）。向量库丢了、坏了，或者与
-    数据库不是同一时刻的备份时用；先用 cuemem doctor --vectors 查哪些空间对不上。"""
+    数据库不是同一时刻的备份时用；先用 cuemem doctor --vectors 查哪些空间对不上。顺带删掉进程
+    被杀掉时没有提交的写入、没做完的遗忘留在媒体库里的原图（cuemem doctor 提示有没有）。"""
     if (space is None) == (not all_spaces):
         console.print("[red]指定 --space 或 --all 其中一个[/red]")
         raise typer.Exit(2)
@@ -474,6 +484,10 @@ def reindex(
             if report.get("facts_missing"):
                 line += f"；{report['facts_missing']} 个事实单元在事实表里找不到，补不上"
             console.print(f"记忆空间 [bold]{escape(target)}[/bold]：{line}")
+        # 被杀掉的写入与遗忘留在媒体库里的原图（第七轮体检）：只删标记点名、没有记录引用的
+        recovered, _ = system.recover_media()
+        if recovered:
+            console.print(f"媒体库：删掉 {recovered} 张没有提交的写入或遗忘留下的原图")
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
 
 
@@ -483,7 +497,9 @@ _REINDEX_KINDS = ("round", "fact", "summary", "entity", "image", "image_iso", "i
 
 @app.command()
 def forget(
-    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    space: Annotated[
+        str | None, typer.Option(help="记忆空间 ID（--expired 时不给是所有空间）")
+    ] = None,
     session: Annotated[list[str] | None, typer.Option(help="要遗忘的会话 ID（可多次指定）")] = None,
     turn: Annotated[list[str] | None, typer.Option(help="要遗忘的轮次 ID（可多次指定）")] = None,
     fact: Annotated[
@@ -494,8 +510,30 @@ def forget(
         bool, typer.Option("--dry-run", help="只预演：列出会删哪些发言与事实，什么都不删")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="不再确认，直接删除")] = False,
+    expired: Annotated[
+        bool,
+        typer.Option(
+            "--expired",
+            help="删掉已经过期的发言（写入时给了 expiration_date 的），连同派生的记忆",
+        ),
+    ] = False,
+    older_than_days: Annotated[
+        int, typer.Option("--older-than-days", min=0, help="--expired 时只删过期这么多天以上的")
+    ] = 0,
 ) -> None:
-    """遗忘：删除原始轮次，并清除由它们派生的事实、摘要、向量与缓存（不可恢复）。"""
+    """遗忘：删除原始轮次，并清除由它们派生的事实、摘要、向量与缓存（不可恢复）。
+
+    --expired：删过期的记忆（cuemem serve / proxy 设了 CUEMEM_EXPIRED_RETENTION_DAYS 时每天自己
+    删，只用 SDK 时用这个命令）。只删过期的发言本身，后来引用了它、没给过期时间的回复留着。"""
+    if expired:
+        if session or turn or fact or dry_run:
+            console.print("[red]--expired 不能与 --session、--turn、--fact、--dry-run 一起用[/red]")
+            raise typer.Exit(1)
+        _forget_expired(space, older_than_days, yes)
+        return
+    if space is None:
+        console.print("[red]请用 --space 指定记忆空间[/red]")
+        raise typer.Exit(1)
     if not session and not turn and not fact:
         console.print("[red]请用 --session、--turn 或 --fact 指定要遗忘的内容[/red]")
         raise typer.Exit(1)
@@ -516,11 +554,36 @@ def forget(
         if report.turns_deleted == 0:
             console.print("没有找到要删除的内容。")
             return
+        _print_forget_report(report)
+
+
+def _forget_expired(space: str | None, days: int, yes: bool) -> None:
+    where = f"空间 {space}" if space is not None else "所有空间"
+    if not yes and not typer.confirm(
+        f"将永久删除{where}里过期 {days} 天以上的发言及其派生的全部记忆，确定吗？"
+    ):
+        raise typer.Exit(1)
+    with _open_system() as system:
+        reports = system.purge_expired(space, older_than=timedelta(days=days))
+    if not reports:
+        console.print("没有找到要删除的内容。")
+        return
+    for report in reports.values():
+        console.print(f"空间 {report.space_id}：", end="")
+        _print_forget_report(report)
+
+
+def _print_forget_report(report: ForgetReport) -> None:
+    console.print(
+        f"已删除 {report.turns_deleted} 条轮次（会话 {', '.join(report.sessions_affected)}）；"
+        f"事实 {report.facts_before} → {report.facts_after} 条（已按剩余日志重建）；"
+        f"清理向量缓存 {report.embed_cache_purged} 条、LLM 缓存 {report.llm_cache_purged} 条；"
+        f"耗时 {report.elapsed_ms:.0f} ms"
+    )
+    if report.rebuild_error:
         console.print(
-            f"已删除 {report.turns_deleted} 条轮次（会话 {', '.join(report.sessions_affected)}）；"
-            f"事实 {report.facts_before} → {report.facts_after} 条（已按剩余日志重建）；"
-            f"清理向量缓存 {report.embed_cache_purged} 条、LLM 缓存 {report.llm_cache_purged} 条；"
-            f"耗时 {report.elapsed_ms:.0f} ms"
+            f"[yellow]删除已经做了，重建派生记忆时出错（{report.rebuild_error}），"
+            "下次巩固时补齐[/yellow]"
         )
 
 
@@ -551,8 +614,12 @@ def ask(
     lam: Annotated[
         float | None, typer.Option(help="成本旋钮 λ：越大越省钱；默认取控制器模型里的值")
     ] = None,
+    show_expired: Annotated[
+        bool,
+        typer.Option("--show-expired", help="也用已经过期的记忆（写入时给了 expiration_date 的）"),
+    ] = False,
 ) -> None:
-    """检索记忆并回答问题。"""
+    """检索记忆并回答问题。已经过期的记忆默认不用，同 SDK 的 answer（见 expiry.py）。"""
     if mode not in get_args(AskMode):
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(AskMode))}[/red]")
         raise typer.Exit(1)
@@ -569,6 +636,7 @@ def ask(
             mode=cast(AskMode, mode),
             router=cast(Router, router),
             lam=lam,
+            hide_expired=not show_expired,  # 没有过期的记忆时请求与不打开时逐字相同
         )
         elapsed = (time.perf_counter() - started) * 1000
         if show_context:
@@ -822,6 +890,10 @@ UNKNOWN_MODEL_HELP = (
     "记忆代理收到模型目录里没有的 model 时：remap 改用 agent 角色的模型（响应头 X-CueMem-Model "
     "写明，日志里记一条警告）；reject 返回 400。默认取配置 proxy.unknown_model（remap）"
 )
+# serve 与 proxy 收到 SIGTERM 后，等进行中的请求（例如流式的 /v1 响应）最多这么多秒，之后才接着
+# 收尾（记忆代理重试缓冲着的写回、结束会话、等后台巩固最多 ConsolidationWorker.stop_timeout_s）。
+# 以前不限：一个不结束的连接拖住收尾，docker-compose.yml 的 stop_grace_period 一过就被 SIGKILL
+GRACEFUL_SHUTDOWN_S = 20
 IDLE_HELP = (
     "会话闲置多少分钟后结束并交给抽取：界面与 /api 的会话、/api/v1 的 run、/v1 记忆代理的会话。"
     "之后再往 /api 的会话发消息是 404，界面开一个新的会话，/api/v1 的 run 再 add 时重新打开"
@@ -964,6 +1036,7 @@ def serve(
     from cuemem.api.auth import KeyRing, Keys
     from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy
+    from cuemem.api.service import open_session_limit
 
     if not idle_minutes > 0:  # 在打开记忆系统之前检查
         console.print("[red]--idle-minutes 要大于 0[/red]")
@@ -984,6 +1057,7 @@ def serve(
         keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
+        open_session_limit()  # CUEMEM_MAX_OPEN_SESSIONS（建服务时再读一次）
         _require_token(host, keys, insecure_no_auth, insecure_weak_token)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
@@ -1029,7 +1103,13 @@ def serve(
                 _no_auth_hosts_note(hosts)
             for line in _loose_modes():
                 console.print(line)
-            uvicorn.run(app_, host=host, port=port, log_level="warning")
+            uvicorn.run(
+                app_,
+                host=host,
+                port=port,
+                log_level="warning",
+                timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+            )
     finally:
         proxy.close_all()
         service.close()
@@ -1058,7 +1138,7 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.limits import body_limits, concurrency_limit
+    from cuemem.api.limits import body_limits, concurrency_limit, open_session_limit
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -1072,6 +1152,7 @@ def proxy(
         keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
+        open_session_limit()  # CUEMEM_MAX_OPEN_SESSIONS（建代理时再读一次）
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
@@ -1116,7 +1197,7 @@ def proxy(
             allow_ip_hosts=hosts.ip_literals,
             max_body_bytes=max_body_bytes,
         )
-        uvicorn.run(app_, host=host, port=port)
+        uvicorn.run(app_, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
     finally:
         memory_proxy.close_all()
         system.close()
@@ -1182,8 +1263,8 @@ def _read_keys(path: Path) -> tuple[str, Keys]:
 
 
 def _write_keys(path: Path, text: str) -> None:
-    """换名替换（envfile.atomic_write_text：运行中的服务读到的不是旧的就是新的），再改成 0600。"""
-    path.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    """换名替换（envfile.atomic_write_text：运行中的服务读到的不是旧的就是新的），再改成 0600。
+    所在的目录要已经有（keys add 事先查过）：不替人建目录，路径写错时不悄悄建出一个没人读的文件。"""
     os.chmod(atomic_write_text(path, text), 0o600)
 
 
@@ -1223,7 +1304,9 @@ def keys_add(
     """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
 
     令牌只打印这一次，只打到标准输出（TOKEN=$(cuemem keys add …) 这样接住），文件里不存它；
-    别的提示都在标准错误。运行中的 cuemem serve / proxy 一秒内开始认它。"""
+    别的提示都在标准错误。文件原来就有时，运行中的 cuemem serve / proxy 一秒内开始认它；文件不在
+    时新建（所在的目录要已经有，否则报错退出，不打印令牌），服务要用指向它的
+    CUEMEM_API_KEYS_FILE 启动（或重启）才读它。"""
     import hashlib
     import secrets
 
@@ -1235,7 +1318,14 @@ def keys_add(
     if not user and not agent:
         err.print("[red]错误：[/red]至少给一个 --user 或 --agent（令牌能访问谁的记忆）")
         raise typer.Exit(1)
+    shown = escape(str(path.resolve()))  # 相对路径按各自进程的当前目录解析：提示里给绝对路径
     exists = path.exists()
+    if not exists and not path.resolve().parent.is_dir():
+        err.print(
+            f"[red]错误：[/red]{shown} 不在，它所在的目录 {escape(str(path.resolve().parent))} "
+            "也不在：路径是不是写错了（或者用了容器里的路径）？要新建令牌文件，先建好目录"
+        )
+        raise typer.Exit(1)
     text, old = _read_keys(path) if exists else ("", Keys())
     if name in old.names:
         err.print(f"[red]错误：[/red]{escape(str(path))} 里已经有名叫 {escape(name)} 的令牌")
@@ -1281,10 +1371,18 @@ def keys_add(
         raise typer.Exit(1)
     else:
         _write_keys(path, new)
-        err.print(
-            f"已把 {escape(name)} 加进 {escape(str(path))}（只存 sha256）。令牌只显示这一次，"
-            "在标准输出；运行中的 cuemem serve / proxy 一秒内开始认它"
-        )
+        if exists:
+            err.print(
+                f"已把 {escape(name)} 加进 {shown}（只存 sha256）。令牌只显示这一次，"
+                "在标准输出；运行中的 cuemem serve / proxy 一秒内开始认它"
+            )
+        else:
+            err.print(
+                f"已新建 {shown}（0600），把 {escape(name)} 加了进去（只存 sha256）。令牌只显示"
+                "这一次，在标准输出。cuemem serve / proxy 只有用 "
+                f"CUEMEM_API_KEYS_FILE={shown} 启动时才读它（在 Docker 里是容器里的路径）："
+                "带上这个设置启动或重启它们"
+            )
     print(token)
 
 
@@ -1367,7 +1465,7 @@ def keys_revoke(
     assert new is not None
     _write_keys(path, new)
     err.print(
-        f"已从 {escape(str(path))} 删掉 {escape(name)}；"
+        f"已从 {escape(str(path.resolve()))} 删掉 {escape(name)}；"
         "运行中的 cuemem serve / proxy 一秒内不再认它"
     )
     if not parsed.scoped and not os.environ.get(TOKEN_ENV):
@@ -1615,8 +1713,12 @@ def inspect_facts(
         datetime | None,
         typer.Option("--known-at", formats=DATETIME_FORMATS, help="记录时间：系统那时相信的事实"),
     ] = None,
+    hide_expired: Annotated[
+        bool, typer.Option("--hide-expired", help="不列出已经过期的事实（expiration_date）")
+    ] = False,
 ) -> None:
-    """事实时间线：按主语分组、按时间排列，标出被取代的版本。"""
+    """事实时间线：按主语分组、按时间排列，标出被取代的版本与已经过期的事实（检查用，默认
+    都列出；--hide-expired 时不列出过期的，同检索与记忆浏览器）。"""
     if valid_at is not None:
         try:
             valid_period(valid_at)
@@ -1625,10 +1727,20 @@ def inspect_facts(
                 f"{valid_at!r} 不是 ISO 日期：写成 YYYY、YYYY-MM 或 YYYY-MM-DD",
                 param_hint="--valid-at",
             ) from None
-    with _open_system() as system:
-        facts = system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
+    from cuemem.expiry import expired_ids
+
+    with _open_db_only() as db:  # 只读数据库：cuemem serve 开着它的时候也能用（见 _open_db_only）
+        facts = db.get_facts(
+            space,
+            current_only=current,
+            valid_period=valid_period(valid_at) if valid_at is not None else None,
+            known_at=naive_local(known_at) if known_at is not None else None,
+        )
         if subject:
             facts = [f for f in facts if f.subject.casefold() == subject.casefold()]
+        gone = expired_ids(db, space, datetime.now())
+        if hide_expired:
+            facts = [f for f in facts if f.id not in gone]
         if not facts:
             console.print("没有符合条件的事实。还没巩固的话，先运行 cuemem consolidate。")
             return
@@ -1644,7 +1756,7 @@ def inspect_facts(
                 fact.statement,
                 _span_text(fact.valid_from, fact.valid_to),
                 f"{fact.recorded_at:%Y-%m-%d}",
-                _fact_status(fact, ids),
+                _fact_status(fact, ids, expired=fact.id in gone),
                 fact.id,
             )
         console.print(table)
@@ -1653,8 +1765,8 @@ def inspect_facts(
 @inspect_app.command("entities")
 def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
     """实体列表：名字、类型、别名、提及次数。"""
-    with _open_system() as system:
-        entities = system.entities(space)
+    with _open_db_only() as db:
+        entities = db.get_entities(space)
         if not entities:
             console.print("没有实体。还没巩固的话，先运行 cuemem consolidate。")
             return
@@ -1679,8 +1791,8 @@ def inspect_sources(
     space: Annotated[str, typer.Option(help="记忆空间 ID")],
 ) -> None:
     """溯源：一条事实来自哪些原始轮次，以及它的版本链。"""
-    with _open_system() as system:
-        found = system.db.get_facts(space, ids=[fact_id])
+    with _open_db_only() as db:
+        found = db.get_facts(space, ids=[fact_id])
         if not found:
             console.print(f"[red]找不到事实 {fact_id}[/red]")
             raise typer.Exit(1)
@@ -1691,13 +1803,13 @@ def inspect_sources(
             f"重要度 {fact.importance} · 事件时间 {_span_text(fact.valid_from, fact.valid_to)} · "
             f"记录于 {fact.recorded_at:%Y-%m-%d %H:%M}"
         )
-        chain = system.db.get_facts(space, superseded_by=[fact.id])
+        chain = db.get_facts(space, superseded_by=[fact.id])
         if fact.superseded_by:
-            chain += system.db.get_facts(space, ids=[fact.superseded_by])
+            chain += db.get_facts(space, ids=[fact.superseded_by])
         for other in chain:
             relation = "取代了" if other.superseded_by == fact.id else "被它取代"
             console.print(f"[dim]{relation}：{other.statement}（{other.id}）[/dim]")
-        turns = system.db.get_turns(space, ids=fact.source_turn_ids)
+        turns = db.get_turns(space, ids=fact.source_turn_ids)
         for t in turns:
             who = t.speaker or ("用户" if t.role == "user" else "助手")
             console.print(f"[bold]{t.ts:%Y-%m-%d} · {t.session_id} · {who}[/bold]：{t.text}")
@@ -1706,8 +1818,8 @@ def inspect_sources(
 @inspect_app.command("profile")
 def inspect_profile(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
     """核心记忆（用户画像）：重要且当前有效的事实，每轮常驻上下文。"""
-    with _open_system() as system:
-        core = system.core_memory(space)
+    with _open_db_only() as db:
+        core = db.get_core_memory(space)
         if core is None or not core.text:
             console.print("还没有核心记忆。先运行 cuemem consolidate。")
             return
@@ -2351,6 +2463,23 @@ def _print_disk(settings: Settings) -> None:
         console.print(line)
 
 
+def _print_media_journal(settings: Settings) -> None:
+    """进程被杀掉时没有提交的写入、没做完的遗忘留在媒体库里的原图（第七轮体检，见
+    store/media.py）：有的话提示 cuemem reindex 删掉。只读标记，不打开数据库。"""
+    from cuemem.store.media import MediaStore
+
+    media = MediaStore(settings.paths.media, owner=str(settings.paths.db.absolute()))
+    try:
+        stale = media.pending()
+    except OSError:
+        return
+    if stale:
+        console.print(
+            f"[yellow]媒体库里有 {stale} 个被中断的写入或遗忘[/yellow]：可能留下了没有记录的原图，"
+            "运行 [bold]cuemem reindex --all[/bold] 删掉（cuemem serve 与 proxy 启动时也会删）"
+        )
+
+
 def _loose_modes(settings: Settings | None = None) -> list[str]:
     """同一台机器上别的用户能读的数据目录（给了 settings 时）与密钥文件（.env、
     CUEMEM_API_KEYS_FILE）：每个一行黄字与收紧的命令（第四轮体检）。只提醒、不改：已经存在的
@@ -2503,13 +2632,15 @@ def _span_text(start: str | None, end: str | None) -> str:
     return f"{start or '?'} → {end or '至今'}"
 
 
-def _fact_status(fact: Fact, ids: dict[str, int]) -> str:
+def _fact_status(fact: Fact, ids: dict[str, int], *, expired: bool = False) -> str:
+    """expired：出处各句都过期了（expiration_date，见 expiry.py），检索与记忆浏览器不给出它。"""
     if fact.is_current:
-        return "[green]当前[/green]"
+        return "[red]已过期[/red]" if expired else "[green]当前[/green]"
     successor = f"#{ids[fact.superseded_by]}" if fact.superseded_by in ids else "新版本"
+    gone = " · [red]已过期[/red]" if expired else ""
     if fact.supersede_reason == "corrected":
-        return f"[yellow]已更正[/yellow]（见 {successor}）"
-    return f"[dim]已变化[/dim]（见 {successor}）"
+        return f"[yellow]已更正[/yellow]（见 {successor}）{gone}"
+    return f"[dim]已变化[/dim]（见 {successor}）{gone}"
 
 
 def _print_hits(answer: Answer) -> None:

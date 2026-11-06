@@ -32,10 +32,15 @@ from cuemem.api.failures import provider_failure
 from cuemem.api.mcp import build_server
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.replay import DemoScript, check, replay
-from cuemem.api.service import ChatService
+from cuemem.api.service import ChatService, open_session_limit
 from cuemem.api.ui import _assistant, _profile_markdown, build_ui, render_graph, render_trace
 from cuemem.config import Settings
-from cuemem.errors import ContentFilteredError, EmbeddingAPIError
+from cuemem.errors import (
+    ContentFilteredError,
+    CueMemError,
+    EmbeddingAPIError,
+    SessionLimitError,
+)
 from cuemem.memory import MemorySystem, _open_mark
 from cuemem.sdk import Memory
 from cuemem.store.media import image_data_url
@@ -219,9 +224,74 @@ def test_idle_chat_sessions_are_ended(service: ChatService, tmp_path: Path) -> N
     assert busy.closed and not chat.is_open(busy.session_id)
 
 
+def test_open_chat_sessions_per_space_are_capped(service: ChatService, tmp_path: Path) -> None:
+    """第七轮体检 P14：一个空间同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）。到了
+    上限时开新的会话先结束最久没有活动、没说过话的那个（只去掉进行中的标记）；都说过话时 429，
+    不提前结束别人的对话。以前不限：一个令牌一直开会话，每个都占着内存与一个进行中的标记。"""
+    now = [1000.0]
+    chat = ChatService(service.system, service.agent, clock=lambda: now[0])
+    assert chat.max_open_sessions == 64
+    started = []
+    for _ in range(65):
+        now[0] += 1
+        started.append(chat.start("shop", at=DAY).session_id)
+    assert len(chat.open_sessions("shop")) == 64 and not chat.is_open(started[0])
+    assert service.system.open_sessions("shop") == set(started[1:])
+    chat.start("other", at=DAY)  # 别的空间各算各的
+    assert len(chat.open_sessions("other")) == 1
+
+    small = ChatService(service.system, service.agent, clock=lambda: now[0], max_open_sessions=2)
+    a = small.start("tiny", at=DAY).session_id
+    small.chat(a, "I'm vegan.", mode="l0")
+    now[0] += 1
+    b = small.start("tiny", at=DAY).session_id
+    now[0] += 1
+    c = small.start("tiny", at=DAY).session_id  # 结束的是没说过话的 b，不是更早的 a
+    assert small.is_open(a) and not small.is_open(b) and small.is_open(c)
+    small.chat(c, "I wear EU 39.", mode="l0")
+    with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+        small.start("tiny", at=DAY)
+    assert {s.session_id for s in small.open_sessions("tiny")} == {a, c}
+    client = TestClient(create_app(small, upload_dir=tmp_path / "uploads", ui=False))
+    refused = client.post("/api/sessions", json={"space": "tiny"})
+    assert refused.status_code == 429 and refused.headers["retry-after"] == "60"
+    assert "上限 2" in refused.json()["detail"]
+    small.end(a)
+    assert client.post("/api/sessions", json={"space": "tiny"}).status_code == 200
+    # /api/v1/runs 开的 run 同一个上限，各算各的（第七轮复审）
+    runs = [client.post("/api/v1/runs", json={"user_id": "tiny"}) for _ in range(3)]
+    assert [r.status_code for r in runs] == [200, 200, 429]
+
+
+def test_the_ui_explains_the_open_session_limit(service: ChatService) -> None:
+    """第七轮复审 P14：界面开会话（New session，或还没有会话时发第一句）碰到上限时给出说明
+    （gr.Error），以前 SessionLimitError 原样抛出，界面只显示笼统的 "Error"。"""
+    small = ChatService(service.system, service.agent, max_open_sessions=1)
+    small.chat(small.start("tiny", at=DAY).session_id, "I'm vegan.", mode="l0")
+    events = {f.name: f.fn for f in build_ui(small).fns.values()}
+    with pytest.raises(gr.Error, match="too many open sessions") as raised:
+        events["start"]("tiny", "", None, None)
+    assert "the limit is 1" in str(raised.value)
+    message = {"text": "hello", "files": []}
+    replies = events["send"](message, [], None, "tiny", "", "l0", "learned", 0.5, None)
+    with pytest.raises(gr.Error, match="too many open sessions"):
+        list(replies)
+    assert len(small.open_sessions("tiny")) == 1
+
+
+def test_open_session_limit_from_the_environment() -> None:
+    """CUEMEM_MAX_OPEN_SESSIONS：默认 64，写错时 CueMemError（cuemem serve 退出码 1）。"""
+    assert open_session_limit({}) == 64
+    assert open_session_limit({"CUEMEM_MAX_OPEN_SESSIONS": " 5 "}) == 5
+    for bad in ("0", "-1", "ten", "1.5"):
+        with pytest.raises(CueMemError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            open_session_limit({"CUEMEM_MAX_OPEN_SESSIONS": bad})
+
+
 def test_the_app_sweeps_idle_sessions_while_it_runs(service: ChatService, tmp_path: Path) -> None:
-    """create_app 的清理线程只在应用运行期间（lifespan）跑，idle_minutes=None 时不起；一项出错不影响
-    别的，线程也不退出。"""
+    """create_app 的清理线程只在应用运行期间（lifespan）跑；idle_minutes=None 时不结束会话，但还是
+    要起：收拾媒体库里被杀掉的操作留下的原图（第七轮体检 P8），媒体库不写标记时才不起。一项出错
+    不影响别的，线程也不退出。"""
 
     def sweepers() -> int:
         return sum(t.name == "cuemem-api-sweep" for t in threading.enumerate())
@@ -232,7 +302,12 @@ def test_the_app_sweeps_idle_sessions_while_it_runs(service: ChatService, tmp_pa
     assert sweepers() == before
     service.idle_minutes = None
     with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)):
-        assert sweepers() == before and service.idle_minutes is None
+        assert sweepers() == before + 1 and service.idle_minutes is None
+    assert service.system.media is not None
+    owner, service.system.media.owner = service.system.media.owner, None
+    with TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)):
+        assert sweepers() == before
+    service.system.media.owner = owner
 
     calls: list[str] = []
     stop = threading.Event()
@@ -312,6 +387,105 @@ def test_graph_links_entities_named_in_statements(
     edges = {(e["source"], e["target"]) for e in graph["edges"]}
     assert edges == {("u", "max"), ("u", "lis"), ("u", "p12"), ("u", "p7")}
     assert len(searches) <= 12  # 以前 4 条事实 × 1,200 多个名字
+
+
+def _mentions_by_regex(entities: Sequence[Any], text: str) -> set[str]:
+    """实体图以前找名字的做法（第七轮体检 P17 之前），留作对照：每个实体的每个别名一个正则。"""
+    text = text.lower()
+    return {
+        e.id
+        for e in entities
+        for a in [n.lower() for n in [e.name, *e.aliases] if len(n) >= 3]
+        if a in text and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text)
+    }
+
+
+def test_graph_name_index_matches_the_regex_scan() -> None:
+    """第七轮体检 P17：实体图找名字改成按单词边界查字典（以前实体数 × 事实数，5000 个实体、
+    1 万条事实要 19 秒），随机的名字与陈述上与原来的正则逐条相同：互相重叠、是别的名字的前缀、
+    两头是标点、带重音、中文、下划线与数字。"""
+    import random
+
+    from cuemem.api.service import _Mentions
+    from cuemem.core.models import Entity
+
+    rng = random.Random(7)
+    pieces = ["max", "maxie", "ana", "anna", "lis", "lisbon", "o'neil", "c++", "(x)", "café",
+              "Café", "ÉCOLE", "北京", "北京市", "王小明", "nick_1", "nick", "r2d2", "a.b", "ss",
+              "STRASSE", "straße", "İstanbul", "x-y", "..."]  # fmt: skip
+    glue = [" ", "", "_", "-", ".", "'", ",", "!", "\n", "1", "é", "的", "，"]
+    for case in range(3000):
+        entities = [
+            Entity(
+                id=f"e{i}",
+                space_id="g",
+                name=rng.choice(pieces),
+                type="other",
+                aliases=rng.sample(pieces, rng.randint(0, 3)),
+                first_seen=DAY,
+                last_seen=DAY,
+            )
+            for i in range(rng.randint(1, 6))
+        ]
+        text = "".join(rng.choice(pieces) + rng.choice(glue) for _ in range(rng.randint(0, 8)))
+        expected = _mentions_by_regex(entities, text)
+        assert _Mentions(entities).find(text) == expected, (case, text, entities)
+
+
+def test_graph_is_unchanged_by_the_name_index(service: ChatService) -> None:
+    """同一个空间上的实体图与按原来的正则算出来的逐条相同（点、边与各点的事实数）。"""
+    from cuemem.core.models import Entity, Fact
+
+    words = ["Max", "Maxie", "Lisbon", "Ana", "Anna", "Porto", "café", "Nick_1", "北京"]
+    entities = [
+        Entity(
+            id=f"e{i}",
+            space_id="g",
+            name=w,
+            type="other",
+            aliases=[w.lower() + "y"],
+            first_seen=DAY,
+            last_seen=DAY,
+        )
+        for i, w in enumerate(words)
+    ]
+    statements = [
+        "Max met Anna in Lisbon.",
+        "Maxie likes café au lait",
+        "Nick_1 visited 北京",
+        "Anna's dog is anay",
+        "Porto, Lisbon and maxy",
+        "Analysis of Maximal Anna",
+    ]
+    facts = [
+        Fact(
+            id=f"f{i}",
+            space_id="g",
+            subject_id=f"e{i % len(words)}",
+            subject=words[0],
+            predicate=f"p{i}",
+            object=s.split()[-1],
+            statement=s,
+            recorded_at=DAY,
+            session_id="s",
+            source_turn_ids=[],
+        )
+        for i, s in enumerate(statements)
+    ]
+    service.system.db.apply_consolidation(facts=facts, entities=entities, episodes=[], units=[])
+    graph = service.graph("g")
+    edges, degree, seen = [], {}, set()
+    for f in facts:
+        degree[f.subject_id] = degree.get(f.subject_id, 0) + 1
+        linked = set(f.entity_ids) | _mentions_by_regex(entities, f"{f.statement} {f.object}")
+        for other in sorted(linked - {f.subject_id}):
+            pair = (min(f.subject_id, other), max(f.subject_id, other))
+            if pair not in seen:
+                seen.add(pair)
+                edges.append({"source": f.subject_id, "target": other, "label": f.predicate})
+                degree[other] = degree.get(other, 0) + 1
+    assert graph["edges"] == edges and len(edges) > 5
+    assert {n["id"]: n["facts"] for n in graph["nodes"]} == degree
 
 
 def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedModel) -> None:
@@ -1166,7 +1340,7 @@ def test_ui_api_refuses_cross_origin_requests(
         )
         assert preflight.status_code == 403
         assert "access-control-allow-origin" not in preflight.headers
-        posted = client.post(call, json={"data": ["alice", False, "fact"]}, headers=evil)
+        posted = client.post(call, json={"data": ["alice", False, False, "fact"]}, headers=evil)
         assert posted.status_code == 403
         assert "access-control-allow-origin" not in posted.headers
         upload = client.post(
@@ -1175,7 +1349,7 @@ def test_ui_api_refuses_cross_origin_requests(
         assert upload.status_code == 403
 
         same = {"Host": host, "Origin": f"http://{host}"}  # 界面本身
-        posted = client.post(call, json={"data": ["alice", False, "fact"]}, headers=same)
+        posted = client.post(call, json={"data": ["alice", False, False, "fact"]}, headers=same)
         assert posted.status_code == 200
         event = posted.json()["event_id"]
         assert "4321" in client.get(f"{call}/{event}", headers=same).text
@@ -1210,7 +1384,7 @@ def test_no_auth_lan_bind_refuses_rebound_hosts(service: ChatService, tmp_path: 
             assert client.get("/v1/models", headers=rebound).status_code == 400
             call = client.post(
                 "/gradio_api/call/load_memory",
-                json={"data": ["alice", False, "fact"]},
+                json={"data": ["alice", False, False, "fact"]},
                 headers=rebound,
             )
             assert call.status_code == 400

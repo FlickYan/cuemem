@@ -19,7 +19,7 @@ All three integrations share `cuemem/evidence.py`.
 - **One evidence format:** the recalled facts and conversation excerpts are laid out exactly as the proxy and the reader lay them out, and placed at the start of the latest user message.
 - **Prefix caching is kept:** the system prompt and earlier messages are untouched, so provider prefix caching keeps working.
 - **Same tools as MCP:** recall / remember / forget have the same names, descriptions and semantics as the MCP tools.
-- **Memories are framed as data:** the evidence block and the recall tools' listing say that their content is quoted from past conversations, information and not instructions, and a stored `<memory` or `</memory` is escaped so it cannot close the block early. The recall listing quotes stored text line by line with '| ' and ends with 'End of recalled memories.' (multi-line facts are joined with ' / '), so a stored message cannot pass itself off as part of the listing, such as a `Facts:` block with real ids next to the forget tool. This reduces prompt injection from stored memories but cannot prevent it.
+- **Memories are framed as data:** the evidence block and the recall tools' listing say that their content is quoted from past conversations, information and not instructions, and a stored `<memory` or `</memory` is escaped so it cannot close the block early. The recall listing quotes stored text line by line with '| ' and ends with 'End of recalled memories.' (multi-line facts are joined with ' / '), so a stored message cannot pass itself off as part of the listing, such as a `Facts:` block with real ids next to the forget tool. The MCP `profile` tool quotes the profile the same way (`Profile:`, every line prefixed with '| ', then 'End of recalled memories.'). This reduces prompt injection from stored memories but cannot prevent it.
 - **Nothing twice:** in OpenAI Agents and LangGraph, rounds of the current conversation that are still in the request are left out of the evidence, photo rounds included (`evidence.stored_text` and `in_context_rounds`, shared with the proxy).
 - **Forgetting says what happened:** when the deletion is done but rebuilding the derived memory from the rest of the log fails (say, the provider is out of balance), the forget tools of MCP, Agents and LangGraph answer "Deleted N conversation turn(s). Rebuilding the memory derived from the rest failed (…); it finishes on the next consolidation…" instead of an error, so the model does not tell the user nothing was deleted.
 - **Writes are all or nothing:** when embedding or the vector store fails, nothing is written, so a write can be retried without duplicating turns. Once the turns are committed nothing raises: a trace that cannot be written is only a warning on the `cuemem.core.trace` logger.
@@ -31,7 +31,7 @@ Install with `pip install "cuemem[integrations] @ git+https://github.com/FlickYa
 
 ## OpenAI Agents SDK
 
-`cuemem.integrations.openai_agents` (openai-agents 0.23). It has three parts, usable separately:
+`cuemem.integrations.openai_agents` (openai-agents 0.24). It has three parts, usable separately:
 
 - `memory_tools(memory, user_id=...)`: the recall, remember and forget tools.
 - `memory_input_filter(memory, user_id=...)`: pass it as `RunConfig.call_model_input_filter`. Before every model call, it runs the controller and injects the evidence into the copy sent to the model.
@@ -41,7 +41,7 @@ Install with `pip install "cuemem[integrations] @ git+https://github.com/FlickYa
   - When the conversation ends, the whole session is extracted into facts.
 
 ```python
-from agents import Agent, RunConfig, Runner
+from agents import Agent, ModelSettings, RunConfig, Runner
 from cuemem import Memory
 from cuemem.integrations.openai_agents import (
     CueMemSession,
@@ -61,6 +61,7 @@ agent = Agent(name="Assistant", model=..., tools=memory_tools(memory, user_id=us
 config = RunConfig(
     call_model_input_filter=memory_input_filter(memory, user_id=user_of),
     trace_include_sensitive_data=False,  # keep recalled memories out of SDK traces
+    model_settings=ModelSettings(store=False),  # the provider keeps no copy of responses
 )
 
 async with CueMemSession("chat-1", memory, user_id="alice") as session:
@@ -74,12 +75,13 @@ close_sessions(memory)  # at shutdown, before memory.close()
   - Sessions are written as open and not extracted.
   - They are handed to background extraction when `async with` ends, on `end()`, after 30 idle minutes, or on `close_sessions()`.
   - A later conversation in the same SDK session becomes a new segment, with its own conversation date.
-- **Server-managed state:** with `conversation_id` or `previous_response_id`, use `memory_input_filter(..., placement="instructions")`. The evidence then goes into that call's instructions and is never stored server-side with the user message.
+- **Server-managed state:** with `conversation_id` or `previous_response_id`, use `memory_input_filter(..., placement="instructions")`. The evidence then goes into that call's instructions, which keeps it out of the conversation items that later calls replay; each stored response still keeps its own instructions (see below).
 - **Forgetting:**
   - Messages removed with `pop_item` or `clear_session` are also forgotten in long-term memory.
   - Turns deleted with the forget tool are pruned from the inner session the next time history is read.
+  - **The provider's copy:** the Agents SDK leaves `ModelSettings.store` unset, so the Responses API stores every response (its instructions and input, evidence included, in either placement) for at least 30 days unless you pass `ModelSettings(store=False)` or the organization has zero data retention. That copy is outside `forget` and `delete_all`. For client-held history (`CueMemSession`, `result.to_input_list()`) use `RunConfig(model_settings=ModelSettings(store=False), call_model_input_filter=..., trace_include_sensitive_data=False)`, as above. Server-managed state (`previous_response_id`, `conversation_id`) needs stored responses, so there the provider's copy cannot be avoided and forget cannot reach it. (Checked against openai-agents 0.24 and openai 3.40; see OpenAI's documentation for its retention terms.)
 - **Unanswered messages:** user messages the model never answered (for example, blocked by an input guardrail) are not stored.
-- **Write-backs that fail are retried:** when a batch cannot be written (an embedding or Qdrant outage), `CueMemSession` keeps it and writes it, with its original time, before the next batch or in `end()`. A batch is dropped (trace event `agents_mirror_dropped`) when retrying cannot help (most 4xx errors, a content-filter refusal, invalid input such as an image above Pillow's pixel limit, which is dropped alone) or when the space has forgotten turns in the meantime, so messages from before a forget are never written back. Kept batches live only in process memory.
+- **Write-backs that fail are retried:** when a batch cannot be written (an embedding or Qdrant outage), `CueMemSession` keeps it and writes it, with its original time, before the next batch or in `end()`. A batch is dropped (trace event `agents_mirror_dropped`) when retrying cannot help (most 4xx errors, a content-filter refusal, invalid input such as an image above Pillow's pixel limit, which is dropped alone) or when the space has forgotten turns in the meantime, so messages from before a forget are never written back. Kept batches live only in process memory: at most 100 batches or 32 MiB per session (text plus image data-URL characters); during a long outage older ones are dropped with a warning and an `agents_mirror_dropped` trace event (`reason=backlog`).
 - **Through the memory proxy instead:** the Agents SDK's default model class calls the Responses API, usually with tools or streaming, and the proxy answers those with 501. Use this integration, or point `OpenAIChatCompletionsModel` at the proxy.
 
 ## LangGraph / LangChain
@@ -125,6 +127,7 @@ cuemem.close()  # at shutdown, before memory.close(); async: aend_thread / aclos
   - They are stored per user in a small side store, `claude_memory.sqlite` in the data directory (a SQLite database in WAL mode). Back it up with the data directory, including its `-wal` and `-shm` files; see [Backup and recovery](../../README.md#backup-and-recovery).
   - Every change is also written as a note into CueMem's raw log, which consolidation turns into facts.
   - Deleting a file forgets what it contributed.
+  - `Memory.delete_all`, `reset` and `delete` (and the `/api/v1` delete routes) delete the matching files in this store at once: all of a deleted user's files, or the files whose notes a forget removed. The module's own `delete_all` is needed only for a store at a custom `store=` path; it also returns `memory_files_deleted`.
 - **Safety:** strict path validation keeps everything inside `/memories`, and file sizes are limited.
 - **Recall:** `with_recall` / `awith_recall` run the controller and inject evidence before the request goes to Claude.
 
@@ -150,6 +153,7 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
             max_tokens=16000,
             tools=[tool],
             messages=history,
+            thread=False,  # send the whole history each step (anthropic>=2.3), so forget covers it
         )
         for message in runner:
             history.append(message.to_param())
@@ -157,20 +161,20 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
             if results is not None:
                 history.append(results)
 
-delete_all(memory, user_id="alice")  # memories and Claude's files, together
+delete_all(memory, user_id="alice")  # memories and Claude's files; memory.delete_all does both too
 ```
 
 - **Not run against the real Claude API:** there was no Anthropic key, and DeepSeek's Anthropic-compatible endpoint rejects `memory_20250818`. Offline tests drive every tool command directly. The live smoke test drove the same commands through DeepSeek as a regular tool.
 - **Removing a line from a file** records "this no longer holds"; extraction and reconciliation decide what follows. Only deleting the whole file is a guaranteed forget.
 - **Provider failures after the note is logged:** if extraction fails once a change has been written as a note (say, the provider is out of balance), the file change still succeeds and the note is logged once; extraction finishes on the next consolidation. A delete whose rebuild fails after the deletion also succeeds, and says that the rebuild finishes later.
 - **Export:** Claude's files are not in `Memory.export`, which only has the notes in the raw log.
-- **anthropic 2.3 and later:** `tool_runner` keeps the conversation in a thread the server holds by default, so the requests within one turn after the first send only the new messages (the earlier ones, evidence block included, stay as sent). The pattern above still starts each turn from the full `history`. With a thread, the provider stores the conversation server-side, evidence blocks included; that copy is outside CueMem's forget and `delete_all`. Pass `thread=False` to `tool_runner` (anthropic 2.3 and later; the parameter does not exist in 1.x, which CueMem still accepts) when forgetting must cover what was sent: every request then carries the whole history, as 1.x did. For how long the provider keeps threads or requests, see Anthropic's documentation. `examples/integrations/claude_example.py` does not pass it yet and needs `ANTHROPIC_MODEL` set to a Claude model that supports the memory tool.
+- **anthropic 2.3 and later:** `tool_runner` keeps the conversation in a thread the server holds by default, so the requests within one turn after the first send only the new messages (the earlier ones, evidence block included, stay as sent). The pattern above still starts each turn from the full `history`. With a thread, the provider stores the conversation server-side, evidence blocks included; that copy is outside CueMem's forget and `delete_all`. The snippet above and `examples/integrations/claude_example.py` pass `thread=False` (it needs anthropic 2.3 or later; on 1.x, which CueMem's `anthropic>=1.14` floor still accepts, remove the argument, since 1.x already sends the whole history). Each step then re-sends the whole history, so everything sent stays within CueMem's forget and `delete_all`. Removing it trades forget coverage for smaller requests, because the default server-held thread keeps the evidence blocks on the provider's side. For how long the provider keeps threads or requests, see Anthropic's documentation. The example needs `ANTHROPIC_MODEL` set to a Claude model that supports the memory tool.
 
 ## Limitations
 
-- **Open sessions:** they are tracked in memory per process. When several processes share a data directory (with a Qdrant server), one process can hand over a session that another is still using.
+- **One process per database:** a database can be opened by one process at a time. A second process (stdio `cuemem mcp`, `cuemem proxy`, `cuemem reindex`, an SDK `Memory()`) opening the same database gets `StorageLockedError` naming the holder's pid and command, also when vectors live on a Qdrant server. Talk to the running process through `MemoryClient` or HTTP (`/api/v1`, `/mcp`), or set `CUEMEM_ALLOW_SHARED_DB=1` to skip the lock at your own risk (adoption of each other's open runs, `reindex` deleting the other process's in-flight vectors, colliding turn numbers). The lock is a file `<database>.lock` next to the database (for example `data/cuemem.sqlite.lock`); it uses `flock`, which NFS may not honour. Two data directories pointing at the same Qdrant server and space still share collections; the lock does not cover that.
 - **A forget during the model call:** if a memory that was injected is forgotten while the model is still answering, the memory proxy returns the answer but does not store it (the user's message is stored). The integrations have the same recall → model → write shape without that check, so such an answer may still be written back there (not reproduced).
 - **Images:** the integrations inject text evidence only. When the controller wants to look at the original photo (`see`), the photo is not attached to the model call (the same as the proxy).
 - **Async:** CueMem itself is synchronous and runs in threads. In async frameworks use `AsyncMemory` or each integration's async variants.
 - **Provider errors and expiry:** the integrations' own memory tools do not turn provider errors (rate limits, an empty balance, timeouts) into explanations the way MCP does; the provider client's error comes through. Memories whose `expiration_date` has passed are left out of the integrations' recall, auto-recall and profile, and of the Claude memory tool's generated `profile.md`, `facts.md` and `history/` (D-072; before, only the SDK's `search`, `get_all` and profile left them out). Expiry is judged against the current time; a memory restated later without an expiry stays.
-- **Traces:** every automatic recall and recall tool call writes a `retrieve` trace (the question, the retrieval mode and the IDs it retrieved) to `runs/traces/*.jsonl` in the data directory. Forgetting deletes the traces that list a deleted memory, together with the cached query vectors of their questions (also when the question contains U+2028, U+2029 or U+0085) and of the sub-queries, follow-up queries and the agent's own searches recorded in them, and `delete_all` deletes every trace of the space. A trace file that cannot be rewritten during a forget (a full disk) is deleted whole, with a warning; the forget still succeeds. Traces are kept until then unless `CUEMEM_TRACES_RETENTION_DAYS` is set: `cuemem serve` and `cuemem proxy` apply it daily, and an app that only uses the SDK can call `memory.system.prune_traces(days)`.
+- **Traces:** every automatic recall and recall tool call writes a `retrieve` trace (the question, the retrieval mode and the IDs it retrieved) to `runs/traces/*.jsonl` in the data directory. Retrieval also records a `profile` event with the ids of the facts behind the profile it showed, so forgetting a profile fact deletes the traces of answers that only paraphrased it (in practice, most traces of that space). Forgetting deletes the traces that list a deleted memory, together with the cached query vectors of their questions (also when the question contains U+2028, U+2029 or U+0085) and of the sub-queries, follow-up queries and the agent's own searches recorded in them, and `delete_all` deletes every trace of the space. A trace file that cannot be rewritten during a forget (a full disk) is deleted whole, with a warning; the forget still succeeds. Traces are kept until then unless `CUEMEM_TRACES_RETENTION_DAYS` is set: `cuemem serve` and `cuemem proxy` apply it daily, and an app that only uses the SDK can call `memory.system.prune_traces(days)`.

@@ -27,6 +27,10 @@ services:
     build: .
     image: cuemem:latest
     restart: unless-stopped
+    # 停止时先 SIGTERM，过了这段时间才 SIGKILL（Docker 默认 10 秒）。cuemem 要等进行中的请求（最多
+    # 20 秒）、重试记忆代理缓冲着的写回（可能要调向量接口）、等后台巩固（最多 30 秒）：10 秒不够，
+    # 被杀掉时缓冲的写回就丢了。单独 docker run 时加 --stop-timeout 90
+    stop_grace_period: 90s
     depends_on:
       - qdrant
     ports:

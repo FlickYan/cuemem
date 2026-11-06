@@ -63,6 +63,8 @@ MAX_BODY_ENV = "CUEMEM_MAX_BODY_BYTES"
 MAX_IMPORT_ENV = "CUEMEM_MAX_IMPORT_BYTES"
 MAX_CONCURRENT_ENV = "CUEMEM_MAX_CONCURRENT_PER_KEY"
 MAX_CONCURRENT = 8  # 一个限定作用域的令牌同时在处理的请求数（线程池共 40 个线程）
+MAX_OPEN_SESSIONS_ENV = "CUEMEM_MAX_OPEN_SESSIONS"
+MAX_OPEN_SESSIONS = 64  # 一个记忆空间同时进行中的会话（见 open_session_limit）
 MAX_BODY_BYTES = 64 << 20
 MAX_IMPORT_BYTES = 1 << 30
 OTHER_BODY_BYTES = 8 << 20  # 界面的登录与事件（不可配置）
@@ -335,5 +337,22 @@ def concurrency_limit(environ: Mapping[str, str] | None = None) -> int:
     if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
         raise CueMemError(
             f"{MAX_CONCURRENT_ENV} 要是正整数（请求数，默认 {MAX_CONCURRENT}），现在是 {raw!r}"
+        )
+    return int(raw)
+
+
+def open_session_limit(environ: Mapping[str, str] | None = None) -> int:
+    """环境变量 CUEMEM_MAX_OPEN_SESSIONS 给出的、一个记忆空间同时进行中的会话数的上限；没设
+    或是空的时默认 64。不是正整数时 CueMemError（cuemem serve / proxy 打印原因、退出码 1）。
+    管三种会话，各算各的：/api 的对话会话（ChatService.start，含界面）、记忆代理的会话
+    （MemoryProxy._run）与 /api/v1/runs 开的 run（Memory.max_open_runs）。"""
+    env = os.environ if environ is None else environ
+    raw = (env.get(MAX_OPEN_SESSIONS_ENV) or "").strip()
+    if not raw:
+        return MAX_OPEN_SESSIONS
+    if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
+        raise CueMemError(
+            f"{MAX_OPEN_SESSIONS_ENV} 要是正整数（会话数，默认 {MAX_OPEN_SESSIONS}），"
+            f"现在是 {raw!r}"
         )
     return int(raw)

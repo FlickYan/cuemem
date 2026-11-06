@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import httpx2
 import pytest
-from fakes import FakeAPI
+from fakes import FakeAPI, fill_to_capacity
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 
@@ -21,6 +21,7 @@ from cuemem.llm import ChatResult, Ledger, LLMClient, ResponseCache, ToolCall, U
 from cuemem.llm import client as llm_client
 from cuemem.llm.cache import request_key
 from cuemem.llm.client import unparsable_json
+from cuemem.llm.ledger import UsageRecord
 
 HELLO = [{"role": "user", "content": "hi"}]
 
@@ -674,3 +675,101 @@ def test_unparsable_json() -> None:
     assert unparsable_json(reply('{"a": "line\nbreak"}'))  # 字符串里原样的换行：严格解析不过
     call = ToolCall(id="c1", name="save", arguments="{}")
     assert not unparsable_json(reply(None, [call]))
+
+
+def test_full_cache_raises_by_default_and_rolls_back(tmp_path: Path) -> None:
+    """LLM 缓存默认严格（评测与脚本）：磁盘满了时 put 照样抛出，缓存是复现结果的依据；调高上限
+    之后接着能写。出错时先回滚：commit 出错（SQLITE_IOERR）时 INSERT 打开的事务还在，以前一直
+    拿着写锁，同一个文件的别的连接（遗忘的清理）写不进去；best_effort 时也一样回滚。"""
+    import sqlite3
+
+    path = tmp_path / "llm.sqlite"
+    cache = ResponseCache(path)
+    fill_to_capacity(cache._conn)
+    with pytest.raises(sqlite3.OperationalError, match="full"):
+        cache.put("k1", "m", {"content": "x" * 20000})
+    cache._conn.execute("PRAGMA max_page_count = 1000000")
+    cache.put("k1", "m", {"content": "x" * 20000})
+    assert len(cache) == 1
+
+    real = cache._conn
+
+    class FailingCommit:  # INSERT 照常执行（打开事务、拿到写锁），commit 时磁盘出错
+        def execute(self, *args: Any) -> Any:
+            return real.execute(*args)
+
+        def commit(self) -> None:
+            error = sqlite3.OperationalError("disk I/O error")
+            error.sqlite_errorname = "SQLITE_IOERR_WRITE"  # type: ignore[attr-defined]
+            raise error
+
+        def rollback(self) -> None:
+            real.rollback()
+
+    for best_effort in (False, True):
+        cache.best_effort = best_effort
+        cache._conn = FailingCommit()  # type: ignore[assignment]
+        if best_effort:
+            cache.put("k2", "m", {"content": "y"})
+        else:
+            with pytest.raises(sqlite3.OperationalError, match="I/O"):
+                cache.put("k2", "m", {"content": "y"})
+        assert not real.in_transaction
+        other = sqlite3.connect(str(path), timeout=0)
+        other.execute("BEGIN IMMEDIATE")  # 没回滚时 database is locked
+        other.rollback()
+        other.close()
+    cache._conn = real
+    assert len(cache) == 1
+    cache.close()
+
+
+def test_best_effort_cache_and_ledger_warn_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """best_effort 的缓存与账本（MemorySystem.from_settings 打开）：磁盘满了时只记一条警告，接连
+    失败不再记，写入恢复之后再失败时再记。"database is locked" 不是磁盘的问题，照样抛出。"""
+    import sqlite3
+
+    cache = ResponseCache(tmp_path / "llm.sqlite", best_effort=True)
+    ledger = Ledger(tmp_path / "ledger.sqlite", best_effort=True)
+    fill_to_capacity(cache._conn)
+    fill_to_capacity(ledger._conn)
+    record = UsageRecord(
+        ts=datetime(2026, 1, 1),
+        run_id="r",
+        kind="chat",
+        role="reader",
+        provider="p",
+        model="m" * 20000,
+        input_tokens=1,
+        cost=0.0,
+        cost_cached=0.0,
+        currency="USD",
+    )
+    with caplog.at_level("WARNING"):
+        for n in range(2):
+            cache.put(f"k{n}", "m", {"content": "x" * 20000})
+            ledger.record(record)
+    warned = [r.getMessage() for r in caplog.records]
+    assert len(warned) == 2 and any("LLM 缓存" in w for w in warned)
+    assert any("用量账本" in w for w in warned)
+    assert cache.failing and ledger.failing
+    stored = len(cache)
+    cache._conn.execute("PRAGMA max_page_count = 1000000")
+    cache.put("k9", "m", {"content": "x"})
+    assert not cache.failing and len(cache) == stored + 1
+
+    busy = sqlite3.OperationalError("database is locked")
+    busy.sqlite_errorname = "SQLITE_BUSY"  # type: ignore[attr-defined]
+
+    class Busy:
+        def execute(self, *args: Any) -> None:
+            raise busy
+
+        def rollback(self) -> None:
+            pass
+
+    cache._conn = Busy()  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        cache.put("k10", "m", {"content": "x"})

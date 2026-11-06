@@ -196,9 +196,11 @@ class L2Retriever:
         *,
         cache_scope: str | None = None,
         exclude: Collection[str] = (),
+        hidden: Collection[str] = (),
         probe: L1Candidates | None = None,
     ) -> L2Result:
         """exclude：不参与检索的轮与图片（已经在 Agent 上下文里的工作记忆，见 read/l1.py）。
+        hidden：过期的记忆，在各路检索里就排除（见 read/l1.py）。
 
         probe：控制器的探针对原问题检索过的候选。原问题的查询向量与探针的逐位相同时，第一遍
         召回直接用探针的各路结果、按计划的时间区间重新打分，不再检索一遍（见 L1Retriever 的
@@ -222,6 +224,7 @@ class L2Retriever:
                 cfg,
                 debug,
                 exclude=exclude,
+                hidden=hidden,
                 probe=probe,
             )
             timings["recall"] = _since(started) - timings["plan"]
@@ -257,7 +260,14 @@ class L2Retriever:
                 new_queries = new_queries[:MAX_FOLLOWUP_QUERIES]
                 tried.extend(new_queries)
                 extra = self._recall(
-                    space_id, plan, new_queries, question_time, cfg, None, exclude=exclude
+                    space_id,
+                    plan,
+                    new_queries,
+                    question_time,
+                    cfg,
+                    None,
+                    exclude=exclude,
+                    hidden=hidden,
                 )
                 added_rounds = _add_rounds(rounds, extra, cfg)
                 added_facts = self._add_facts(space_id, facts, extra, cfg.followup_facts)
@@ -293,6 +303,7 @@ class L2Retriever:
         debug: dict[str, Any] | None,
         *,
         exclude: Collection[str] = (),
+        hidden: Collection[str] = (),
         probe: L1Candidates | None = None,
     ) -> L1Candidates:
         """对每个查询做一遍 L1 打分，按查询融合，再（第一轮时）加上图扩散这一路。
@@ -308,6 +319,7 @@ class L2Retriever:
                 query=replace(plan.query, text=text),
                 dense_vec=vectors[i],
                 exclude=exclude,
+                hidden=hidden,
                 reuse=probe,
             )
             for i, text in enumerate(queries)
@@ -316,8 +328,8 @@ class L2Retriever:
         fused = _fuse_queries(per_query, weights, cfg)
         if cfg.ppr and debug is not None:
             self._diffuse(space_id, plan, fused, cfg, debug)
-            if exclude:  # 图扩散可能把排除的轮带回来
-                skip = set(exclude)
+            if exclude or hidden:  # 图扩散可能把排除的轮、过期的轮带回来
+                skip = set(exclude) | set(hidden)
                 fused.ranked = [(rid, score) for rid, score in fused.ranked if rid not in skip]
         return fused
 

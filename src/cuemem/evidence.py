@@ -131,6 +131,7 @@ def context_evidence(
                 mode="l1",
                 candidates=recall.candidates,
                 hide_expired=True,
+                expired=recall.expired,  # 第一次检索算过的，不再算一遍
             )
         evidence = evidence_from(recall, query, now)
     if raised:
@@ -193,6 +194,24 @@ def message_text(content: Any) -> str:
     if isinstance(content, list):
         return " ".join(b.get("text", "") for b in content if b.get("type") == "text")
     return ""
+
+
+def payload_size(messages: Sequence[Mapping[str, Any]]) -> int:
+    """OpenAI 格式的消息大约占多少内存：文字与图片 URL（data URL 就是图片本身）的字符数之和。
+    记忆代理与 Agents 会话用它限制写不进去、留着重试的写回（见 proxy.MAX_UNSAVED_BYTES）。"""
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+            continue
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, Mapping):
+                continue
+            image = block.get("image_url")
+            url = image.get("url") if isinstance(image, Mapping) else image
+            total += len(block.get("text") or "") + (len(url) if isinstance(url, str) else 0)
+    return total
 
 
 # ---------- 已经在上下文里的轮 ----------
@@ -278,6 +297,7 @@ def recall_listing(
                 mode="l1",
                 candidates=recall.candidates,
                 hide_expired=True,
+                expired=recall.expired,  # 第一次检索算过的，不再算一遍
             )
     view = recall.view
     decision = recall.decision
@@ -354,6 +374,13 @@ def format_listing(found: dict[str, Any]) -> str:
         lines += ["", "No memories were retrieved for this query."]
     lines += ["", LISTING_END]
     return "\n".join(lines)
+
+
+def format_profile(text: str) -> str:
+    """MCP 的 profile 工具：非空的画像与 format_listing 里的一样逐行加 "| "，最后一行 LISTING_END。
+    以前原样返回，一条多行的事实陈述能在 forget 工具旁边顶格写出 "Facts:" 与 "[f_…] (said …)"
+    （第七轮体检 P1）。"""
+    return "\n".join([LISTING_NOTE, "", "Profile:", _quoted(text), "", LISTING_END])
 
 
 def resolve_ids(

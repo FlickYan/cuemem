@@ -42,6 +42,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import tempfile
 import threading
@@ -73,7 +74,7 @@ from cuemem.core.models import (
 )
 from cuemem.core.timeutil import naive_local, normalize_expiry
 from cuemem.core.types import PeakPolicy, Router
-from cuemem.errors import ConcurrentWriteError, IdempotencyConflictError
+from cuemem.errors import ConcurrentWriteError, IdempotencyConflictError, SessionLimitError
 from cuemem.expiry import Sources as _Sources
 from cuemem.expiry import visible_core
 from cuemem.store.sqlite import legacy_idx_key, next_idx_key
@@ -107,6 +108,10 @@ def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
 
     "/" 是分隔符，所以 ID 里的 "/" 与 "%" 先转义（URL 的百分号编码）：否则 user_id="agent/x"
     与 agent_id="x" 会落进同一个空间。不含这两个字符的 ID 原样保留（"alice" 还是 "alice"）。"""
+    # 别的类型（user_id=42）以前在 _part 里 AttributeError；/api/v1 的请求校验报 ValueError
+    for name, value in (("user_id", user_id), ("agent_id", agent_id)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
     if user_id and agent_id:
         return f"{_part(agent_id)}/{_part(user_id)}"
     if user_id:
@@ -230,7 +235,11 @@ class Memory:
         # close_idle_runs 结束的 run（按结束的先后，最多 IDLE_CLOSED_KEPT 个）：再 add 时重新打开
         self._idle_closed: dict[tuple[str, str], None] = {}
         self._adopted: set[str] = set()  # 接手过崩溃前留下的 run 的空间（见 _adopt）
+        self._opening: dict[str, int] = {}  # 空间 → 正在 open_run（还没登记）的 run 数
         self._runs_lock = threading.Lock()
+        # 一个空间同时开着的 run 的上限（open_run），None 是不限。cuemem serve 给 /api/v1 设成
+        # CUEMEM_MAX_OPEN_SESSIONS（默认 64）；本地的 SDK 不限
+        self.max_open_runs: int | None = None
 
     def _adopt(self, space: str, keep: Sequence[str] = ()) -> None:
         """这个对象第一次碰到这个空间：之前的进程崩溃时还开着的 run（open_run 了、没来得及
@@ -281,8 +290,9 @@ class Memory:
         后台抽取的状态与出错见 status()。
         idempotency_key：调用方给的键（1 到 255 个可打印的 ASCII 字符，例如 uuid4），重试时原样
         再给（第六轮体检，默认不用）。同一个用户下 24 小时内这个键已经写过同样的请求时不再写，
-        返回 status "duplicate"、那次的 session_id 与 turn_ids、replayed True（results 是空的，
-        wait=True 也不抽取）；那次写下的发言已经遗忘时 status 是 "forgotten"；同一个键用于不同的
+        返回 status "duplicate"、那次的 session_id 与 turn_ids、replayed True（results 是空的；
+        wait=True 时先等这个空间的抽取做完，这个会话的抽取失败时加上 error，那次的会话是还开着的
+        run 时不等）；那次写下的发言已经遗忘时 status 是 "forgotten"；同一个键用于不同的
         请求（消息或别的参数不同，wait 不算）时抛 IdempotencyConflictError，什么都不写。并发的
         同一个键只有一个写进去，别的回滚、按 duplicate 返回。
         """
@@ -297,7 +307,7 @@ class Memory:
             )
             replayed = self._replayed(space, *keyed)
             if replayed is not None:
-                return replayed
+                return self._settle_replay(space, replayed, wait=wait and infer)
         if run_id is not None:
             self._resume(space, run_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
@@ -344,17 +354,21 @@ class Memory:
                                     sid,
                                     [stable_id(space, sid, first + i) for i in range(len(turns))],
                                 )
+                        # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了：在事务里抛出，发言、键与暂存的
+                        # 向量一起撤销。以前提交之后才查：键已经记下，原样重试返回 duplicate 与
+                        # 别人的发言，这次的发言丢了（第七轮体检）
+                        if written.turns_added != len(turns):
+                            raise ConcurrentWriteError(
+                                f"Only {written.turns_added} of {len(turns)} messages could be "
+                                f"written to session {sid!r}: their turn numbers were already "
+                                "taken by another write. Nothing was written; retry the add."
+                            )
                 except sqlite3.IntegrityError:
                     # 并发的同一个键先提交了：这次的发言与暂存的向量已经随事务回滚
                     replayed = self._replayed(space, *keyed) if keyed is not None else None
                     if replayed is None:
                         raise
-                    return replayed
-            if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
-                raise ConcurrentWriteError(
-                    f"Only {written.turns_added} of {len(turns)} messages were written to session "
-                    f"{sid!r}: their turn numbers were already taken by another write."
-                )
+                    return self._settle_replay(space, replayed, wait=wait and infer)
         finally:
             for path in temporary:
                 path.unlink(missing_ok=True)
@@ -405,6 +419,27 @@ class Memory:
             "replayed": True,
         }
 
+    def _settle_replay(self, space: str, out: dict[str, Any], *, wait: bool) -> dict[str, Any]:
+        """wait=True 的重试按 duplicate 返回之前，先等这个空间的抽取做完（第七轮体检）：
+        MemoryClient 超时之后让调用方用同一个键重试，最常见的是 add(wait=True) 发言已经写进去、
+        抽取还没做完；以前重试立即返回，紧接着的 search 找不到这次的事实。consolidate 持有这个
+        空间的巩固锁：原来那次请求还在抽取时等它做完，之后没有剩下的事。那次的会话是还开着的
+        run 时不抽取（结束时才抽取），照旧返回。这个会话的抽取失败时加上 error，status 仍是
+        duplicate、results 仍是空的。"""
+        if not wait or out["status"] != "duplicate":
+            return out
+        sid = out["session_id"]
+        if sid in self.system.open_sessions(space):
+            return out
+        try:
+            report = self.system.consolidate(space)
+        except Exception as exc:  # 与 add(wait=True) 相同：发言写进去了，不抛出
+            out["error"] = _not_extracted(exc)
+        else:
+            if sid in report.failed:
+                out["error"] = _not_extracted(_job_error(self.system, space, sid))
+        return out
+
     def open_run(
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
     ) -> str:
@@ -419,13 +454,38 @@ class Memory:
         的 run 同样（MemorySystem.resume_left_open）。"""
         space = space_for(user_id, agent_id)
         rid = run_id or sortable_session_id("run", datetime.now())
-        self._adopt(space, keep=[rid])
-        self.system.open_session(space, rid)
         with self._runs_lock:
-            self._runs.add((space, rid))
-            self._run_seen[(space, rid)] = time.monotonic()
-            self._idle_closed.pop((space, rid), None)
+            self._make_room(space, rid)
+            self._opening[space] = self._opening.get(space, 0) + 1
+        try:
+            self._adopt(space, keep=[rid])
+            self.system.open_session(space, rid)
+            with self._runs_lock:
+                self._runs.add((space, rid))
+                self._run_seen[(space, rid)] = time.monotonic()
+                self._idle_closed.pop((space, rid), None)
+        finally:
+            with self._runs_lock:
+                self._opening[space] -= 1
+                if not self._opening[space]:
+                    del self._opening[space]
         return rid
+
+    def _make_room(self, space: str, run_id: str) -> None:
+        """open_run 的上限（调用方持有 _runs_lock）：max_open_runs 给了、这个空间开着的（加上正在
+        开的）run 已经这么多、run_id 又不是其中之一时 SessionLimitError（/api/v1 回 429）。不替
+        调用方结束别的 run：那会让它们提前抽取。以前 /api/v1 不限，一个令牌可以一直 open_run，
+        每个都占着内存与一个进行中的标记，直到闲置 30 分钟才结束。"""
+        limit = self.max_open_runs
+        if limit is None or (space, run_id) in self._runs:
+            return
+        count = sum(1 for s, _ in self._runs if s == space) + self._opening.get(space, 0)
+        if count >= limit:
+            raise SessionLimitError(
+                f"User space {space} already has {count} open runs (the limit is {limit}, set by "
+                "CUEMEM_MAX_OPEN_SESSIONS): end one with end_run, or retry after idle runs "
+                "have been ended."
+            )
 
     def end_run(
         self,
@@ -650,7 +710,10 @@ class Memory:
         相同），后台线程记一条警告日志；失败的会话与原因见 status()。
 
         给了 user_id 或 agent_id 时只等这个用户（或 Agent）的抽取，不给时等全部。timeout 秒内
-        没做完时抛 TimeoutError（抽取在后台照常继续）；不给时一直等。"""
+        没做完时抛 TimeoutError（抽取在后台照常继续）；不给时一直等。timeout 是负数时
+        ValueError（与 /api/v1 相同，没有后台线程时也报）。"""
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout: must be >= 0")
         worker = self.system.worker
         if worker is None:
             return
@@ -713,7 +776,7 @@ class Memory:
         run_id: str | None = None,
         limit: int | None = None,
         mode: SearchMode = "auto",
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         router: Router = "learned",
         lam: float | None = None,
         filters: Mapping[str, Any] | None = None,
@@ -747,12 +810,13 @@ class Memory:
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit if limit is not None else top_k
         space = space_for(user_id, agent_id)
+        moment = _moment("at", at)  # 空间还是空的时，写错的 at 也报错
         if not self.system.db.has_sessions(space):
             return _empty(self.system, space)
         from cuemem.evidence import RAISED_REASON
 
         # 两次检索用同一个问题时间：改走 L1 时打包的是探针在这个时间打过分的候选
-        when = naive_local(at) if at is not None else datetime.now()
+        when = moment if moment is not None else datetime.now()
         # 从检索到读出各句的 metadata 与画像一直持有读：改走 L1 时打包的是探针取到的记忆，两次检索
         # 之间插进来的遗忘会让结果里留着已经删掉的事实与对话片段（见 MemorySystem.retrieve）
         with self.system.reading(space):
@@ -762,7 +826,12 @@ class Memory:
             raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
             if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同：不把探针的检索再做一遍
                 recall = self.system.retrieve(
-                    space, query, question_time=when, mode="l1", candidates=recall.candidates
+                    space,
+                    query,
+                    question_time=when,
+                    mode="l1",
+                    candidates=recall.candidates,
+                    expired=recall.expired,
                 )
             select = _Select(
                 run_id, where, _scope_record(user_id, agent_id), datetime.now(), show_expired
@@ -778,7 +847,7 @@ class Memory:
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         mode: SearchMode = "auto",
         router: Router = "learned",
         lam: float | None = None,
@@ -803,6 +872,7 @@ class Memory:
         _valid("min_level", MinLevel, min_level)
         lam = _valid("lam", Lam, lam)
         space = space_for(user_id, agent_id)
+        moment = _moment("at", at)
         if not self.system.db.has_sessions(space):
             return {
                 "context": "",
@@ -818,7 +888,7 @@ class Memory:
             self.system,
             space,
             query,
-            at=at,
+            at=moment,
             mode=mode,
             router=router,
             lam=lam,
@@ -841,7 +911,7 @@ class Memory:
         user_id: str | None = None,
         agent_id: str | None = None,
         mode: AnswerMode = "auto",
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         router: Router = "learned",
         lam: float | None = None,
     ) -> dict[str, Any]:
@@ -855,7 +925,7 @@ class Memory:
         answer = self.system.ask(
             space,
             question,
-            question_time=at,
+            question_time=_moment("at", at),
             mode=mode,
             router=router,
             lam=lam,
@@ -871,7 +941,7 @@ class Memory:
         run_id: str | None = None,
         include_superseded: bool = False,
         valid_at: str | date | None = None,
-        known_at: datetime | None = None,
+        known_at: datetime | date | str | None = None,
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
@@ -879,7 +949,8 @@ class Memory:
     ) -> dict[str, Any]:
         """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at 是那时现实中成立的
         事实，写成 "2025"、"2025-06"、"2025-06-07" 或 date；一年、一个月指这段时间里任何时候
-        成立过的，先后几个值可能都在（别的写法 ValueError）。known_at 是系统在那一刻相信的事实。
+        成立过的，先后几个值可能都在（别的写法 ValueError）。known_at 是系统在那一刻相信的事实
+        （datetime、date、ISO 文本或 Unix 时间戳，同 search 的 at，见 _moment）。
         run_id：只要这个会话里记下的事实；filters 里的其他键是 metadata 的条件（同 search）。过期
         的事实默认不给，show_expired=True 时也给（以前除了 export 与已知的 ID，没有办法列出过期的
         记忆）。limit 同 search。"""
@@ -888,8 +959,9 @@ class Memory:
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit if limit is not None else top_k
         space = space_for(user_id, agent_id)
-        current = not include_superseded and valid_at is None and known_at is None
-        facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
+        moment = _moment("known_at", known_at)
+        current = not include_superseded and valid_at is None and moment is None
+        facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=moment)
         sources = _Sources.load(
             self.system.db, space, [t for f in facts for t in f.source_turn_ids]
         )
@@ -985,7 +1057,9 @@ class Memory:
         对话片段或图片的 ID：删掉那一轮对话（图片所在的那一轮），与 MCP、各框架集成的 forget
         相同。以前这两种 ID 报 KeyError，Mem0 的 for r in results: delete(r["id"]) 中途出错。
         与 Mem0 不同的是删的是整轮对话：同一轮的对话片段、由它抽出的别的事实随之消失，之后再
-        delete 它们的 ID 是 KeyError（与不存在的一样），逐条删时要接住。
+        delete 它们的 ID 是 KeyError（与不存在的一样），逐条删时要接住。每次 delete 都用剩下的
+        日志重放一遍，重放还可能给留下的事实换新的 ID：拿着之前 get_all 的 ID 逐条删时，没删的
+        事实也可能 KeyError。一次删好几条用 delete_many：先认出全部 ID，每个空间只重放一次。
 
         dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。删除做完之后
         重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。
@@ -1008,27 +1082,69 @@ class Memory:
             found[0], fact_ids=[memory_id], report_rebuild_errors=True
         )
         if not report.turns_deleted and self.system.db.get_facts(found[0], ids=[memory_id]):
-            return {
-                "message": "Nothing deleted",
-                **_forget_out(report),
-                "warning": (
-                    "Nothing was deleted: none of the conversation turns this memory came from "
-                    "are in the log any more (an earlier version can leave this behind when a "
-                    "forget failed partway). Run consolidate(rebuild=True) to rebuild the "
-                    "memories from the log; if search still misses conversation excerpts "
-                    "afterwards, `cuemem reindex` restores the vectors the log still has."
-                ),
-            }
+            return {"message": "Nothing deleted", **_forget_out(report), "warning": _STUCK}
         return {"message": "Memory deleted", **_forget_out(report)}
 
+    def delete_many(self, memory_ids: Sequence[str], *, dry_run: bool = False) -> dict[str, Any]:
+        """一次遗忘好几条记忆（事实、对话片段或图片的 ID，与 delete 认的相同）：先认出全部 ID，
+        每个空间调用一次遗忘、重放一次。逐条 delete 时 k 条是 k 次重放，每次都独占这个空间；
+        同一轮里的两个 ID、重放之后换了 ID 的事实也不会中途 KeyError。
+
+        最多 DELETE_MANY_MAX（100）个 ID（去重之后），多了 ValueError：删事实时找转述要对每条
+        陈述调用一次便宜的模型。memory_ids 是单个字符串时 TypeError。不认识的 ID 不报错，放进
+        返回值的 missing（经 /api/v1 时作用域之外的也在这里，与不存在的一样）；deleted 是认出来、
+        删掉（预演时是会删）的 ID。
+
+        dry_run=True 只预演，返回 delete 的预演的各项（几个空间合起来）。删除的返回值与 delete
+        的相同，计数是几个空间相加；重建出错时 warning 只写一次。好几个空间时逐个删，中途出错
+        时前面的空间已经删了。"""
+        return self._delete_many(memory_ids, dry_run=dry_run)
+
+    def batch_delete(self, memories: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Mem0 的 MemoryClient.batch_delete 的写法：memories=[{"memory_id": ...}, ...]，与
+        delete_many 相同（不预演）。"""
+        if isinstance(memories, str | Mapping):
+            raise TypeError('memories must be a list of {"memory_id": ...} objects.')
+        ids: list[str] = []
+        for item in memories:
+            if not isinstance(item, Mapping) or "memory_id" not in item:
+                raise ValueError('Each item of memories must be an object with "memory_id".')
+            ids.append(item["memory_id"])
+        return self.delete_many(ids)
+
     def delete_all(
-        self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图，以及这个
         空间的 trace 与库里写着它的 ID 的元信息（见 MemorySystem.delete_space）。
-        run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。"""
+        run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。日志里
+        没有这个会话的发言（run_id 写错了）时什么都不做，message 是 "No such run: nothing
+        deleted"：以前照样回 "Memories of this run deleted"，与删掉了分不出来。
+
+        dry_run=True 只预演这个会话的删除（与 delete 的 dry_run、cuemem forget --session
+        --dry-run 相同）：返回会删哪些发言、哪些事实会随之消失，什么都不删。只能与 run_id 一起
+        用（ValueError）：不给 run_id 时删的是整个用户，没有预演。"""
         space = space_for(user_id, agent_id)
+        if dry_run and run_id is None:
+            raise ValueError(
+                "dry_run needs run_id; delete_all without run_id deletes the whole user"
+            )
         if run_id is not None:
+            if dry_run:
+                return {
+                    "message": "Dry run: nothing was deleted",
+                    **self.system.preview_forget(space, session_ids=[run_id]),
+                }
+            if not self.system.db.get_turns(space, run_id):  # 只读这一个会话
+                from cuemem.memory import ForgetReport
+
+                empty = ForgetReport(space, 0, [], 0, 0, 0, 0, 0.0)
+                return {"message": "No such run: nothing deleted", **_forget_out(empty)}
             report = self.system.forget_memories(
                 space, session_ids=[run_id], report_rebuild_errors=True
             )
@@ -1170,6 +1286,87 @@ class Memory:
         )
         return {"message": "Memory deleted", **_forget_out(report)}
 
+    def _delete_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        dry_run: bool,
+        keep: Callable[[str], bool] | None = None,
+    ) -> dict[str, Any]:
+        """delete_many 的实现。keep：只删它认的空间里的记忆（/api/v1 收到限定作用域的令牌时是
+        Principal.allows），别的空间的 ID 与不存在的一样放进 missing；None 时不限。不做成公开
+        参数：MemoryClient 与 Memory 的签名逐字相同（与 _reset 一样）。"""
+        from cuemem.evidence import resolve_ids
+
+        ids = _memory_ids(memory_ids)
+        # 空间 → 种类 → ID：先全部认出来，再删（删了之后别的 ID 可能就找不到了）
+        plan: dict[str, dict[MemoryKind, list[str]]] = {}
+        for memory_id in ids:
+            located = self._locate(memory_id)
+            if located is not None and (keep is None or keep(located[0])):
+                plan.setdefault(located[0], {}).setdefault(located[1], []).append(memory_id)
+        for space, kinds in plan.items():  # 与 delete 相同：库里没有的事实算不存在
+            if kinds.get("fact"):
+                found = {f.id for f in self.system.db.get_facts(space, ids=kinds["fact"])}
+                kinds["fact"] = [i for i in kinds["fact"] if i in found]
+        chosen = {i for kinds in plan.values() for group in kinds.values() for i in group}
+        deleted = [i for i in ids if i in chosen]
+        missing = [i for i in ids if i not in chosen]
+        targets = []
+        for space in sorted(plan):
+            kinds = plan[space]
+            excerpts = kinds.get("excerpt", [])
+            turns = resolve_ids(self.system, space, excerpts)[1] if excerpts else []
+            if turns or kinds.get("fact") or kinds.get("image"):
+                targets.append((space, kinds.get("fact", []), turns, kinds.get("image", [])))
+
+        if dry_run:
+            previews = [
+                self.system.preview_forget(space, fact_ids=facts, turn_ids=turns, media_ids=media)
+                for space, facts, turns, media in targets
+            ]
+            return {
+                "message": "Dry run: nothing was deleted",
+                "deleted": deleted,
+                "missing": missing,
+                "turns": [t for p in previews for t in p["turns"]],
+                "sessions_affected": sorted({s for p in previews for s in p["sessions_affected"]}),
+                "cascaded": sum(p["cascaded"] for p in previews),
+                "restated": sum(p["restated"] for p in previews),
+                "facts": [f for p in previews for f in p["facts"]],
+                "images": sum(p["images"] for p in previews),
+            }
+
+        reports: list[ForgetReport] = []
+        stuck: set[str] = set()
+        for space, facts, turns, media in targets:
+            report = self.system.forget_memories(
+                space, fact_ids=facts, turn_ids=turns, media_ids=media, report_rebuild_errors=True
+            )
+            reports.append(report)
+            if not report.turns_deleted and facts:  # 同 delete 的 "Nothing deleted"
+                stuck.update(f.id for f in self.system.db.get_facts(space, ids=facts))
+        turns_deleted = sum(r.turns_deleted for r in reports)
+        out: dict[str, Any] = {
+            "message": "Memories deleted" if turns_deleted else "Nothing deleted",
+            "deleted": [i for i in deleted if i not in stuck],
+            "missing": missing,
+            "turns_deleted": turns_deleted,
+            "sessions_affected": sorted({s for r in reports for s in r.sessions_affected}),
+            "facts_before": sum(r.facts_before for r in reports),
+            "facts_after": sum(r.facts_after for r in reports),
+            "images_deleted": sum(r.images_deleted for r in reports),
+            "restated": sum(r.restated for r in reports),
+        }
+        # 重建出错的说明只写一次（与 delete 相同的措辞），出处不在日志里的事实再加一句
+        failed = next((r for r in reports if r.rebuild_error), None)
+        warnings = [_forget_out(failed)["warning"]] if failed is not None else []
+        if stuck:
+            warnings.insert(0, _STUCK)
+        if warnings:
+            out["warning"] = " ".join(warnings)
+        return out
+
     def _next_idx(self, space: str, session_id: str) -> int:
         """会话里下一句发言的序号：只增不减，遗忘删掉的序号不再复用（与 Agent 相同）；
         新会话（包括删掉后重建的空间）从 0 开始，否则抽取时会被当成有发言被删过。记在
@@ -1186,7 +1383,8 @@ class Memory:
 
 class AsyncMemory(AsyncMethods):
     """Memory 的异步版本（与 Mem0 的 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
-    （cuemem/_async.py）。self.sync 是包着的 Memory；别的属性（.system、.settings）取它的。"""
+    （cuemem/_async.py）。self.sync 是包着的 Memory；别的属性（.system、.settings）取它的。
+    取消一次调用停不下它，被取消的写入照样可能生效，见 AsyncMethods。"""
 
     sync: Memory
 
@@ -1646,6 +1844,39 @@ def _as_datetime(value: datetime | str | float | None) -> datetime | None:
     return datetime.fromtimestamp(value)
 
 
+_NUMBER = re.compile(r"-?\d+(\.\d*)?")
+_MS_ABOVE = 2e10  # 比这大的 Unix 时间戳是毫秒（与 Pydantic 相同：秒数要到 2603 年才这么大）
+
+
+def _moment(name: str, value: datetime | date | str | float | None) -> datetime | None:
+    """search、context、answer 的 at 与 get_all 的 known_at → 本机时间（不带时区，见
+    naive_local）。本地的 Memory 与 /api/v1 都用它（服务端在接口里调用），同一个值两边是同一个
+    时刻（第七轮体检、复审）：datetime；date 是那天零点；ISO 文本（带时区的先换算，20300101 这样
+    的紧凑写法与 2030-W01 这样的周也认）；数字与只有数字的文本（ISO 认不出时）是 Unix 时间戳，
+    绝对值大于 2e10 的是毫秒。以前本地只认 datetime；服务端由 Pydantic 解析，'20300101' 读成
+    1970 年的秒数、毫秒与数字文本本地却报错。别的写法 ValueError，开头是参数名。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return naive_local(value)
+    if isinstance(value, date):  # datetime 也是 date：放在后面
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        try:
+            return naive_local(datetime.fromisoformat(value))
+        except ValueError:
+            if not _NUMBER.fullmatch(value.strip()):
+                raise ValueError(f"{name}: invalid ISO date or datetime {value!r}") from None
+        value = float(value)
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        seconds = value / 1000 if abs(value) > _MS_ABOVE else value
+        try:
+            return datetime.fromtimestamp(seconds)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError(f"{name}: invalid Unix timestamp {value!r}") from None
+    raise ValueError(f"{name}: expected a datetime, date, ISO string or Unix timestamp")
+
+
 # ---------- 输出 ----------
 
 
@@ -1878,6 +2109,33 @@ def _events(
             item["reason"] = previous[0].supersede_reason
         events.append(item)
     return events
+
+
+DELETE_MANY_MAX = 100  # delete_many 一次最多这么多个 ID：删事实时每条陈述调用一次模型找转述
+# delete 一句发言都没删、事实却还在时的说明（delete_many 同）
+_STUCK = (
+    "Nothing was deleted: none of the conversation turns this memory came from "
+    "are in the log any more (an earlier version can leave this behind when a "
+    "forget failed partway). Run consolidate(rebuild=True) to rebuild the "
+    "memories from the log; if search still misses conversation excerpts "
+    "afterwards, `cuemem reindex` restores the vectors the log still has."
+)
+
+
+def _memory_ids(memory_ids: Sequence[str]) -> list[str]:
+    """delete_many 的 ID：字符串的列表（单个字符串 TypeError），按顺序去重，最多
+    DELETE_MANY_MAX 个（ValueError）。"""
+    if isinstance(memory_ids, str | bytes) or not isinstance(memory_ids, Sequence):
+        raise TypeError("memory_ids must be a list of memory ids, not a single id.")
+    if not all(isinstance(i, str) for i in memory_ids):
+        raise TypeError("memory_ids must be a list of strings.")
+    ids = list(dict.fromkeys(memory_ids))
+    if len(ids) > DELETE_MANY_MAX:
+        raise ValueError(
+            f"At most {DELETE_MANY_MAX} memory ids per call (got {len(ids)}); split them into "
+            "several calls."
+        )
+    return ids
 
 
 def _forget_out(report: ForgetReport) -> dict[str, Any]:

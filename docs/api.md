@@ -2,7 +2,7 @@
 
 [English](en/api.md) · 中文
 
-程序使用 CueMem 的各种方式：Python SDK（`Memory`、`AsyncMemory`）、远程客户端（`MemoryClient`、`AsyncMemoryClient`）、`cuemem serve` 的 HTTP 接口（`/api` 与 Mem0 形状的 `/api/v1`）、OpenAI 兼容的记忆代理（`/v1`）、MCP Server（stdio 与 HTTP）、环境变量与可选依赖。签名以 CueMem 0.1.0 为准（`src/cuemem/sdk.py`、`client.py`、`api/`）。背后的决定见[决策记录](decisions.md)：D-061（SDK）、D-062（记忆代理）、D-063（导出）、D-056（部署与令牌）、D-069（第二轮体检，`/api/v1` 的大部分、`MemoryClient`、限定作用域的令牌、metadata、`update` 与 `reset` 都是这一轮加的）、D-070（第三轮体检，加了 `status`、HTTP 上的 MCP、请求的大小上限、闲置结束、带类型的客户端与下面 Mem0 的写法）、D-071（仓库公开之后的第四轮体检：按令牌的上限、Qdrant 的 API Key、公网监听更严的检查、请求头里不是 ASCII 的 ID、跨过重启的 run）、D-072（第五轮体检：`wait` 的上限、传输出错的代码、`valid_at` 按时间段、`cuemem reindex`）、D-073（第六轮体检：`context`、幂等的 `add`、`cuemem keys` 与令牌文件的热加载、每个令牌同时处理的请求有上限）。
+程序使用 CueMem 的各种方式：Python SDK（`Memory`、`AsyncMemory`）、远程客户端（`MemoryClient`、`AsyncMemoryClient`）、`cuemem serve` 的 HTTP 接口（`/api` 与 Mem0 形状的 `/api/v1`）、OpenAI 兼容的记忆代理（`/v1`）、MCP Server（stdio 与 HTTP）、环境变量与可选依赖。签名以 CueMem 0.1.0 为准（`src/cuemem/sdk.py`、`client.py`、`api/`）。背后的决定见[决策记录](decisions.md)：D-061（SDK）、D-062（记忆代理）、D-063（导出）、D-056（部署与令牌）、D-069（第二轮体检，`/api/v1` 的大部分、`MemoryClient`、限定作用域的令牌、metadata、`update` 与 `reset` 都是这一轮加的）、D-070（第三轮体检，加了 `status`、HTTP 上的 MCP、请求的大小上限、闲置结束、带类型的客户端与下面 Mem0 的写法）、D-071（仓库公开之后的第四轮体检：按令牌的上限、Qdrant 的 API Key、公网监听更严的检查、请求头里不是 ASCII 的 ID、跨过重启的 run）、D-072（第五轮体检：`wait` 的上限、传输出错的代码、`valid_at` 按时间段、`cuemem reindex`）、D-073（第六轮体检：`context`、幂等的 `add`、`cuemem keys` 与令牌文件的热加载、每个令牌同时处理的请求有上限）、D-074（第七轮体检：`delete_many` 与 `delete_all` 的预演、各处同样的 `at` 写法、浏览接口的 `show_expired`、可选的过期之后真的删掉、一个数据库一个进程、进行中的会话与留着重试的写回有上限）。
 
 语言：SDK 的返回值与它自己的报错、`/api/v1`、记忆代理与 MCP 工具是英文；命令行、较早的 `/api` 接口、401 的说明，以及核心模块更深处抛出的报错（缺 Key、向量库被占用、配置写错）是中文。
 
@@ -82,7 +82,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 - **`config` 里不认识的键报 ValueError**：在打开任何东西之前，列出每个带点的键名与最接近的写法。Mem0 格式的配置另有改写提示：`llm` 与 `embedder` 换成 `preset="openai"` 或 `models` / `roles`，`custom_instructions` 换成 `Memory(instructions=...)`，`vector_store` 的 provider 配置换成 `{"vector_store": {"url": "http://host:6333"}}`；`preset`、`home`、`config_path` 与 `env_file` 是关键字参数。以前不认识的键悄悄忽略，跑的是 DeepSeek + 通义的缺省配置。`Settings` 对象、`CUEMEM_*` 环境变量与 YAML 文件照旧宽松。
 - `from_config(config)` 就是 `Memory(config)`：CueMem 的配置字典，不是 Mem0 的 `MemoryConfig`。
-- `from_system` 包住进程里已经打开的记忆系统（HTTP 服务与记忆代理就这样用）。本地模式的 Qdrant 同一时间只允许一个进程打开数据目录，`cuemem serve` 正占着的目录再 `Memory()` 会报 `StorageLockedError`；这时用 `MemoryClient` 连服务。
+- `from_system` 包住进程里已经打开的记忆系统（HTTP 服务与记忆代理就这样用）。一个数据库同一时间只能由一个进程打开（锁住 `<数据库>.lock`，本地模式与 Qdrant 服务端都一样），`cuemem serve` 正占着的数据目录再 `Memory()` 会报 `StorageLockedError`，写明拿着锁的进程的 pid 与命令；这时用 `MemoryClient` 连服务（见[一个数据库一个进程](#one-process-per-database)）。同一个进程里对同一个数据目录再开一个 `Memory()` 也被拒绝。
 
 ### 方法
 
@@ -98,7 +98,9 @@ Memory.from_system(system: MemorySystem) -> Memory
 | `history(memory_id)` | 一条事实的版本链，从最早到最新，每个版本带 `"event": "ADD"` 或 `"UPDATE"`；别的 ID 是 `[]` |
 | `update(memory_id, text=None, *, metadata=None, data=None)` | `{"message", "id", "results", "session_id", "turn_ids", ...}` |
 | `delete(memory_id, *, dry_run=False)` | 遗忘报告 |
-| `delete_all(*, user_id=None, agent_id=None, run_id=None)` | 遗忘报告 |
+| `delete_all(*, user_id=None, agent_id=None, run_id=None, dry_run=False)` | 遗忘报告（`dry_run=True` 与 `run_id` 一起时是预演） |
+| `delete_many(memory_ids, *, dry_run=False)` | 这些 ID 合起来的遗忘报告，带 `deleted` 与 `missing` |
+| `batch_delete(memories)` | 与 `delete_many` 相同，收 `memories=[{"memory_id": ...}]`（Mem0 的写法） |
 | `reset()` | `{"message", "spaces_deleted", "turns_deleted", "images_deleted"}` |
 | `profile(*, user_id=None, agent_id=None)` | 画像的文字 |
 | `status(*, user_id=None, agent_id=None)` | `{"pending", "failed", "background", "errors"}` |
@@ -107,7 +109,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 | `run(run_id=None, *, user_id=None, agent_id=None, wait=False)` | 上下文管理器，给出 run 的 ID |
 | `close_idle_runs(idle_s, *, now=None)` | 结束的 run 数（只在本地；`cuemem serve` 每分钟调用一次） |
 | `consolidate(*, user_id=None, agent_id=None, rebuild=False)` | 巩固报告 |
-| `wait(*, user_id=None, agent_id=None, timeout=None)` | `None`：等后台线程把已登记的抽取做完（给了 ID 时只等这个用户或 Agent 的）；`timeout` 秒内没做完时 TimeoutError（抽取在后台照常继续） |
+| `wait(*, user_id=None, agent_id=None, timeout=None)` | `None`：等后台线程把已登记的抽取做完（给了 ID 时只等这个用户或 Agent 的）；`timeout` 秒内没做完时 TimeoutError（抽取在后台照常继续）；`timeout` 是负数时 ValueError |
 | `export(*, user_id=None, agent_id=None, derived=True)` | `cuemem.space` 格式的导出（能直接写成 JSON 的字典） |
 | `load(data, *, user_id=None, agent_id=None, wait=False)` | 导入报告 |
 | `spaces()` | 每个空间一个字典：`space_id`、`created_at`、`sessions`、`turns`、`units`、`current_facts`、`facts`、`entities` |
@@ -117,13 +119,13 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 - `run_id`：写进这个会话。每轮 `add` 一次同一个 `run_id` 时，每次都把整段会话重新抽取一遍（还要重放派生记忆）；一段多轮对话用 `with m.run(...)` 包起来，结束时只抽取一次。
 - `metadata`：JSON 对象，键是字符串，记在这次写入的每句发言上。它不给抽取模型看，请求不变。由这些发言得来的事实、对话片段与图片都带上它，`filters` 可以按它筛。不是字典时 TypeError；键不是字符串、值写不成 JSON 时 ValueError。
-- `expiration_date`：日期、时间或 ISO 字符串；只给日期时到那天结束。过期的记忆不再出现在 `search`、`get_all` 与画像里，除非 `show_expired=True`；`get` 与 `history` 照样取得到，要 `delete` 才删。同一件事后来又说过一次、没给过期时间，它就不过期。过期的记忆也不出现在 `answer()`、记忆代理注入的 `<memory>`、MCP 与 HTTP 的 recall（`cuemem mcp`、`/mcp`、`/api/spaces/{space}/recall`）、各处的画像（`profile()`、MCP 的 profile 工具、`GET /api/spaces/{space}/profile`、界面的画像栏）、`cuemem serve` 的对话 Agent（它的画像、召回与 `memory_search` 工具），以及 Claude、OpenAI Agents 与 LangGraph 的集成里（召回、自动召回，Claude memory tool 的 `profile.md`、`facts.md` 与 `history/`）。过期按现在的时钟算，不按提问的时间 `at`。浏览原始数据的事实列表（`GET /api/spaces/{space}/facts`、界面的事实列表）、实体图（`GET /api/spaces/{space}/graph`、界面的实体图）、图库（`GET /api/spaces/{space}/media`、界面的图库）、`cuemem ask` 与 `cuemem inspect` 仍给出过期的记忆，`get`、`history` 与导出也是。
+- `expiration_date`：日期、时间或 ISO 字符串；只给日期时到那天结束。过期的记忆不再出现在 `search`、`get_all` 与画像里，除非 `show_expired=True`；`get` 与 `history` 照样取得到，要 `delete` 才删；设了 `CUEMEM_EXPIRED_RETENTION_DAYS` 时除外：`cuemem serve` 与 `cuemem proxy` 在过期 N 天之后真的删掉这些发言（0：每次清理时删掉所有已经过期的），启动时与之后每天的第一次清理，所以一句发言过期之后最多还要再留大约一天加 N 天。这是一次遗忘：发言以及由它派生的事实、摘要、向量、图片、缓存与 trace 都删掉，每个受影响的空间重放一次（要发巩固的请求，大多由 LLM 缓存给出；重放期间独占这个空间）。只删过期的发言本身：后来引用了它、没有过期时间的回复留着，后来又说过一次、没给过期时间的事实从那一句重新抽出来。已经写出的导出文件不动。只用 SDK 的部署运行 `cuemem forget --expired [--space S] [--older-than-days N]`。同一件事后来又说过一次、没给过期时间，它就不过期。过期的记忆也不出现在 `answer()`、记忆代理注入的 `<memory>`、MCP 与 HTTP 的 recall（`cuemem mcp`、`/mcp`、`/api/spaces/{space}/recall`）、各处的画像（`profile()`、MCP 的 profile 工具、`GET /api/spaces/{space}/profile`、界面的画像栏）、`cuemem serve` 的对话 Agent（它的画像、召回与 `memory_search` 工具），以及 Claude、OpenAI Agents 与 LangGraph 的集成里（召回、自动召回，Claude memory tool 的 `profile.md`、`facts.md` 与 `history/`）。在这些地方，过期的记忆在每一路检索里就排除，不占有效记忆的候选名额（SDK 的 `search` 则是在检索之后过滤，见下）。过期按现在的时钟算，不按提问的时间 `at`。浏览原始数据的事实列表（`GET /api/spaces/{space}/facts`、界面的事实列表）、实体图（`/graph`、界面的实体图）与图库（`/media`、界面的图库）也不给出过期的记忆，除非 `show_expired=true`（界面上是 "Show expired" 复选框）；它们的条目带 `expired`。界面里遗忘用的选择框仍列出过期的条目，好让人删掉它们。`cuemem ask` 不用它们，除非 `--show-expired`。`cuemem inspect facts` 仍列出它们，标 `已过期`（`--hide-expired` 时不列）。`get`、`history` 与导出照旧给出。实体列表（`/entities`）仍可能列出只出现在过期事实里的实体。
 - `timestamp`：这些话是什么时候说的（时间、ISO 字符串或 Unix 时间戳；默认现在）。带时区的时间换算成本机时间。
 - `infer=False`：只写日志（`status: "logged"`），之后用 `consolidate()` 抽取。空间里别处的遗忘不会抽取这样的会话，导入它们的导出文件也不会（见导出与导入）；`consolidate()`、`add(wait=True)` 与 `update()` 会，它们巩固的是整个空间。
 - `wait=True`：同步抽取，返回 Mem0 风格的事件（`status: "consolidated"`，另有 `consolidation`）。run 还开着时不能用（ValueError：用 `end_run(..., wait=True)` 结束它）。发言存下之后抽取出错（例如模型供应商余额不足）时，`add` 不抛出：返回 `status: "queued"` 与 `error`；发言已经存下，下次巩固时补上抽取，不要再调用一遍。
 - 写进去之前出错（向量接口不可用、图片不对）时照常抛出，什么都没存，可以原样重试（经 `MemoryClient` 时只在代码是 `unreachable`、请求根本没到服务端时可以，见下）。发言提交之后不会再抛出：写不进去的 trace（磁盘满、trace 路径不对）只在 `cuemem.core.trace` 日志里记一条警告，下一句的序号与发言写在同一个事务里。
-- `idempotency_key`：调用方自己给的键（1–255 个可打印的 ASCII 字符，例如一个 UUID；否则 ValueError），让重发的 add 安全。24 小时内，同一个用户（空间）下同一个键、同一个请求只写一次：重发返回 `status: "duplicate"`、原来的 `session_id` 与 `turn_ids`、`results: []` 与 `replayed: true`，`wait=True` 也不抽取。那次写下的发言已经遗忘了时（`delete`、`delete_all(run_id=...)`、任何遗忘），重发返回 `status: "forgotten"`（`session_id` 为 None，`turn_ids` 为 []），什么都不写。同一个键用于不同的请求（`messages`、`user_id`、`agent_id`、`run_id`、`metadata`、`expiration_date`、`timestamp` 或 `infer` 不同；`wait` 不比）时抛 `IdempotencyConflictError`，什么都不写。库里只存键的 sha256。幂等键在 24 小时内保护重发，也跨过对写下的记忆的 forget() / DELETE（重发返回 status "forgotten"）。delete_all() 与 reset() 连同别的一起删掉这个用户的幂等记录，所以之后到的重发是一次新的写入。一个边角情况：带键的 add 提交之后抛 `ConcurrentWriteError`（同一个 `run_id` 里同时进行的写入拿走了同样的序号）时，记录里的发言 ID 并没有全部写下。不给键时 `add` 与以前完全相同。
-- `status` 是 `empty`（没有可存的消息）、`logged`、`queued`、`consolidated` 之一，带 `idempotency_key` 时还可能是 `duplicate` 与 `forgotten`（这时 `replayed` 为真）。并发写入撞了发言序号时抛 `ConcurrentWriteError`。
+- `idempotency_key`：调用方自己给的键（1–255 个可打印的 ASCII 字符，例如一个 UUID；否则 ValueError），让重发的 add 安全。24 小时内，同一个用户（空间）下同一个键、同一个请求只写一次：重发返回 `status: "duplicate"`、原来的 `session_id` 与 `turn_ids`、`results: []` 与 `replayed: true`；`wait=True`（且 `infer=True`）时先像 `add(wait=True)` 一样等这个用户的抽取做完，这个会话的抽取失败时加上 `error`（还开着的 run 不抽取）。那次写下的发言已经遗忘了时（`delete`、`delete_all(run_id=...)`、任何遗忘），重发返回 `status: "forgotten"`（`session_id` 为 None，`turn_ids` 为 []），什么都不写。同一个键用于不同的请求（`messages`、`user_id`、`agent_id`、`run_id`、`metadata`、`expiration_date`、`timestamp` 或 `infer` 不同；`wait` 不比）时抛 `IdempotencyConflictError`，什么都不写。库里只存键的 sha256。幂等键在 24 小时内保护重发，也跨过对写下的记忆的 forget() / DELETE（重发返回 status "forgotten"）。delete_all() 与 reset() 连同别的一起删掉这个用户的幂等记录，所以之后到的重发是一次新的写入。不给键时 `add` 与以前完全相同。
+- `status` 是 `empty`（没有可存的消息）、`logged`、`queued`、`consolidated` 之一，带 `idempotency_key` 时还可能是 `duplicate` 与 `forgotten`（这时 `replayed` 为真）。同一个 `run_id` 里的并发写入撞了发言序号时抛 `ConcurrentWriteError`：什么都没写（没有发言，也没有幂等记录），这次 add 可以重试。
 
 事件是一条带 `"event": "ADD"` 或 `"UPDATE"` 的事实；UPDATE 另有 `previous_memory`（被取代的陈述）与 `reason`（`changed`：现实变了；`corrected`：之前说错了）。
 
@@ -131,7 +133,7 @@ Memory.from_system(system: MemorySystem) -> Memory
 
 - `min_level="l1"`（缺省）：调用 `search` 就是已经决定要查记忆，控制器选了 L0 时改走 L1，reasons 是 `["raised from L0: the caller asked to recall"]`，与 MCP、各框架集成相同。`min_level="l0"` 时照控制器的决定，L0 只返回画像。
 - `mode`：`auto`（控制器），或固定的 `l0`、`l1`、`l2`。`router`：`learned`（缺省）、`hybrid`（门控拿不准时问 LLM）、`rule`、`llm`。`lam`：成本旋钮 λ（缺省取控制器模型里的值；越小越舍得花钱），≥ 0 的有限数。`mode`、`router`、`min_level` 与 `lam` 最先检查，类型与 `/api/v1` 相同，空的空间也查：写错时抛 ValueError，说明是 HTTP 的那句去掉 `Invalid request: body.` 前缀，例如 `mode: Input should be 'auto', 'l0', 'l1' or 'l2'`。
-- `at`：提问的时间，相对日期按它换算。
+- `at`：提问的时间，相对日期按它换算。收 datetime、date（那天零点）、ISO 8601 文本（带时差或 `Z` 的换算成本机时间；`20300101` 这样的紧凑写法与 `2030-W01-2` 这样按周的写法也认）或 Unix 时间戳（数字，或只有数字、不是 ISO 的文本；单位是秒，绝对值大于 2e10 的读作毫秒），四个类与 HTTP 都一样。别的写法报 ValueError，开头是 `at:`，这个用户还没有记忆时也报。
 - `limit` 或 `top_k`：截断 `results`，要是正整数（0、负数与布尔值报 ValueError）。`run_id`：只要这个会话的记忆。`show_expired=True` 时过期的记忆也给（画像里始终没有）。
 - `filters`：Mem0 v3 的写法。`user_id`、`agent_id`、`run_id` 可以写在这里代替关键字参数（`user_id`、`agent_id` 只能是一个 ID）。其余的键都是 metadata 的条件；`created_at`、`updated_at` 与 `categories`（Mem0 保留的名字）在 metadata 没有同名的键时也对记忆自己的字段（结果里 `created_at` 的 ISO 字符串；事实的 category，作为一个元素的列表）：
   - `{"键": 值}` 是等于，`{"键": "*"}` 是有这个键，几个键并列时都要满足；
@@ -162,7 +164,7 @@ prompt = m.context("Where do I work?", user_id="alice")["context"] + "\n\nWhere 
 
 **`answer`**。检索，再用配置的回答模型回答。`mode` 另外可以是 `agent`（回答模型自己决定什么时候调用 `memory_search` 工具）与 `hatch`（控制器先召回，回答模型还可以补查）。`citations` 是 `{"ref", "id", "memory"}`。`mode` 只能是 `auto`、`l0`、`l1`、`l2`、`agent` 与 `hatch`（否则 ValueError；评测的基线 `naive` 与 `facts` 只在 `MemorySystem.ask` 与命令行里），`router` 与 `lam` 的检查同 `search`。
 
-**`get_all`**。缺省只给当前有效的事实。`include_superseded=True` 加上被取代的版本；`valid_at` 回放那时现实中成立的：`"2025"`（全年）、`"2025-06"`（整个月）或 `"2025-06-07"`（那一天），或 date、datetime；年或月给出那段时间里任何时候成立的事实，所以先后两个值都可能出现（`valid_at="2026"` 可能同时给出旧地址与新地址）。结束时间只知道年或月的值，算在那一年或那个月里；更正了的记忆从它更正的那个值开始的时候算起（它自己写明的开始时间优先），所以查更正之前的日期给出的是更正之后的值。带时间的字符串整个按 ISO 时间解析，带时差或 `Z` 的先换算成本机时间再取日期，与 datetime 相同。别的写法报 ValueError（`GET /api/v1/memories` 400）；`known_at=<时间>` 回放系统那一刻相信的。`run_id`、`filters`、`limit` / `top_k` 与 `show_expired` 同 `search`；缺省不给过期的事实。
+**`get_all`**。缺省只给当前有效的事实。`include_superseded=True` 加上被取代的版本；`valid_at` 回放那时现实中成立的：`"2025"`（全年）、`"2025-06"`（整个月）或 `"2025-06-07"`（那一天），或 date、datetime；年或月给出那段时间里任何时候成立的事实，所以先后两个值都可能出现（`valid_at="2026"` 可能同时给出旧地址与新地址）。结束时间只知道年或月的值，算在那一年或那个月里；更正了的记忆从它更正的那个值开始的时候算起（它自己写明的开始时间优先），所以查更正之前的日期给出的是更正之后的值。带时间的字符串整个按 ISO 时间解析，带时差或 `Z` 的先换算成本机时间再取日期，与 datetime 相同。别的写法报 ValueError（`GET /api/v1/memories` 400）；`known_at` 回放系统那一刻相信的，收的写法与 `search` 的 `at` 相同（否则 ValueError，开头是 `known_at:`）。`run_id`、`filters`、`limit` / `top_k` 与 `show_expired` 同 `search`；缺省不给过期的事实。
 
 **`get`、`media` 与 `history`**。`search` 给出的每个 ID 都能按 ID 用。`get` 返回一条事实、一段对话片段（一轮对话）或一张图片，过期的也给；ID 不存在时是 `None`。`media(media_id)` 返回图片原文件的字节（别的 ID、或原文件已经不在时是 `None`）。`history` 返回一条事实的版本链；对话片段与图片没有版本（`[]`）。
 
@@ -170,11 +172,11 @@ prompt = m.context("Where do I work?", user_id="alice")["context"] + "\n\nWhere 
 
 - `text` 是 Mem0 2.x 的名字，`data` 是它旧的名字：给一个就行（两个都给且不同时 ValueError）。只给 `metadata` 时 ValueError：metadata 记在出处的发言上，要随一句更正写进去。
 - `message` 是 `"Memory updated"`。
-- 从这句话里抽不出事实时，原来那条不变，这句更正也从日志里遗忘，`turn_ids` 是空的，`message` 写明。
+- 从这句话里抽不出事实时，原来那条不变，这句更正也从日志里遗忘（它什么都没派生出来，不重放空间），`turn_ids` 是空的，`message` 写明。
 - 更正记下之后抽取出错时，`message` 写明、`error` 给出原因；不要再调用一遍。
 - ID 不存在时 KeyError；这条已经被取代（请改当前的版本）、它是对话片段或图片（只有事实能改）、或者文字是空的时 ValueError。
 
-**`delete` 与 `delete_all`**。遗忘对应"被遗忘权"。`delete` 删掉事实出自的那一轮对话，沿引用找到之后引用过它的回复，并找出没有引用的转述，再用剩下的日志重建派生记忆：被它取代过的旧事实重新成为当前的。它也认对话片段与图片的 ID，遗忘那一轮或那张图。`dry_run=True` 只列出会删什么，什么都不删。`delete_all` 删掉整个空间：日志、派生记忆、向量、缓存与原图，还有这个空间的 trace（连同其中提问的查询向量）与库里写着它的元信息；给了 `run_id` 时只删这个会话。发言数超过 SQLite 参数上限（32,766）的用户也删得掉：查询是分批的。
+**`delete` 与 `delete_all`**。遗忘对应"被遗忘权"。`delete` 删掉事实出自的那一轮对话，沿引用找到之后引用过它的回复，并找出没有引用的转述，再用剩下的日志重建派生记忆：被它取代过的旧事实重新成为当前的。它也认对话片段与图片的 ID，遗忘那一轮或那张图。`dry_run=True` 只列出会删什么，什么都不删。`delete_all` 删掉整个空间：日志、派生记忆、向量、缓存与原图，还有这个空间的 trace（连同其中提问的查询向量）、库里写着它的元信息，以及 `claude_memory.sqlite` 里 Claude 记忆工具的文件；给了 `run_id` 时只删这个会话。日志里没有这个 `run_id` 的发言时什么都不删，`message` 是 `"No such run: nothing deleted"`、计数都是 0（以前的版本回 "Memories of this run deleted"）。`delete_all(run_id=..., dry_run=True)` 与 `delete` 的预演一样只预演；不给 `run_id` 时 `dry_run` 报 ValueError（HTTP 400）：删整个用户没有预演。发言数超过 SQLite 参数上限（32,766）的用户也删得掉：查询是分批的。
 
 - 报告里有 `message`、`turns_deleted`、`sessions_affected`、`facts_before`、`facts_after`、`images_deleted`、`restated`；删除做完、用剩下的日志重建出错时另有 `warning`（下次巩固时补上）。
 - 还没删任何东西就出错的遗忘（向量接口不可用、向量库或数据库出错）照常抛出、什么都不删，可以原样重试。
@@ -182,10 +184,13 @@ prompt = m.context("Where do I work?", user_id="alice")["context"] + "\n\nWhere 
 - 除了提问的查询向量，遗忘还删掉 L2 的子查询与追加查询、Agent 自己的记忆检索与导购演示的商品检索的查询向量，用 DashScope 多模态向量器时还删以文搜图的查询向量，以及别的记忆不再用的被删图片的向量。
 - 同一个记忆系统上开着的对话会话（界面、`/api`）在任何一次删除之后的下一轮去掉被删的内容，不管删除从哪里来（包括 `/api/v1` 的 delete、`delete_all` 与 `reset`）；删除重建期间开始的会话，下一轮取回重建好的画像。
 - 一句发言都没删、事实却还在时（它出处的发言已经不在日志里，旧版本可能留下这种情况），`message` 是 `"Nothing deleted"`，`warning` 让调用方 `consolidate(rebuild=True)`（之后检索仍缺对话片段时再 `cuemem reindex`）。
-- 删一条事实或一段对话片段遗忘的是整轮对话，同一轮的别的 ID 之后报 KeyError，与不存在的 ID 一样。照 Mem0 写的 `for r in results: m.delete(r["id"])` 要接住 KeyError。
+- 删一条事实或一段对话片段遗忘的是整轮对话，同一轮的别的 ID 之后报 KeyError，与不存在的 ID 一样。每次 `delete` 还要重放日志，重放可能给留下的事实换新的 ID：拿着之前 `get_all` 的 ID 逐条删时，没删的事实也可能 KeyError。一次删好几条用 `delete_many`；照 Mem0 写的 `for r in results: m.delete(r["id"])` 要接住 KeyError。
+- **`delete_many(memory_ids, *, dry_run=False)`** 一次遗忘好几条记忆（事实、对话片段或图片的 ID），每个记忆空间只遗忘一次、重建一次：先认出全部 ID，再逐个空间遗忘。去重之后最多 100 个（`cuemem.sdk.DELETE_MANY_MAX`；多了 ValueError：删每条事实仍要用便宜的模型找一次转述）；单个字符串 TypeError。不认识的 ID 不报错，列在 `missing` 里（经 HTTP 时作用域之外的也在这里）；`deleted` 是删掉了的（预演时是会删的）ID。返回 `message`、`deleted`、`missing`、`turns_deleted`、`sessions_affected`、`facts_before`、`facts_after`、`images_deleted` 与 `restated`（几个空间相加），最多一条 `warning`；`dry_run=True` 时是 `message`、`deleted`、`missing`、`turns`、`sessions_affected`、`cascaded`、`restated`、`facts` 与 `images`。好几个空间时逐个删，中途出错时前面的空间已经删了。`batch_delete(memories=[{"memory_id": ...}, ...])` 是同一个调用的 Mem0 写法（不预演）。
+- 遗忘也删掉 Claude 记忆工具里笔记出自被删发言的文件（数据目录里的 `claude_memory.sqlite`），删整个空间时删掉它的全部文件；文件不存在时什么都不建。`store=` 指到别处的存储由 `cuemem.integrations.claude.delete_all` 或工具下次打开这个空间时删。
+- 被删的会话整段删掉、又什么都没派生出来时（没有事实，没有新建或链接的实体，没有图片，没有别的发言引用它们，空间里没有待做、失败或过时的任务），遗忘不重放；结果与重放相同。
 - 不要在 `m.system.reading(space)` 里调用 `m.system` 的 `forget`、`delete_space` 或 `consolidate`：会抛 RuntimeError，而不是死锁。
 
-**`reset`**。删掉数据目录里的每个空间，包括 HTTP 服务、记忆代理与演示写的空间，并结束开着的 run。不可恢复。经 `/api/v1` 用限定作用域的令牌调用时，只删这个令牌作用域里的空间。
+**`reset`**。删掉数据目录里的每个空间，包括 HTTP 服务、记忆代理与演示写的空间（以及 `claude_memory.sqlite` 里 Claude 记忆工具的文件），并结束开着的 run。不可恢复。经 `/api/v1` 用限定作用域的令牌调用时，只删这个令牌作用域里的空间。
 
 **`status`**。一个用户（或 Agent）的记忆的抽取状态：`pending`（等着抽取的会话数）；`failed`，每个抽取失败的会话一项，带 `session_id`、`attempts`、`error`（出错的第一行）与 `retry_at`（后台线程什么时候重试，ISO 时间；失败到 3 次、流水线版本不同、或没有后台线程时是 `null`，这时要 `consolidate()`）；`background`（有没有后台线程）；`errors`，后台线程在这个空间最近的 3 条出错。后台抽取失败时还在 `cuemem.write.consolidate` 日志里记一条警告，同一空间、同一类出错只记一次。
 
@@ -207,6 +212,7 @@ prompt = m.context("Where do I work?", user_id="alice")["context"] + "\n\nWhere 
 | `search(..., rerank=True)` | `mode="l2"` |
 | `search` / `get_all` 列出过期的记忆 | `show_expired=True` |
 | `delete(id)` 删一条记忆 | 删整轮对话，同一轮之后的 ID 报 KeyError |
+| `batch_delete(memories=[{"memory_id": ...}])` | 四个类都有，另有 `delete_many(ids, dry_run=False)`；最多 100 个 ID，每个空间重建一次，不认识的 ID 列在 `missing` 里 |
 | `MemoryClient(api_key=..., host=...)` | 相同（`host` 是 `base_url` 的别名）；`MemoryClient("m0-...")` 把 Key 当第一个参数时报 ValueError，第一个参数是地址 |
 | `filters` 里的 `created_at`、`updated_at`、`categories` | 相同，对记忆自己的字段；事实的别的字段（`category`、`predicate`、`status`……）是 metadata 的条件，metadata 里没有这个键时什么都不匹配 |
 | `add()` 返回抽取出的事件 | 只在 `wait=True` 时；不带时 `results` 是 `[]`、`status` 是 `"queued"` |
@@ -219,11 +225,13 @@ prompt = m.context("Where do I work?", user_id="alice")["context"] + "\n\nWhere 
 
 `AsyncMemory(...)` 的参数相同，每个方法都是带类型的协程，签名与 `Memory` 上的相同（在线程池里执行；测试两个方向都核对）。`AsyncMemory.from_system(system)` 包住已经打开的记忆系统。`async with AsyncMemory() as m:` 退出时关闭，`async with m.run(user_id="alice") as run_id:` 是异步的 run。别的属性（`.system`、`.settings`）交给同步对象。
 
+取消协程（`task.cancel()`，或 `asyncio.wait_for`、`asyncio.timeout` 超时）停不下调用本身：它在事件循环默认线程池的线程里执行完，被取消的 `add`、`update`、`delete` 或 `forget` 照样可能生效。传 `idempotency_key`、用同一个键再调一次；限定等待用 `wait(timeout=...)`（与客户端的 `timeout=`），不用 `wait_for`。
+
 ### 异常与日志
 
-`cuemem.errors` 定义了 `CueMemError` 与它的子类：`MissingAPIKeyError`、`CacheMissError`、`StructuredOutputError`、`EmbeddingAPIError`（带 `status` 与 `retry_after`）、`DatasetChecksumError`、`ConfigMismatchError`（更新的 CueMem 写的库也是它：升级，或者用新版本导出再在这里导入）、`ConsolidationError`、`ContentFilteredError`、`ConcurrentWriteError`、`IdempotencyConflictError`（`idempotency_key` 用在了另一次不同的 add 上）、`StorageLockedError`、`VectorStoreOpenError`（本地模式的 Qdrant 打不开或建不了集合，多半是打开的文件太多，或者读不出它的 `meta.json`；说明里写着办法，后者是 `cuemem doctor --repair-vectors`）、`AccessKeysError` 与 `MemoryAPIError`（带 `status`、`code`、`type`、`retry_after` 与 `sent`）。SDK 还会按上面说的抛 KeyError、ValueError、TypeError 与 RuntimeError；OpenAI 客户端库的异常在 CueMem 自己的重试之后原样抛出。
+`cuemem.errors` 定义了 `CueMemError` 与它的子类：`MissingAPIKeyError`、`CacheMissError`、`StructuredOutputError`、`EmbeddingAPIError`（带 `status` 与 `retry_after`）、`DatasetChecksumError`、`ConfigMismatchError`（更新的 CueMem 写的库也是它：升级，或者用新版本导出再在这里导入）、`ConsolidationError`、`ContentFilteredError`、`ConcurrentWriteError`、`IdempotencyConflictError`（`idempotency_key` 用在了另一次不同的 add 上）、`StorageLockedError`（数据库，不论哪种模式，或本地模式的 Qdrant 正被另一个进程使用；说明里写着它的 pid 与命令）、`DatabaseOpenError`（数据库、账本或缓存打不开：目录只读、磁盘满、数据路径上挡着一个文件；它也是 `sqlite3.OperationalError`）、`SessionLimitError`（一个记忆空间进行中的 run 或对话会话太多；HTTP 429）、`VectorStoreOpenError`（本地模式的 Qdrant 打不开或建不了集合，多半是打开的文件太多，或者读不出它的 `meta.json`；说明里写着办法，后者是 `cuemem doctor --repair-vectors`）、`AccessKeysError` 与 `MemoryAPIError`（带 `status`、`code`、`type`、`retry_after` 与 `sent`）。SDK 还会按上面说的抛 KeyError、ValueError、TypeError 与 RuntimeError；OpenAI 客户端库的异常在 CueMem 自己的重试之后原样抛出。
 
-日志：`cuemem.write.consolidate`（后台抽取失败，英文）、`cuemem.core.trace`（trace 写不进去，或遗忘时只好整个删掉某天的 trace 文件）、`cuemem.memory`（遗忘的发言的图片文件删不掉，或遗忘提交之后的清理出错）、`cuemem.sdk`（高峰时段的等待）与 `cuemem.api.proxy`。
+日志：`cuemem.write.consolidate`（后台抽取失败，英文）、`cuemem.core.trace`（trace 写不进去，或遗忘时只好整个删掉某天的 trace 文件）、`cuemem.memory`（遗忘的发言的图片文件删不掉，或遗忘提交之后的清理出错）、`cuemem.sdk`（高峰时段的等待）、`cuemem.store.files`（磁盘满或只读时跳过的向量缓存、LLM 缓存或用量账本的写入；关掉了数据库锁）与 `cuemem.api.proxy`。
 
 ## 远程客户端：`MemoryClient`
 
@@ -251,14 +259,14 @@ MemoryClient(
 - `api_key` 不填时取环境变量 `CUEMEM_API_TOKEN`；可以是管理令牌，也可以是限定作用域的令牌。`timeout` 是单次请求的秒数（`wait=True` 的 `add` 要等抽取做完）；自带 `http_client` 时照它自己的超时。
 - 内容块里的本地图片路径（与 `file://`）在客户端读成 data URL 再发；服务器不读自己磁盘上的文件。`media(id)` 从服务端取图片原文件。
 - `metadata` 发送之前照 SDK 的规则检查（JSON 会悄悄把非字符串的键变成字符串），`limit` 与 `top_k` 也是（JSON 的 `true` 会变成 1）。
-- 时间参数（`timestamp`、`at`、`known_at`、`expiration_date`）按 ISO 格式发送。不带时区的时间按服务器的本机时间理解，客户端与服务器不在一个时区时请带上时区。
+- 时间参数（`timestamp`、`at`、`known_at`、`expiration_date`）是 datetime 或 date 时按 ISO 格式发送，文本与 Unix 时间戳原样发送；服务端用与 `Memory` 相同的解析读 `at` 与 `known_at`。不带时区的时间按服务器的本机时间理解，客户端与服务器不在一个时区时请带上时区。
 - 抛出与 `Memory` 相同的异常：KeyError、ValueError、TypeError 与 `cuemem.errors` 里的类型；`EmbeddingAPIError` 带着 `status` 与 `retry_after`。别的 HTTP 出错（令牌不对、连不上服务、超出令牌作用域的 403、其他供应商出错）是 `MemoryAPIError`，带 `status`（没有拿到响应时为 None）、`code`（错误码见下）、`type`（服务端的异常类，例如 `RateLimitError`）、`retry_after`（响应的 Retry-After，429 与 503 时有）与 `sent`（请求有没有到服务端：False、True，拿到了 HTTP 响应时是 None）。没有异常类型的 404 另外说明 `base_url` 要是 `cuemem serve` 的根地址。没有拿到响应时 `code` 是客户端一侧的：`unreachable`（`sent=False`：什么都没写，可以重发；连接被拒绝时问那里是不是在运行 `cuemem serve`）、`timeout`（`sent=True`：客户端的超时之内没有响应，请求可能已经处理了）、`disconnected`（`sent=True`：连接中途断开）、`transport`（`sent=True`：别的传输出错）。客户端不自动重试：写入只在 `unreachable` 之后、或者带 `retry_after` 的 429 与 503 之后重发；`timeout` 与 `disconnected` 之后可能已经存下了。带了 `idempotency_key` 的 `add` 可以用同一个键重发（只写一次，见上面的 `add`）；没带时先查 `export`（还在排队等抽取的 add 不在 `get_all` 里）。这两种出错的说明是 "the request may have been processed (repeat it with the same idempotency_key, or check export)"。别的租户的 ID 与不存在的一样，`get()` 返回 `None`。
 - `wait()` 让服务端最多等这个客户端的读超时减 5 秒（`cuemem.client.WAIT_MARGIN_S`；读超时的一半更大时取一半），不给 `timeout` 时也是，所以等不完时抛的是 TimeoutError（服务端的 504），不是 `MemoryAPIError(code="timeout")`；缺省 300 秒的客户端下服务端最多等 295 秒。
 - `close()`（或 `with MemoryClient(...) as m:`）结束这个客户端开的 run。远程开了、一直没结束的 run，`cuemem serve` 在闲置 30 分钟（`--idle-minutes`）后结束它，同一个 `run_id` 的下一次 `add` 重新打开；服务重启时还开着的 run，由带它的 `run_id` 的下一次 `add` 接着写（见上面的 run）。
 - 框架集成要本地的 `Memory` 或 `AsyncMemory`：传 `MemoryClient` 时在构造时就抛 TypeError。
 - 这个模块只导入 httpx2 与 `cuemem._async`，不加载记忆系统。
 
-`AsyncMemoryClient(...)` 是异步版本，带类型的协程与 `AsyncMemory` 相同。
+`AsyncMemoryClient(...)` 是异步版本，带类型的协程与 `AsyncMemory` 相同。取消的行为与 `AsyncMemory` 相同。
 
 ## HTTP 接口：`cuemem serve`
 
@@ -278,6 +286,10 @@ MemoryClient(
 | `--unknown-model` | `proxy.unknown_model`（`remap`） | 记忆代理收到不认识的模型时：`remap` 或 `reject` |
 
 每个 `cuemem` 命令都先把进程打开文件数的软上限调到硬上限（最多 65,536）。Qdrant 本地模式每个集合（每个记忆空间一个，有图的两个）一直开着一个文件、启动时全部打开，用户多的服务器请用 Qdrant 服务端（`cuemem migrate-vectors --to URL`，再设 `CUEMEM_VECTOR_STORE__URL`）。`cuemem doctor` 列出集合数与上限。
+
+- **每个空间进行中的会话数。** `CUEMEM_MAX_OPEN_SESSIONS`（正整数，默认 64；写错时 `cuemem serve` 与 `cuemem proxy` 以 1 退出）按记忆空间、各算各的限住 `/api` 的对话会话（`POST /api/sessions`、网页界面、`cuemem chat`）、记忆代理的会话与 `/api/v1` 的 run。到了上限时，开新的对话会话先结束最久没有活动、一句话都还没说的那个；进行中的会话都说过话时 `POST /api/sessions` 回 429，带 `Retry-After: 60`（界面上有说明）。结束一个会话（`POST /api/sessions/{id}/end`）或等闲置的会话被清理。新的代理会话先结束最久没有请求、没有留着重试的写回的那个（与闲置结束相同，交给抽取）；没有这样的会话时代理回 429。超过上限的新 `run_id` 得到 429（code `rate_limited`，type `SessionLimitError`，`MemoryClient` 抛它）；重新打开已经开着的 run 可以，也从不替调用方结束别的 run。本地 SDK 的 `Memory` 不限（`max_open_runs = None`）。
+- **停止。** 收到 SIGTERM 时，serve 与 proxy 等进行中的请求最多 20 秒，再重试记忆代理缓冲的写回、结束对话会话，等后台抽取最多 30 秒。docker-compose 给这些留了 90 秒（`stop_grace_period: 90s`）；单独 `docker run` 时加 `--stop-timeout 90`：Docker 默认的 10 秒会在收尾中途杀掉服务，缓冲的写回就丢了。
+- **磁盘满了。** 磁盘满了或只读时服务照样回答：向量缓存、LLM 回答缓存或用量账本写不进去时在 `cuemem.store.files` 记一条警告、跳过，直到又写得进去；付费的调用先记账、再缓存回答。评测仍然严格，照样出错。缓存留着每个新问题的向量与回答（1,024 维向量时每个不同的问题约 6–7 KB）；只有 `CUEMEM_TRACES_RETENTION_DAYS` 清查询向量。
 
 ### 鉴权与限定作用域的令牌
 
@@ -320,7 +332,7 @@ MemoryClient(
   cuemem keys revoke alice-app                          # 运行中的 serve/proxy 约一秒内不再认它
   ```
 
-  这几个命令改 `--file` 或 `CUEMEM_API_KEYS_FILE`（数据目录的 `.env` 里设的也算）指的文件，保留注释，只存 sha256（加引号），原子地重写、权限 0600；`keys add` 在文件不在时新建。每次 `keys add` 写一个作用域：`--user` 的值，给了 `--agent` 时连同它的值；只给 `--agent` 是这个 Agent 自己的记忆；`--user`、`--agent` 与 `--models` 都可以重复。令牌写在 `CUEMEM_API_KEYS` 里时它们拒绝（`keys list` 照样列出）。`keys:` 写成流式（`keys: [...]`，空的 `keys: []` 除外）的文件不动，`keys add` 改为打印要贴进去的那一项与令牌、以 1 退出，这一项贴进 `keys:` 之前这个令牌不能用。`keys revoke` 只删这一项的几行；这一项与别的内容写在同一行、或者它的 `-` 单独一行时拒绝，并写明要手工删哪几行。吊销最后一个令牌时写成 `keys: []`，并提醒没有 `CUEMEM_API_TOKEN` 时运行中的服务在停掉之前仍认原来的令牌。之后的 `keys add` 把 `keys: []` 改回一项一行的写法，接着加。手工的做法照旧可用：`printf %s "$TOKEN" | sha256sum`，写一项 `sha256:`。
+  这几个命令改 `--file` 或 `CUEMEM_API_KEYS_FILE`（数据目录的 `.env` 里设的也算）指的文件，保留注释，只存 sha256（加引号），原子地重写、权限 0600，并打印文件的绝对路径。`keys add` 在文件不在时新建（它所在的目录要已经存在，否则以 1 退出、不打印令牌）。运行中的服务只有在启动时用 `CUEMEM_API_KEYS_FILE` 指向新建的文件，才会读它（在 Docker 里是容器里的路径），所以要带上这个设置启动或重启它们；服务已经在看的文件，改动约一秒内生效。每次 `keys add` 写一个作用域：`--user` 的值，给了 `--agent` 时连同它的值；只给 `--agent` 是这个 Agent 自己的记忆；`--user`、`--agent` 与 `--models` 都可以重复。令牌写在 `CUEMEM_API_KEYS` 里时它们拒绝（`keys list` 照样列出）。`keys:` 写成流式（`keys: [...]`，空的 `keys: []` 除外）的文件不动，`keys add` 改为打印要贴进去的那一项与令牌、以 1 退出，这一项贴进 `keys:` 之前这个令牌不能用。`keys revoke` 只删这一项的几行；这一项与别的内容写在同一行、或者它的 `-` 单独一行时拒绝，并写明要手工删哪几行。吊销最后一个令牌时写成 `keys: []`，并提醒没有 `CUEMEM_API_TOKEN` 时运行中的服务在停掉之前仍认原来的令牌。之后的 `keys add` 把 `keys: []` 改回一项一行的写法，接着加。手工的做法照旧可用：`printf %s "$TOKEN" | sha256sum`，写一项 `sha256:`。
 - **作用域管的是能访问谁的记忆，不是能花多少。** 任何有效的令牌都能让服务器调用运营者的模型供应商：`/v1/chat/completions` 与 `/v1/responses`（带不带 user 都行；`model`、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发）、`/v1/embeddings`（最多 2,048 条）、`/api` 的对话、`POST /api/v1/answer`、`/mcp`，以及每一次写入（之后的抽取每写入一个字节约向上游发 2 个字符）。只把令牌给你愿意让它花这笔钱的人，在供应商那里设花费上限，在反向代理里按 `Authorization` 头限流（例如 nginx 的 `limit_req_zone $http_authorization ...`），调小 `CUEMEM_MAX_BODY_BYTES` 限住一次写入的花费。
 - **可选的按令牌上限**（正整数或非空的列表；不写时什么都不变，转发的请求体逐字节相同）：
   - `rate_per_minute`：在 `/api`、`/api/v1`、`/v1` 与 `/mcp` 上每分钟最多这么多个除 GET、HEAD、OPTIONS 之外的请求（POST、PUT、DELETE）；经 POST 的检索与回答、`/v1/embeddings` 与每次 MCP 调用（Streamable HTTP 用 POST）也算，GET 请求不算。做法是容量为这个数、每秒补 `rate_per_minute / 60` 个的令牌桶。超过时 429，带 `Retry-After`（等到下一个名额的秒数）；`/api/v1` 下 code 是 `rate_limited`，`/api` 下是中文的 `{"detail"}`，`/v1` 与 `/mcp` 下是 `{"detail": "Too many requests for this access key: ..."}`。
@@ -362,14 +374,15 @@ SDK 的每个方法一个接口。请求体与查询参数的名字、缺省值�
 | `PUT /api/v1/memories/{id}`，`{text, metadata}`（或用 `data` 代替 `text`） | `update` |
 | `GET /api/v1/memories/{id}/history` | `history` |
 | `DELETE /api/v1/memories/{id}?dry_run=` | `delete` |
-| `DELETE /api/v1/memories?user_id&agent_id&run_id` | `delete_all` |
+| `DELETE /api/v1/memories?user_id&agent_id&run_id&dry_run` | `delete_all`（`dry_run=true` 要与 `run_id` 一起，否则 400） |
+| `POST /api/v1/memories/batch-delete`，`{memory_ids, dry_run}` | `delete_many`，返回 `BatchForgetResult` 或 `BatchDryRunResult`（operationId `delete_many`；超过 100 个 ID 时 400；限定作用域的令牌作用域之外的 ID 与不认识的一样列在 `missing` 里；`rate_per_minute` 算一次写入，预演也算）。`MemoryClient.batch_delete` 也用它 |
 | `GET /api/v1/media/{id}` | `media`：图片原文件，带它的 Content-Type（别的 ID、或超出令牌作用域时 404） |
 | `POST /api/v1/reset` | `reset`（限定作用域的令牌只删它的空间，message 是 "All memories in this key's scope deleted"） |
 | `POST /api/v1/context`，`{query, user_id, agent_id, at, mode, router, lam, min_level, wrap}` | `context`，返回 `ContextResult`；作用域之外 403，没有 `user_id` 也没有 `agent_id` 时 400，写错的值 422；不调用模型 |
 | `POST /api/v1/answer`，`{question, user_id, agent_id, mode, at, router, lam}` | `answer` |
 | `GET /api/v1/profile?user_id&agent_id` | `profile`，返回 `{"profile": ...}` |
 | `GET /api/v1/status?user_id&agent_id` | `status` |
-| `POST /api/v1/runs`，`{run_id, user_id, agent_id}` | `open_run`，返回 `{"run_id": ...}` |
+| `POST /api/v1/runs`，`{run_id, user_id, agent_id}` | `open_run`，返回 `{"run_id": ...}`；这个空间已经有 `CUEMEM_MAX_OPEN_SESSIONS` 个进行中的 run 时 429（type `SessionLimitError`，`Retry-After: 60`） |
 | `POST /api/v1/runs/end`，`{run_id, user_id, agent_id, wait}` | `end_run` |
 | `POST /api/v1/consolidate`，`{user_id, agent_id, rebuild}` | `consolidate` |
 | `POST /api/v1/wait`，可选 `{user_id, agent_id, timeout}` | `wait`，返回 `{"ok": true}`。给了 ID 时令牌要管得着（否则 403）；不给时管理令牌等全部，限定作用域的令牌只等它能访问的空间。服务端最多等 300 秒，之后 504 `timeout`（type `TimeoutError`，`MemoryClient` 抛 TimeoutError）。等的时候不占服务器的线程：每 0.25 秒看一次，所以最多在抽取做完之后 0.25 秒返回。客户端断开时，服务端 0.25 秒内不再等，放开这个令牌的并发名额（`max_concurrent`） |
@@ -377,7 +390,7 @@ SDK 的每个方法一个接口。请求体与查询参数的名字、缺省值�
 | `POST /api/v1/import`，`{data, user_id, agent_id, wait}` | `load` |
 | `GET /api/v1/spaces` | `spaces` |
 
-`messages` 里的图片只收 data URL：本地路径与 `file://` 回 400，服务器不读自己磁盘上的文件。
+`messages` 里的图片只收 data URL：本地路径与 `file://` 回 400，服务器不读自己磁盘上的文件。`at`（search、context、answer）与 `known_at`（`GET /memories`）用 SDK 的解析读（见上面的 `search`）：请求体里收文本或数字，查询参数收文本；写错时 400（以前是 Pydantic 的 422），`"20300101"` 现在是 2030-01-01（以前读成 Unix 秒数）。
 
 `/api/v1` 的出错都是 `{"error": {"code", "type", "message"}}` 这个形状（`V1ErrorBody`）。`type` 是 SDK 抛出的异常（`KeyError`、`ValueError`、`TypeError`、`cuemem.errors` 里的类型，或供应商异常的类名），向量接口的出错另带 `upstream_status`。`/api/v1` 下的 401、413、422、500、找不到接口、别的网站的浏览器请求与 Host 不对也是这个形状（401 的 message 是 `/api` 的中文说明）；别的路径的 500 仍是纯文本。
 
@@ -388,17 +401,17 @@ SDK 的每个方法一个接口。请求体与查询参数的名字、缺省值�
 | 402 | `no_balance` | 模型供应商的账户余额不足 |
 | 403 | `forbidden` | 超出令牌的作用域；别的网站发来的浏览器请求 |
 | 404 | `not_found` | 记忆 ID 不存在、导出的空间不存在、别的租户的 ID、找不到接口 |
-| 409 | `conflict` | `ConcurrentWriteError`；`IdempotencyConflictError`（`Idempotency-Key` 用在了另一次不同的 add 上） |
+| 409 | `conflict` | `ConcurrentWriteError`（什么都没写，可以重试）；`IdempotencyConflictError`（`Idempotency-Key` 用在了另一次不同的 add 上） |
 | 413 | `payload_too_large` | 请求体超过上限 |
 | 422 | `invalid_request` 或 `content_filtered` | 请求体不合格式（type 是 `ValueError`）；供应商的内容审核拒绝了这次请求 |
-| 429 | `rate_limited` | 重试之后仍被限流、限定作用域的令牌同时在处理的请求体超过上限、用完了令牌的 `rate_per_minute`，或者令牌已经有 `max_concurrent` 个请求在处理；带 `Retry-After` |
+| 429 | `rate_limited` | 重试之后仍被限流、限定作用域的令牌同时在处理的请求体超过上限、用完了令牌的 `rate_per_minute`，或者令牌已经有 `max_concurrent` 个请求在处理；带 `Retry-After`。还有超过 `CUEMEM_MAX_OPEN_SESSIONS` 的新 run（type `SessionLimitError`，`Retry-After: 60`） |
 | 502 | `upstream_error` | 其余供应商出错（5xx、连不上、鉴权失败）与 CueMem 的其他出错 |
 | 503 | `unavailable` | 供应商暂时不可用，带 `Retry-After` |
 | 504 | `timeout` | 供应商超时；`POST /api/v1/wait` 等过了上限（type `TimeoutError`） |
 | 500 | `internal_error` | 服务端出了意料之外的错（是 bug），调用栈在服务端的日志里。`type` 是 null，message 从不带异常的细节 |
 | （没有） | `unreachable`、`timeout`、`disconnected`、`transport` | 没有拿到响应时 `MemoryClient` 在客户端一侧给的代码（`status` 是 None；见上面的 `sent`）。客户端的 `timeout` 与 504 的代码同名，用 `status` 区分 |
 
-`/openapi.json`（与 `/docs`）给 `/api/v1` 的每个响应一个有名字的结构（按 `type` 区分的 `FactItem`、`ExcerptItem`、`ImageItem`，`SearchResult`，`AddResult`，`ForgetResult` 或 `DryRunResult`，`StatusResult`，`ContextResult`，`ExportDocument`……），每个出错状态都写成 `V1ErrorBody`，包括 500。21 个 operationId 就是 SDK 的方法名（`add`、`get_all`、`search`、`context`……）：按 D-072 之前的快照生成的客户端要重新生成，方法名会变。`GET /api/v1/media/{id}` 写明 `image/jpeg`、`image/png`、`image/webp`、`image/gif`、`image/bmp`、`image/tiff`、`image/mpo` 与 `application/octet-stream`。`/api/v1` 那部分的快照提交在 [`docs/openapi-v1.json`](openapi-v1.json)；用 `uv run python scripts/openapi_v1.py` 重新生成（`--check` 在它过期时退出码 1，测试会跑它）。没有手写的 TypeScript 客户端；生成类型、用它调用接口：
+`/openapi.json`（与 `/docs`）给 `/api/v1` 的每个响应一个有名字的结构（按 `type` 区分的 `FactItem`、`ExcerptItem`、`ImageItem`，`SearchResult`，`AddResult`，`ForgetResult` 或 `DryRunResult`，`BatchForgetResult` 或 `BatchDryRunResult`，`StatusResult`，`ContextResult`，`ExportDocument`……），每个出错状态都写成 `V1ErrorBody`，包括 500。22 个 operationId 就是 SDK 的方法名（`add`、`get_all`、`search`、`context`、`delete_many`……）：按 D-072 之前的快照生成的客户端要重新生成，方法名会变。`GET /api/v1/media/{id}` 写明 `image/jpeg`、`image/png`、`image/webp`、`image/gif`、`image/bmp`、`image/tiff`、`image/mpo` 与 `application/octet-stream`。`/api/v1` 那部分的快照提交在 [`docs/openapi-v1.json`](openapi-v1.json)；用 `uv run python scripts/openapi_v1.py` 重新生成（`--check` 在它过期时退出码 1，测试会跑它）。没有手写的 TypeScript 客户端；生成类型、用它调用接口：
 
 ```bash
 npx openapi-typescript docs/openapi-v1.json -o cuemem.d.ts   # 再用 openapi-fetch，带 Authorization: Bearer <令牌>
@@ -422,6 +435,8 @@ curl -s "$CUEMEM/status?user_id=alice" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$CUEMEM/memories/<id>?dry_run=true" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$CUEMEM/memories/<id>" -H "Authorization: Bearer $TOKEN"
 curl -s -X DELETE "$CUEMEM/memories?user_id=alice" -H "Authorization: Bearer $TOKEN"
+curl -s -X POST $CUEMEM/memories/batch-delete -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"memory_ids":["<id>","<id>"],"dry_run":true}'
 curl -s -X POST $CUEMEM/memories -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -H "Idempotency-Key: 6f1c2b9e-3d4a-4e8b-9a51-2f7d0c8e1b34" -d '{"messages":"I moved to Berlin","user_id":"alice"}'
 curl -s -H "Authorization: Bearer $CUEMEM_API_TOKEN" -X POST http://127.0.0.1:7860/api/v1/context \
@@ -436,11 +451,11 @@ curl -s -H "Authorization: Bearer $CUEMEM_API_TOKEN" -X POST http://127.0.0.1:78
 |---|---|
 | `GET /api/health` | `{"ok", "version", "open_sessions"}`，不要令牌 |
 | `GET /api/spaces` | 记忆空间（按令牌的作用域筛） |
-| `POST /api/sessions`，`{space, at}` | 与 Agent 开始一段会话（缺省空间是 `--space`） |
+| `POST /api/sessions`，`{space, at}` | 与 Agent 开始一段会话（缺省空间是 `--space`）；这个空间已经有 `CUEMEM_MAX_OPEN_SESSIONS` 个都说过话的进行中会话时 429，带 `Retry-After: 60` |
 | `POST /api/sessions/{session_id}/messages`，表单字段 `text`、`images`（文件）、`mode`、`router`、`lam` | Agent 的一轮：召回、带引用回答、写回；返回回答与它的轨迹 |
 | `POST /api/sessions/{session_id}/end?wait=` | 结束会话并交给抽取 |
 | `POST /api/spaces/{space}/recall`，`{query, mode, router, lam, at}` | 只召回、不回答；控制器选档（L0 只给画像） |
-| `GET /api/spaces/{space}/profile`、`/facts?current_only=`、`/entities`、`/graph`、`/media`、`/media/{media_id}`、`/sessions`、`/status` | 浏览这个空间（`/status` 只列出这个空间的后台出错） |
+| `GET /api/spaces/{space}/profile`、`/facts?current_only=&show_expired=`、`/entities`、`/graph?show_expired=`、`/media?show_expired=`、`/media/{media_id}`、`/sessions`、`/status` | 浏览这个空间（`/status` 只列出这个空间的后台出错）。`/facts`、`/graph` 与 `/media` 不给出过期的记忆，除非 `show_expired=true`；事实与图片的条目带 `expired` |
 | `POST /api/spaces/{space}/forget`，`{session_ids, turn_ids, fact_ids, media_ids, dry_run}` | 遗忘（`dry_run` 时只预演）；删除之后重建出错时带 `warning` |
 | `GET /api/spaces/{space}/export?derived=` | 导出 |
 | `POST /api/spaces/import?space=`，请求体是导出的文件 | 导入（文件不对或格式坏了时 409，包括没有 `space_id`、也没给 `?space` 的） |
@@ -448,7 +463,7 @@ curl -s -H "Authorization: Bearer $CUEMEM_API_TOKEN" -X POST http://127.0.0.1:78
 
 闲置 `--idle-minutes`（30）分钟的对话会话会结束、交给抽取；之后再给它发消息回 404 并说明原因，要开新的会话（界面自己会开，并说明原因）。
 
-状态码：会话不存在或已结束、图片不存在、导出不存在的空间时 404；输入不对时 409（包括图片太大）；请求体超过上限时 413；上传的不是图片时 415；`mode`、`router` 写错时 422；401、403 同上；供应商出错时 429（带 `Retry-After`）、402、503（带 `Retry-After`）、504、422（内容审核）与 502（其余）。
+状态码：会话不存在或已结束、图片不存在、导出不存在的空间时 404；输入不对时 409（包括图片太大）；请求体超过上限时 413；上传的不是图片时 415；`mode`、`router` 写错时 422；到了进行中会话的上限时 429（带 `Retry-After: 60`）；401、403 同上；供应商出错时 429（带 `Retry-After`）、402、503（带 `Retry-After`）、504、422（内容审核）与 502（其余）。
 
 ## 记忆代理：`/v1`
 
@@ -482,10 +497,10 @@ client.chat.completions.create(model="gpt-5.4-mini", messages=[...], user="alice
 - **身份**：请求头 `X-CueMem-User` 或请求体的 `user` 字段（请求头优先），可加 `X-CueMem-Agent`；都没有时用 `--user`。限定作用域的令牌要覆盖这个用户与 Agent，否则在检索、开会话与转发之前回 OpenAI 格式的 403（type `permission_error`，code `forbidden`）。没有点名用户的请求原样转发、不碰记忆。`/v1/models` 与 `/v1/embeddings` 任何有效的令牌都能用。
 - **不是 ASCII 的用户或 Agent ID** 在这两个请求头里写成 RFC 8187 的 UTF-8 百分号编码，例如张三是 `X-CueMem-User: utf-8''%E5%BC%A0%E4%B8%89`；Node 的客户端（包括 Claude Code）只能这样发，curl 原样发的 UTF-8 也认，记忆代理也可以把 ID 放进请求体的 `user` 字段。`utf-8''` 写错、百分号编码的字节不是 UTF-8，或者 `utf-8''` 与非 ASCII 的值里带控制字符时 400（记忆代理是 OpenAI 格式的 `invalid_request_error`，param `user`）；原样发来、不是 UTF-8 的字节按 Latin-1 读，ASCII 的值原样。
 - **花费**：作用域管的是能访问谁的记忆，不是能花多少；`model`、`n`、`max_tokens` 与 `enable_thinking` 这类开关原样转发，除非令牌写了 `models` 或 `max_output_tokens`（见[鉴权与限定作用域的令牌](#鉴权与限定作用域的令牌)）。不在令牌 `models` 里的模型回 OpenAI 格式的 403（type `permission_error`，param `model`），写了 `max_output_tokens` 时 `n` 不是 1 回 400（param `n`）。
-- **会话**：`X-CueMem-Session` 指定会话。不给时，请求里没有之前的消息、或空闲超过 `--idle-minutes` 之后，开一段新的会话；并行的几段对话要各带自己的会话头。闲置的会话另由每分钟一次的清理结束，`cuemem proxy` 与 `cuemem serve` 挂着的代理都是。
+- **会话**：`X-CueMem-Session` 指定会话。不给时，请求里没有之前的消息、或空闲超过 `--idle-minutes` 之后，开一段新的会话；并行的几段对话要各带自己的会话头。闲置的会话另由每分钟一次的清理结束，`cuemem proxy` 与 `cuemem serve` 挂着的代理都是。每个用户（记忆空间）进行中的会话数受 `CUEMEM_MAX_OPEN_SESSIONS`（64）限制：开新会话先结束最久没有请求、没有留着重试的写回的那个；进行中的会话都留着写回时（故障期间），请求在召回与转发之前得到 OpenAI 格式的 429（type `rate_limit_error`，code `rate_limited`，`Retry-After: 60`）。
 - **响应头**：`X-CueMem-Level`（`L0`、`L1`、`L2`；没有用记忆时是 `none`，检索出错、照常不带记忆转发时是 `error`）、`X-CueMem-Recalled`、`X-CueMem-Reasons`、`X-CueMem-Session`，以及每个响应都有的 `X-CueMem-Model`：实际转发给上游的模型。响应体是供应商的原样。
 - **模型**：`model` 是配置里的别名或模型 ID；不带 `model` 的请求用 agent 角色的模型。不认识的模型也改用 agent 角色的模型，每个模型名在日志里警告一次（`proxy.unknown_model: remap`，缺省）；设成 `reject`（配置项、`CUEMEM_PROXY__UNKNOWN_MODEL` 或 `--unknown-model reject`）时在检索之前回 400，code `model_not_found`。服务端没设供应商 Key 的目录模型（例如 `--preset openai` 下没有 `DASHSCOPE_API_KEY` 时的 `qwen3.8-flash`）在检索、开会话之前回 503，错误码 `model_not_available`（type `server_error`，param `model`，响应头 `x-should-retry: false`），说明里写着缺的环境变量与能用的模型；不认识的名字改用的 agent 模型没有 Key 时也是这样。`GET /v1/models` 只列服务端有 Key 的模型（加上向量模型），`unknown_model: reject` 的 400 列的也是这些。限定作用域的令牌请求作用域之外的用户时仍先回 403。
-- **出错**：上游的出错原样返回，带上 `retry-after`、`retry-after-ms` 与 `x-should-retry`，什么都不写。连不上上游时回 OpenAI 格式的 502，超时 504。写回失败（例如向量接口暂时不可用）时留在进程内存里，这个会话下一次写回之前先写它，会话结束之前再试一次；进程退出就丢了。带着超过像素上限或格式不收的图片的写回只丢这一条。等上游回答期间（例如长的流式回答时别的调用方删除），注入的记忆被遗忘了的话，回答照样返回给调用方，但不存下；用户的话照样存下。
+- **出错**：上游的出错原样返回，带上 `retry-after`、`retry-after-ms` 与 `x-should-retry`，什么都不写。连不上上游时回 OpenAI 格式的 502，超时 504。写回失败（例如向量接口暂时不可用）时留在进程内存里，这个会话下一次写回之前先写它，会话结束之前再试一次；进程退出就丢了。故障持续很久时，每个会话最多留 100 次写回或 32 MiB（按文字与图片 data URL 的字符数算）；更早的丢掉，记警告与 `proxy_write_dropped` trace 事件（`reason=backlog`）。带着超过像素上限或格式不收的图片的写回只丢这一条。等上游回答期间（例如长的流式回答时别的调用方删除），注入的记忆被遗忘了的话，回答照样返回给调用方，但不存下；用户的话照样存下。
 - 请求体必须是 JSON（`Content-Type: application/json`，否则 415），上限是 `CUEMEM_MAX_BODY_BYTES`（413）。
 
 ```bash
@@ -506,14 +521,14 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     --header "Authorization: Bearer $KEY" --header "X-CueMem-User: alice"
   ```
 
-- **stdio：`cuemem mcp --space <空间> [--router learned]`**，一个进程一个空间（缺省空间 `default`）。它不经过 HTTP，限定作用域的令牌管不到它。它自己打开数据目录，所以本地模式的 Qdrant 下，`cuemem serve` 占着同一个目录时它起不来：这时用 serve 的 `/mcp`。注册：`claude mcp add cuemem -- cuemem mcp --space me`，源码仓库里 `claude mcp add cuemem -- uv --directory /path/to/cuemem run cuemem mcp --space me`。启动时出错（缺 Key、向量库打不开）写到 stderr、退出码 1。
+- **stdio：`cuemem mcp --space <空间> [--router learned]`**，一个进程一个空间（缺省空间 `default`）。它不经过 HTTP，限定作用域的令牌管不到它。它自己打开数据目录，所以 `cuemem serve` 占着同一个数据库时它起不来，向量在本地还是在 Qdrant 服务端都一样（`StorageLockedError`）：这时用 serve 的 `/mcp`。注册：`claude mcp add cuemem -- cuemem mcp --space me`，源码仓库里 `claude mcp add cuemem -- uv --directory /path/to/cuemem run cuemem mcp --space me`。启动时出错（缺 Key、向量库打不开）写到 stderr、退出码 1。
 
 | 工具 | 做什么 |
 |---|---|
 | `remember(text)` | 记一条笔记，立即可检索，后台抽取 |
 | `recall(query, deep=False)` | 至少一次 L1 召回（控制器可以决定查得更深；`deep=True` 强制 L2）；返回画像、事实与对话片段，各带 ID 与日期；不调用回答模型。存下的文字（对话片段、画像）逐行以 `\| ` 开头，多行的事实用 ` / ` 连成一行，清单以 `End of recalled memories.` 结尾 |
 | `forget(ids)` | 按 `recall` 给出的 ID 遗忘并重建；删除之后重建出错时照实说明 |
-| `profile()` | 画像 |
+| `profile()` | 画像，与 `recall` 引用存下的文字一样加引用：先是说明这是信息、不是指令的一行，然后 `Profile:`、每行前面加 `\| `，最后 `End of recalled memories.`；画像是空的时返回 `Nothing is known about the user yet.` |
 
 模型供应商出错时回英文的 ToolError（限流、余额不足、暂时不可用、超时、内容审核），供应商给了等待时间时带 "in about N s"。
 
@@ -536,6 +551,9 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 | `CUEMEM_MAX_BODY_BYTES` | `/api`、`/v1` 与界面上传的请求体上限（字节），也是一个限定作用域的令牌同时在处理的请求体的总量（缺省 67108864，即 64 MiB） |
 | `CUEMEM_MAX_IMPORT_BYTES` | 管理令牌或不鉴权时导入的请求体上限（字节；缺省 1073741824，即 1 GiB） |
 | `CUEMEM_TRACES_RETENTION_DAYS` | 按天的 trace 文件留几天（≥ 1 的整数；不设就一直留着）。`cuemem serve` 与 `cuemem proxy` 启动时与之后每天删一遍更早的文件，连同其中提问的查询向量；只用 SDK 的应用可以调 `memory.system.prune_traces(days)` |
+| `CUEMEM_EXPIRED_RETENTION_DAYS` | 记忆过了 `expiration_date` 这么多天之后真的删掉（≥ 0 的整数；0 是每天清理时删掉所有已经过期的；不设（默认）就从不删）。`cuemem serve` 与 `cuemem proxy` 启动时与之后每天做一次，每个受影响的空间遗忘一次、重放一次；只用 SDK 的应用运行 `cuemem forget --expired` |
+| `CUEMEM_MAX_OPEN_SESSIONS` | 每个记忆空间进行中的对话会话、记忆代理的会话与 `/api/v1` 的 run 数，各算各的（正整数，默认 64；见上面的"每个空间进行中的会话数"） |
+| `CUEMEM_ALLOW_SHARED_DB` | `1`（或 `true`、`yes`）让几个进程打开同一个数据库：不加锁，风险自负（记一条警告）；见[一个数据库一个进程](#one-process-per-database) |
 | `CUEMEM_CONSOLIDATION__BACKGROUND_WORKERS` | 后台同时巩固几个空间（缺省 4；同一空间仍一次一个） |
 | `CUEMEM_VECTOR_STORE__URL` | 用 Qdrant 服务端代替本地模式（带 `http://` 或 `https://`） |
 | `CUEMEM_VECTOR_STORE__API_KEY` | Qdrant 服务端的 API Key（作为 `api-key` 请求头发出；服务端的 `QDRANT__SERVICE__API_KEY` 或 Qdrant Cloud 的 Key），`cuemem migrate-vectors` 也带上。空或不设表示没有 Key。只从环境变量或 `.env` 读，没有命令行参数。URL 是 `http://` 时 qdrant-client 每个客户端警告一次 "Api key is used with an insecure connection."：本机与 compose 的内部网络上无妨，远处的服务端与 Cloud 用 `https://`。`Memory(config={"vector_store": {"url": ..., "api_key": ...}})` 也认 |
@@ -554,16 +572,19 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 - 预设名写错或 `CUEMEM_*` 的值不合法时，任何命令都只打印一行"错误：配置有误：…"（字段、原因与收到的值，密钥类的值不回显）并以 1 退出，不再打印调用栈；`cuemem mcp` 写到 stderr。SDK 照旧抛 ValueError 或 pydantic 的 ValidationError。
 - 文件权限：命令行把 umask 收紧到至少 077（从不放宽），写的文件都是 0600、目录 0700；SDK 与 `MemorySystem.from_settings` 新建缺的数据目录时也是 0700。已经存在的目录一律不改。POSIX 上 `cuemem doctor` 还查数据目录、`.env` 与 `CUEMEM_API_KEYS_FILE` 的权限，别人能读时写出要运行的 `chmod 700` / `chmod 600`；`serve` 与 `proxy` 启动时提醒这两个密钥文件。`cuemem configure` 经一个 0600 的临时文件替换 `.env`（符号链接的 `.env` 链接留着；它所在的目录要可写）。
 - 用 Qdrant 服务端时 `cuemem doctor` 写 `向量库：<url>（API Key 已设/未设）`；`cuemem migrate-vectors` 给目标带上 `CUEMEM_VECTOR_STORE__API_KEY`。
-- `cuemem doctor` 还打印数据目录的剩余空间（少于 200 MiB 或没有写权限时标黄）。打不开 SQLite 数据库时（目录只读、磁盘满），自己打开它的命令（`ingest`、`import`、`export`、`consolidate`、`reindex`、`forget`、`ask`、`search-image`、`spaces`、`inspect` 与 `doctor --vectors`）只打印一行、写明数据目录，以 1 退出；`serve`、`proxy`、`chat`、`demo` 与 `mcp` 仍打印调用栈。
+- `cuemem doctor` 还打印数据目录的剩余空间（少于 200 MiB 或没有写权限时标黄）。打不开 SQLite 数据库时（目录只读、磁盘满），自己打开它的命令（`ingest`、`import`、`export`、`consolidate`、`reindex`、`forget`、`ask`、`search-image`、`spaces`、`inspect` 与 `doctor --vectors`）只打印一行、写明数据目录，以 1 退出；`serve`、`proxy`、`chat`、`demo` 与 `mcp` 也一样（`mcp` 打印到 stderr）：`<文件> 打不开（<错误>）：检查目录权限与磁盘空间`。SDK 抛 `cuemem.errors.DatabaseOpenError`，说明相同。
 - `cuemem doctor --repair-vectors`：本地向量库的 `data/qdrant/meta.json` 读不出、不在了而集合还在、或者某个集合的配置不合法时，按 `collection/<名字>/storage.sqlite` 重写它。先停掉 `cuemem serve` 或 `cuemem proxy`：别的进程拿着向量库时拒绝。稠密向量的维度从存着的点读（空的集合用 `embedding.dim` 或 `multimodal_embedding.dim`），原来的文件改名为 `meta.json.broken-<时间>`。不要手动删掉 `meta.json`：Qdrant 会写一个空的，已有的集合就再也找不到了。
 - `cuemem doctor --vectors`（要显式加）：逐个空间比较数据库里各种单元的个数与向量库里的点数，开了图片向量时再比较图片的行与图片的点。对不上的空间标黄并给出 `cuemem reindex --space S`，最后一行是 `cuemem reindex --all`；都对得上时打印 `向量库：N 个空间的点数与数据库一致`。本地向量库正被别的进程（serve）拿着时跳过这项并说明，doctor 的其余检查照常。
-- `cuemem reindex [--space S | --all] [--full]`：按数据库补齐向量库（不调用 LLM；向量缓存是热的时候也不发请求）：没有向量的单元与图片重新向量化，删掉数据库里已经没有的点；`--full` 把每个向量都重写一遍。`--space` 与 `--all` 必须给且只给一个（否则退出码 2），空间不存在时退出码 1。每个空间打印一行：补上了哪几种、各几个，删掉的多余的点，原图不在了的图片，事实表里找不到的事实单元。本地模式下要打开向量库，先停掉 serve。在 Python 里：`MemorySystem.reindex(space_id, *, only_missing=True)`（例如 `m.system.reindex(space)`）返回一个字典：每种补上的单元一个计数（`round`、`fact`、`summary`、`entity`、`image`、`image_iso`），`images`、`orphans`、`image_orphans`、`missing_files`，有时还有 `facts_missing`；在这个空间的 `reading()` 里调用时与遗忘一样抛 RuntimeError。
-- `cuemem export` 与 `cuemem spaces` 只打开 SQLite 数据库：`cuemem serve` 开着（它拿着本地向量库）、或者向量库打不开时照样能用。`cuemem export -o FILE` 先写同一目录下的临时文件、落盘后换名替换 FILE：导出失败（例如磁盘满）时旧的备份不动，只打印一行原因（退出码 1）；FILE 是符号链接时替换它指向的文件，`/dev/stdout`、FIFO 直接写。`cuemem import` 遇到截断的或不是 UTF-8 的文件时打印一行（`不是有效的 CueMem 导出文件`）并以 1 退出。`cuemem inspect facts --valid-at` 接受上面 `valid_at` 的写法，别的以 2 退出。
+- `cuemem reindex [--space S | --all] [--full]`：按数据库补齐向量库（不调用 LLM；向量缓存是热的时候也不发请求）：没有向量的单元与图片重新向量化，删掉数据库里已经没有的点；`--full` 把每个向量都重写一遍。`--space` 与 `--all` 必须给且只给一个（否则退出码 2），空间不存在时退出码 1。每个空间打印一行：补上了哪几种、各几个，删掉的多余的点，原图不在了的图片，事实表里找不到的事实单元。它要独占数据库，先停掉 serve（否则报 `StorageLockedError`）。它还删掉被杀掉的图片写入或遗忘留在 `media/` 里的原图，有的话打印 `媒体库：删掉 N 张没有提交的写入或遗忘留下的原图`。在 Python 里：`MemorySystem.reindex(space_id, *, only_missing=True)`（例如 `m.system.reindex(space)`）返回一个字典：每种补上的单元一个计数（`round`、`fact`、`summary`、`entity`、`image`、`image_iso`），`images`、`orphans`、`image_orphans`、`missing_files`，有时还有 `facts_missing`；在这个空间的 `reading()` 里调用时与遗忘一样抛 RuntimeError。
+- `cuemem export` 与 `cuemem spaces` 只打开 SQLite 数据库：`cuemem serve` 开着（它拿着本地向量库）、或者向量库打不开时照样能用。`cuemem export -o FILE` 先写同一目录下的临时文件、落盘后换名替换 FILE：导出失败（例如磁盘满）时旧的备份不动，只打印一行原因（退出码 1）；FILE 是符号链接时替换它指向的文件，`/dev/stdout`、FIFO 直接写。`cuemem import` 遇到截断的或不是 UTF-8 的文件时打印一行（`不是有效的 CueMem 导出文件`）并以 1 退出。`cuemem inspect facts --valid-at` 接受上面 `valid_at` 的写法，别的以 2 退出。`cuemem inspect facts` 给过期的事实标 `已过期`（`--hide-expired` 时不列），`cuemem ask` 不用过期的记忆，除非 `--show-expired`。
+- `cuemem forget --expired [--space S] [--older-than-days N] [--yes]` 删掉 `expiration_date` 过了 N 天以上（默认 0）的发言，连同由它们派生的，每个空间遗忘一次、重放一次，每个空间打印一行报告。不给 `--space` 时是所有空间；有 `--expired` 时不收 `--session`、`--turn`、`--fact` 与 `--dry-run`。没有 `--expired` 时仍要给 `--space`。
+- `cuemem doctor` 报出被杀掉而中断的图片写入或遗忘（`媒体库里有 N 个被中断的写入或遗忘……`），指向 `cuemem reindex --all`；`cuemem serve` 与 `cuemem proxy` 启动时与之后每小时收拾它们。它们的标记在 `media/.journal/` 里，没有进行中的操作时是空的。
+- <a id="one-process-per-database"></a>**一个数据库一个进程。** 记忆系统锁住数据库旁边的 `<数据库>.lock`（例如 `data/cuemem.sqlite.lock`，权限 0600；用的是 `flock`，NFS 上可能不起作用）。第二个打开同一个数据库的进程得到 `StorageLockedError`，写明拿着锁的进程的 pid 与命令，向量在 Qdrant 服务端时也一样：`serve`、`proxy`、stdio 的 `mcp`、`chat`、`demo`、`ingest`、`import`、`consolidate`、`reindex`、`forget`（包括 `--dry-run`）、`ask`、`search-image` 与 SDK 的 `Memory()`。只读数据库的命令在 serve 运行时照样能用：`export`、`spaces`、`inspect facts|entities|sources|profile`、`doctor`（用 Qdrant 服务端时 `--vectors` 也行；本地向量库被 serve 拿着时 `--vectors` 只打印一行"跳过"，不做它的检查）、`keys` 与 `usage`（例如 `docker compose exec cuemem cuemem inspect facts --space default`）；要提问，用 HTTP 接口（`/api/v1/answer`）或 `/mcp` 上的 MCP。通过 `MemoryClient` 或 HTTP 连到运行中的进程；或者设 `CUEMEM_ALLOW_SHARED_DB=1` 不加锁，风险自负（一个进程接手另一个进程进行中的 run、`reindex` 删掉另一个进程刚写的向量、发言序号相撞）。两个数据目录指向同一个 Qdrant 服务端与同一个空间时仍共用集合，锁管不到。
 - `cuemem keys add|list|revoke [--file PATH]`：管理 `CUEMEM_API_KEYS_FILE` 里限定作用域的令牌（见[鉴权与限定作用域的令牌](#鉴权与限定作用域的令牌)）。`keys add NAME --user U… [--agent A…] [--rate-per-minute N] [--models M…] [--max-output-tokens N] [--max-concurrent N]` 把新令牌只打印一次、单独一行打到标准输出；`keys list` 从不显示令牌与摘要。
-- 数据目录自动升级；不支持降级。D-073 起数据库里还可能有表 `add_keys`（幂等的记录），自动建，不改数据格式的版本；旧的 v7 CueMem 不管它。更新的 CueMem 写的库以 ConfigMismatchError 拒绝打开、原样不动：要换回旧版本，用新版本导出（`cuemem export`）再导入。
+- 数据目录自动升级；不支持降级。D-073 起数据库里还可能有表 `add_keys`（幂等的记录），自动建，不改数据格式的版本；旧的 v7 CueMem 不管它。D-074 起打开时还建索引 `idx_facts_session` 与 `idx_add_keys_created`，同样不改数据格式的版本。更新的 CueMem 写的库以 ConfigMismatchError 拒绝打开、原样不动：要换回旧版本，用新版本导出（`cuemem export`）再导入。
 
 ### 备份与恢复
 
-- **要留的**（在数据目录里，源码仓库里是 `data/`）：`cuemem.sqlite` 连同它的 `-wal` 与 `-shm`（原始日志与派生记忆）、`ledger.sqlite`、`media/`（原图）与 `qdrant/`（或 Qdrant 服务端的存储）；`claude_memory.sqlite` 连同它的 `-wal` 与 `-shm`（只在用了 Claude memory tool 的集成时有：Claude 写的 `/memories` 文件；它不在 `cuemem export` 里，也不能从日志重建）；`cache/` 可留可不留（能重建，但要花请求）。恢复用不着 `runs/`。
+- **要留的**（在数据目录里，源码仓库里是 `data/`）：`cuemem.sqlite` 连同它的 `-wal` 与 `-shm`（原始日志与派生记忆）、`ledger.sqlite`、`media/`（原图）与 `qdrant/`（或 Qdrant 服务端的存储）；`claude_memory.sqlite` 连同它的 `-wal` 与 `-shm`（只在用了 Claude memory tool 的集成时有：Claude 写的 `/memories` 文件；它不在 `cuemem export` 里，也不能从日志重建）；`cache/` 可留可不留（能重建，但要花请求）。恢复用不着 `runs/`、`media/.journal/` 与 `cuemem.sqlite.lock`。
 - **怎么备份**：停掉 `cuemem serve` 再复制整个数据目录，或者每个 SQLite 文件（`cuemem.sqlite`、`ledger.sqlite`，有的话还有 `claude_memory.sqlite`）用 `sqlite3 FILE ".backup DEST"`（或 Python 的 `sqlite3.Connection.backup`）。从不 `cp` 一个正在用、不带 `-wal` 的 `.sqlite`：用 WAL 时最近提交的还在 `-wal` 文件里。
 - **恢复**：停掉 `cuemem serve`，先放回 SQLite 文件，再放回 `media/`，`qdrant/` 可选；然后跑 `cuemem doctor --vectors` 与 `cuemem reindex --all`。放回 `.backup` 的副本之前，先删掉数据目录里留着的 `cuemem.sqlite-wal` / `-shm`、`ledger.sqlite-wal` / `-shm` 与 `claude_memory.sqlite-wal` / `-shm`：serve 崩溃时会留下，SQLite 会把那个不相干的 WAL 重放到放回的文件上。停机时复制的整个目录连同它自己的 `-wal` 与 `-shm` 一起放回。SQLite 与 Qdrant 不是同一时刻的备份、或者向量库丢了（检索什么都没有、`get_all` 仍列得出）时，都这样补。按空间的 `cuemem export` 是可以带走的另一种做法，它带着原始日志与原图，不带向量，也不带 Claude memory tool 的文件。

@@ -39,9 +39,11 @@
 遗忘在两个方向上都成立（D-021）：文件的某条笔记在别处被遗忘（Memory.delete、MCP 的 forget、
 转述追查）之后，这个文件从 /memories 里去掉——不知道被遗忘的信息在文件的哪几行，留着就泄露了；
 它其余的笔记仍在 CueMem 里，记录保留（facts.md 注明出自"已去掉"的文件），删除这个路径或
-clear_all_memory 照样能遗忘它们。整个记忆空间被删除（Memory.delete_all）之后，下次访问时这个
-空间的文件全部清掉；直接用本模块的 delete_all 则当场清掉。文件原文不在 Memory.export 里（导出
-的是原始日志，其中有每次改动的笔记）。
+clear_all_memory 照样能遗忘它们。默认位置（数据目录下）的存储由 Memory.delete_all、reset 与
+delete（以及 /api/v1 的删除）当场清理（第七轮体检，见 _claude_store.purge_space、prune_turns）：
+删除空间时这个空间的文件全部删掉，遗忘笔记时去掉它所在的文件；下次访问时的检查留着，管别的
+路径的存储（store=，只有本模块的 delete_all 当场清掉）与别的进程刚写进去的文件。文件原文不在
+Memory.export 里（导出的是原始日志，其中有每次改动的笔记）。
 
 几个工具实例（例如每个请求一个）可以共用一个存储文件：同一进程里同一个记忆空间的读改写串行；
 跨进程时保存前核对文件没有被别人改过，改过就撤销刚写的笔记并报错，让 Claude 重新查看。
@@ -59,12 +61,9 @@ level 为 "error"，这一轮只是不带记忆。
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import logging
-import os
 import re
-import sqlite3
 import threading
 import unicodedata
 import uuid
@@ -101,6 +100,7 @@ from cuemem.core.models import Fact, Turn
 from cuemem.core.timeutil import day
 from cuemem.core.trace import record_event
 from cuemem.evidence import inject_evidence, recall_evidence
+from cuemem.integrations._claude_store import STORE_NAME, _Conflict, _FileStore, _Note
 from cuemem.memory import RecallMode
 from cuemem.read.facts import fact_status
 from cuemem.sdk import AsyncMemory, Memory, space_for
@@ -121,7 +121,6 @@ ROOT = "/memories"
 PROFILE = f"{ROOT}/profile.md"
 FACTS = f"{ROOT}/facts.md"
 HISTORY = f"{ROOT}/history"
-STORE_NAME = "claude_memory.sqlite"  # 放在数据目录（paths.db 所在目录）下
 
 MAX_FILE_CHARS = 20_000  # 单个文件
 MAX_FILES = 200  # 每个记忆空间
@@ -173,15 +172,6 @@ REMOVED_NOTE = (
 )
 
 
-class _Note(NamedTuple):
-    """文件的一次改动写进 CueMem 原始日志的那条笔记。live=False：文件已经去掉，笔记还在。"""
-
-    path: str
-    session_id: str
-    turn_id: str
-    live: bool = True
-
-
 class _State(NamedTuple):
     """一个记忆空间里 Claude 的文件与出处（每个命令开始时读一次）。"""
 
@@ -189,192 +179,6 @@ class _State(NamedTuple):
     notes: list[_Note]  # 现有文件的笔记
     orphans: list[_Note]  # 已经去掉的文件留下的笔记
     turns: dict[str, Turn]  # 笔记在原始日志里的那一条
-
-
-class _Conflict(Exception):
-    """保存时发现文件已经被别的进程改过。"""
-
-
-# ---------- 旁边的文件存储 ----------
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS files (
-    space_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (space_id, path)
-);
-CREATE TABLE IF NOT EXISTS notes (
-    space_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    turn_id TEXT NOT NULL,
-    command TEXT NOT NULL,
-    ts TEXT NOT NULL,
-    live INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (space_id, turn_id)
-);
-CREATE INDEX IF NOT EXISTS notes_by_path ON notes (space_id, path);
-CREATE TABLE IF NOT EXISTS spaces (
-    space_id TEXT PRIMARY KEY,
-    epoch TEXT NOT NULL
-);
-"""
-
-
-class _FileStore:
-    """Claude 写的文件原文，与每次改动写进原始日志的笔记（出处）。几个工具实例可以共用一个文件。
-
-    里面是用户的个人信息：文件只给本人读写（-wal、-shm 随数据库文件的权限），删除时覆写
-    （secure_delete），删完把 WAL 写回并截断，不在磁盘上留下被删的原文。"""
-
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():  # 先以 0600 建好空文件，SQLite 建 -wal、-shm 时沿用这个权限
-            with contextlib.suppress(FileExistsError):
-                os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-        for extra in (Path(f"{path}-wal"), Path(f"{path}-shm")):
-            try:
-                if extra.exists() and extra.stat().st_mode & 0o077:
-                    os.chmod(extra, 0o600)
-            except OSError:  # 别人的文件：改不了就算了
-                pass
-        self.path = path
-        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
-        self._lock = threading.Lock()
-        self._conn.execute("PRAGMA secure_delete=ON")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(_SCHEMA)
-        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(notes)")}
-        if "live" not in columns:  # 早期版本的存储
-            self._conn.execute("ALTER TABLE notes ADD COLUMN live INTEGER NOT NULL DEFAULT 1")
-            self._conn.commit()
-
-    def files(self, space: str) -> dict[str, str]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT path, content FROM files WHERE space_id = ? ORDER BY path", (space,)
-            ).fetchall()
-        return {path: content for path, content in rows}
-
-    def notes(self, space: str) -> list[_Note]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT path, session_id, turn_id, live FROM notes WHERE space_id = ? "
-                "ORDER BY ts, turn_id",
-                (space,),
-            ).fetchall()
-        return [_Note(path, session, turn, bool(live)) for path, session, turn, live in rows]
-
-    def save(
-        self,
-        space: str,
-        path: str,
-        content: str,
-        note: _Note | None,
-        command: str,
-        expected: str | None,
-    ) -> None:
-        """存原文与出处。expected 是读到的原文（None：读的时候还没有这个文件）；文件在此期间
-        被别的进程改过时抛出 _Conflict，什么都不写。"""
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._lock, self._conn:
-            if expected is None:
-                cursor = self._conn.execute(
-                    "INSERT INTO files (space_id, path, content, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT (space_id, path) DO NOTHING",
-                    (space, path, content, now, now),
-                )
-            else:
-                cursor = self._conn.execute(
-                    "UPDATE files SET content = ?, updated_at = ? "
-                    "WHERE space_id = ? AND path = ? AND content = ?",
-                    (content, now, space, path, expected),
-                )
-            if cursor.rowcount != 1:
-                raise _Conflict(path)
-            if note is not None:
-                self._conn.execute(
-                    "INSERT INTO notes (space_id, path, session_id, turn_id, command, ts, live) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 1)",
-                    (space, path, note.session_id, note.turn_id, command, now),
-                )
-
-    def prune(self, space: str, paths: Sequence[str], dead_turns: Sequence[str]) -> None:
-        """笔记在别处被遗忘了：去掉这些文件（它们其余的笔记留作记录），删掉死了的笔记。"""
-        with self._lock, self._conn:
-            for path in paths:
-                self._conn.execute(
-                    "DELETE FROM files WHERE space_id = ? AND path = ?", (space, path)
-                )
-                self._conn.execute(
-                    "UPDATE notes SET live = 0 WHERE space_id = ? AND path = ? AND live = 1",
-                    (space, path),
-                )
-            for turn in dead_turns:
-                self._conn.execute(
-                    "DELETE FROM notes WHERE space_id = ? AND turn_id = ?", (space, turn)
-                )
-        self._checkpoint()
-
-    def remove(self, space: str, paths: Sequence[str]) -> None:
-        """删除这些路径的文件与全部笔记（包括已经去掉的文件留下的）。"""
-        with self._lock, self._conn:
-            for path in paths:
-                self._conn.execute(
-                    "DELETE FROM files WHERE space_id = ? AND path = ?", (space, path)
-                )
-                self._conn.execute(
-                    "DELETE FROM notes WHERE space_id = ? AND path = ?", (space, path)
-                )
-        self._checkpoint()
-
-    def purge(self, space: str) -> int:
-        """删掉这个记忆空间的一切，返回删掉的文件数。"""
-        with self._lock, self._conn:
-            removed = self._conn.execute("DELETE FROM files WHERE space_id = ?", (space,)).rowcount
-            self._conn.execute("DELETE FROM notes WHERE space_id = ?", (space,))
-            self._conn.execute("DELETE FROM spaces WHERE space_id = ?", (space,))
-        self._checkpoint()
-        return int(removed)
-
-    def move(self, space: str, moves: Mapping[str, str]) -> None:
-        """改名：文件与它的笔记一起搬（目标路径事先确认过都不存在）；已经去掉的文件的笔记不动。"""
-        with self._lock, self._conn:
-            for old, new in moves.items():
-                self._conn.execute(
-                    "UPDATE files SET path = ? WHERE space_id = ? AND path = ?", (new, space, old)
-                )
-                self._conn.execute(
-                    "UPDATE notes SET path = ? WHERE space_id = ? AND path = ? AND live = 1",
-                    (new, space, old),
-                )
-        self._checkpoint()
-
-    def epoch(self, space: str) -> str | None:
-        """第一次写入时 CueMem 里这个记忆空间的建立时间：之后对不上就是空间被删过。"""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT epoch FROM spaces WHERE space_id = ?", (space,)
-            ).fetchone()
-        return None if row is None else str(row[0])
-
-    def set_epoch(self, space: str, epoch: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO spaces (space_id, epoch) VALUES (?, ?)", (space, epoch)
-            )
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
-    def _checkpoint(self) -> None:
-        """把 WAL 写回数据库并截断：被删的原文不留在 WAL 里。"""
-        with self._lock:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
 class _SpaceLock:
@@ -913,21 +717,29 @@ def delete_all(
     store: str | Path | None = None,
 ) -> dict[str, Any]:
     """Memory.delete_all 加上 Claude 的文件：这个用户（或 Agent）的全部记忆，以及记忆工具
-    存的文件原文，当场删除（被遗忘权）。只调用 Memory.delete_all 的话，文件在下次访问时才清掉。
+    存的文件原文，当场删除（被遗忘权），返回里多一个 memory_files_deleted（删掉的文件数）。
+    默认位置的存储 Memory.delete_all 自己就删（第七轮体检），这里先数好文件数再调用它；
+    store= 给了别的路径时只有这里（或下次访问时）删得到。
     异步代码里放进线程执行：await asyncio.to_thread(delete_all, memory.sync, user_id=...)。"""
     space = _space(user_id, agent_id)
     memory = _sync(memory)  # MemoryClient 先报错：不能删了服务端的记忆、留下本机的文件
-    out = memory.delete_all(user_id=user_id, agent_id=agent_id)
     path = _store_path(memory, store)
-    if not path.exists():  # 从没用过记忆工具：不为了删除建一个空的存储
-        out["memory_files_deleted"] = 0
-        return out
-    files = _FileStore(path)
-    try:
-        with _space_lock(files.path, space).lock:
-            out["memory_files_deleted"] = files.purge(space)
-    finally:
-        files.close()
+    count = 0
+    if path.exists():  # 从没用过记忆工具：不为了删除建一个空的存储
+        files = _FileStore(path)
+        try:
+            count = len(files.files(space))
+        finally:
+            files.close()
+    out = memory.delete_all(user_id=user_id, agent_id=agent_id)
+    if path.exists():  # 别的路径的存储；默认位置的已经删了，再删一遍什么都不做
+        files = _FileStore(path)
+        try:
+            with _space_lock(files.path, space).lock:
+                files.purge(space)
+        finally:
+            files.close()
+    out["memory_files_deleted"] = count
     return out
 
 

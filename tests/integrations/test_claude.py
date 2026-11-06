@@ -3,6 +3,7 @@ tool_runner 用 SDK 自己的客户端配上模拟的传输层，CueMem 用脚�
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -20,11 +21,15 @@ anthropic = pytest.importorskip("anthropic")
 
 import httpx2  # noqa: E402
 from anthropic.lib.tools import ToolError  # noqa: E402
-from fakes import FakeAPI  # noqa: E402
+from fakes import PROJECT_ROOT, FakeAPI  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 from scripted import ScriptedModel  # noqa: E402
 from test_sdk import without_balance_for_reconciling  # noqa: E402
 
 from cuemem import AsyncMemory, Memory, MemoryClient  # noqa: E402
+from cuemem.api.auth import Keys, guard  # noqa: E402
+from cuemem.api.memories import install_error_format, memories_router  # noqa: E402
 from cuemem.config import Settings  # noqa: E402
 from cuemem.evidence import MEMORY_NOTE  # noqa: E402
 from cuemem.integrations.claude import (  # noqa: E402
@@ -947,8 +952,8 @@ def test_notes_of_a_file_removed_elsewhere_can_still_be_forgotten(
 
 
 def test_deleting_the_user_also_deletes_the_files(memory: Memory) -> None:
-    """Memory.delete_all 之后，文件下次访问时清掉（包括没写过笔记的空文件）；
-    本模块的 delete_all 当场清掉。"""
+    """Memory.delete_all 当场删掉这个空间的文件（包括没写过笔记的空文件，第七轮体检；以前要等
+    下次访问时才清掉）；本模块的 delete_all 同样当场清掉，并数出删掉了几个。"""
     with CueMemMemoryTool(memory, user_id="alice", wait=True) as tool:
         run(tool, command="create", path="/memories/me.md", file_text="- The user likes jazz.\n")
         run(tool, command="create", path="/memories/todo.md", file_text="")
@@ -971,6 +976,97 @@ def test_deleting_the_user_also_deletes_the_files(memory: Memory) -> None:
     assert out["message"] == "All memories deleted" and out["memory_files_deleted"] == 1
     with sqlite3.connect(store) as conn:
         assert conn.execute("SELECT path, content FROM files").fetchall() == []
+
+
+CANARY = "ZQXclaudefilesecret"
+
+
+def canary_left(store: Path) -> bool:
+    """存储与它的 -wal、-shm 里还有没有这段原文（按字节找，不打开存储）。"""
+    paths = [store, Path(f"{store}-wal"), Path(f"{store}-shm")]
+    return any(CANARY.encode() in p.read_bytes() for p in paths if p.exists())
+
+
+def _v1(memory: Memory) -> TestClient:
+    app = FastAPI()
+    app.include_router(memories_router(memory, dependencies=guard(Keys())))
+    install_error_format(app)
+    return TestClient(app)
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "reset",
+        "delete_all",
+        "delete_fact",
+        "delete_many",
+        "v1_delete_all",
+        "v1_delete_fact",
+        "v1_batch_delete",
+    ],
+)
+def test_deleting_through_cuemem_removes_the_file_text_at_once(memory: Memory, how: str) -> None:
+    """第七轮体检：reset、delete_all、delete（事实）与 /api/v1 的 DELETE 当场删掉记忆工具存的
+    文件原文。以前只有本模块的 delete_all 或工具下次打开这个空间时才删，不再打开就一直在
+    claude_memory.sqlite 里。按字节扫存储与它的 WAL，不打开工具。"""
+    with CueMemMemoryTool(memory, user_id="alice", wait=True) as tool:
+        run(tool, command="create", path="/memories/notes.md", file_text=f"- I like {CANARY}\n")
+        store = tool.store.path
+    with CueMemMemoryTool(memory, user_id="bob", wait=True) as tool:  # 别人的文件不动
+        run(tool, command="create", path="/memories/bob.md", file_text="- I like tea\n")
+    assert canary_left(store)
+    (fact,) = memory.get_all(user_id="alice")["results"]
+    if how == "reset":
+        memory.reset()
+    elif how == "delete_all":
+        memory.delete_all(user_id="alice")
+    elif how == "delete_fact":
+        assert memory.delete(fact["id"])["message"] == "Memory deleted"
+    elif how == "delete_many":  # 预演什么都不删，文件原文也还在
+        assert memory.delete_many([fact["id"]], dry_run=True)["deleted"] == [fact["id"]]
+        assert canary_left(store)
+        assert memory.delete_many([fact["id"]])["deleted"] == [fact["id"]]
+    elif how == "v1_batch_delete":
+        with _v1(memory) as http:
+            body = {"memory_ids": [fact["id"]]}
+            assert http.post("/api/v1/memories/batch-delete", json=body).status_code == 200
+    else:
+        with _v1(memory) as http:
+            url = "/api/v1/memories" + ("?user_id=alice" if how == "v1_delete_all" else "")
+            url += f"/{fact['id']}" if how == "v1_delete_fact" else ""
+            assert http.delete(url).status_code == 200
+    assert not canary_left(store)
+    with sqlite3.connect(store) as conn:
+        left = conn.execute("SELECT space_id, path FROM files ORDER BY space_id").fetchall()
+    assert left == ([] if how == "reset" else [("bob", "/memories/bob.md")])
+
+
+def test_deleting_never_creates_the_file_store(memory: Memory) -> None:
+    """没用过记忆工具时，遗忘与删除空间不为了清理建一个空的 claude_memory.sqlite。"""
+    store = memory.settings.paths.db.parent / "claude_memory.sqlite"
+    memory.add("I live in Rome", user_id="alice", wait=True)
+    (fact,) = memory.get_all(user_id="alice")["results"]
+    memory.delete(fact["id"])
+    memory.add("I live in Oslo", user_id="alice", wait=True)
+    memory.delete_all(user_id="alice")
+    memory.reset()
+    assert not store.exists()
+
+
+def test_a_tool_opened_before_delete_all_starts_empty(memory: Memory) -> None:
+    """工具在 delete_all 之前打开、之后接着用：/memories 里只有生成的文件，照常写新文件。"""
+    with CueMemMemoryTool(memory, user_id="alice", wait=True) as tool:
+        run(tool, command="create", path="/memories/notes.md", file_text=f"- I like {CANARY}\n")
+        memory.delete_all(user_id="alice")
+        assert listed(run(tool, command="view", path="/memories")) == [
+            "/memories/facts.md",
+            "/memories/history/",
+            "/memories/profile.md",
+        ]
+        run(tool, command="create", path="/memories/new.md", file_text="- I like tea\n")
+        assert set(tool.store.files("alice")) == {"/memories/new.md"}
+        assert facts(memory) == {"I like tea": facts(memory)["I like tea"]}
 
 
 def test_the_file_store_is_private_and_leaves_nothing_behind(
@@ -1168,3 +1264,20 @@ def test_a_remote_client_is_refused_up_front(tmp_path: Path) -> None:
             with pytest.raises(TypeError, match="needs a local Memory or AsyncMemory"):
                 make()
     assert not store.exists()
+
+
+def test_the_example_sends_the_whole_history() -> None:
+    """第七轮体检 P15：示例的 tool_runner 传 thread=False。anthropic 2.3 起默认在服务端的线程上
+    跑，带证据块的消息留在供应商那边，CueMem 的 forget / delete_all 管不到（D-073 留到以后的第 7
+    项）。"""
+    source = (PROJECT_ROOT / "examples" / "integrations" / "claude_example.py").read_text()
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "tool_runner"
+    ]
+    assert len(calls) == 1
+    thread = {k.arg: k.value for k in calls[0].keywords}.get("thread")
+    assert isinstance(thread, ast.Constant) and thread.value is False

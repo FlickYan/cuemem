@@ -118,7 +118,8 @@ class MemoryClient:
     ) -> dict[str, Any]:
         """写入对话（见 Memory.add）。内容块里的本地图片先读成 data URL。idempotency_key 作为
         Idempotency-Key 头发送（不给时不发，请求与以前相同）：超时或连接断开（MemoryAPIError 的
-        code 为 timeout、disconnected）之后用同一个键原样重发，服务端只写一次。"""
+        code 为 timeout、disconnected）之后用同一个键原样重发，服务端只写一次；wait=True 的
+        重发等那次的抽取做完再返回 duplicate（第七轮体检）。"""
         body = {
             "messages": _inline_images(messages),
             "user_id": user_id,
@@ -237,7 +238,7 @@ class MemoryClient:
         run_id: str | None = None,
         limit: int | None = None,
         mode: SearchMode = "auto",
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         router: Router = "learned",
         lam: float | None = None,
         filters: Mapping[str, Any] | None = None,
@@ -271,7 +272,7 @@ class MemoryClient:
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         mode: SearchMode = "auto",
         router: Router = "learned",
         lam: float | None = None,
@@ -299,7 +300,7 @@ class MemoryClient:
         user_id: str | None = None,
         agent_id: str | None = None,
         mode: AnswerMode = "auto",
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         router: Router = "learned",
         lam: float | None = None,
     ) -> dict[str, Any]:
@@ -322,7 +323,7 @@ class MemoryClient:
         run_id: str | None = None,
         include_superseded: bool = False,
         valid_at: str | date | None = None,
-        known_at: datetime | None = None,
+        known_at: datetime | date | str | None = None,
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
@@ -371,10 +372,38 @@ class MemoryClient:
         params = {"dry_run": dry_run}
         return self._call("DELETE", f"/memories/{_id(memory_id)}", params=params)
 
+    def delete_many(self, memory_ids: Sequence[str], *, dry_run: bool = False) -> dict[str, Any]:
+        """一次遗忘好几条记忆（见 Memory.delete_many）：POST /api/v1/memories/batch-delete，算一次
+        写入。单个字符串在发送之前 TypeError，与本地相同；去重与上限由服务端检查。"""
+        if isinstance(memory_ids, str | bytes) or not isinstance(memory_ids, Sequence):
+            raise TypeError("memory_ids must be a list of memory ids, not a single id.")
+        body = {"memory_ids": list(memory_ids), "dry_run": dry_run}
+        return self._call("POST", "/memories/batch-delete", body=body)
+
+    def batch_delete(self, memories: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Mem0 的写法：memories=[{"memory_id": ...}, ...]，与 delete_many 相同（见
+        Memory.batch_delete）。"""
+        if isinstance(memories, str | Mapping):
+            raise TypeError('memories must be a list of {"memory_id": ...} objects.')
+        ids: list[str] = []
+        for item in memories:
+            if not isinstance(item, Mapping) or "memory_id" not in item:
+                raise ValueError('Each item of memories must be an object with "memory_id".')
+            ids.append(item["memory_id"])
+        return self.delete_many(ids)
+
     def delete_all(
-        self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
-        params = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
+        """见 Memory.delete_all。dry_run 只在为 True 时发送：不预演的请求与以前逐字相同。"""
+        params: dict[str, Any] = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
+        if dry_run:
+            params["dry_run"] = True
         return self._call("DELETE", "/memories", params=params)
 
     def reset(self) -> dict[str, Any]:
@@ -503,7 +532,8 @@ class MemoryClient:
 
 class AsyncMemoryClient(AsyncMethods):
     """MemoryClient 的异步版本（与 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
-    （cuemem/_async.py）。self.sync 是包着的 MemoryClient；别的属性（.base_url）取它的。"""
+    （cuemem/_async.py）。self.sync 是包着的 MemoryClient；别的属性（.base_url）取它的。
+    取消一次调用停不下已经发出的请求，见 AsyncMethods。"""
 
     sync: MemoryClient
 

@@ -7,10 +7,11 @@
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
-from collections.abc import Callable, Sequence
+from bisect import bisect_right
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,11 +21,12 @@ import httpx2
 
 from cuemem.agent import Agent, ChatSession, Persona, Reply
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
+from cuemem.api.limits import MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import sortable_session_id, stable_id
-from cuemem.core.models import SessionIn, TurnIn
+from cuemem.core.models import Entity, SessionIn, TurnIn
 from cuemem.core.types import RecallMode, Router, Scenario
-from cuemem.errors import CueMemError
+from cuemem.errors import CueMemError, SessionLimitError
 from cuemem.evidence import fact_state, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem
 
@@ -45,7 +47,9 @@ class SessionInfo:
 class ChatService:
     """clock：会话最后一次活动的时间用的时钟（close_idle 据此判断闲置，测试里可以换）。
     idle_minutes：会话闲置多久由 HTTP 应用的清理线程结束（create_app 设置；None 是不结束），
-    只用于说明。"""
+    只用于说明。
+    max_open_sessions：一个记忆空间同时进行中的会话数的上限（见 start）；不给时读环境变量
+    CUEMEM_MAX_OPEN_SESSIONS（默认 64）。"""
 
     def __init__(
         self,
@@ -55,7 +59,11 @@ class ChatService:
         catalog: Catalog | None = None,
         default_space: str = "default",
         clock: Callable[[], float] = time.monotonic,
+        max_open_sessions: int | None = None,
     ) -> None:
+        self.max_open_sessions = (
+            max_open_sessions if max_open_sessions is not None else open_session_limit()
+        )
         self.system = system
         self.agent = agent
         self.catalog = catalog
@@ -65,6 +73,7 @@ class ChatService:
         self._clock = clock
         self._seen: dict[str, float] = {}  # 会话 → 最后一次活动（开始、发消息）的时刻
         self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间（见 start）
+        self._starting: Counter[str] = Counter()  # 空间 → 正在开（还没登记）的会话数
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的巩固在后台完成
 
@@ -87,6 +96,7 @@ class ChatService:
                 "pip 安装的包里没有。改用通用助手（cuemem serve --scenario plain，"
                 '代码里 scenario="plain"），或用 catalog_path 指定商品目录'
             )
+        limit = open_session_limit()  # 写错时在打开记忆系统之前报错
         system = MemorySystem.from_settings(settings, http_client=http_client)
         catalog = None
         persona: Persona | None = None
@@ -98,7 +108,9 @@ class ChatService:
             persona = SHOP_PERSONA
             tools = shop_tools(catalog)
         agent = Agent(system, persona=persona, tools=tools, router=router, lam=lam)
-        return cls(system, agent, catalog=catalog, default_space=default_space)
+        return cls(
+            system, agent, catalog=catalog, default_space=default_space, max_open_sessions=limit
+        )
 
     # ---------- 会话 ----------
 
@@ -109,17 +121,52 @@ class ChatService:
         at: datetime | None = None,
         session_id: str | None = None,
     ) -> ChatSession:
+        """开始一个会话。这个空间进行中的会话已经有 max_open_sessions 个时，先结束其中最久没有
+        活动、一句话都没说过的那个（只去掉它的进行中标记，不抽取）；都说过话时 SessionLimitError
+        （HTTP 429），不结束别人的对话（那会让它提前、付费地抽取）。以前不限：一个令牌可以一直开
+        会话，每个都占着内存与一个进行中的标记，直到闲置 30 分钟才结束。"""
         space = space_id or self.default_space
         with self._lock:
+            idle = self._make_room(space)
             first = space not in self._adopted
             self._adopted.add(space)
-        if first:  # 之前的进程崩溃时还在进行中的会话交给抽取；接着写的那个会话除外
-            self.system.adopt_open(space, keep=[session_id] if session_id else [])
-        session = self.agent.start(space, at=at, session_id=session_id)
+            self._starting[space] += 1
+        try:
+            if idle is not None:
+                try:
+                    self.agent.end(idle)  # 没说过话：只去掉进行中的标记
+                except Exception:
+                    logger.warning("会话 %s 没能结束", idle.session_id, exc_info=True)
+            if first:  # 之前的进程崩溃时还在进行中的会话交给抽取；接着写的那个会话除外
+                self.system.adopt_open(space, keep=[session_id] if session_id else [])
+            session = self.agent.start(space, at=at, session_id=session_id)
+        finally:
+            with self._lock:
+                self._starting[space] -= 1
+                if not self._starting[space]:
+                    del self._starting[space]
         with self._lock:
             self.sessions[session.session_id] = session
             self._seen[session.session_id] = self._clock()
         return session
+
+    def _make_room(self, space: str) -> ChatSession | None:
+        """start 的上限（调用方持有 self._lock）：没到上限时 None；到了时取走最久没有活动、没说过
+        话、也没在回答的会话（调用方结束它），没有这样的会话时 SessionLimitError。"""
+        mine = [s for s in self.sessions.values() if s.space_id == space]
+        if len(mine) + self._starting[space] < self.max_open_sessions:
+            return None
+        empty = [s for s in mine if s.next_idx == 0 and not s.lock.locked()]
+        if not empty:
+            raise SessionLimitError(
+                f"记忆空间 {space} 已经有 {len(mine) + self._starting[space]} 个进行中的会话"
+                f"（上限 {self.max_open_sessions}，环境变量 {MAX_OPEN_SESSIONS_ENV}）：先结束"
+                "一个会话，或等闲置的会话被清理之后再开"
+            )
+        oldest = min(empty, key=lambda s: self._seen.get(s.session_id, 0.0))
+        self.sessions.pop(oldest.session_id)
+        self._seen.pop(oldest.session_id, None)
+        return oldest
 
     def get(self, session_id: str) -> ChatSession:
         with self._lock:
@@ -255,12 +302,21 @@ class ChatService:
         core = self.system.visible_core(space_id, self.system.core_memory(space_id), datetime.now())
         return core.text if core is not None else ""
 
-    def facts(self, space_id: str, *, current_only: bool = False) -> list[dict[str, Any]]:
+    def facts(
+        self, space_id: str, *, current_only: bool = False, show_expired: bool = False
+    ) -> list[dict[str, Any]]:
+        """事实时间线。已经过期的事实（SDK 的 expiration_date，规则见 expiry.py）默认不列出，
+        同画像与检索；show_expired=True 时也列出，各行的 expired 标着（遗忘的候选要用它：过期的
+        事实在删除之前还在日志里）。"""
         facts = self.system.facts(space_id)
+        gone = self.system.expired_ids(space_id, datetime.now())
         by_id = {f.id: f for f in facts}
         rows = []
         for fact in sorted(facts, key=lambda f: (f.recorded_at, f.id)):
             if current_only and not fact.is_current:
+                continue
+            expired = fact.id in gone
+            if expired and not show_expired:
                 continue
             rows.append(
                 {
@@ -280,6 +336,7 @@ class ChatService:
                     ),
                     "session_id": fact.session_id,
                     "importance": fact.importance,
+                    "expired": expired,
                 }
             )
         return rows
@@ -297,30 +354,20 @@ class ChatService:
             for e in self.system.entities(space_id)
         ]
 
-    def graph(self, space_id: str) -> dict[str, Any]:
+    def graph(self, space_id: str, *, show_expired: bool = False) -> dict[str, Any]:
         """实体图：实体为点；当前有效的事实把主语和它提到的其他实体连起来（宾语，或陈述里
-        出现了名字或别名的实体），边上写谓词。"""
+        出现了名字或别名的实体），边上写谓词。已经过期的事实不算（show_expired=True 时也算）。"""
         entities = {e.id: e for e in self.system.entities(space_id)}
-        names = {
-            eid: [n.lower() for n in [e.name, *e.aliases] if len(n) >= 3]
-            for eid, e in entities.items()
-        }
+        mentions = _Mentions(entities.values())
+        gone = frozenset() if show_expired else self.system.expired_ids(space_id, datetime.now())
         edges = []
         degree: dict[str, int] = {}
         seen: set[tuple[str, str]] = set()
         for fact in self.system.facts(space_id, current_only=True):
-            if fact.subject_id not in entities:
+            if fact.subject_id not in entities or fact.id in gone:
                 continue
             degree[fact.subject_id] = degree.get(fact.subject_id, 0) + 1
-            text = f"{fact.statement} {fact.object}".lower()
-            # 先按子串筛：每个名字一个正则，名字多过 re 的缓存后每条事实都要全部重新编译
-            linked = set(fact.entity_ids) | {
-                eid
-                for eid, aliases in names.items()
-                if any(
-                    a in text and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text) for a in aliases
-                )
-            }
+            linked = set(fact.entity_ids) | mentions.find(f"{fact.statement} {fact.object}")
             for other in sorted(linked - {fact.subject_id}):
                 pair = (min(fact.subject_id, other), max(fact.subject_id, other))
                 if other in entities and pair not in seen:  # 每对实体只画一条边
@@ -337,7 +384,10 @@ class ChatService:
         ]  # fmt: skip
         return {"nodes": nodes, "edges": edges}
 
-    def media(self, space_id: str) -> list[dict[str, Any]]:
+    def media(self, space_id: str, *, show_expired: bool = False) -> list[dict[str, Any]]:
+        """图片（界面的图库）。出自已经过期的发言的图片默认不列出，show_expired=True 时也列出、
+        各行的 expired 标着。"""
+        gone = self.system.expired_ids(space_id, datetime.now())
         return [
             {
                 "id": m.id,
@@ -345,15 +395,15 @@ class ChatService:
                 "caption": m.caption,
                 "ts": m.ts.isoformat(),
                 "turn_id": m.source_turn_id,
+                "expired": m.id in gone,
             }
             for m in sorted(self.system.db.get_media(space_id), key=lambda m: m.ts)
+            if show_expired or m.id not in gone
         ]
 
     def session_list(self, space_id: str) -> list[SessionInfo]:
         started = self.system.db.get_sessions(space_id)
-        counts: dict[str, int] = {}
-        for turn in self.system.db.get_turns(space_id):
-            counts[turn.session_id] = counts.get(turn.session_id, 0) + 1
+        counts = self.system.db.session_turn_counts(space_id)  # 只数，不解出每句发言
         live = {s.session_id for s in self.open_sessions(space_id)}
         return [
             SessionInfo(space_id, sid, at, sid in live, counts.get(sid, 0))
@@ -410,6 +460,39 @@ class ChatService:
             if not session.closed:
                 self.agent.end(session)  # 登记巩固任务；进程退出后下次巩固时完成
         self.system.close()
+
+
+class _Mentions:
+    """实体图找陈述里出现了哪些实体的名字或别名（三个字及以上，不分大小写，前后不是单词字符，
+    即正则的 (?<!\\w)别名(?!\\w)）。以前每条事实把每个实体的每个别名都试一遍，实体数 × 事实数：
+    5000 个实体、1 万条事实要 19 秒，界面每次刷新都算。现在把别名放进字典，每条事实只在单词边界
+    之间、不长于最长别名的片段里查，结果与原来的正则逐条相同（包括两头是标点的别名、中文名字在
+    不分词的中文里照旧找不到）。"""
+
+    def __init__(self, entities: Iterable[Entity]) -> None:
+        self.index: dict[str, set[str]] = {}
+        for e in entities:
+            for name in [e.name, *e.aliases]:
+                if len(name) >= 3:
+                    self.index.setdefault(name.lower(), set()).add(e.id)
+        self.longest = max(map(len, self.index), default=0)
+
+    def find(self, text: str) -> set[str]:
+        text = text.lower()
+        if not self.index:
+            return set()
+        word = [c.isalnum() or c == "_" for c in text]  # 与 re 的 Unicode \w 相同
+        n = len(text)
+        ends = [q for q in range(1, n + 1) if q == n or not word[q]]
+        found: set[str] = set()
+        for p in range(n):
+            if p and word[p - 1]:
+                continue
+            for q in ends[bisect_right(ends, p) :]:
+                if q - p > self.longest:
+                    break
+                found |= self.index.get(text[p:q], set())
+        return found
 
 
 def _display(name: str, aliases: list[str]) -> str:
