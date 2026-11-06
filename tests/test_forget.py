@@ -1629,3 +1629,17 @@ def test_forget_one_session_reads_only_that_session(
         assert not [c for c in turns if c == (None, None, None)]
         left = {t.session_id for t in m.system.db.get_turns(space_for("u", None))}
         assert len(left) == 199 and "r100" not in left
+
+
+def test_forget_removes_traces_of_answers_built_from_the_profile(system: MemorySystem) -> None:
+    """控制器选了 L0（或指定 mode="l0"）时回答只看画像：回答转述画像里的一行，trace 里既没有
+    原话也没有 ID。以前遗忘这条事实删不掉这条 trace（第七轮体检 P4）；现在检索记下画像出自
+    哪些事实（profile 事件），遗忘按 ID 删掉它。"""
+    core = system.core_memory("demo")
+    assert core is not None and core.fact_ids
+    fact = system.db.get_facts("demo", ids=[core.fact_ids[0]])[0]
+    system.ask("demo", "zzqq paraphrase question", mode="l0")
+    assert "zzqq" in _traces(system)
+    report = system.forget("demo", turn_ids=fact.source_turn_ids)
+    assert report.traces_removed >= 1
+    assert "zzqq" not in _traces(system)

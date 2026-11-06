@@ -338,6 +338,8 @@ class Agent:
                     hide_expired=True,
                 )
             timings["recall"] = _ms(started)
+            if session.profile:  # 模型看到的是会话里的画像快照（重新同步前可能与现在的不同）
+                record_event("profile", facts=[fid for _, fid, _ in session.profile])
             schemas = [t.schema() for t in self.tools.values()]
             ctx = build_context(
                 persona=self.persona.prompt(),

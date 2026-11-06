@@ -35,7 +35,13 @@ from cuemem.core.models import (
     TurnMeta,
 )
 from cuemem.core.timeutil import naive_local, valid_period
-from cuemem.core.trace import TraceSink, current_trace, start_trace, trace_queries
+from cuemem.core.trace import (
+    TraceSink,
+    current_trace,
+    record_event,
+    start_trace,
+    trace_queries,
+)
 from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
 from cuemem.embed.base import TextEmbedder
@@ -229,6 +235,15 @@ def _strings(value: Any) -> Iterator[str]:
 
 def _error_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:300]}"
+
+
+def _record_profile(core: CoreMemory | None) -> None:
+    """往当前 trace 记下交给模型的画像出自哪些事实（profile 事件）：回答常常只是转述画像里的
+    一行，trace 里没有原话也没有 ID，遗忘这条事实时就找不到它（第七轮体检 P4）。有了 ID，
+    _remove_traces 按 ID 删掉这些 trace。画像几乎每次都给，遗忘画像里的事实会删掉这个空间
+    几乎所有问答的 trace（宁可多删，同 D-046、D-051）。不在 trace 里时什么也不做。"""
+    if core is not None and core.fact_ids:
+        record_event("profile", facts=list(core.fact_ids))
 
 
 def _without_images(text: str) -> str:
@@ -1786,6 +1801,7 @@ class MemorySystem:
                 core = self.db.get_core_memory(space_id)
                 if gone:  # 画像与 memory_search 同样不给过期的记忆
                     core = self.visible_core(space_id, core, now)
+                _record_profile(core)
 
                 def search(query: str, cfg: L1Config) -> L1Result:
                     if not gone:
@@ -1822,6 +1838,8 @@ class MemorySystem:
                     current_only=validity == "current",
                     chain=validity == "full",
                 )
+                if profile:
+                    _record_profile(view.core)
                 answer = self.reader.answer_with_memory(
                     question,
                     view,
@@ -1904,7 +1922,9 @@ class MemorySystem:
                 cache_scope=cache_scope,
                 candidates=candidates,
             )
-            return self._without(space_id, recall, gone, now) if gone else recall
+            out = self._without(space_id, recall, gone, now) if gone else recall
+            _record_profile(out.view.core)  # 去掉过期的几行之后：记下的是交给模型的画像
+            return out
 
     def _retrieve(
         self,
