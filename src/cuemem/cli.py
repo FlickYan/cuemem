@@ -59,7 +59,12 @@ from cuemem.config import (
 from cuemem.core.timeutil import valid_period
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import atomic_write_text, mask, read_env, update_env
-from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
+from cuemem.errors import (
+    ConfigMismatchError,
+    CueMemError,
+    DatabaseOpenError,
+    DatasetChecksumError,
+)
 
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
@@ -206,6 +211,9 @@ def _open_system() -> Iterator[MemorySystem]:
         _peak_note(settings)
         try:
             system = MemorySystem.from_settings(settings)
+        except DatabaseOpenError as exc:  # 已经说明了哪个文件：不再包一层 _unopenable
+            console.print(f"[red]错误：[/red]{escape(str(exc))}")
+            raise typer.Exit(1) from exc
         except sqlite3.OperationalError as exc:  # 只管打开时：用的时候出的错照常抛出
             console.print(_unopenable(settings, exc))
             raise typer.Exit(1) from exc

@@ -104,9 +104,11 @@ def build_embedder(
             inner = DashScopeTextEmbedder(cfg, api_key, http_client=http_client, ledger=ledger)
     if not use_cache:
         return inner
-    return CachedEmbedder(
-        inner, EmbeddingCache(settings.paths.embed_cache), instruct=cfg.query_instruct
-    )
+    from cuemem.store.files import opening
+
+    with opening(settings.paths.embed_cache):  # 打不开时 DatabaseOpenError（一行说明）
+        cache = EmbeddingCache(settings.paths.embed_cache)
+    return CachedEmbedder(inner, cache, instruct=cfg.query_instruct)
 
 
 def image_vectors_enabled(settings: Settings) -> bool:

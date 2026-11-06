@@ -1,5 +1,7 @@
 """CueMem 的异常类型。"""
 
+import sqlite3
+
 
 class CueMemError(RuntimeError):
     """所有 CueMem 异常的基类。"""
@@ -59,6 +61,12 @@ class IdempotencyConflictError(CueMemError):
 
 class StorageLockedError(CueMemError):
     """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
+
+
+class DatabaseOpenError(CueMemError, sqlite3.OperationalError):
+    """数据库、账本或缓存打不开（目录只读、磁盘满了、路径被占）。
+
+    同时是 sqlite3.OperationalError：以前打开时原样抛出它，按它捕获的调用方照样捕获得到。"""
 
 
 class VectorStoreOpenError(CueMemError):

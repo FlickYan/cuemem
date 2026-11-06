@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -70,7 +70,7 @@ from cuemem.read.plan import QueryPlan, rule_plan
 from cuemem.read.probe import Probe
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
-from cuemem.store.files import private_dirs, storage_dirs
+from cuemem.store.files import opening, private_dirs, storage_dirs
 from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
@@ -469,43 +469,59 @@ class MemorySystem:
         新建的数据目录只给本人（0700，第四轮体检），已经存在的不改：见 store/files.py。"""
         private_dirs(*storage_dirs(settings))
         paths = settings.paths
-        ledger = Ledger(paths.ledger)
-        embedder = build_embedder(settings, ledger=ledger, http_client=http_client)
-        db = MemoryDB(paths.db)
-        # 记录建库时的向量模型，防止换模型后新旧向量混在一起
-        db.check_or_set_meta("embedder", f"{embedder.name}:{embedder.dim}")
-        llm = LLMClient(
-            settings,
-            cache=ResponseCache(paths.llm_cache),
-            ledger=ledger,
-            http_client=http_client,
-            on_peak_wait=on_peak_wait,
-        )
-        # 图片向量与文本向量共用一个缓存连接：另开一个连接写缓存，文本那边就当缓存被别人改过，
-        # 巩固丢掉跨运行留着的镜像（见 build_image_embedder）
-        cache = embedder.cache if isinstance(embedder, CachedEmbedder) else None
-        return cls(
-            settings,
-            db=db,
-            vectors=VectorStore(
+        # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
+        # 关掉已经打开的：以前账本打开了、数据库打不开时账本的连接一直开着（长期运行的 SDK 进程）
+        with ExitStack() as opened:
+            with opening(paths.ledger):
+                ledger = Ledger(paths.ledger)
+            opened.callback(ledger.close)
+            embedder = build_embedder(settings, ledger=ledger, http_client=http_client)
+            if isinstance(embedder, CachedEmbedder):
+                opened.callback(embedder.cache.close)
+            with opening(paths.db):
+                db = MemoryDB(paths.db)
+            opened.callback(db.close)
+            # 记录建库时的向量模型，防止换模型后新旧向量混在一起
+            db.check_or_set_meta("embedder", f"{embedder.name}:{embedder.dim}")
+            with opening(paths.llm_cache):
+                response_cache = ResponseCache(paths.llm_cache)
+            opened.callback(response_cache.close)
+            llm = LLMClient(
+                settings,
+                cache=response_cache,
+                ledger=ledger,
+                http_client=http_client,
+                on_peak_wait=on_peak_wait,
+            )
+            vectors = VectorStore(
                 paths.qdrant,
                 dim=embedder.dim,
                 url=settings.vector_store.url,
                 api_key=settings.vector_store.secret(),
-            ),
-            embedder=embedder,
-            llm=llm,
-            ledger=ledger,
-            tracer=TraceSink(paths.traces),
-            owns_caches=True,
-            reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
-            # 写入与遗忘在媒体库里留标记（见 store/media.py）：进程被杀时 recover_media 收拾原图。
-            # 评测空间（ephemeral、on_disk）不写：它们的图片记录不在这个数据库里
-            media=MediaStore(paths.media, owner=str(paths.db.absolute())),
-            image_embedder=build_image_embedder(
-                settings, ledger=ledger, http_client=http_client, cache=cache
-            ),
-        )
+            )
+            opened.callback(vectors.close)
+            # 图片向量与文本向量共用一个缓存连接：另开一个连接写缓存，文本那边就当缓存被别人改过，
+            # 巩固丢掉跨运行留着的镜像（见 build_image_embedder）
+            cache = embedder.cache if isinstance(embedder, CachedEmbedder) else None
+            system = cls(
+                settings,
+                db=db,
+                vectors=vectors,
+                embedder=embedder,
+                llm=llm,
+                ledger=ledger,
+                tracer=TraceSink(paths.traces),
+                owns_caches=True,
+                reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
+                # 写入与遗忘在媒体库里留标记（见 store/media.py）：进程被杀时 recover_media
+                # 收拾原图。评测空间（ephemeral、on_disk）不写：它们的图片记录不在这个数据库里
+                media=MediaStore(paths.media, owner=str(paths.db.absolute())),
+                image_embedder=build_image_embedder(
+                    settings, ledger=ledger, http_client=http_client, cache=cache
+                ),
+            )
+            opened.pop_all()  # 都打开了：之后由 close 关
+        return system
 
     @classmethod
     def ephemeral(

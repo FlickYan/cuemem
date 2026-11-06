@@ -2431,3 +2431,45 @@ def test_status_counts_jobs_without_reading_them_all(
         "done": expected["done"],
     }
     assert db.job_counts(space) == {"pending": 2, "failed": 3, "done": 1, "superseded": 1}
+
+
+def test_unopenable_database_raises_database_open_error(
+    offline_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """数据库打不开（路径上是个目录）：以前抛出不带路径的 sqlite3.OperationalError，账本的连接也
+    一直开着；现在 DatabaseOpenError 说明是哪个文件，它同时是 CueMemError 与
+    sqlite3.OperationalError（按后者捕获的调用方照样捕获得到），已经打开的账本关掉。"""
+    from cuemem.errors import CueMemError, DatabaseOpenError
+    from cuemem.llm.ledger import Ledger
+
+    offline_settings.paths.db.mkdir(parents=True)
+    closed: list[str] = []
+    original = Ledger.close
+
+    def close(self: Ledger) -> None:
+        closed.append("ledger")
+        original(self)
+
+    monkeypatch.setattr(Ledger, "close", close)
+    with pytest.raises(DatabaseOpenError) as caught:
+        Memory(offline_settings, background=False)
+    assert isinstance(caught.value, sqlite3.OperationalError)
+    assert isinstance(caught.value, CueMemError)
+    assert str(offline_settings.paths.db) in str(caught.value)
+    assert "打不开" in str(caught.value)
+    assert closed == ["ledger"]
+
+
+def test_data_path_blocked_by_a_file_raises_database_open_error(
+    offline_settings: Settings,
+) -> None:
+    """数据库的上级目录是个文件：以前 mkdir 抛出 FileExistsError（不是 CueMemError），现在也是
+    DatabaseOpenError。"""
+    from cuemem.errors import DatabaseOpenError
+
+    blocker = offline_settings.paths.db.parent / "plain-file"
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.write_text("", encoding="utf-8")
+    paths = offline_settings.paths.model_copy(update={"db": blocker / "cuemem.sqlite"})
+    with pytest.raises(DatabaseOpenError, match="plain-file"):
+        Memory(offline_settings.model_copy(update={"paths": paths}), background=False)

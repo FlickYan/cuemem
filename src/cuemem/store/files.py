@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from cuemem.errors import DatabaseOpenError
 
 if TYPE_CHECKING:
     from cuemem.config import Settings
@@ -55,3 +59,15 @@ def storage_dirs(settings: Settings) -> list[Path]:
     if settings.vector_store.url is None:
         dirs.append(paths.qdrant)
     return list(dict.fromkeys(dirs))
+
+
+@contextlib.contextmanager
+def opening(path: Path) -> Iterator[None]:
+    """打开数据库、账本或缓存（MemorySystem.from_settings）：SQLite 打不开（目录只读、磁盘满了）
+    或者建不了上级目录（挡在路上的是文件，OSError）时换成 DatabaseOpenError，一行说明哪个文件，
+    格式与 cli._unopenable 相同。以前原样抛出，cuemem serve、proxy、chat、demo 与 mcp 打印调用栈，
+    也看不出是哪个文件（第七轮体检）。只包打开：用的时候出的错照常抛出。"""
+    try:
+        yield
+    except (sqlite3.OperationalError, OSError) as exc:
+        raise DatabaseOpenError(f"{path} 打不开（{exc}）：检查目录权限与磁盘空间") from exc

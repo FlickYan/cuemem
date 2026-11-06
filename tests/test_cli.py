@@ -195,6 +195,44 @@ def test_unopenable_database_is_one_line(
         assert "Traceback" not in result.output
 
 
+@pytest.mark.parametrize("blocker", ["directory", "file"])
+@pytest.mark.parametrize(
+    "command",
+    [["serve", "--no-ui", "--scenario", "plain"], ["chat", "--space", "s"], ["proxy"], ["mcp"]],
+)
+def test_unopenable_database_is_one_line_for_servers(
+    isolated_paths: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: list[str],
+    blocker: str,
+) -> None:
+    """数据库打不开（路径上是个目录：SQLite 的 unable to open database file；上级目录是个文件：
+    mkdir 的 OSError）：serve、chat、proxy 与 mcp 以前打印几十行调用栈、不说是哪个文件，现在与别的
+    命令一样一行说明（DatabaseOpenError），退出码 1。mcp 写到 stderr：stdout 是 MCP 的通道。"""
+    import sqlite3
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    if blocker == "directory":
+        db = tmp_path / "db"
+        db.mkdir()
+    else:
+        (tmp_path / "plain-file").write_text("", encoding="utf-8")
+        db = tmp_path / "plain-file" / "cuemem.sqlite"
+        monkeypatch.setenv("CUEMEM_PATHS__DB", str(db))
+    calls: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
+    result = runner.invoke(app, command, input="/quit\n")
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, sqlite3.OperationalError | OSError), result.exception
+    flat = _flat(result.output)
+    assert "Traceback" not in result.output
+    assert _flat(str(db)) in flat and "打不开（" in flat and "检查目录权限与磁盘空间" in flat
+    assert calls == []
+    if command == ["mcp"]:
+        assert result.stdout == "" and "打不开" in result.stderr
+
+
 def test_doctor_reports_free_space(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
