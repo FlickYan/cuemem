@@ -48,7 +48,8 @@ class ContentFilteredError(CueMemError):
 
 
 class ConcurrentWriteError(CueMemError):
-    """要写入的发言没有全部写进去：序号与会话里已有的发言撞上了（同一会话的并发写入没有串行）。"""
+    """要写入的发言没有全部写进去：序号与会话里已有的发言撞上了（同一会话的并发写入没有串行）。
+    这次什么都没写（发言、idempotency_key 与暂存的向量一起撤销），可以重试。"""
 
 
 class IdempotencyConflictError(CueMemError):

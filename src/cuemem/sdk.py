@@ -281,8 +281,9 @@ class Memory:
         后台抽取的状态与出错见 status()。
         idempotency_key：调用方给的键（1 到 255 个可打印的 ASCII 字符，例如 uuid4），重试时原样
         再给（第六轮体检，默认不用）。同一个用户下 24 小时内这个键已经写过同样的请求时不再写，
-        返回 status "duplicate"、那次的 session_id 与 turn_ids、replayed True（results 是空的，
-        wait=True 也不抽取）；那次写下的发言已经遗忘时 status 是 "forgotten"；同一个键用于不同的
+        返回 status "duplicate"、那次的 session_id 与 turn_ids、replayed True（results 是空的；
+        wait=True 时先等这个空间的抽取做完，这个会话的抽取失败时加上 error，那次的会话是还开着的
+        run 时不等）；那次写下的发言已经遗忘时 status 是 "forgotten"；同一个键用于不同的
         请求（消息或别的参数不同，wait 不算）时抛 IdempotencyConflictError，什么都不写。并发的
         同一个键只有一个写进去，别的回滚、按 duplicate 返回。
         """
@@ -297,7 +298,7 @@ class Memory:
             )
             replayed = self._replayed(space, *keyed)
             if replayed is not None:
-                return replayed
+                return self._settle_replay(space, replayed, wait=wait and infer)
         if run_id is not None:
             self._resume(space, run_id)
         if infer and wait and run_id is not None and run_id in self.system.open_sessions(space):
@@ -344,17 +345,21 @@ class Memory:
                                     sid,
                                     [stable_id(space, sid, first + i) for i in range(len(turns))],
                                 )
+                        # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了：在事务里抛出，发言、键与暂存的
+                        # 向量一起撤销。以前提交之后才查：键已经记下，原样重试返回 duplicate 与
+                        # 别人的发言，这次的发言丢了（第七轮体检）
+                        if written.turns_added != len(turns):
+                            raise ConcurrentWriteError(
+                                f"Only {written.turns_added} of {len(turns)} messages could be "
+                                f"written to session {sid!r}: their turn numbers were already "
+                                "taken by another write. Nothing was written; retry the add."
+                            )
                 except sqlite3.IntegrityError:
                     # 并发的同一个键先提交了：这次的发言与暂存的向量已经随事务回滚
                     replayed = self._replayed(space, *keyed) if keyed is not None else None
                     if replayed is None:
                         raise
-                    return replayed
-            if written.turns_added != len(turns):  # 撞号的发言被 INSERT OR IGNORE 悄悄跳过了
-                raise ConcurrentWriteError(
-                    f"Only {written.turns_added} of {len(turns)} messages were written to session "
-                    f"{sid!r}: their turn numbers were already taken by another write."
-                )
+                    return self._settle_replay(space, replayed, wait=wait and infer)
         finally:
             for path in temporary:
                 path.unlink(missing_ok=True)
@@ -404,6 +409,27 @@ class Memory:
             "status": "duplicate",
             "replayed": True,
         }
+
+    def _settle_replay(self, space: str, out: dict[str, Any], *, wait: bool) -> dict[str, Any]:
+        """wait=True 的重试按 duplicate 返回之前，先等这个空间的抽取做完（第七轮体检）：
+        MemoryClient 超时之后让调用方用同一个键重试，最常见的是 add(wait=True) 发言已经写进去、
+        抽取还没做完；以前重试立即返回，紧接着的 search 找不到这次的事实。consolidate 持有这个
+        空间的巩固锁：原来那次请求还在抽取时等它做完，之后没有剩下的事。那次的会话是还开着的
+        run 时不抽取（结束时才抽取），照旧返回。这个会话的抽取失败时加上 error，status 仍是
+        duplicate、results 仍是空的。"""
+        if not wait or out["status"] != "duplicate":
+            return out
+        sid = out["session_id"]
+        if sid in self.system.open_sessions(space):
+            return out
+        try:
+            report = self.system.consolidate(space)
+        except Exception as exc:  # 与 add(wait=True) 相同：发言写进去了，不抛出
+            out["error"] = _not_extracted(exc)
+        else:
+            if sid in report.failed:
+                out["error"] = _not_extracted(_job_error(self.system, space, sid))
+        return out
 
     def open_run(
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None

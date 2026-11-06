@@ -118,7 +118,8 @@ class MemoryClient:
     ) -> dict[str, Any]:
         """写入对话（见 Memory.add）。内容块里的本地图片先读成 data URL。idempotency_key 作为
         Idempotency-Key 头发送（不给时不发，请求与以前相同）：超时或连接断开（MemoryAPIError 的
-        code 为 timeout、disconnected）之后用同一个键原样重发，服务端只写一次。"""
+        code 为 timeout、disconnected）之后用同一个键原样重发，服务端只写一次；wait=True 的
+        重发等那次的抽取做完再返回 duplicate（第七轮体检）。"""
         body = {
             "messages": _inline_images(messages),
             "user_id": user_id,

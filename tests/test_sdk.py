@@ -29,7 +29,7 @@ from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
 from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, stored_text
 from cuemem.memory import _open_mark
-from cuemem.sdk import _matches, parse_messages, space_for
+from cuemem.sdk import _key_hash, _matches, parse_messages, space_for
 from cuemem.store.vector import VectorStore
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -1689,9 +1689,62 @@ def test_a_retry_with_the_same_key_writes_once(memory: Memory) -> None:
         "replayed": True,
     }
     assert _turn_count(memory) == 1
-    assert memory.system.db.get_jobs("alice", status="pending")  # wait=True 也没有抽取
+    # wait=True 的重试等抽取做完（第七轮体检）：以前立即返回，紧接着的 get_all 是空的
+    assert memory.system.db.get_jobs("alice", status="pending") == []
+    (berlin,) = memory.get_all(user_id="alice")["results"]
+    assert berlin["memory"] == "The user lives in Berlin."
     memory.add("I live in Berlin", user_id="alice")
     assert _turn_count(memory) == 2
+
+
+def test_a_waiting_retry_reports_a_failed_extraction(
+    memory: Memory, model: ScriptedModel, fake_api: FakeAPI
+) -> None:
+    """wait=True 的重试遇上这次会话的抽取失败：仍是 duplicate、results 是空的，加上 error。"""
+    first = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1")
+    without_balance_for_extracting(model, fake_api)
+    again = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1", wait=True)
+    assert again["status"] == "duplicate" and again["replayed"] is True
+    assert again["results"] == [] and again["session_id"] == first["session_id"]
+    assert "Error code: 402" in again["error"] and "Do not add them again" in again["error"]
+
+
+def test_a_waiting_retry_into_an_open_run_returns_the_duplicate(memory: Memory) -> None:
+    """那次写进的是还开着的 run：wait=True 的重试不报 ValueError、不抽取，照旧返回 duplicate。"""
+    memory.open_run("r", user_id="alice")
+    first = memory.add("I live in Berlin", user_id="alice", run_id="r", idempotency_key="k1")
+    again = memory.add(
+        "I live in Berlin", user_id="alice", run_id="r", idempotency_key="k1", wait=True
+    )
+    assert again == {
+        "results": [],
+        "session_id": "r",
+        "turn_ids": first["turn_ids"],
+        "status": "duplicate",
+        "replayed": True,
+    }
+    assert memory.system.db.get_jobs("alice") == []  # 结束时才抽取
+
+
+def test_a_keyed_add_that_collides_writes_nothing_and_its_retry_writes(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带键的 add 撞号（另一个进程先写了这些序号）：ConcurrentWriteError，键与发言都不留；
+    原样重试写进这次的发言。以前提交之后才查：键已经记下，重试返回 duplicate 与别人的发言 ID，
+    这次的发言丢了。"""
+    db = memory.system.db
+    memory.add("I like tea", user_id="alice", run_id="r", infer=False)
+    real = Memory._next_idx
+    monkeypatch.setattr(Memory, "_next_idx", lambda self, space, session_id: 0)
+    with pytest.raises(ConcurrentWriteError, match="Nothing was written"):
+        memory.add("I like coffee", user_id="alice", run_id="r", infer=False, idempotency_key="k")
+    assert [t.text for t in db.get_turns("alice", "r")] == ["I like tea"]
+    assert db.add_key_lookup("alice", _key_hash("k")) is None
+    monkeypatch.setattr(Memory, "_next_idx", real)
+    out = memory.add("I like coffee", user_id="alice", run_id="r", infer=False, idempotency_key="k")
+    assert out["status"] == "logged"
+    text = {t.id: t.text for t in db.get_turns("alice", "r")}
+    assert [text[tid] for tid in out["turn_ids"]] == ["I like coffee"]
 
 
 def test_the_same_key_for_another_request_is_refused(memory: Memory) -> None:

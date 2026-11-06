@@ -41,7 +41,8 @@ def worth_retrying(exc: BaseException) -> bool:
     会话据此决定留着重试还是丢掉。向量接口暂时不可用、限流、超时、连不上、余额不足，向量库或
     数据库出错时有。没有的：向量接口拒绝了请求本身（别的 4xx）、内容审核、发言本身不合法（图片
     读不出来、像素太多等），留着它们，这个会话后面的写入都得排在它们后面；撞号
-    （ConcurrentWriteError）时已经写进去了一部分，再写就重复了。"""
+    （ConcurrentWriteError）时什么都没写（第七轮体检起），但这个会话另有一个写入者（别的进程），
+    自动重试会把发言排到它的发言之后，留给调用方决定。"""
     if isinstance(
         exc,
         ConcurrentWriteError
