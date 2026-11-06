@@ -13,7 +13,7 @@ await m.serach(...)、search(user_id=42)、mode="l9" 一个都查不出来。__g
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Literal, Self
@@ -277,6 +277,16 @@ class AsyncMethods:
     async def delete(self, memory_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         """见 Memory.delete。"""
         return await asyncio.to_thread(self.sync.delete, memory_id, dry_run=dry_run)
+
+    async def delete_many(
+        self, memory_ids: Sequence[str], *, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """见 Memory.delete_many。"""
+        return await asyncio.to_thread(self.sync.delete_many, memory_ids, dry_run=dry_run)
+
+    async def batch_delete(self, memories: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """见 Memory.batch_delete。"""
+        return await asyncio.to_thread(self.sync.batch_delete, memories)
 
     async def delete_all(
         self,

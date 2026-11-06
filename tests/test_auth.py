@@ -609,6 +609,14 @@ def test_v1_api_stays_in_scope(world: World) -> None:
     theirs = world.http.get(f"/api/v1/memories/{bob}", headers=bearer(ALICE_TOKEN)).json()
     none = world.http.get("/api/v1/memories/0000000000000000", headers=bearer(ALICE_TOKEN)).json()
     assert theirs["error"] | {"message": ""} == none["error"] | {"message": ""}
+    # 一次删好几条（第七轮体检 P16）：别人的 ID 与不存在的一样放进 missing，预演也不透露什么
+    unknown = "0000000000000000"
+    preview = alice.delete_many([bob, unknown], dry_run=True)
+    assert (preview["deleted"], preview["missing"]) == ([], [bob, unknown])
+    assert preview["turns"] == [] and preview["facts"] == []
+    out = alice.delete_many([unknown, bob])
+    assert out["message"] == "Nothing deleted"
+    assert (out["deleted"], out["missing"]) == ([], [unknown, bob])
     kept = admin.get(bob)
     assert kept is not None and kept["memory"] == "Secret of bob" and kept["status"] == "current"
 

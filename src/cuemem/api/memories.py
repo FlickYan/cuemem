@@ -10,6 +10,8 @@
     PUT    /api/v1/memories/{id}             update（text 或 data、metadata）
     GET    /api/v1/memories/{id}/history     history
     DELETE /api/v1/memories/{id}             delete（dry_run）
+    POST   /api/v1/memories/batch-delete     delete_many（memory_ids、dry_run；MemoryClient 的
+                                             batch_delete 也发到这里）
     DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id、dry_run：
                                              预演只能与 run_id 一起）
     GET    /api/v1/media/{id}                media（图片的原文件）
@@ -178,6 +180,11 @@ class UpdateRequest(BaseModel):
     text: str | None = None
     data: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+class BatchDeleteRequest(BaseModel):
+    memory_ids: list[str]
+    dry_run: bool = False
 
 
 class RunRequest(BaseModel):
@@ -414,6 +421,21 @@ class DryRunResult(_Out):
     restated: int
     facts: list[DryRunFact]
     images: int
+
+
+class BatchForgetResult(ForgetResult):
+    """delete_many: deleted lists the ids that were deleted; missing lists unknown ids and ids
+    outside this key's scope."""
+
+    deleted: list[str]
+    missing: list[str]
+
+
+class BatchDryRunResult(DryRunResult):
+    """delete_many with dry_run=true: deleted lists the ids that would be deleted; nothing is."""
+
+    deleted: list[str]
+    missing: list[str]
 
 
 class ResetResult(_Out):
@@ -858,6 +880,22 @@ def memories_router(
             raise missing(memory_id)
         with _sdk_errors(by_id=True):
             return memory.delete(memory_id, dry_run=dry_run)
+
+    @router.post(
+        "/memories/batch-delete",
+        responses=_ok(BatchForgetResult | BatchDryRunResult),
+        description="Delete several memories (fact, excerpt or image ids) with one rebuild per "
+        "memory space; at most 100 ids. Unknown ids and ids outside this key's scope are listed "
+        "in missing, not an error. dry_run=true only lists what would be deleted.",
+    )
+    def delete_many(http: Request, request: BatchDeleteRequest) -> V1Json:
+        # 一次写入（rate_per_minute 算一个）。管理令牌照 SDK；限定作用域的令牌只删作用域里的，
+        # 别的 ID 与不存在的一样进 missing（与 reset 同样的分法）
+        who = principal_of(http)
+        with _sdk_errors():
+            if who.admin:
+                return memory.delete_many(request.memory_ids, dry_run=request.dry_run)
+            return memory._delete_many(request.memory_ids, dry_run=request.dry_run, keep=who.allows)
 
     @router.get(
         "/media/{media_id}",

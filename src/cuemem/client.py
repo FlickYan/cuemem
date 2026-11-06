@@ -372,6 +372,26 @@ class MemoryClient:
         params = {"dry_run": dry_run}
         return self._call("DELETE", f"/memories/{_id(memory_id)}", params=params)
 
+    def delete_many(self, memory_ids: Sequence[str], *, dry_run: bool = False) -> dict[str, Any]:
+        """一次遗忘好几条记忆（见 Memory.delete_many）：POST /api/v1/memories/batch-delete，算一次
+        写入。单个字符串在发送之前 TypeError，与本地相同；去重与上限由服务端检查。"""
+        if isinstance(memory_ids, str | bytes) or not isinstance(memory_ids, Sequence):
+            raise TypeError("memory_ids must be a list of memory ids, not a single id.")
+        body = {"memory_ids": list(memory_ids), "dry_run": dry_run}
+        return self._call("POST", "/memories/batch-delete", body=body)
+
+    def batch_delete(self, memories: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Mem0 的写法：memories=[{"memory_id": ...}, ...]，与 delete_many 相同（见
+        Memory.batch_delete）。"""
+        if isinstance(memories, str | Mapping):
+            raise TypeError('memories must be a list of {"memory_id": ...} objects.')
+        ids: list[str] = []
+        for item in memories:
+            if not isinstance(item, Mapping) or "memory_id" not in item:
+                raise ValueError('Each item of memories must be an object with "memory_id".')
+            ids.append(item["memory_id"])
+        return self.delete_many(ids)
+
     def delete_all(
         self,
         *,

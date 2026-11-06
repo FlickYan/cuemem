@@ -1027,7 +1027,9 @@ class Memory:
         对话片段或图片的 ID：删掉那一轮对话（图片所在的那一轮），与 MCP、各框架集成的 forget
         相同。以前这两种 ID 报 KeyError，Mem0 的 for r in results: delete(r["id"]) 中途出错。
         与 Mem0 不同的是删的是整轮对话：同一轮的对话片段、由它抽出的别的事实随之消失，之后再
-        delete 它们的 ID 是 KeyError（与不存在的一样），逐条删时要接住。
+        delete 它们的 ID 是 KeyError（与不存在的一样），逐条删时要接住。每次 delete 都用剩下的
+        日志重放一遍，重放还可能给留下的事实换新的 ID：拿着之前 get_all 的 ID 逐条删时，没删的
+        事实也可能 KeyError。一次删好几条用 delete_many：先认出全部 ID，每个空间只重放一次。
 
         dry_run=True 只预演：返回会删哪些发言、哪些事实会随之消失，什么都不删。删除做完之后
         重建出错（模型供应商余额不足等）时不抛出：已经删了，warning 写明重建下次巩固时补上。
@@ -1050,18 +1052,35 @@ class Memory:
             found[0], fact_ids=[memory_id], report_rebuild_errors=True
         )
         if not report.turns_deleted and self.system.db.get_facts(found[0], ids=[memory_id]):
-            return {
-                "message": "Nothing deleted",
-                **_forget_out(report),
-                "warning": (
-                    "Nothing was deleted: none of the conversation turns this memory came from "
-                    "are in the log any more (an earlier version can leave this behind when a "
-                    "forget failed partway). Run consolidate(rebuild=True) to rebuild the "
-                    "memories from the log; if search still misses conversation excerpts "
-                    "afterwards, `cuemem reindex` restores the vectors the log still has."
-                ),
-            }
+            return {"message": "Nothing deleted", **_forget_out(report), "warning": _STUCK}
         return {"message": "Memory deleted", **_forget_out(report)}
+
+    def delete_many(self, memory_ids: Sequence[str], *, dry_run: bool = False) -> dict[str, Any]:
+        """一次遗忘好几条记忆（事实、对话片段或图片的 ID，与 delete 认的相同）：先认出全部 ID，
+        每个空间调用一次遗忘、重放一次。逐条 delete 时 k 条是 k 次重放，每次都独占这个空间；
+        同一轮里的两个 ID、重放之后换了 ID 的事实也不会中途 KeyError。
+
+        最多 DELETE_MANY_MAX（100）个 ID（去重之后），多了 ValueError：删事实时找转述要对每条
+        陈述调用一次便宜的模型。memory_ids 是单个字符串时 TypeError。不认识的 ID 不报错，放进
+        返回值的 missing（经 /api/v1 时作用域之外的也在这里，与不存在的一样）；deleted 是认出来、
+        删掉（预演时是会删）的 ID。
+
+        dry_run=True 只预演，返回 delete 的预演的各项（几个空间合起来）。删除的返回值与 delete
+        的相同，计数是几个空间相加；重建出错时 warning 只写一次。好几个空间时逐个删，中途出错
+        时前面的空间已经删了。"""
+        return self._delete_many(memory_ids, dry_run=dry_run)
+
+    def batch_delete(self, memories: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Mem0 的 MemoryClient.batch_delete 的写法：memories=[{"memory_id": ...}, ...]，与
+        delete_many 相同（不预演）。"""
+        if isinstance(memories, str | Mapping):
+            raise TypeError('memories must be a list of {"memory_id": ...} objects.')
+        ids: list[str] = []
+        for item in memories:
+            if not isinstance(item, Mapping) or "memory_id" not in item:
+                raise ValueError('Each item of memories must be an object with "memory_id".')
+            ids.append(item["memory_id"])
+        return self.delete_many(ids)
 
     def delete_all(
         self,
@@ -1236,6 +1255,87 @@ class Memory:
             space, turn_ids=turns, media_ids=media, report_rebuild_errors=True
         )
         return {"message": "Memory deleted", **_forget_out(report)}
+
+    def _delete_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        dry_run: bool,
+        keep: Callable[[str], bool] | None = None,
+    ) -> dict[str, Any]:
+        """delete_many 的实现。keep：只删它认的空间里的记忆（/api/v1 收到限定作用域的令牌时是
+        Principal.allows），别的空间的 ID 与不存在的一样放进 missing；None 时不限。不做成公开
+        参数：MemoryClient 与 Memory 的签名逐字相同（与 _reset 一样）。"""
+        from cuemem.evidence import resolve_ids
+
+        ids = _memory_ids(memory_ids)
+        # 空间 → 种类 → ID：先全部认出来，再删（删了之后别的 ID 可能就找不到了）
+        plan: dict[str, dict[MemoryKind, list[str]]] = {}
+        for memory_id in ids:
+            located = self._locate(memory_id)
+            if located is not None and (keep is None or keep(located[0])):
+                plan.setdefault(located[0], {}).setdefault(located[1], []).append(memory_id)
+        for space, kinds in plan.items():  # 与 delete 相同：库里没有的事实算不存在
+            if kinds.get("fact"):
+                found = {f.id for f in self.system.db.get_facts(space, ids=kinds["fact"])}
+                kinds["fact"] = [i for i in kinds["fact"] if i in found]
+        chosen = {i for kinds in plan.values() for group in kinds.values() for i in group}
+        deleted = [i for i in ids if i in chosen]
+        missing = [i for i in ids if i not in chosen]
+        targets = []
+        for space in sorted(plan):
+            kinds = plan[space]
+            excerpts = kinds.get("excerpt", [])
+            turns = resolve_ids(self.system, space, excerpts)[1] if excerpts else []
+            if turns or kinds.get("fact") or kinds.get("image"):
+                targets.append((space, kinds.get("fact", []), turns, kinds.get("image", [])))
+
+        if dry_run:
+            previews = [
+                self.system.preview_forget(space, fact_ids=facts, turn_ids=turns, media_ids=media)
+                for space, facts, turns, media in targets
+            ]
+            return {
+                "message": "Dry run: nothing was deleted",
+                "deleted": deleted,
+                "missing": missing,
+                "turns": [t for p in previews for t in p["turns"]],
+                "sessions_affected": sorted({s for p in previews for s in p["sessions_affected"]}),
+                "cascaded": sum(p["cascaded"] for p in previews),
+                "restated": sum(p["restated"] for p in previews),
+                "facts": [f for p in previews for f in p["facts"]],
+                "images": sum(p["images"] for p in previews),
+            }
+
+        reports: list[ForgetReport] = []
+        stuck: set[str] = set()
+        for space, facts, turns, media in targets:
+            report = self.system.forget_memories(
+                space, fact_ids=facts, turn_ids=turns, media_ids=media, report_rebuild_errors=True
+            )
+            reports.append(report)
+            if not report.turns_deleted and facts:  # 同 delete 的 "Nothing deleted"
+                stuck.update(f.id for f in self.system.db.get_facts(space, ids=facts))
+        turns_deleted = sum(r.turns_deleted for r in reports)
+        out: dict[str, Any] = {
+            "message": "Memories deleted" if turns_deleted else "Nothing deleted",
+            "deleted": [i for i in deleted if i not in stuck],
+            "missing": missing,
+            "turns_deleted": turns_deleted,
+            "sessions_affected": sorted({s for r in reports for s in r.sessions_affected}),
+            "facts_before": sum(r.facts_before for r in reports),
+            "facts_after": sum(r.facts_after for r in reports),
+            "images_deleted": sum(r.images_deleted for r in reports),
+            "restated": sum(r.restated for r in reports),
+        }
+        # 重建出错的说明只写一次（与 delete 相同的措辞），出处不在日志里的事实再加一句
+        failed = next((r for r in reports if r.rebuild_error), None)
+        warnings = [_forget_out(failed)["warning"]] if failed is not None else []
+        if stuck:
+            warnings.insert(0, _STUCK)
+        if warnings:
+            out["warning"] = " ".join(warnings)
+        return out
 
     def _next_idx(self, space: str, session_id: str) -> int:
         """会话里下一句发言的序号：只增不减，遗忘删掉的序号不再复用（与 Agent 相同）；
@@ -1970,6 +2070,33 @@ def _events(
             item["reason"] = previous[0].supersede_reason
         events.append(item)
     return events
+
+
+DELETE_MANY_MAX = 100  # delete_many 一次最多这么多个 ID：删事实时每条陈述调用一次模型找转述
+# delete 一句发言都没删、事实却还在时的说明（delete_many 同）
+_STUCK = (
+    "Nothing was deleted: none of the conversation turns this memory came from "
+    "are in the log any more (an earlier version can leave this behind when a "
+    "forget failed partway). Run consolidate(rebuild=True) to rebuild the "
+    "memories from the log; if search still misses conversation excerpts "
+    "afterwards, `cuemem reindex` restores the vectors the log still has."
+)
+
+
+def _memory_ids(memory_ids: Sequence[str]) -> list[str]:
+    """delete_many 的 ID：字符串的列表（单个字符串 TypeError），按顺序去重，最多
+    DELETE_MANY_MAX 个（ValueError）。"""
+    if isinstance(memory_ids, str | bytes) or not isinstance(memory_ids, Sequence):
+        raise TypeError("memory_ids must be a list of memory ids, not a single id.")
+    if not all(isinstance(i, str) for i in memory_ids):
+        raise TypeError("memory_ids must be a list of strings.")
+    ids = list(dict.fromkeys(memory_ids))
+    if len(ids) > DELETE_MANY_MAX:
+        raise ValueError(
+            f"At most {DELETE_MANY_MAX} memory ids per call (got {len(ids)}); split them into "
+            "several calls."
+        )
+    return ids
 
 
 def _forget_out(report: ForgetReport) -> dict[str, Any]:

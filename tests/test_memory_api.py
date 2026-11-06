@@ -224,6 +224,8 @@ ARGUMENTS: dict[str, Any] = {
     "valid_at": "2026-01-01",
     "known_at": WHEN,
     "memory_id": "m1",
+    "memory_ids": ["m1", "m2"],
+    "memories": [{"memory_id": "m1"}, {"memory_id": "m2"}],  # batch_delete（Mem0 的写法）
     "media_id": "0123456789abcdef",
     "text": "new text",
     "data": "new text",  # update 的 data 与 text 是同一个参数
@@ -313,6 +315,8 @@ def test_every_argument_reaches_memory(name: str) -> None:
             return
         getattr(client, name)(**args)
     called, got = recorder.calls[0]  # open_run 之后，关掉客户端时还会 end_run
+    if name == "batch_delete":  # 客户端换成 delete_many 的请求，服务端照样调用 delete_many
+        name, args = "delete_many", {"memory_ids": ["m1", "m2"], "dry_run": False}
     assert called == name
     assert _meaning(name, got) == _meaning(name, args)
 
@@ -1017,6 +1021,80 @@ def test_the_client_sends_delete_all_dry_run_only_when_set(system: MemorySystem)
     ]
 
 
+def _likes(mem: Mem, user_id: str) -> dict[str, str]:
+    return {f["memory"]: f["id"] for f in mem.get_all(user_id=user_id)["results"]}
+
+
+def test_delete_many_replays_once_and_matches_deleting_one_by_one(
+    mem: Mem, system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮体检 P16：delete_many 先认出全部 ID，每个空间只遗忘、重放一次。留下的事实与逐条
+    delete 的相同（逐条删时每次按文字重新找 ID：重放可能给留下的事实换 ID）。重复的 ID 只算
+    一次，不认识的放进 missing，不报错。"""
+    for user in ("alice", "bob"):
+        for n in range(6):
+            mem.add(f"I like thing{n}", user_id=user, run_id=f"s{n}", wait=True)
+    doomed = ["I like thing1", "I like thing3", "I like thing4"]
+    for text in doomed:  # 逐条删
+        mem.delete(_likes(mem, "bob")[text])
+
+    calls: list[str] = []
+    forget = system.forget_memories
+    monkeypatch.setattr(
+        system, "forget_memories", lambda space, **k: calls.append(space) or forget(space, **k)
+    )
+    ids = [_likes(mem, "alice")[text] for text in doomed]
+    out = mem.delete_many([*ids, ids[0], "no-such-id"])
+    assert calls == ["alice"]  # 一次，不是三次
+    assert (out["message"], out["deleted"], out["missing"]) == (
+        "Memories deleted",
+        ids,
+        ["no-such-id"],
+    )
+    assert out["turns_deleted"] == 3 and sorted(out["sessions_affected"]) == ["s1", "s3", "s4"]
+    assert current(mem, "alice") == current(mem, "bob")
+    assert sorted(_likes(mem, "alice")) == ["I like thing0", "I like thing2", "I like thing5"]
+
+    nothing = mem.delete_many(["no-such-id"])
+    assert (nothing["message"], nothing["deleted"], nothing["turns_deleted"]) == (
+        "Nothing deleted",
+        [],
+        0,
+    )
+    assert calls == ["alice"]
+
+
+def test_delete_many_of_one_round_dry_run_and_its_limits(mem: Mem, system: MemorySystem) -> None:
+    """同一轮的事实与对话片段一起删不出错（逐条删时第二个 KeyError）；dry_run 什么都不删；
+    超过 100 个 ID 是 ValueError（HTTP 400），单个字符串是 TypeError；batch_delete 是 Mem0 的
+    写法。本地与经 /api/v1 的 MemoryClient 相同。"""
+    mem.add("I like tea", user_id="carol", wait=True)
+    mem.add("I like chess", user_id="carol", wait=True)
+    tea = _likes(mem, "carol")["I like tea"]
+    (fact,) = system.db.get_facts("carol", ids=[tea])
+    (excerpt,) = [
+        u.id
+        for u in system.db.list_units("carol", kinds=["round"])
+        if set(fact.source_turn_ids) <= set(u.source_turn_ids)
+    ]
+    preview = mem.delete_many([tea, excerpt], dry_run=True)
+    assert preview["message"] == "Dry run: nothing was deleted"
+    assert (preview["deleted"], preview["missing"]) == ([tea, excerpt], [])
+    assert [t["text"] for t in preview["turns"]] == ["I like tea"]
+    assert [f["memory"] for f in preview["facts"]] == ["I like tea"]
+    assert current(mem, "carol") == ["I like chess", "I like tea"]
+
+    with pytest.raises(ValueError, match="At most 100"):
+        mem.delete_many([f"id{i}" for i in range(101)])
+    with pytest.raises(TypeError):
+        mem.delete_many(tea)
+    assert current(mem, "carol") == ["I like chess", "I like tea"]
+
+    out = mem.batch_delete([{"memory_id": tea}, {"memory_id": excerpt}])
+    assert (out["deleted"], out["missing"], out["turns_deleted"]) == ([tea, excerpt], [], 1)
+    assert current(mem, "carol") == ["I like chess"]
+
+
 def test_export_and_load_errors_are_the_same_remotely(system: MemorySystem) -> None:
     """导出不存在的空间（KeyError）、导入没有 space_id 的文件又没给 user_id（ValueError，以前本地
     是 KeyError('space_id')）：MemoryClient 抛出与本地相同的异常。以前远程的这两个是没有说明的
@@ -1674,7 +1752,7 @@ def test_the_openapi_documents_every_v1_response() -> None:
     图片写的 image/* 生成客户端时被丢掉。"""
     spec = openapi_v1()
     operations = [(p, m, op) for p, ops in spec["paths"].items() for m, op in ops.items()]
-    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 21
+    assert len(operations) == sum(len(r.methods) for r in V1_ROUTES) == 22
     ids = [op["operationId"] for _, _, op in operations]
     assert len(set(ids)) == len(ids) and set(ids) == {r.name for r in V1_ROUTES}
     assert set(ids) <= _methods(MemoryClient)
@@ -1821,6 +1899,10 @@ def test_every_v1_response_matches_its_documented_model(
         dump = mem.export(user_id="alice")
         assert mem.load(dump, user_id="carol", wait=True)["consolidation"]
         assert mem.spaces() and mem.delete_all(user_id="carol")["turns_deleted"]
+        assert mem.delete_all(user_id="bob", run_id=run_id, dry_run=True)["turns"]
+        facts = [f["id"] for f in mem.get_all(user_id="alice")["results"]]
+        assert mem.delete_many([*facts, "no-such-id"], dry_run=True)["missing"] == ["no-such-id"]
+        assert facts and mem.delete_many(facts)["deleted"] == facts
         for call in (lambda: mem.update("no-such-id", "x"), lambda: mem.export(user_id="nobody")):
             with pytest.raises(KeyError):
                 call()
