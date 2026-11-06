@@ -42,6 +42,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import tempfile
 import threading
@@ -1843,11 +1844,17 @@ def _as_datetime(value: datetime | str | float | None) -> datetime | None:
     return datetime.fromtimestamp(value)
 
 
+_NUMBER = re.compile(r"-?\d+(\.\d*)?")
+_MS_ABOVE = 2e10  # 比这大的 Unix 时间戳是毫秒（与 Pydantic 相同：秒数要到 2603 年才这么大）
+
+
 def _moment(name: str, value: datetime | date | str | float | None) -> datetime | None:
     """search、context、answer 的 at 与 get_all 的 known_at → 本机时间（不带时区，见
-    naive_local）。与 /api/v1（MemoryClient）收的写法相同（第七轮体检）：datetime；date 是那天
-    零点；ISO 文本（带时区的先换算）；数字是 Unix 时间戳。以前只认 datetime，别的写法在空间里
-    有记忆时 AttributeError。别的写法 ValueError，开头是参数名。"""
+    naive_local）。本地的 Memory 与 /api/v1 都用它（服务端在接口里调用），同一个值两边是同一个
+    时刻（第七轮体检、复审）：datetime；date 是那天零点；ISO 文本（带时区的先换算，20300101 这样
+    的紧凑写法与 2030-W01 这样的周也认）；数字与只有数字的文本（ISO 认不出时）是 Unix 时间戳，
+    绝对值大于 2e10 的是毫秒。以前本地只认 datetime；服务端由 Pydantic 解析，'20300101' 读成
+    1970 年的秒数、毫秒与数字文本本地却报错。别的写法 ValueError，开头是参数名。"""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -1858,10 +1865,13 @@ def _moment(name: str, value: datetime | date | str | float | None) -> datetime 
         try:
             return naive_local(datetime.fromisoformat(value))
         except ValueError:
-            raise ValueError(f"{name}: invalid ISO date or datetime {value!r}") from None
+            if not _NUMBER.fullmatch(value.strip()):
+                raise ValueError(f"{name}: invalid ISO date or datetime {value!r}") from None
+        value = float(value)
     if isinstance(value, int | float) and not isinstance(value, bool):
+        seconds = value / 1000 if abs(value) > _MS_ABOVE else value
         try:
-            return datetime.fromtimestamp(value)
+            return datetime.fromtimestamp(seconds)
         except (OverflowError, OSError, ValueError):
             raise ValueError(f"{name}: invalid Unix timestamp {value!r}") from None
     raise ValueError(f"{name}: expected a datetime, date, ISO string or Unix timestamp")

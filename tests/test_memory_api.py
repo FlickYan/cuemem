@@ -525,15 +525,25 @@ def test_bad_read_arguments_raise_the_same_error_locally(
 
 
 # 与 at=datetime(2030, 1, 1) 同一个时刻的别的写法（第七轮体检；known_at 要在写入之后）
+# 第七轮复审：毫秒、只有数字的文本、紧凑的与按周的 ISO 写法两边也是同一个时刻（以前服务端由
+# Pydantic 解析，'20300101' 读成 1970 年的秒数；毫秒与数字文本本地报错，按周的写法远程 422）
 MOMENTS = [
     "2030-01-01",
     date(2030, 1, 1),
     datetime(2030, 1, 1, 0, 0).astimezone(UTC).isoformat(),
     datetime(2030, 1, 1, 0, 0).timestamp(),
+    datetime(2030, 1, 1, 0, 0).timestamp() * 1000,
+    str(int(datetime(2030, 1, 1, 0, 0).timestamp())),
+    "20300101",
+    "2030-W01-2",
 ]
 
 
-@pytest.mark.parametrize("moment", MOMENTS, ids=["iso-date", "date", "iso-utc", "epoch"])
+@pytest.mark.parametrize(
+    "moment",
+    MOMENTS,
+    ids=["iso-date", "date", "iso-utc", "epoch", "epoch-ms", "epoch-text", "compact", "week"],
+)
 def test_read_times_take_the_same_forms_locally(system: MemorySystem, moment: Any) -> None:
     """search、context、answer 的 at 与 get_all 的 known_at：MemoryClient 收 ISO 文本、date 与
     Unix 时间戳（服务端的 Pydantic 解析），本地的 Memory 以前只认 datetime，空间里有记忆时
@@ -562,6 +572,8 @@ BAD_TIMES = [
     ("answer", {"at": "banana"}),
     ("search", {"at": True}),
     ("get_all", {"known_at": "banana"}),
+    ("search", {"at": "1e9"}),
+    ("get_all", {"known_at": "1e9"}),
     ("add", {"user_id": 42}),
     ("search", {"user_id": 42}),
     ("wait", {"timeout": -1}),

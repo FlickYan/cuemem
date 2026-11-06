@@ -285,8 +285,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string",
-                  "format": "date-time"
+                  "type": "string"
                 },
                 {
                   "type": "null"
@@ -4308,14 +4307,20 @@
           "at": {
             "anyOf": [
               {
-                "type": "string",
-                "format": "date-time"
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "At"
+            "title": "At",
+            "description": "ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"
           },
           "router": {
             "type": "string",
@@ -4731,14 +4736,20 @@
           "at": {
             "anyOf": [
               {
-                "type": "string",
-                "format": "date-time"
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "At"
+            "title": "At",
+            "description": "ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"
           },
           "mode": {
             "type": "string",
@@ -6421,14 +6432,20 @@
           "at": {
             "anyOf": [
               {
-                "type": "string",
-                "format": "date-time"
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "At"
+            "title": "At",
+            "description": "ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"
           },
           "router": {
             "type": "string",

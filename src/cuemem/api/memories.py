@@ -51,7 +51,6 @@ import json
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
 import anyio
@@ -64,7 +63,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.routing import APIRoute
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, WithJsonSchema
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cuemem import __version__
@@ -79,7 +78,16 @@ from cuemem.errors import (
     SessionLimitError,
 )
 from cuemem.read.controller import Router
-from cuemem.sdk import AnswerMode, Lam, Memory, MinLevel, SearchMode, _scope, space_for
+from cuemem.sdk import (
+    AnswerMode,
+    Lam,
+    Memory,
+    MinLevel,
+    SearchMode,
+    _moment,
+    _scope,
+    space_for,
+)
 from cuemem.store.media import ACCEPTED_FORMATS
 
 PREFIX = "/api/v1"
@@ -138,6 +146,15 @@ class AddRequest(BaseModel):
     wait: bool = False
 
 
+# 时刻（search、context、answer 的 at，get_all 的 known_at）：原样交给接口，与本地的 Memory 用同一个
+# sdk._moment 解析（第七轮复审）。以前由 Pydantic 解析：'20300101' 读成 1970 年的秒数，本地读成
+# 2030-01-01；毫秒与只有数字的文本本地报错、这里照收。不收 true、false
+Moment = Annotated[
+    str | StrictInt | StrictFloat | None,
+    Field(description="ISO date or datetime, or Unix time (seconds; above 2e10: milliseconds)"),
+]
+
+
 class SearchRequest(BaseModel):
     query: str
     user_id: str | None = None
@@ -145,7 +162,7 @@ class SearchRequest(BaseModel):
     run_id: str | None = None
     limit: int | None = None
     mode: SearchMode = "auto"
-    at: datetime | None = None
+    at: Moment = None
     router: Router = "learned"
     lam: Lam = None
     filters: dict[str, Any] | None = None
@@ -158,7 +175,7 @@ class ContextRequest(BaseModel):
     query: str
     user_id: str | None = None
     agent_id: str | None = None
-    at: datetime | None = None
+    at: Moment = None
     mode: SearchMode = "auto"
     router: Router = "learned"
     lam: Lam = None
@@ -171,7 +188,7 @@ class AnswerRequest(BaseModel):
     user_id: str | None = None
     agent_id: str | None = None
     mode: AnswerMode = "auto"
-    at: datetime | None = None
+    at: Moment = None
     router: Router = "learned"
     lam: Lam = None
 
@@ -778,7 +795,7 @@ def memories_router(
                 run_id=request.run_id,
                 limit=request.limit,
                 mode=request.mode,
-                at=request.at,
+                at=_moment("at", request.at),
                 router=request.router,
                 lam=request.lam,
                 filters=request.filters,
@@ -795,7 +812,7 @@ def memories_router(
                 request.query,
                 user_id=request.user_id,
                 agent_id=request.agent_id,
-                at=request.at,
+                at=_moment("at", request.at),
                 mode=request.mode,
                 router=request.router,
                 lam=request.lam,
@@ -811,7 +828,7 @@ def memories_router(
         run_id: str | None = None,
         include_superseded: bool = False,
         valid_at: str | None = None,
-        known_at: datetime | None = None,
+        known_at: str | None = None,  # 时刻，见 Moment
         limit: int | None = None,
         filters: str | None = None,
         top_k: int | None = None,
@@ -826,7 +843,7 @@ def memories_router(
                 run_id=run_id,
                 include_superseded=include_superseded,
                 valid_at=valid_at,
-                known_at=known_at,
+                known_at=_moment("known_at", known_at),
                 limit=limit,
                 filters=where,
                 top_k=top_k,
@@ -946,7 +963,7 @@ def memories_router(
                 user_id=request.user_id,
                 agent_id=request.agent_id,
                 mode=request.mode,
-                at=request.at,
+                at=_moment("at", request.at),
                 router=request.router,
                 lam=request.lam,
             )
