@@ -1410,8 +1410,9 @@ class MemoryDB:
     def drop_inert_sessions(self, space_id: str, session_ids: Sequence[str]) -> list[str]:
         """遗忘的快速路径（第七轮体检，见 MemorySystem._inert_sessions）：整段删掉的会话什么都
         没留下（没有事实、没有新建或关联的实体），派生层里只有它们的片段与摘要单元、任务。删掉
-        这些，连同这个空间里被取代的任务（重放时清空派生层，它们也不在了），返回删掉的摘要单元
-        ID，供调用方删向量。在调用方的事务里调用（这里的事务是保存点）。"""
+        这些，连同这个空间里被取代的任务（重放时清空派生层，它们也不在了），别的已完成任务的
+        失败次数清零（与重放相同），返回删掉的摘要单元 ID，供调用方删向量。在调用方的事务里
+        调用（这里的事务是保存点）。"""
         ids = list(dict.fromkeys(session_ids))
         removed: list[str] = []
         with self.transaction() as conn:
@@ -1439,6 +1440,14 @@ class MemoryDB:
                     )
             conn.execute(
                 "DELETE FROM jobs WHERE space_id = ? AND status = 'superseded'", (space_id,)
+            )
+            # 别的会话已完成的任务：重放重新登记、重新执行（命中缓存），失败过几次的记录随之
+            # 清零；内容审核跳过的保留原来的结局（write.consolidate._keeps_outcome）。与重放一致
+            conn.execute(
+                "UPDATE jobs SET attempts = 0, error = NULL WHERE space_id = ? AND status = 'done'"
+                " AND (attempts != 0 OR error IS NOT NULL)"
+                " AND COALESCE(json_extract(stats, '$.skipped'), '') != 'content_filter'",
+                (space_id,),
             )
         return removed
 

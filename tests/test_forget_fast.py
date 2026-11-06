@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import time
@@ -287,3 +288,109 @@ def test_a_space_with_a_pending_job_still_replays(
         m.add("I like cake", user_id=SPACE, timestamp=START + timedelta(days=30))  # 不等巩固
         assert m.system.db.job_counts(SPACE).get("pending") == 1
         assert replays(m, lambda: m.system.forget(SPACE, session_ids=[sessions[1]]))
+
+
+def test_retried_jobs_match_the_replay(
+    tmp_path: Path, n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """第七轮复审：别的会话的任务失败过几次才完成（attempts 不是 0）时，重放重新登记、重新执行
+    它们，失败次数清零；快速路径同样清零。内容审核跳过的任务两边都保留原来的结局。以前快速路径
+    留着失败次数，与重放只差在任务表的这一列。"""
+
+    def act(m: Memory, sessions: list[str]) -> None:
+        conn = m.system.db._conn
+        conn.execute("UPDATE jobs SET attempts = 2 WHERE space_id = ?", (SPACE,))
+        (job,) = [j for j in m.system.db.get_jobs(SPACE) if j["session_id"] == sessions[4]]
+        stats = json.dumps({**job["stats"], "skipped": "content_filter"}, ensure_ascii=False)
+        conn.execute(
+            "UPDATE jobs SET attempts = 1, error = 'filtered', stats = ? WHERE id = ?",
+            (stats, job["id"]),
+        )
+        conn.commit()
+        m.system.forget(SPACE, session_ids=[sessions[1]])
+
+    texts = [*HISTORY, "smalltalk about snow"]
+    fast, slow, fast_runs, slow_runs = fast_vs_replay(
+        tmp_path, n3_settings, fake_api, model, texts, act
+    )
+    assert fast_runs == [0] and slow_runs == [1]
+    assert fast == slow
+    attempts = sorted((job[5], job[6]) for job in fast["jobs"])
+    assert attempts == [(0, None)] * 3 + [(1, "filtered")]
+
+
+@pytest.mark.parametrize(
+    "case", ["cited_fact", "content_filter", "stale", "rebuild_pending", "cited_round", "open"]
+)
+def test_each_guard_keeps_the_replay(
+    tmp_path: Path, n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, case: str
+) -> None:
+    """第七轮复审：_inert_sessions 的每一条都要成立才走快速路径，任何一条单独不成立时照旧重放
+    （以前只有一部分有测试：去掉其余几条，整个测试集也不失败）。都只差这一条：
+    - cited_fact：有事实出自要删的发言（任务统计却写着 0 条）；
+    - content_filter：要删的会话是内容审核跳过的；
+    - stale：派生记忆过期了（换了抽取版本等）；
+    - rebuild_pending：之前的重建没做完；
+    - cited_round：留下的发言引用过要删的片段（不沿引用扩散）；
+    - open：要删的会话巩固过、又在进行中（重放时跳过它）。"""
+    from cuemem.write.consolidate import REBUILD_PENDING
+
+    fake_api.chat_replies = [model]
+    with opened(_settings(n3_settings, tmp_path / "a"), fake_api) as m:
+        sessions = history(m, HISTORY)
+        db, conn = m.system.db, m.system.db._conn
+        doomed = sessions[1]  # 有摘要的闲聊
+        follow = True
+        if case == "cited_fact":
+            doomed = sessions[2]  # I like jazz
+            conn.execute(
+                "UPDATE jobs SET stats = json_set(stats, '$.facts', 0) WHERE session_id = ?",
+                (doomed,),
+            )
+        elif case == "content_filter":
+            conn.execute(
+                "UPDATE jobs SET stats = json_set(stats, '$.skipped', 'content_filter')"
+                " WHERE session_id = ?",
+                (doomed,),
+            )
+        elif case == "stale":
+            m.system.consolidator.stale = lambda space_id: True  # type: ignore[method-assign]
+        elif case == "rebuild_pending":  # 它也让 stale 成立：单看这一条
+            db.set_meta(f"consolidation:{SPACE}", REBUILD_PENDING)
+            m.system.consolidator.stale = lambda space_id: False  # type: ignore[method-assign]
+        elif case == "cited_round":
+            [chat] = db.list_units(SPACE, kinds=["round"], session_ids=[doomed])
+            survivor = db.get_turns(SPACE, sessions[3])[0].id
+            db.add_provenance(SPACE, survivor, [chat.id])
+            follow = False
+        elif case == "open":
+            m.system.open_session(SPACE, doomed)
+        conn.commit()
+        assert replays(
+            m, lambda: m.system.forget(SPACE, session_ids=[doomed], follow_citations=follow)
+        )
+
+
+def test_a_lost_speaker_keeps_the_replay(
+    tmp_path: Path, n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """第七轮复审：要删的会话是某个说话人仅有的发言时，删掉之后说话人变了（核心记忆按他们挑
+    实体），照旧重放。"""
+    fake_api.chat_replies = [model]
+    with opened(_settings(n3_settings, tmp_path / "a"), fake_api) as m:
+        history(m, HISTORY)
+        out = m.add(
+            [{"role": "user", "name": "Bob", "content": "smalltalk from Bob"}],
+            user_id=SPACE,
+            timestamp=START + timedelta(days=30),
+            wait=True,
+        )
+        assert m.system.db.speakers(SPACE) == ["Bob"]
+        # 只差说话人这一条：统计里不算新建的实体（例如说话人的实体在别处已经建过）
+        conn = m.system.db._conn
+        conn.execute(
+            "UPDATE jobs SET stats = json_set(stats, '$.entities_created', 0) WHERE session_id = ?",
+            (out["session_id"],),
+        )
+        conn.commit()
+        assert replays(m, lambda: m.system.forget(SPACE, session_ids=[out["session_id"]]))
