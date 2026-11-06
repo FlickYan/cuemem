@@ -203,6 +203,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (space_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_media_space ON media (space_id, source_turn_id);
+CREATE INDEX IF NOT EXISTS idx_add_keys_created ON add_keys (created_at);
 """
 
 # 派生数据所在的表：forget 与重建时整体清空，再从原始轮次重放
@@ -794,9 +795,12 @@ class MemoryDB:
         session_id: str,
         turn_ids: Sequence[str],
     ) -> None:
-        """记下一次带键的写入（在调用方写发言的事务里）。先删掉超过 ADD_KEY_TTL 的行（全部空间）；
-        再用普通的 INSERT：同一个键已经由并发的另一次写入提交时 sqlite3.IntegrityError，调用方的
-        事务整个回滚（连同这次的发言与向量），再按 add_key_lookup 返回先提交的那次。"""
+        """记下一次带键的写入（在调用方写发言的事务里）。先删掉超过 ADD_KEY_TTL 的行（全部空间，
+        按 idx_add_keys_created 只找过期的行：以前每次扫一遍整张表，50 万个键时约 33 毫秒，持着
+        写锁，第七轮体检）。每次都删，不隔一段时间才删：同一个键过期之后再用时，过期的那一行得先
+        删掉，否则下面的 INSERT 撞上主键、这次写入整个回滚。再用普通的 INSERT：同一个键已经由
+        并发的另一次写入提交时 sqlite3.IntegrityError，调用方的事务整个回滚（连同这次的发言与
+        向量），再按 add_key_lookup 返回先提交的那次。"""
         now = datetime.now()
         conn.execute(
             "DELETE FROM add_keys WHERE created_at < ?", ((now - ADD_KEY_TTL).isoformat(),)

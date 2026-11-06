@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +276,48 @@ def test_requeue_after_clearing_grows_linearly_with_the_sessions(tmp_path: Path)
     assert "idx_jobs_session" in names
     small, large = steps("a", 600), steps("b", 1200)
     assert large < 2.5 * small  # 线性：会话翻倍，指令数约翻倍（以前约是 4 倍）
+    db.close()
+
+
+def test_expired_idempotency_keys_are_found_by_an_index(tmp_path: Path) -> None:
+    """add_key_insert 每次删掉过期的键：created_at 上有索引，只找过期的行（第七轮体检）。以前
+    每次扫一遍整张 add_keys，键多时每个带键的 add 都持着写锁扫一遍。已有的库打开时自动补上，
+    SCHEMA_VERSION 不变。"""
+    path = tmp_path / "memory.sqlite"
+    MemoryDB(path).close()
+    conn = sqlite3.connect(path)  # 模拟升级前的库：没有这个索引
+    conn.execute("DROP INDEX IF EXISTS idx_add_keys_created")
+    conn.close()
+    db = MemoryDB(path)
+    names = {row[1] for row in db._conn.execute("PRAGMA index_list(add_keys)")}
+    assert "idx_add_keys_created" in names
+    plan = " ".join(
+        row[-1]
+        for row in db._conn.execute(
+            "EXPLAIN QUERY PLAN DELETE FROM add_keys WHERE created_at < ?", ("x",)
+        )
+    )
+    assert "USING INDEX idx_add_keys_created" in plan
+    db.close()
+
+
+def test_an_expired_idempotency_key_can_be_used_again(tmp_path: Path) -> None:
+    """过期的键再用：add_key_insert 先删掉过期的那一行，INSERT 不撞主键，查到的是新的一次。"""
+    db = MemoryDB(tmp_path / "memory.sqlite")
+    stale = (datetime.now() - sqlite_module.ADD_KEY_TTL - timedelta(hours=1)).isoformat()
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO add_keys VALUES ('sp', 'k', 'old', 's0', '[]', ?)",
+            (stale,),
+        )
+    assert db.add_key_lookup("sp", "k") is None
+    with db.transaction() as conn:
+        db.add_key_insert(conn, "sp", "k", "new", "s1", ["t1"])
+    assert db.add_key_lookup("sp", "k") == {
+        "request_hash": "new",
+        "session_id": "s1",
+        "turn_ids": ["t1"],
+    }
     db.close()
 
 
