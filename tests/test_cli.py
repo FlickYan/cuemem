@@ -638,6 +638,23 @@ def served(isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_servers_bound_the_graceful_shutdown(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """serve 与 proxy 收到 SIGTERM 后等进行中的请求最多 GRACEFUL_SHUTDOWN_S 秒（以前不限：一个
+    流式响应就能拖住收尾，过了 docker-compose.yml 的 stop_grace_period 被 SIGKILL，见第七轮体检
+    P8）。"""
+    from cuemem.cli import GRACEFUL_SHUTDOWN_S
+
+    options: list[dict[str, Any]] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: options.append(kwargs))
+    result = runner.invoke(app, [*command, "--host", "127.0.0.1"])
+    assert result.exit_code == 0, result.output
+    [kwargs] = options
+    assert kwargs["timeout_graceful_shutdown"] == GRACEFUL_SHUTDOWN_S == 20
+
+
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_non_loopback_bind_needs_a_token(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:

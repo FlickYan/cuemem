@@ -243,3 +243,21 @@ def test_compat_job_runs_unlocked_versions_weekly_and_is_not_required() -> None:
     [checks] = [r for r in ruleset["rules"] if r["type"] == "required_status_checks"]
     required = {c["context"] for c in checks["parameters"]["required_status_checks"]}
     assert not required & {"compat", *cells}, required
+
+
+def test_compose_stop_grace_covers_the_shutdown() -> None:
+    """docker compose 停止 cuemem 时，SIGTERM 之后等 stop_grace_period 才 SIGKILL（不写是 10 秒）。
+    收尾要等进行中的请求（serve/proxy 的 GRACEFUL_SHUTDOWN_S）、重试记忆代理缓冲着的写回（再留 30
+    秒）、等后台巩固（ConsolidationWorker.stop_timeout_s）：以前没写，收尾到一半就被杀掉，缓冲的
+    写回丢了，还没提交的写入存下的原图也成了没有记录的文件（第七轮体检 P8）。"""
+    from unittest.mock import MagicMock
+
+    from cuemem.cli import GRACEFUL_SHUTDOWN_S
+    from cuemem.write.consolidate import ConsolidationWorker
+
+    compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text("utf-8"))
+    grace = compose["services"]["cuemem"].get("stop_grace_period", "10s")
+    match = re.fullmatch(r"(\d+)s", str(grace))
+    assert match, grace
+    worker = ConsolidationWorker(MagicMock())
+    assert int(match.group(1)) >= worker.stop_timeout_s + GRACEFUL_SHUTDOWN_S + 30

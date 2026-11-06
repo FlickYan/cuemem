@@ -876,6 +876,10 @@ UNKNOWN_MODEL_HELP = (
     "记忆代理收到模型目录里没有的 model 时：remap 改用 agent 角色的模型（响应头 X-CueMem-Model "
     "写明，日志里记一条警告）；reject 返回 400。默认取配置 proxy.unknown_model（remap）"
 )
+# serve 与 proxy 收到 SIGTERM 后，等进行中的请求（例如流式的 /v1 响应）最多这么多秒，之后才接着
+# 收尾（记忆代理重试缓冲着的写回、结束会话、等后台巩固最多 ConsolidationWorker.stop_timeout_s）。
+# 以前不限：一个不结束的连接拖住收尾，docker-compose.yml 的 stop_grace_period 一过就被 SIGKILL
+GRACEFUL_SHUTDOWN_S = 20
 IDLE_HELP = (
     "会话闲置多少分钟后结束并交给抽取：界面与 /api 的会话、/api/v1 的 run、/v1 记忆代理的会话。"
     "之后再往 /api 的会话发消息是 404，界面开一个新的会话，/api/v1 的 run 再 add 时重新打开"
@@ -1083,7 +1087,13 @@ def serve(
                 _no_auth_hosts_note(hosts)
             for line in _loose_modes():
                 console.print(line)
-            uvicorn.run(app_, host=host, port=port, log_level="warning")
+            uvicorn.run(
+                app_,
+                host=host,
+                port=port,
+                log_level="warning",
+                timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+            )
     finally:
         proxy.close_all()
         service.close()
@@ -1170,7 +1180,7 @@ def proxy(
             allow_ip_hosts=hosts.ip_literals,
             max_body_bytes=max_body_bytes,
         )
-        uvicorn.run(app_, host=host, port=port)
+        uvicorn.run(app_, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
     finally:
         memory_proxy.close_all()
         system.close()
