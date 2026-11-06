@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 import httpx2
 from pydantic import BaseModel, Field
@@ -70,7 +70,13 @@ from cuemem.read.plan import QueryPlan, rule_plan
 from cuemem.read.probe import Probe
 from cuemem.read.reader import Reader
 from cuemem.read.rerank import Reranker
-from cuemem.store.files import opening, private_dirs, storage_dirs
+from cuemem.store.files import (
+    lock_database,
+    opening,
+    private_dirs,
+    storage_dirs,
+    unlock_database,
+)
 from cuemem.store.media import MediaStore
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
@@ -397,9 +403,11 @@ class MemorySystem:
         reranker: Reranker | None = None,
         media: MediaStore | None = None,
         image_embedder: ImageEmbedder | None = None,
+        db_lock: IO[str] | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
+        self._db_lock = db_lock  # from_settings 给数据库加的锁（见 lock_database），close 时放掉
         self.vectors = vectors
         vectors.owned_units = db.some_unit_ids  # 旧名字的集合按数据库核对归属（见 collection_name）
         self.embedder = embedder
@@ -472,6 +480,9 @@ class MemorySystem:
         # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
         # 关掉已经打开的：以前账本打开了、数据库打不开时账本的连接一直开着（长期运行的 SDK 进程）
         with ExitStack() as opened:
+            # 先拿数据库的锁：另一个进程开着它时什么都不打开，本地模式下也先于 Qdrant 的锁报错
+            db_lock = lock_database(paths.db)
+            opened.callback(unlock_database, db_lock)
             with opening(paths.ledger):
                 ledger = Ledger(paths.ledger)
             opened.callback(ledger.close)
@@ -519,6 +530,7 @@ class MemorySystem:
                 image_embedder=build_image_embedder(
                     settings, ledger=ledger, http_client=http_client, cache=cache
                 ),
+                db_lock=db_lock,
             )
             opened.pop_all()  # 都打开了：之后由 close 关
         return system
@@ -2367,6 +2379,8 @@ class MemorySystem:
                 image.cache.close()
         if self._owns_ledger:
             self.ledger.close()
+        lock, self._db_lock = self._db_lock, None
+        unlock_database(lock)  # 最后放：之后另一个进程才能打开这个数据库
 
     def __enter__(self) -> MemorySystem:
         return self

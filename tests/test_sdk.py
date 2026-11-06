@@ -7,6 +7,7 @@ import base64
 import io
 import itertools
 import json
+import os
 import re
 import sqlite3
 import tempfile
@@ -2473,3 +2474,75 @@ def test_data_path_blocked_by_a_file_raises_database_open_error(
     paths = offline_settings.paths.model_copy(update={"db": blocker / "cuemem.sqlite"})
     with pytest.raises(DatabaseOpenError, match="plain-file"):
         Memory(offline_settings.model_copy(update={"paths": paths}), background=False)
+
+
+def _second_vector_dir(settings: Settings) -> Settings:
+    """同一个数据库、另一个向量库目录：两个进程共用数据库、向量在 Qdrant 服务端时的样子
+    （本地模式的 Qdrant 锁挡不住它们）。"""
+    paths = settings.paths.model_copy(update={"qdrant": settings.paths.qdrant.parent / "qdrant-b"})
+    return settings.model_copy(update={"paths": paths})
+
+
+def test_second_system_on_one_database_is_refused(offline_settings: Settings) -> None:
+    """一个数据库同一时间只能有一个进程写：以前向量在服务端时第二个 Memory() 照样打开，接手第一个
+    还在写的会话（这里 B 的 add 把 A 进行中的 r1 登记成待抽取）。现在第二个打开者
+    StorageLockedError，说明拿着锁的进程；第一个关掉之后就能打开。"""
+    from cuemem.errors import StorageLockedError
+
+    first = Memory(offline_settings, background=False)
+    try:
+        first.open_run("r1", user_id="u")
+        first.add("I live in Berlin.", user_id="u", run_id="r1", infer=False)
+        with pytest.raises(StorageLockedError) as caught:
+            Memory(_second_vector_dir(offline_settings), background=False)
+        message = str(caught.value)
+        assert str(offline_settings.paths.db) in message and f"pid {os.getpid()}" in message
+        assert "CUEMEM_ALLOW_SHARED_DB=1" in message
+    finally:
+        first.close()
+    with Memory(_second_vector_dir(offline_settings), background=False) as second:
+        second.add("Hello", user_id="u", infer=False)
+
+
+def test_database_lock_holds_across_processes(offline_settings: Settings, tmp_path: Path) -> None:
+    """另一个进程也拿不到这把锁（flock），报错里是这个进程的 pid。"""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from cuemem.errors import StorageLockedError\n"
+        "from cuemem.store.files import lock_database\n"
+        "try:\n"
+        "    lock_database(Path(sys.argv[1]))\n"
+        "except StorageLockedError as exc:\n"
+        "    print(exc)\n"
+        "else:\n"
+        "    print('locked')\n"
+    )
+    with Memory(offline_settings, background=False):
+        out = subprocess.run(
+            [sys.executable, "-c", script, str(offline_settings.paths.db)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            check=True,
+            env={k: v for k, v in os.environ.items() if k != "CUEMEM_ALLOW_SHARED_DB"},
+        ).stdout
+    assert "正被另一个进程使用" in out and f"pid {os.getpid()}" in out, out
+
+
+def test_shared_database_opt_out_warns(
+    offline_settings: Settings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """CUEMEM_ALLOW_SHARED_DB=1：不加锁，两个都打开，并记一条警告说明风险。"""
+    monkeypatch.setenv("CUEMEM_ALLOW_SHARED_DB", "1")
+    with (
+        caplog.at_level("WARNING", logger="cuemem.store.files"),
+        Memory(offline_settings, background=False),
+        Memory(_second_vector_dir(offline_settings), background=False),
+    ):
+        pass
+    warned = [r.getMessage() for r in caplog.records if "CUEMEM_ALLOW_SHARED_DB" in r.getMessage()]
+    assert len(warned) == 2 and "reindex" in warned[0]

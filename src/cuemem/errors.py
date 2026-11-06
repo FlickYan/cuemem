@@ -60,7 +60,9 @@ class IdempotencyConflictError(CueMemError):
 
 
 class StorageLockedError(CueMemError):
-    """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
+    """数据库或本地模式的向量库已被另一个进程打开：一个数据库同一时间只允许一个进程写
+    （store.files.lock_database，向量在 Qdrant 服务端时也一样），Qdrant 本地模式同一时间只允许
+    一个进程访问。"""
 
 
 class DatabaseOpenError(CueMemError, sqlite3.OperationalError):

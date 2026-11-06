@@ -12,16 +12,23 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
+import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
-from cuemem.errors import DatabaseOpenError
+from cuemem.errors import DatabaseOpenError, StorageLockedError
 
 if TYPE_CHECKING:
     from cuemem.config import Settings
+
+logger = logging.getLogger(__name__)
+
+# 设为 1 时 lock_database 不加锁（几个进程共用一个数据库，风险自负，见 lock_database）
+SHARED_DB_ENV = "CUEMEM_ALLOW_SHARED_DB"
 
 
 def private_dirs(*dirs: Path) -> None:
@@ -71,3 +78,68 @@ def opening(path: Path) -> Iterator[None]:
         yield
     except (sqlite3.OperationalError, OSError) as exc:
         raise DatabaseOpenError(f"{path} 打不开（{exc}）：检查目录权限与磁盘空间") from exc
+
+
+def lock_database(db: Path) -> IO[str] | None:
+    """给数据库加独占锁（MemorySystem.from_settings，第七轮体检）：数据库旁边的 <数据库>.lock，
+    不等待，拿不到时 StorageLockedError，说明拿着锁的进程（pid 与命令，写在锁文件里）。
+
+    一个数据库同一时间只能有一个进程写（D-068 起的前提）：接手进行中的会话、reindex 删孤儿向量、
+    分配发言序号与重新读令牌文件都按这个前提来。以前只有 Qdrant 本地模式的锁挡着；用 Qdrant
+    服务端（docker-compose 的默认）时第二个进程（cuemem mcp、reindex、SDK 的 Memory()）照样
+    打开，接手第一个进程还在写的会话、把它刚写的向量当孤儿删掉。锁按数据库文件而不是数据目录：
+    paths.db 与 paths.qdrant 可以分开配置。只读的命令（export、spaces、doctor、keys）不经过
+    from_settings，不加锁。
+
+    返回拿着锁的文件，关掉记忆系统时交给 unlock_database；环境变量 CUEMEM_ALLOW_SHARED_DB=1 时
+    不加锁、记一条警告，返回 None。flock 在同一进程里的两个文件描述符之间也互斥：同一进程再打开
+    一次也被拒绝，与 Qdrant 本地模式相同。NFS 上 flock 可能不起作用。"""
+    if os.environ.get(SHARED_DB_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        logger.warning(
+            "%s=1：不给数据库 %s 加锁。几个进程同时写它时，一个进程会接手另一个进程进行中的会话、"
+            "reindex 删掉另一个进程刚写的向量、同一会话的发言序号相撞",
+            SHARED_DB_ENV,
+            db,
+        )
+        return None
+    import portalocker
+
+    path = db.with_name(db.name + ".lock")
+    with opening(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8")
+    flags = portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING
+    try:
+        portalocker.lock(handle, flags)
+    except portalocker.exceptions.LockException as exc:
+        try:  # 拿着锁的进程写下的 pid 与命令；读不出（正好在写）时不说
+            pid, _, command = handle.read().strip().partition("\t")
+        except (OSError, ValueError):
+            pid = command = ""
+        finally:
+            handle.close()
+        holder = f"（pid {pid}，{command}）" if pid else ""
+        raise StorageLockedError(
+            f"数据库 {db} 正被另一个进程使用{holder}：先停掉它，或者通过 MemoryClient、HTTP"
+            "（/api/v1、/mcp）连到那个进程；确实要几个进程共用时设置 "
+            f"{SHARED_DB_ENV}=1（风险自负）"
+        ) from exc
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\t{' '.join(sys.argv[:2])}\n")
+        handle.flush()
+    except OSError:  # 只是给别的进程看的说明，写不进去也照样拿着锁
+        pass
+    return handle
+
+
+def unlock_database(handle: IO[str] | None) -> None:
+    """放掉 lock_database 加的锁（锁文件留着：删掉它时另一个进程可能正要锁它）。"""
+    if handle is None:
+        return
+    import portalocker
+
+    with contextlib.suppress(OSError, ValueError):
+        portalocker.unlock(handle)
+    handle.close()
