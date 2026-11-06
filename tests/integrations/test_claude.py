@@ -995,7 +995,16 @@ def _v1(memory: Memory) -> TestClient:
 
 
 @pytest.mark.parametrize(
-    "how", ["reset", "delete_all", "delete_fact", "v1_delete_all", "v1_delete_fact"]
+    "how",
+    [
+        "reset",
+        "delete_all",
+        "delete_fact",
+        "delete_many",
+        "v1_delete_all",
+        "v1_delete_fact",
+        "v1_batch_delete",
+    ],
 )
 def test_deleting_through_cuemem_removes_the_file_text_at_once(memory: Memory, how: str) -> None:
     """第七轮体检：reset、delete_all、delete（事实）与 /api/v1 的 DELETE 当场删掉记忆工具存的
@@ -1014,6 +1023,14 @@ def test_deleting_through_cuemem_removes_the_file_text_at_once(memory: Memory, h
         memory.delete_all(user_id="alice")
     elif how == "delete_fact":
         assert memory.delete(fact["id"])["message"] == "Memory deleted"
+    elif how == "delete_many":  # 预演什么都不删，文件原文也还在
+        assert memory.delete_many([fact["id"]], dry_run=True)["deleted"] == [fact["id"]]
+        assert canary_left(store)
+        assert memory.delete_many([fact["id"]])["deleted"] == [fact["id"]]
+    elif how == "v1_batch_delete":
+        with _v1(memory) as http:
+            body = {"memory_ids": [fact["id"]]}
+            assert http.post("/api/v1/memories/batch-delete", json=body).status_code == 200
     else:
         with _v1(memory) as http:
             url = "/api/v1/memories" + ("?user_id=alice" if how == "v1_delete_all" else "")
