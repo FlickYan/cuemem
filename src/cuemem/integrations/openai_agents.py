@@ -51,7 +51,8 @@ idle_minutes（默认 30 分钟）或 close_sessions() 时交给后台抽取，�
 
 一问一答为一轮：用户消息先留着，等助手的文字回复来了一起写入；同一轮里工具调用之后的回复并进
 这一轮。模型没有回应过的用户消息（输入护栏拦下的、调用出错的）不写进长期记忆。写不进去（向量
-接口暂时不可用等）时留着，下一批消息或 end() 时再写，不影响对话。
+接口暂时不可用等）时留着，下一批消息或 end() 时再写，不影响对话；最多留 MAX_UNSAVED 批、
+MAX_UNSAVED_BYTES，超出的丢掉最早的、记警告。
 
 遗忘（D-021）：pop_item 撤回的消息、clear_session 清掉的整段对话（各段都算），在长期记忆里也一并
 遗忘：删原始日志、按剩下的日志重建派生记忆。先在 CueMem 里遗忘，成功了才动内层会话，失败时抛出、
@@ -106,6 +107,7 @@ from cuemem.evidence import (
     forget_summary,
     format_listing,
     in_context_rounds,
+    payload_size,
     recall_evidence,
     recall_listing,
     resolve_ids,
@@ -128,6 +130,11 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+# 写不进去、留着重试的几批最多这么多批、这么大（与记忆代理的 MAX_UNSAVED、MAX_UNSAVED_BYTES
+# 相同）：长时间故障而对话一直在进行时，超出的丢掉最早的
+MAX_UNSAVED = 100
+MAX_UNSAVED_BYTES = 32 * 1024 * 1024
 
 # 与 MCP 工具（api/mcp.py）的说明逐字相同
 RECALL_DESCRIPTION = (
@@ -820,7 +827,7 @@ class CueMemSession:
         不可用）时，这一批与之后的都留着，下一批或 end() 时再写，异常照常抛出。在线写入要么全写、
         要么不写（R1），以前丢下它们就永远丢了：内层会话的历史不会再写一遍。重试也没用的丢掉、
         记警告，接着写后面的；之后这个空间遗忘过发言（例如别处删了这个用户的记忆）时也丢掉：
-        它们是遗忘之前说的。"""
+        它们是遗忘之前说的。留着的超过 MAX_UNSAVED 批或 MAX_UNSAVED_BYTES 时丢掉最早的（_trim）。"""
         system = self.memory.system
         if batch:
             epoch = system.db.turn_epoch(self.space)
@@ -843,6 +850,7 @@ class CueMemSession:
                     )
                 except Exception as exc:
                     if worth_retrying(exc):
+                        self._trim()  # 只限写不进去、还留着的
                         raise
                     logger.warning(
                         "CueMem could not store %d message(s) of session %s and dropped them (%s).",
@@ -861,6 +869,28 @@ class CueMemSession:
                 self._touch(segment)
                 if head.merge and ids:  # 发言已经写进去了：并不进这一轮也不再重写
                     _merge_round(system, self.space, segment, ids[0])
+
+    def _trim(self) -> None:
+        """留着重试的超过 MAX_UNSAVED 批或 MAX_UNSAVED_BYTES 时丢掉最早的，最新的一批总留着
+        （调用方持有 self._lock）。批里的消息会被 _forget_item 删掉，大小每次现算。"""
+        sizes = [payload_size([p.message for p in u.batch]) for u in self._unsaved]
+        total, dropped = sum(sizes), 0
+        while len(self._unsaved) > 1 and (
+            len(self._unsaved) > MAX_UNSAVED or total > MAX_UNSAVED_BYTES
+        ):
+            dropped += len(self._unsaved[0].batch)
+            total -= sizes.pop(0)
+            del self._unsaved[0]
+            record_event("agents_mirror_dropped", space=self.space, reason="backlog")
+        if dropped:
+            logger.warning(
+                "CueMem could not store %d message(s) of session %s for a long time and dropped "
+                "them (more than %d batches or %d bytes were waiting).",
+                dropped,
+                self.session_id,
+                MAX_UNSAVED,
+                MAX_UNSAVED_BYTES,
+            )
 
     def _open_segment(self) -> str:
         """现在写入的段：这个对象的段还在进行就接着写；同一对话的另一个对象（例如按请求新建的）

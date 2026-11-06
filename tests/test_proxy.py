@@ -649,6 +649,79 @@ def test_write_backs_that_cannot_succeed_are_dropped(
     assert len(dropped) == 1 and "store 4 message(s)" in dropped[0], dropped
 
 
+def test_write_backs_kept_during_an_outage_are_capped(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """第七轮体检 P14：故障期间一个会话留着重试的写回最多 MAX_UNSAVED 次：超出时丢掉最早的，
+    记 proxy_write_dropped（reason=backlog）与一条警告。以前一直留着，长时间故障而调用方一直
+    在说话时内存一直长（每次请求可以有 64 MiB 的图片），最后服务被杀、留着的全丢。"""
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
+    )
+    monkeypatch.setattr("cuemem.api.proxy.MAX_UNSAVED", 3)
+    outage = Outage(system, monkeypatch)
+    session = {"X-CueMem-Session": "s1"}
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        for i in range(5):
+            assert chat(client, f"note {i}", user="alice", headers=session).status_code == 200
+    [run] = proxy._runs.values()
+    assert [u.messages[0]["content"] for u in run.unsaved] == ["note 2", "note 3", "note 4"]
+    assert run.unsaved_bytes == sum(u.size for u in run.unsaved) > 0
+    backlog = [d for kind, d in events if kind == "proxy_write_dropped"]
+    assert backlog == [{"space": "alice", "reason": "backlog"}] * 2
+    warned = [r.getMessage() for r in caplog.records if "for a long time" in r.getMessage()]
+    assert len(warned) == 2 and "store 2 message(s) of proxy session s1" in warned[0]
+
+    outage.status = None
+    chat(client, "note 5", user="alice", headers=session)
+    assert [t.text for t in system.db.get_turns("alice", "s1") if t.role == "user"] == [
+        "note 2",
+        "note 3",
+        "note 4",
+        "note 5",
+    ]
+    assert run.unsaved == [] and run.unsaved_bytes == 0
+
+
+def test_write_backs_kept_during_an_outage_are_capped_by_size(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """留着的写回也按大小限制（MAX_UNSAVED_BYTES，图片按 data URL 的长度算）：只按次数限制时
+    100 次 64 MiB 的请求就是 6.4 GB。比上限还大的一次照样留着：单个请求已经由请求体上限限住。"""
+    image = red_png_url()
+
+    def content(i: int) -> list[dict[str, Any]]:
+        return [
+            {"type": "text", "text": f"photo {i}"},
+            {"type": "image_url", "image_url": {"url": image}},
+        ]
+
+    one = len("photo 0") + len(image) + len("Happy to help, Alice!")
+    monkeypatch.setattr("cuemem.api.proxy.MAX_UNSAVED_BYTES", 2 * one + 1)
+    Outage(system, monkeypatch)
+    session = {"X-CueMem-Session": "s1"}
+    for i in range(4):
+        assert chat(client, content(i), user="alice", headers=session).status_code == 200
+    [run] = proxy._runs.values()
+    assert [u.messages[0]["content"][0]["text"] for u in run.unsaved] == ["photo 2", "photo 3"]
+    assert [u.size for u in run.unsaved] == [one, one] and run.unsaved_bytes == 2 * one
+
+    monkeypatch.setattr("cuemem.api.proxy.MAX_UNSAVED_BYTES", 10)
+    chat(client, content(4), user="alice", headers=session)
+    assert [u.messages[0]["content"][0]["text"] for u in run.unsaved] == ["photo 4"]
+    assert run.unsaved_bytes == one
+
+
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）
 WORTH_RETRYING: list[tuple[BaseException, bool]] = [
     (EmbeddingAPIError("no balance", status=402), True),

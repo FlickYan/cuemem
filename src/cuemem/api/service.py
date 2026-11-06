@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from bisect import bisect_right
-from collections.abc import Callable, Iterable, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,13 +26,31 @@ from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import Entity, SessionIn, TurnIn
 from cuemem.core.types import RecallMode, Router, Scenario
-from cuemem.errors import CueMemError
+from cuemem.errors import CueMemError, SessionLimitError
 from cuemem.evidence import fact_state, recall_listing, resolve_ids
 from cuemem.memory import ForgetReport, MemorySystem
 
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
 
 logger = logging.getLogger(__name__)
+
+MAX_OPEN_SESSIONS_ENV = "CUEMEM_MAX_OPEN_SESSIONS"
+MAX_OPEN_SESSIONS = 64  # 一个记忆空间同时进行中的对话会话（ChatService.start）
+
+
+def open_session_limit(environ: Mapping[str, str] | None = None) -> int:
+    """环境变量 CUEMEM_MAX_OPEN_SESSIONS 给出的、一个记忆空间同时进行中的对话会话数的上限；没设
+    或是空的时默认 64。不是正整数时 CueMemError（cuemem serve 打印原因、退出码 1）。"""
+    env = os.environ if environ is None else environ
+    raw = (env.get(MAX_OPEN_SESSIONS_ENV) or "").strip()
+    if not raw:
+        return MAX_OPEN_SESSIONS
+    if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
+        raise CueMemError(
+            f"{MAX_OPEN_SESSIONS_ENV} 要是正整数（会话数，默认 {MAX_OPEN_SESSIONS}），"
+            f"现在是 {raw!r}"
+        )
+    return int(raw)
 
 
 @dataclass
@@ -45,7 +65,9 @@ class SessionInfo:
 class ChatService:
     """clock：会话最后一次活动的时间用的时钟（close_idle 据此判断闲置，测试里可以换）。
     idle_minutes：会话闲置多久由 HTTP 应用的清理线程结束（create_app 设置；None 是不结束），
-    只用于说明。"""
+    只用于说明。
+    max_open_sessions：一个记忆空间同时进行中的会话数的上限（见 start）；不给时读环境变量
+    CUEMEM_MAX_OPEN_SESSIONS（默认 64）。"""
 
     def __init__(
         self,
@@ -55,7 +77,11 @@ class ChatService:
         catalog: Catalog | None = None,
         default_space: str = "default",
         clock: Callable[[], float] = time.monotonic,
+        max_open_sessions: int | None = None,
     ) -> None:
+        self.max_open_sessions = (
+            max_open_sessions if max_open_sessions is not None else open_session_limit()
+        )
         self.system = system
         self.agent = agent
         self.catalog = catalog
@@ -65,6 +91,7 @@ class ChatService:
         self._clock = clock
         self._seen: dict[str, float] = {}  # 会话 → 最后一次活动（开始、发消息）的时刻
         self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间（见 start）
+        self._starting: Counter[str] = Counter()  # 空间 → 正在开（还没登记）的会话数
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的巩固在后台完成
 
@@ -87,6 +114,7 @@ class ChatService:
                 "pip 安装的包里没有。改用通用助手（cuemem serve --scenario plain，"
                 '代码里 scenario="plain"），或用 catalog_path 指定商品目录'
             )
+        limit = open_session_limit()  # 写错时在打开记忆系统之前报错
         system = MemorySystem.from_settings(settings, http_client=http_client)
         catalog = None
         persona: Persona | None = None
@@ -98,7 +126,9 @@ class ChatService:
             persona = SHOP_PERSONA
             tools = shop_tools(catalog)
         agent = Agent(system, persona=persona, tools=tools, router=router, lam=lam)
-        return cls(system, agent, catalog=catalog, default_space=default_space)
+        return cls(
+            system, agent, catalog=catalog, default_space=default_space, max_open_sessions=limit
+        )
 
     # ---------- 会话 ----------
 
@@ -109,17 +139,52 @@ class ChatService:
         at: datetime | None = None,
         session_id: str | None = None,
     ) -> ChatSession:
+        """开始一个会话。这个空间进行中的会话已经有 max_open_sessions 个时，先结束其中最久没有
+        活动、一句话都没说过的那个（只去掉它的进行中标记，不抽取）；都说过话时 SessionLimitError
+        （HTTP 429），不结束别人的对话（那会让它提前、付费地抽取）。以前不限：一个令牌可以一直开
+        会话，每个都占着内存与一个进行中的标记，直到闲置 30 分钟才结束。"""
         space = space_id or self.default_space
         with self._lock:
+            idle = self._make_room(space)
             first = space not in self._adopted
             self._adopted.add(space)
-        if first:  # 之前的进程崩溃时还在进行中的会话交给抽取；接着写的那个会话除外
-            self.system.adopt_open(space, keep=[session_id] if session_id else [])
-        session = self.agent.start(space, at=at, session_id=session_id)
+            self._starting[space] += 1
+        try:
+            if idle is not None:
+                try:
+                    self.agent.end(idle)  # 没说过话：只去掉进行中的标记
+                except Exception:
+                    logger.warning("会话 %s 没能结束", idle.session_id, exc_info=True)
+            if first:  # 之前的进程崩溃时还在进行中的会话交给抽取；接着写的那个会话除外
+                self.system.adopt_open(space, keep=[session_id] if session_id else [])
+            session = self.agent.start(space, at=at, session_id=session_id)
+        finally:
+            with self._lock:
+                self._starting[space] -= 1
+                if not self._starting[space]:
+                    del self._starting[space]
         with self._lock:
             self.sessions[session.session_id] = session
             self._seen[session.session_id] = self._clock()
         return session
+
+    def _make_room(self, space: str) -> ChatSession | None:
+        """start 的上限（调用方持有 self._lock）：没到上限时 None；到了时取走最久没有活动、没说过
+        话、也没在回答的会话（调用方结束它），没有这样的会话时 SessionLimitError。"""
+        mine = [s for s in self.sessions.values() if s.space_id == space]
+        if len(mine) + self._starting[space] < self.max_open_sessions:
+            return None
+        empty = [s for s in mine if s.next_idx == 0 and not s.lock.locked()]
+        if not empty:
+            raise SessionLimitError(
+                f"记忆空间 {space} 已经有 {len(mine) + self._starting[space]} 个进行中的会话"
+                f"（上限 {self.max_open_sessions}，环境变量 {MAX_OPEN_SESSIONS_ENV}）：先结束"
+                "一个会话，或等闲置的会话被清理之后再开"
+            )
+        oldest = min(empty, key=lambda s: self._seen.get(s.session_id, 0.0))
+        self.sessions.pop(oldest.session_id)
+        self._seen.pop(oldest.session_id, None)
+        return oldest
 
     def get(self, session_id: str) -> ChatSession:
         with self._lock:

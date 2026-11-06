@@ -75,7 +75,7 @@ from cuemem.api.limits import (
 from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
-from cuemem.errors import CueMemError
+from cuemem.errors import CueMemError, SessionLimitError
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router
@@ -529,7 +529,10 @@ def create_app(
     @api.post("/api/sessions")
     def start(http: Request, request: StartRequest) -> SessionOut:
         _check_space(principal_of(http), request.space or service.default_space)
-        session = service.start(request.space, at=request.at)
+        try:
+            session = service.start(request.space, at=request.at)
+        except SessionLimitError as exc:  # 结束一个会话或等闲置的会话被清理（每分钟一次）
+            raise HTTPException(429, str(exc), headers={"Retry-After": "60"}) from exc
         return SessionOut(
             session_id=session.session_id, space=session.space_id, started_at=session.started_at
         )

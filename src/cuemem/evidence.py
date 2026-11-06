@@ -196,6 +196,24 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def payload_size(messages: Sequence[Mapping[str, Any]]) -> int:
+    """OpenAI 格式的消息大约占多少内存：文字与图片 URL（data URL 就是图片本身）的字符数之和。
+    记忆代理与 Agents 会话用它限制写不进去、留着重试的写回（见 proxy.MAX_UNSAVED_BYTES）。"""
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+            continue
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, Mapping):
+                continue
+            image = block.get("image_url")
+            url = image.get("url") if isinstance(image, Mapping) else image
+            total += len(block.get("text") or "") + (len(url) if isinstance(url, str) else 0)
+    return total
+
+
 # ---------- 已经在上下文里的轮 ----------
 
 

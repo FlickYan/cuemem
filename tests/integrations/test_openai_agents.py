@@ -655,6 +655,47 @@ def test_messages_that_could_not_be_stored_are_retried(
     assert [t.text for t in memory.system.db.get_turns("alice")] == ["Hello", "Hi."]
 
 
+def test_messages_kept_during_an_outage_are_capped(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """第七轮体检 P14：留着重试的几批最多 MAX_UNSAVED 批、MAX_UNSAVED_BYTES：超出时丢掉最早的，
+    记 agents_mirror_dropped（reason=backlog）与警告；写得进去时先写，只限还留着的。以前一直
+    留着，长时间故障而对话一直在进行时内存一直长。"""
+    from cuemem.integrations import openai_agents
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(openai_agents, "record_event", lambda kind, **d: events.append((kind, d)))
+    monkeypatch.setattr(openai_agents, "MAX_UNSAVED", 3)
+    embed = memory.system.embedder.embed
+    down = {"on": True}
+
+    def flaky(texts: Any, kind: Any) -> Any:
+        if down["on"] and kind == "document":
+            raise EmbeddingAPIError("HTTP 503", status=503)
+        return embed(texts, kind)
+
+    monkeypatch.setattr(memory.system.embedder, "embed", flaky)
+    agent = Agent(name="a", model=AgentScript([reply(f"Ok {i}.") for i in range(7)]))
+    session = CueMemSession("monday", memory, user_id="alice")
+    with caplog.at_level(logging.WARNING, logger="cuemem.integrations.openai_agents"):
+        for i in range(5):
+            run(agent, f"note {i}", session=session)
+    kept = [u.batch[0].message["content"] for u in session._unsaved]
+    assert kept == ["note 2", "note 3", "note 4"]
+    assert [d for kind, d in events if kind == "agents_mirror_dropped"] == [
+        {"space": "alice", "reason": "backlog"}
+    ] * 2
+    assert sum("for a long time" in r.getMessage() for r in caplog.records) == 2
+
+    monkeypatch.setattr(openai_agents, "MAX_UNSAVED_BYTES", 2 * len("note 2Ok 2.") + 1)
+    run(agent, "note 5", session=session)  # 按大小：只剩最近的两批
+    assert [u.batch[0].message["content"] for u in session._unsaved] == ["note 4", "note 5"]
+    down["on"] = False
+    run(agent, "note 6", session=session)
+    users = [text for role, text in turns(memory, "oa-monday") if role == "user"]
+    assert users == ["note 4", "note 5", "note 6"] and session._unsaved == []
+
+
 def test_session_ids_do_not_collide(memory: Memory) -> None:
     ids = ["chat/1", "chat_1", "周一", "周二", "x" * 100, "x" * 100 + "y"]
     assert len({session_for(i) for i in ids}) == len(ids)

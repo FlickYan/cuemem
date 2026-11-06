@@ -17,7 +17,8 @@
    都支持，响应原样返回；控制器的决定与实际用的模型（X-CueMem-Model）放在响应头里；
 4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）；上游出错时不写，流式
    回答中途断开（客户端停下）只写用户的话。写不进去（向量接口暂时不可用等）时留着，这个会话
-   下一次写回或结束之前再写（见 Run）。会话进行中不抽取事实，
+   下一次写回或结束之前再写（见 Run；一个会话最多留 MAX_UNSAVED 次、MAX_UNSAVED_BYTES，超出的
+   丢掉最早的、记警告）。会话进行中不抽取事实，
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-045）。
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent；不是 ASCII 的 ID 写成
@@ -84,6 +85,7 @@ from cuemem.evidence import (
     in_context_rounds,
     inject_evidence,
     message_text,
+    payload_size,
     recall_evidence,
     stored_text,
 )
@@ -95,6 +97,10 @@ logger = logging.getLogger(__name__)
 
 _SESSION_ID = re.compile(r"[^A-Za-z0-9_.:-]")
 MAX_EMBED_INPUTS = 2048  # 与 OpenAI 的上限相同
+# 一个会话写不进去、留着重试的写回最多这么多次、这么大（文字与图片 data URL 的字符数，
+# evidence.payload_size）：长时间故障而调用方一直在说话时，超出的丢掉最早的，不让内存一直长
+MAX_UNSAVED = 100
+MAX_UNSAVED_BYTES = 32 * 1024 * 1024
 
 
 class ProxyError(Exception):
@@ -127,6 +133,7 @@ class Unsaved:
     messages: list[dict[str, Any]]
     when: datetime
     epoch: int
+    size: int = 0  # evidence.payload_size(messages)
 
 
 @dataclass
@@ -136,7 +143,8 @@ class Run:
     unsaved：写回失败（向量接口暂时不可用等，见 write.online.worth_retrying）、留着重试的写回，
     按先后排。之后每次写回这个会话时先写它们，会话结束（空闲、开了新的一段、close_all）之前
     再试一次，还是写不进去才丢掉、记警告。在线写入要么全写、要么不写（R1），以前丢下它们就永远
-    丢了：之后的请求只写各自最后一句用户消息。"""
+    丢了：之后的请求只写各自最后一句用户消息。最多留 MAX_UNSAVED 次、MAX_UNSAVED_BYTES
+    （unsaved_bytes 是它们的 size 之和），超出时丢掉最早的、记警告（MemoryProxy._trim）。"""
 
     space: str
     session_id: str
@@ -145,6 +153,16 @@ class Run:
     user_id: str | None = None
     agent_id: str | None = None
     unsaved: list[Unsaved] = field(default_factory=list)
+    unsaved_bytes: int = 0
+
+    def keep(self, unsaved: Unsaved) -> None:
+        self.unsaved.append(unsaved)
+        self.unsaved_bytes += unsaved.size
+
+    def drop(self, count: int = 1) -> None:
+        """丢掉最早的 count 次写回。"""
+        self.unsaved_bytes -= sum(u.size for u in self.unsaved[:count])
+        del self.unsaved[:count]
 
 
 @dataclass
@@ -604,8 +622,30 @@ class MemoryProxy:
                 messages.append({"role": "assistant", "content": answer})
             if not messages:
                 return
-            run.unsaved.append(Unsaved(messages, datetime.now(), epoch))
+            run.keep(Unsaved(messages, datetime.now(), epoch, payload_size(messages)))
             self._save(run)
+            self._trim(run)  # 写得进去时先写：只限写完之后还留着的
+
+    @staticmethod
+    def _trim(run: Run) -> None:
+        """留着重试的写回超过 MAX_UNSAVED 次或 MAX_UNSAVED_BYTES 时丢掉最早的（调用方持有
+        run.lock）。最新的这一次总留着：单个请求已经由 MAX_BODY_BYTES 限住。"""
+        dropped: list[Unsaved] = []
+        while len(run.unsaved) > 1 and (
+            len(run.unsaved) > MAX_UNSAVED or run.unsaved_bytes > MAX_UNSAVED_BYTES
+        ):
+            dropped.append(run.unsaved[0])
+            run.drop()
+            record_event("proxy_write_dropped", space=run.space, reason="backlog")
+        if dropped:
+            logger.warning(
+                "CueMem could not store %d message(s) of proxy session %s for a long time and "
+                "dropped them (more than %d write-backs or %d bytes were waiting).",
+                sum(len(u.messages) for u in dropped),
+                run.session_id,
+                MAX_UNSAVED,
+                MAX_UNSAVED_BYTES,
+            )
 
     def _save(self, run: Run, *, final: bool = False) -> None:
         """把这个会话还没写进去的写回按先后写进记忆，各用各自的时间（调用方持有 run.lock）。
@@ -616,7 +656,7 @@ class MemoryProxy:
             if head.epoch != self.system.db.turn_epoch(run.space):
                 # 之后这个空间遗忘过发言（例如调用方删了这个用户的记忆）：这是遗忘之前说的话
                 record_event("proxy_write_dropped", space=run.space, reason="forgotten")
-                del run.unsaved[0]
+                run.drop()
                 continue
             try:
                 self.memory.add(
@@ -640,9 +680,9 @@ class MemoryProxy:
                     run.session_id,
                     error,
                 )
-                del run.unsaved[: len(lost)]
+                run.drop(len(lost))
                 continue
-            del run.unsaved[0]
+            run.drop()
 
 
 class _Relay(Iterator[bytes]):

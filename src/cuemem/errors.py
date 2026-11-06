@@ -75,6 +75,12 @@ class VectorStoreOpenError(CueMemError):
     """本地模式的向量库打不开或建不了集合：多半是打开的文件太多（每个集合一直开着一个文件）。"""
 
 
+class SessionLimitError(CueMemError):
+    """这个记忆空间进行中的对话会话（/api/sessions、界面）已经到了 CUEMEM_MAX_OPEN_SESSIONS，又都
+    说过话：没有开新的会话（HTTP 429）。结束一个会话（/api/sessions/{id}/end）或等闲置的会话被
+    清理之后再开。"""
+
+
 class AccessKeysError(CueMemError):
     """限定作用域的访问令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）读不出来或写错了。"""
 

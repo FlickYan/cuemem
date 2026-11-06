@@ -1036,6 +1036,7 @@ def serve(
     from cuemem.api.auth import KeyRing, Keys
     from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy
+    from cuemem.api.service import open_session_limit
 
     if not idle_minutes > 0:  # 在打开记忆系统之前检查
         console.print("[red]--idle-minutes 要大于 0[/red]")
@@ -1056,6 +1057,7 @@ def serve(
         keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
+        open_session_limit()  # CUEMEM_MAX_OPEN_SESSIONS（建服务时再读一次）
         _require_token(host, keys, insecure_no_auth, insecure_weak_token)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)

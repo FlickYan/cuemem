@@ -1153,6 +1153,19 @@ def test_body_limits_from_the_environment(
     assert len(served) == 1
 
 
+def test_serve_refuses_a_bad_open_session_limit(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CUEMEM_MAX_OPEN_SESSIONS 写错时 cuemem serve 在打开记忆系统之前报错（退出码 1）。"""
+    command = ["serve", "--no-ui", "--scenario", "plain"]
+    monkeypatch.setenv("CUEMEM_MAX_OPEN_SESSIONS", "0")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1 and "CUEMEM_MAX_OPEN_SESSIONS" in result.output
+    assert served == []
+    monkeypatch.setenv("CUEMEM_MAX_OPEN_SESSIONS", "3")
+    assert runner.invoke(app, command).exit_code == 0 and len(served) == 1
+
+
 def test_serve_offers_mcp_over_http(served: list[Any]) -> None:
     """cuemem serve 默认在 /mcp 提供 MCP（Streamable HTTP），启动时打印地址；--no-mcp 时没有。
     （应用没有进入 lifespan：只看在交给 MCP 之前的检查，不带 X-CueMem-User 时 400。）"""
