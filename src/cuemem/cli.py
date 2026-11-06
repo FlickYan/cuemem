@@ -56,7 +56,7 @@ from cuemem.config import (
     extra_remedy,
     load_settings,
 )
-from cuemem.core.timeutil import valid_period
+from cuemem.core.timeutil import naive_local, valid_period
 from cuemem.core.types import AskMode, RecallMode, Router, Scenario
 from cuemem.envfile import atomic_write_text, mask, read_env, update_env
 from cuemem.errors import (
@@ -236,8 +236,8 @@ def _unopenable(settings: Settings, exc: sqlite3.OperationalError) -> str:
 
 @contextmanager
 def _open_db_only() -> Iterator[MemoryDB]:
-    """只打开数据库（cuemem export、spaces）：不用向量库、模型与缓存，向量库打不开、或者
-    cuemem serve 正开着它的时候也能用。"""
+    """只打开数据库（cuemem export、spaces、inspect）：不用向量库、模型与缓存，向量库打不开、
+    或者 cuemem serve 正开着它的时候也能用（不拿 MemorySystem.from_settings 的数据库锁）。"""
     from cuemem.store.files import private_dirs, storage_dirs
     from cuemem.store.sqlite import MemoryDB
 
@@ -1727,11 +1727,18 @@ def inspect_facts(
                 f"{valid_at!r} 不是 ISO 日期：写成 YYYY、YYYY-MM 或 YYYY-MM-DD",
                 param_hint="--valid-at",
             ) from None
-    with _open_system() as system:
-        facts = system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
+    from cuemem.expiry import expired_ids
+
+    with _open_db_only() as db:  # 只读数据库：cuemem serve 开着它的时候也能用（见 _open_db_only）
+        facts = db.get_facts(
+            space,
+            current_only=current,
+            valid_period=valid_period(valid_at) if valid_at is not None else None,
+            known_at=naive_local(known_at) if known_at is not None else None,
+        )
         if subject:
             facts = [f for f in facts if f.subject.casefold() == subject.casefold()]
-        gone = system.expired_ids(space, datetime.now())
+        gone = expired_ids(db, space, datetime.now())
         if hide_expired:
             facts = [f for f in facts if f.id not in gone]
         if not facts:
@@ -1758,8 +1765,8 @@ def inspect_facts(
 @inspect_app.command("entities")
 def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
     """实体列表：名字、类型、别名、提及次数。"""
-    with _open_system() as system:
-        entities = system.entities(space)
+    with _open_db_only() as db:
+        entities = db.get_entities(space)
         if not entities:
             console.print("没有实体。还没巩固的话，先运行 cuemem consolidate。")
             return
@@ -1784,8 +1791,8 @@ def inspect_sources(
     space: Annotated[str, typer.Option(help="记忆空间 ID")],
 ) -> None:
     """溯源：一条事实来自哪些原始轮次，以及它的版本链。"""
-    with _open_system() as system:
-        found = system.db.get_facts(space, ids=[fact_id])
+    with _open_db_only() as db:
+        found = db.get_facts(space, ids=[fact_id])
         if not found:
             console.print(f"[red]找不到事实 {fact_id}[/red]")
             raise typer.Exit(1)
@@ -1796,13 +1803,13 @@ def inspect_sources(
             f"重要度 {fact.importance} · 事件时间 {_span_text(fact.valid_from, fact.valid_to)} · "
             f"记录于 {fact.recorded_at:%Y-%m-%d %H:%M}"
         )
-        chain = system.db.get_facts(space, superseded_by=[fact.id])
+        chain = db.get_facts(space, superseded_by=[fact.id])
         if fact.superseded_by:
-            chain += system.db.get_facts(space, ids=[fact.superseded_by])
+            chain += db.get_facts(space, ids=[fact.superseded_by])
         for other in chain:
             relation = "取代了" if other.superseded_by == fact.id else "被它取代"
             console.print(f"[dim]{relation}：{other.statement}（{other.id}）[/dim]")
-        turns = system.db.get_turns(space, ids=fact.source_turn_ids)
+        turns = db.get_turns(space, ids=fact.source_turn_ids)
         for t in turns:
             who = t.speaker or ("用户" if t.role == "user" else "助手")
             console.print(f"[bold]{t.ts:%Y-%m-%d} · {t.session_id} · {who}[/bold]：{t.text}")
@@ -1811,8 +1818,8 @@ def inspect_sources(
 @inspect_app.command("profile")
 def inspect_profile(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
     """核心记忆（用户画像）：重要且当前有效的事实，每轮常驻上下文。"""
-    with _open_system() as system:
-        core = system.core_memory(space)
+    with _open_db_only() as db:
+        core = db.get_core_memory(space)
         if core is None or not core.text:
             console.print("还没有核心记忆。先运行 cuemem consolidate。")
             return

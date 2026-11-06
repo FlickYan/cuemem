@@ -475,6 +475,40 @@ def test_ask_and_inspect_leave_out_expired_memories(
     assert "Berlin" not in result.output and "jazz" in result.output
 
 
+def test_inspect_reads_next_to_a_running_server(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮复审 P9：cuemem inspect 只读数据库（_open_db_only），另一个进程（例如向量在 Qdrant
+    服务端时 docker compose exec 进 cuemem serve 的容器）拿着数据库锁的时候也能用，与 export、
+    spaces 相同。以前经 MemorySystem.from_settings 打开，被数据库锁挡住（StorageLockedError）。"""
+    from cuemem.store.files import lock_database, unlock_database
+    from cuemem.store.sqlite import MemoryDB
+
+    _expired_space(monkeypatch)
+    settings = load_settings()
+    db = MemoryDB(settings.paths.db)
+    [berlin] = [f for f in db.get_facts("u") if "Berlin" in f.statement]
+    db.close()
+    held = lock_database(settings.paths.db)  # 同一进程的另一个文件描述符也互斥（flock）
+    try:
+        result = runner.invoke(app, ["inspect", "facts", "--space", "u", "--hide-expired"])
+        assert result.exit_code == 0, result.output
+        assert "Berlin" not in result.output and "jazz" in result.output
+        result = runner.invoke(
+            app, ["inspect", "facts", "--space", "u", "--known-at", "2000-01-01"]
+        )
+        assert result.exit_code == 0 and "没有符合条件的事实" in result.output
+        result = runner.invoke(app, ["inspect", "sources", berlin.id, "--space", "u"])
+        assert result.exit_code == 0 and "I live in Berlin" in result.output, result.output
+        for command in ("entities", "profile"):
+            result = runner.invoke(app, ["inspect", command, "--space", "u"])
+            assert result.exit_code == 0, result.output
+        result = runner.invoke(app, ["consolidate", "--space", "u"])  # 要写的命令照样被挡住
+        assert result.exit_code == 1 and "正被另一个进程使用" in _flat(result.output)
+    finally:
+        unlock_database(held)
+
+
 def test_forget_expired(isolated_paths: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """第七轮体检 P20：只用 SDK 时用 cuemem forget --expired 删过期的记忆（cuemem serve / proxy
     设了 CUEMEM_EXPIRED_RETENTION_DAYS 时每天自己删）；--older-than-days 只删过期这么久的。"""

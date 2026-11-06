@@ -88,8 +88,8 @@ def lock_database(db: Path) -> IO[str] | None:
     分配发言序号与重新读令牌文件都按这个前提来。以前只有 Qdrant 本地模式的锁挡着；用 Qdrant
     服务端（docker-compose 的默认）时第二个进程（cuemem mcp、reindex、SDK 的 Memory()）照样
     打开，接手第一个进程还在写的会话、把它刚写的向量当孤儿删掉。锁按数据库文件而不是数据目录：
-    paths.db 与 paths.qdrant 可以分开配置。只读的命令（export、spaces、doctor、keys）不经过
-    from_settings，不加锁。
+    paths.db 与 paths.qdrant 可以分开配置。只读数据库的命令（export、spaces、inspect、doctor、keys）
+    不经过 from_settings，不加锁。
 
     返回拿着锁的文件，关掉记忆系统时交给 unlock_database；环境变量 CUEMEM_ALLOW_SHARED_DB=1 时
     不加锁、记一条警告，返回 None。flock 在同一进程里的两个文件描述符之间也互斥：同一进程再打开
