@@ -1260,8 +1260,8 @@ def _read_keys(path: Path) -> tuple[str, Keys]:
 
 
 def _write_keys(path: Path, text: str) -> None:
-    """换名替换（envfile.atomic_write_text：运行中的服务读到的不是旧的就是新的），再改成 0600。"""
-    path.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    """换名替换（envfile.atomic_write_text：运行中的服务读到的不是旧的就是新的），再改成 0600。
+    所在的目录要已经有（keys add 事先查过）：不替人建目录，路径写错时不悄悄建出一个没人读的文件。"""
     os.chmod(atomic_write_text(path, text), 0o600)
 
 
@@ -1301,7 +1301,9 @@ def keys_add(
     """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
 
     令牌只打印这一次，只打到标准输出（TOKEN=$(cuemem keys add …) 这样接住），文件里不存它；
-    别的提示都在标准错误。运行中的 cuemem serve / proxy 一秒内开始认它。"""
+    别的提示都在标准错误。文件原来就有时，运行中的 cuemem serve / proxy 一秒内开始认它；文件不在
+    时新建（所在的目录要已经有，否则报错退出，不打印令牌），服务要用指向它的
+    CUEMEM_API_KEYS_FILE 启动（或重启）才读它。"""
     import hashlib
     import secrets
 
@@ -1313,7 +1315,14 @@ def keys_add(
     if not user and not agent:
         err.print("[red]错误：[/red]至少给一个 --user 或 --agent（令牌能访问谁的记忆）")
         raise typer.Exit(1)
+    shown = escape(str(path.resolve()))  # 相对路径按各自进程的当前目录解析：提示里给绝对路径
     exists = path.exists()
+    if not exists and not path.resolve().parent.is_dir():
+        err.print(
+            f"[red]错误：[/red]{shown} 不在，它所在的目录 {escape(str(path.resolve().parent))} "
+            "也不在：路径是不是写错了（或者用了容器里的路径）？要新建令牌文件，先建好目录"
+        )
+        raise typer.Exit(1)
     text, old = _read_keys(path) if exists else ("", Keys())
     if name in old.names:
         err.print(f"[red]错误：[/red]{escape(str(path))} 里已经有名叫 {escape(name)} 的令牌")
@@ -1359,10 +1368,18 @@ def keys_add(
         raise typer.Exit(1)
     else:
         _write_keys(path, new)
-        err.print(
-            f"已把 {escape(name)} 加进 {escape(str(path))}（只存 sha256）。令牌只显示这一次，"
-            "在标准输出；运行中的 cuemem serve / proxy 一秒内开始认它"
-        )
+        if exists:
+            err.print(
+                f"已把 {escape(name)} 加进 {shown}（只存 sha256）。令牌只显示这一次，"
+                "在标准输出；运行中的 cuemem serve / proxy 一秒内开始认它"
+            )
+        else:
+            err.print(
+                f"已新建 {shown}（0600），把 {escape(name)} 加了进去（只存 sha256）。令牌只显示"
+                "这一次，在标准输出。cuemem serve / proxy 只有用 "
+                f"CUEMEM_API_KEYS_FILE={shown} 启动时才读它（在 Docker 里是容器里的路径）："
+                "带上这个设置启动或重启它们"
+            )
     print(token)
 
 
@@ -1445,7 +1462,7 @@ def keys_revoke(
     assert new is not None
     _write_keys(path, new)
     err.print(
-        f"已从 {escape(str(path))} 删掉 {escape(name)}；"
+        f"已从 {escape(str(path.resolve()))} 删掉 {escape(name)}；"
         "运行中的 cuemem serve / proxy 一秒内不再认它"
     )
     if not parsed.scoped and not os.environ.get(TOKEN_ENV):

@@ -208,6 +208,29 @@ def test_key_errors_never_echo_a_token() -> None:
         Keys.parse(f"keys:\n  - {{name: a, token: {secret}, scopes: [{{user: a}}]}}", secret)
 
 
+def test_keys_parse_uses_the_c_safe_loader_with_the_same_result() -> None:
+    """装了 libyaml 时 Keys.parse 用 CSafeLoader（运行中的服务在事件循环上重新读入，几百个令牌
+    时快近十倍）：解出的对象与 safe_load 一样，照样不认 Python 标签，写错的文件照样说第几行。"""
+    import yaml
+
+    from cuemem.api import auth
+
+    if yaml.__with_libyaml__:
+        assert auth._SAFE_LOADER is yaml.CSafeLoader
+    entries = [
+        f"name: k{i}, token: '{i:064x}', scopes: [{{user: 'u{i}'}}, {{agent: 'a{i}'}}]"
+        for i in range(200)
+    ]
+    text = "# 说明\n" + _keys(*entries) + "\n  - name: 'é ü 中'\n    token: tttttttttttttttttt\n"
+    text += '    scopes:\n      - {user: "x\\ty"}\n    rate_per_minute: 0x10\n'
+    assert yaml.load(text, Loader=auth._SAFE_LOADER) == yaml.safe_load(text)
+    assert Keys.parse(text).names[-1] == "é ü 中"
+    with pytest.raises(AccessKeysError):
+        Keys.parse("keys: !!python/object/apply:os.getcwd []\n")
+    with pytest.raises(AccessKeysError, match="第 4 行"):
+        Keys.parse("keys:\n  - name: a\n    token: [x\n", source="f")
+
+
 def test_keys_from_the_environment(tmp_path: Path) -> None:
     path = tmp_path / "keys.yaml"
     path.write_text(KEYS, encoding="utf-8")

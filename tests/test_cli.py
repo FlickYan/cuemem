@@ -991,13 +991,42 @@ def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
     again = runner.invoke(app, ["keys", "add", "shop", "--user", "x"])
     assert again.exit_code == 1 and "已经有" in again.stderr and again.stdout == ""
     assert path.read_text(encoding="utf-8") == text
-    fresh = tmp_path / "new" / "keys.yaml"
+    fresh = tmp_path / "new.yaml"
     result = runner.invoke(app, ["keys", "add", "a", "--agent", "bot", "--file", str(fresh)])
     assert result.exit_code == 0, result.output
     agent_key = Keys.parse(fresh.read_text(encoding="utf-8")).resolve(result.stdout.strip())
     assert agent_key is not None and agent_key.allows("agent/bot")
     assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
     assert runner.invoke(app, ["keys", "add", "b", "--file", str(fresh)]).exit_code == 1
+
+
+def test_keys_add_says_where_the_file_is_and_never_makes_directories(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """keys add 不替人建目录：文件与它所在的目录都不在时报错退出（多半是路径写错了，或者用了容器
+    里的路径），什么都不建，也不打印令牌。新建文件时给出绝对路径，说服务要用指向它的
+    CUEMEM_API_KEYS_FILE 启动才读它，不说一秒内认；文件原来就有时才说一秒内认。"""
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "typo" / "nested" / "keys.yml"
+    result = runner.invoke(app, ["keys", "add", "a", "--user", "a", "--file", str(missing)])
+    assert result.exit_code == 1 and result.stdout == ""
+    assert str(missing.parent) in _flat(result.stderr)
+    assert not (tmp_path / "typo").exists()
+
+    result = runner.invoke(app, ["keys", "add", "a", "--user", "a", "--file", "new.yml"])
+    assert result.exit_code == 0, result.output
+    created = str(tmp_path / "new.yml")
+    flat = _flat(result.stderr)
+    assert f"CUEMEM_API_KEYS_FILE={created}" in flat and "重启" in flat
+    assert "一秒内" not in flat and result.stdout.strip() not in result.stderr
+    assert stat.S_IMODE((tmp_path / "new.yml").stat().st_mode) == 0o600
+
+    result = runner.invoke(app, ["keys", "add", "b", "--user", "b", "--file", "new.yml"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.stderr)
+    assert created in flat and "一秒内开始认它" in flat and "重启" not in flat
+    result = runner.invoke(app, ["keys", "revoke", "b", "--file", "new.yml"])
+    assert result.exit_code == 0 and created in _flat(result.stderr)
 
 
 def test_keys_add_refuses_inline_keys_and_leaves_flow_style_files_alone(
