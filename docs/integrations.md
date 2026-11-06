@@ -16,7 +16,7 @@ CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 
 三个集成共用 `cuemem/evidence.py`：控制器先选档（L0 不检索、只给画像），取回的事实与对话片段排成与记忆代理、回答模型相同的证据块，放在最新一句用户消息的开头；系统提示与之前的消息不动，供应商的前缀缓存照常命中。工具（recall / remember / forget）的名字、说明与语义与 MCP 相同。
 
-- 证据块与 recall 工具的清单都声明里面是从过去的对话里引来的资料、不是指令；存下的 `<memory`、`</memory` 注入前会转义，关不上证据块。召回清单里存下的文字逐行以 '| ' 开头，结尾是 'End of recalled memories.'（多行的事实用 ' / ' 连成一行），存下的消息冒充不了清单本身，例如在 forget 工具旁边伪造一段带着真实 ID 的 `Facts:`。这只能减少、不能杜绝从记忆来的提示注入。
+- 证据块与 recall 工具的清单都声明里面是从过去的对话里引来的资料、不是指令；存下的 `<memory`、`</memory` 注入前会转义，关不上证据块。召回清单里存下的文字逐行以 '| ' 开头，结尾是 'End of recalled memories.'（多行的事实用 ' / ' 连成一行），存下的消息冒充不了清单本身，例如在 forget 工具旁边伪造一段带着真实 ID 的 `Facts:`。MCP 的 `profile` 工具也这样引用画像（`Profile:`、每行以 '| ' 开头，最后是 'End of recalled memories.'）。这只能减少、不能杜绝从记忆来的提示注入。
 - OpenAI Agents 与 LangGraph 里，当前对话里还在请求中的轮不进证据，带照片的轮也一样（`evidence.stored_text` 与 `in_context_rounds`，与记忆代理共用）。
 - 遗忘照实说：删除做完、用剩下的日志重建派生记忆却出错时（例如模型供应商余额不足），MCP、Agents 与 LangGraph 的 forget 工具回 "Deleted N conversation turn(s). Rebuilding the memory derived from the rest failed (…); it finishes on the next consolidation…"，不报成出错，模型不会告诉用户什么都没删。
 - 写入要么全写、要么不留：向量化或向量库出错时什么都不写，重试不会写出重复的发言。发言提交之后不再抛出：写不进去的 trace 只在 `cuemem.core.trace` 日志里记一条警告。
@@ -28,14 +28,14 @@ CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 
 ## OpenAI Agents SDK
 
-`cuemem.integrations.openai_agents`（openai-agents 0.23）。三样东西可以分开用：
+`cuemem.integrations.openai_agents`（openai-agents 0.24）。三样东西可以分开用：
 
 - `memory_tools(memory, user_id=...)`：recall、remember、forget 三个工具；
 - `memory_input_filter(memory, user_id=...)`：交给 `RunConfig.call_model_input_filter`，SDK 每次调用模型之前先过控制器、注入证据（只改这次发给模型的副本）；
 - `CueMemSession(session_id, memory, user_id=...)`：Session 协议的实现。内层会话（默认 SQLiteSession）原样保存短期历史，用户与助手的文字同时写进 CueMem（一问一答为一轮），对话结束后整段抽取成事实。
 
 ```python
-from agents import Agent, RunConfig, Runner
+from agents import Agent, ModelSettings, RunConfig, Runner
 from cuemem import Memory
 from cuemem.integrations.openai_agents import (
     CueMemSession,
@@ -55,6 +55,7 @@ agent = Agent(name="Assistant", model=..., tools=memory_tools(memory, user_id=us
 config = RunConfig(
     call_model_input_filter=memory_input_filter(memory, user_id=user_of),
     trace_include_sensitive_data=False,  # 注入的记忆不上传到 SDK 的 trace 后台
+    model_settings=ModelSettings(store=False),  # 响应（连同证据）不存到供应商那边
 )
 
 async with CueMemSession("chat-1", memory, user_id="alice") as session:
@@ -65,10 +66,11 @@ close_sessions(memory)  # 退出前、memory.close() 之前
 ```
 
 - 会话：写入时标记为进行中、不抽取；`async with` 结束、`end()`、空闲 30 分钟或 `close_sessions()` 时交给后台抽取。之后同一个 SDK 会话再有对话，写进新的一段（对话日期是新的）。
-- 服务端保存对话状态（`conversation_id`、`previous_response_id`）时用 `memory_input_filter(..., placement="instructions")`：证据接在这次调用的 instructions 后面，不会随用户消息存到服务端。
+- 服务端保存对话状态（`conversation_id`、`previous_response_id`）时用 `memory_input_filter(..., placement="instructions")`：证据接在这次调用的 instructions 后面，不进之后各次调用重放的对话条目；但每个存下的响应仍留着它自己的 instructions（见下）。
 - 遗忘：`pop_item`、`clear_session` 撤回的消息在长期记忆里一并遗忘；forget 工具删掉的发言，下次读历史时也从内层会话里去掉。
+- 供应商那边的副本：Agents SDK 不设 `ModelSettings.store`，Responses API 保存每个响应（它的 instructions 与输入，两种位置的证据都在里面）至少 30 天，除非传 `ModelSettings(store=False)` 或组织开了零数据保留；这份副本在 `forget` 与 `delete_all` 之外。历史由客户端保存时（`CueMemSession`、`result.to_input_list()`）用 `RunConfig(model_settings=ModelSettings(store=False), call_model_input_filter=..., trace_include_sensitive_data=False)`，如上。服务端保存对话状态（`previous_response_id`、`conversation_id`）要靠存下的响应，这份副本避免不了，遗忘也管不到。（按 openai-agents 0.24 与 openai 3.40 核对；保留的期限以 OpenAI 的文档为准。）
 - 输入护栏拦下的、模型没有回应过的用户消息不写进长期记忆。
-- 写不进去的留着重试：一批写不进去时（向量接口或 Qdrant 故障），`CueMemSession` 留着它，下一批或 `end()` 时先按原来的时间写它。重试没有用的（大部分 4xx、内容审核拒绝、输入不合法，例如像素超过 Pillow 上限的图片，这一批单独丢掉），或这个空间之后遗忘过发言的，丢掉（trace 事件 `agents_mirror_dropped`），不把遗忘之前的消息写回去。留着的只在进程内存里。
+- 写不进去的留着重试：一批写不进去时（向量接口或 Qdrant 故障），`CueMemSession` 留着它，下一批或 `end()` 时先按原来的时间写它。重试没有用的（大部分 4xx、内容审核拒绝、输入不合法，例如像素超过 Pillow 上限的图片，这一批单独丢掉），或这个空间之后遗忘过发言的，丢掉（trace 事件 `agents_mirror_dropped`），不把遗忘之前的消息写回去。留着的只在进程内存里：每个会话最多 100 批或 32 MiB（按文字与图片 data URL 的字符数算）；故障持续很久时丢掉更早的，记警告与 `agents_mirror_dropped` trace 事件（`reason=backlog`）。
 - 改走记忆代理：Agents SDK 缺省的模型类调用 Responses API，通常带工具或流式，记忆代理对这些回 501。用这里的集成，或者把 `OpenAIChatCompletionsModel` 指向记忆代理。
 
 ## LangGraph / LangChain
@@ -102,7 +104,7 @@ cuemem.close()  # 应用退出时，memory.close() 之前；异步用 aend_threa
 `cuemem.integrations.claude`（anthropic 1.14，工具类型 `memory_20250818`）。Claude 的 memory tool 在客户端执行：模型对 `/memories` 目录做 view、create、str_replace、insert、delete、rename。`CueMemMemoryTool` 把这个目录接到 CueMem 上：
 
 - 只读的生成文件：`/memories/profile.md`（画像）、`/memories/facts.md`（当前事实，带日期、ID 与有效状态），写入时报错说明；
-- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`，WAL 模式的 SQLite；随数据目录一起备份，连同它的 `-wal` 与 `-shm`，见[备份与恢复](../README.zh-CN.md#备份与恢复)），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；
+- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`，WAL 模式的 SQLite；随数据目录一起备份，连同它的 `-wal` 与 `-shm`，见[备份与恢复](../README.zh-CN.md#备份与恢复)），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；`Memory.delete_all`、`reset` 与 `delete`（以及 `/api/v1` 的删除接口）当场删掉这个小库里对应的文件：删掉的用户的全部文件，或笔记被遗忘了的文件。这个模块自己的 `delete_all` 只在 `store=` 指到别处时才需要，它还返回 `memory_files_deleted`；
 - 路径严格校验（不能出 `/memories`），有大小上限；`with_recall` / `awith_recall` 在发给 Claude 之前先过控制器、注入证据。
 
 ```python
@@ -127,6 +129,7 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
             max_tokens=16000,
             tools=[tool],
             messages=history,
+            thread=False,  # 每一步都发完整历史（anthropic>=2.3），遗忘管得到
         )
         for message in runner:
             history.append(message.to_param())
@@ -134,20 +137,20 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
             if results is not None:
                 history.append(results)
 
-delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
+delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删（memory.delete_all 也两样都删）
 ```
 
 - 没有在真实的 Claude 上跑过（开发环境没有 Anthropic 的 Key；DeepSeek 的 Anthropic 兼容接口不接受 `memory_20250818`）。离线测试直接驱动工具的各个命令；联网冒烟用 DeepSeek 驱动了同样的命令（以普通工具的形式）。
 - 从文件里删掉一行，记作"这一条不再成立"，由抽取与对账决定后果；只有删掉整个文件才确定遗忘。
 - 笔记记下之后供应商出错：改动已经作为笔记写进日志、抽取却出错时（例如余额不足），文件的改动照样成功，笔记只记一次，下次巩固时补上抽取。删除之后重建出错时，删除也照样成功，并说明重建要等下次。
 - Claude 的文件不在 `Memory.export` 里（导出只有原始日志里的笔记）。
-- anthropic 2.3 起，`tool_runner` 默认把对话放在服务端保存的会话（thread）里：一轮里第一次之后的请求只发新消息（之前发过的消息，包括证据块，按发出去的样子留着）。上面的写法每一轮照样从完整的 `history` 开始。用了服务端的会话时，供应商在服务端存着这段对话，证据块也在内；这一份在 CueMem 的遗忘与 `delete_all` 之外。遗忘要覆盖发出去的内容时，给 `tool_runner` 传 `thread=False`（anthropic 2.3 起才有这个参数，CueMem 仍接受的 1.x 没有）：每次请求都发完整历史，与 1.x 相同。供应商把会话或请求留多久，见 Anthropic 的文档。`examples/integrations/claude_example.py` 还没有传它，运行时要把 `ANTHROPIC_MODEL` 设成支持 memory tool 的 Claude 模型。
+- anthropic 2.3 起，`tool_runner` 默认把对话放在服务端保存的会话（thread）里：一轮里第一次之后的请求只发新消息（之前发过的消息，包括证据块，按发出去的样子留着）。上面的写法每一轮照样从完整的 `history` 开始。用了服务端的会话时，供应商在服务端存着这段对话，证据块也在内；这一份在 CueMem 的遗忘与 `delete_all` 之外。上面的写法与 `examples/integrations/claude_example.py` 都传 `thread=False`（要 anthropic 2.3 或更新；CueMem 的下限 `anthropic>=1.14` 仍接受的 1.x 没有这个参数，用 1.x 时去掉它：1.x 本来就每次发完整历史）。这样每一步都重发完整历史，发出去的都在 CueMem 的遗忘与 `delete_all` 管得到的地方。去掉它是拿遗忘的覆盖换更小的请求：默认的服务端会话把证据块留在供应商那边。供应商把会话或请求留多久，见 Anthropic 的文档。示例运行时要把 `ANTHROPIC_MODEL` 设成支持 memory tool 的 Claude 模型。
 
 ## 局限
 
-- 进行中的会话按进程记在内存里：多个进程共用一个数据目录（Qdrant 服务端）时，一个进程可能提前交出另一个进程还在进行的会话。
+- 一个数据库一个进程：一个数据库同一时间只能由一个进程打开。第二个打开同一个数据库的进程（stdio 的 `cuemem mcp`、`cuemem proxy`、`cuemem reindex`、SDK 的 `Memory()`）得到 `StorageLockedError`，写明拿着锁的进程的 pid 与命令，向量在 Qdrant 服务端时也一样。通过 `MemoryClient` 或 HTTP（`/api/v1`、`/mcp`）连到运行中的进程；或者设 `CUEMEM_ALLOW_SHARED_DB=1` 不加锁，风险自负（互相接手进行中的 run、`reindex` 删掉另一个进程刚写的向量、发言序号相撞）。锁是数据库旁边的文件 `<数据库>.lock`（例如 `data/cuemem.sqlite.lock`），用的是 `flock`，NFS 上可能不起作用。两个数据目录指向同一个 Qdrant 服务端与同一个空间时仍共用集合，锁管不到。
 - 模型回答期间的遗忘：注入的记忆在模型还在回答时被遗忘了，记忆代理照样返回回答，但不存下（用户的话照样存下）。三个集成同样是"召回 → 模型 → 写回"，没有这项检查，这样的回答在那里仍可能写回（没有复现过）。
 - 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
 - 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。
 - 供应商出错与过期：各集成自己的记忆工具不像 MCP 那样把供应商的出错（限流、余额不足、超时）换成说明，出来的是供应商客户端的异常。`expiration_date` 已过的记忆不出现在各集成的召回、自动召回与画像里，也不出现在 Claude memory tool 生成的 `profile.md`、`facts.md` 与 `history/` 里（D-072；以前只有 SDK 的 `search`、`get_all` 与画像排除它们）。过期按现在的时间算；后来又说过一次、没给过期时间的记忆照样留着。
-- 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉（提问里有 U+2028、U+2029、U+0085 时也一样），其中记着的子查询、追加查询与 Agent 自己检索的查询向量也删，`delete_all` 删掉这个空间的全部 trace。遗忘时重写不了的 trace 文件（磁盘满）整个删掉，记一条警告，遗忘照常成功。在那之前 trace 一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`：`cuemem serve` 与 `cuemem proxy` 每天按它删一遍，只用 SDK 的应用可以调 `memory.system.prune_traces(days)`。
+- 每次自动召回与 recall 工具调用都在数据目录的 `runs/traces/*.jsonl` 里记一条 `retrieve` trace（提问、检索模式与取回的 ID）；检索还记一个 `profile` 事件，写下给出的画像出自哪些事实的 ID，所以遗忘画像里的一条事实时，只是转述了它的回答的 trace 也删掉（实际上是这个空间的大部分 trace）。遗忘时，列着被删记忆的 trace 连同提问的查询向量缓存一起删掉（提问里有 U+2028、U+2029、U+0085 时也一样），其中记着的子查询、追加查询与 Agent 自己检索的查询向量也删，`delete_all` 删掉这个空间的全部 trace。遗忘时重写不了的 trace 文件（磁盘满）整个删掉，记一条警告，遗忘照常成功。在那之前 trace 一直留着，除非设了 `CUEMEM_TRACES_RETENTION_DAYS`：`cuemem serve` 与 `cuemem proxy` 每天按它删一遍，只用 SDK 的应用可以调 `memory.system.prune_traces(days)`。
