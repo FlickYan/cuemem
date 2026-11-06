@@ -354,11 +354,14 @@ def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]
 
 def _sweep_jobs(system: MemorySystem, *idle: Callable[[], object]) -> list[Callable[[], object]]:
     """清理线程要做的事：结束闲置的会话（idle），设了 traces_retention_days 时再加上删过期的
-    trace（启动时与之后每天一次，见 MemorySystem.expire_traces）。cuemem serve 与 cuemem proxy
-    共用。"""
+    trace（启动时与之后每天一次，见 MemorySystem.expire_traces），设了 expired_retention_days 时
+    再加上删过期的记忆（同样每天一次，见 MemorySystem.expire_memories）。cuemem serve 与
+    cuemem proxy 共用。"""
     jobs = list(idle)
     if system.settings.traces_retention_days is not None:
         jobs.append(system.expire_traces)
+    if system.settings.expired_retention_days is not None:
+        jobs.append(system.expire_memories)
     return jobs
 
 
@@ -430,8 +433,9 @@ def create_app(
     （Memory.close_idle_runs）与记忆代理的会话（MemoryProxy.close_idle，按它自己的 idle_minutes）。
     以前关掉的标签页、崩溃的客户端留下的会话一直开着，服务运行期间一直不抽取；与记忆代理和各个
     框架集成一样，默认 30 分钟。启动这么久之后，这个线程还把之前的进程留下、没人接着写的进行中
-    的会话交给抽取（一次，见 _adopt_after）。设了 traces_retention_days 时这个线程还删过期的 trace
-    （启动时与之后每天一次，见 _sweep_jobs），idle_minutes 为 None 时也起。
+    的会话交给抽取（一次，见 _adopt_after）。设了 traces_retention_days、expired_retention_days 时
+    这个线程还删过期的 trace、过期的记忆（启动时与之后每天一次，见 _sweep_jobs），idle_minutes 为
+    None 时也起。
     """
     _clear_uploads(upload_dir)
     v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
@@ -451,7 +455,7 @@ def create_app(
                 idle.append(proxy.close_idle)
             # 之前的进程留下、过了一个闲置期还没人接着写的会话交给抽取（从启动时算起）
             idle.append(_adopt_after(service.system, idle_s))
-        jobs = _sweep_jobs(service.system, *idle)  # 只设了 traces_retention_days 时也要起线程
+        jobs = _sweep_jobs(service.system, *idle)  # 只设了保留天数时也要起线程
         if not jobs:
             yield
             return

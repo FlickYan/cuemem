@@ -437,6 +437,28 @@ def test_ask_and_inspect_leave_out_expired_memories(
     assert "Berlin" not in result.output and "jazz" in result.output
 
 
+def test_forget_expired(isolated_paths: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """第七轮体检 P20：只用 SDK 时用 cuemem forget --expired 删过期的记忆（cuemem serve / proxy
+    设了 CUEMEM_EXPIRED_RETENTION_DAYS 时每天自己删）；--older-than-days 只删过期这么久的。"""
+    from cuemem.memory import MemorySystem
+
+    _expired_space(monkeypatch)
+    result = runner.invoke(app, ["forget", "--expired", "--session", "x"])
+    assert result.exit_code == 1 and "不能与" in result.output
+    result = runner.invoke(app, ["forget", "--fact", "x"])
+    assert result.exit_code == 1 and "--space" in result.output
+    result = runner.invoke(app, ["forget", "--expired", "--older-than-days", "5", "--yes"])
+    assert result.exit_code == 0 and "没有找到要删除的内容。" in result.output
+    result = runner.invoke(app, ["forget", "--expired", "--space", "u"], input="n\n")
+    assert result.exit_code == 1  # 没有确认，不删除
+    result = runner.invoke(app, ["forget", "--expired", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "空间u：已删除1条轮次" in _flat(result.output)
+    with MemorySystem.from_settings(load_settings()) as system:
+        assert [t.text for t in system.db.get_turns("u")] == ["I like jazz"]
+        assert system.db.expiring_turns("u") == {}
+
+
 def test_demo_and_chat_commands(
     isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

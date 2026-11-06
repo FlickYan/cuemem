@@ -37,7 +37,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args
 
@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     from cuemem.core.models import Answer, Fact
     from cuemem.evals.datasets import EvalSet
     from cuemem.evals.runner import RunSummary
-    from cuemem.memory import MemorySystem
+    from cuemem.memory import ForgetReport, MemorySystem
     from cuemem.store.sqlite import MemoryDB
     from cuemem.write.consolidate import ConsolidationReport
 
@@ -483,7 +483,9 @@ _REINDEX_KINDS = ("round", "fact", "summary", "entity", "image", "image_iso", "i
 
 @app.command()
 def forget(
-    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    space: Annotated[
+        str | None, typer.Option(help="记忆空间 ID（--expired 时不给是所有空间）")
+    ] = None,
     session: Annotated[list[str] | None, typer.Option(help="要遗忘的会话 ID（可多次指定）")] = None,
     turn: Annotated[list[str] | None, typer.Option(help="要遗忘的轮次 ID（可多次指定）")] = None,
     fact: Annotated[
@@ -494,8 +496,30 @@ def forget(
         bool, typer.Option("--dry-run", help="只预演：列出会删哪些发言与事实，什么都不删")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="不再确认，直接删除")] = False,
+    expired: Annotated[
+        bool,
+        typer.Option(
+            "--expired",
+            help="删掉已经过期的发言（写入时给了 expiration_date 的），连同派生的记忆",
+        ),
+    ] = False,
+    older_than_days: Annotated[
+        int, typer.Option("--older-than-days", min=0, help="--expired 时只删过期这么多天以上的")
+    ] = 0,
 ) -> None:
-    """遗忘：删除原始轮次，并清除由它们派生的事实、摘要、向量与缓存（不可恢复）。"""
+    """遗忘：删除原始轮次，并清除由它们派生的事实、摘要、向量与缓存（不可恢复）。
+
+    --expired：删过期的记忆（cuemem serve / proxy 设了 CUEMEM_EXPIRED_RETENTION_DAYS 时每天自己
+    删，只用 SDK 时用这个命令）。只删过期的发言本身，后来引用了它、没给过期时间的回复留着。"""
+    if expired:
+        if session or turn or fact or dry_run:
+            console.print("[red]--expired 不能与 --session、--turn、--fact、--dry-run 一起用[/red]")
+            raise typer.Exit(1)
+        _forget_expired(space, older_than_days, yes)
+        return
+    if space is None:
+        console.print("[red]请用 --space 指定记忆空间[/red]")
+        raise typer.Exit(1)
     if not session and not turn and not fact:
         console.print("[red]请用 --session、--turn 或 --fact 指定要遗忘的内容[/red]")
         raise typer.Exit(1)
@@ -516,11 +540,36 @@ def forget(
         if report.turns_deleted == 0:
             console.print("没有找到要删除的内容。")
             return
+        _print_forget_report(report)
+
+
+def _forget_expired(space: str | None, days: int, yes: bool) -> None:
+    where = f"空间 {space}" if space is not None else "所有空间"
+    if not yes and not typer.confirm(
+        f"将永久删除{where}里过期 {days} 天以上的发言及其派生的全部记忆，确定吗？"
+    ):
+        raise typer.Exit(1)
+    with _open_system() as system:
+        reports = system.purge_expired(space, older_than=timedelta(days=days))
+    if not reports:
+        console.print("没有找到要删除的内容。")
+        return
+    for report in reports.values():
+        console.print(f"空间 {report.space_id}：", end="")
+        _print_forget_report(report)
+
+
+def _print_forget_report(report: ForgetReport) -> None:
+    console.print(
+        f"已删除 {report.turns_deleted} 条轮次（会话 {', '.join(report.sessions_affected)}）；"
+        f"事实 {report.facts_before} → {report.facts_after} 条（已按剩余日志重建）；"
+        f"清理向量缓存 {report.embed_cache_purged} 条、LLM 缓存 {report.llm_cache_purged} 条；"
+        f"耗时 {report.elapsed_ms:.0f} ms"
+    )
+    if report.rebuild_error:
         console.print(
-            f"已删除 {report.turns_deleted} 条轮次（会话 {', '.join(report.sessions_affected)}）；"
-            f"事实 {report.facts_before} → {report.facts_after} 条（已按剩余日志重建）；"
-            f"清理向量缓存 {report.embed_cache_purged} 条、LLM 缓存 {report.llm_cache_purged} 条；"
-            f"耗时 {report.elapsed_ms:.0f} ms"
+            f"[yellow]删除已经做了，重建派生记忆时出错（{report.rebuild_error}），"
+            "下次巩固时补齐[/yellow]"
         )
 
 

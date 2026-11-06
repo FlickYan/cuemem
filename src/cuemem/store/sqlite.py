@@ -619,6 +619,15 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def spaces_with_expiring(self) -> list[str]:
+        """有带过期时间的发言的空间（定时删过期的记忆用，见 MemorySystem.purge_expired）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT space_id FROM turn_meta WHERE expires_at IS NOT NULL"
+                " ORDER BY space_id"
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def turn_sessions(self, space_id: str, turn_ids: Sequence[str]) -> set[str]:
         """这几句发言所在的会话（只读 session_id 一列，见 expiry.expired_ids）。"""
         sql = "SELECT session_id FROM turns WHERE space_id = ?"

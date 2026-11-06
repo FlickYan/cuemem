@@ -1098,7 +1098,8 @@ def create_proxy_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         # 每分钟把空闲的会话交给后台抽取；启动一个闲置期之后，把之前的进程（崩溃时）留下、没人
-        # 接着写的会话交给抽取（一次）；设了 traces_retention_days 时再删过期的 trace
+        # 接着写的会话交给抽取（一次）；设了 traces_retention_days、expired_retention_days 时再删
+        # 过期的 trace、过期的记忆
         adopt = _adopt_after(proxy.system, proxy.idle_s)
         jobs = _sweep_jobs(proxy.system, proxy.close_idle, adopt)
         threading.Thread(

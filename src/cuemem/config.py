@@ -280,6 +280,10 @@ class Settings(BaseSettings):
     # trace 保留几天（cuemem serve 与 cuemem proxy 启动时与之后每天删一遍更早的 trace 文件，连同
     # 其中提问的查询向量，见 MemorySystem.prune_traces）；None 一直留着
     traces_retention_days: int | None = Field(default=None, ge=1)
+    # 过期的记忆（SDK 的 expiration_date）过期之后再留几天：cuemem serve 与 cuemem proxy 启动时与
+    # 之后每天把过期这么久的发言真的删掉（遗忘，连同派生的记忆，见 MemorySystem.expire_memories）；
+    # 0 是一过期就删。None（默认）不删：过期的记忆只是读取时不给出
+    expired_retention_days: int | None = Field(default=None, ge=0)
 
     @classmethod
     def settings_customise_sources(

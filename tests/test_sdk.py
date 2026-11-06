@@ -1318,6 +1318,81 @@ def test_memory_browser_hides_expired_memories(memory: Memory, tmp_path: Path) -
     assert berlin not in statements(service.facts("u", show_expired=True))
 
 
+def test_purge_expired_deletes_expired_memories(memory: Memory, fake_api: FakeAPI) -> None:
+    """第七轮体检 P20：expiration_date 以前只是读取时不给出，过期的发言、事实、向量与缓存一直
+    留着，要逐条 delete。purge_expired 真的删掉过期的发言（遗忘），同一件事后来又说过一次、
+    没给过期时间的留着、重放时重新抽出来；还没过期、过期没那么久的不动。"""
+    yesterday = date.today() - timedelta(days=1)
+    berlin = memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+    berlin_id = berlin["results"][0]["id"]
+    memory.add("I like rain", user_id="v", expiration_date="2020-01-01", wait=True)
+    memory.add("I like rain", user_id="v", wait=True)  # 又说了一次，没给过期时间
+    memory.add("I like jazz", user_id="v", expiration_date="2999-01-01", wait=True)
+    system = memory.system
+    kept = system.db.get_turns("v")[1:]
+
+    # 过期 30 天以上的：只有 2020 年到期的那一句，昨天到期的住址还留着
+    reports = system.purge_expired(older_than=timedelta(days=30))
+    assert sorted(reports) == ["v"] and reports["v"].turns_deleted == 1
+    assert memory.get(berlin_id) is not None
+    reports = system.purge_expired(older_than=timedelta(0))
+    assert sorted(reports) == ["u"] and reports["u"].turns_deleted == 1
+    assert memory.get(berlin_id) is None
+    assert memory.get_all(user_id="u", show_expired=True)["results"] == []
+    assert system.db.expiring_turns("u") == {} and not system.db.get_turns("u")
+    assert "Berlin" not in (system.core_memory("u").text if system.core_memory("u") else "")
+    # 后来又说过一次的留着，那一句与没过期的一句原样不动
+    assert system.db.get_turns("v") == kept
+    assert sorted(f["memory"] for f in memory.get_all(user_id="v")["results"]) == [
+        "I like jazz",
+        "I like rain",
+    ]
+    assert list(system.db.expiring_turns("v").values()) == ["2999-01-01"]
+    before = len(fake_api.chat_requests)
+    assert system.purge_expired(older_than=timedelta(0)) == {}  # 都删过了：不重放、不发请求
+    assert len(fake_api.chat_requests) == before
+
+
+def test_purge_expired_leaves_spaces_without_expiry_alone(
+    memory: Memory, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有带过期时间的发言的空间（评测的空间都是）：不遗忘、不发请求、库不动。"""
+    memory.add("I live in Berlin", user_id="w", metadata={"k": "v"}, wait=True)
+    system = memory.system
+    turns, facts = system.db.get_turns("w"), system.facts("w")
+    calls: list[str] = []
+    monkeypatch.setattr(system, "forget", lambda space, **kw: calls.append(space))
+    before = (len(fake_api.chat_requests), len(fake_api.embed_requests))
+    assert system.purge_expired(older_than=timedelta(0)) == {}
+    assert system.purge_expired("w", older_than=timedelta(0)) == {}
+    assert calls == [] and (len(fake_api.chat_requests), len(fake_api.embed_requests)) == before
+    assert system.db.get_turns("w") == turns and system.facts("w") == facts
+
+
+def test_expired_retention_is_a_daily_opt_in_sweep_job(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CUEMEM_EXPIRED_RETENTION_DAYS 没设时（默认）cuemem serve / proxy 的清理线程不删过期的
+    记忆、要做的事不变；设了时启动时与之后每天删一遍过期这么多天以上的。"""
+    from cuemem.api.app import _sweep_jobs
+
+    system = memory.system
+    assert system.settings.expired_retention_days is None
+    assert _sweep_jobs(system) == []
+    calls: list[timedelta] = []
+    monkeypatch.setattr(
+        system, "purge_expired", lambda *a, older_than, **kw: calls.append(older_than) or {}
+    )
+    assert system.expire_memories() == {} and calls == []  # 没设：什么都不做
+    system.settings = system.settings.model_copy(update={"expired_retention_days": 3})
+    assert _sweep_jobs(system) == [system.expire_memories]
+    today = date(2026, 11, 6)
+    system.expire_memories(today=today)
+    system.expire_memories(today=today)  # 同一天只删一次
+    system.expire_memories(today=today + timedelta(days=1))
+    assert calls == [timedelta(days=3)] * 2
+
+
 def test_a_restated_memory_without_expiry_stays(memory: Memory, model: ScriptedModel) -> None:
     """同一件事后来又说过一次、没给过期时间：它一直有效（同 search 的规则）。"""
     memory.add("I like rain", user_id="u", expiration_date="2020-01-01", wait=True)

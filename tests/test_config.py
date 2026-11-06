@@ -64,6 +64,19 @@ def test_trace_retention_is_off_unless_set(
         load_settings()
 
 
+def test_expired_retention_is_off_unless_set(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """过期的记忆默认不删（第七轮体检 P20）；CUEMEM_EXPIRED_RETENTION_DAYS 设过期之后再留几天，
+    0 是一过期就删。"""
+    assert load_settings().expired_retention_days is None
+    monkeypatch.setenv("CUEMEM_EXPIRED_RETENTION_DAYS", "0")
+    assert load_settings().expired_retention_days == 0
+    monkeypatch.setenv("CUEMEM_EXPIRED_RETENTION_DAYS", "-1")
+    with pytest.raises(ValidationError, match="expired_retention_days"):
+        load_settings()
+
+
 def test_vector_store_api_key_comes_from_the_environment(
     clean_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -34,7 +34,7 @@ from cuemem.core.models import (
     Turn,
     TurnMeta,
 )
-from cuemem.core.timeutil import naive_local, valid_period
+from cuemem.core.timeutil import expiry_instant, naive_local, valid_period
 from cuemem.core.trace import (
     TraceSink,
     current_trace,
@@ -452,6 +452,7 @@ class MemorySystem:
         self._gates_guard = threading.Lock()
         self._forget_epochs: dict[str, int] = {}  # 空间 → 遗忘过几次（见 forget_epoch），同上一把锁
         self._traces_expired: date | None = None  # 哪天删过过期的 trace（见 expire_traces）
+        self._memories_expired: date | None = None  # 哪天删过过期的记忆（见 expire_memories）
 
     @classmethod
     def from_settings(
@@ -1652,6 +1653,63 @@ class MemorySystem:
                 "删掉了 %d 个 %d 天之前的 trace 文件，清掉 %d 个查询向量", files, days, purged
             )
         return files, purged
+
+    def purge_expired(
+        self,
+        space_id: str | None = None,
+        *,
+        older_than: timedelta,
+        now: datetime | None = None,
+    ) -> dict[str, ForgetReport]:
+        """真的删掉过期了 older_than 以上的发言（SDK 的 expiration_date）：按空间各遗忘一次
+        （forget，连同派生的事实、摘要、向量、图片、缓存与 trace，再从剩下的日志重放）。
+        space_id 为 None 时是所有有过期时间的空间。返回空间 → 遗忘的报告，没有要删的空间不在里面
+        （不重放、不发请求）。
+
+        只删过期的发言本身（follow_citations=False）：后来没给过期时间、引用了它的回复留着，
+        同读取时的规则（一条记忆的出处各句都过期了才过期）；同一件事后来又说过一次的，重放时
+        从那一句重新抽出来。已经导出的文件不在 CueMem 里，删不到。
+
+        一个空间出错不影响别的空间，都做完之后把第一个出错抛出去（删掉的不会再删一遍）。"""
+        cutoff = (now or datetime.now()) - older_than
+        spaces = [space_id] if space_id is not None else self.db.spaces_with_expiring()
+        reports: dict[str, ForgetReport] = {}
+        failed: Exception | None = None
+        for space in spaces:
+            stamps = self.db.expiring_turns(space)
+            doomed = sorted(t for t, stamp in stamps.items() if expiry_instant(stamp) <= cutoff)
+            if not doomed:
+                continue
+            try:
+                reports[space] = self.forget(
+                    space, turn_ids=doomed, follow_citations=False, report_rebuild_errors=True
+                )
+            except Exception as exc:
+                logger.warning("删空间 %s 里过期的记忆出错", space, exc_info=True)
+                failed = failed or exc
+        if failed is not None:
+            raise failed
+        return reports
+
+    def expire_memories(self, *, today: date | None = None) -> dict[str, ForgetReport]:
+        """按配置的 expired_retention_days 删过期的记忆（purge_expired）：cuemem serve 与 cuemem
+        proxy 启动时与之后每分钟调用一次（见 api.app._sweep），每天只在第一次真的去删。没设时
+        什么都不做（默认）：过期的记忆只是读取时不给出，要 delete 才删。每个要删的空间重放一遍
+        （巩固的请求大多由 LLM 缓存给出），重放期间这个空间的读写都要等。"""
+        days = self.settings.expired_retention_days
+        today = today or date.today()
+        if days is None or self._memories_expired == today:
+            return {}
+        reports = self.purge_expired(older_than=timedelta(days=days))
+        self._memories_expired = today  # 出错时下一分钟再试（已经删掉的不会再删）
+        if reports:
+            logger.info(
+                "删掉了 %d 个空间里过期 %d 天以上的 %d 条发言",
+                len(reports),
+                days,
+                sum(r.turns_deleted for r in reports.values()),
+            )
+        return reports
 
     # ---------- 读取 ----------
 
