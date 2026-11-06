@@ -493,15 +493,18 @@ class MemoryDB:
                 found.update((r[0], _dt(r[1])) for r in rows)
         return found
 
-    def speakers(self, space_id: str) -> list[str]:
-        """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。"""
+    def speakers(self, space_id: str, *, without_sessions: Sequence[str] = ()) -> list[str]:
+        """多人对话里出现过的说话人名字（按首次出现排序）；普通的用户—助手对话返回空列表。
+        without_sessions：不算这几个会话（遗忘的快速路径比较删掉它们之后会不会变）。"""
+        sql = "SELECT speaker, MIN(ts) FROM turns WHERE space_id = ? AND speaker IS NOT NULL"
+        args: list[Any] = [space_id]
+        if without_sessions:
+            sql += f" AND session_id NOT IN ({', '.join('?' * len(without_sessions))})"
+            args += list(without_sessions)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT speaker, MIN(ts) FROM turns WHERE space_id = ? AND speaker IS NOT NULL"
-                " GROUP BY speaker ORDER BY MIN(ts), speaker",
-                (space_id,),
-            ).fetchall()
-        return [r[0] for r in rows]
+            rows = self._conn.execute(sql + " GROUP BY speaker ORDER BY MIN(ts), speaker", args)
+            fetched = rows.fetchall()
+        return [r[0] for r in fetched]
 
     def add_turns(self, turns: Sequence[Turn], meta: Mapping[str, TurnMeta] | None = None) -> int:
         """写入原始轮次，返回实际新增的条数。
@@ -1399,6 +1402,41 @@ class MemoryDB:
                 (space_id,),
             )
         return ids
+
+    def drop_inert_sessions(self, space_id: str, session_ids: Sequence[str]) -> list[str]:
+        """遗忘的快速路径（第七轮体检，见 MemorySystem._inert_sessions）：整段删掉的会话什么都
+        没留下（没有事实、没有新建或关联的实体），派生层里只有它们的片段与摘要单元、任务。删掉
+        这些，连同这个空间里被取代的任务（重放时清空派生层，它们也不在了），返回删掉的摘要单元
+        ID，供调用方删向量。在调用方的事务里调用（这里的事务是保存点）。"""
+        ids = list(dict.fromkeys(session_ids))
+        removed: list[str] = []
+        with self.transaction() as conn:
+            self._bump([space_id])
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                marks = ", ".join("?" * len(chunk))
+                args = [space_id, *chunk]
+                removed += [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT id FROM units WHERE space_id = ? AND kind = 'summary'"
+                        f" AND session_id IN ({marks})",
+                        args,
+                    )
+                ]
+                conn.execute(
+                    "DELETE FROM units WHERE space_id = ? AND kind = 'summary'"
+                    f" AND session_id IN ({marks})",
+                    args,
+                )
+                for table in ("episodes", "jobs"):
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE space_id = ? AND session_id IN ({marks})", args
+                    )
+            conn.execute(
+                "DELETE FROM jobs WHERE space_id = ? AND status = 'superseded'", (space_id,)
+            )
+        return removed
 
     # ---------- 巩固任务队列 ----------
 

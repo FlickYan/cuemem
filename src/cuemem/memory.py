@@ -76,6 +76,7 @@ from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
 from cuemem.write.consolidate import (
     MAX_ATTEMPTS,
+    REBUILD_PENDING,
     ConsolidationReport,
     ConsolidationWorker,
     Consolidator,
@@ -1006,6 +1007,12 @@ class MemorySystem:
           report_rebuild_errors=True 时不抛出，写在报告的 rebuild_error 里：HTTP 接口、MCP、SDK 与
           各集成据此说明删除已经做了、只是派生记忆要等下次巩固（以前它们把供应商的出错照搬成
           "遗忘失败"，调用方以为没删）。
+
+        快速路径（第七轮体检）：整段删掉的会话在派生层里什么都没留下（_inert_sessions：没有事实、
+        没有新建或关联的实体，空间里没有待处理的任务；update() 抽不出事实的更正就是这样）时，
+        事务里不清空派生层，只删这几个会话的片段、摘要与任务（MemoryDB.drop_inert_sessions），
+        不重放；对账与消歧的缓存原样留着。结果与重放相同（tests/test_forget_fast.py），trace
+        记 fast_path。
         """
         started = time.perf_counter()
         with (
@@ -1033,12 +1040,18 @@ class MemorySystem:
             refs = {u.id for u in old_rounds if doomed & set(u.source_turn_ids)}
             refs |= {f.id for f in facts if doomed & set(f.source_turn_ids)}
             refs |= {m.id for m in doomed_media}
+            # 整段删掉的会话什么都没留下时不重放（第七轮体检）：只删它们的片段、摘要与任务
+            fast = self._inert_sessions(space_id, affected, doomed, facts, doomed_media, refs)
 
             # 1. 联网的几步，数据库不动：先写新"轮"的向量（库里有记录，向量就一定在），再删要失去
             #    记录的向量（与以前删旧"轮"相同，先删向量、后删记录）。出错时什么都没删
             new_rounds = self.writer.prepare_rounds(space_id, affected, doomed)
             kept = {u.id for u in new_rounds}
-            derived = self.db.derived_unit_ids(space_id)
+            if fast:  # 只有这几个会话的摘要要失去记录，别的派生记忆都留着
+                summaries = self.db.list_units(space_id, kinds=["summary"], session_ids=affected)
+                derived = [u.id for u in summaries]
+            else:
+                derived = self.db.derived_unit_ids(space_id)
             self.vectors.delete(space_id, [u.id for u in old_rounds if u.id not in kept] + derived)
             self.vectors.delete_images(space_id, [m.id for m in doomed_media])
 
@@ -1052,7 +1065,8 @@ class MemorySystem:
             if cache is not None:
                 parts = [f"session:{sid}" for sid in affected] + ["ask", "forget"]
                 llm_purged = sum(cache.delete_scope(scope(space_id, p)) for p in parts)
-                cache.hold(held)
+                if not fast:  # 快速路径不重放：对账与消歧的条目都还是剩下的日志算得出来的
+                    cache.hold(held)
             committed = False
             try:
                 # 3. 一个事务：换上新的"轮"，删发言，清空派生层，按原来的任务重新登记。进行中的
@@ -1061,16 +1075,21 @@ class MemorySystem:
                 with self._open_lock:
                     skip = {sid for space, sid in self._open if space == space_id}
                     with self.db.transaction() as conn:
-                        before = self.db.get_jobs(space_id)
+                        before = [] if fast else self.db.get_jobs(space_id)
                         self.db.delete_units(space_id, [u.id for u in old_rounds])
                         if new_rounds:
                             self.db.add_units(new_rounds)
                         deleted = self.db.delete_turns(space_id, [t.id for t in targets])
                         # add 的 idempotency_key 写下过这些发言的只留墓碑（第六轮体检）
                         self.db.add_key_forget(conn, space_id, doomed)
-                        removed = self.db.clear_derived(space_id)
-                        self.consolidator.requeue(space_id, before, skip)
+                        if fast:
+                            removed = self.db.drop_inert_sessions(space_id, affected)
+                        else:
+                            removed = self.db.clear_derived(space_id)
+                            self.consolidator.requeue(space_id, before, skip)
                 committed = True
+                if fast:
+                    trace.attrs.update(fast_path=True)
                 # 还在独占里：之后的读取（进行中的会话的下一轮）都看得到这次遗忘。之后重建出错
                 # 抛出时也已经加过：日志已经删了。重放之后再加一次（见下面的 finally）
                 self._bump_forget_epoch(space_id)
@@ -1084,8 +1103,9 @@ class MemorySystem:
                 try:
                     images_deleted, images_left = self._delete_image_files(doomed_media)
                     self.vectors.delete(space_id, sorted(set(removed) - set(derived)))
-                    with cache.recording(reused) if cache is not None else nullcontext():
-                        self.consolidator.run(space_id)  # 没有待处理的任务时什么都不做
+                    if not fast:
+                        with cache.recording(reused) if cache is not None else nullcontext():
+                            self.consolidator.run(space_id)  # 没有待处理的任务时什么都不做
                 except Exception as exc:  # 清理照样做完（下面的 finally），之后再抛出或写进报告
                     failed = exc
                 finally:
@@ -1150,9 +1170,11 @@ class MemorySystem:
                             exc_info=True,
                         )
             finally:  # 中途出错时重放用到的更少，删得更多
-                if cache is not None and committed:
+                if cache is None or fast:
+                    pass
+                elif committed:
                     llm_purged += cache.settle(held, reused)
-                elif cache is not None:  # 事务没提交：日志与派生层都没动，标记的条目原样留下
+                else:  # 事务没提交：日志与派生层都没动，标记的条目原样留下
                     cache.release(held)
                 if committed:
                     # 重放之后再加一次（还在独占里）：提交时加过的那次之后、重放做完之前，不在
@@ -1186,6 +1208,68 @@ class MemorySystem:
             if report.rebuild_error:
                 trace.attrs.update(rebuild_error=report.rebuild_error)
         return report
+
+    def _inert_sessions(
+        self,
+        space_id: str,
+        affected: Sequence[str],
+        doomed: set[str],
+        facts: Sequence[Fact],
+        doomed_media: Sequence[MediaItem],
+        refs: Collection[str],
+    ) -> bool:
+        """遗忘能不能走快速路径（第七轮体检）：要删的会话整段删掉，而且它们在派生层里什么都
+        没留下，从剩下的日志重放得到的派生记忆与现在的只差它们的片段、摘要与任务。以前 update()
+        的更正抽不出事实时也把整个空间清空重放（2 万轮的空间约 59 秒，期间这个用户的读取都在
+        等）。在遗忘的独占里调用。全部成立才是 True：
+
+        - 受影响的会话的每一句都在要删的里面（只删一部分时剩下的要重新抽取）；
+        - 没有要删的图片，没有事实出自要删的发言；
+        - 每个受影响的会话恰好有一个没被取代的任务：已完成，统计里没有事实（facts 为 0，合并与
+          重复也不算），没有新建或关联实体，不是内容审核跳过的；
+        - 整个空间没有待处理或失败的任务，派生记忆没有过期（stale），之前的重建做完了：重放
+          除了跳过这几个会话不会做别的；
+        - 没有别的发言引用过被删的记忆（沿引用扩散的已经在要删的里面，只删一部分会话不成立）；
+        - 删掉之后说话人（核心记忆按他们挑实体）不变；没有巩固过的会话正在进行中。
+
+        与重放的差别只在 LLM 缓存：重放用不到的对账与消歧条目留着。这几个会话没有发过对账与
+        消歧请求（没有事实、没有关联实体），条目里不会有它们的内容。"""
+        if not affected or doomed_media:
+            return False
+        if any(doomed.intersection(f.source_turn_ids) for f in facts):
+            return False
+        if any(t.id not in doomed for t in self.db.turns_of(space_id, session_ids=affected)):
+            return False
+        sessions = set(affected)
+        own: dict[str, list[dict[str, Any]]] = {}
+        with_jobs: set[str] = set()
+        for job in self.db.get_jobs(space_id):
+            if job["status"] not in ("done", "superseded"):
+                return False
+            with_jobs.add(job["session_id"])
+            if job["session_id"] in sessions and job["status"] == "done":
+                own.setdefault(job["session_id"], []).append(job)
+        for sid in affected:
+            jobs = own.get(sid, [])
+            if len(jobs) != 1:
+                return False
+            stats = jobs[0]["stats"]
+            if "skipped" in stats or any(
+                stats.get(k, 1) != 0 for k in ("facts", "entities_created", "entities_linked")
+            ):
+                return False
+        if self.consolidator.stale(space_id):
+            return False
+        if self.db.get_meta(f"consolidation:{space_id}") == REBUILD_PENDING:
+            return False
+        if any(t not in doomed for t in self.db.citing_turns(space_id, sorted(refs))):
+            return False
+        if self.db.speakers(space_id) != self.db.speakers(space_id, without_sessions=affected):
+            return False
+        # 进行中、巩固过的会话：重放时跳过它（requeue 的 skip），它的派生记忆暂时没了；这里
+        # 不碰它会不一样，所以照旧重放
+        with self._open_lock:
+            return not any(space == space_id and sid in with_jobs for space, sid in self._open)
 
     def _delete_image_files(self, items: Sequence[MediaItem]) -> tuple[int, int]:
         """遗忘提交之后删掉被删图片的原图文件：没有别的记录引用、本进程里也没有正在写入它的。
