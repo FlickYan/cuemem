@@ -1161,6 +1161,9 @@ class MemorySystem:
                             exc_info=True,
                         )
                         trace.attrs.update(embed_cache_left=True)
+                    # 7. Claude 记忆工具的文件（第七轮体检）：笔记被删了的文件去掉，与工具下次
+                    #    打开时（_own）做的相同；以前要等工具再打开这个空间，不再打开就一直留着
+                    self._prune_claude_store(space_id, doomed, trace)
                     try:  # 两种缓存在删除时各自截断 WAL（见 delete_scope、delete_many）
                         self.db.scrub()
                     except Exception:
@@ -1208,6 +1211,32 @@ class MemorySystem:
             if report.rebuild_error:
                 trace.attrs.update(rebuild_error=report.rebuild_error)
         return report
+
+    def _prune_claude_store(
+        self, space_id: str, turn_ids: Collection[str] | None, trace: Any | None
+    ) -> None:
+        """清理数据目录下 Claude 记忆工具的存储（claude_memory.sqlite，第七轮体检）：turn_ids
+        为 None 时删掉这个空间的一切（删除空间），否则去掉笔记在这些发言里的文件。存储不存在时
+        什么都不做（不建）。在提交之后调用：出错时记警告、不抛出，trace 记 claude_memory_left。"""
+        from cuemem.integrations._claude_store import STORE_NAME, prune_turns, purge_space
+
+        store = self.settings.paths.db.parent / STORE_NAME
+        try:
+            if turn_ids is None:
+                purge_space(store, space_id)
+            else:
+                prune_turns(store, space_id, turn_ids)
+        except Exception:
+            logger.warning(
+                "遗忘 %s：Claude 记忆工具的文件没能清理，%s 里可能还有被删的内容",
+                space_id,
+                store,
+                exc_info=True,
+            )
+            if trace is not None:
+                trace.attrs.update(claude_memory_left=True)
+            else:
+                record_event("claude_memory_left", space=space_id)
 
     def _inert_sessions(
         self,
@@ -1643,6 +1672,8 @@ class MemorySystem:
             report = self.forget(space_id, session_ids=sorted(self.db.get_sessions(space_id)))
             self.vectors.delete_space(space_id)  # 先于数据库：旧名字的集合按库里的记忆单元核对归属
             self.db.delete_space(space_id)
+            # Claude 记忆工具在这个空间里的一切（没有笔记的文件、spaces 里的那一行也在内）
+            self._prune_claude_store(space_id, None, None)
             self._bump_forget_epoch(space_id)  # 画像等派生记忆也没了（空间里没有会话时遗忘不加）
             prefix = _open_mark(space_id)
             with self._open_lock:  # 与 open_session 的顺序相同：先这把锁、后数据库
