@@ -1153,11 +1153,12 @@ def test_body_limits_from_the_environment(
     assert len(served) == 1
 
 
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_serve_refuses_a_bad_open_session_limit(
-    served: list[Any], monkeypatch: pytest.MonkeyPatch
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
-    """CUEMEM_MAX_OPEN_SESSIONS 写错时 cuemem serve 在打开记忆系统之前报错（退出码 1）。"""
-    command = ["serve", "--no-ui", "--scenario", "plain"]
+    """CUEMEM_MAX_OPEN_SESSIONS 写错时 cuemem serve 与 proxy 在打开记忆系统之前报错（退出码 1；
+    记忆代理的会话也按它限数，第七轮复审）。"""
     monkeypatch.setenv("CUEMEM_MAX_OPEN_SESSIONS", "0")
     result = runner.invoke(app, command)
     assert result.exit_code == 1 and "CUEMEM_MAX_OPEN_SESSIONS" in result.output

@@ -25,6 +25,8 @@
 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id，或者放进 user 字段）；
 会话：请求头 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）
 或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
+一个用户（记忆空间）同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时先结束
+最久没有请求的那个（与闲置结束相同，交给抽取）；都留着没写进去的写回时 429（见 _make_room）。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
@@ -75,7 +77,7 @@ from starlette.types import Receive, Scope, Send
 from cuemem import __version__
 from cuemem.api.auth import AnyKeys, Keys, Principal, guard, identity_headers, principal_of
 from cuemem.api.failures import provider_failure
-from cuemem.api.limits import MAX_BODY_BYTES
+from cuemem.api.limits import MAX_BODY_BYTES, MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
@@ -193,8 +195,11 @@ class MemoryProxy:
         unknown_model: UnknownModel | None = None,
         http_client: httpx2.Client | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_open_runs: int | None = None,
     ) -> None:
         self.system = system
+        # 一个记忆空间同时进行中的会话数的上限（见 _make_room）；不给时读 CUEMEM_MAX_OPEN_SESSIONS
+        self.max_open_runs = max_open_runs if max_open_runs is not None else open_session_limit()
         self.memory = Memory.from_system(system)
         self.default_user = default_user
         self.role = role
@@ -376,24 +381,48 @@ class MemoryProxy:
         self.close_idle()
         self._adopt(space, explicit)
         key = (space, explicit)
+        ended: list[Run] = []
         with self._lock:
             run = self._runs.get(key)
             if run is not None and fresh and explicit is None:
-                self._runs.pop(key)
-                ended: Run | None = run
+                ended.append(self._runs.pop(key))
                 run = None
-            else:
-                ended = None
             if run is None:
+                evicted = self._make_room(space)
+                if evicted is not None:
+                    ended.append(evicted)
                 when = datetime.now()
                 sid = explicit or sortable_session_id("proxy", when)
                 run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
                 self._runs[key] = run
                 self.system.open_session(space, sid)  # 进行中：每轮照常写入，但不抽取
             run.last_seen = now
-        if ended is not None:
-            self._finish(ended)
+        for done in ended:
+            self._finish(done)
         return run
+
+    def _make_room(self, space: str) -> Run | None:
+        """_run 开新会话之前（调用方持有 self._lock）：这个空间进行中的会话没到 max_open_runs 个时
+        None；到了时取走其中最久没有请求、没有留着重试的写回、也没在写回的那个（调用方结束它，与
+        闲置结束相同：交给抽取），没有这样的会话时 ProxyError 429。以前不限：调用方每换一个
+        X-CueMem-Session 就多一个会话，故障期间每个会话还能留 MAX_UNSAVED_BYTES 的写回，内存跟着
+        会话数一直长。"""
+        mine = [k for k, r in self._runs.items() if r.space == space]
+        if len(mine) < self.max_open_runs:
+            return None
+        idle = [k for k in mine if not self._runs[k].unsaved and not self._runs[k].lock.locked()]
+        if not idle:
+            raise ProxyError(
+                429,
+                f"This user already has {len(mine)} open memory sessions (the limit is "
+                f"{self.max_open_runs}, set by {MAX_OPEN_SESSIONS_ENV}) and none can be ended "
+                "now: retry later.",
+                kind="rate_limit_error",
+                code="rate_limited",
+                headers={"Retry-After": "60"},
+            )
+        oldest = min(idle, key=lambda k: self._runs[k].last_seen)
+        return self._runs.pop(oldest)
 
     def _adopt(self, space: str, explicit: str | None) -> None:
         """这个进程第一次碰到这个空间：之前的进程崩溃时还在进行中的会话（正常退出时 close_all

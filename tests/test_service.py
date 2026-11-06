@@ -258,6 +258,25 @@ def test_open_chat_sessions_per_space_are_capped(service: ChatService, tmp_path:
     assert "上限 2" in refused.json()["detail"]
     small.end(a)
     assert client.post("/api/sessions", json={"space": "tiny"}).status_code == 200
+    # /api/v1/runs 开的 run 同一个上限，各算各的（第七轮复审）
+    runs = [client.post("/api/v1/runs", json={"user_id": "tiny"}) for _ in range(3)]
+    assert [r.status_code for r in runs] == [200, 200, 429]
+
+
+def test_the_ui_explains_the_open_session_limit(service: ChatService) -> None:
+    """第七轮复审 P14：界面开会话（New session，或还没有会话时发第一句）碰到上限时给出说明
+    （gr.Error），以前 SessionLimitError 原样抛出，界面只显示笼统的 "Error"。"""
+    small = ChatService(service.system, service.agent, max_open_sessions=1)
+    small.chat(small.start("tiny", at=DAY).session_id, "I'm vegan.", mode="l0")
+    events = {f.name: f.fn for f in build_ui(small).fns.values()}
+    with pytest.raises(gr.Error, match="too many open sessions") as raised:
+        events["start"]("tiny", "", None, None)
+    assert "the limit is 1" in str(raised.value)
+    message = {"text": "hello", "files": []}
+    replies = events["send"](message, [], None, "tiny", "", "l0", "learned", 0.5, None)
+    with pytest.raises(gr.Error, match="too many open sessions"):
+        list(replies)
+    assert len(small.open_sessions("tiny")) == 1
 
 
 def test_open_session_limit_from_the_environment() -> None:

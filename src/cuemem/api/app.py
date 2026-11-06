@@ -464,6 +464,7 @@ def create_app(
     """
     _clear_uploads(upload_dir)
     v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
+    v1.max_open_runs = service.max_open_sessions  # 一个空间开着的 run 与对话会话同一个上限
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

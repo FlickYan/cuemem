@@ -61,6 +61,7 @@ from cuemem.errors import (
     EmbeddingAPIError,
     IdempotencyConflictError,
     MemoryAPIError,
+    SessionLimitError,
 )
 from cuemem.evidence import MEMORY_NOTE, RAISED_REASON, inject_evidence, recall_evidence
 from cuemem.memory import MemorySystem
@@ -1397,6 +1398,35 @@ def test_closing_the_client_ends_its_runs(system: MemorySystem) -> None:
         client.close()
         assert system.open_sessions("eve") == set()
         assert [j["session_id"] for j in system.db.get_jobs("eve")] == [run_id]
+
+
+def test_open_runs_per_space_are_capped_on_the_server(system: MemorySystem) -> None:
+    """第七轮复审 P14：max_open_runs 给了时（cuemem serve 给 /api/v1 设成 CUEMEM_MAX_OPEN_SESSIONS，
+    默认 64）一个空间开着的 run 最多这么多个：再 open_run 新的时 SessionLimitError，/api/v1 回 429
+    （Retry-After: 60），MemoryClient 抛同样的异常；不替调用方结束别的 run。以前 /api/v1 不限。
+    已经开着的 run 再 open_run（接着写）不算新的；本地的 SDK 默认不限。"""
+    assert Memory.from_system(system).max_open_runs is None
+    server = Memory.from_system(system)
+    server.max_open_runs = 2
+    app = FastAPI()
+    app.include_router(memories_router(server, dependencies=guard(Keys())))
+    install_error_format(app)
+    with TestClient(app) as http:
+        client = MemoryClient("http://testserver", http_client=http)
+        a = client.open_run(user_id="eve")
+        b = client.open_run(user_id="eve")
+        assert client.open_run(a, user_id="eve") == a
+        refused = http.post("/api/v1/runs", json={"user_id": "eve"})
+        assert refused.status_code == 429 and refused.headers["retry-after"] == "60"
+        assert refused.json()["error"]["code"] == "rate_limited"
+        with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            client.open_run(user_id="eve")
+        assert system.open_sessions("eve") == {a, b}
+        assert client.open_run(user_id="bob")  # 别的空间各算各的
+        client.end_run(a, user_id="eve")
+        c = client.open_run(user_id="eve")
+        assert system.open_sessions("eve") == {b, c}
+        client.close()
 
 
 @pytest.mark.parametrize("where", ["local", "remote"])

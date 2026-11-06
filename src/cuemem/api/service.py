@@ -7,12 +7,11 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +21,7 @@ import httpx2
 
 from cuemem.agent import Agent, ChatSession, Persona, Reply
 from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
+from cuemem.api.limits import MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import Entity, SessionIn, TurnIn
@@ -33,24 +33,6 @@ from cuemem.memory import ForgetReport, MemorySystem
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
 
 logger = logging.getLogger(__name__)
-
-MAX_OPEN_SESSIONS_ENV = "CUEMEM_MAX_OPEN_SESSIONS"
-MAX_OPEN_SESSIONS = 64  # 一个记忆空间同时进行中的对话会话（ChatService.start）
-
-
-def open_session_limit(environ: Mapping[str, str] | None = None) -> int:
-    """环境变量 CUEMEM_MAX_OPEN_SESSIONS 给出的、一个记忆空间同时进行中的对话会话数的上限；没设
-    或是空的时默认 64。不是正整数时 CueMemError（cuemem serve 打印原因、退出码 1）。"""
-    env = os.environ if environ is None else environ
-    raw = (env.get(MAX_OPEN_SESSIONS_ENV) or "").strip()
-    if not raw:
-        return MAX_OPEN_SESSIONS
-    if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
-        raise CueMemError(
-            f"{MAX_OPEN_SESSIONS_ENV} 要是正整数（会话数，默认 {MAX_OPEN_SESSIONS}），"
-            f"现在是 {raw!r}"
-        )
-    return int(raw)
 
 
 @dataclass

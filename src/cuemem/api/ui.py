@@ -29,10 +29,11 @@ from typing import Any, cast, get_args
 import gradio as gr
 from PIL import Image
 
-from cuemem.agent import Reply
+from cuemem.agent import ChatSession, Reply
 from cuemem.agent.runtime import RecalledItem, TurnTrace
 from cuemem.api.auth import ADMIN, Principal
 from cuemem.api.service import ChatService
+from cuemem.errors import SessionLimitError
 from cuemem.memory import RecallMode
 from cuemem.read.controller import Router, english_reason
 from cuemem.store.media import decoding
@@ -302,7 +303,7 @@ def build_ui(
             notice = ""
             if sid := mine(request, sid):
                 notice = _end(service, sid)
-            session = service.start(space, at=_parse_date(date))
+            session = _start(service, space, date)
             return (
                 session.session_id,
                 [],
@@ -342,7 +343,7 @@ def build_ui(
             if sid and not service.is_open(sid):  # 闲置太久，清理线程结束了它（已经交给抽取）
                 sid, notice = None, _ended_notice(service)
             if not sid:
-                sid = service.start(space, at=_parse_date(date)).session_id
+                sid = _start(service, space, date).session_id
             user: list[Any] = [text] if text else []
             user += [{"path": f} for f in files]
             history = [*history, {"role": "user", "content": user}]
@@ -805,6 +806,19 @@ def _end(service: ChatService, sid: str) -> str:
             "descriptions, profile)."
         )
     return "Session ended (it was empty)."
+
+
+def _start(service: ChatService, space: str, date: str) -> ChatSession:
+    """开一个会话；这个空间进行中的会话到了上限（SessionLimitError）时给出说明，而不是 Gradio
+    笼统的 "Error"（第七轮复审）。"""
+    try:
+        return service.start(space, at=_parse_date(date))
+    except SessionLimitError as exc:
+        raise gr.Error(
+            f"The memory space {space!r} has too many open sessions "
+            f"(the limit is {service.max_open_sessions}): end one, or wait until idle sessions "
+            "are cleaned up."
+        ) from exc
 
 
 def _parse_date(text: str) -> datetime | None:

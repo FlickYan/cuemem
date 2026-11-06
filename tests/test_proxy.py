@@ -722,6 +722,53 @@ def test_write_backs_kept_during_an_outage_are_capped_by_size(
     assert run.unsaved_bytes == one
 
 
+def test_open_proxy_sessions_per_user_are_capped(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第七轮复审 P14：一个用户同时进行中的代理会话最多 max_open_runs 个
+    （CUEMEM_MAX_OPEN_SESSIONS，默认 64）。再开新的时先结束最久没有请求、没有留着写回的那个
+    （与闲置结束相同）；都留着写回（故障期间）时 429。以前每个会话的写回有上限，会话数却不限：
+    调用方每次换一个 X-CueMem-Session，故障期间每个都能留 32 MiB。"""
+    assert proxy.max_open_runs == 64
+    proxy.max_open_runs = 2
+    for i, sid in enumerate(("s1", "s2", "s3")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    assert sorted(sid for _, sid in proxy._runs) == ["s2", "s3"]  # s1 最久没有请求：结束了
+    assert system.open_sessions("alice") == {"s2", "s3"}
+    assert chat(client, "hi", user="bob", headers={"X-CueMem-Session": "s1"}).is_success  # 各算各的
+
+    outage = Outage(system, monkeypatch)
+    for i, sid in enumerate(("s2", "s3")):
+        clock.now = 10.0 + i
+        chat(client, f"later {i}", user="alice", headers={"X-CueMem-Session": sid})
+    refused = chat(client, "one more", user="alice", headers={"X-CueMem-Session": "s4"})
+    assert refused.status_code == 429 and refused.headers["retry-after"] == "60"
+    error = refused.json()["error"]
+    assert error["code"] == "rate_limited" and "CUEMEM_MAX_OPEN_SESSIONS" in error["message"]
+    assert sorted(sid for space, sid in proxy._runs if space == "alice") == ["s2", "s3"]
+    assert upstream.proxied[-1]["messages"][-1]["content"] != "one more"  # 没有转发
+
+    outage.status = None
+    chat(client, "back", user="alice", headers={"X-CueMem-Session": "s2"})  # s2 留着的写进去了
+    clock.now = 20.0
+    assert chat(client, "one more", user="alice", headers={"X-CueMem-Session": "s4"}).is_success
+    # s2 刚有过请求，却是唯一没有留着写回的：结束它；s3 留着的写回不丢
+    assert sorted(sid for space, sid in proxy._runs if space == "alice") == ["s3", "s4"]
+    assert "s2" not in system.open_sessions("alice")
+    assert [t.text for t in system.db.get_turns("alice", "s2") if t.role == "user"] == [
+        "note 1",
+        "later 0",
+        "back",
+    ]
+    assert [u.messages[0]["content"] for u in proxy._runs[("alice", "s3")].unsaved] == ["later 1"]
+
+
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）
 WORTH_RETRYING: list[tuple[BaseException, bool]] = [
     (EmbeddingAPIError("no balance", status=402), True),

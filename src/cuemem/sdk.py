@@ -73,7 +73,7 @@ from cuemem.core.models import (
 )
 from cuemem.core.timeutil import naive_local, normalize_expiry
 from cuemem.core.types import PeakPolicy, Router
-from cuemem.errors import ConcurrentWriteError, IdempotencyConflictError
+from cuemem.errors import ConcurrentWriteError, IdempotencyConflictError, SessionLimitError
 from cuemem.expiry import Sources as _Sources
 from cuemem.expiry import visible_core
 from cuemem.store.sqlite import legacy_idx_key, next_idx_key
@@ -234,7 +234,11 @@ class Memory:
         # close_idle_runs 结束的 run（按结束的先后，最多 IDLE_CLOSED_KEPT 个）：再 add 时重新打开
         self._idle_closed: dict[tuple[str, str], None] = {}
         self._adopted: set[str] = set()  # 接手过崩溃前留下的 run 的空间（见 _adopt）
+        self._opening: dict[str, int] = {}  # 空间 → 正在 open_run（还没登记）的 run 数
         self._runs_lock = threading.Lock()
+        # 一个空间同时开着的 run 的上限（open_run），None 是不限。cuemem serve 给 /api/v1 设成
+        # CUEMEM_MAX_OPEN_SESSIONS（默认 64）；本地的 SDK 不限
+        self.max_open_runs: int | None = None
 
     def _adopt(self, space: str, keep: Sequence[str] = ()) -> None:
         """这个对象第一次碰到这个空间：之前的进程崩溃时还开着的 run（open_run 了、没来得及
@@ -449,13 +453,38 @@ class Memory:
         的 run 同样（MemorySystem.resume_left_open）。"""
         space = space_for(user_id, agent_id)
         rid = run_id or sortable_session_id("run", datetime.now())
-        self._adopt(space, keep=[rid])
-        self.system.open_session(space, rid)
         with self._runs_lock:
-            self._runs.add((space, rid))
-            self._run_seen[(space, rid)] = time.monotonic()
-            self._idle_closed.pop((space, rid), None)
+            self._make_room(space, rid)
+            self._opening[space] = self._opening.get(space, 0) + 1
+        try:
+            self._adopt(space, keep=[rid])
+            self.system.open_session(space, rid)
+            with self._runs_lock:
+                self._runs.add((space, rid))
+                self._run_seen[(space, rid)] = time.monotonic()
+                self._idle_closed.pop((space, rid), None)
+        finally:
+            with self._runs_lock:
+                self._opening[space] -= 1
+                if not self._opening[space]:
+                    del self._opening[space]
         return rid
+
+    def _make_room(self, space: str, run_id: str) -> None:
+        """open_run 的上限（调用方持有 _runs_lock）：max_open_runs 给了、这个空间开着的（加上正在
+        开的）run 已经这么多、run_id 又不是其中之一时 SessionLimitError（/api/v1 回 429）。不替
+        调用方结束别的 run：那会让它们提前抽取。以前 /api/v1 不限，一个令牌可以一直 open_run，
+        每个都占着内存与一个进行中的标记，直到闲置 30 分钟才结束。"""
+        limit = self.max_open_runs
+        if limit is None or (space, run_id) in self._runs:
+            return
+        count = sum(1 for s, _ in self._runs if s == space) + self._opening.get(space, 0)
+        if count >= limit:
+            raise SessionLimitError(
+                f"User space {space} already has {count} open runs (the limit is {limit}, set by "
+                "CUEMEM_MAX_OPEN_SESSIONS): end one with end_run, or retry after idle runs "
+                "have been ended."
+            )
 
     def end_run(
         self,

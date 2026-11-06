@@ -78,7 +78,8 @@ class VectorStoreOpenError(CueMemError):
 class SessionLimitError(CueMemError):
     """这个记忆空间进行中的对话会话（/api/sessions、界面）已经到了 CUEMEM_MAX_OPEN_SESSIONS，又都
     说过话：没有开新的会话（HTTP 429）。结束一个会话（/api/sessions/{id}/end）或等闲置的会话被
-    清理之后再开。"""
+    清理之后再开。/api/v1/runs 开的 run 同样（Memory.max_open_runs，MemoryClient.open_run 抛出
+    它）：end_run 一个或等闲置的 run 被结束。"""
 
 
 class AccessKeysError(CueMemError):

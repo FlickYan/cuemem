@@ -1138,7 +1138,7 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.limits import body_limits, concurrency_limit
+    from cuemem.api.limits import body_limits, concurrency_limit, open_session_limit
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -1152,6 +1152,7 @@ def proxy(
         keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
+        open_session_limit()  # CUEMEM_MAX_OPEN_SESSIONS（建代理时再读一次）
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
