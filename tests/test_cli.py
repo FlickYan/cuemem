@@ -860,7 +860,7 @@ def test_keys_add_refuses_inline_keys_and_leaves_flow_style_files_alone(
     clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """令牌写在 CUEMEM_API_KEYS 里时 add、revoke 拒绝（改了文件服务也不读）；没有设文件时报错。
-    keys: 是流式写法的文件不改，打印要加的几行（令牌照样只在标准输出）。"""
+    keys: 是流式写法的文件不改，打印要加的几行（令牌照样只在标准输出），退出码 1。"""
     monkeypatch.setenv("CUEMEM_API_KEYS", KEYS_WITH_COMMENTS)
     for command in (["keys", "add", "x", "--user", "x"], ["keys", "revoke", "alice-app"]):
         result = runner.invoke(app, command)
@@ -872,7 +872,7 @@ def test_keys_add_refuses_inline_keys_and_leaves_flow_style_files_alone(
     path = tmp_path / "flow.yaml"
     path.write_text(flow, encoding="utf-8")
     result = runner.invoke(app, ["keys", "add", "x", "--user", "x", "--file", str(path)])
-    assert result.exit_code == 0 and path.read_text(encoding="utf-8") == flow
+    assert result.exit_code == 1 and path.read_text(encoding="utf-8") == flow
     token = result.stdout.strip()
     assert "- name: " in result.stderr and token not in result.stderr
     assert hashlib.sha256(token.encode()).hexdigest() in result.stderr
@@ -883,6 +883,8 @@ def test_keys_list_and_revoke(
 ) -> None:
     """keys list 只列名字、作用域与限制，不显示令牌与摘要；keys revoke 只删那一项的几行，别的
     行与注释不动；删到最后一个时写成 keys: []，并提醒运行中的服务不会因此关掉鉴权。"""
+    from cuemem.api.auth import Keys
+
     path = tmp_path / "keys.yaml"
     path.write_text(KEYS_WITH_COMMENTS, encoding="utf-8")
     monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
@@ -907,6 +909,14 @@ def test_keys_list_and_revoke(
     result = runner.invoke(app, ["keys", "revoke", "bob-app"])
     assert result.exit_code == 0 and "最后一个令牌" in result.stderr
     assert path.read_text(encoding="utf-8") == "# 运营者写的说明\nkeys: []\n  # alice 的应用\n"
+    # 删空之后还能接着 add（吊销再加同名的令牌就是换令牌）：keys: [] 改回块状写法
+    readded = runner.invoke(app, ["keys", "add", "bob-app", "--user", "bob"])
+    assert readded.exit_code == 0, readded.output
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("# 运营者写的说明\nkeys:\n  # alice 的应用\n  - name: ")
+    fresh_token = readded.stdout.strip()
+    found = Keys.parse(text, source="t").resolve(fresh_token)
+    assert found is not None and found.name == "bob-app"
     # 删不干净的写法：不改文件，说明手工删哪几行
     odd = "keys:\n  -\n    name: a\n    token: aaaaaaaaaaaaaaaaaaaa\n    scopes: [{user: a}]\n"
     path.write_text(odd, encoding="utf-8")

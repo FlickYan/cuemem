@@ -1274,8 +1274,11 @@ def keys_add(
     ):
         err.print(
             f"{escape(str(path))} 的 keys: 不是一项一行开头的列表（例如写成了 keys: [...]），没有"
-            f"改它。把下面这几行加进它的 keys: 列表：\n\n{escape(entry('  '))}"
+            f"改它。把下面这几行加进它的 keys: 列表：\n\n{escape(entry('  '))}\n"
+            "贴进去之前这个令牌不能用（退出码 1）"
         )
+        print(token)
+        raise typer.Exit(1)
     else:
         _write_keys(path, new)
         err.print(

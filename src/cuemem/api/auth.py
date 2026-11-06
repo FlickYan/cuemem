@@ -609,10 +609,16 @@ def key_entry(
 
 
 def append_key(text: str, entry: Callable[[str], str]) -> str | None:
-    """在块状写法的 keys: 列表末尾加上 entry(列表项的缩进) 的文本，返回整个文件的文本。keys: 不是
-    块状写法的列表（keys: [] 或 [{...}] 这样的流式写法）、没有一项时 None：由调用方打印出来让运营者
-    自己贴。keys 是文件里唯一的顶层项（Keys.parse 不收别的），所以文件末尾还在这个列表里。"""
+    """在块状写法的 keys: 列表末尾加上 entry(列表项的缩进) 的文本，返回整个文件的文本。空的
+    keys: [] 改成块状写法、加上这一项。keys: 不是块状写法的列表（[{...}] 这样的流式写法）、
+    没有一项时 None：由调用方打印出来让运营者自己贴。keys 是文件里唯一的顶层项（Keys.parse
+    不收别的），所以文件末尾还在这个列表里。"""
     node = _keys_node(text)
+    if node is not None and node.flow_style and not node.value:
+        # keys: []（例如 cuemem keys revoke 吊销了最后一个）：去掉 []，改成块状写法的第一项
+        start, end = node.start_mark.index, node.end_mark.index
+        rest = text[:start].rstrip(" ") + text[end:]
+        return (rest if rest.endswith("\n") else rest + "\n") + entry("  ")
     if node is None or node.flow_style or not node.value:
         return None
     return (text if text.endswith("\n") else text + "\n") + entry(" " * node.start_mark.column)
