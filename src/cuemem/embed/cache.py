@@ -15,6 +15,7 @@ import numpy as np
 
 from cuemem.core.ids import content_hash
 from cuemem.embed.base import EmbeddingBatch, EmbedKind, FloatArray, SparseVector, TextEmbedder
+from cuemem.store.files import spare_write
 
 CachedVector = tuple[FloatArray, SparseVector | None]
 
@@ -22,7 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingCache:
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | None, *, best_effort: bool = False) -> None:
+        """best_effort：磁盘满了、只读时 put_many 记一条警告、不抛出（见 store.files.spare_write），
+        这次的向量照样返回，只是没有缓存。只有 MemorySystem.from_settings 打开（经 build_embedder
+        的 cache_best_effort）；评测与脚本用默认的 False。"""
+        self._path = path
+        self.best_effort = best_effort
+        self.failing = False  # 上一次 put_many 因为磁盘写不进去（接连失败只记一次警告）
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
         # 几个评测进程共用一份缓存：写锁多等一会儿（默认 5 秒），免得忙时报 "database is locked"
@@ -73,12 +80,25 @@ class EmbeddingCache:
             for key, dense, sparse in items
         ]
         with self._lock:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO embed_cache (key, dense, sparse_idx, sparse_val)"
-                " VALUES (?, ?, ?, ?)",
-                rows,
-            )
-            self._conn.commit()
+            try:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO embed_cache (key, dense, sparse_idx, sparse_val)"
+                    " VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                spare_write(
+                    self._conn,
+                    exc,
+                    best_effort=self.best_effort,
+                    failing=self.failing,
+                    what="向量缓存",
+                    path=self._path,
+                )
+                self.failing = True
+            else:
+                self.failing = False
 
     def delete_many(self, keys: Sequence[str]) -> int:
         """删除若干条缓存（遗忘时清理被删内容的向量：向量本身也可能泄露原文信息）。

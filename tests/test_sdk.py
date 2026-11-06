@@ -2546,3 +2546,58 @@ def test_shared_database_opt_out_warns(
         pass
     warned = [r.getMessage() for r in caplog.records if "CUEMEM_ALLOW_SHARED_DB" in r.getMessage()]
     assert len(warned) == 2 and "reindex" in warned[0]
+
+
+def test_full_embedding_cache_does_not_break_search(
+    memory: Memory, caplog: pytest.LogCaptureFixture
+) -> None:
+    """向量缓存所在的磁盘满了：以前每个没见过的问题都抛出 database or disk is full（检索用不了）；
+    现在照样检索，只是问题的向量没有缓存，接连失败只记一条警告。"""
+    from fakes import fill_to_capacity
+
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    embedder = memory.system.embedder
+    assert isinstance(embedder, CachedEmbedder)
+    fill_to_capacity(embedder.cache._conn)
+    with caplog.at_level("WARNING", logger="cuemem.store.files"):
+        for question in ("Where do I live these days?", "Which city is my home now?"):
+            found = memory.search(question, user_id="alice", mode="l1")
+            assert any(r["memory"] == "The user lives in Berlin." for r in found["results"])
+    warned = [r.getMessage() for r in caplog.records if "向量缓存写不进" in r.getMessage()]
+    assert len(warned) == 1
+
+
+def test_full_llm_cache_still_answers_and_accounts(
+    n3_settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """LLM 缓存所在的磁盘满了：以前付费拿到的回答写不进缓存就抛出，账本也没记这笔（先写缓存后
+    记账）；现在回答照样返回、每次付费的调用都记了账，只记一条警告。"""
+    from fakes import fill_to_capacity
+
+    model = ScriptedModel(
+        where_i_live,
+        reader=lambda prompt: {
+            "answer": "Berlin. " * 2500,
+            "citations": ["f1"],
+            "evidence_sufficient": True,
+        },
+    )
+    fake_api.chat_replies = [model]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        memory.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+        system = memory.system
+        assert system.llm.cache is not None
+        fill_to_capacity(system.llm.cache._conn)
+
+        def rows() -> int:
+            return int(system.ledger._conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0])
+
+        before, paid = rows(), len(fake_api.chat_requests)
+        with caplog.at_level("WARNING", logger="cuemem.store.files"):
+            for question in ("Where do I live?", "Which city do I live in?"):
+                answer = memory.answer(question, user_id="alice", mode="l1")
+                assert answer["answer"].startswith("Berlin.")
+        assert len(fake_api.chat_requests) - paid == 2
+        assert rows() - before == 2
+    warned = [r.getMessage() for r in caplog.records if "LLM 缓存写不进" in r.getMessage()]
+    assert len(warned) == 1

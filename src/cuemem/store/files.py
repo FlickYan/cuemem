@@ -143,3 +143,32 @@ def unlock_database(handle: IO[str] | None) -> None:
     with contextlib.suppress(OSError, ValueError):
         portalocker.unlock(handle)
     handle.close()
+
+
+def disk_trouble(exc: sqlite3.OperationalError) -> bool:
+    """SQLite 写不进去是磁盘的问题：满了（SQLITE_FULL）、只读（SQLITE_READONLY*）、读写出错
+    （SQLITE_IOERR*）。"database is locked"（SQLITE_BUSY，别的连接拿着写锁）不算：那是并发，
+    不是磁盘。缓存与账本的 best_effort 只对这几种不抛出（第七轮体检）。"""
+    name = getattr(exc, "sqlite_errorname", "") or ""
+    return name == "SQLITE_FULL" or name.startswith(("SQLITE_READONLY", "SQLITE_IOERR"))
+
+
+def spare_write(
+    conn: sqlite3.Connection,
+    exc: sqlite3.OperationalError,
+    *,
+    best_effort: bool,
+    failing: bool,
+    what: str,
+    path: Path | None,
+) -> None:
+    """缓存或账本的一次写入出错之后（调用方持有它的锁、在 except 里调用）：先回滚，否则失败的
+    INSERT 或 commit 留着打开的事务，一直拿着 WAL 的写锁，之后的写入与删除（包括遗忘的清理）
+    都等不到。best_effort 而且是磁盘的问题（disk_trouble）时记一条警告就返回（之前已经失败过、
+    failing 时不再记），调用方接着走；否则原样抛出。"""
+    with contextlib.suppress(sqlite3.Error):
+        conn.rollback()
+    if not (best_effort and disk_trouble(exc)):
+        raise exc
+    if not failing:
+        logger.warning("%s写不进 %s，这次与之后的不记，直到写入恢复：%s", what, path, exc)

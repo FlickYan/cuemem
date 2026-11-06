@@ -474,7 +474,11 @@ class MemorySystem:
         """按配置组装各组件。http_client 用于测试时注入模拟的网络层；on_peak_wait：wait 策略下
         遇到高峰、开始暂停时通知调用方（每段高峰每个供应商一次）。
 
-        新建的数据目录只给本人（0700，第四轮体检），已经存在的不改：见 store/files.py。"""
+        新建的数据目录只给本人（0700，第四轮体检），已经存在的不改：见 store/files.py。
+
+        账本与两个缓存是 best_effort（第七轮体检）：磁盘满了、只读时少记一笔、少缓存一条，记一条
+        警告，检索与回答照样返回（以前每个没见过的问题都抛出 database or disk is full，已经付费的
+        回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。"""
         private_dirs(*storage_dirs(settings))
         paths = settings.paths
         # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
@@ -484,9 +488,11 @@ class MemorySystem:
             db_lock = lock_database(paths.db)
             opened.callback(unlock_database, db_lock)
             with opening(paths.ledger):
-                ledger = Ledger(paths.ledger)
+                ledger = Ledger(paths.ledger, best_effort=True)
             opened.callback(ledger.close)
-            embedder = build_embedder(settings, ledger=ledger, http_client=http_client)
+            embedder = build_embedder(
+                settings, ledger=ledger, http_client=http_client, cache_best_effort=True
+            )
             if isinstance(embedder, CachedEmbedder):
                 opened.callback(embedder.cache.close)
             with opening(paths.db):
@@ -495,7 +501,7 @@ class MemorySystem:
             # 记录建库时的向量模型，防止换模型后新旧向量混在一起
             db.check_or_set_meta("embedder", f"{embedder.name}:{embedder.dim}")
             with opening(paths.llm_cache):
-                response_cache = ResponseCache(paths.llm_cache)
+                response_cache = ResponseCache(paths.llm_cache, best_effort=True)
             opened.callback(response_cache.close)
             llm = LLMClient(
                 settings,

@@ -276,6 +276,8 @@ class LLMClient:
             role=role,
             latency_ms=latency_ms,
         )
+        # 先记账再写缓存：缓存写不进去（磁盘满了）时抛出的话，已经付费的这次调用也记下了
+        self._account(role, alias, spec, result)
         # 空回复不缓存：它往往是偶发问题，缓存后会被永久复现
         if key and (result.content or result.tool_calls):
             assert self.cache is not None
@@ -285,7 +287,6 @@ class LLMClient:
                 result.model_dump(mode="json", exclude={"role", "from_cache", "latency_ms"}),
                 scope=cache_scope,
             )
-        self._account(role, alias, spec, result)
         return result
 
     def _send(self, provider: str, request: dict[str, Any], retry_timeouts: bool) -> Any:
