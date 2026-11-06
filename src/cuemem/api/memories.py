@@ -10,7 +10,8 @@
     PUT    /api/v1/memories/{id}             update（text 或 data、metadata）
     GET    /api/v1/memories/{id}/history     history
     DELETE /api/v1/memories/{id}             delete（dry_run）
-    DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id）
+    DELETE /api/v1/memories                  delete_all（user_id、agent_id、run_id、dry_run：
+                                             预演只能与 run_id 一起）
     GET    /api/v1/media/{id}                media（图片的原文件）
     POST   /api/v1/reset                     reset
     GET    /api/v1/status                    status（抽取的状态：待处理、失败的会话与原因）
@@ -805,16 +806,25 @@ def memories_router(
                 show_expired=show_expired,
             )
 
-    @router.delete("/memories", responses=_ok(ForgetResult))
+    @router.delete(
+        "/memories",
+        responses=_ok(ForgetResult | DryRunResult),
+        description="Delete all memories of a user (or agent), or only one run with run_id. "
+        "dry_run=true needs run_id and only lists what would be deleted. A run_id with no "
+        "conversation turns deletes nothing and answers 'No such run: nothing deleted'.",
+    )
     def delete_all(
         http: Request,
         user_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        dry_run: bool = False,
     ) -> V1Json:
         with _sdk_errors():
             allow(http, user_id, agent_id)
-            return memory.delete_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
+            return memory.delete_all(
+                user_id=user_id, agent_id=agent_id, run_id=run_id, dry_run=dry_run
+            )
 
     @router.get("/memories/{memory_id}", responses=_ok(MemoryItem))
     def get(http: Request, memory_id: str) -> V1Json:

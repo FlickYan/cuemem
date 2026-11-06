@@ -503,6 +503,7 @@
           "memories (v1)"
         ],
         "summary": "Delete All",
+        "description": "Delete all memories of a user (or agent), or only one run with run_id. dry_run=true needs run_id and only lists what would be deleted. A run_id with no conversation turns deletes nothing and answers 'No such run: nothing deleted'.",
         "operationId": "delete_all",
         "security": [
           {
@@ -557,6 +558,16 @@
               ],
               "title": "Run Id"
             }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Dry Run"
+            }
           }
         ],
         "responses": {
@@ -565,8 +576,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response Delete All",
-                  "$ref": "#/components/schemas/ForgetResult"
+                  "title": "Response 200 Delete All",
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ForgetResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunResult"
+                    }
+                  ]
                 }
               }
             }

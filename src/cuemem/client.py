@@ -373,9 +373,17 @@ class MemoryClient:
         return self._call("DELETE", f"/memories/{_id(memory_id)}", params=params)
 
     def delete_all(
-        self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
-        params = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
+        """见 Memory.delete_all。dry_run 只在为 True 时发送：不预演的请求与以前逐字相同。"""
+        params: dict[str, Any] = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
+        if dry_run:
+            params["dry_run"] = True
         return self._call("DELETE", "/memories", params=params)
 
     def reset(self) -> dict[str, Any]:

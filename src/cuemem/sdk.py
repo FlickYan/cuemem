@@ -1064,13 +1064,38 @@ class Memory:
         return {"message": "Memory deleted", **_forget_out(report)}
 
     def delete_all(
-        self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """删除这个用户（或 Agent）的全部记忆：原始日志、派生记忆、向量、缓存与原图，以及这个
         空间的 trace 与库里写着它的 ID 的元信息（见 MemorySystem.delete_space）。
-        run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。"""
+        run_id：只删这个会话（与按会话遗忘相同，再用剩下的日志重建派生记忆），空间留着。日志里
+        没有这个会话的发言（run_id 写错了）时什么都不做，message 是 "No such run: nothing
+        deleted"：以前照样回 "Memories of this run deleted"，与删掉了分不出来。
+
+        dry_run=True 只预演这个会话的删除（与 delete 的 dry_run、cuemem forget --session
+        --dry-run 相同）：返回会删哪些发言、哪些事实会随之消失，什么都不删。只能与 run_id 一起
+        用（ValueError）：不给 run_id 时删的是整个用户，没有预演。"""
         space = space_for(user_id, agent_id)
+        if dry_run and run_id is None:
+            raise ValueError(
+                "dry_run needs run_id; delete_all without run_id deletes the whole user"
+            )
         if run_id is not None:
+            if dry_run:
+                return {
+                    "message": "Dry run: nothing was deleted",
+                    **self.system.preview_forget(space, session_ids=[run_id]),
+                }
+            if not self.system.db.get_turns(space, run_id):  # 只读这一个会话
+                from cuemem.memory import ForgetReport
+
+                empty = ForgetReport(space, 0, [], 0, 0, 0, 0, 0.0)
+                return {"message": "No such run: nothing deleted", **_forget_out(empty)}
             report = self.system.forget_memories(
                 space, session_ids=[run_id], report_rebuild_errors=True
             )

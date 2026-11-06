@@ -279,11 +279,20 @@ class AsyncMethods:
         return await asyncio.to_thread(self.sync.delete, memory_id, dry_run=dry_run)
 
     async def delete_all(
-        self, *, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """见 Memory.delete_all。"""
         return await asyncio.to_thread(
-            self.sync.delete_all, user_id=user_id, agent_id=agent_id, run_id=run_id
+            self.sync.delete_all,
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            dry_run=dry_run,
         )
 
     async def reset(self) -> dict[str, Any]:

@@ -970,6 +970,53 @@ def test_runs_scopes_export_and_load(mem: Mem) -> None:
     assert {s["space_id"] for s in mem.spaces()} == {"carol", "dave"}
 
 
+def test_delete_all_of_a_run_has_a_dry_run_and_reports_an_unknown_run(
+    mem: Mem, system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮体检 P16：delete_all(run_id=, dry_run=True) 列出这个会话会删的发言，什么都不删
+    （以前没有这个参数，TypeError）；dry_run 不带 run_id 时 ValueError（HTTP 400）：删整个用户
+    没有预演。写错的 run_id 回 "No such run: nothing deleted"，不重放（以前照样回 "Memories of
+    this run deleted"）。本地与经 /api/v1 的 MemoryClient 相同。"""
+    mem.add("I like tea", user_id="carol", run_id="r1", wait=True)
+    mem.add("I like chess", user_id="carol", run_id="r2", wait=True)
+    before = current(mem, "carol")
+    preview = mem.delete_all(user_id="carol", run_id="r1", dry_run=True)
+    assert preview["message"] == "Dry run: nothing was deleted"
+    assert [t["text"] for t in preview["turns"]] == ["I like tea"]
+    assert preview["sessions_affected"] == ["r1"] and preview["facts"]
+    assert current(mem, "carol") == before
+    with pytest.raises(ValueError, match="dry_run needs run_id"):
+        mem.delete_all(user_id="carol", dry_run=True)
+    assert current(mem, "carol") == before
+
+    replays: list[Any] = []
+    forget = system.forget
+    monkeypatch.setattr(system, "forget", lambda *a, **k: replays.append(a) or forget(*a, **k))
+    out = mem.delete_all(user_id="carol", run_id="r9")
+    assert out["message"] == "No such run: nothing deleted"
+    assert (out["turns_deleted"], out["sessions_affected"]) == (0, [])
+    assert replays == [] and current(mem, "carol") == before
+    out = mem.delete_all(user_id="carol", run_id="r1")
+    assert out["message"] == "Memories of this run deleted" and len(replays) == 1
+    assert current(mem, "carol") == ["I like chess"]
+
+
+def test_the_client_sends_delete_all_dry_run_only_when_set(system: MemorySystem) -> None:
+    """MemoryClient.delete_all 只在 dry_run=True 时带上 dry_run：不预演的请求与以前逐字相同。"""
+    urls: list[str] = []
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as client,
+    ):
+        http.event_hooks = {"request": [lambda r: urls.append(str(r.url))], "response": []}
+        client.delete_all(user_id="carol", run_id="r1")
+        client.delete_all(user_id="carol", run_id="r1", dry_run=True)
+    assert urls == [
+        "http://testserver/api/v1/memories?user_id=carol&run_id=r1",
+        "http://testserver/api/v1/memories?user_id=carol&run_id=r1&dry_run=true",
+    ]
+
+
 def test_export_and_load_errors_are_the_same_remotely(system: MemorySystem) -> None:
     """导出不存在的空间（KeyError）、导入没有 space_id 的文件又没给 user_id（ValueError，以前本地
     是 KeyError('space_id')）：MemoryClient 抛出与本地相同的异常。以前远程的这两个是没有说明的
