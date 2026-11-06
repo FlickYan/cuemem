@@ -107,6 +107,10 @@ def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
 
     "/" 是分隔符，所以 ID 里的 "/" 与 "%" 先转义（URL 的百分号编码）：否则 user_id="agent/x"
     与 agent_id="x" 会落进同一个空间。不含这两个字符的 ID 原样保留（"alice" 还是 "alice"）。"""
+    # 别的类型（user_id=42）以前在 _part 里 AttributeError；/api/v1 的请求校验报 ValueError
+    for name, value in (("user_id", user_id), ("agent_id", agent_id)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
     if user_id and agent_id:
         return f"{_part(agent_id)}/{_part(user_id)}"
     if user_id:
@@ -676,7 +680,10 @@ class Memory:
         相同），后台线程记一条警告日志；失败的会话与原因见 status()。
 
         给了 user_id 或 agent_id 时只等这个用户（或 Agent）的抽取，不给时等全部。timeout 秒内
-        没做完时抛 TimeoutError（抽取在后台照常继续）；不给时一直等。"""
+        没做完时抛 TimeoutError（抽取在后台照常继续）；不给时一直等。timeout 是负数时
+        ValueError（与 /api/v1 相同，没有后台线程时也报）。"""
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout: must be >= 0")
         worker = self.system.worker
         if worker is None:
             return
@@ -739,7 +746,7 @@ class Memory:
         run_id: str | None = None,
         limit: int | None = None,
         mode: SearchMode = "auto",
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         router: Router = "learned",
         lam: float | None = None,
         filters: Mapping[str, Any] | None = None,
@@ -773,12 +780,13 @@ class Memory:
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit if limit is not None else top_k
         space = space_for(user_id, agent_id)
+        moment = _moment("at", at)  # 空间还是空的时，写错的 at 也报错
         if not self.system.db.has_sessions(space):
             return _empty(self.system, space)
         from cuemem.evidence import RAISED_REASON
 
         # 两次检索用同一个问题时间：改走 L1 时打包的是探针在这个时间打过分的候选
-        when = naive_local(at) if at is not None else datetime.now()
+        when = moment if moment is not None else datetime.now()
         # 从检索到读出各句的 metadata 与画像一直持有读：改走 L1 时打包的是探针取到的记忆，两次检索
         # 之间插进来的遗忘会让结果里留着已经删掉的事实与对话片段（见 MemorySystem.retrieve）
         with self.system.reading(space):
@@ -809,7 +817,7 @@ class Memory:
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         mode: SearchMode = "auto",
         router: Router = "learned",
         lam: float | None = None,
@@ -834,6 +842,7 @@ class Memory:
         _valid("min_level", MinLevel, min_level)
         lam = _valid("lam", Lam, lam)
         space = space_for(user_id, agent_id)
+        moment = _moment("at", at)
         if not self.system.db.has_sessions(space):
             return {
                 "context": "",
@@ -849,7 +858,7 @@ class Memory:
             self.system,
             space,
             query,
-            at=at,
+            at=moment,
             mode=mode,
             router=router,
             lam=lam,
@@ -872,7 +881,7 @@ class Memory:
         user_id: str | None = None,
         agent_id: str | None = None,
         mode: AnswerMode = "auto",
-        at: datetime | None = None,
+        at: datetime | date | str | None = None,
         router: Router = "learned",
         lam: float | None = None,
     ) -> dict[str, Any]:
@@ -886,7 +895,7 @@ class Memory:
         answer = self.system.ask(
             space,
             question,
-            question_time=at,
+            question_time=_moment("at", at),
             mode=mode,
             router=router,
             lam=lam,
@@ -902,7 +911,7 @@ class Memory:
         run_id: str | None = None,
         include_superseded: bool = False,
         valid_at: str | date | None = None,
-        known_at: datetime | None = None,
+        known_at: datetime | date | str | None = None,
         limit: int | None = None,
         filters: Mapping[str, Any] | None = None,
         top_k: int | None = None,
@@ -910,7 +919,8 @@ class Memory:
     ) -> dict[str, Any]:
         """全部事实：默认只给当前有效的。两条时间轴可以分别回放：valid_at 是那时现实中成立的
         事实，写成 "2025"、"2025-06"、"2025-06-07" 或 date；一年、一个月指这段时间里任何时候
-        成立过的，先后几个值可能都在（别的写法 ValueError）。known_at 是系统在那一刻相信的事实。
+        成立过的，先后几个值可能都在（别的写法 ValueError）。known_at 是系统在那一刻相信的事实
+        （datetime、date、ISO 文本或 Unix 时间戳，同 search 的 at，见 _moment）。
         run_id：只要这个会话里记下的事实；filters 里的其他键是 metadata 的条件（同 search）。过期
         的事实默认不给，show_expired=True 时也给（以前除了 export 与已知的 ID，没有办法列出过期的
         记忆）。limit 同 search。"""
@@ -919,8 +929,9 @@ class Memory:
         user_id, agent_id, run_id, where = _scope(user_id, agent_id, run_id, filters)
         limit = limit if limit is not None else top_k
         space = space_for(user_id, agent_id)
-        current = not include_superseded and valid_at is None and known_at is None
-        facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
+        moment = _moment("known_at", known_at)
+        current = not include_superseded and valid_at is None and moment is None
+        facts = self.system.facts(space, current_only=current, valid_at=valid_at, known_at=moment)
         sources = _Sources.load(
             self.system.db, space, [t for f in facts for t in f.source_turn_ids]
         )
@@ -1676,6 +1687,30 @@ def _as_datetime(value: datetime | str | float | None) -> datetime | None:
     if isinstance(value, str):
         return naive_local(datetime.fromisoformat(value))
     return datetime.fromtimestamp(value)
+
+
+def _moment(name: str, value: datetime | date | str | float | None) -> datetime | None:
+    """search、context、answer 的 at 与 get_all 的 known_at → 本机时间（不带时区，见
+    naive_local）。与 /api/v1（MemoryClient）收的写法相同（第七轮体检）：datetime；date 是那天
+    零点；ISO 文本（带时区的先换算）；数字是 Unix 时间戳。以前只认 datetime，别的写法在空间里
+    有记忆时 AttributeError。别的写法 ValueError，开头是参数名。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return naive_local(value)
+    if isinstance(value, date):  # datetime 也是 date：放在后面
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        try:
+            return naive_local(datetime.fromisoformat(value))
+        except ValueError:
+            raise ValueError(f"{name}: invalid ISO date or datetime {value!r}") from None
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError(f"{name}: invalid Unix timestamp {value!r}") from None
+    raise ValueError(f"{name}: expected a datetime, date, ISO string or Unix timestamp")
 
 
 # ---------- 输出 ----------

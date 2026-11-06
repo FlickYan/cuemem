@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -517,6 +517,78 @@ def test_bad_read_arguments_raise_the_same_error_locally(
             response = http.post(path, content=body, headers={"content-type": "application/json"})
             assert response.status_code == 422
             assert response.json()["error"]["message"] == f"Invalid request: body.{ours.value}"
+
+
+# 与 at=datetime(2030, 1, 1) 同一个时刻的别的写法（第七轮体检；known_at 要在写入之后）
+MOMENTS = [
+    "2030-01-01",
+    date(2030, 1, 1),
+    datetime(2030, 1, 1, 0, 0).astimezone(UTC).isoformat(),
+    datetime(2030, 1, 1, 0, 0).timestamp(),
+]
+
+
+@pytest.mark.parametrize("moment", MOMENTS, ids=["iso-date", "date", "iso-utc", "epoch"])
+def test_read_times_take_the_same_forms_locally(system: MemorySystem, moment: Any) -> None:
+    """search、context、answer 的 at 与 get_all 的 known_at：MemoryClient 收 ISO 文本、date 与
+    Unix 时间戳（服务端的 Pydantic 解析），本地的 Memory 以前只认 datetime，空间里有记忆时
+    AttributeError。现在两边收同样的写法，结果与给 datetime 时相同。"""
+    local = Memory.from_system(system)
+    local.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
+    when = datetime(2030, 1, 1)
+    text = "Where do I live?"
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as remote,
+    ):
+        for method in ("search", "context", "answer"):
+            expected = getattr(local, method)(text, user_id="alice", at=when)
+            assert getattr(local, method)(text, user_id="alice", at=moment) == expected, method
+            assert getattr(remote, method)(text, user_id="alice", at=moment) == expected, method
+        expected = local.get_all(user_id="alice", known_at=when)
+        assert expected["results"]
+        assert local.get_all(user_id="alice", known_at=moment) == expected
+        assert remote.get_all(user_id="alice", known_at=moment) == expected
+
+
+BAD_TIMES = [
+    ("search", {"at": "banana"}),
+    ("context", {"at": "banana"}),
+    ("answer", {"at": "banana"}),
+    ("search", {"at": True}),
+    ("get_all", {"known_at": "banana"}),
+    ("add", {"user_id": 42}),
+    ("search", {"user_id": 42}),
+    ("wait", {"timeout": -1}),
+]
+
+
+@pytest.mark.parametrize(("method", "bad"), BAD_TIMES)
+def test_bad_times_and_ids_raise_value_error_on_both_sides(
+    system: MemorySystem, method: str, bad: dict[str, Any]
+) -> None:
+    """写错的时间、不是字符串的 user_id 与负的 timeout：本地与 MemoryClient 都 ValueError（以前
+    本地 AttributeError，wait 什么都不做）。服务端的话由 Pydantic 写，两边的文字不同；本地的以
+    参数名开头。空间还是空的时也报错。"""
+    local = Memory.from_system(system)
+    (name,) = bad
+    args: dict[str, Any] = {"user_id": "alice", **bad}
+    if method in ("search", "context", "answer"):
+        args["query" if method != "answer" else "question"] = "Where do I live?"
+    if method == "add":
+        args["messages"] = "I live in Berlin"
+    if method == "wait":
+        del args["user_id"]
+    with (
+        TestClient(v1_app(system)) as http,
+        MemoryClient("http://testserver", http_client=http) as remote,
+    ):
+        for _ in range(2):  # 先是空的空间，再是有记忆的
+            with pytest.raises(ValueError, match=f"^{name}"):
+                getattr(local, method)(**args)
+            with pytest.raises(ValueError, match=name):
+                getattr(remote, method)(**args)
+            local.add("I live in Berlin", user_id="alice", timestamp=AUG, wait=True)
 
 
 def test_good_read_arguments_still_pass(mem: Mem) -> None:
