@@ -250,6 +250,7 @@ def build_ui(
                 with gr.Row():
                     refresh = gr.Button("Refresh", scale=0)
                     current_only = gr.Checkbox(label="Current facts only", value=False)
+                    show_expired = gr.Checkbox(label="Show expired", value=False)
                 with gr.Row():
                     with gr.Column(scale=2):
                         profile = gr.Markdown()
@@ -392,15 +393,16 @@ def build_ui(
         )
 
         def load_memory(
-            space_id: str, current: bool, kind: str, request: gr.Request
+            space_id: str, current: bool, expired: bool, kind: str, request: gr.Request
         ) -> tuple[Any, ...]:
             sid = allowed(request, space_id)
-            rows = service.facts(sid, current_only=current)
+            # 过期的记忆（expiration_date）默认不显示，同画像；勾上 Show expired 时也显示
+            rows = service.facts(sid, current_only=current, show_expired=expired)
             table = [
                 [r["said_on"][:10], r["statement"], r["status"], r["replaced_by"] or ""]
                 for r in rows
             ]
-            media = service.media(sid)
+            media = service.media(sid, show_expired=expired)
             pictures = [
                 (m["path"], f"{m['ts'][:10]} · {m['caption'] or 'not described yet'}")
                 for m in media
@@ -412,7 +414,7 @@ def build_ui(
             ]
             return (
                 _profile_markdown(service.profile(sid)),
-                render_graph(service.graph(sid)),
+                render_graph(service.graph(sid, show_expired=expired)),
                 table,
                 pictures,
                 listed,
@@ -420,10 +422,11 @@ def build_ui(
             )
 
         memory_outputs = [profile, graph, facts, gallery, sessions, forget_target]
-        memory_inputs = [space, current_only, forget_kind]
+        memory_inputs = [space, current_only, show_expired, forget_kind]
         refresh.click(load_memory, memory_inputs, memory_outputs)
         memory_tab.select(load_memory, memory_inputs, memory_outputs)
         current_only.change(load_memory, memory_inputs, memory_outputs)
+        show_expired.change(load_memory, memory_inputs, memory_outputs)
 
         def choices(space_id: str, kind: str, request: gr.Request) -> Any:
             options = _forget_choices(service, allowed(request, space_id), kind)
@@ -746,12 +749,12 @@ def _forget_choices(service: ChatService, space_id: str, kind: str) -> list[tupl
     if kind == "fact":
         return [
             (f"{r['said_on'][:10]} · {r['statement'][:90]}", r["id"])
-            for r in service.facts(sid, current_only=True)
+            for r in service.facts(sid, current_only=True, show_expired=True)
         ]
     if kind == "image":
         return [
             (f"{m['ts'][:10]} · {(m['caption'] or 'image')[:80]}", m["id"])
-            for m in service.media(sid)
+            for m in service.media(sid, show_expired=True)
         ]
     return [
         (f"{s.started_at:%Y-%m-%d %H:%M} · {s.turns} turns · {s.session_id}", s.session_id)

@@ -1258,6 +1258,66 @@ def test_served_profile_and_chat_drop_expired_memories(
     assert "Berlin" not in sent and "jazz" in sent
 
 
+def test_memory_browser_hides_expired_memories(memory: Memory, tmp_path: Path) -> None:
+    """第七轮体检 P17：记忆浏览器的事实表、实体图与图库以前列出过期的记忆，同一个页面的画像
+    栏却不给：过期的住址在事实表里、在实体图里算一条边。默认不列出，show_expired 时列出、
+    标着 expired；遗忘的候选（界面的下拉框、演示脚本）照样列出：删除之前它还在日志里。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.agent import Agent
+    from cuemem.api.app import create_app
+    from cuemem.api.replay import _forget
+    from cuemem.api.service import ChatService
+    from cuemem.api.ui import _forget_choices
+
+    _expired_berlin(memory)
+    picture = tmp_path / "flat.png"
+    Image.new("RGB", (16, 16), "green").save(picture)
+    content = [
+        {"type": "text", "text": "My old flat"},
+        {"type": "image_url", "image_url": {"url": str(picture)}},
+    ]
+    memory.add(
+        [{"role": "user", "content": content}],
+        user_id="u",
+        expiration_date=date.today() - timedelta(days=1),
+        infer=False,
+    )
+    service = ChatService(memory.system, Agent(memory.system, router="rule"))
+    berlin = "The user lives in Berlin."
+
+    def statements(rows: list[dict[str, Any]]) -> list[str]:
+        return [r["statement"] for r in rows]
+
+    assert statements(service.facts("u")) == ["I like jazz"]
+    shown = service.facts("u", show_expired=True)
+    assert statements(shown) == [berlin, "I like jazz"]
+    assert [r["expired"] for r in shown] == [True, False]
+    assert [n["facts"] for n in service.graph("u")["nodes"]] == [1]
+    assert [n["facts"] for n in service.graph("u", show_expired=True)["nodes"]] == [2]
+    assert service.media("u") == []
+    (image,) = service.media("u", show_expired=True)
+    assert image["expired"] is True
+    assert berlin in [
+        label.split(" · ", 1)[1] for label, _ in _forget_choices(service, "u", "fact")
+    ]
+    assert [i for _, i in _forget_choices(service, "u", "image")] == [image["id"]]
+
+    app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
+    with TestClient(app) as http:
+        assert statements(http.get("/api/spaces/u/facts").json()) == ["I like jazz"]
+        listed = http.get("/api/spaces/u/facts", params={"show_expired": "true"}).json()
+        assert statements(listed) == [berlin, "I like jazz"]
+        (user,) = http.get("/api/spaces/u/graph").json()["nodes"]
+        assert user["facts"] == 1
+        (user,) = http.get("/api/spaces/u/graph?show_expired=true").json()["nodes"]
+        assert user["facts"] == 2
+        assert http.get("/api/spaces/u/media").json() == []
+        assert len(http.get("/api/spaces/u/media?show_expired=true").json()) == 1
+    assert _forget(service, "u", "Berlin")["facts"] == [berlin]
+    assert berlin not in statements(service.facts("u", show_expired=True))
+
+
 def test_a_restated_memory_without_expiry_stays(memory: Memory, model: ScriptedModel) -> None:
     """同一件事后来又说过一次、没给过期时间：它一直有效（同 search 的规则）。"""
     memory.add("I like rain", user_id="u", expiration_date="2020-01-01", wait=True)

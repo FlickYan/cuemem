@@ -370,6 +370,73 @@ def test_consolidate_inspect_and_forget(
     assert "新加坡一家电商公司" not in _flat(result.output)
 
 
+def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """一个用户 u：昨天到期的住址与没有过期时间的爱好，都已巩固（离线的脚本化模型）。返回模型。"""
+    from datetime import date, timedelta
+
+    from fakes import FakeAPI
+    from scripted import ScriptedModel
+
+    from cuemem import Memory, cli
+    from cuemem.memory import MemorySystem
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake-qwen")
+
+    def said(prompt: str) -> dict[str, Any]:
+        lines = re.findall(r"\[t(\d+)\] User: (.*)", prompt)
+        facts = [
+            {"statement": text, "predicate": "said", "object": text[:40],
+             "cardinality": "multi", "importance": 4, "turns": [int(n)]}
+            for n, text in lines
+        ]  # fmt: skip
+        return {"summary": "", "facts": facts, "entities": []}
+
+    model = ScriptedModel(said)
+    api = FakeAPI()
+    api.chat_replies = [model]
+    original = MemorySystem.from_settings
+    monkeypatch.setattr(
+        MemorySystem,
+        "from_settings",
+        lambda settings, **kw: original(settings, http_client=api.client()),
+    )
+    monkeypatch.setattr(cli.console, "width", 300)  # 表格不折行，便于断言
+    with Memory(load_settings(), background=False) as memory:
+        yesterday = date.today() - timedelta(days=1)
+        memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+        memory.add("I like jazz", user_id="u", wait=True)
+    return model
+
+
+def test_ask_and_inspect_leave_out_expired_memories(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第七轮体检 P17：cuemem ask 以前不打开 hide_expired，过期的住址照样进回答模型的提示
+    （SDK 的 answer 不给）；--show-expired 时才用。inspect facts 是检查用的：照样列出，标"已过期"，
+    --hide-expired 时不列出。"""
+    model = _expired_space(monkeypatch)
+    question = "Where do I live? Do I like jazz?"
+    result = runner.invoke(app, ["ask", question, "--space", "u"])
+    assert result.exit_code == 0, result.output
+    (prompt,) = model.prompts["read"]
+    assert "Berlin" not in prompt and "jazz" in prompt
+    result = runner.invoke(app, ["ask", question, "--space", "u", "--show-expired"])
+    assert result.exit_code == 0, result.output
+    assert "Berlin" in model.prompts["read"][-1]
+
+    result = runner.invoke(app, ["inspect", "facts", "--space", "u"])
+    assert result.exit_code == 0, result.output
+    rows = [line for line in result.output.splitlines() if "Berlin" in line or "jazz" in line]
+    assert len(rows) == 2
+    assert all(("已过期" in line) == ("Berlin" in line) for line in rows), rows
+    result = runner.invoke(app, ["inspect", "facts", "--space", "u", "--hide-expired"])
+    assert result.exit_code == 0, result.output
+    assert "Berlin" not in result.output and "jazz" in result.output
+
+
 def test_demo_and_chat_commands(
     isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

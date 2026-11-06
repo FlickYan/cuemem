@@ -1253,11 +1253,13 @@ def test_ui_stays_in_scope(n3_settings: Settings, fake_api: FakeAPI, tmp_path: P
             ok = {"username": "alice-app", "password": ALICE_TOKEN}
             assert http.post("/login", data=ok).status_code == 200
 
-            assert "Secret of alice" in _ui_call(http, "load_memory", ["alice", False, "fact"])
+            assert "Secret of alice" in _ui_call(
+                http, "load_memory", ["alice", False, False, "fact"]
+            )
             for name, data in (
-                ("load_memory", ["bob", False, "fact"]),
-                ("load_memory", ["agent/alice", False, "fact"]),
-                ("load_memory", ["", False, "fact"]),  # 默认空间 shop-demo
+                ("load_memory", ["bob", False, False, "fact"]),
+                ("load_memory", ["agent/alice", False, False, "fact"]),
+                ("load_memory", ["", False, False, "fact"]),  # 默认空间 shop-demo
                 ("choices", ["bob", "fact"]),
                 ("forget", ["bob", "fact", None]),  # 在看要遗忘什么之前就拒绝
                 ("start", ["bob", "", None]),
@@ -1272,7 +1274,7 @@ def test_ui_stays_in_scope(n3_settings: Settings, fake_api: FakeAPI, tmp_path: P
             admin = TestClient(app)
             login = admin.post("/login", data={"username": "me", "password": ADMIN_TOKEN})
             assert login.status_code == 200
-            assert "Secret of bob" in _ui_call(admin, "load_memory", ["bob", False, "fact"])
+            assert "Secret of bob" in _ui_call(admin, "load_memory", ["bob", False, False, "fact"])
             admin.close()
     finally:
         service.close()
@@ -1454,7 +1456,7 @@ def test_ui_uploads_pass_the_path_checks(ui_alice: tuple[TestClient, MemorySyste
     second = _ui_call(http, "send", [again, history, sid, "alice", "", "l0", "rule", 30])
     assert "event: error" not in second, second
     assert len(system.db.get_media("alice")) == 1
-    panel = _ui_call(http, "load_memory", ["alice", False, "fact"])
+    panel = _ui_call(http, "load_memory", ["alice", False, False, "fact"])
     assert "event: error" not in panel, panel
 
 

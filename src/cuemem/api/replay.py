@@ -162,7 +162,9 @@ def replay(
 
 
 def _forget(service: ChatService, space_id: str, keyword: str) -> dict[str, Any]:
-    facts = [f for f in service.facts(space_id, current_only=True) if keyword in f["statement"]]
+    # 过期的事实也在候选里：删除之前它还在日志里（第七轮体检 P17）
+    listed = service.facts(space_id, current_only=True, show_expired=True)
+    facts = [f for f in listed if keyword in f["statement"]]
     if not facts:
         return {"facts": [], "turns_deleted": 0}
     report = service.forget(space_id, fact_ids=[f["id"] for f in facts])

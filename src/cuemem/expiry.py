@@ -4,7 +4,10 @@
 过期：同一件事后来又说过一次、没说什么时候过期，它就一直有效。以前只有 SDK 的 search、get_all
 与 profile 按它筛（sdk._Sources、_profile）；第五轮体检（P7）把规则挪到这里，MemorySystem 的
 retrieve / ask（hide_expired=True）也用它：answer()、记忆代理、MCP 与各框架集成都不再给出过期的
-记忆。评测与命令行不打开 hide_expired：它们的空间从不写 turn_meta，请求本来也不会变。
+记忆。cuemem ask 也打开它（--show-expired 时不打开）；记忆浏览器的事实、实体图与图库
+（ChatService.facts / graph / media、/api/spaces/{space}/facts|graph|media）默认也不列出过期的，
+show_expired 时列出、标着 expired；cuemem inspect facts 是检查用的，照样列出、标"已过期"
+（第七轮体检 P17）。评测不打开 hide_expired：它们的空间从不写 turn_meta，打开了请求也不会变。
 """
 
 from __future__ import annotations

@@ -558,20 +558,23 @@ def create_app(
         return {"text": service.profile(space)}
 
     @api.get("/api/spaces/{space:path}/facts")
-    def facts(space: AllowedSpace, current_only: bool = False) -> list[dict[str, Any]]:
-        return service.facts(space, current_only=current_only)
+    def facts(
+        space: AllowedSpace, current_only: bool = False, show_expired: bool = False
+    ) -> list[dict[str, Any]]:
+        # 已经过期的记忆（expiration_date）默认不列出，同画像；show_expired=true 时也列出
+        return service.facts(space, current_only=current_only, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/entities")
     def entities(space: AllowedSpace) -> list[dict[str, Any]]:
         return service.entities(space)
 
     @api.get("/api/spaces/{space:path}/graph")
-    def graph(space: AllowedSpace) -> dict[str, Any]:
-        return service.graph(space)
+    def graph(space: AllowedSpace, show_expired: bool = False) -> dict[str, Any]:
+        return service.graph(space, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/media")
-    def media(space: AllowedSpace) -> list[dict[str, Any]]:
-        return service.media(space)
+    def media(space: AllowedSpace, show_expired: bool = False) -> list[dict[str, Any]]:
+        return service.media(space, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/media/{media_id}")
     def media_file(space: AllowedSpace, media_id: str) -> FileResponse:

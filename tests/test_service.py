@@ -314,6 +314,105 @@ def test_graph_links_entities_named_in_statements(
     assert len(searches) <= 12  # 以前 4 条事实 × 1,200 多个名字
 
 
+def _mentions_by_regex(entities: Sequence[Any], text: str) -> set[str]:
+    """实体图以前找名字的做法（第七轮体检 P17 之前），留作对照：每个实体的每个别名一个正则。"""
+    text = text.lower()
+    return {
+        e.id
+        for e in entities
+        for a in [n.lower() for n in [e.name, *e.aliases] if len(n) >= 3]
+        if a in text and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", text)
+    }
+
+
+def test_graph_name_index_matches_the_regex_scan() -> None:
+    """第七轮体检 P17：实体图找名字改成按单词边界查字典（以前实体数 × 事实数，5000 个实体、
+    1 万条事实要 19 秒），随机的名字与陈述上与原来的正则逐条相同：互相重叠、是别的名字的前缀、
+    两头是标点、带重音、中文、下划线与数字。"""
+    import random
+
+    from cuemem.api.service import _Mentions
+    from cuemem.core.models import Entity
+
+    rng = random.Random(7)
+    pieces = ["max", "maxie", "ana", "anna", "lis", "lisbon", "o'neil", "c++", "(x)", "café",
+              "Café", "ÉCOLE", "北京", "北京市", "王小明", "nick_1", "nick", "r2d2", "a.b", "ss",
+              "STRASSE", "straße", "İstanbul", "x-y", "..."]  # fmt: skip
+    glue = [" ", "", "_", "-", ".", "'", ",", "!", "\n", "1", "é", "的", "，"]
+    for case in range(3000):
+        entities = [
+            Entity(
+                id=f"e{i}",
+                space_id="g",
+                name=rng.choice(pieces),
+                type="other",
+                aliases=rng.sample(pieces, rng.randint(0, 3)),
+                first_seen=DAY,
+                last_seen=DAY,
+            )
+            for i in range(rng.randint(1, 6))
+        ]
+        text = "".join(rng.choice(pieces) + rng.choice(glue) for _ in range(rng.randint(0, 8)))
+        expected = _mentions_by_regex(entities, text)
+        assert _Mentions(entities).find(text) == expected, (case, text, entities)
+
+
+def test_graph_is_unchanged_by_the_name_index(service: ChatService) -> None:
+    """同一个空间上的实体图与按原来的正则算出来的逐条相同（点、边与各点的事实数）。"""
+    from cuemem.core.models import Entity, Fact
+
+    words = ["Max", "Maxie", "Lisbon", "Ana", "Anna", "Porto", "café", "Nick_1", "北京"]
+    entities = [
+        Entity(
+            id=f"e{i}",
+            space_id="g",
+            name=w,
+            type="other",
+            aliases=[w.lower() + "y"],
+            first_seen=DAY,
+            last_seen=DAY,
+        )
+        for i, w in enumerate(words)
+    ]
+    statements = [
+        "Max met Anna in Lisbon.",
+        "Maxie likes café au lait",
+        "Nick_1 visited 北京",
+        "Anna's dog is anay",
+        "Porto, Lisbon and maxy",
+        "Analysis of Maximal Anna",
+    ]
+    facts = [
+        Fact(
+            id=f"f{i}",
+            space_id="g",
+            subject_id=f"e{i % len(words)}",
+            subject=words[0],
+            predicate=f"p{i}",
+            object=s.split()[-1],
+            statement=s,
+            recorded_at=DAY,
+            session_id="s",
+            source_turn_ids=[],
+        )
+        for i, s in enumerate(statements)
+    ]
+    service.system.db.apply_consolidation(facts=facts, entities=entities, episodes=[], units=[])
+    graph = service.graph("g")
+    edges, degree, seen = [], {}, set()
+    for f in facts:
+        degree[f.subject_id] = degree.get(f.subject_id, 0) + 1
+        linked = set(f.entity_ids) | _mentions_by_regex(entities, f"{f.statement} {f.object}")
+        for other in sorted(linked - {f.subject_id}):
+            pair = (min(f.subject_id, other), max(f.subject_id, other))
+            if pair not in seen:
+                seen.add(pair)
+                edges.append({"source": f.subject_id, "target": other, "label": f.predicate})
+                degree[other] = degree.get(other, 0) + 1
+    assert graph["edges"] == edges and len(edges) > 5
+    assert {n["id"]: n["facts"] for n in graph["nodes"]} == degree
+
+
 def test_forget_fact_removes_whole_round(service: ChatService, model: ScriptedModel) -> None:
     model.agent = lambda body: "Happy early birthday to Ana on October 3!"
     session = service.start("shop", at=DAY)
@@ -1166,7 +1265,7 @@ def test_ui_api_refuses_cross_origin_requests(
         )
         assert preflight.status_code == 403
         assert "access-control-allow-origin" not in preflight.headers
-        posted = client.post(call, json={"data": ["alice", False, "fact"]}, headers=evil)
+        posted = client.post(call, json={"data": ["alice", False, False, "fact"]}, headers=evil)
         assert posted.status_code == 403
         assert "access-control-allow-origin" not in posted.headers
         upload = client.post(
@@ -1175,7 +1274,7 @@ def test_ui_api_refuses_cross_origin_requests(
         assert upload.status_code == 403
 
         same = {"Host": host, "Origin": f"http://{host}"}  # 界面本身
-        posted = client.post(call, json={"data": ["alice", False, "fact"]}, headers=same)
+        posted = client.post(call, json={"data": ["alice", False, False, "fact"]}, headers=same)
         assert posted.status_code == 200
         event = posted.json()["event_id"]
         assert "4321" in client.get(f"{call}/{event}", headers=same).text
@@ -1210,7 +1309,7 @@ def test_no_auth_lan_bind_refuses_rebound_hosts(service: ChatService, tmp_path: 
             assert client.get("/v1/models", headers=rebound).status_code == 400
             call = client.post(
                 "/gradio_api/call/load_memory",
-                json={"data": ["alice", False, "fact"]},
+                json={"data": ["alice", False, False, "fact"]},
                 headers=rebound,
             )
             assert call.status_code == 400

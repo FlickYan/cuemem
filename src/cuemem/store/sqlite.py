@@ -452,6 +452,15 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: _dt(r[1]) for r in rows}
 
+    def session_turn_counts(self, space_id: str) -> dict[str, int]:
+        """会话 ID → 发言条数（记忆浏览器的会话列表）：只数，不解出每句发言。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, COUNT(*) FROM turns WHERE space_id = ? GROUP BY session_id",
+                (space_id,),
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     def has_sessions(self, space_id: str) -> bool:
         """这个空间有没有会话（检索之前判断空间是不是空的）。"""
         with self._lock:

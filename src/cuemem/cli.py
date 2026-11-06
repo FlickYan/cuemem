@@ -551,8 +551,12 @@ def ask(
     lam: Annotated[
         float | None, typer.Option(help="成本旋钮 λ：越大越省钱；默认取控制器模型里的值")
     ] = None,
+    show_expired: Annotated[
+        bool,
+        typer.Option("--show-expired", help="也用已经过期的记忆（写入时给了 expiration_date 的）"),
+    ] = False,
 ) -> None:
-    """检索记忆并回答问题。"""
+    """检索记忆并回答问题。已经过期的记忆默认不用，同 SDK 的 answer（见 expiry.py）。"""
     if mode not in get_args(AskMode):
         console.print(f"[red]--mode 只能是 {'、'.join(get_args(AskMode))}[/red]")
         raise typer.Exit(1)
@@ -569,6 +573,7 @@ def ask(
             mode=cast(AskMode, mode),
             router=cast(Router, router),
             lam=lam,
+            hide_expired=not show_expired,  # 没有过期的记忆时请求与不打开时逐字相同
         )
         elapsed = (time.perf_counter() - started) * 1000
         if show_context:
@@ -1615,8 +1620,12 @@ def inspect_facts(
         datetime | None,
         typer.Option("--known-at", formats=DATETIME_FORMATS, help="记录时间：系统那时相信的事实"),
     ] = None,
+    hide_expired: Annotated[
+        bool, typer.Option("--hide-expired", help="不列出已经过期的事实（expiration_date）")
+    ] = False,
 ) -> None:
-    """事实时间线：按主语分组、按时间排列，标出被取代的版本。"""
+    """事实时间线：按主语分组、按时间排列，标出被取代的版本与已经过期的事实（检查用，默认
+    都列出；--hide-expired 时不列出过期的，同检索与记忆浏览器）。"""
     if valid_at is not None:
         try:
             valid_period(valid_at)
@@ -1629,6 +1638,9 @@ def inspect_facts(
         facts = system.facts(space, current_only=current, valid_at=valid_at, known_at=known_at)
         if subject:
             facts = [f for f in facts if f.subject.casefold() == subject.casefold()]
+        gone = system.expired_ids(space, datetime.now())
+        if hide_expired:
+            facts = [f for f in facts if f.id not in gone]
         if not facts:
             console.print("没有符合条件的事实。还没巩固的话，先运行 cuemem consolidate。")
             return
@@ -1644,7 +1656,7 @@ def inspect_facts(
                 fact.statement,
                 _span_text(fact.valid_from, fact.valid_to),
                 f"{fact.recorded_at:%Y-%m-%d}",
-                _fact_status(fact, ids),
+                _fact_status(fact, ids, expired=fact.id in gone),
                 fact.id,
             )
         console.print(table)
@@ -2503,13 +2515,15 @@ def _span_text(start: str | None, end: str | None) -> str:
     return f"{start or '?'} → {end or '至今'}"
 
 
-def _fact_status(fact: Fact, ids: dict[str, int]) -> str:
+def _fact_status(fact: Fact, ids: dict[str, int], *, expired: bool = False) -> str:
+    """expired：出处各句都过期了（expiration_date，见 expiry.py），检索与记忆浏览器不给出它。"""
     if fact.is_current:
-        return "[green]当前[/green]"
+        return "[red]已过期[/red]" if expired else "[green]当前[/green]"
     successor = f"#{ids[fact.superseded_by]}" if fact.superseded_by in ids else "新版本"
+    gone = " · [red]已过期[/red]" if expired else ""
     if fact.supersede_reason == "corrected":
-        return f"[yellow]已更正[/yellow]（见 {successor}）"
-    return f"[dim]已变化[/dim]（见 {successor}）"
+        return f"[yellow]已更正[/yellow]（见 {successor}）{gone}"
+    return f"[dim]已变化[/dim]（见 {successor}）{gone}"
 
 
 def _print_hits(answer: Answer) -> None:
