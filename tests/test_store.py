@@ -1041,6 +1041,104 @@ def test_valid_period_gives_a_correction_the_start_of_what_it_corrected() -> Non
     db.close()
 
 
+def test_valid_period_on_a_deep_correction_chain_is_fast() -> None:
+    """第七轮体检 P6：反复 update 同一条记忆得到一条很深的更正链（都没有自己的起点）。以前的
+    CTE 存每一版与它所有祖先的对，深 1000 时一次查询约 4 秒、期间占着全库的锁；现在从链头往后
+    传起点，几毫秒。"""
+    from cuemem.core.timeutil import valid_period
+
+    depth = 1000
+    db = MemoryDB(None)
+    db.apply_consolidation(
+        facts=[
+            _lives_in(
+                f"v{i}",
+                f"City{i}",
+                None,
+                by=f"v{i + 1}" if i < depth - 1 else None,
+                reason="corrected" if i < depth - 1 else None,
+                said=datetime(2026, 1, 1) + timedelta(minutes=i),
+            )
+            for i in range(depth)
+        ],
+        entities=[],
+        episodes=[],
+        units=[],
+    )
+    started = time.perf_counter()
+    found = [f.id for f in db.get_facts("s", valid_period=valid_period("2026"))]
+    elapsed = time.perf_counter() - started
+    assert found == [f"v{depth - 1}"]
+    assert elapsed < 1.0
+    db.close()
+
+
+# 第六轮的写法（每一版与它所有祖先的对），第七轮 P6 换掉；留在这里对照结果
+_OLD_CORRECTED_CHAIN = (
+    "WITH RECURSIVE corrected_chain(id, anc) AS ("
+    "SELECT p.superseded_by, p.id FROM facts p JOIN facts f ON f.id = p.superseded_by"
+    " WHERE p.space_id = ? AND p.supersede_reason = 'corrected' AND f.valid_from IS NULL"
+    " UNION SELECT c.id, p.id FROM corrected_chain c JOIN facts a ON a.id = c.anc"
+    " JOIN facts p ON p.space_id = a.space_id AND p.superseded_by = a.id"
+    " AND p.supersede_reason = 'corrected' WHERE a.valid_from IS NULL)"
+)
+_OLD_CORRECTED_START = (
+    "(SELECT MIN(COALESCE(a.valid_from, substr(a.recorded_at, 1, 10)))"
+    " FROM corrected_chain c JOIN facts a ON a.id = c.anc WHERE c.id = facts.id"
+    " AND (a.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
+    " WHERE q.space_id = a.space_id AND q.superseded_by = a.id"
+    " AND q.supersede_reason = 'corrected')))"
+)
+
+
+def test_valid_period_matches_the_old_correction_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """第七轮体检 P6：新的 CTE 与以前的结果相同。随机的版本森林（几版取代同一版、更正与正常
+    取代混着、部分有起点与终点、提到的时间不同），每个查几段时间。"""
+    import random
+
+    from cuemem.core.timeutil import valid_period
+
+    new = (sqlite_module._CORRECTED_CHAIN, sqlite_module._CORRECTED_START)
+    old = (_OLD_CORRECTED_CHAIN, _OLD_CORRECTED_START)
+    periods = ("2023", "2024-05", "2025-01-01", "2026", "2022", "2023-06-15")
+    checked = 0
+    for seed in range(50):
+        rnd = random.Random(seed)
+        n = rnd.randint(5, 60)
+        later: dict[int, int] = {}
+        for i in range(n - 1):
+            if rnd.random() < 0.7:
+                later[i] = rnd.randint(i + 1, min(n - 1, i + 5))
+        db = MemoryDB(None)
+        db.apply_consolidation(
+            facts=[
+                _lives_in(
+                    f"x{i}",
+                    f"City{i}",
+                    rnd.choice([None, None, None, "2023", "2024-05", "2025-03-02"]),
+                    rnd.choice([None, None, "2025", "2026-02"]),
+                    by=f"x{later[i]}" if i in later else None,
+                    reason=rnd.choice(["corrected"] * 3 + ["changed"] * 2) if i in later else None,
+                    said=datetime(rnd.randint(2023, 2026), rnd.randint(1, 9), rnd.randint(10, 19)),
+                )
+                for i in range(n)
+            ],
+            entities=[],
+            episodes=[],
+            units=[],
+        )
+        for value in periods:
+            got = {}
+            for name, (chain, start) in (("old", old), ("new", new)):
+                monkeypatch.setattr(sqlite_module, "_CORRECTED_CHAIN", chain)
+                monkeypatch.setattr(sqlite_module, "_CORRECTED_START", start)
+                got[name] = [f.id for f in db.get_facts("s", valid_period=valid_period(value))]
+            assert got["new"] == got["old"], (seed, value)
+            checked += bool(got["new"])
+        db.close()
+    assert checked > 50  # 不是处处都空
+
+
 def test_v5_database_gains_turn_meta(tmp_path: Path) -> None:
     """v6 加了 turn_meta（SDK 的 metadata、过期时间与更正目标）：v5 的库打开时自动补上这张表，
     已有的发言没有附加信息；附加信息只写给这次真正写进去的发言，随发言一起删。"""

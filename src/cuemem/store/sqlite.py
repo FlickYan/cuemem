@@ -215,24 +215,24 @@ _FACT_COLUMNS = (
 )
 # 按事件时间查事实（get_facts 的 valid_period）时，没有自己起点的更正版的起点。更正指旧值从未
 # 成立（见 write/reconcile.py），新值从旧值的起点起就成立；以前从更正那天算起，查更正之前的
-# 日期新旧两版都查不到。corrected_chain(id, anc)：anc 是 id 沿"被更正"一路往前的各版（只经过
-# 没有自己起点的版本）；起点取链上到头的那些版（自己有起点，或不再更正过别的）里最早的。
-# 参数：space_id 一个，放在整句最前
+# 日期新旧两版都查不到。corrected_start(id, start)：start 是 id 往前那条更正链到头的一版（自己有
+# 起点，或不再更正过别的）的起点，从链头往后传：种子是这样到头的被更正版，起点只传给没有自己
+# 起点的后继版；起点取各条链头里最早的。UNION 按 (id, start) 去重，行数不超过事实数 × 不同的
+# 起点数。以前存每一版与它所有祖先的对（深 d 的链约 d²/2 行），反复 update 同一条记忆时，深
+# 1000 的链一次查询约 4 秒、期间占着全库的锁。参数：space_id 一个，放在整句最前
 _CORRECTED_CHAIN = (
-    "WITH RECURSIVE corrected_chain(id, anc) AS ("
-    "SELECT p.superseded_by, p.id FROM facts p JOIN facts f ON f.id = p.superseded_by"
+    "WITH RECURSIVE corrected_start(id, start) AS ("
+    "SELECT f.id, COALESCE(p.valid_from, substr(p.recorded_at, 1, 10))"
+    " FROM facts p JOIN facts f ON f.id = p.superseded_by"
     " WHERE p.space_id = ? AND p.supersede_reason = 'corrected' AND f.valid_from IS NULL"
-    " UNION SELECT c.id, p.id FROM corrected_chain c JOIN facts a ON a.id = c.anc"
-    " JOIN facts p ON p.space_id = a.space_id AND p.superseded_by = a.id"
-    " AND p.supersede_reason = 'corrected' WHERE a.valid_from IS NULL)"
+    " AND (p.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
+    " WHERE q.space_id = p.space_id AND q.superseded_by = p.id"
+    " AND q.supersede_reason = 'corrected'))"
+    " UNION SELECT f.id, c.start FROM corrected_start c JOIN facts a ON a.id = c.id"
+    " JOIN facts f ON f.id = a.superseded_by"
+    " WHERE a.supersede_reason = 'corrected' AND f.valid_from IS NULL)"
 )
-_CORRECTED_START = (
-    "(SELECT MIN(COALESCE(a.valid_from, substr(a.recorded_at, 1, 10)))"
-    " FROM corrected_chain c JOIN facts a ON a.id = c.anc WHERE c.id = facts.id"
-    " AND (a.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
-    " WHERE q.space_id = a.space_id AND q.superseded_by = a.id"
-    " AND q.supersede_reason = 'corrected')))"
-)
+_CORRECTED_START = "(SELECT MIN(c.start) FROM corrected_start c WHERE c.id = facts.id)"
 _UNIT_COLUMNS = "id, space_id, kind, session_id, text, ts, source_turn_ids, meta"
 _ENTITY_COLUMNS = "id, space_id, name, type, aliases, description, first_seen, last_seen, mentions"
 _MEDIA_COLUMNS = (
