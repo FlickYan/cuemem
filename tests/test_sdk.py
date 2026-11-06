@@ -26,7 +26,7 @@ from cuemem import AsyncMemory, Memory
 from cuemem.config import PathsConfig, Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
-from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError
+from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
 from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
 from cuemem.memory import _open_mark
 from cuemem.sdk import _matches, parse_messages, space_for
@@ -1480,6 +1480,7 @@ def test_delete_all_and_reset_leave_nothing_naming_the_user(memory: Memory, how:
         memory.add("I like jazz", user_id=user, run_id=rid)
     memory.search("Where do I live?", user_id=user)
     system.db.set_meta(_open_mark(user, "chat-1"), AUG.isoformat())  # 之前的进程崩溃时留下的
+    memory.add("I like tea", user_id=user, infer=False, idempotency_key="k1")  # add_keys 的一行
     memory.add("I live in Paris", user_id="bob", run_id="r", infer=False)
     keys, in_db, traces = naming(memory, user)
     assert len(keys) >= 7 and in_db and traces >= 7
@@ -1489,6 +1490,7 @@ def test_delete_all_and_reset_leave_nothing_naming_the_user(memory: Memory, how:
     else:
         memory.reset()
     assert naming(memory, user) == ([], False, 0)
+    assert system.db._conn.execute("SELECT COUNT(*) FROM add_keys").fetchone() == (0,)
     if how == "delete_all":
         assert naming(memory, "bob")[2] == 1  # bob 的写入的 trace 还在
         memory.add("I moved to Rome", user_id="bob", run_id="r", infer=False)
@@ -1526,6 +1528,170 @@ def test_a_reset_that_fails_partway_still_purges_the_traces_of_what_it_deleted(
     assert naming(memory, untouched)[2] > 0  # 还没开始删的空间不动
     memory.reset()  # 重试删掉剩下的
     assert memory.spaces() == [] and all(naming(memory, u)[2] == 0 for u in users)
+
+
+# ---------- add 的 idempotency_key（第六轮体检） ----------
+
+
+def _turn_count(memory: Memory, space: str = "alice") -> int:
+    return len(memory.system.db.get_turns(space))
+
+
+def test_a_retry_with_the_same_key_writes_once(memory: Memory) -> None:
+    """响应丢了（MemoryClient 超时，sent=True）之后用同一个键重试：只写一次，返回 duplicate 与
+    那次的 session_id、turn_ids。以前没有办法：add 默认 queued，get_all 看不到刚写的，盲目重试
+    原始日志里就有两遍。不给键时与以前一样，每次都写。"""
+    first = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1")
+    assert first["status"] == "queued" and "replayed" not in first
+    again = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1", wait=True)
+    assert again == {
+        "results": [],
+        "session_id": first["session_id"],
+        "turn_ids": first["turn_ids"],
+        "status": "duplicate",
+        "replayed": True,
+    }
+    assert _turn_count(memory) == 1
+    assert memory.system.db.get_jobs("alice", status="pending")  # wait=True 也没有抽取
+    memory.add("I live in Berlin", user_id="alice")
+    assert _turn_count(memory) == 2
+
+
+def test_the_same_key_for_another_request_is_refused(memory: Memory) -> None:
+    """同一个键用于不同的请求（消息不同，或别的参数不同）：IdempotencyConflictError，什么都不写。
+    wait 不算请求的一部分；本地的 datetime 与 ISO 文本算同一个时间。"""
+    memory.add("I live in Berlin", user_id="alice", timestamp=AUG, idempotency_key="k1")
+    for change in (
+        {"messages": "I live in Rome"},
+        {"metadata": {"k": 1}},
+        {"infer": False},
+        {"timestamp": SEP},
+    ):
+        args: dict[str, Any] = {"messages": "I live in Berlin", "timestamp": AUG, **change}
+        with pytest.raises(IdempotencyConflictError, match="different add request"):
+            memory.add(user_id="alice", idempotency_key="k1", **args)
+    same = memory.add(
+        "I live in Berlin", user_id="alice", timestamp=AUG.isoformat(), idempotency_key="k1"
+    )
+    assert same["status"] == "duplicate"
+    assert _turn_count(memory) == 1
+
+
+def test_keys_are_per_user_and_checked(memory: Memory) -> None:
+    """键按用户（记忆空间）分开：bob 用 alice 用过的键照常写。键要是 1 到 255 个可打印的 ASCII
+    字符（它也要能放进 HTTP 头），否则 ValueError，什么都不写。"""
+    memory.add("I live in Berlin", user_id="alice", idempotency_key="k1")
+    assert memory.add("I live in Berlin", user_id="bob", idempotency_key="k1")["status"] == "queued"
+    for bad in ("", "x" * 256, "naïve", "a\nb"):
+        with pytest.raises(ValueError, match="idempotency_key"):
+            memory.add("hi", user_id="carol", idempotency_key=bad)
+    assert memory.add("hi", user_id="carol", idempotency_key="x" * 255)["status"] == "queued"
+    assert _turn_count(memory, "carol") == 1
+    (row,) = memory.system.db._conn.execute(
+        "SELECT key_hash FROM add_keys WHERE space_id = 'alice'"
+    ).fetchall()
+    assert "k1" not in row[0]  # 只存键的 sha256
+
+
+def test_no_key_runs_no_extra_query(memory: Memory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """不给键时与以前完全相同：不查、不写 add_keys。"""
+    db = memory.system.db
+
+    def unused(*args: Any) -> Any:
+        raise AssertionError("add_keys touched without an idempotency_key")
+
+    monkeypatch.setattr(db, "add_key_lookup", unused)
+    monkeypatch.setattr(db, "add_key_insert", unused)
+    assert memory.add("I live in Berlin", user_id="alice", wait=True)["status"] == "consolidated"
+
+
+def test_racing_retries_write_once_and_leave_no_vectors_behind(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """8 个线程同时用同一个键 add：只有一个写进去，别的在提交时撞上主键、整个事务回滚（连同
+    发言与暂存的向量），按 duplicate 返回同一个 session_id。向量与只写一次的空间一样多。每个
+    线程的第一次查询都当作没查到：8 个都走到写入，确定地走一遍回滚的路径。"""
+    barrier = threading.Barrier(8)
+    out: list[dict[str, Any]] = []
+    looked = threading.local()
+    real = Memory._replayed
+
+    def first_misses(self: Memory, *args: str) -> dict[str, Any] | None:
+        if not getattr(looked, "once", False):
+            looked.once = True
+            return None
+        return real(self, *args)
+
+    monkeypatch.setattr(Memory, "_replayed", first_misses)
+
+    def go() -> None:
+        barrier.wait()
+        out.append(memory.add("I like tea", user_id="alice", idempotency_key="race"))
+
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(r["status"] for r in out) == ["duplicate"] * 7 + ["queued"]
+    assert len({r["session_id"] for r in out}) == 1
+    assert _turn_count(memory) == 1
+    memory.add("I like tea", user_id="bob")
+    vectors = memory.system.vectors
+    assert vectors.count("alice") == vectors.count("bob") > 0
+
+
+def test_a_forgotten_write_is_not_written_again_by_a_late_retry(memory: Memory) -> None:
+    """遗忘之后键只留下墓碑：请求的摘要、会话与发言 ID 都置空（由被遗忘的内容算出，不能留着），
+    晚到的重试返回 forgotten，不再写一遍；用这个键的不同请求也是 forgotten。没有被遗忘的发言的
+    键照旧是 duplicate。"""
+    first = memory.add("I live in Berlin", user_id="alice", idempotency_key="k1", wait=True)
+    memory.add("I like jazz", user_id="alice", run_id="r", idempotency_key="k2", infer=False)
+    memory.delete(first["results"][0]["id"])
+    assert len(memory.system.db.get_turns("alice")) == 1
+    rows = dict(
+        memory.system.db._conn.execute(
+            "SELECT request_hash IS NULL AND session_id IS NULL AND turn_ids IS NULL, COUNT(*)"
+            " FROM add_keys GROUP BY 1"
+        ).fetchall()
+    )
+    assert rows == {1: 1, 0: 1}
+    forgotten = {
+        "results": [],
+        "session_id": None,
+        "turn_ids": [],
+        "status": "forgotten",
+        "replayed": True,
+    }
+    assert memory.add("I live in Berlin", user_id="alice", idempotency_key="k1") == forgotten
+    assert memory.add("Something else", user_id="alice", idempotency_key="k1") == forgotten
+    kept = memory.add("I like jazz", user_id="alice", run_id="r", idempotency_key="k2", infer=False)
+    assert kept["status"] == "duplicate"
+    assert len(memory.system.db.get_turns("alice")) == 1
+
+
+def test_keys_expire_after_a_day(memory: Memory) -> None:
+    """键记 24 小时（与 Stripe 相同）：过期的不再算，下一次带键的写入顺带删掉过期的行。"""
+    db = memory.system.db
+    memory.add("I like tea", user_id="alice", idempotency_key="old")
+    stale = (datetime.now() - timedelta(hours=25)).isoformat()
+    with db.transaction() as conn:
+        conn.execute("UPDATE add_keys SET created_at = ?", (stale,))
+    assert memory.add("I like tea", user_id="alice", idempotency_key="old")["status"] == "queued"
+    assert _turn_count(memory) == 2
+    assert db._conn.execute("SELECT COUNT(*) FROM add_keys").fetchone() == (1,)
+
+
+def test_async_memory_passes_the_key(memory: Memory) -> None:
+    async def twice() -> list[str]:
+        mem = AsyncMemory.from_system(memory.system)
+        return [
+            (await mem.add("I like tea", user_id="alice", idempotency_key="a1"))["status"]
+            for _ in range(2)
+        ]
+
+    assert asyncio.run(twice()) == ["queued", "duplicate"]
+    assert _turn_count(memory) == 1
 
 
 def test_delete_all_keeps_the_mark_of_a_run_still_open(memory: Memory) -> None:

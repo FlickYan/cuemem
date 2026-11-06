@@ -26,7 +26,7 @@ from cuemem.embed.base import FloatArray
 from cuemem.errors import ContentFilteredError
 from cuemem.llm.client import LLMClient
 from cuemem.write.extract import ExtractedEntity
-from cuemem.write.predicates import lossy, unicode_key
+from cuemem.write.predicates import _BEYOND, lossy, strict_key, unicode_key
 
 USER_NAMES = frozenset({"user", "the user", "i", "me", "myself", "用户", "我"})
 ASSISTANT_NAMES = frozenset({"assistant", "the assistant", "ai", "ai assistant", "助手"})
@@ -63,6 +63,12 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", name.casefold()).strip()
 
 
+def name_keys(name: str) -> tuple[str, str]:
+    """名字的两个键：normalize_name 与 strict_key。只有拉丁字母带重音、全角字母数字这类原来
+    被删掉的字才会让两个名字前一个键相同、后一个不同（'Müller' 与 'Möller'）。"""
+    return normalize_name(name), strict_key(name)
+
+
 def is_generic(alias: str) -> bool:
     """泛称（"my dog""那只金毛"）不能当别名：同一个说法在不同时间可能指不同对象。"""
     return bool(_GENERIC_PREFIX.match(normalize_name(alias) + " ")) or len(alias.strip()) < 2
@@ -84,6 +90,9 @@ class EntityState:
     entities: dict[str, Entity] = field(default_factory=dict)
     alias_index: dict[str, str] = field(default_factory=dict)  # 规范化名字 → 实体 ID
     vectors: dict[str, FloatArray] = field(default_factory=dict)
+    # 名字的两个键（name_keys）→ 实体 ID：alias_index 命中的实体名字其实不同时（'Möller' 命中
+    # 'Müller'）按它找
+    strict_index: dict[tuple[str, str], str] = field(default_factory=dict)
 
     def add(self, entity: Entity, vector: FloatArray | None) -> None:
         self.entities[entity.id] = entity
@@ -91,6 +100,7 @@ class EntityState:
             key = normalize_name(name)
             if key and not is_generic(name):
                 self.alias_index.setdefault(key, entity.id)
+                self.strict_index.setdefault((key, strict_key(name)), entity.id)
         if vector is not None:
             self.vectors[entity.id] = vector
 
@@ -102,7 +112,18 @@ class EntityState:
                 if user_entity_id(self.space_id) in self.entities
                 else None
             )
-        return self.alias_index.get(key)
+        found = self.alias_index.get(key)
+        if found is None or not (_BEYOND.search(name) or _BEYOND.search(self.entities[found].name)):
+            return found
+        strict = strict_key(name)
+        if self.named(found, strict):
+            return found
+        return self.strict_index.get((key, strict))
+
+    def named(self, entity_id: str, strict: str) -> bool:
+        """这个实体的名字或某个别名的 strict_key 是 strict。"""
+        entity = self.entities[entity_id]
+        return any(strict_key(n) == strict for n in [entity.name, *entity.aliases])
 
 
 @dataclass
@@ -145,6 +166,10 @@ class EntityResolver:
             else:
                 key = normalize_name(name)  # 只有符号或 emoji 的名字键是 ''：按原样区分
                 entity_id = stable_id(state.space_id, "entity", key or name.strip(), "person")
+                strict = strict_key(name)
+                if entity_id in state.entities and not state.named(entity_id, strict):
+                    # 原来的键撞上、名字其实不同（'Müller' 与 'Möller'）：另派一个 ID
+                    entity_id = stable_id(state.space_id, "entity", strict, "person", "u")
                 display = name
             if entity_id in state.entities:
                 continue
@@ -162,6 +187,7 @@ class EntityResolver:
             state.add(entity, None)
             if display != "User" and normalize_name(name):  # 空键会让任何空宾语都指向这个人
                 state.alias_index[normalize_name(name)] = entity_id
+                state.strict_index[name_keys(name)] = entity_id
             report.created += 1
             report.changed[entity_id] = entity
 
@@ -174,7 +200,7 @@ class EntityResolver:
             return
         self.ensure_people(state, ["User"], ts, report)
         uid = user_entity_id(state.space_id)
-        if state.alias_index.get(key) not in (None, uid):
+        if state.lookup(name) not in (None, uid):
             return  # 已经是另一个实体的名字：不擅自合并
         self._link(state, uid, ExtractedEntity(name=name.strip(), type="person"), ts, report)
         state.alias_index[key] = uid
@@ -276,11 +302,12 @@ class EntityResolver:
         entity = state.entities[entity_id]
         aliases = list(entity.aliases)
         for alias in [mention.name, *mention.aliases]:
+            # 两个键都相同才算已有的名字：'Möller' 并进 'Müller' 时要记成别名
             if (
                 alias
                 and not is_generic(alias)
-                and normalize_name(alias) != normalize_name(entity.name)
-                and normalize_name(alias) not in {normalize_name(a) for a in aliases}
+                and name_keys(alias) != name_keys(entity.name)
+                and name_keys(alias) not in {name_keys(a) for a in aliases}
             ):
                 aliases.append(alias.strip())
         updated = entity.model_copy(
@@ -307,6 +334,10 @@ class EntityResolver:
     ) -> str:
         key = normalize_name(mention.name)
         entity_id = stable_id(state.space_id, "entity", key or mention.name.strip(), mention.type)
+        strict = strict_key(mention.name)
+        if entity_id in state.entities and not state.named(entity_id, strict):
+            # 原来的键撞上、名字其实不同（'Müller' 与 'Möller'）：另派一个 ID，已有的 ID 不变
+            entity_id = stable_id(state.space_id, "entity", strict, mention.type, "u")
         if entity_id in state.entities:  # 同名同类型：确定性 ID 相同，按同一实体处理
             self._link(state, entity_id, mention, ts, report)
             return entity_id
@@ -378,9 +409,9 @@ def _compatible(a: str, b: str) -> bool:
 
 def _dedupe(mentions: Sequence[ExtractedEntity]) -> list[ExtractedEntity]:
     """同一会话里重复列出的实体合并（别名取并集）。"""
-    merged: dict[str, ExtractedEntity] = {}
+    merged: dict[tuple[str, str], ExtractedEntity] = {}
     for mention in mentions:
-        key = normalize_name(mention.name)
+        key = name_keys(mention.name)  # 'Müller' 与 'Möller' 不合并
         if key in merged:
             first = merged[key]
             aliases = list(dict.fromkeys([*first.aliases, *mention.aliases]))

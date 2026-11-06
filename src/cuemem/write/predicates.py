@@ -171,6 +171,22 @@ def normalize_value(text: str) -> str:
     return re.sub(r"^(the|a|an|my) ", "", flat)
 
 
+def strict_key(text: str) -> str:
+    """第二个相等键，只在原来的键（normalize_value、normalize_name）相同时再比一次。
+
+    原来的键把带重音的拉丁字母与全角数字整个删掉：'Müller' 与 'Möller' 都成了 'm ller'，
+    '８０００円' 与 '６０００円' 都成了 '円'，不同的值被合并、不同的人成了同一个实体。这里先
+    NFKC（全角数字变成 '8000'）、casefold，再 NFKD 去掉附加符号：重音折叠而不是保留，
+    'Café'、'Cafe'、'cafè' 都是 'cafe'，原来就合并的照旧合并。只有 ASCII 与汉字的文本
+    （绝大多数）与 normalize_value 相同。原来的键与由它派生的 ID 都不变。
+    """
+    if not _BEYOND.search(text):
+        return normalize_value(text)
+    folded = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", text).casefold())
+    bare = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return re.sub(r"^(the|a|an|my) ", "", re.sub(r"[\W_]+", " ", bare).strip())
+
+
 def legacy_value_key(text: str) -> str:
     """原来的 normalize_value，只用来派生事实 ID：已有的事实 ID 一个都不变。"""
     return re.sub(r"^(the|a|an|my) ", "", _legacy_flat(text))

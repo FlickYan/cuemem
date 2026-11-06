@@ -12,7 +12,8 @@
    用户消息的前面（与 Mem0 的 proxy 相同的位置）；系统提示与之前的消息不动，
    供应商的前缀缓存照常命中；
 3. **转发**：按配置里的模型目录转发给上游（model 是配置里的别名或模型 ID；不认识的模型默认
-   改用 agent 角色的模型并记一条警告，proxy.unknown_model: reject 时返回 400），流式与非流式
+   改用 agent 角色的模型并记一条警告，proxy.unknown_model: reject 时返回 400；目录里供应商的
+   Key 没设置的模型返回 503 model_not_available，GET /v1/models 也不列它们），流式与非流式
    都支持，响应原样返回；控制器的决定与实际用的模型（X-CueMem-Model）放在响应头里；
 4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）；上游出错时不写，流式
    回答中途断开（客户端停下）只写用户的话。写不进去（向量接口暂时不可用等）时留着，这个会话
@@ -71,7 +72,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
-from cuemem.api.auth import Keys, Principal, guard, identity_headers, principal_of
+from cuemem.api.auth import AnyKeys, Keys, Principal, guard, identity_headers, principal_of
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import MAX_BODY_BYTES
 from cuemem.config import ModelSpec, UnknownModel
@@ -199,9 +200,13 @@ class MemoryProxy:
     # ---------- 请求 ----------
 
     def models(self) -> dict[str, Any]:
+        """GET /v1/models：目录里供应商的 Key 已设置的别名（_available_aliases），加上向量模型。"""
+        catalog = self.system.settings.models
+        available = set(self._available_aliases())
         data = [
             {"id": alias, "object": "model", "created": 0, "owned_by": spec.provider}
-            for alias, spec in self.system.settings.models.items()
+            for alias, spec in catalog.items()
+            if alias in available
         ]
         cfg = self.system.settings.embedding  # /v1/embeddings 的模型
         owner = cfg.provider if cfg.backend in ("dashscope", "openai") else "cuemem"
@@ -387,15 +392,21 @@ class MemoryProxy:
         self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
     ) -> tuple[Turn, dict[str, Any], str, dict[str, str]]:
         # 先认模型与令牌的用量限制：被拒绝的请求不开会话、不检索
-        upstream, url, auth = self._upstream(body, principal)
+        try:
+            upstream, url, auth = self._upstream(body, principal)
+        except ProxyError as exc:
+            if exc.status == 503:  # 缺 Key 排在令牌的作用域之后：越权的请求照旧先 403
+                self._identity(body, headers, principal)
+            raise
         turn = self._recall(body, headers, principal)
         if turn.write_user is not None and turn.block:
             upstream["messages"] = inject_evidence(upstream["messages"], turn.block)
         return turn, upstream, url, auth
 
-    def _recall(
+    def _identity(
         self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
-    ) -> Turn:
+    ) -> tuple[Any, str | None]:
+        """请求的用户与 Agent；用户不在令牌的作用域里时 ProxyError（403）。"""
         try:  # 不是 ASCII 的 ID：原样的 UTF-8 或 utf-8''<百分号编码>（auth.header_id）
             header_user, agent_id = identity_headers(headers)
         except ValueError as exc:
@@ -416,6 +427,12 @@ class MemoryProxy:
                 param="user",
                 code="forbidden",
             )
+        return user_id, agent_id
+
+    def _recall(
+        self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
+    ) -> Turn:
+        user_id, agent_id = self._identity(body, headers, principal)
         messages = body.get("messages") or []
         if user_id is None or not messages:
             return Turn(space=None)
@@ -483,12 +500,31 @@ class MemoryProxy:
         if cap is not None and body.get("n") not in (None, 1):
             raise ProxyError(400, "This API key may request one choice only (n = 1).", param="n")
         provider = settings.providers[spec.provider]
+        key = provider.api_key()
+        if key is None:
+            # 预设叠在默认配置上，目录里还有没设 Key 的供应商的别名（--preset ollama 下的
+            # qwen3.8-flash 等）。以前照样转发、不带鉴权头：用户的话连同想起的记忆发给了
+            # 没配置 Key 的供应商，再被 401 拒绝。现在在检索、开会话之前 503
+            requested = body.get("model")
+            named = isinstance(requested, str) and (
+                requested in settings.models or requested == spec.model_id
+            )
+            name = requested if named else spec.model_id  # 改用 agent 角色的模型时写它
+            raise ProxyError(
+                503,
+                f"Model {name!r} needs {provider.api_key_env}, "
+                "which is not set on this server. Use one of: "
+                f"{', '.join(self._available_aliases())} (see GET /v1/models).",
+                kind="server_error",
+                param="model",
+                code="model_not_available",
+                headers={"x-should-retry": "false"},  # 缺的是服务端的配置，重试也一样
+            )
         upstream = {k: v for k, v in body.items() if k != "user"}
         upstream["model"] = spec.model_id
         _adapt(upstream, spec, override=models is not None)
         if cap is not None:
             _cap_output(upstream, spec, cap)
-        key = provider.api_key()
         auth = {"Authorization": f"Bearer {key}"} if key else {}
         return upstream, provider.base_url.rstrip("/") + "/chat/completions", auth
 
@@ -506,17 +542,26 @@ class MemoryProxy:
         self._check_model(requested, models.keys(), fallback.model_id)
         return fallback
 
+    def _available_aliases(self) -> list[str]:
+        """目录里供应商的 Key 已设置（或不需要 Key）的别名，按字母排。别的别名转发不了（503）。"""
+        settings = self.system.settings
+        return sorted(
+            alias
+            for alias, spec in settings.models.items()
+            if settings.providers[spec.provider].api_key() is not None
+        )
+
     def _check_model(self, requested: Any, known: Collection[str], used: str) -> None:
         """请求的 model 不在 known 里时：unknown_model 是 reject 时报 400（OpenAI 的
-        model_not_found），否则照旧改用 used，每个模型名记一次警告（响应头 X-CueMem-Model
-        写着实际用的模型）。没给 model 的请求不算：没有要求哪个模型。"""
+        model_not_found，列出转发得了的别名），否则照旧改用 used，每个模型名记一次警告（响应头
+        X-CueMem-Model 写着实际用的模型）。没给 model 的请求不算：没有要求哪个模型。"""
         if requested is None or (isinstance(requested, str) and requested in known):
             return
         if self.unknown_model == "reject":
             raise ProxyError(
                 400,
                 f"The model {requested!r} is not served by this proxy. Use one of: "
-                f"{', '.join(sorted(known))} (see GET /v1/models).",
+                f"{', '.join(self._available_aliases())} (see GET /v1/models).",
                 param="model",
                 code="model_not_found",
             )
@@ -1032,7 +1077,7 @@ def create_proxy_app(
     proxy: MemoryProxy,
     *,
     token: str | None = None,
-    keys: Keys | None = None,
+    keys: AnyKeys | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
     allow_ip_hosts: bool = False,

@@ -18,6 +18,26 @@
             "HTTPBearer": []
           }
         ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional key (1-255 printable ASCII characters, e.g. a UUID) for retrying an add safely: within 24 hours the same key and request for the same user is written once and answered with status 'duplicate' (or 'forgotten'); the same key with a different request is a 409 IdempotencyConflictError.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Optional key (1-255 printable ASCII characters, e.g. a UUID) for retrying an add safely: within 24 hours the same key and request for the same user is written once and answered with status 'duplicate' (or 'forgotten'); the same key with a different request is a 409 IdempotencyConflictError."
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -709,6 +729,173 @@
                 "schema": {
                   "$ref": "#/components/schemas/SearchResult",
                   "title": "Response Search"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (the SDK raised ValueError or TypeError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or wrong access token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The model provider's balance is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The memory space is outside this API key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such memory, run or space (KeyError), or outside this key's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write to the same run (ConcurrentWriteError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Malformed request body or parameters (type ValueError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate-limited by the model provider; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The model or embedding provider failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error (a bug); the traceback is in the server log.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/context": {
+      "post": {
+        "tags": [
+          "memories (v1)"
+        ],
+        "summary": "Context",
+        "operationId": "context",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextResult",
+                  "title": "Response Context"
                 }
               }
             }
@@ -3835,7 +4022,9 @@
               "empty",
               "logged",
               "queued",
-              "consolidated"
+              "consolidated",
+              "duplicate",
+              "forgotten"
             ],
             "title": "Status"
           },
@@ -3859,6 +4048,17 @@
                 "type": "null"
               }
             ]
+          },
+          "replayed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replayed"
           }
         },
         "additionalProperties": true,
@@ -4140,6 +4340,156 @@
           "elapsed_ms"
         ],
         "title": "ConsolidationReport"
+      },
+      "ContextRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "l0",
+              "l1",
+              "l2"
+            ],
+            "title": "Mode",
+            "default": "auto"
+          },
+          "router": {
+            "type": "string",
+            "enum": [
+              "learned",
+              "hybrid",
+              "rule",
+              "llm"
+            ],
+            "title": "Router",
+            "default": "learned"
+          },
+          "lam": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lam"
+          },
+          "min_level": {
+            "type": "string",
+            "enum": [
+              "l0",
+              "l1"
+            ],
+            "title": "Min Level",
+            "default": "l1"
+          },
+          "wrap": {
+            "type": "boolean",
+            "title": "Wrap",
+            "description": "Wrap the block in <memory>...</memory>",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "ContextRequest"
+      },
+      "ContextResult": {
+        "properties": {
+          "context": {
+            "type": "string",
+            "title": "Context",
+            "description": "The <memory> block (empty when there is nothing to add); without the <memory> tags when wrap is false"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "L0",
+              "L1",
+              "L2"
+            ],
+            "title": "Level"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons"
+          },
+          "recalled": {
+            "type": "integer",
+            "title": "Recalled",
+            "description": "Items in the block; the profile counts as one"
+          },
+          "see": {
+            "type": "boolean",
+            "title": "See"
+          },
+          "refs": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Refs",
+            "description": "Label in the block -> memory id (see GET)"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "context",
+          "level",
+          "reasons",
+          "recalled",
+          "see",
+          "refs"
+        ],
+        "title": "ContextResult",
+        "description": "POST /context: the evidence block the memory proxy injects, ready for a prompt."
       },
       "DryRunFact": {
         "properties": {

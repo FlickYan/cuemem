@@ -10,9 +10,12 @@ import functools
 import hashlib
 import io
 import json
+import os
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1021,6 +1024,8 @@ def test_key_limits_are_validated() -> None:
         ("models: []", "models"),
         ("models: ['']", "models"),
         ("models: qwen3.8-flash", "models"),
+        ("max_concurrent: 0", "max_concurrent"),
+        ("max_concurrent: '4'", "max_concurrent"),
     ):
         with pytest.raises(AccessKeysError) as caught:
             Keys.parse(_keys(f"name: a, token: t, scopes: [{{user: a}}], {entry}"))
@@ -1028,14 +1033,189 @@ def test_key_limits_are_validated() -> None:
     keys = Keys.parse(
         _keys(
             "name: a, token: t, scopes: [{user: a}], rate_per_minute: 60, "
-            "models: [qwen3.8-flash, deepseek-flash], max_output_tokens: 2000"
+            "models: [qwen3.8-flash, deepseek-flash], max_output_tokens: 2000, max_concurrent: 4"
         )
     )
     principal = keys.resolve("t")
     assert principal is not None and principal.rate_per_minute == 60
     assert principal.models == ("qwen3.8-flash", "deepseek-flash")
     assert principal.max_output_tokens == 2000
+    assert principal.max_concurrent == 4
     assert ADMIN.rate_per_minute is None and ADMIN.models is None
+    assert ADMIN.max_concurrent is None
+
+
+def test_idempotency_keys_stay_in_their_space(world: World) -> None:
+    """Idempotency-Key 按记忆空间分开：bob 的空间用过的键，alice 的令牌在自己的空间照常写入，
+    看不到 bob 那次的会话与发言 ID，也不会因为请求不同而 409；用这个键写 bob 的空间仍是 403，
+    在查键之前。"""
+    keyed = {"Idempotency-Key": "shared-key"}
+    body = {"messages": "My locker code is 1234", "user_id": "bob"}
+    first = world.http.post("/api/v1/memories", json=body, headers={**bearer(ADMIN_TOKEN), **keyed})
+    assert first.status_code == 200, first.text
+    mine = {"messages": "I like tea", "user_id": "alice"}
+    own = world.http.post("/api/v1/memories", json=mine, headers={**bearer(ALICE_TOKEN), **keyed})
+    assert own.status_code == 200 and own.json()["status"] == "queued"
+    assert own.json()["session_id"] != first.json()["session_id"]
+    other = world.http.post("/api/v1/memories", json=body, headers={**bearer(ALICE_TOKEN), **keyed})
+    assert other.status_code == 403
+
+
+# ---------- 同时在处理的请求（第六轮体检） ----------
+
+
+@contextmanager
+def _held(world: World, space: str) -> Iterator[threading.Event]:
+    """在另一个线程里拿着这个空间的巩固锁（RLock 只能由拿到它的线程释放），并让后台线程开始
+    抽取这个空间（卡在锁上）；返回的 Event 被 set 或离开时放开。"""
+    lock = world.system.consolidator.exclusive(space)
+    got, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with lock:
+            got.set()
+            release.wait(60)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert got.wait(10)
+    assert world.system.worker is not None
+    world.system.worker.submit(space)
+    try:
+        yield release
+    finally:
+        release.set()
+        thread.join(10)
+
+
+def _flood(world: World, path: str, body: dict[str, Any], n: int) -> tuple[float, list[int]]:
+    """alice 的令牌并发 n 个请求（都卡在 alice 的巩固锁上）期间，管理令牌查 bob 的状态要多久；
+    返回（秒数，alice 的请求的状态码）。"""
+    codes: list[int] = []
+    with _held(world, "alice") as release:
+
+        def one() -> None:
+            codes.append(world.http.post(path, json=body, headers=bearer(ALICE_TOKEN)).status_code)
+
+        threads = [threading.Thread(target=one) for _ in range(n)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.5)  # 让它们都进到接口里
+        start = time.monotonic()
+        status = world.http.get(
+            "/api/v1/status", params={"user_id": "bob"}, headers=bearer(ADMIN_TOKEN)
+        )
+        took = time.monotonic() - start
+        assert status.status_code == 200, status.text
+        release.set()
+        for thread in threads:
+            thread.join(30)
+    return took, codes
+
+
+def test_a_scoped_key_cannot_take_every_thread(world: World) -> None:
+    """一个限定作用域的令牌同时在处理的请求最多 8 个（CUEMEM_MAX_CONCURRENT_PER_KEY），多的 429：
+    以前 alice 并发 45 个卡住的 POST /api/v1/consolidate 就占满 AnyIO 的 40 个线程，管理令牌查别人
+    的状态也要等到它们做完。"""
+    took, codes = _flood(world, "/api/v1/consolidate", {"user_id": "alice"}, 45)
+    assert took < 1.0, took
+    assert codes.count(429) >= 45 - 8 and set(codes) <= {200, 429}, codes
+
+
+@pytest.fixture
+def raised_cap(n3_settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """建应用之前把每个令牌同时在处理的请求数调高（在清掉环境变量的 clean_env 之后，world 在它
+    之后建应用）。"""
+    monkeypatch.setenv("CUEMEM_MAX_CONCURRENT_PER_KEY", "100")
+
+
+def test_waits_hold_no_thread(raised_cap: None, world: World) -> None:
+    """POST /api/v1/wait 是异步的，等着时不占线程：上限调到 100，alice 并发 45 个等不到的 wait，
+    管理令牌查 bob 的状态照样马上回。以前每个 wait 占着一个线程，状态要等到它们超时（4 秒）。
+    放开之后它们都 200。"""
+    took, codes = _flood(world, "/api/v1/wait", {"user_id": "alice", "timeout": 4}, 45)
+    assert took < 1.0, took
+    assert codes == [200] * 45, codes
+
+
+def _body_limit(app: Any) -> Any:
+    """应用的中间件栈里的 BodyLimit（建好栈之后）。"""
+    from cuemem.api.limits import BodyLimit
+
+    while not isinstance(app, BodyLimit):
+        app = app.app
+    return app
+
+
+def test_an_abandoned_wait_frees_its_slot(world: World) -> None:
+    """客户端断开（Ctrl-C、客户端的超时比服务端短）之后，POST /api/v1/wait 在 WAIT_POLL_S 秒内
+    结束、放开这个令牌的名额（第六轮复审）。以前一直等到 timeout（最多 300 秒），8 个丢下的 wait
+    就让这个令牌的每个请求都 429。"""
+    import anyio
+
+    world.http.get("/api/v1/status", params={"user_id": "alice"}, headers=bearer(ALICE_TOKEN))
+    limit = _body_limit(world.app.middleware_stack)
+    body = json.dumps({"user_id": "alice", "timeout": 30}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/v1/wait",
+        "raw_path": b"/api/v1/wait",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"authorization", f"Bearer {ALICE_TOKEN}".encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}  # 读完请求体之后客户端就走了
+
+    async def send(message: dict[str, Any]) -> None:
+        pass
+
+    async def call() -> float:
+        start = time.monotonic()
+        with anyio.fail_after(10):
+            await world.app(scope, receive, send)
+        return time.monotonic() - start
+
+    with _held(world, "alice"):
+        took = anyio.run(call)
+    assert took < 2.0, took
+    assert limit.requests_in_flight == {}
+
+
+def test_scoped_wait_times_out_with_504(world: World) -> None:
+    """等不到时仍是 504（type TimeoutError），出错的文字不变；不给 ID 时限定作用域的令牌只等它能
+    访问的空间：bob 的抽取卡着不影响 alice 的令牌。"""
+    with _held(world, "alice"):
+        late = world.http.post(
+            "/api/v1/wait", json={"user_id": "alice", "timeout": 0.3}, headers=bearer(ALICE_TOKEN)
+        )
+        assert late.status_code == 504, late.text
+        assert late.json()["error"]["type"] == "TimeoutError"
+        assert late.json()["error"]["message"] == (
+            "Extraction did not finish within 0.3s; it continues in the background."
+        )
+    with _held(world, "bob"):
+        mine = world.http.post("/api/v1/wait", json={"timeout": 1}, headers=bearer(ALICE_TOKEN))
+        assert mine.status_code == 200, mine.text
+        everyone = world.http.post(
+            "/api/v1/wait", json={"timeout": 0.3}, headers=bearer(ADMIN_TOKEN)
+        )
+        assert everyone.status_code == 504
 
 
 # ---------- 界面 ----------
@@ -1337,3 +1517,270 @@ def test_ui_starts_a_new_session_after_an_idle_end(
         assert [t.session_id for t in system.db.get_turns("alice")] == [sid, sid]
     finally:
         service.close()
+
+
+# ---------- 重新读入令牌文件（KeyRing，第六轮体检） ----------
+
+
+B_TOKEN = "bob-token-0123456789"
+RING_KEYS = f"""# 运营者的注释
+keys:
+  - name: alice-app
+    sha256: "{_sha256(ALICE_TOKEN)}"
+    scopes:
+      - user: alice
+  - name: bob-app   # B
+    sha256: "{_sha256(B_TOKEN)}"
+    scopes:
+      - user: bob
+"""
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _replace(path: Path, text: str) -> None:
+    """与 cuemem keys 一样换名替换（inode 变了）。"""
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+Ring = tuple[TestClient, Path, FakeClock, Any]  # 最后一项是 auth.KeyRing
+
+
+@pytest.fixture
+def ring_app(n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path) -> Iterator[Ring]:
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="shop-demo")
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, keys=ring)
+    try:
+        with TestClient(app) as http:
+            yield http, path, clock, ring
+    finally:
+        service.close()
+
+
+def _status(http: TestClient, token: str | None) -> int:
+    return http.get("/api/spaces", headers=bearer(token) if token else {}).status_code
+
+
+def test_revoked_key_rejected_without_restart(ring_app: Ring) -> None:
+    """改了 CUEMEM_API_KEYS_FILE 的文件：运行中的服务一秒内按新的文件认令牌，不用重启（以前只在
+    启动时读一次，吊销泄露的令牌要重启，进行中的 run 只能等下一个进程接手）。一秒之内不看文件。"""
+    http, path, clock, _ = ring_app
+    assert _status(http, ALICE_TOKEN) == 200 and _status(http, B_TOKEN) == 200
+    _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+    clock.now += 0.5
+    assert _status(http, B_TOKEN) == 200  # 还不到一秒：不 stat
+    clock.now += 0.6
+    assert _status(http, B_TOKEN) == 401 and _status(http, ALICE_TOKEN) == 200
+    assert _status(http, None) == 401
+
+
+def test_reload_notices_a_rename_with_the_same_mtime_and_size(tmp_path: Path) -> None:
+    """换名替换的文件修改时间与大小都相同时也看得出来（签名里有 inode）。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    st = path.stat()
+    tmp = tmp_path / "keys.new"
+    tmp.write_text(RING_KEYS.replace("bob-app", "bob-xyz"), encoding="utf-8")
+    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.replace(tmp, path)
+    assert path.stat().st_size == st.st_size and path.stat().st_mtime_ns == st.st_mtime_ns
+    clock.now += 2
+    assert ring.names == ["alice-app", "bob-xyz"]
+
+
+def test_reload_parse_error_keeps_old_keys(
+    ring_app: Ring, caplog: pytest.LogCaptureFixture
+) -> None:
+    """新的文件写错了（或不在了）：留着原来的令牌，日志里记一条警告（不带令牌本身）；改好之后
+    照常换上。"""
+    http, path, clock, ring = ring_app
+    secret = "s3cr3t-value-0123456789"
+    _replace(path, RING_KEYS + f"  - {{name: c, token: [{secret}], scopes: [{{user: c}}]}}\n")
+    clock.now += 2
+    with caplog.at_level("WARNING", logger="cuemem.api.auth"):
+        assert _status(http, B_TOKEN) == 200 and _status(http, ALICE_TOKEN) == 200
+        assert "重新读入失败" in caplog.text and secret not in caplog.text
+        path.unlink()
+        clock.now += 2
+        assert _status(http, B_TOKEN) == 200 and "不在了" in caplog.text
+    path.write_text(RING_KEYS.replace("bob-app", "bob-2"), encoding="utf-8")
+    clock.now += 2
+    assert _status(http, B_TOKEN) == 200 and ring.names == ["alice-app", "bob-2"]
+
+
+@pytest.mark.parametrize("emptied", ["keys: []\n", "# 全删了\nkeys: []\n"])
+def test_reload_to_empty_file_does_not_disable_auth(
+    ring_app: Ring, caplog: pytest.LogCaptureFixture, emptied: str
+) -> None:
+    """新的文件一个令牌都没有、又没有管理令牌：不换（换上就是不鉴权，谁都能进来）。有管理令牌
+    时照常换上（仍然鉴权）。"""
+    http, path, clock, ring = ring_app
+    with caplog.at_level("WARNING", logger="cuemem.api.auth"):
+        _replace(path, emptied)
+        clock.now += 2
+        assert _status(http, None) == 401 and _status(http, B_TOKEN) == 200
+    assert ring.enabled and "一个令牌都没有" in caplog.text
+    with_admin = auth.KeyRing(
+        Keys.parse(RING_KEYS, ADMIN_TOKEN), path, admin_token=ADMIN_TOKEN, clock=clock
+    )
+    _replace(path, emptied + "\n")
+    clock.now += 2
+    assert with_admin.names == [] and with_admin.resolve(ADMIN_TOKEN) == ADMIN
+
+
+def test_revoked_key_name_does_not_fall_back_to_admin_in_the_ui(tmp_path: Path) -> None:
+    """界面里用吊销了的令牌登录、还没退出的人：用户名不再是哪个令牌的名字，Keys.by_username 会
+    把它当成用管理令牌登录的（ADMIN）。KeyRing 记着去掉了的名字，这时不给任何权限。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(
+        Keys.parse(RING_KEYS, ADMIN_TOKEN), path, admin_token=ADMIN_TOKEN, clock=clock
+    )
+    bob = ring.by_username("bob-app")
+    assert bob is not None and bob.name == "bob-app"
+    _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+    clock.now += 2
+    assert ring.by_username("bob-app") is None and not ring.login("bob-app", B_TOKEN)
+    assert ring.by_username("anyone") == ADMIN and ring.login("anyone", ADMIN_TOKEN)
+    _replace(path, RING_KEYS)  # 又加回来：照常
+    clock.now += 2
+    assert ring.by_username("bob-app") == bob
+
+
+@pytest.mark.parametrize("how", ["rotate", "revoke-then-add"])
+def test_rotating_a_key_signs_out_its_ui_sessions(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, how: str
+) -> None:
+    """令牌换了（同名改 sha256，或 cuemem keys revoke 之后又 keys add 回来）：用旧令牌在界面里
+    登录的会话退出（第六轮复审）。以前 Gradio 记着 cookie → 用户名，by_username 只按名字找令牌，
+    泄露的旧令牌在 /api 上 401、在界面里照旧有 bob 的作用域，直到重启。别的令牌的会话照常。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="shop-demo")
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=True, keys=ring)
+    new_token = "bob-token-rotated-0123456789"
+    rotated = RING_KEYS.replace(_sha256(B_TOKEN), _sha256(new_token))
+    try:
+        with TestClient(app) as attacker, TestClient(app) as alice:
+            for http, name, token in (
+                (attacker, "bob-app", B_TOKEN),
+                (alice, "alice-app", ALICE_TOKEN),
+            ):
+                assert http.post("/login", data={"username": name, "password": token}).is_success
+                assert http.get("/config").json()["username"] == name
+            if how == "revoke-then-add":
+                _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+                clock.now += 2
+                assert _status(attacker, B_TOKEN) == 401
+            _replace(path, rotated)
+            clock.now += 2
+            assert _status(attacker, B_TOKEN) == 401
+            assert attacker.get("/config").json().get("username") != "bob-app"
+            assert alice.get("/config").json()["username"] == "alice-app"
+            assert not attacker.post(
+                "/login", data={"username": "bob-app", "password": B_TOKEN}
+            ).is_success
+            assert attacker.post(
+                "/login", data={"username": "bob-app", "password": new_token}
+            ).is_success
+            assert attacker.get("/config").json()["username"] == "bob-app"
+    finally:
+        service.close()
+
+
+def test_reload_refuses_weak_tokens_when_startup_would(tmp_path: Path) -> None:
+    """cuemem serve / proxy 启动时因为短令牌拒绝的情形（allow_weak=False），重新读入时也不换。"""
+    path = tmp_path / "keys.yaml"
+    path.write_text(RING_KEYS, encoding="utf-8")
+    clock = FakeClock()
+    strict = auth.KeyRing(Keys.parse(RING_KEYS), path, allow_weak=False, clock=clock)
+    loose = auth.KeyRing(Keys.parse(RING_KEYS), path, clock=clock)
+    _replace(path, RING_KEYS + "  - {name: short, token: abc, scopes: [{user: c}]}\n")
+    clock.now += 2
+    assert "short" not in strict.names and loose.names[-1] == "short"
+
+
+def test_static_ring_never_looks_at_a_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """没设 CUEMEM_API_KEYS_FILE：与直接用 Keys 一样，不 stat。"""
+    ring = auth.KeyRing.from_env({"CUEMEM_API_TOKEN": ADMIN_TOKEN, "CUEMEM_API_KEYS": KEYS})
+    monkeypatch.setattr(auth, "_signature", lambda path: pytest.fail("stat"))
+    monkeypatch.setattr(auth, "RELOAD_INTERVAL_S", 0.0)
+    assert ring.path is None and ring.current() == Keys.parse(KEYS, ADMIN_TOKEN)
+    assert ring.resolve(ADMIN_TOKEN) == ADMIN and ring.names == Keys.parse(KEYS).names
+
+
+def test_rate_bucket_survives_reload(tmp_path: Path) -> None:
+    """限速的令牌桶按令牌的名字记：重新读入文件之后不重新装满。"""
+    from starlette.responses import PlainTextResponse
+
+    from cuemem.api.limits import BodyLimit
+
+    limited = RING_KEYS.replace(
+        "      - user: bob\n", "      - user: bob\n    rate_per_minute: 2\n"
+    )
+    path = tmp_path / "keys.yaml"
+    path.write_text(limited, encoding="utf-8")
+    clock = FakeClock()
+    ring = auth.KeyRing(Keys.parse(limited), path, clock=clock)
+    http = TestClient(BodyLimit(PlainTextResponse("ok"), keys=ring, clock=clock))
+    codes = [http.post("/api/x", headers=bearer(B_TOKEN)).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+    before = ring.current()
+    _replace(path, limited.replace("# 运营者的注释", "# 改过的注释"))
+    clock.now += 1.5  # 重新读入；令牌桶只补回 0.05 个
+    assert http.post("/api/x", headers=bearer(B_TOKEN)).status_code == 429
+    assert ring.current() is not before  # 确实换上了新的快照
+
+
+def test_new_v1_endpoints_follow_a_reloaded_key_file(ring_app: Ring) -> None:
+    """第六轮两条线合起来：POST /api/v1/context、/api/v1/wait 与带 Idempotency-Key 的写都按
+    KeyRing 当前的快照认令牌：作用域外 403，吊销之后一秒内 401；文件里改了 max_concurrent，
+    BodyLimit 认出的令牌也跟着换。"""
+    from cuemem.api.limits import BodyLimit
+
+    http, path, clock, ring = ring_app
+    auth_b = bearer(B_TOKEN)
+    body = {"messages": "I like tea", "user_id": "bob", "infer": False}
+    keyed = {**auth_b, "Idempotency-Key": "k-1"}
+    first = http.post("/api/v1/memories", json=body, headers=keyed)
+    again = http.post("/api/v1/memories", json=body, headers=keyed)
+    assert first.status_code == 200 and again.json()["status"] == "duplicate"
+    ask = {"query": "tea", "user_id": "bob", "min_level": "l0"}
+    context = http.post("/api/v1/context", json=ask, headers=auth_b)
+    assert context.status_code == 200, context.text
+    outside = {**ask, "user_id": "alice"}
+    assert http.post("/api/v1/context", json=outside, headers=auth_b).status_code == 403
+    wait = {"user_id": "bob", "timeout": 1}
+    assert http.post("/api/v1/wait", json=wait, headers=auth_b).status_code == 200
+    scope = {"type": "http", "headers": [(b"authorization", f"Bearer {B_TOKEN}".encode())]}
+    limit = BodyLimit(http.app, keys=ring)
+    tenant = limit._tenant(scope)
+    assert tenant is not None and tenant.max_concurrent is None
+    _replace(path, RING_KEYS + "    max_concurrent: 2\n")
+    clock.now += 2
+    tenant = limit._tenant(scope)
+    assert tenant is not None and tenant.max_concurrent == 2
+    _replace(path, RING_KEYS.split("  - name: bob-app")[0])
+    clock.now += 2
+    assert http.post("/api/v1/memories", json=body, headers=keyed).status_code == 401
+    assert http.post("/api/v1/context", json=ask, headers=auth_b).status_code == 401
+    assert http.post("/api/v1/wait", json=wait, headers=auth_b).status_code == 401

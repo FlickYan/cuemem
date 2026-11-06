@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 from fakes import PROJECT_ROOT, TOY_CONVERSATION, FakeAPI
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
@@ -23,7 +24,7 @@ from test_cli import _flat, runner
 
 from cuemem import Memory
 from cuemem.cli import app
-from cuemem.config import PathsConfig, Settings, load_settings
+from cuemem.config import PathsConfig, Settings, load_settings, presets
 from cuemem.core.models import Turn
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import EmbeddingAPIError
@@ -446,6 +447,14 @@ def test_cli_export_import_and_preset(
     assert result.exit_code == 0, result.output
     assert os.environ["CUEMEM_PRESET"] == "ollama"
     assert "不需要Key" in _flat(result.output) and "llama3.1-8b" in result.output
+
+
+def test_preset_help_names_every_shipped_preset() -> None:
+    """--preset 的帮助列出随包发布的每个预设（以前漏了 deepseek 与 qwen）。"""
+    [option] = [p for p in typer.main.get_command(app).params if "--preset" in p.opts]
+    text = getattr(option, "help", None)
+    assert isinstance(text, str)
+    assert presets() and all(name in text for name in presets()), text
 
 
 def test_cli_export_keeps_the_old_backup_when_the_write_fails(

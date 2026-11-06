@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 from fakes import PROJECT_ROOT
+from packaging.markers import Marker
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
@@ -148,3 +149,97 @@ def test_dependency_audit_reads_hashed_exports_and_is_not_required() -> None:
     ci_jobs = set(_workflow(PROJECT_ROOT / ".github" / "workflows" / "ci.yml")["jobs"])
     assert required == {"test", "package", "docker", "qdrant-server"} <= ci_jobs
     assert "audit" not in required and "audit" not in ci_jobs
+
+
+def _platform(system: str, machine: str, python: str) -> dict[str, str]:
+    return {
+        "sys_platform": system,
+        "platform_system": {"darwin": "Darwin", "linux": "Linux", "win32": "Windows"}[system],
+        "platform_machine": machine,
+        "python_version": python,
+        "python_full_version": f"{python}.0",
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+        "os_name": "nt" if system == "win32" else "posix",
+    }
+
+
+def _locked_onnxruntime(env: dict[str, str]) -> dict[str, Any]:
+    """锁文件里 fastembed（local）在这个平台上装的 onnxruntime。"""
+    lock = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text("utf-8"))
+    packages = [p for p in lock["package"] if p["name"] == "onnxruntime"]
+    [fastembed] = [p for p in lock["package"] if p["name"] == "fastembed"]
+    [dep] = [
+        d
+        for d in fastembed["dependencies"]
+        if d["name"] == "onnxruntime"
+        and Marker(d.get("marker", "python_version > '0'")).evaluate(env)
+    ]
+    if "version" not in dep:
+        [package] = packages
+        return package
+    [package] = [p for p in packages if p["version"] == dep["version"]]
+    return package
+
+
+def test_lock_installs_local_on_intel_macs_and_keeps_other_platforms() -> None:
+    """onnxruntime 从 1.24 起没有 Intel macOS 的 wheel，也没有源码包：以前锁文件只有 1.31.0，
+    Intel Mac 上 uv sync --extra local 解不出来。[tool.uv] constraint-dependencies 让那里（3.14
+    以下）停在 1.23.2，别的平台照旧是新版本；ci.yml 的 test 任务用 --dry-run 核对。"""
+    for python in ("3.12", "3.13"):
+        intel = _locked_onnxruntime(_platform("darwin", "x86_64", python))
+        tag = "-cp" + python.replace(".", "") + "-"
+        names = [w["url"].rsplit("/", 1)[1] for w in intel["wheels"]]
+        assert any(tag in n and "macosx" in n and "x86_64" in n for n in names), names
+    newest = _locked_onnxruntime(_platform("linux", "x86_64", "3.12"))
+    for env in (
+        _platform("linux", "aarch64", "3.12"),
+        _platform("win32", "AMD64", "3.12"),
+        _platform("darwin", "arm64", "3.12"),
+        _platform("darwin", "x86_64", "3.14"),  # 1.23.2 没有 cp314 的 wheel
+    ):
+        assert _locked_onnxruntime(env)["version"] == newest["version"], env
+    assert newest["version"] != intel["version"]
+
+    steps = _steps(PROJECT_ROOT / ".github" / "workflows" / "ci.yml")
+    commands = [shlex.split(step["run"]) for step in steps if "--dry-run" in step.get("run", "")]
+    assert any(
+        c[:3] == ["uv", "sync", "--locked"] and "x86_64-apple-darwin" in c and "local" in c
+        for c in commands
+    ), commands
+
+
+def test_compat_job_runs_unlocked_versions_weekly_and_is_not_required() -> None:
+    """兼容性任务（compat.yml）：锁文件之外的版本——可选依赖取最新的、取下限（lowest-direct），
+    以及锁文件在 Python 3.14 上——每周跑一次。不读 [tool.uv]（--no-config，与 pip 用户相同）；
+    pytest 写着下限（lowest-direct 下不写时解到 pytest 2.0.0，构建失败）；不用 setup-uv 的缓存
+    （缓存键不分任务，最新、最低版本的包不能流进必需的任务）；不在规则集的必需检查里。"""
+    path = PROJECT_ROOT / ".github" / "workflows" / "compat.yml"
+    workflow = _workflow(path)
+    triggers = workflow[True]  # PyYAML 把 "on" 读成 True
+    assert triggers["schedule"] and "workflow_dispatch" in triggers
+    assert {"pyproject.toml", "uv.lock"} <= set(triggers["pull_request"]["paths"])
+    [job] = workflow["jobs"].values()
+    assert job["strategy"]["fail-fast"] is False
+    cells = {cell["name"]: cell.get("resolution") for cell in job["strategy"]["matrix"]["include"]}
+    assert cells == {"newest-3.12": "highest", "floors-3.12": "lowest-direct", "locked-3.14": None}
+    [setup] = [s for s in _steps(path) if s.get("uses", "").startswith("astral-sh/setup-uv@")]
+    assert setup["with"]["enable-cache"] is False
+    commands = [
+        shlex.split(line)
+        for step in _steps(path)
+        for line in step.get("run", "").replace("\\\n", " ").splitlines()
+        if line.strip()
+    ]
+    [install] = [c for c in commands if c[:3] == ["uv", "pip", "install"]]
+    assert "--no-config" in install and "--resolution" in install, install
+    [pytest] = [Requirement(a) for a in install if a.startswith("pytest")]
+    assert any(s.operator == ">=" for s in pytest.specifier), pytest
+    assert ["uv", "sync", "--locked", "--all-extras", "--python", "3.14"] in commands
+
+    ruleset = json.loads(
+        (PROJECT_ROOT / ".github" / "rulesets" / "protect-main.json").read_text("utf-8")
+    )
+    [checks] = [r for r in ruleset["rules"] if r["type"] == "required_status_checks"]
+    required = {c["context"] for c in checks["parameters"]["required_status_checks"]}
+    assert not required & {"compat", *cells}, required

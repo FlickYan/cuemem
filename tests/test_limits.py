@@ -22,7 +22,14 @@ from scripted import ScriptedModel, echo_extraction
 from cuemem.agent import Agent
 from cuemem.api.app import create_app
 from cuemem.api.auth import Keys
-from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, OTHER_BODY_BYTES, body_limits
+from cuemem.api.limits import (
+    MAX_BODY_BYTES,
+    MAX_CONCURRENT,
+    MAX_IMPORT_BYTES,
+    OTHER_BODY_BYTES,
+    body_limits,
+    concurrency_limit,
+)
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
@@ -371,3 +378,99 @@ def test_limits_from_the_environment() -> None:
         for bad in ("0", "-1", "64MB", "1e6", "²"):
             with pytest.raises(CueMemError, match=name):
                 body_limits({name: bad})
+
+
+def test_concurrency_limit_from_the_environment() -> None:
+    """CUEMEM_MAX_CONCURRENT_PER_KEY：默认 8，写错时 CueMemError（serve / proxy 退出码 1）。"""
+    assert concurrency_limit({}) == MAX_CONCURRENT == 8
+    assert concurrency_limit({"CUEMEM_MAX_CONCURRENT_PER_KEY": " 3 "}) == 3
+    assert concurrency_limit({"CUEMEM_MAX_CONCURRENT_PER_KEY": ""}) == 8
+    for bad in ("0", "-1", "8.0", "²"):
+        with pytest.raises(CueMemError, match="CUEMEM_MAX_CONCURRENT_PER_KEY"):
+            concurrency_limit({"CUEMEM_MAX_CONCURRENT_PER_KEY": bad})
+
+
+def _scope(path: str, token: str) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "headers": [(b"authorization", f"Bearer {token}".encode())],
+    }
+
+
+def test_requests_in_flight_per_scoped_key() -> None:
+    """BodyLimit 数每个限定作用域的令牌在 /api/、/v1/ 与 /mcp 正在处理的请求（任何方法）：到了
+    max_concurrent（令牌自己写的优先）时 429；请求结束时减回去，应用抛出异常时也减；管理令牌、
+    别的路径不算。"""
+    import anyio
+
+    from cuemem.api.limits import BodyLimit
+
+    keys = Keys.parse(
+        f"""
+keys:
+  - {{name: alice-app, token: {ALICE_TOKEN}, scopes: [{{user: alice}}]}}
+  - {{name: bob-app, token: {BOB_TOKEN}, scopes: [{{user: bob}}], max_concurrent: 1}}
+""",
+        TOKEN,
+    )
+    entered = 0
+    release: anyio.Event | None = None
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        nonlocal entered
+        entered += 1
+        if scope["path"] == "/api/v1/boom":
+            raise RuntimeError("boom")
+        if scope["path"] != "/api/v1/later":
+            assert release is not None
+            await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    limit = BodyLimit(app, keys=keys, max_concurrent=2)
+
+    async def call(path: str, token: str) -> int:
+        statuses: list[int] = []
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b""}
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                statuses.append(message["status"])
+
+        await limit(_scope(path, token), receive, send)
+        return statuses[0]
+
+    async def main() -> None:
+        nonlocal release
+        release = anyio.Event()
+        results: dict[str, list[int]] = {"alice": [], "bob": [], "admin": [], "ui": []}
+
+        async def run(who: str, path: str, token: str) -> None:
+            results[who].append(await call(path, token))
+
+        async with anyio.create_task_group() as tasks:
+            for _ in range(2):
+                tasks.start_soon(run, "alice", "/api/v1/memories", ALICE_TOKEN)
+            tasks.start_soon(run, "bob", "/v1/chat/completions", BOB_TOKEN)
+            for _ in range(5):
+                tasks.start_soon(run, "admin", "/api/v1/memories", TOKEN)
+            tasks.start_soon(run, "ui", "/gradio_api/queue/join", ALICE_TOKEN)
+            await anyio.wait_all_tasks_blocked()
+            assert limit.requests_in_flight == {"alice-app": 2, "bob-app": 1}
+            assert await call("/mcp", ALICE_TOKEN) == 429  # 第三个
+            assert await call("/api/v1/memories", BOB_TOKEN) == 429  # 令牌自己写的 1
+            release.set()
+        assert results == {"alice": [200, 200], "bob": [200], "admin": [200] * 5, "ui": [200]}
+        assert limit.requests_in_flight == {}
+        for _ in range(3):  # 应用抛出异常：照样减回去，不会越积越多
+            with pytest.raises(RuntimeError):
+                await call("/api/v1/boom", ALICE_TOKEN)
+        assert limit.requests_in_flight == {}
+        assert await call("/api/v1/later", ALICE_TOKEN) == 200
+
+    anyio.run(main)
+    assert entered == 2 + 1 + 5 + 1 + 3 + 1

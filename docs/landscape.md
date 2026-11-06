@@ -167,6 +167,14 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 | 令牌之后的 HTTP 上的 MCP | Mem0 与 Graphiti 的托管 MCP | `cuemem serve` 的 `/mcp`（Streamable HTTP），令牌与作用域同 `/api`；`X-CueMem-User` 选空间 | `api/mcp.py` | D-070 |
 | 带类型的约定 | Mem0 与 Supermemory 的 TypeScript SDK | `/api/v1` 带类型的 OpenAPI 快照（`docs/openapi-v1.json`），可以生成 TypeScript 的类型；`py.typed` 与带类型的异步类。没有手写的 TypeScript 包 | `api/memories.py`、`_async.py` | D-070 |
 
+第六轮体检又补上三项（D-073）：
+
+| 补上的能力 | 照着谁 | CueMem 的做法与不同 | 位置 | 决策 |
+|---|---|---|---|---|
+| 直接放进提示词的上下文 | Zep 的 `thread.get_context`、Memobase 的 `context()` | `Memory.context(query)` 与 `POST /api/v1/context` 返回记忆代理注入的那段证据块（带日期与有效状态的事实、按时间排列的对话片段、画像，`</memory>` 已转义）以及块里编号对应的 ID，不调用模型；档位仍由控制器选，缺省把 L0 抬到 L1 | `sdk.py`、`evidence.py`、`api/memories.py` | D-073 |
+| 幂等的写入 | HTTP 接口常用的幂等键 | `add(idempotency_key=)` 与 `Idempotency-Key` 头让 24 小时内重发的 add 只写一次；发言遗忘之后再重发返回 `forgotten`，不再写回去 | `sdk.py`、`store/sqlite.py` | D-073 |
+| 不用重启的令牌管理 | — | `cuemem keys add\|list\|revoke` 生成、列出与吊销限定作用域的令牌（只存 sha256）；运行中的服务约一秒内重新读入令牌文件，读入出错时从不关掉鉴权 | `cli.py`、`api/auth.py` | D-073 |
+
 ## 6. 刻意没有照搬的
 
 - **让 LLM 自己决定检索、自己改记忆作为默认**（Letta、LangMem 的工具式记忆）：这正是 CueMem 研究的对照组（B3 ReAct）。N9 的结论是它在文本上强、在图片上弱（MemLens 46.7%），成本也更高（LoCoMo 每千题 $3.15，L1 是 $1.44）。保留为 `mode="agent"` 与 Agent 的 `memory_search` 逃生通道，不作默认。
@@ -179,7 +187,7 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 按"用户最先会碰到"的顺序：
 
 1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺手写的 TypeScript 客户端（别的语言经 HTTP 的 `/api/v1`，它的 OpenAPI 快照可以生成 TypeScript 的类型）与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
-2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070），可选的按令牌上限（`rate_per_minute`、`models`、`max_output_tokens`）是第四轮（D-071）。还缺：按令牌的每日花费预算；令牌文件只在启动时读，没有生成令牌的命令；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
+2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070），可选的按令牌上限（`rate_per_minute`、`models`、`max_output_tokens`）是第四轮（D-071）。第六轮（D-073）起，`cuemem keys` 生成与吊销令牌，令牌文件改了不用重启，每个令牌同时处理的请求有上限。还缺：按令牌的每日花费预算；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
 3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；第五轮体检起（D-072）过期也在 `answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、对话 Agent 与各集成里生效，浏览原始数据的事实列表、实体图、图库、`cuemem ask` 与 `cuemem inspect` 仍给出过期的记忆；Supermemory 那样自动认出临时事实、让它过期的还没有。

@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import gradio as gr
 import httpx2
 import pytest
 from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
@@ -32,7 +33,7 @@ from cuemem.api.mcp import build_server
 from cuemem.api.proxy import MemoryProxy, create_proxy_app
 from cuemem.api.replay import DemoScript, check, replay
 from cuemem.api.service import ChatService
-from cuemem.api.ui import _assistant, build_ui, render_graph, render_trace
+from cuemem.api.ui import _assistant, _profile_markdown, build_ui, render_graph, render_trace
 from cuemem.config import Settings
 from cuemem.errors import ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem, _open_mark
@@ -1125,7 +1126,10 @@ def test_http_api_refuses_cross_origin_requests(service: ChatService, tmp_path: 
     same = client.post("/api/sessions", json={}, headers={"Host": lan, "Origin": f"http://{lan}"})
     assert same.status_code == 200
     assert client.get("/api/spaces").status_code == 200
-    assert client.get("/", headers={"Host": lan, "Origin": evil}).status_code == 200  # 界面
+    # 界面：在地址栏打开（不带 Origin）照常；别的网站的网页 fetch 首页 403（第六轮复审：首页的
+    # HTML 里有登录的密钥名，见 test_ui_config_refuses_cross_origin_reads）
+    assert client.get("/", headers={"Host": lan}).status_code == 200
+    assert client.get("/", headers={"Host": lan, "Origin": evil}).status_code == 403
 
 
 @pytest.mark.parametrize("bind", ["::1", "127.0.0.2", "127.0.0.1"])
@@ -1252,6 +1256,39 @@ def test_ui_login_refuses_cross_origin_posts(service: ChatService, tmp_path: Pat
         bare = client.post("/login", data=form)
         assert bare.status_code == 200 and "set-cookie" in bare.headers
         assert client.get("/logout", follow_redirects=False).status_code != 403
+
+
+def test_ui_config_refuses_cross_origin_reads(service: ChatService, tmp_path: Path) -> None:
+    """界面的 /config 带着登录的密钥名：HTTPS 下 cookie 是 SameSite=None，以前别的网站的网页
+    带凭据读得到。现在同 /login 一样只接受同源与不带 Origin 的请求。/logout 是 GET、查 Origin
+    拦不住，浏览器标明 Sec-Fetch-Site: cross-site 时拒绝。"""
+    token = "mallory-token-0123456789"
+    keys = Keys.parse(f"keys: [{{name: mallory, token: {token}, scopes: [{{user: mallory}}]}}]")
+    app_ = create_app(service, upload_dir=tmp_path / "uploads", ui=True, keys=keys)
+    host = "mem.example.com"
+    with TestClient(app_, base_url=f"https://{host}") as client:
+        login = client.post("/login", data={"username": "mallory", "password": token})
+        assert login.status_code == 200 and client.cookies
+        # 首页把同样的配置写在 HTML 里（第六轮复审）
+        for path in ("/config", "/config/", "/config?deep_link=x", "/", "/?x=1"):
+            refused = client.get(path, headers={"Origin": "https://evil.example"})
+            assert refused.status_code == 403, path
+            assert "mallory" not in refused.text
+            assert "access-control-allow-origin" not in refused.headers
+        for headers in ({"Origin": f"https://{host}"}, {}):
+            shown = client.get("/config", headers=headers)
+            assert shown.status_code == 200 and shown.json()["username"] == "mallory"
+            page = client.get("/", headers=headers)
+            assert page.status_code == 200 and '"username":"mallory"' in page.text
+        cross = {"Sec-Fetch-Site": "cross-site"}
+        for path in ("/logout", "/logout/"):
+            assert client.get(path, headers=cross, follow_redirects=False).status_code == 403
+        assert client.get("/config").json()["username"] == "mallory"  # 还登录着
+        same = client.get(
+            "/logout", headers={"Sec-Fetch-Site": "same-origin"}, follow_redirects=False
+        )
+        assert same.status_code == 302
+        assert client.get("/config").json().get("username") != "mallory"
 
 
 def test_http_api_trusted_hosts(service: ChatService, tmp_path: Path) -> None:
@@ -1442,6 +1479,26 @@ def test_citations_render_as_superscripts(service: ChatService, model: ScriptedM
     assert _assistant(reply)[0] == 'Your budget is $180<sup class="cite">f1, m2</sup>.'
     reply.text = "From $120 [f1][m2] to $180."
     assert _assistant(reply)[0] == 'From $120<sup class="cite">f1, m2</sup> to $180.'
+
+
+def test_replies_and_the_profile_render_no_remote_images(
+    service: ChatService, model: ScriptedModel
+) -> None:
+    """回答与画像按 Markdown 显示：记忆里存下的话能诱导模型写出外站图片，浏览器一显示就把
+    记忆内容带到第三方。图片语法（行内、引用式）与画像里的 <img> 都只显示成文字。"""
+    model.agent = lambda body: (
+        "See ![a](https://x.example/p.png?d=1) and ![b][r] Great![f1]\n\n[r]: https://x.example/q"
+    )
+    session = service.start("shop", at=DAY)
+    reply = service.chat(session.session_id, "budget?", mode="l0")
+    reply.citations = ["f1"]
+    rendered = _assistant(reply)[0]
+    assert "![" not in rendered and "See" in rendered and "x.example/p.png" in rendered
+    assert 'Great!<sup class="cite">f1</sup>' in rendered  # "!" 后面的引用照样是上标
+    assert "![" not in _profile_markdown("![x](https://x.example/q?u=alice)")
+    assert "<img" not in _profile_markdown('<img src="https://x.example/q">')
+    shown = gr.Markdown().postprocess(_profile_markdown("- likes tea ![x](https://x.example/q)"))
+    assert shown is not None and "![" not in str(shown)
 
 
 def test_replay_checks_expectations(

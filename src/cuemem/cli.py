@@ -1,6 +1,6 @@
 """命令行入口。
 
-cuemem [--preset openai|ollama] …     换模型供应商（也可设 CUEMEM_PRESET，N12）
+cuemem [--preset openai|ollama|deepseek|qwen] …   换模型供应商（也可设 CUEMEM_PRESET，N12）
 cuemem configure                      交互式填写 API Key（写入 .env）
 cuemem doctor [--live]                检查配置、API Key 与连通性（--repair-vectors 修本地向量库）
 cuemem ingest FILE [--consolidate]    导入对话（可选：立即巩固）
@@ -65,7 +65,7 @@ from cuemem.errors import ConfigMismatchError, CueMemError, DatasetChecksumError
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
 if TYPE_CHECKING:
     from cuemem.agent import Reply
-    from cuemem.api.auth import Keys
+    from cuemem.api.auth import AnyKeys, KeyRing, Keys
     from cuemem.api.service import ChatService
     from cuemem.core.models import Answer, Fact
     from cuemem.evals.datasets import EvalSet
@@ -89,8 +89,8 @@ def main(
         str | None,
         typer.Option(
             "--preset",
-            help="换模型供应商的预设：openai、ollama（本地，不要 Key），或预设 YAML 的路径；"
-            "也可以设环境变量 CUEMEM_PRESET",
+            help="换模型供应商的预设：openai、ollama（本地，不要 Key）、deepseek、qwen，"
+            "或预设 YAML 的路径；也可以设环境变量 CUEMEM_PRESET",
         ),
     ] = None,
 ) -> None:
@@ -748,16 +748,26 @@ def _exposed_names() -> list[str]:
     return [h for h in _allowed_hosts_env() if h == "*" or not _loopback_name(h)]
 
 
-def _access_keys() -> Keys:
+def _access_keys(allow_weak: bool = True) -> KeyRing:
     """访问令牌：CUEMEM_API_TOKEN 与限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS，
     见 api/auth.py）。在读完配置（数据目录的 .env 已加载）之后、打开记忆系统之前调用；写错时
-    AccessKeysError（CueMemError），由调用方打印原因。"""
-    from cuemem.api.auth import Keys
+    AccessKeysError（CueMemError），由调用方打印原因。
 
-    return Keys.from_env()
+    设了 CUEMEM_API_KEYS_FILE 时运行期间改了文件会重新读入（KeyRing，第六轮体检）；allow_weak 为
+    False（_weak_refused）时新的文件里有短令牌就不换，与启动时的检查一致。"""
+    from cuemem.api.auth import KeyRing
+
+    return KeyRing.from_env(allow_weak=allow_weak)
 
 
-def _keys_note(keys: Keys) -> str:
+def _weak_refused(host: str, insecure: bool, allow_weak: bool) -> bool:
+    """_require_token 会不会因为短令牌拒绝启动（运行期间重新读入令牌文件时也按它查）。"""
+    if insecure or allow_weak:
+        return False
+    return not _is_loopback(host) or bool(_exposed_names())
+
+
+def _keys_note(keys: AnyKeys) -> str:
     from cuemem.api.auth import TOKEN_ENV
 
     parts = [f"管理令牌（{TOKEN_ENV}）"] if keys.admin is not None else []
@@ -766,7 +776,7 @@ def _keys_note(keys: Keys) -> str:
     return "、".join(parts)
 
 
-def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = False) -> None:
+def _require_token(host: str, keys: AnyKeys, insecure: bool, allow_weak: bool = False) -> None:
     """监听非本机地址时必须设访问令牌：没有令牌时拒绝启动，除非显式加 --insecure-no-auth。
     容器里总是监听 0.0.0.0（看不出宿主机只映射到了本机），所以镜像也要设令牌。只有限定作用域的
     令牌、没有管理令牌也算设了。
@@ -799,7 +809,7 @@ def _require_token(host: str, keys: Keys, insecure: bool, allow_weak: bool = Fal
             "使用时也可以加 --insecure-no-auth。"
         )
         raise typer.Exit(2)
-    if keys.weak and not allow_weak:
+    if keys.weak and _weak_refused(host, insecure, allow_weak):
         console.print(
             f"[red]{where}这些访问令牌短于 {MIN_TOKEN_CHARS} 个字符，拒绝启动："
             f"{escape('、'.join(keys.weak))}。[/red]\n换成随机生成的长令牌（例如 openssl rand "
@@ -951,8 +961,8 @@ def serve(
     import uvicorn
 
     from cuemem.api.app import create_app
-    from cuemem.api.auth import Keys
-    from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits
+    from cuemem.api.auth import KeyRing, Keys
+    from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy
 
     if not idle_minutes > 0:  # 在打开记忆系统之前检查
@@ -966,13 +976,14 @@ def serve(
         )
         ui = False
     unknown = _unknown_model(unknown_model)
-    keys = Keys()
+    keys = KeyRing(Keys())
     limits = MAX_BODY_BYTES, MAX_IMPORT_BYTES
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
         nonlocal keys, limits
-        keys = _access_keys()
+        keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
+        concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
         _require_token(host, keys, insecure_no_auth, insecure_weak_token)
 
     settings, service = _service(space, scenario or _default_scenario(), router, lam, check=check)
@@ -1047,7 +1058,7 @@ def proxy(
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     import uvicorn
 
-    from cuemem.api.limits import body_limits
+    from cuemem.api.limits import body_limits, concurrency_limit
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -1057,8 +1068,10 @@ def proxy(
     unknown = _unknown_model(unknown_model)
     settings = _settings(peak_policy="warn")
     try:
-        keys = _access_keys()  # load_settings 已读入 .env
+        # load_settings 已读入 .env
+        keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
+        concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
@@ -1107,6 +1120,261 @@ def proxy(
     finally:
         memory_proxy.close_all()
         system.close()
+
+
+keys_app = typer.Typer(
+    help="限定作用域的访问令牌（CUEMEM_API_KEYS_FILE 的文件）：生成、列出、吊销。运行中的 serve 与 "
+    "proxy 一秒内读到改动，不用重启",
+    no_args_is_help=True,
+)
+app.add_typer(keys_app, name="keys")
+KEYS_FILE_HELP = "令牌文件；默认取环境变量 CUEMEM_API_KEYS_FILE（数据目录的 .env 里设的也算）"
+# keys add 新建文件时写在开头
+KEYS_FILE_HEADER = (
+    "# CueMem 限定作用域的访问令牌（格式见 cuemem/api/auth.py）。\n"
+    "# 只存令牌的 sha256，不存令牌本身；用 cuemem keys add / revoke 增删，\n"
+    "# 运行中的 cuemem serve / proxy 一秒内读到改动\n"
+)
+
+
+def _keys_path(file: Path | None, *, edit: bool) -> Path | None:
+    """keys 命令的令牌文件：--file，否则 CUEMEM_API_KEYS_FILE（先读入数据目录的 .env，与 serve
+    一样，已经设了的环境变量优先）。都没有时：edit（add、revoke）报错退出；list 返回 None（看
+    CUEMEM_API_KEYS 里的）。令牌写在 CUEMEM_API_KEYS 里时 add、revoke 拒绝：改了文件服务也不读。"""
+    from dotenv import load_dotenv
+
+    from cuemem.api.auth import KEYS_ENV, KEYS_FILE_ENV
+
+    load_dotenv(env_file_path(), override=False)
+    err = Console(stderr=True)
+    if edit and os.environ.get(KEYS_ENV):
+        err.print(
+            f"[red]错误：[/red]令牌写在环境变量 {KEYS_ENV} 里，cuemem keys 只改文件：把它们移进一个"
+            f"文件，用 {KEYS_FILE_ENV} 指向它（两个只能设一个）"
+        )
+        raise typer.Exit(1)
+    if file is None and (env := os.environ.get(KEYS_FILE_ENV)):
+        file = Path(env)
+    if file is None and edit:
+        err.print(
+            f"[red]错误：[/red]没有设置 {KEYS_FILE_ENV}：用 --file 指定令牌文件，并在 .env 里设置 "
+            f"{KEYS_FILE_ENV}，cuemem serve / proxy 才会读它"
+        )
+        raise typer.Exit(1)
+    return file.expanduser() if file is not None else None
+
+
+def _read_keys(path: Path) -> tuple[str, Keys]:
+    """令牌文件的文本与解析结果；读不出、写错时打印原因退出（出错信息里不带令牌本身）。"""
+    from cuemem.api.auth import Keys
+
+    try:
+        text = path.read_text(encoding="utf-8")
+        return text, Keys.parse(text, source=str(path))
+    except OSError as exc:
+        Console(stderr=True).print(
+            f"[red]错误：[/red]读不出 {escape(str(path))}：{escape(exc.strerror or str(exc))}"
+        )
+        raise typer.Exit(1) from exc
+    except CueMemError as exc:
+        Console(stderr=True).print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+
+def _write_keys(path: Path, text: str) -> None:
+    """换名替换（envfile.atomic_write_text：运行中的服务读到的不是旧的就是新的），再改成 0600。"""
+    path.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(atomic_write_text(path, text), 0o600)
+
+
+@keys_app.command("add")
+def keys_add(
+    name: Annotated[str, typer.Argument(help="令牌的名字（也是界面登录的用户名）")],
+    user: Annotated[
+        list[str] | None,
+        typer.Option("--user", help='能访问的用户 ID；可重复；"*" 是任何用户，"acme:*" 是前缀'),
+    ] = None,
+    agent: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--agent",
+            help="与 --user 一起：只限这些 Agent 下面的记忆；只写 --agent：这些 Agent 自己的记忆",
+        ),
+    ] = None,
+    rate_per_minute: Annotated[
+        int | None, typer.Option(min=1, help="每分钟最多这么多个写的请求（429）")
+    ] = None,
+    models: Annotated[
+        list[str] | None,
+        typer.Option("--models", help="记忆代理只能用这些模型（别名或模型 ID）；可重复"),
+    ] = None,
+    max_output_tokens: Annotated[
+        int | None, typer.Option(min=1, help="记忆代理转发的 max_tokens 上限")
+    ] = None,
+    max_concurrent: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="同时在处理的请求最多这么多个（429）；不给时用 CUEMEM_MAX_CONCURRENT_PER_KEY",
+        ),
+    ] = None,
+    file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
+) -> None:
+    """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
+
+    令牌只打印这一次，只打到标准输出（TOKEN=$(cuemem keys add …) 这样接住），文件里不存它；
+    别的提示都在标准错误。运行中的 cuemem serve / proxy 一秒内开始认它。"""
+    import hashlib
+    import secrets
+
+    from cuemem.api.auth import Keys, append_key, key_entry
+
+    err = Console(stderr=True)
+    path = _keys_path(file, edit=True)
+    assert path is not None
+    if not user and not agent:
+        err.print("[red]错误：[/red]至少给一个 --user 或 --agent（令牌能访问谁的记忆）")
+        raise typer.Exit(1)
+    exists = path.exists()
+    text, old = _read_keys(path) if exists else ("", Keys())
+    if name in old.names:
+        err.print(f"[red]错误：[/red]{escape(str(path))} 里已经有名叫 {escape(name)} 的令牌")
+        raise typer.Exit(1)
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def entry(indent: str) -> str:
+        return key_entry(
+            name,
+            digest,
+            users=user or (),
+            agents=agent or (),
+            rate_per_minute=rate_per_minute,
+            models=models,
+            max_output_tokens=max_output_tokens,
+            max_concurrent=max_concurrent,
+            indent=indent,
+        )
+
+    new = append_key(text, entry) if exists else f"{KEYS_FILE_HEADER}keys:\n{entry('  ')}"
+    try:  # 核对：原来的令牌一个不少，新的这个认得出、名字对
+        parsed = Keys.parse(new, source=str(path)) if new is not None else None
+    except CueMemError as exc:
+        if not exists:  # 新建的文件只有这一项：是参数写错了（例如名字前后有空格）
+            err.print(f"[red]错误：[/red]{escape(str(exc))}")
+            raise typer.Exit(1) from exc
+        parsed = None
+    found = parsed.resolve(token) if parsed is not None else None
+    if (
+        new is None
+        or parsed is None
+        or parsed.scoped[:-1] != old.scoped
+        or found is None
+        or found.name != name
+    ):
+        err.print(
+            f"{escape(str(path))} 的 keys: 不是一项一行开头的列表（例如写成了 keys: [...]），没有"
+            f"改它。把下面这几行加进它的 keys: 列表：\n\n{escape(entry('  '))}\n"
+            "贴进去之前这个令牌不能用（退出码 1）"
+        )
+        print(token)
+        raise typer.Exit(1)
+    else:
+        _write_keys(path, new)
+        err.print(
+            f"已把 {escape(name)} 加进 {escape(str(path))}（只存 sha256）。令牌只显示这一次，"
+            "在标准输出；运行中的 cuemem serve / proxy 一秒内开始认它"
+        )
+    print(token)
+
+
+def _scope_text(scope: Any) -> str:
+    users = f"user={','.join(scope.users)}" if scope.users is not None else ""
+    agents = f"agent={','.join(scope.agents)}" if scope.agents is not None else ""
+    return " ".join(x for x in (users, agents) if x)
+
+
+@keys_app.command("list")
+def keys_list(
+    file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
+) -> None:
+    """列出限定作用域的令牌：名字、作用域与用量限制（不显示令牌与摘要）。"""
+    from cuemem.api.auth import KEYS_ENV, Keys
+
+    path = _keys_path(file, edit=False)
+    if path is not None:
+        _, keys = _read_keys(path)
+        where = str(path)
+    elif inline := os.environ.get(KEYS_ENV):
+        try:
+            keys = Keys.parse(inline, source=KEYS_ENV)
+        except CueMemError as exc:
+            Console(stderr=True).print(f"[red]错误：[/red]{escape(str(exc))}")
+            raise typer.Exit(1) from exc
+        where = KEYS_ENV
+    else:
+        console.print("没有设置限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）")
+        return
+    table = Table(title=f"{escape(where)}：{len(keys.names)} 个令牌")
+    for column in ("名字", "作用域", "每分钟写", "同时处理", "模型", "max_output_tokens"):
+        table.add_column(column)
+    for _, p in keys.scoped:
+        table.add_row(
+            escape(p.name),
+            escape("；".join(_scope_text(s) for s in p.scopes)),
+            str(p.rate_per_minute or "—"),
+            str(p.max_concurrent or "—"),
+            escape(", ".join(p.models)) if p.models is not None else "—",
+            str(p.max_output_tokens or "—"),
+        )
+    console.print(table)
+
+
+@keys_app.command("revoke")
+def keys_revoke(
+    name: Annotated[str, typer.Argument(help="要吊销的令牌的名字")],
+    file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
+) -> None:
+    """从令牌文件里删掉这个令牌的那几行（别的行与注释不动）。运行中的 cuemem serve / proxy
+    一秒内不再认它，不用重启。删不干净（与别的内容写在同一行这样的写法）时不改文件，说明要手工删
+    哪几行。"""
+    from cuemem.api.auth import TOKEN_ENV, Keys, key_lines, remove_key
+
+    err = Console(stderr=True)
+    path = _keys_path(file, edit=True)
+    assert path is not None
+    text, old = _read_keys(path)
+    if name not in old.names:
+        others = "、".join(old.names) or "没有"
+        err.print(
+            f"[red]错误：[/red]{escape(str(path))} 里没有名叫 {escape(name)} 的令牌"
+            f"（有：{escape(others)}）"
+        )
+        raise typer.Exit(1)
+    new = remove_key(text, name)
+    try:
+        parsed = Keys.parse(new, source=str(path)) if new is not None else None
+    except CueMemError:
+        parsed = None
+    if parsed is None or parsed.scoped != tuple(k for k in old.scoped if k[1].name != name):
+        where = key_lines(text, name)
+        lines = f"第 {where[0] + 1}–{where[1] + 1} 行" if where is not None else "它的那几行"
+        err.print(
+            f"[red]没能确定地删掉 {escape(name)}，没有改文件。[/red]请手工删掉 "
+            f"{escape(str(path))} 的{lines}（名叫 {escape(name)} 的那一项）"
+        )
+        raise typer.Exit(1)
+    assert new is not None
+    _write_keys(path, new)
+    err.print(
+        f"已从 {escape(str(path))} 删掉 {escape(name)}；"
+        "运行中的 cuemem serve / proxy 一秒内不再认它"
+    )
+    if not parsed.scoped and not os.environ.get(TOKEN_ENV):
+        err.print(
+            f"[yellow]注意：[/yellow]这是最后一个令牌，又没有设置 {TOKEN_ENV}：运行中的服务不会因此"
+            "关掉鉴权，仍认原来的令牌（包括这一个），要停掉服务（或加一个令牌）"
+        )
 
 
 @app.command()

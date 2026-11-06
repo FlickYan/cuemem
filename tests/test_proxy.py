@@ -28,7 +28,7 @@ from test_sdk import where_i_live
 
 from cuemem import Memory
 from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
-from cuemem.config import Settings
+from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
@@ -940,6 +940,78 @@ def test_unknown_models_can_be_rejected(
         assert chat(client, "hi", model="qwen3.8-flash", user="alice").status_code == 200
         unnamed = {"messages": [SYSTEM, {"role": "user", "content": "hi"}], "user": "alice"}
         assert client.post("/v1/chat/completions", json=unnamed).status_code == 200
+
+
+@pytest.fixture
+def openai_proxy(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_api: FakeAPI
+) -> Iterator[MemoryProxy]:
+    """--preset openai，只设了 OPENAI_API_KEY：目录里还有默认配置的 Qwen、DeepSeek 别名。"""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    loaded = load_settings(preset="openai")
+    settings = loaded.model_copy(
+        update={
+            "paths": PathsConfig().resolve_against(tmp_path),
+            "peak_policy": "allow",
+            "embedding": loaded.embedding.model_copy(update={"backend": "hash", "dim": 256}),
+        }
+    )
+    system = MemorySystem.from_settings(settings, http_client=fake_api.client())
+    yield MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    system.close()
+
+
+def test_models_without_a_key_are_not_forwarded(
+    openai_proxy: MemoryProxy, fake_api: FakeAPI, upstream: Upstream
+) -> None:
+    """目录里供应商的 Key 没设置的模型（--preset openai 下的 qwen3.8-flash）：503
+    model_not_available，在开会话、检索与转发之前。以前不带鉴权头照样转发，用户的话连同想起的
+    记忆发给了没配置 Key 的供应商。GET /v1/models 也只列转发得了的模型。"""
+    system = openai_proxy.system
+    with TestClient(create_proxy_app(openai_proxy)) as client:
+        refused = chat(client, "I live in Berlin", user="alice")
+        assert refused.status_code == 503
+        assert refused.headers["x-should-retry"] == "false"
+        error = refused.json()["error"]
+        assert (error["code"], error["param"]) == ("model_not_available", "model")
+        assert "'qwen3.8-flash'" in error["message"] and "DASHSCOPE_API_KEY" in error["message"]
+        assert "gpt-5.4-mini" in error["message"] and "qwen3.8-max" not in error["message"]
+        streamed = {"model": "deepseek-flash", "stream": True, "user": "bob", "messages": [SYSTEM]}
+        assert client.post("/v1/chat/completions", json=streamed).status_code == 503
+        answered = client.post(
+            "/v1/responses", json={"model": "qwen3.8-flash", "input": "hi", "user": "alice"}
+        )
+        assert answered.status_code == 503
+        assert answered.json()["error"]["code"] == "model_not_available"
+        assert fake_api.chat_requests == [] and upstream.proxied == []
+        assert system.db.list_spaces() == [] and system.open_sessions("alice") == set()
+        listed = [m["id"] for m in client.get("/v1/models").json()["data"]]
+        assert "gpt-5.4-mini" in listed
+        assert not {"qwen3.8-flash", "deepseek-flash", "qwen3-vl-plus"} & set(listed)
+        ok = chat(client, "I live in Berlin", model="gpt-5.4-mini", user="alice")
+        assert ok.status_code == 200 and fake_api.chat_requests[-1]["model"] == "gpt-5.4-mini"
+
+
+def test_unknown_models_rejected_list_only_available_ones(
+    openai_proxy: MemoryProxy, upstream: Upstream
+) -> None:
+    openai_proxy.unknown_model = "reject"
+    with TestClient(create_proxy_app(openai_proxy)) as client:
+        error = chat(client, "hi", model="gpt-4o", user="alice").json()["error"]
+    assert error["code"] == "model_not_found"
+    assert "gpt-5.4-mini" in error["message"] and "qwen3.8-flash" not in error["message"]
+
+
+def test_requests_with_keys_keep_their_auth_header(proxy: MemoryProxy) -> None:
+    """默认配置、Key 都设了：鉴权头与以前相同；不需要 Key 的本地供应商照旧用占位 Key。"""
+    body = {"model": "qwen3.8-flash", "messages": [SYSTEM]}
+    _, url, auth = proxy._upstream(body)
+    assert auth == {"Authorization": "Bearer sk-test-dashscope"}
+    assert url == "https://maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
+    _, _, auth = proxy._upstream({**body, "model": "deepseek-flash"})
+    assert auth == {"Authorization": "Bearer sk-test-deepseek"}
+    listed = {m["id"] for m in proxy.models()["data"]}
+    assert set(proxy.system.settings.models) <= listed
 
 
 def test_embeddings_pass_through_to_the_configured_embedder(

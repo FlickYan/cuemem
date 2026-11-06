@@ -1,0 +1,68 @@
+name: 兼容性
+
+# 锁文件之外的版本：CI 的 test 任务只跑 uv.lock 与 Python 3.12，package 任务只解核心依赖，而文档
+# 推荐的 pip install "cuemem[...] @ git+..." 拿到的是当天最新的版本。这里每周（以及改到依赖的 PR）
+# 跑三种：全部可选依赖取最新的版本、取 pyproject.toml 写的下限（lowest-direct），以及锁文件在
+# Python 3.14 上。不在规则集的必需检查里：上游发布新版本不需要代码改动就会让它变红，红了说明要
+# 改下限或适配新版本，不该挡住无关的合并
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 4" # 每周四（UTC）
+  pull_request:
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/compat.yml
+
+# 令牌只读；第三方 Action 按提交号固定（同 ci.yml，tests/test_ci_pins.py 核对）
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  compat:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: newest-3.12
+            resolution: highest
+          - name: floors-3.12
+            resolution: lowest-direct
+          - name: locked-3.14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.24"
+          # 不用缓存：setup-uv 的缓存键不分任务，这里存进去的最新版本、最低版本的包会被 CI 的任务取到
+          enable-cache: false
+      - name: 不按锁文件安装（pip 用户拿到的版本）
+        if: matrix.resolution
+        # --no-config：不读 [tool.uv] 的 override-dependencies（pillow>=13），与 pip 一样解到
+        # Pillow 12.x，图片的测试照样核对字节。pytest 要写下限：lowest-direct 下不写时解到
+        # pytest 2.0.0，构建都失败
+        env:
+          RESOLUTION: ${{ matrix.resolution }}
+        run: |
+          uv venv --no-config --python 3.12 .venv-compat
+          uv pip install --no-config --python .venv-compat --resolution "$RESOLUTION" \
+            -e '.[ui,eval,local,integrations]' 'pytest>=9.1.1'
+          uv pip list --no-config --python .venv-compat
+      - name: 单元测试（离线，不需要 API Key）
+        if: matrix.resolution
+        run: .venv-compat/bin/python -m pytest
+      - name: 锁文件在 Python 3.14 上
+        if: ${{ !matrix.resolution }}
+        run: |
+          uv sync --locked --all-extras --python 3.14
+          uv run --python 3.14 pytest

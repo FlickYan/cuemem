@@ -12,13 +12,20 @@ import pytest
 from fakes import FakeAPI
 
 from cuemem.config import Settings
-from cuemem.core.models import Fact
+from cuemem.core.ids import stable_id
+from cuemem.core.models import Entity, Fact
 from cuemem.llm import LLMClient
 from cuemem.write import reconcile as reconcile_module
 from cuemem.write.entities import EntityResolver, EntityState, ResolutionReport, user_entity_id
 from cuemem.write.extract import ExtractedEntity
-from cuemem.write.predicates import normalize_value
-from cuemem.write.reconcile import FactState, Reconciler, _by_similarity
+from cuemem.write.predicates import normalize_value, strict_key
+from cuemem.write.reconcile import (
+    FactState,
+    Reconciler,
+    _by_similarity,
+    _same_object,
+    object_keys,
+)
 
 USER = "u"
 
@@ -308,6 +315,98 @@ def test_speakers_in_other_scripts_are_separate_people(
     assert state.lookup("—") is None
 
 
+def test_fullwidth_digits_are_a_new_value(settings: Settings, fake_api: FakeAPI) -> None:
+    """'８０００円' 与 '６０００円' 原来的键都是 '円'：新预算被当成重复合并掉，当前值还是旧的，
+    LLM 一次都没问。现在两个键都相同才算同一个值，换了预算照常交给 LLM 确认。"""
+    state = FactState()
+    rec = reconciler(settings, fake_api, [{"new": 1, "action": "update", "target": "e1"}])
+    old = fact("a", "User's budget is ８０００円.", "budget", "８０００円", "2025-03-01")
+    new = fact("b", "User's budget is ６０００円.", "budget", "６０００円", "2025-04-01")
+    rec.reconcile(state, [(old, vec(1, 0))])
+    result = rec.reconcile(state, [(new, vec(0, 1))])
+    assert [op.action for op in result.operations] == ["supersede"]
+    assert len(fake_api.chat_requests) == 1
+    assert [f.object for f in state.facts.values() if f.is_current] == ["６０００円"]
+
+
+def test_accents_split_values_but_folded_spellings_still_merge(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """带重音的字母原来整个删掉：'Müller Str. 5' 与 'Möller Str. 5' 是同一个宾语。strict_key
+    折叠重音而不是删掉，所以 'Café' 与 'Cafe'、弯引号的 '“Paris”' 与 'Paris' 照旧合并。"""
+    assert not _same_object("Müller Str. 5", "Möller Str. 5")
+    assert not _same_object("８０００", "６０００")
+    assert _same_object("Café", "Cafe") and _same_object("Café", "cafè")
+    assert _same_object("“Paris”", "Paris") and _same_object("Paris", "Paris, France")
+    assert strict_key("Müller") == "muller" != strict_key("Möller")
+    assert strict_key("８０００円") == "8000円"
+    assert strict_key("The user lives in Paris.") == normalize_value("The user lives in Paris.")
+
+    state = FactState()
+    rec = reconciler(settings, fake_api, [])
+    for fid, obj, when, v in [
+        ("a", "Café", "2025-03-01", vec(1, 0)),
+        ("b", "Cafe", "2025-04-01", vec(1, 0)),  # 原来的键 'caf' 是 'cafe' 的一部分：similar
+        ("c", "“Paris”", "2025-05-01", vec(0, 1)),
+        ("d", "Paris", "2025-06-01", vec(0, 1)),  # 两个键都是 'paris'：duplicate
+    ]:
+        new = fact(fid, f"User likes {obj}.", "likes", obj, when, cardinality="multi")
+        rec.reconcile(state, [(new, v)])
+    assert [(f.id, f.object) for f in state.facts.values() if f.is_current] == [
+        ("a", "Café"),
+        ("c", "“Paris”"),
+    ]
+    assert fake_api.chat_requests == []
+
+
+def test_accented_names_are_different_people(settings: Settings, fake_api: FakeAPI) -> None:
+    """'Müller' 与 'Möller' 原来的名字键都是 'm ller'：两个人成了同一个实体。现在名字的两个键
+    都相同才算同一个名字；原来的实体 ID 不变，撞上的那个另派一个。"""
+    when = datetime(2026, 1, 10)
+    res = resolver(settings, fake_api, {"matches": []})
+
+    state, report = EntityState("s"), ResolutionReport()
+    res.resolve(state, [ExtractedEntity(name="Müller", type="person")], {}, when, report)
+    res.resolve(state, [ExtractedEntity(name="Möller", type="person")], {}, when, report)
+    assert report.created == 2 and len(state.entities) == 2
+    muller, moller = state.lookup("Müller"), state.lookup("Möller")
+    assert muller == stable_id("s", "entity", "m ller", "person")  # 原来的 ID
+    assert moller == stable_id("s", "entity", "moller", "person", "u")
+    assert state.lookup("müller") == muller and state.lookup("Muller") is None
+
+    state, report = EntityState("s"), ResolutionReport()  # 同一会话里一起提到
+    mentions = [ExtractedEntity(name=n, type="person") for n in ("Müller", "Möller", "Müller")]
+    res.resolve(state, mentions, {}, when, report)
+    assert sorted(e.name for e in state.entities.values()) == ["Möller", "Müller"]
+
+    state, report = EntityState("s"), ResolutionReport()  # 对话参与者
+    res.ensure_people(state, ["Müller", "Möller"], when, report)
+    res.ensure_people(state, ["Möller", "Müller"], when, report)
+    assert report.created == 2 and len(state.entities) == 2
+    assert state.lookup("Müller") == muller and state.lookup("Möller") == moller
+    assert res.subject_id(state, "Möller", when, report) == state.lookup("Möller")
+    assert fake_api.chat_requests == []
+
+    # 灰区里 LLM 认定是同一个人：拼法不同的名字要记成别名（原来的键相同也要记）
+    entity = state.entities[muller or ""]
+    res._link(state, entity.id, ExtractedEntity(name="Möller", type="person"), when, report)
+    assert state.entities[entity.id].aliases == ["Möller"]
+    zoe = Entity(id="z", space_id="s", name="Zoë", type="person", first_seen=when, last_seen=when)
+    state.add(zoe, None)
+    res._link(state, "z", ExtractedEntity(name="Zo", type="person"), when, report)
+    res._link(state, "z", ExtractedEntity(name="ZOË", type="person"), when, report)
+    assert state.entities["z"].aliases == ["Zo"]
+
+    # 用户叫 'Müller'，另一个人 'Möller' 占着原来的键 'm ller'：照样记成用户的名字（第六轮
+    # 复审）。按原来的键查时以为是 Möller 的名字，悄悄不记
+    state, report = EntityState("s"), ResolutionReport()
+    res.ensure_people(state, ["Möller"], when, report)
+    res.name_user(state, "Müller", when, report)
+    uid = user_entity_id("s")
+    assert state.lookup("Müller") == uid and state.lookup("Möller") not in (None, uid)
+    assert "Müller" in state.entities[uid].aliases
+
+
 def test_reconcile_cost_is_not_quadratic(
     settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -347,7 +446,7 @@ def test_fact_state_index_matches_a_full_scan() -> None:
     state = FactState()
     subjects = ["u", "mia", "odd"]
     predicates = ["likes", "lives_in", "age", "has_pet"]
-    objects = ["Cats", "cats", "the cats", "Berlin", "Paris", "31", "a dog"]
+    objects = ["Cats", "cats", "the cats", "Berlin", "Paris", "31", "a dog", "Müller", "Möller"]
 
     def unit(subject: str) -> np.ndarray:
         v = vectors.standard_normal(dim)
@@ -402,13 +501,13 @@ def test_fact_state_index_matches_a_full_scan() -> None:
             for predicate in predicates:
                 for obj in objects:
                     for negated in (False, True):
-                        value = normalize_value(obj)
+                        value = object_keys(obj)
                         first = next(
                             (
                                 f
                                 for f in scan
                                 if f.predicate == predicate
-                                and normalize_value(f.object) == value
+                                and object_keys(f.object) == value
                                 and f.negated == negated
                             ),
                             None,

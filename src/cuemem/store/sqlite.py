@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,7 +42,8 @@ MemoryKind = Literal["fact", "excerpt", "image"]  # 按 ID 找到的记忆的种
 # v4：media 增加孤立描述与尺寸；v5：provenance（助手的回复引用了哪些记忆，遗忘时沿引用扩散）；
 # v6：turn_meta（SDK 写入时附带的 metadata、过期时间与 update 的更正目标）。新表都用
 # CREATE TABLE IF NOT EXISTS 建，打开已有的库时自动补上；v7：表不变，标出第二轮复审的 128 位
-# 集合名（VectorStore.collection_name，D-069）。
+# 集合名（VectorStore.collection_name，D-069）。add_keys（第六轮体检，add 的 idempotency_key）
+# 也是这样补上的，不升版本：旧代码不读它，只是 delete_space 时不删它的行。
 #
 # 旧代码读不懂新代码写下的东西时就要升版本：不只是 SQLite 的表，也包括 Qdrant 的集合名与
 # payload。D-069 的 128 位集合名（第二轮复审）是在 v6 里改的、当时没升版本，所以那次复审
@@ -182,6 +183,15 @@ CREATE TABLE IF NOT EXISTS turn_meta (
     edit_of TEXT,
     PRIMARY KEY (space_id, turn_id)
 );
+CREATE TABLE IF NOT EXISTS add_keys (
+    space_id TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    request_hash TEXT,
+    session_id TEXT,
+    turn_ids TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (space_id, key_hash)
+);
 CREATE INDEX IF NOT EXISTS idx_provenance_target ON provenance (space_id, target);
 CREATE INDEX IF NOT EXISTS idx_turns_space ON turns (space_id, session_id, idx);
 CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id);
@@ -200,6 +210,26 @@ _FACT_COLUMNS = (
     "id, space_id, subject_id, subject, predicate, object, statement, category, cardinality,"
     " negated, valid_from, valid_to, recorded_at, invalidated_at, superseded_by,"
     " supersede_reason, importance, entity_ids, session_id, source_turn_ids"
+)
+# 按事件时间查事实（get_facts 的 valid_period）时，没有自己起点的更正版的起点。更正指旧值从未
+# 成立（见 write/reconcile.py），新值从旧值的起点起就成立；以前从更正那天算起，查更正之前的
+# 日期新旧两版都查不到。corrected_chain(id, anc)：anc 是 id 沿"被更正"一路往前的各版（只经过
+# 没有自己起点的版本）；起点取链上到头的那些版（自己有起点，或不再更正过别的）里最早的。
+# 参数：space_id 一个，放在整句最前
+_CORRECTED_CHAIN = (
+    "WITH RECURSIVE corrected_chain(id, anc) AS ("
+    "SELECT p.superseded_by, p.id FROM facts p JOIN facts f ON f.id = p.superseded_by"
+    " WHERE p.space_id = ? AND p.supersede_reason = 'corrected' AND f.valid_from IS NULL"
+    " UNION SELECT c.id, p.id FROM corrected_chain c JOIN facts a ON a.id = c.anc"
+    " JOIN facts p ON p.space_id = a.space_id AND p.superseded_by = a.id"
+    " AND p.supersede_reason = 'corrected' WHERE a.valid_from IS NULL)"
+)
+_CORRECTED_START = (
+    "(SELECT MIN(COALESCE(a.valid_from, substr(a.recorded_at, 1, 10)))"
+    " FROM corrected_chain c JOIN facts a ON a.id = c.anc WHERE c.id = facts.id"
+    " AND (a.valid_from IS NOT NULL OR NOT EXISTS (SELECT 1 FROM facts q"
+    " WHERE q.space_id = a.space_id AND q.superseded_by = a.id"
+    " AND q.supersede_reason = 'corrected')))"
 )
 _UNIT_COLUMNS = "id, space_id, kind, session_id, text, ts, source_turn_ids, meta"
 _ENTITY_COLUMNS = "id, space_id, name, type, aliases, description, first_seen, last_seen, mentions"
@@ -224,6 +254,9 @@ def next_idx_key(space_id: str, session_id: str) -> str:
 def legacy_idx_key(space_id: str, session_id: str) -> str:
     """以前的 next_idx 的键（有歧义，见 next_idx_key）：只读，不再写。"""
     return f"{_LEGACY_IDX}{space_id}:{session_id}"
+
+
+ADD_KEY_TTL = timedelta(hours=24)  # add 的 idempotency_key 记多久（与 Stripe 相同）
 
 
 class MemoryDB:
@@ -691,6 +724,78 @@ class MemoryDB:
             )
         return deleted
 
+    # ---------- add 的 idempotency_key（第六轮体检） ----------
+
+    def add_key_lookup(self, space_id: str, key_hash: str) -> dict[str, Any] | None:
+        """这个空间里这个键（调用方给的键的 sha256）记下的那次写入：request_hash、session_id、
+        turn_ids；遗忘过的（墓碑）三者都是 None。没有记过、或者记了超过 ADD_KEY_TTL 时 None。"""
+        cutoff = (datetime.now() - ADD_KEY_TTL).isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT request_hash, session_id, turn_ids FROM add_keys"
+                " WHERE space_id = ? AND key_hash = ? AND created_at >= ?",
+                (space_id, key_hash, cutoff),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "request_hash": row[0],
+            "session_id": row[1],
+            "turn_ids": json.loads(row[2]) if row[2] is not None else None,
+        }
+
+    def add_key_insert(
+        self,
+        conn: sqlite3.Connection,
+        space_id: str,
+        key_hash: str,
+        request_hash: str,
+        session_id: str,
+        turn_ids: Sequence[str],
+    ) -> None:
+        """记下一次带键的写入（在调用方写发言的事务里）。先删掉超过 ADD_KEY_TTL 的行（全部空间）；
+        再用普通的 INSERT：同一个键已经由并发的另一次写入提交时 sqlite3.IntegrityError，调用方的
+        事务整个回滚（连同这次的发言与向量），再按 add_key_lookup 返回先提交的那次。"""
+        now = datetime.now()
+        conn.execute(
+            "DELETE FROM add_keys WHERE created_at < ?", ((now - ADD_KEY_TTL).isoformat(),)
+        )
+        conn.execute(
+            "INSERT INTO add_keys"
+            " (space_id, key_hash, request_hash, session_id, turn_ids, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                space_id,
+                key_hash,
+                request_hash,
+                session_id,
+                json.dumps(list(turn_ids)),
+                now.isoformat(),
+            ),
+        )
+
+    def add_key_forget(
+        self, conn: sqlite3.Connection, space_id: str, turn_ids: Iterable[str]
+    ) -> int:
+        """遗忘这些发言时（在遗忘的事务里）：写下过其中任何一句的键只留下墓碑——request_hash、
+        session_id 与 turn_ids 都置空，只剩调用方随机的键的 sha256。请求的摘要由被遗忘的内容算出，
+        不能留着；晚到的重试按墓碑返回 forgotten，不再写一遍。返回改了几行。"""
+        doomed = set(turn_ids)
+        if not doomed:
+            return 0
+        rows = conn.execute(
+            "SELECT key_hash, turn_ids FROM add_keys WHERE space_id = ? AND turn_ids IS NOT NULL",
+            (space_id,),
+        ).fetchall()
+        hit = [key for key, ids in rows if doomed.intersection(json.loads(ids))]
+        for key in hit:
+            conn.execute(
+                "UPDATE add_keys SET request_hash = NULL, session_id = NULL, turn_ids = NULL"
+                " WHERE space_id = ? AND key_hash = ?",
+                (space_id, key),
+            )
+        return len(hit)
+
     def _drop_idle_idx(self, conn: sqlite3.Connection, space_id: str) -> None:
         """删掉这个空间里已经没有发言的会话的 next_idx（next_idx_key，在调用方的事务里）：会话
         没有发言时 SDK 的序号本来就从 0 开始，留着的只是写着用户 ID 与写入时间的键（不给 run_id
@@ -1051,8 +1156,9 @@ class MemoryDB:
 
         - valid_period（事件时间，(起, 止) 两个含在内的 YYYY-MM-DD，见 timeutil.valid_period）：
           "那时现实中什么是成立的"，例如"2025 年 6 月我在哪工作"。给的是一段时间（一年、一个月）
-          时，这段时间里任何时候成立过的都算，先后几个值可能同时出现。不知道起始时间的事实，从它
-          被说出的那天算起；被更正的事实从未成立，不会出现；
+          时，这段时间里任何时候成立过的都算，先后几个值可能同时出现（终点是部分日期时，终点所在
+          的那一年、那个月也算）。不知道起始时间的事实，从它被说出的那天算起；被更正的事实从未
+          成立，不会出现，没有自己起点的更正版沿用它更正的那一版的起点；
         - known_at（记录时间）："系统在那一刻相信什么"，用来回放当时的认知、审计与调试。
         """
         sql = f"SELECT {_FACT_COLUMNS} FROM facts WHERE space_id = ?"
@@ -1079,11 +1185,23 @@ class MemoryDB:
             # '2023-05' <= '2023-05-31'。查询的一端是部分日期时不行（'2023-05-07' <= '2023-05'
             # 不成立），所以查询总是换成完整的日期；只查一天时两端相同，与以前的结果一样
             lo, hi = valid_period
-            sql += (
-                " AND COALESCE(valid_from, substr(recorded_at, 1, 10)) <= ?"
-                " AND (valid_to IS NULL OR ? < valid_to)"
-            )
-            args.extend([hi, lo])
+            # 没有自己起点的更正版，起点沿版本链取它更正的那一版的（见 _CORRECTED_START）
+            sql = f"{_CORRECTED_CHAIN} {sql}"
+            args.insert(0, space_id)
+            sql += f" AND COALESCE(valid_from, {_CORRECTED_START}, substr(recorded_at, 1, 10)) <= ?"
+            args.append(hi)
+            if lo == hi:
+                sql += " AND (valid_to IS NULL OR ? < valid_to)"
+                args.append(lo)
+            else:
+                # 终点常是部分日期（取代时记成新值的起点，'2026'、'2026-06'）：'2026-01-01' <
+                # '2026' 不成立，以前查 2026 年就没有换走的旧值。终点是这段时间开头所在的年、月时
+                # 也算重叠。只能用 =：用 >= 的话旧值在以后每一年、每个月都会出现
+                sql += (
+                    " AND (valid_to IS NULL OR ? < valid_to"
+                    " OR (length(valid_to) < 10 AND substr(?, 1, length(valid_to)) = valid_to))"
+                )
+                args.extend([lo, lo])
             sql += " AND (supersede_reason IS NULL OR supersede_reason != 'corrected')"
         if known_at is not None:
             sql += " AND recorded_at <= ? AND (invalidated_at IS NULL OR ? < invalidated_at)"
@@ -1428,7 +1546,7 @@ class MemoryDB:
         with self.transaction() as conn:
             self._bump([space_id])
             self._turn_epochs[space_id] = self._turn_epochs.get(space_id, 0) + 1
-            raw = ("units", "turns", "sessions", "media", "provenance", "turn_meta")
+            raw = ("units", "turns", "sessions", "media", "provenance", "turn_meta", "add_keys")
             for table in (*raw, *DERIVED_TABLES):
                 conn.execute(f"DELETE FROM {table} WHERE space_id = ?", (space_id,))
             conn.execute("DELETE FROM spaces WHERE id = ?", (space_id,))

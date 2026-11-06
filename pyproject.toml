@@ -6,8 +6,15 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_prompts/LICENSE"]
 requires-python = ">=3.12"
-# 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用
-classifiers = ["Typing :: Typed"]
+# 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用。锁文件、Docker
+# 镜像与发表的结果用 3.12；3.14 由 .github/workflows/compat.yml 每周跑一次（不是必需检查）
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
 keywords = ["llm", "agents", "agent-memory", "long-term-memory", "multimodal", "rag", "mcp"]
 # 核心依赖：SDK、命令行、HTTP 接口、记忆代理与 MCP。界面、评测与本机向量是可选依赖
 dependencies = [
@@ -81,6 +88,13 @@ dev = [
 # 运行的 uv pip install 同样被覆盖（uv pip install pillow==12.3.0 装上的是 13.0.0）：要拿 12.x 对比
 # 图片字节，在仓库之外建环境，或者用 uv run --with pillow==12.3.0（--with 不受覆盖）
 override-dependencies = ["pillow>=13.0.0"]
+# onnxruntime（local 的 fastembed 用它）从 1.24 起没有 Intel macOS 的 wheel，也没有源码包，1.23.2
+# 是最后一个有的：不加这条时 Intel Mac 上 uv sync --extra local 解不出来（pip 自己会退到 1.23.2）。
+# 1.23.2 没有 cp314 的 wheel，所以只管 3.14 以下（不加时 uv lock 失败）。别的平台照旧是锁文件里
+# 的新版本（ci.yml 的 test 任务用 --dry-run 核对 Intel Mac 解得出来）
+constraint-dependencies = [
+    "onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64' and python_version < '3.14'",
+]
 
 [tool.ruff]
 line-length = 100

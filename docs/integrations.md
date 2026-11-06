@@ -16,7 +16,7 @@ CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 
 三个集成共用 `cuemem/evidence.py`：控制器先选档（L0 不检索、只给画像），取回的事实与对话片段排成与记忆代理、回答模型相同的证据块，放在最新一句用户消息的开头；系统提示与之前的消息不动，供应商的前缀缓存照常命中。工具（recall / remember / forget）的名字、说明与语义与 MCP 相同。
 
-- 证据块与 recall 工具的清单都声明里面是从过去的对话里引来的资料、不是指令；存下的 `<memory`、`</memory` 注入前会转义，关不上证据块。这只能减少、不能杜绝从记忆来的提示注入。
+- 证据块与 recall 工具的清单都声明里面是从过去的对话里引来的资料、不是指令；存下的 `<memory`、`</memory` 注入前会转义，关不上证据块。召回清单里存下的文字逐行以 '| ' 开头，结尾是 'End of recalled memories.'（多行的事实用 ' / ' 连成一行），存下的消息冒充不了清单本身，例如在 forget 工具旁边伪造一段带着真实 ID 的 `Facts:`。这只能减少、不能杜绝从记忆来的提示注入。
 - OpenAI Agents 与 LangGraph 里，当前对话里还在请求中的轮不进证据，带照片的轮也一样（`evidence.stored_text` 与 `in_context_rounds`，与记忆代理共用）。
 - 遗忘照实说：删除做完、用剩下的日志重建派生记忆却出错时（例如模型供应商余额不足），MCP、Agents 与 LangGraph 的 forget 工具回 "Deleted N conversation turn(s). Rebuilding the memory derived from the rest failed (…); it finishes on the next consolidation…"，不报成出错，模型不会告诉用户什么都没删。
 - 写入要么全写、要么不留：向量化或向量库出错时什么都不写，重试不会写出重复的发言。发言提交之后不再抛出：写不进去的 trace 只在 `cuemem.core.trace` 日志里记一条警告。
@@ -102,7 +102,7 @@ cuemem.close()  # 应用退出时，memory.close() 之前；异步用 aend_threa
 `cuemem.integrations.claude`（anthropic 1.14，工具类型 `memory_20250818`）。Claude 的 memory tool 在客户端执行：模型对 `/memories` 目录做 view、create、str_replace、insert、delete、rename。`CueMemMemoryTool` 把这个目录接到 CueMem 上：
 
 - 只读的生成文件：`/memories/profile.md`（画像）、`/memories/facts.md`（当前事实，带日期、ID 与有效状态），写入时报错说明；
-- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；
+- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`，WAL 模式的 SQLite；随数据目录一起备份，连同它的 `-wal` 与 `-shm`，见[备份与恢复](../README.zh-CN.md#备份与恢复)），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；
 - 路径严格校验（不能出 `/memories`），有大小上限；`with_recall` / `awith_recall` 在发给 Claude 之前先过控制器、注入证据。
 
 ```python
@@ -141,7 +141,7 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删
 - 从文件里删掉一行，记作"这一条不再成立"，由抽取与对账决定后果；只有删掉整个文件才确定遗忘。
 - 笔记记下之后供应商出错：改动已经作为笔记写进日志、抽取却出错时（例如余额不足），文件的改动照样成功，笔记只记一次，下次巩固时补上抽取。删除之后重建出错时，删除也照样成功，并说明重建要等下次。
 - Claude 的文件不在 `Memory.export` 里（导出只有原始日志里的笔记）。
-- anthropic 2.3 起，`tool_runner` 默认把对话放在服务端保存的会话（thread）里：一轮里第一次之后的请求只发新消息（之前发过的消息，包括证据块，按发出去的样子留着）。上面的写法每一轮照样从完整的 `history` 开始。想像 1.x 那样每次请求都发完整历史，给 `tool_runner` 传 `thread=False`。
+- anthropic 2.3 起，`tool_runner` 默认把对话放在服务端保存的会话（thread）里：一轮里第一次之后的请求只发新消息（之前发过的消息，包括证据块，按发出去的样子留着）。上面的写法每一轮照样从完整的 `history` 开始。用了服务端的会话时，供应商在服务端存着这段对话，证据块也在内；这一份在 CueMem 的遗忘与 `delete_all` 之外。遗忘要覆盖发出去的内容时，给 `tool_runner` 传 `thread=False`（anthropic 2.3 起才有这个参数，CueMem 仍接受的 1.x 没有）：每次请求都发完整历史，与 1.x 相同。供应商把会话或请求留多久，见 Anthropic 的文档。`examples/integrations/claude_example.py` 还没有传它，运行时要把 `ANTHROPIC_MODEL` 设成支持 memory tool 的 Claude 模型。
 
 ## 局限
 

@@ -43,6 +43,7 @@ class AsyncMethods:
         timestamp: datetime | str | float | None = None,
         infer: bool = True,
         wait: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """见 Memory.add。"""
         return await asyncio.to_thread(
@@ -56,6 +57,7 @@ class AsyncMethods:
             timestamp=timestamp,
             infer=infer,
             wait=wait,
+            idempotency_key=idempotency_key,
         )
 
     async def open_run(
@@ -167,6 +169,33 @@ class AsyncMethods:
             top_k=top_k,
             min_level=min_level,
             show_expired=show_expired,
+        )
+
+    async def context(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        at: datetime | None = None,
+        mode: SearchMode = "auto",
+        router: Router = "learned",
+        lam: float | None = None,
+        min_level: Literal["l0", "l1"] = "l1",
+        wrap: bool = True,
+    ) -> dict[str, Any]:
+        """见 Memory.context。"""
+        return await asyncio.to_thread(
+            self.sync.context,
+            query,
+            user_id=user_id,
+            agent_id=agent_id,
+            at=at,
+            mode=mode,
+            router=router,
+            lam=lam,
+            min_level=min_level,
+            wrap=wrap,
         )
 
     async def answer(

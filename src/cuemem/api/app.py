@@ -53,9 +53,24 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from cuemem import __version__
 from cuemem.agent import Reply
-from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of, ui_login
+from cuemem.api.auth import (
+    AnyKeys,
+    KeyRing,
+    Keys,
+    Principal,
+    authenticated_route,
+    guard,
+    principal_of,
+    ui_login,
+)
 from cuemem.api.failures import provider_failure
-from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, BodyLimit, _v1
+from cuemem.api.limits import (
+    MAX_BODY_BYTES,
+    MAX_IMPORT_BYTES,
+    BodyLimit,
+    _v1,
+    concurrency_limit,
+)
 from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
@@ -89,16 +104,30 @@ class SameOriginOnly:
 
     /login（第四轮体检）是 Gradio 在 /gradio_api 之外唯一改状态的接口：以前别的网站的网页自动提交
     一个表单，就能让访问者用攻击者（另一个租户）的令牌登录，之后访问者在界面里说的话都写进攻击者
-    的空间。按前缀匹配，也管 /login/；/logout 不在里面。"""
+    的空间。按前缀匹配，也管 /login/。
 
-    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp", "/login")
+    /config（第六轮体检）带着登录的密钥名：HTTPS 下登录 cookie 是 SameSite=None，Gradio 又允许带
+    凭据的跨域请求，别的网站的网页以前能读出访问者用哪个密钥登录。按前缀匹配，也管 /config/ 与
+    带查询参数的。界面的首页 /（第六轮复审）把同样的配置写在 HTML 里，也只接受同源与不带 Origin
+    的请求；只管正好是 / 的路径（PATHS 按前缀匹配，不能放 "/"）。在地址栏打开、点链接跳过来时
+    浏览器不带 Origin，照常。
+
+    /logout 不按 Origin 判断：它是 GET，<img> 与页面跳转不带 Origin 头，查了也拦不住。浏览器带着
+    Sec-Fetch-Site: cross-site 时拒绝（别的网站的网页把访问者登出）；不带这个头的（旧浏览器、
+    curl）照常，hosts 里有 "*"（允许任何来源）时也照常。"""
+
+    PATHS = ("/api/", "/v1/", "/gradio_api/", "/mcp", "/login", "/config")
+    INDEX = "/"
+    LOGOUT = ("/logout", "/logout/")
 
     def __init__(self, app: ASGIApp, hosts: Sequence[str] = ()) -> None:
         self.app = app
         self.hosts = {h.lower() for h in hosts}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"].startswith(self.PATHS):
+        if scope["type"] == "http" and (
+            scope["path"].startswith(self.PATHS) or scope["path"] == self.INDEX
+        ):
             headers = Headers(scope=scope)
             origin = headers.get("origin")
             if origin is not None and not self._allowed(origin, headers.get("host", "")):
@@ -109,6 +138,15 @@ class SameOriginOnly:
                 )
                 await response(scope, receive, send)
                 return
+        if (
+            scope["type"] == "http"
+            and scope["path"] in self.LOGOUT
+            and "*" not in self.hosts
+            and Headers(scope=scope).get("sec-fetch-site") == "cross-site"
+        ):
+            response = JSONResponse({"detail": "不接受别的网站发来的浏览器请求"}, 403)
+            await response(scope, receive, send)
+            return
         await self.app(scope, receive, send)
 
     def _allowed(self, origin: str, host: str) -> bool:
@@ -194,15 +232,21 @@ def _guard(
     *,
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
-    keys: Keys | None = None,
+    keys: AnyKeys | None = None,
     allow_ip_hosts: bool = False,
 ) -> None:
     """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
     先于 Origin，再是请求体的上限（api/limits.py；keys：限定作用域的令牌导入也用 max_body_bytes，
     同时在处理的请求体加起来有上限）。这三项都不读请求体。allow_ip_hosts：allowed_hosts 之外
-    另外接受任何 IP 地址作为 Host（TrustedHosts 的 ip_literals）。"""
+    另外接受任何 IP 地址作为 Host（TrustedHosts 的 ip_literals）。一个限定作用域的令牌同时在
+    处理的请求数的上限这时从环境变量 CUEMEM_MAX_CONCURRENT_PER_KEY 读（limits.concurrency_limit，
+    写错时 CueMemError）。"""
     app.add_middleware(
-        BodyLimit, max_body_bytes=max_body_bytes, max_import_bytes=max_import_bytes, keys=keys
+        BodyLimit,
+        max_body_bytes=max_body_bytes,
+        max_import_bytes=max_import_bytes,
+        keys=keys,
+        max_concurrent=concurrency_limit(),
     )
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:
@@ -348,7 +392,7 @@ def create_app(
     upload_dir: Path,
     ui: bool = True,
     token: str | None = None,
-    keys: Keys | None = None,
+    keys: AnyKeys | None = None,
     proxy: MemoryProxy | None = None,
     allowed_hosts: Sequence[str] | None = None,
     origin_hosts: Sequence[str] = (),
@@ -649,6 +693,8 @@ def create_app(
         # Gradio 都在事件函数之前把它复制进缓存，再经 /gradio_api/file= 交出去。不在 ui.py 的事件
         # 函数里查：它拿到的已经是缓存里的副本，聊天记录这个输入也不经过它
         demo.has_launched = True
+        if isinstance(keys, KeyRing):
+            keys.on_rotate(_ui_sign_out(app, demo))
     # 中间件：落到界面的预检请求也先过这里；请求体的上限也管界面的登录与事件接口
     _guard(
         app,
@@ -662,7 +708,30 @@ def create_app(
     return app
 
 
-def _serve_mcp(app: FastAPI, service: ChatService, keys: Keys) -> None:
+def _ui_sign_out(app: FastAPI, demo: Any) -> Callable[[frozenset[str]], None]:
+    """KeyRing.on_rotate 的回调：令牌换了或去掉了的名字在界面里的登录全部退出（第六轮复审）。
+    Gradio 在挂载的子应用的 tokens 里记着 cookie → 用户名，删掉之后这些 cookie 回到登录页。
+    以前换了令牌（同名改 sha256，或 revoke 之后又 add 回来）时，用旧令牌登录的界面会话照旧能用
+    这个名字的令牌的作用域，直到重启。"""
+    from starlette.routing import Mount
+
+    mounted: list[Any] = [  # gradio.routes.App
+        r.app
+        for r in app.routes
+        if isinstance(r, Mount) and getattr(r.app, "get_blocks", lambda: None)() is demo
+    ]
+    (ui,) = mounted
+    tokens: dict[str, str] = ui.tokens
+
+    def sign_out(names: frozenset[str]) -> None:
+        for token, user in list(tokens.items()):  # 事件循环里同时在读：只逐个删
+            if user in names:
+                tokens.pop(token, None)
+
+    return sign_out
+
+
+def _serve_mcp(app: FastAPI, service: ChatService, keys: AnyKeys) -> None:
     """/mcp：McpEndpoint 挂成一个路由，它的会话管理器接在应用的 lifespan 上（Gradio 挂载时
     接着套在外面）。不用 app.mount：挂载的子应用的 lifespan 不运行（每个请求 500），/mcp 还
     被 307 重定向到 /mcp/。MCP 的 SDK 在这里才导入（cuemem serve 的启动不多加载它）。"""

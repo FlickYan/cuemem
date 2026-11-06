@@ -42,7 +42,7 @@ from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store import MemoryDB
 from cuemem.write import consolidate as consolidate_module
-from cuemem.write.consolidate import MAX_ATTEMPTS
+from cuemem.write.consolidate import MAX_ATTEMPTS, REBUILD_PENDING
 from cuemem.write.extract import PIPELINE_VERSION, session_content_hash
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
@@ -952,10 +952,104 @@ def test_a_rebuild_clears_and_requeues_in_one_transaction(
             system.consolidator.run("u")  # 后台线程按退避重试
             assert statements(memory) == ["I also play piano", "I live in Paris", "I play violin"]
         else:
-            system.consolidate("u")  # 不用再要求重建：stale() 为真
-            assert statements(memory) == facts
+            # serve、代理与 MCP 的写法：不等巩固，后台线程接着 run。它要先把没做完的重建做完
+            # （第六轮体检：以前 run 最后照样写这次的指纹，标记被抹掉，缺的向量再没人补）
+            memory.add("I like tea", user_id="u", run_id="s3", timestamp=SEP)
+            system.consolidator.run("u")
+            assert statements(memory) == ["I like tea", *facts]
             assert not system.consolidator.stale("u")
+            hits = memory.search("Paris", user_id="u", mode="l1")["results"]
+            assert "I live in Paris" in [h["memory"] for h in hits]
         assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def test_a_worker_run_without_jobs_finishes_an_interrupted_rebuild(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """清空重建出错之后，没有新任务的一次后台 run 也把重建做完（第六轮体检）：以前标记留着、
+    向量缺着，要等显式的 consolidate。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        requeue = system.consolidator.requeue
+
+        def locked(space: str, before: Any, skip: Any) -> int:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(system.consolidator, "requeue", locked)
+        with pytest.raises(sqlite3.OperationalError):
+            system.consolidate("u", rebuild=True)
+        monkeypatch.setattr(system.consolidator, "requeue", requeue)
+        assert system.consolidator.stale("u")
+        system.consolidator.run("u")
+        assert not system.consolidator.stale("u")
+        assert statements(memory) == ["I live in Paris"]
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def _interrupt_rebuild(system: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """consolidate(rebuild=True) 在重新登记时出错：标记 REBUILD_PENDING 留在库里。"""
+    requeue = system.consolidator.requeue
+
+    def locked(space: str, before: Any, skip: Any) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(system.consolidator, "requeue", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        system.consolidate("u", rebuild=True)
+    monkeypatch.setattr(system.consolidator, "requeue", requeue)
+    assert system.db.get_meta("consolidation:u") == REBUILD_PENDING
+
+
+def test_a_resumed_rebuild_drops_the_marker_once_it_commits(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """接着做的重建一提交，标记就删了（第六轮复审）：之后的重放途中进程被杀，下一次不会从头
+    再重建一遍。以前事务里把标记原样写回，要等 _run 做完整个空间才换掉。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        _interrupt_rebuild(system, monkeypatch)
+        replay = system.consolidator._replay_regrown
+
+        def killed(space: str) -> None:
+            raise KeyboardInterrupt  # 进程在接着做的重建提交之后被杀
+
+        monkeypatch.setattr(system.consolidator, "_replay_regrown", killed)
+        with pytest.raises(KeyboardInterrupt):
+            system.consolidator.run("u")
+        assert system.db.get_meta("consolidation:u") != REBUILD_PENDING
+        assert system.db.get_jobs("u", status="pending")  # 剩下的事在任务里
+        monkeypatch.setattr(system.consolidator, "_replay_regrown", replay)
+        system.consolidator.run("u")
+        assert not system.consolidator.stale("u")
+        assert statements(memory) == ["I live in Paris"]
+        assert set(system.vectors.unit_ids("u")) == {u.id for u in system.db.list_units("u")}
+
+
+def test_consolidate_after_an_interrupted_rebuild_rebuilds_once(
+    n3_settings: Settings, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """中断之后的 consolidate() 只重建一次（第六轮复审）：以前 stale() 重建一次、写回标记，
+    run 看见标记又重建一次。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        system = memory.system
+        memory.add("I live in Paris", user_id="u", run_id="s1", timestamp=AUG, wait=True)
+        _interrupt_rebuild(system, monkeypatch)
+        rebuild, calls = system.consolidator.rebuild, []
+
+        def counted(space: str, *, replay: bool = False) -> None:
+            calls.append(replay)
+            rebuild(space, replay=replay)
+
+        monkeypatch.setattr(system.consolidator, "rebuild", counted)
+        system.consolidate("u")
+        assert calls == [False]
+        assert not system.consolidator.stale("u")
+        assert statements(memory) == ["I live in Paris"]
 
 
 def said(
@@ -1042,6 +1136,70 @@ def test_names_and_values_in_other_scripts(n3_settings: Settings, fake_api: Fake
         assert busan.is_current and not seoul.is_current
         assert seoul.superseded_by == busan.id
         assert model.calls["reconcile"] == 1 and "서울" in model.prompts["reconcile"][0]
+
+
+ACCENTS: dict[str, Any] = {
+    "2026-01-10": {
+        "summary": "",
+        "facts": [
+            said("The user's budget is ８０００ yuan.", "User", "budget", "８０００ yuan", 0),
+            said("Müller likes chess.", "Müller", "likes", "chess", 0, "multi"),
+            said("Möller likes tennis.", "Möller", "likes", "tennis", 1, "multi"),
+        ],
+        "entities": [],
+    },
+    "2026-02-01": {
+        "summary": "",
+        "facts": [
+            said("The user's budget is ６０００ yuan.", "User", "budget", "６０００ yuan", 0),
+            said("The user has a friend named Zoë.", "User", "has_friend", "Zoë", 0, "multi"),
+            said("The user has a friend named Zoé.", "User", "has_friend", "Zoé", 0, "multi"),
+            said("The user has a friend named Zoà.", "User", "has_friend", "Zoà", 0, "multi"),
+        ],
+        "entities": [],
+    },
+}
+
+
+def test_accented_letters_and_fullwidth_digits(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """原来的键删掉带重音的拉丁字母与全角数字：'Müller' 与 'Möller' 两位说话人成了一个实体，
+    预算从 ８０００ 改成 ６０００ 被当成重复丢掉，同一会话里 'Zoë' 与 'Zoà' 两句的事实 ID 相同、
+    后一句被丢掉。现在都分开；折叠重音后相同的 'Zoé' 仍与 'Zoë' 是同一个值。"""
+    model = ScriptedModel(
+        ACCENTS,
+        reconcile=lambda prompt: {"decisions": [{"new": 1, "action": "update", "target": "e1"}]},
+    )
+    fake_api.chat_replies = [model]
+    first = SessionIn(
+        session_id="a",
+        started_at=datetime(2026, 1, 10),
+        turns=[
+            TurnIn(
+                role="user", speaker="Müller", text="Mein Budget: ８０００ yuan. Ich mag Schach."
+            ),
+            TurnIn(role="user", speaker="Möller", text="Ich spiele Tennis."),
+        ],
+    )
+    second = SessionIn(
+        session_id="b",
+        started_at=datetime(2026, 2, 1),
+        turns=[TurnIn(role="user", text="Budget now ６０００ yuan. Friends: Zoë, Zoé, Zoà.")],
+    )
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
+        memory.ingest(Conversation(space_id="de", sessions=[first, second]), consolidate=True)
+        people = {e.name: e.id for e in memory.entities("de") if e.type == "person"}
+        assert {"Müller", "Möller"} <= set(people) and people["Müller"] != people["Möller"]
+        assert people["Müller"] == stable_id("de", "entity", "m ller", "person")  # 原来的 ID
+        facts = memory.facts("de")
+        assert by_statement(facts, "chess").subject_id == people["Müller"]
+        assert by_statement(facts, "tennis").subject_id == people["Möller"]
+        old, new = by_statement(facts, "８０００"), by_statement(facts, "６０００")
+        assert new.is_current and old.superseded_by == new.id
+        assert model.calls["reconcile"] == 1
+        friends = [f for f in facts if f.predicate == "has_friend" and f.is_current]
+        assert sorted(f.object for f in friends) == ["Zoà", "Zoë"]
+        zoe = by_statement(facts, "Zoë")
+        assert zoe.id == stable_id("de", "fact", "b", "user has a friend named zo")  # 原来的 ID
 
 
 # ---------- 跨巩固复用载入的状态（R6） ----------
@@ -1405,3 +1563,27 @@ def test_state_is_not_reused_after_another_connection_wrote_during_the_run(
         m.add("I moved to Paris", user_id="u", run_id="s3", wait=True)
     assert len(prompts) == 2
     assert "Munich" in prompts[1] and "Berlin" not in prompts[1]
+
+
+@pytest.mark.parametrize("later", [timedelta(hours=5), timedelta(days=2)], ids=["same-day", "days"])
+def test_facts_reconcile_in_the_order_they_were_said(
+    n3_settings: Settings, fake_api: FakeAPI, later: timedelta
+) -> None:
+    """一个会话里先说住在 Berlin、几小时后说搬到 Munich，抽取模型却把 Munich 列在前面：Munich
+    是当前的、取代了 Berlin（第六轮体检）。以前同一天里的事实记录时间都是会话开始的时间，对账按
+    模型列出的顺序走，Berlin 反倒成了当前的；跨了天时以前就对，现在照样对。"""
+
+    def reversed_order(prompt: str) -> dict[str, Any]:
+        out = where_i_live(prompt)
+        out["facts"] = out["facts"][::-1]  # 模型先列后说的
+        return out
+
+    fake_api.chat_replies = [ScriptedModel(reversed_order, reconcile=moved)]
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        with memory.run(user_id="u", wait=True) as run_id:
+            memory.add("I live in Berlin", user_id="u", run_id=run_id, timestamp=AUG)
+            memory.add("I moved to Munich", user_id="u", run_id=run_id, timestamp=AUG + later)
+        facts = {f.object: f for f in memory.system.facts("u")}
+        assert facts.keys() == {"Berlin", "Munich"}
+        assert facts["Munich"].is_current and not facts["Berlin"].is_current
+        assert facts["Berlin"].superseded_by == facts["Munich"].id

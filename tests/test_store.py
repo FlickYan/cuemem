@@ -893,6 +893,112 @@ def test_fact_indexes_are_added_to_existing_databases(tmp_path: Path) -> None:
     db.close()
 
 
+def _lives_in(
+    fid: str,
+    city: str,
+    valid_from: str | None,
+    valid_to: str | None = None,
+    *,
+    by: str | None = None,
+    reason: str | None = None,
+    said: datetime = datetime(2026, 9, 1),
+) -> Fact:
+    return Fact(
+        id=fid,
+        space_id="s",
+        subject_id="u",
+        subject="User",
+        predicate="lives_in",
+        object=city,
+        statement=f"The user lives in {city}.",
+        valid_from=valid_from,
+        valid_to=valid_to,
+        recorded_at=said,
+        invalidated_at=datetime(2026, 9, 1) if by else None,
+        superseded_by=by,
+        supersede_reason=reason,
+        session_id="x",
+        source_turn_ids=[],
+    )
+
+
+def test_valid_period_keeps_a_value_that_ended_in_a_partial_period() -> None:
+    """第六轮体检 P5：取代时旧值的终点记成新值的起点，常是部分日期（'2026'、'2026-06'）。
+    以前 '2026-01-01' < '2026' 不成立，查 2026 年只有 Munich，换走的 Berlin 不见了。只查一天时
+    与以前相同；用 >= 的话 Berlin 会在以后每一年都出现，所以 2027 年只有 Munich。"""
+    from cuemem.core.timeutil import valid_period
+
+    def at(db: MemoryDB, value: str) -> list[str]:
+        return sorted(f.object for f in db.get_facts("s", valid_period=valid_period(value)))
+
+    for end, inside, after, before in (
+        ("2026", "2026", "2027", "2025"),
+        ("2026-06", "2026-06", "2026-07", "2026-05"),
+    ):
+        db = MemoryDB(None)
+        db.apply_consolidation(
+            facts=[
+                _lives_in("b", "Berlin", "2020", end, by="m", reason="changed"),
+                _lives_in("m", "Munich", end),
+            ],
+            entities=[],
+            episodes=[],
+            units=[],
+        )
+        assert at(db, inside) == ["Berlin", "Munich"]
+        assert at(db, after) == ["Munich"]
+        assert at(db, before) == ["Berlin"]
+        assert at(db, f"{inside}-01-01"[:10]) == ["Munich"]  # 只查一天：与以前相同
+        if end == "2026":
+            assert at(db, "2026-03") == ["Berlin", "Munich"]
+        db.close()
+
+
+def test_valid_period_gives_a_correction_the_start_of_what_it_corrected() -> None:
+    """第六轮体检 P5：更正指旧值从未成立，新值从旧值的起点起就成立。以前更正版没有自己的起点
+    时从更正那天算起，查更正之前的日期什么都没有。沿版本链往前找（更正了又更正）；更正版自己有
+    起点时用自己的；按会话查（分批）时也一样。"""
+    from cuemem.core.timeutil import valid_period
+
+    db = MemoryDB(None)
+    db.apply_consolidation(
+        facts=[
+            _lives_in(
+                "a1", "Berlin", None, by="a2", reason="corrected", said=datetime(2026, 1, 10)
+            ),
+            _lives_in(
+                "a2", "Hamburg", None, by="a3", reason="corrected", said=datetime(2026, 3, 5)
+            ),
+            _lives_in("a3", "Bremen", None, said=datetime(2026, 4, 2)),
+            _lives_in("b1", "Rome", "2024", by="b2", reason="corrected", said=datetime(2026, 2, 1)),
+            _lives_in("b2", "Milan", "2025-06", said=datetime(2026, 5, 1)),
+            _lives_in(
+                "c1",
+                "Oslo",
+                None,
+                "2026-06-01",
+                by="c2",
+                reason="changed",
+                said=datetime(2026, 1, 10),
+            ),
+            _lives_in("c2", "Bergen", None, said=datetime(2026, 6, 1)),
+        ],
+        entities=[],
+        episodes=[],
+        units=[],
+    )
+
+    def at(value: str, **kw: Any) -> list[str]:
+        return sorted(f.id for f in db.get_facts("s", valid_period=valid_period(value), **kw))
+
+    assert at("2026-01-10") == at("2026-01") == ["a3", "b2", "c1"]
+    assert at("2025-12-31") == ["b2"]  # 自己有起点（2025-06）的不往前沿用 Rome 的 2024
+    assert at("2025-05") == []
+    assert at("2026-06-01") == ["a3", "b2", "c2"]  # 正常取代（changed）不沿用起点
+    assert at("2026-01-10", session_ids=["x"]) == ["a3", "b2", "c1"]
+    db.close()
+
+
 def test_v5_database_gains_turn_meta(tmp_path: Path) -> None:
     """v6 加了 turn_meta（SDK 的 metadata、过期时间与更正目标）：v5 的库打开时自动补上这张表，
     已有的发言没有附加信息；附加信息只写给这次真正写进去的发言，随发言一起删。"""

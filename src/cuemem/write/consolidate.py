@@ -64,6 +64,7 @@ from cuemem.write.predicates import (
     normalize_predicate,
     normalize_value,
     registered_cardinality,
+    strict_key,
 )
 from cuemem.write.profile import build_core_memory
 from cuemem.write.reconcile import FactState, Reconciler
@@ -301,10 +302,18 @@ class Consolidator:
         与任何配置的指纹都不同），事务里再改回原来的（第五轮复审）：向量删了、事务却没提交时
         （进程被杀，重新登记出错）事实与"已完成"的任务都在、向量没了，以前 stale() 仍是 False，
         后台线程、重启与下一次巩固都不会补，检索悄悄找不到这些事实。现在留下的指纹让 stale()
-        为真，下一次 consolidate 或 add(wait=True) 把重建再做一遍（也可以 cuemem reindex 按数据库
-        补齐向量）。会话又长了时的重放不需要：那对任务留着，后台线程会再做一遍。"""
+        为真，下一次 consolidate 或 add(wait=True) 把重建再做一遍，后台线程的下一次 run 也会
+        （见 run；也可以 cuemem reindex 按数据库补齐向量）。会话又长了时的重放不需要：那对任务
+        留着，后台线程会再做一遍。
+
+        原来的指纹就是这个标记（接着做之前没做完的重建）时，事务里把它删掉、不写回（第六轮
+        复审）：清空与重新登记一提交，剩下的事都在任务里，_run 做完时写这次的指纹。以前写回
+        标记：重放途中进程再被杀，下一次又整个重建一遍、已经重放的会话白做；consolidate() 在
+        中断之后也会重建两次（stale() 一次，run 看见标记又一次）。"""
         key = f"consolidation:{space_id}"
         recorded = None if replay else self.db.get_meta(key)
+        if recorded == REBUILD_PENDING:
+            recorded = None
         if not replay:
             self.db.set_meta(key, REBUILD_PENDING)
         derived = self.db.derived_unit_ids(space_id)
@@ -387,8 +396,16 @@ class Consolidator:
     def run(self, space_id: str) -> ConsolidationReport:
         """执行该空间所有待处理的任务。同一空间同一时间只有一个巩固在跑。
 
-        巩固过的会话又追加了发言时，先清空派生记忆、从原始日志重放（见 _replay_regrown）。"""
+        巩固过的会话又追加了发言时，先清空派生记忆、从原始日志重放（见 _replay_regrown）。
+
+        之前的清空重建没做完（指纹是 REBUILD_PENDING，见 rebuild）时先把它做完（第六轮体检）：
+        以前后台线程这里不看，_run 最后照样写这次的指纹，标记被抹掉，派生记忆的向量从此缺着。
+        只看这个标记、不看 stale()：配置或版本变了时的重建照旧留给显式的 consolidate。接着做的
+        重建一提交，标记就删了（见 rebuild）：之后被杀不会再从头重建。"""
         with self._lock_for(space_id):
+            if self.db.get_meta(f"consolidation:{space_id}") == REBUILD_PENDING:
+                record_event("consolidate_resume_rebuild")
+                self.rebuild(space_id)
             self._replay_regrown(space_id)
             return self._run(space_id, scope(space_id, "consolidate"))
 
@@ -669,7 +686,7 @@ class Consolidator:
 
         new_facts: list[tuple[Fact, FloatArray]] = []
         said_on = {t.id: t.ts for t in turns}
-        keys: dict[str, str] = {}  # 本次抽取里用过的事实 ID → 陈述的规范形式
+        keys: dict[str, tuple[str, str]] = {}  # 本次抽取里用过的事实 ID → 陈述的两个键
         for candidate in ext.facts:
             raw = candidate.raw
             subject_id = self.resolver.subject_id(entity_state, raw.subject, ts, ents)
@@ -678,11 +695,16 @@ class Consolidator:
             predicate = normalize_predicate(raw.predicate)
             object_id = entity_state.lookup(raw.object) if raw.object else None
             # 事实 ID 照旧按原来的规范形式派生（已有的 ID 不变）；只有原来的形式撞上、陈述其实
-            # 不同时（"...named 초코." 与 "...named 보리." 原来都成了 "...named"）才另派一个
-            key = normalize_value(raw.statement)
+            # 不同时（"...named 초코." 与 "...named 보리." 原来都成了 "...named"）才另派一个；
+            # 只有 strict_key 不同时也另派一个："...is ８０００ yuan." 与 "...is ６０００ yuan."、
+            # "...Zoë." 与 "...Zoà."，原来的形式都删掉了不同的那几个字
+            key, strict = normalize_value(raw.statement), strict_key(raw.statement)
             fact_id = stable_id(space_id, "fact", ext.session_id, legacy_value_key(raw.statement))
-            if keys.setdefault(fact_id, key) != key:
+            seen = keys.setdefault(fact_id, (key, strict))
+            if seen[0] != key:
                 fact_id = stable_id(space_id, "fact", ext.session_id, key, "u")
+            elif seen[1] != strict:
+                fact_id = stable_id(space_id, "fact", ext.session_id, strict, "s")
             fact = Fact(
                 id=fact_id,
                 space_id=space_id,
@@ -711,6 +733,14 @@ class Consolidator:
         # SDK 的 Memory.update 写下的更正（原始层的 edit_of）：由它抽出的事实取代指定的那条
         edits = self.db.get_turn_meta(space_id, [t.id for t in turns])
         corrections = {t: m.edit_of for t, m in edits.items() if m.edit_of}
+        # 按说出的先后对账（第六轮体检）：同一天里时间不同的发言（run()、LangGraph 的线程、代理
+        # 指定的会话），以前按抽取模型列出的顺序，先说的反倒取代后说的。按出处最晚一句的完整时间
+        # （不是 _said_at 那样只分到天）稳定排序；只有一个时间的会话（评测的会话都是）顺序不变
+        new_facts.sort(
+            key=lambda item: max(
+                (said_on[t] for t in item[0].source_turn_ids if t in said_on), default=ts
+            )
+        )
         rec = self.reconciler.reconcile(
             fact_state, new_facts, cache_scope=cache_scope, sources=said, corrections=corrections
         )

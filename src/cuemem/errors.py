@@ -51,6 +51,11 @@ class ConcurrentWriteError(CueMemError):
     """要写入的发言没有全部写进去：序号与会话里已有的发言撞上了（同一会话的并发写入没有串行）。"""
 
 
+class IdempotencyConflictError(CueMemError):
+    """add 的 idempotency_key（HTTP 的 Idempotency-Key 头）在这个用户下已经用于另一次不同的写入
+    （消息或参数不同）：没有写入。重试要原样重发同一个请求，新的写入要换一个键。"""
+
+
 class StorageLockedError(CueMemError):
     """本地模式的向量库已被另一个进程打开：Qdrant 本地模式同一时间只允许一个进程访问。"""
 
@@ -71,7 +76,8 @@ class MemoryAPIError(CueMemError):
 
     没有拿到响应时 code 是客户端自己的错误码，sent 说请求有没有送到服务端：unreachable
     （sent=False：连不上，写入一定没做，可以重发）；timeout 与 disconnected（sent=True：超时、
-    连接中途断开，写入可能已经提交，不要盲目重发）；transport（sent=True：别的传输出错）。
+    连接中途断开，写入可能已经提交：add 用同一个 idempotency_key 原样重发，服务端只写一次；没给键时
+    不要盲目重发，用 export 核对）；transport（sent=True：别的传输出错）。
     拿到了 HTTP 响应时 sent 是 None。"""
 
     def __init__(

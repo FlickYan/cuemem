@@ -14,6 +14,8 @@
     GET    /api/v1/media/{id}                media（图片的原文件）
     POST   /api/v1/reset                     reset
     GET    /api/v1/status                    status（抽取的状态：待处理、失败的会话与原因）
+    POST   /api/v1/context                   context（放进提示词的 <memory> 证据块，与记忆代理
+                                             注入的相同；不调用模型）
     以及 answer、profile、runs（open_run）、runs/end（end_run）、consolidate、wait、export、
     import（load）、spaces。
 
@@ -43,12 +45,14 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Iterator, Mapping
+import time
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+import anyio
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -64,13 +68,19 @@ from cuemem import __version__
 from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of
 from cuemem.api.failures import provider_failure
 from cuemem.core.models import FactCategory, SupersedeReason
-from cuemem.errors import ConcurrentWriteError, CueMemError, EmbeddingAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    CueMemError,
+    EmbeddingAPIError,
+    IdempotencyConflictError,
+)
 from cuemem.read.controller import Router
 from cuemem.sdk import AnswerMode, Lam, Memory, MinLevel, SearchMode, _scope, space_for
 from cuemem.store.media import ACCEPTED_FORMATS
 
 PREFIX = "/api/v1"
 WAIT_TIMEOUT_S = 300.0  # POST /wait 最多等这么久（MemoryClient 默认的超时），之后 504
+WAIT_POLL_S = 0.25  # POST /wait 每隔这么久看一次抽取做完没有
 _CODES = {
     400: "invalid_request",
     401: "unauthorized",
@@ -138,6 +148,18 @@ class SearchRequest(BaseModel):
     top_k: int | None = None
     min_level: MinLevel = "l1"
     show_expired: bool = False
+
+
+class ContextRequest(BaseModel):
+    query: str
+    user_id: str | None = None
+    agent_id: str | None = None
+    at: datetime | None = None
+    mode: SearchMode = "auto"
+    router: Router = "learned"
+    lam: Lam = None
+    min_level: MinLevel = "l1"
+    wrap: bool = Field(True, description="Wrap the block in <memory>...</memory>")
 
 
 class AnswerRequest(BaseModel):
@@ -315,9 +337,10 @@ class AddResult(_Out):
     results: list[FactEvent]
     session_id: str | None
     turn_ids: list[str]
-    status: Literal["empty", "logged", "queued", "consolidated"]
+    status: Literal["empty", "logged", "queued", "consolidated", "duplicate", "forgotten"]
     error: str | None = None
     consolidation: ConsolidationReport | None = None
+    replayed: bool | None = None  # Idempotency-Key 已经写过：duplicate 或 forgotten
 
 
 class SearchResult(_Out):
@@ -327,6 +350,20 @@ class SearchResult(_Out):
     level: Literal["L0", "L1", "L2"]
     see: bool
     reasons: list[str]
+
+
+class ContextResult(_Out):
+    """POST /context: the evidence block the memory proxy injects, ready for a prompt."""
+
+    context: str = Field(
+        description="The <memory> block (empty when there is nothing to add); without the "
+        "<memory> tags when wrap is false"
+    )
+    level: Literal["L0", "L1", "L2"]
+    reasons: list[str]
+    recalled: int = Field(description="Items in the block; the profile counts as one")
+    see: bool
+    refs: dict[str, str] = Field(description="Label in the block -> memory id (see GET)")
 
 
 class GetAllResult(_Out):
@@ -551,7 +588,7 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(404, str(exc.args[0] if exc.args else exc), error_type="KeyError") from exc
     except (ValueError, TypeError) as exc:
         raise V1Error(400, str(exc), error_type=type(exc).__name__) from exc
-    except ConcurrentWriteError as exc:
+    except (ConcurrentWriteError, IdempotencyConflictError) as exc:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
     except Exception as exc:
         failure = provider_failure(exc)
@@ -670,7 +707,22 @@ def memories_router(
         return V1Error(404, f"No memory with id {memory_id}", error_type="KeyError")
 
     @router.post("/memories", responses=_ok(AddResult))
-    def add(http: Request, request: AddRequest) -> V1Json:
+    def add(
+        http: Request,
+        request: AddRequest,
+        idempotency_key: Annotated[
+            str | None,
+            Header(
+                alias="Idempotency-Key",
+                description=(
+                    "Optional key (1-255 printable ASCII characters, e.g. a UUID) for retrying "
+                    "an add safely: within 24 hours the same key and request for the same user "
+                    "is written once and answered with status 'duplicate' (or 'forgotten'); the "
+                    "same key with a different request is a 409 IdempotencyConflictError."
+                ),
+            ),
+        ] = None,
+    ) -> V1Json:
         with _sdk_errors():
             allow(http, request.user_id, request.agent_id)
             _no_server_files(request.messages)
@@ -684,6 +736,7 @@ def memories_router(
                 timestamp=request.timestamp,
                 infer=request.infer,
                 wait=request.wait,
+                idempotency_key=idempotency_key,
             )
 
     @router.post("/memories/search", responses=_ok(SearchResult))
@@ -704,6 +757,22 @@ def memories_router(
                 top_k=request.top_k,
                 min_level=request.min_level,
                 show_expired=request.show_expired,
+            )
+
+    @router.post("/context", responses=_ok(ContextResult))
+    def context(http: Request, request: ContextRequest) -> V1Json:
+        with _sdk_errors():
+            allow(http, request.user_id, request.agent_id)
+            return memory.context(
+                request.query,
+                user_id=request.user_id,
+                agent_id=request.agent_id,
+                at=request.at,
+                mode=request.mode,
+                router=request.router,
+                lam=request.lam,
+                min_level=request.min_level,
+                wrap=request.wrap,
             )
 
     @router.get("/memories", responses=_ok(GetAllResult))
@@ -864,34 +933,45 @@ def memories_router(
             )
 
     @router.post("/wait", responses=_ok(WaitResult))
-    def wait(http: Request, request: WaitRequest | None = None) -> V1Json:
+    async def wait(http: Request, request: WaitRequest | None = None) -> V1Json:
         """给了 user_id、agent_id 时只等这个空间（要在作用域里）；不给时管理令牌（没配令牌时的
         本机演示）等全部，限定作用域的令牌只等它能访问的空间。以前不看作用域、等全部用户的抽取：
         限定作用域的令牌也能占着一个线程，还能从等了多久看出别的用户排着多少抽取。最多等
         WAIT_TIMEOUT_S 秒，没做完时 504（timeout，type TimeoutError）。"""
+        # 异步的接口（第六轮体检）：在事件循环里每 WAIT_POLL_S 秒看一次，不占线程池的线程。以前
+        # 是同步的，每个等着的请求占着 AnyIO 40 个线程中的一个，45 个并发的 wait 就让别的同步接口
+        # 都等到它们超时
         request = request or WaitRequest()
         timeout = min(
             request.timeout if request.timeout is not None else WAIT_TIMEOUT_S, WAIT_TIMEOUT_S
         )
         who = principal_of(http)
         user_id, agent_id = request.user_id, request.agent_id
-        try:
-            if user_id is not None or agent_id is not None:
-                with _sdk_errors():
-                    allow(http, user_id, agent_id)
-                memory.wait(user_id=user_id, agent_id=agent_id, timeout=timeout)
-            elif who.admin:
-                memory.wait(timeout=timeout)
-            else:
-                worker = memory.system.worker
-                if worker is not None and not worker.wait(who.allows, timeout):
-                    raise TimeoutError
-        except TimeoutError as exc:
-            raise V1Error(
-                504,
-                f"Extraction did not finish within {timeout:g}s; it continues in the background.",
-                error_type="TimeoutError",
-            ) from exc
+        spaces: Callable[[str], bool] | None
+        if user_id is not None or agent_id is not None:
+            with _sdk_errors():
+                allow(http, user_id, agent_id)
+            spaces = space_for(user_id, agent_id).__eq__
+        else:
+            spaces = None if who.admin else who.allows
+        worker = memory.system.worker
+        if worker is None:
+            return {"ok": True}
+        deadline = time.monotonic() + timeout
+        while not worker.wait(spaces, 0):  # 只看一眼，不阻塞事件循环
+            if time.monotonic() >= deadline:
+                raise V1Error(
+                    504,
+                    f"Extraction did not finish within {timeout:g}s; "
+                    "it continues in the background.",
+                    error_type="TimeoutError",
+                )
+            # 客户端断开了（第六轮复审）：不再等，放开这个令牌同时在处理的名额（BodyLimit 在接口
+            # 返回时才放开）。以前一直等到 timeout，丢下的 wait 最多占着名额 300 秒，8 个就让这个
+            # 令牌的每个请求都 429。回的内容没人收
+            if await http.is_disconnected():
+                return cast(V1Json, Response(status_code=499))
+            await anyio.sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
         return {"ok": True}
 
     @router.get("/status", responses=_ok(StatusResult))

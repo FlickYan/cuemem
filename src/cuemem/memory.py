@@ -1042,12 +1042,14 @@ class MemorySystem:
                 #    否则期间结束的会话登记的任务被清空，没人补上。锁里不能调用 open_sessions
                 with self._open_lock:
                     skip = {sid for space, sid in self._open if space == space_id}
-                    with self.db.transaction():
+                    with self.db.transaction() as conn:
                         before = self.db.get_jobs(space_id)
                         self.db.delete_units(space_id, [u.id for u in old_rounds])
                         if new_rounds:
                             self.db.add_units(new_rounds)
                         deleted = self.db.delete_turns(space_id, [t.id for t in targets])
+                        # add 的 idempotency_key 写下过这些发言的只留墓碑（第六轮体检）
+                        self.db.add_key_forget(conn, space_id, doomed)
                         removed = self.db.clear_derived(space_id)
                         self.consolidator.requeue(space_id, before, skip)
                 committed = True
