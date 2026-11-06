@@ -102,6 +102,8 @@ class Recall:
     details: dict[str, Any] = field(default_factory=dict)  # L2 的计划、充分性检查等
     # 学到的控制器的探针打过分的候选（mode="auto" 时）：L0 改走 L1 时直接打包（见 retrieve）
     candidates: L1Candidates | None = None
+    # hide_expired 时算出的过期记忆（没打开时 None）：改走 L1 的第二次检索传回去，不再算一遍
+    expired: frozenset[str] | None = None
 
 
 @dataclass
@@ -1806,7 +1808,7 @@ class MemorySystem:
                 def search(query: str, cfg: L1Config) -> L1Result:
                     if not gone:
                         return self.l1.search(space_id, query, when, cfg)
-                    found = self.l1.search(space_id, query, when, cfg, exclude=gone)
+                    found = self.l1.search(space_id, query, when, cfg, hidden=gone)
                     media = {mid: m for mid, m in found.media.items() if mid not in gone}
                     return replace(
                         found,
@@ -1872,6 +1874,7 @@ class MemorySystem:
         cache_scope: str | None = None,
         candidates: L1Candidates | None = None,
         hide_expired: bool = False,
+        expired: frozenset[str] | None = None,
     ) -> Recall:
         """只检索、不回答：按 mode 取记忆（auto 由检索控制器选档），返回交给回答模型的材料。
 
@@ -1881,10 +1884,10 @@ class MemorySystem:
         探针打过分的候选不丢：控制器选 L1 时直接打包；选 L2 时原问题的召回用探针的结果（见
         L2Retriever.search）；返回的 Recall 带着它们，调用方把 L0 改走 L1 时（recall_listing 的
         at_least_l1）以 mode="l1" 与 candidates 传回来、直接打包，不再检索一遍。candidates 必须
-        是同一个问题、同一个问题时间、同样的 exclude 与 L1 配置下的探针结果，调用方还要在两次
-        检索期间一直持有这个空间的读（with reading(space_id)）：候选是探针取到内存里的轮与事实，
-        两次之间插进来的遗忘删掉了它们，打包出来的却还是它们。没有持有读时不用 candidates、
-        重新检索（R5 之前的做法，结果相同，只是多检索一遍）。
+        是同一个问题、同一个问题时间、同样的 exclude、同样的过期记忆与 L1 配置下的探针结果，
+        调用方还要在两次检索期间一直持有这个空间的读（with reading(space_id)）：候选是探针取到
+        内存里的轮与事实，两次之间插进来的遗忘删掉了它们，打包出来的却还是它们。没有持有读时
+        不用 candidates、重新检索（R5 之前的做法，结果相同，只是多检索一遍）。
 
         不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
         retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
@@ -1892,11 +1895,14 @@ class MemorySystem:
         遗忘等进行中的检索写完 trace（reading）。
 
         hide_expired：不给出已经过期的记忆（SDK 的 expiration_date，见 expiry.py）。过期的事实、
-        对话片段与图片加进 exclude（探针与各路检索都不看，名额留给别的），画像去掉过期的几行，
-        检索之后再筛一遍（版本链带出的旧事实、装入的轮里的图片）。过期按墙上时间算，不按
-        question_time，同 SDK 的 search。SDK 的 answer、记忆代理、MCP 与各框架集成打开它；评测、
-        命令行与冻结的方法不打开。空间里没有过期的记忆时（评测的空间从不写过期时间）只多查一次
-        turn_meta，exclude 与画像原样不动，请求逐字节不变。
+        对话片段与图片作为 hidden 交给探针与各路检索，在检索里就排除，名额留给别的记忆（第七轮
+        体检 P5：以前加进 exclude，各路先取前 pool 条再去掉，过期的照样占着名额）；exclude 本身
+        不变（N8 的 Agent 的工作记忆照旧取完再去掉）。画像去掉过期的几行，检索之后再筛一遍
+        （版本链带出的旧事实、装入的轮里的图片）。过期按墙上时间算，不按 question_time，同 SDK 的
+        search。SDK 的 answer、记忆代理、MCP 与各框架集成打开它；评测、命令行与冻结的方法不打开。
+        空间里没有过期的记忆时（评测的空间从不写过期时间）只多查一次 turn_meta，hidden 是空的，
+        画像原样不动，请求逐字节不变。返回的 Recall.expired 是这次算出的过期记忆；同一次 reading
+        里带着 candidates 再检索一次时把它作为 expired 传回来，不再算一遍。
         """
         tracing: AbstractContextManager[object] = (
             nullcontext()
@@ -1907,7 +1913,9 @@ class MemorySystem:
             candidates = None  # 在下面的 reading 里查就晚了：那时总是持有读
         with self.reading(space_id), tracing:
             now = datetime.now()  # 过期按墙上时间算（同 SDK 的 search），不按 question_time
-            gone = self.expired_ids(space_id, now) if hide_expired else frozenset()
+            gone: frozenset[str] = frozenset()
+            if hide_expired:
+                gone = expired if expired is not None else self.expired_ids(space_id, now)
             recall = self._retrieve(
                 space_id,
                 question,
@@ -1918,11 +1926,14 @@ class MemorySystem:
                 k=k,
                 l1=l1,
                 l2=l2,
-                exclude=frozenset(exclude) | gone if gone else exclude,
+                exclude=exclude,
+                hidden=gone,
                 cache_scope=cache_scope,
                 candidates=candidates,
             )
             out = self._without(space_id, recall, gone, now) if gone else recall
+            if hide_expired:
+                out = replace(out, expired=gone)
             _record_profile(out.view.core)  # 去掉过期的几行之后：记下的是交给模型的画像
             return out
 
@@ -1941,6 +1952,7 @@ class MemorySystem:
         exclude: Collection[str],
         cache_scope: str | None,
         candidates: L1Candidates | None,
+        hidden: frozenset[str] = frozenset(),
     ) -> Recall:
         """retrieve 的检索本身（调用方已经持有读、记着 trace）。"""
         when = naive_local(question_time) if question_time is not None else datetime.now()
@@ -1952,7 +1964,15 @@ class MemorySystem:
             candidates = None
         if mode == "auto":
             decision, candidates, used = self._route(
-                space_id, question, when, l1 or L1Config(), router, lam, cache_scope, exclude
+                space_id,
+                question,
+                when,
+                l1 or L1Config(),
+                router,
+                lam,
+                cache_scope,
+                exclude,
+                hidden,
             )
             level = decision.level.lower()
             if decision.see:  # 再感知：回答时附上最相关的 3 张原图（N6）
@@ -1967,7 +1987,9 @@ class MemorySystem:
             if candidates is not None:  # 探针已经打过分：直接打包，不重复检索
                 result = self.l1.pack(space_id, candidates, cfg)
             else:
-                result = self.l1.search(space_id, question, when, cfg, exclude=exclude)
+                result = self.l1.search(
+                    space_id, question, when, cfg, exclude=exclude, hidden=hidden
+                )
             view = MemoryView(
                 rounds=result.rounds,
                 facts=result.facts,
@@ -1985,6 +2007,7 @@ class MemorySystem:
             l2_cfg,
             cache_scope=cache_scope,
             exclude=exclude,
+            hidden=hidden,
             probe=candidates,
         )
         view = MemoryView(
@@ -2018,7 +2041,7 @@ class MemorySystem:
     def _without(
         self, space_id: str, recall: Recall, gone: frozenset[str], now: datetime
     ) -> Recall:
-        """检索结果再去掉过期的：exclude 挡住了各路检索，版本链补上的旧事实与装入的轮里的图片
+        """检索结果再去掉过期的：hidden 挡住了各路检索，版本链补上的旧事实与装入的轮里的图片
         不经过它。"""
         view = recall.view
         media = {mid: m for mid, m in view.media.items() if mid not in gone}
@@ -2042,6 +2065,7 @@ class MemorySystem:
         lam: float | None,
         cache_scope: str,
         exclude: Collection[str] = (),
+        hidden: frozenset[str] = frozenset(),
     ) -> tuple[RouteDecision, L1Candidates | None, Router]:
         """检索控制器选档；学到的控制器先跑探针，选了 L1 时把探针的候选交回去直接打包。
 
@@ -2051,7 +2075,7 @@ class MemorySystem:
             return self.router.decide(question, cache_scope=cache_scope), None, "llm"
         if router == "rule" or self.learned is None:
             return self.controller.decide(question, when), None, "rule"
-        probe = self.probe.run(space_id, question, when, cfg, exclude=exclude)
+        probe = self.probe.run(space_id, question, when, cfg, exclude=exclude, hidden=hidden)
         has_images = probe.features.get("m_media", 0.0) > 0
         p_none: float | None = None
         asked = False

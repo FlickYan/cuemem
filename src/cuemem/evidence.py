@@ -131,6 +131,7 @@ def context_evidence(
                 mode="l1",
                 candidates=recall.candidates,
                 hide_expired=True,
+                expired=recall.expired,  # 第一次检索算过的，不再算一遍
             )
         evidence = evidence_from(recall, query, now)
     if raised:
@@ -278,6 +279,7 @@ def recall_listing(
                 mode="l1",
                 candidates=recall.candidates,
                 hide_expired=True,
+                expired=recall.expired,  # 第一次检索算过的，不再算一遍
             )
     view = recall.view
     decision = recall.decision

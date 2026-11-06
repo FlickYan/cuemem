@@ -769,6 +769,60 @@ def test_context_leaves_out_expired_memories(mem: Mem) -> None:
     assert "snow" in text and "rain" not in text
 
 
+def test_expired_memories_do_not_take_recall_slots(system: MemorySystem) -> None:
+    """过期的近似说法不再占召回的名额（第七轮体检 P5）：以前它们加进 exclude，各路先取前 30 条、
+    再去掉它们，有效的记忆被挤出候选（300 条过期的近似说法时装入的对话片段从 33 条降到 29 条）；
+    现在在检索里就排除，各路的前 30 条都是有效的记忆，召回的不比没有过期记忆的空间少。"""
+    mem = Memory.from_system(system)
+    question = "what is the daily special at the cafe?"
+    yesterday = date.today() - timedelta(days=1)
+    for user, expired in (("plain", 0), ("crowded", 300)):
+        lunch = "I had lunch at the cafe, their daily special is pasta carbonara"
+        mem.add(lunch, user_id=user, infer=False)
+        for i in range(50):
+            note = f"note {i} about gardening tomatoes and bicycles number {i}"
+            mem.add(note, user_id=user, infer=False)
+        for i in range(expired):
+            text = f"what is the daily special at the cafe? it is the soup {i}"
+            mem.add(text, user_id=user, infer=False, expiration_date=yesterday)
+        mem.consolidate(user_id=user)
+    plain = mem.context(question, user_id="plain", mode="l1")
+    crowded = mem.context(question, user_id="crowded", mode="l1")
+    assert crowded["recalled"] >= plain["recalled"]
+    assert "pasta" in crowded["context"] and "soup" not in crowded["context"]
+    recall = system.retrieve("crowded", question, mode="l1", hide_expired=True)
+    rounds = [h.unit.text for h in recall.view.rounds]
+    plain_rounds = system.retrieve("plain", question, mode="l1", hide_expired=True).view.rounds
+    assert len(rounds) >= len(plain_rounds) and not any("soup" in t for t in rounds)
+    # 改走 L1 的第二次检索用第一次算出的过期记忆，不再算一遍
+    assert recall.expired is not None and len(recall.expired) >= 300
+
+
+def test_raising_l0_computes_the_expired_memories_once(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """控制器选了 L0、context 与 recall_listing 改走 L1 时，第二次检索用第一次算出的过期记忆
+    （Recall.expired），不再算一遍（第七轮体检 P5：以前每次 context 算两遍）。"""
+    import cuemem.memory as memory_module
+
+    mem = Memory.from_system(system)
+    yesterday = date.today() - timedelta(days=1)
+    mem.add("I work at Acme", user_id="ann", timestamp=AUG, wait=True)
+    mem.add("I like rain", user_id="ann", expiration_date=yesterday, wait=True)
+    calls: list[str] = []
+    real = memory_module.expired_ids
+
+    def counting(db: Any, space: str, now: datetime) -> frozenset[str]:
+        calls.append(space)
+        return real(db, space, now)
+
+    monkeypatch.setattr(memory_module, "expired_ids", counting)
+    raised = mem.context("Hi there", user_id="ann")
+    assert raised["level"] == "L1" and raised["reasons"] == [RAISED_REASON]
+    assert "I like rain" not in raised["context"]
+    assert len(calls) == 1
+
+
 def test_context_respects_the_key_scope(system: MemorySystem) -> None:
     """限定作用域的令牌：POST /api/v1/context 点名作用域之外的用户时 403，与 search 相同。"""
     eve_token = "eve-token-0123456789"

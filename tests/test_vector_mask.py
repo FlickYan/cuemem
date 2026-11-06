@@ -165,3 +165,50 @@ def test_only_this_stores_collections_are_patched(tmp_path: Path, counted: list[
     assert [h.unit_id for h in store.search_dense("s", np.ones(4), 5, kinds=["fact"])] == ["a"]
     assert counted == [1]
     store.close()
+
+
+def test_hidden_ids_are_left_out_inside_the_search(tmp_path: Path, counted: list[int]) -> None:
+    """hidden_ids（过期的记忆，第七轮体检 P5）在检索里就排除：前 k 条都是别的点，与"多取再去掉"
+    的结果逐条相同（顺序与分数），也不走上游的逐点过滤（上游每个点都把整个 ID 列表重组一遍）。"""
+    store = _store(tmp_path, n=120)
+    query = np.array([1.0, 0.5, 0.2, 0.1], dtype=np.float32)
+    every = store.search_dense("s", query, 200, kinds=["round", "fact"])
+    hidden = {h.unit_id for h in every[:15]} | {"never-stored"}
+    hits = store.search_dense("s", query, 10, kinds=["round", "fact"], hidden_ids=hidden)
+    expected = [(h.unit_id, h.score) for h in every if h.unit_id not in hidden][:10]
+    assert [(h.unit_id, h.score) for h in hits] == expected and len(hits) == 10
+    probe = SparseVector(indices=[1, 8], values=[1.0, 1.0])
+    every_sparse = store.search_sparse("s", probe, 200, kinds=KINDS)
+    gone = {h.unit_id for h in every_sparse[:5]}
+    sparse_hits = store.search_sparse("s", probe, 5, kinds=KINDS, hidden_ids=gone)
+    assert [h.unit_id for h in sparse_hits] == [
+        h.unit_id for h in every_sparse if h.unit_id not in gone
+    ][:5]
+    assert counted == []
+
+    # 掩码与上游逐位相同：带 kind 的、不带 kind 的（以文搜图的集合没有 kind）
+    coll = _collection(store)
+    upstream = coll._payload_and_non_deleted_mask.args[1]
+    for kinds in (["fact"], None):
+        payload_filter = vector_module._build_filter(kinds, None, hidden)
+        for vector_name in (None, "dense", "sparse"):
+            expected_mask = _upstream(coll, payload_filter, vector_name)
+            got = vector_module._fast_mask(coll, upstream, payload_filter, vector_name)
+            assert np.array_equal(got, expected_mask), (kinds, vector_name)
+    # 没有 hidden_ids 时过滤条件与以前完全相同
+    assert vector_module._build_filter(["fact"], None, ()) == _kind_filter(["fact"])
+    assert vector_module._build_filter(None, None, frozenset()) is None
+    store.close()
+
+
+def test_hidden_images_are_left_out(tmp_path: Path) -> None:
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    rng = np.random.default_rng(1)
+    vectors = rng.random((12, 2)).astype(np.float32)
+    ids = [f"m{i}" for i in range(12)]
+    store.upsert_images("s", ids, vectors, [{"ts": float(i)} for i in range(12)])
+    every = store.search_images("s", vectors[0], 12)
+    hidden = {h.unit_id for h in every[:4]}
+    hits = store.search_images("s", vectors[0], 5, hidden_ids=hidden)
+    assert [h.unit_id for h in hits] == [h.unit_id for h in every if h.unit_id not in hidden][:5]
+    store.close()

@@ -92,16 +92,13 @@ def expired_ids(db: MemoryDB, space: str, now: datetime) -> frozenset[str]:
     if not gone:
         return frozenset()
     turns = sorted(gone)
-    sessions: set[str] = set()
-    for start in range(0, len(turns), 500):
-        sessions.update(t.session_id for t in db.get_turns(space, ids=turns[start : start + 500]))
+    within = sorted(db.turn_sessions(space, turns))
 
     def dead(turn_ids: Sequence[str]) -> bool:
         return bool(turn_ids) and all(t in gone for t in turn_ids)
 
-    within = sorted(sessions)
-    ids = {u.id for u in db.list_units(space, session_ids=within) if dead(u.source_turn_ids)}
-    ids.update(f.id for f in db.get_facts(space, session_ids=within) if dead(f.source_turn_ids))
-    for start in range(0, len(turns), 500):
-        ids.update(m.id for m in db.get_media(space, turn_ids=turns[start : start + 500]))
+    # 只读 ID 与出处两列（第七轮体检 P5）：以前给这些会话的每个检索单元、每条事实都构造一个
+    # pydantic 模型，2 万句发言的空间里过期 4000 句时每次检索要多花 1 秒以上
+    ids = {uid for uid, sources in db.sources_in(space, within) if dead(sources)}
+    ids.update(db.media_of_turns(space, turns))
     return frozenset(ids)

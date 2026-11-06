@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -148,3 +149,29 @@ def test_token_budget_packing(toy: tuple[MemorySystem, ScriptedModel]) -> None:
     assert 1 <= len(small.rounds) < len(large.rounds) == 9  # 示例对话一共 9 轮
     assert sum(estimate_tokens(h.unit.text) for h in small.rounds) <= 40 or len(small.rounds) == 1
     assert estimate_tokens("我买了笔记本") == 7 and estimate_tokens("abcdefgh") == 3
+
+
+def test_hidden_rounds_free_their_bm25_and_dense_slots(
+    toy: tuple[MemorySystem, ScriptedModel],
+) -> None:
+    """hidden（过期的记忆，第七轮体检 P5）在各路检索里就排除：BM25 与 dense 每路仍取满 pool 条，
+    结果与"取全部再去掉"的前 pool 条相同；exclude 照旧先取前 pool 条再去掉（N8 的做法不变）。"""
+    system, _ = toy
+    when = datetime(2025, 10, 10)
+    question = "我现在在哪工作？"
+    cfg = L1Config(pool=4, sparse="bm25")
+    full = system.l1.candidates("demo", question, when, replace(cfg, pool=100))
+    order = [uid for uid, _ in full.routes[("round", "dense")]]
+    words = [uid for uid, _ in full.routes[("round", "sparse")]]
+    assert len(order) == 9 and len(words) > 4  # 示例对话一共 9 轮
+    hidden = frozenset(order[:3]) | frozenset(words[:2])
+    found = system.l1.candidates("demo", question, when, cfg, hidden=hidden)
+    assert [u for u, _ in found.routes[("round", "dense")]] == [
+        u for u in order if u not in hidden
+    ][:4]
+    assert [u for u, _ in found.routes[("round", "sparse")]] == [
+        u for u in words if u not in hidden
+    ][:4]
+    assert not {rid for rid, _ in found.ranked} & hidden
+    excluded = system.l1.candidates("demo", question, when, cfg, exclude=hidden)
+    assert len(excluded.routes[("round", "dense")]) == 4 - len(hidden & set(order[:4]))

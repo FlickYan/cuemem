@@ -184,11 +184,19 @@ class Probe:
         cfg: L1Config | None = None,
         *,
         exclude: Collection[str] = (),
+        hidden: Collection[str] = (),
     ) -> ProbeResult:
-        """exclude：已经在上下文里的轮与图片（Agent 的工作记忆），不算作探针的命中。"""
+        """exclude：已经在上下文里的轮与图片（Agent 的工作记忆），不算作探针的命中；hidden：
+        过期的记忆，在各路检索里就排除（见 read/l1.py）。"""
         started = time.perf_counter()
         cands = self.l1.candidates(
-            space_id, question, question_time, cfg or L1Config(), exclude=exclude, probe=True
+            space_id,
+            question,
+            question_time,
+            cfg or L1Config(),
+            exclude=exclude,
+            hidden=hidden,
+            probe=True,
         )
         features = {
             **query_features(question, cands.query),

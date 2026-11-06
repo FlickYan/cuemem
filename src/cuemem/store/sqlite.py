@@ -198,6 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_units_space ON units (space_id, kind, session_id)
 CREATE INDEX IF NOT EXISTS idx_facts_space ON facts (space_id, subject_id, predicate);
 CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts (space_id, superseded_by);
 CREATE INDEX IF NOT EXISTS idx_facts_current ON facts (space_id, invalidated_at);
+CREATE INDEX IF NOT EXISTS idx_facts_session ON facts (space_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_entities_space ON entities (space_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_space ON jobs (space_id, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (space_id, session_id);
@@ -608,6 +609,25 @@ class MemoryDB:
                 (space_id,),
             ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    def turn_sessions(self, space_id: str, turn_ids: Sequence[str]) -> set[str]:
+        """这几句发言所在的会话（只读 session_id 一列，见 expiry.expired_ids）。"""
+        sql = "SELECT session_id FROM turns WHERE space_id = ?"
+        return {r[0] for r in self._in_chunks(sql, [space_id], "id", turn_ids)}
+
+    def sources_in(self, space_id: str, session_ids: Sequence[str]) -> list[tuple[str, list[str]]]:
+        """这几个会话里的检索单元与事实：（ID，出处的发言），只读这两列、不构造模型（过期的记忆
+        每次检索都要算一遍，见 expiry.expired_ids）。"""
+        rows: list[Sequence[Any]] = []
+        for table in ("units", "facts"):
+            sql = f"SELECT id, source_turn_ids FROM {table} WHERE space_id = ?"
+            rows.extend(self._in_chunks(sql, [space_id], "session_id", session_ids))
+        return [(r[0], json.loads(r[1])) for r in rows]
+
+    def media_of_turns(self, space_id: str, turn_ids: Sequence[str]) -> list[str]:
+        """这几句发言里的图片 ID（只读 id 一列，见 expiry.expired_ids）。"""
+        sql = "SELECT id FROM media WHERE space_id = ?"
+        return [r[0] for r in self._in_chunks(sql, [space_id], "source_turn_id", turn_ids)]
 
     def get_turns(
         self,

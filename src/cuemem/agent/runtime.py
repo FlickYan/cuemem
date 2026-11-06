@@ -320,9 +320,6 @@ class Agent:
             if session.forget_epoch != self.system.forget_epoch(space):
                 self._prune_locked(session)
             exclude = self._window_ids(session)
-            # 过期的记忆不给（同 SDK 的 search 与 MCP 的 recall）：召回打开 hide_expired，
-            # memory_search 也不看它们。空间里没有过期的记忆时 gone 是空的，请求不变
-            gone = self.system.expired_ids(space, datetime.now())
             l1 = L1Config(budget_tokens=self.budget.recalled)
             with span("recall"):
                 recall = self.system.retrieve(
@@ -338,6 +335,10 @@ class Agent:
                     hide_expired=True,
                 )
             timings["recall"] = _ms(started)
+            # 过期的记忆不给（同 SDK 的 search 与 MCP 的 recall）：召回打开了 hide_expired，
+            # memory_search 用召回算出的同一批（在检索里就排除，见 read/l1.py 的 hidden）。
+            # 空间里没有过期的记忆时 gone 是空的，请求不变
+            gone = recall.expired or frozenset()
             if session.profile:  # 模型看到的是会话里的画像快照（重新同步前可能与现在的不同）
                 record_event("profile", facts=[fid for _, fid, _ in session.profile])
             schemas = [t.schema() for t in self.tools.values()]
@@ -356,7 +357,7 @@ class Agent:
             memory = SearchSession(
                 question_time=when,
                 search=lambda query, cfg: self.system.l1.search(
-                    space, query, when, cfg, exclude=exclude | gone if gone else exclude
+                    space, query, when, cfg, exclude=exclude, hidden=gone
                 ),
                 config=replace(L1Config(), budget_tokens=2000),
                 rounds=list(recall.view.rounds),

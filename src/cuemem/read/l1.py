@@ -19,7 +19,11 @@
 打分（candidates）与打包（pack_rounds）分开：L2 对多个子查询分别打分、融合后再打包（read/l2.py）。
 
 exclude（N8）：Agent 的工作记忆（当前会话最近几轮）已经原样放在上下文里，检索时排除这些轮与其中的
-图片，召回的名额留给上下文里没有的记忆。
+图片，召回的名额留给上下文里没有的记忆。各路先取前 pool 条、再去掉它们（N8 是这样量的，不改）。
+
+hidden（第七轮体检 P5）：过期的记忆（MemorySystem.retrieve 的 hide_expired）。与 exclude 不同，它们
+在各路检索里就排除（向量库的过滤条件、BM25 多取几条再去掉），前 pool 条都是别的记忆：以前过期的
+记忆照样占着名额，过期的近似说法一多，有效的记忆就挤不进候选。为空时请求与结果与以前完全相同。
 """
 
 from __future__ import annotations
@@ -103,6 +107,7 @@ class RecallKey:
     sparse: str  # 实际走的稀疏路：v4（有词项权重时）、bm25 或 none
     kinds: tuple[str, ...]  # 检索了哪几种单元
     exclude: frozenset[str]
+    hidden: frozenset[str] = frozenset()  # 在检索里就排除的（过期的记忆，见模块说明）
 
 
 @dataclass
@@ -147,8 +152,11 @@ class L1Retriever:
         cfg: L1Config,
         *,
         exclude: Collection[str] = (),
+        hidden: Collection[str] = (),
     ) -> L1Result:
-        cands = self.candidates(space_id, question, question_time, cfg, exclude=exclude)
+        cands = self.candidates(
+            space_id, question, question_time, cfg, exclude=exclude, hidden=hidden
+        )
         return self.pack(space_id, cands, cfg)
 
     def pack(self, space_id: str, cands: L1Candidates, cfg: L1Config) -> L1Result:
@@ -195,6 +203,7 @@ class L1Retriever:
         query: QueryInfo | None = None,
         dense_vec: FloatArray | None = None,
         exclude: Collection[str] = (),
+        hidden: Collection[str] = (),
         probe: bool = False,
         reuse: L1Candidates | None = None,
     ) -> L1Candidates:
@@ -202,7 +211,8 @@ class L1Retriever:
 
         query 可以传入改写过的问题分析（L2 用查询规划给出的时间区间替换规则解析的结果）；
         dense_vec 是已经算好的查询向量（L2 把几个子查询一次向量化）；
-        exclude 是不参与检索的轮与图片的 ID（已经在上下文里的）。
+        exclude 是不参与检索的轮与图片的 ID（已经在上下文里的），各路取完前 pool 条再去掉；
+        hidden 是过期的记忆，在各路检索里就排除（见模块说明）。
 
         probe：探针要看会话摘要这一路的分数（p_summary_*），summary_weight 为 0 时也检索摘要。
         其他时候权重为 0 就不检索：摘要只给所在会话的轮加 summary_weight × 先验，乘 0 不改分数。
@@ -233,6 +243,7 @@ class L1Retriever:
                 sparse="v4" if v4 else "bm25" if cfg.sparse == "bm25" else "none",
                 kinds=tuple(kinds),
                 exclude=frozenset(exclude),
+                hidden=frozenset(hidden),
             )
             routes = _reusable_routes(reuse, recall)
             if routes is None:
@@ -243,10 +254,14 @@ class L1Retriever:
                 and self._has_images(space_id)
             ):
                 vector = self.image_embedder.embed_texts([question])[0]
-                hits = self.vectors.search_images(space_id, vector, cfg.pool)
+                hits = self.vectors.search_images(
+                    space_id, vector, cfg.pool, hidden_ids=recall.hidden
+                )
                 routes[("media", "visual")] = [(h.unit_id, h.score) for h in hits]
             timings["recall"] = (time.perf_counter() - started) * 1000 - timings["embed"]
-            skip = set(exclude)
+            # hidden 已经在检索里排除了；事实、图片映射回来的轮可能是过期的，打分后与 exclude
+            # 一起再去一遍
+            skip = set(exclude) | recall.hidden
             if skip:  # 打分前从各路召回里去掉；事实、图片映射回来的分数在打分后再去一遍
                 routes = {
                     key: [(uid, score) for uid, score in hits if uid not in skip]
@@ -286,13 +301,19 @@ class L1Retriever:
                 if key.sparse != "none":
                     routes[(kind, "sparse")] = []
                 continue
-            hits = self.vectors.search_dense(space_id, dense_vec, key.pool, kinds=[kind])
+            hits = self.vectors.search_dense(
+                space_id, dense_vec, key.pool, kinds=[kind], hidden_ids=key.hidden
+            )
             routes[(kind, "dense")] = [(h.unit_id, h.score) for h in hits]
             if key.sparse == "v4" and sparse_vec is not None:
-                hits = self.vectors.search_sparse(space_id, sparse_vec, key.pool, kinds=[kind])
+                hits = self.vectors.search_sparse(
+                    space_id, sparse_vec, key.pool, kinds=[kind], hidden_ids=key.hidden
+                )
                 routes[(kind, "sparse")] = [(h.unit_id, h.score) for h in hits]
             elif key.sparse == "bm25":
-                routes[(kind, "sparse")] = self._bm25_search(space_id, kind, key.text, key.pool)
+                routes[(kind, "sparse")] = self._bm25_search(
+                    space_id, kind, key.text, key.pool, key.hidden
+                )
         return routes
 
     # ---------- 融合与重排 ----------
@@ -468,14 +489,21 @@ class L1Retriever:
     def _has_images(self, space_id: str) -> bool:
         return self.db.has_media(space_id)
 
-    def _bm25_search(self, space_id: str, kind: str, query: str, k: int) -> list[tuple[str, float]]:
+    def _bm25_search(
+        self, space_id: str, kind: str, query: str, k: int, hidden: frozenset[str] = frozenset()
+    ) -> list[tuple[str, float]]:
+        """hidden：多取 len(hidden) 条、去掉它们再取前 k 条（结果已经按分数排好，与排除之后的
+        前 k 条相同）。"""
         units = self.db.list_units(space_id, kinds=[kind])
         cached = self._bm25.get((space_id, kind))
         if cached is None or cached[0] != len(units):
             cached = (len(units), BM25([u.text for u in units]), units)
             self._bm25[(space_id, kind)] = cached
         _, index, indexed = cached
-        return [(indexed[i].id, score) for i, score in index.search(query, k)]
+        if not hidden:
+            return [(indexed[i].id, score) for i, score in index.search(query, k)]
+        found = index.search(query, k + len(hidden))
+        return [(indexed[i].id, score) for i, score in found if indexed[i].id not in hidden][:k]
 
 
 def collect_media(

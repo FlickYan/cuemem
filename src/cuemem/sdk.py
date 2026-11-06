@@ -762,7 +762,12 @@ class Memory:
             raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
             if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同：不把探针的检索再做一遍
                 recall = self.system.retrieve(
-                    space, query, question_time=when, mode="l1", candidates=recall.candidates
+                    space,
+                    query,
+                    question_time=when,
+                    mode="l1",
+                    candidates=recall.candidates,
+                    expired=recall.expired,
                 )
             select = _Select(
                 run_id, where, _scope_record(user_id, agent_id), datetime.now(), show_expired
