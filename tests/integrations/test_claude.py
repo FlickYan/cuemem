@@ -3,6 +3,7 @@ tool_runner 用 SDK 自己的客户端配上模拟的传输层，CueMem 用脚�
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -20,7 +21,7 @@ anthropic = pytest.importorskip("anthropic")
 
 import httpx2  # noqa: E402
 from anthropic.lib.tools import ToolError  # noqa: E402
-from fakes import FakeAPI  # noqa: E402
+from fakes import PROJECT_ROOT, FakeAPI  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from scripted import ScriptedModel  # noqa: E402
@@ -1246,3 +1247,20 @@ def test_a_remote_client_is_refused_up_front(tmp_path: Path) -> None:
             with pytest.raises(TypeError, match="needs a local Memory or AsyncMemory"):
                 make()
     assert not store.exists()
+
+
+def test_the_example_sends_the_whole_history() -> None:
+    """第七轮体检 P15：示例的 tool_runner 传 thread=False。anthropic 2.3 起默认在服务端的线程上
+    跑，带证据块的消息留在供应商那边，CueMem 的 forget / delete_all 管不到（D-073 留到以后的第 7
+    项）。"""
+    source = (PROJECT_ROOT / "examples" / "integrations" / "claude_example.py").read_text()
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "tool_runner"
+    ]
+    assert len(calls) == 1
+    thread = {k.arg: k.value for k in calls[0].keywords}.get("thread")
+    assert isinstance(thread, ast.Constant) and thread.value is False

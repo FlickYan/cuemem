@@ -1,6 +1,6 @@
 """OpenAI Agents SDK 集成（N12）：记忆工具、调用模型前先过检索控制器、对话写进长期记忆。
 
-    from agents import Agent, RunConfig, Runner
+    from agents import Agent, ModelSettings, RunConfig, Runner
     from cuemem import Memory
     from cuemem.integrations.openai_agents import CueMemSession, memory_input_filter, memory_tools
 
@@ -9,6 +9,7 @@
     config = RunConfig(
         call_model_input_filter=memory_input_filter(memory, user_id="alice"),
         trace_include_sensitive_data=False,  # 注入的记忆不上传到 trace 后台
+        model_settings=ModelSettings(store=False),  # 响应（连同证据）不存到供应商那边
     )
     async with CueMemSession("chat-1", memory, user_id="alice") as session:
         await Runner.run(agent, "I moved to Lisbon", session=session, run_config=config)
@@ -31,6 +32,14 @@
   （conversation_id、previous_response_id、auto_previous_response_id）用这个：改过的用户消息会被
   SDK 当成另一条，原消息每次调用都重发，带着证据块存到服务端（遗忘管不到）。用 "message" 时过滤器
   察觉到这种情况（这一轮的工具结果前面没有工具调用）会给出警告、不再注入。
+  "instructions" 只是让证据不进之后各次调用重放的对话条目，不是不存到服务端：见下一段。
+
+供应商那边的副本：Agents SDK 不设 ModelSettings.store 时，Responses API 保存每个响应（连同它的
+instructions 与输入，两种位置的证据块都在里面，至少 30 天），除非 store=False 或组织开了零数据
+保留；这份副本在 CueMem 的遗忘（forget、delete_all）之外。历史由客户端保存时（CueMemSession、
+result.to_input_list()）用 RunConfig(model_settings=ModelSettings(store=False),
+call_model_input_filter=..., trace_include_sensitive_data=False)。服务端保存对话状态时
+（previous_response_id、conversation_id）要靠保存下来的响应，这份副本避免不了，遗忘也管不到。
 
 会话（D-045）：一个 SDK 会话在 CueMem 里是一段或几段会话（session_for 给出第一段的 ID；不同的
 session_id 不会撞在一起）。写入时标记为进行中、不抽取；end()、async with 结束、空闲超过
