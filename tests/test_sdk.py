@@ -27,7 +27,7 @@ from cuemem.config import PathsConfig, Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
-from cuemem.evidence import RAISED_REASON, recall_listing, stored_text
+from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, stored_text
 from cuemem.memory import _open_mark
 from cuemem.sdk import _matches, parse_messages, space_for
 from cuemem.store.vector import VectorStore
@@ -1246,7 +1246,9 @@ def test_served_profile_and_chat_drop_expired_memories(
     service = ChatService(memory.system, agent)
     assert service.profile("u") == "- I like jazz"
     result = asyncio.run(build_server(service, "u").call_tool("profile", {}))
-    assert "".join(getattr(c, "text", "") for c in result.content) == "- I like jazz"
+    assert "".join(getattr(c, "text", "") for c in result.content) == format_profile(
+        "- I like jazz"
+    )
     app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
     with TestClient(app) as http:
         assert http.get("/api/spaces/u/profile").json() == {"text": "- I like jazz"}

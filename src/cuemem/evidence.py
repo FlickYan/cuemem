@@ -358,6 +358,13 @@ def format_listing(found: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_profile(text: str) -> str:
+    """MCP 的 profile 工具：非空的画像与 format_listing 里的一样逐行加 "| "，最后一行 LISTING_END。
+    以前原样返回，一条多行的事实陈述能在 forget 工具旁边顶格写出 "Facts:" 与 "[f_…] (said …)"
+    （第七轮体检 P1）。"""
+    return "\n".join([LISTING_NOTE, "", "Profile:", _quoted(text), "", LISTING_END])
+
+
 def resolve_ids(
     system: MemorySystem, space: str, ids: Sequence[str]
 ) -> tuple[list[str], list[str]]:

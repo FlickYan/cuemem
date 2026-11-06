@@ -39,7 +39,7 @@ from starlette.types import Receive, Scope, Send
 from cuemem.api.auth import UNAUTHORIZED, AnyKeys, bearer_principal, identity_headers
 from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
-from cuemem.evidence import forget_summary, format_listing
+from cuemem.evidence import forget_summary, format_listing, format_profile
 from cuemem.sdk import space_for
 
 INSTRUCTIONS = """CueMem is a long-term memory of past conversations with this user.
@@ -86,7 +86,8 @@ def build_server(service: ChatService, space_id: str | None = None) -> MCPServer
     @server.tool()
     def profile() -> str:
         """The user's profile: the most important facts that are currently true."""
-        return service.profile(space()) or "Nothing is known about the user yet."
+        text = service.profile(space())  # 与 recall 的清单一样逐行引用（format_profile）
+        return format_profile(text) if text else "Nothing is known about the user yet."
 
     return server
 
