@@ -161,7 +161,7 @@ with CueMemMemoryTool(memory, user_id="alice") as tool:
             if results is not None:
                 history.append(results)
 
-delete_all(memory, user_id="alice")  # memories and Claude's files, together (memory.delete_all does both too)
+delete_all(memory, user_id="alice")  # memories and Claude's files; memory.delete_all does both too
 ```
 
 - **Not run against the real Claude API:** there was no Anthropic key, and DeepSeek's Anthropic-compatible endpoint rejects `memory_20250818`. Offline tests drive every tool command directly. The live smoke test drove the same commands through DeepSeek as a regular tool.
