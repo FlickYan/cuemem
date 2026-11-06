@@ -602,7 +602,7 @@ N12 之后，CueMem 有了 SDK、记忆代理、三个框架集成、HTTP 接口
   - [ ] SDK 给 data URL 图片的临时文件在 `kill -9` 之后可能留在 `$TMPDIR`；与评测空间同时写进同样字节的新图片崩溃时会丢那个文件
   - [ ] 锁靠 `flock`，NFS 上可能不起作用；几个数据目录指向同一个 Qdrant 服务端与空间时仍共用集合
   - [ ] `get_all` 的条目没有 `negated` 与基数（P22 否掉时记下的）
-  - [ ] D-073 仍留着的：很多令牌加起来能占满线程；一次多条消息的 `add()` 按抽取的顺序；不用生成的键自动重试；`CUEMEM_API_KEYS` 与 `CUEMEM_API_TOKEN` 改了要重启；Python 3.14 下的 Intel Mac 装不了 `local`
+  - [ ] D-073 仍留着的：很多令牌加起来能占满线程，界面的路由不计入每个令牌的上限；一次多条消息的 `add()` 按抽取的顺序；不用生成的键自动重试，`delete_all()` 删整个用户或 `reset()` 之后的重发会再写一次；`CUEMEM_API_KEYS` 与 `CUEMEM_API_TOKEN` 改了要重启；Python 3.14 下的 Intel Mac 装不了 `local`，macOS 13 上的 Apple Silicon 也不支持它
 
 **验收结果**：
 - 20 处修复与复审的 6 处里，每个行为修复都有在修复之前失败的测试；代码与测试改了 58 个文件（不计文字的文档，含 `docs/openapi-v1.json`、`docker-compose.yml` 与 Claude 示例），新增 76 个测试函数；收集 1,543 个测试，去掉 6 个联网的，离线跑 1,537 个，其中 23 个在没装外部基线的包（18 个）或没有 Qdrant 服务端（5 个）时跳过、改由 CI 跑；ruff、mypy 通过。
