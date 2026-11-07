@@ -95,16 +95,19 @@ def main() -> None:
         cells = {**mem0, **{k: v for k, v in base.items() if k[0] in set(ids)}}
         methods: dict[str, Any] = {}
         for method in ["M0", *CUEMEM]:
-            rows = [cells[(sid, method)] for sid in ids if (sid, method) in cells]
-            if not rows:
+            # 不能叫 rows：外层的 rows 是全部运行，下一个 RUNS 条目还要用
+            method_rows = [cells[(sid, method)] for sid in ids if (sid, method) in cells]
+            if not method_rows:
                 continue
             by_type: dict[str, list[bool]] = defaultdict(list)
-            for row in rows:
+            for row in method_rows:
                 by_type[row["question_type"]].append(bool(row["correct"]))
+            n = len(method_rows)
+            cost = sum(r["usage"]["cost"] for r in method_rows)
             methods[method] = {
-                "n": len(rows),
-                "accuracy": round(sum(r["correct"] for r in rows) / len(rows), 4),
-                "cost_per_1k": round(sum(r["usage"]["cost"] for r in rows) / len(rows) * 1000, 2),
+                "n": n,
+                "accuracy": round(sum(r["correct"] for r in method_rows) / n, 4),
+                "cost_per_1k": round(cost / n * 1000, 2),
                 "by_type": {t: round(sum(v) / len(v), 3) for t, v in sorted(by_type.items())},
             }
         paired = {}
@@ -135,8 +138,9 @@ def main() -> None:
             "mem0_session_recall": round(sum(recall) / len(recall), 3) if recall else None,
         }
         print(f"\n{run}（{len(ids)} 题）")
-        for method, row in methods.items():
-            print(f"  {LABELS[method]:<40} {row['accuracy']:.1%}  ${row['cost_per_1k']:.2f} / 1k q")
+        for method, stats in methods.items():
+            line = f"{stats['accuracy']:.1%}  ${stats['cost_per_1k']:.2f} / 1k q"
+            print(f"  {LABELS[method]:<40} {line}")
         for name, row in paired.items():
             print(f"  {name}: +{row['wins']} / -{row['losses']}  p={row['p']:.3g}")
         print(f"  写入：{result[run]['write']}")

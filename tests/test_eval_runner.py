@@ -999,6 +999,42 @@ def test_n11_mem0_does_not_write_without_every_run(
     assert [p.name for p in out.parent.iterdir()] == ["mem0.json"]
 
 
+def test_n11_mem0_writes_both_runs(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """四个运行都在时两个 Mem0 运行都写进 mem0.json：以前方法循环里的列表也叫 rows，盖掉了
+    全部运行那个 dict，第二个运行 rows[run] 拿字符串去索引列表，TypeError（复现脚本的 N11
+    这步跑不通）。"""
+    module = _script_module("n11_mem0")
+    out = _published(tmp_path, module, "mem0.json")
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    monkeypatch.setattr(module, "write_cost", lambda *args: {})
+    runs = tmp_path / "eval"
+
+    def row(sample: str, method: str, correct: bool = True) -> dict[str, Any]:
+        return {
+            "sample_id": sample,
+            "method": method,
+            "correct": correct,
+            "question_type": "single",
+            "usage": {"cost": 0.001},
+            "space_key": f"k-{sample}",
+        }
+
+    _run_rows(runs, "locomo-test200r-mem0", row("a", "M0"))
+    _run_rows(runs, "test100r-mem0", row("b", "M0", correct=False))
+    _run_rows(runs, "locomo-test7-n9", *(row("a", m) for m in module.CUEMEM))
+    _run_rows(runs, "test400-n9", *(row("b", m) for m in module.CUEMEM))
+    monkeypatch.setenv("CUEMEM_PATHS__EVAL_RUNS", str(runs))
+    module.main()
+    result = json.loads(out.read_text("utf-8"))
+    for run in ("locomo-test200r-mem0", "test100r-mem0"):
+        assert {"M0", "B6"} <= set(result[run]["methods"]), run
+        assert "B6_vs_M0" in result[run]["paired"], run
+    assert result["test100r-mem0"]["paired"]["B6_vs_M0"]["wins"] == 1
+    assert (out.parent / "mem0-holm.json").exists()
+
+
 def test_n11_second_judge_does_not_write_without_every_dataset(
     clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
