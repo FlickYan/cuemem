@@ -41,9 +41,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import mimetypes
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import groupby
 from pathlib import Path
@@ -51,7 +53,7 @@ from typing import Any
 
 from PIL import Image
 
-from cuemem.core.models import SessionIn, Turn, TurnIn, TurnMeta
+from cuemem.core.models import MediaItem, SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.core.timeutil import normalize_expiry
 from cuemem.memory import MemorySystem, _open_mark
 from cuemem.store.media import ACCEPTED_FORMATS
@@ -59,6 +61,8 @@ from cuemem.store.sqlite import MemoryDB
 
 FORMAT = "cuemem.space"
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
+# iter_export_json 攒到这么多个字符就写出一段（只有文字的空间不必每句发言一段）
+EXPORT_CHUNK_BYTES = 1 << 16
 # PIL 认出的格式 → 临时文件的后缀（媒体库按后缀存放）；没列出的格式用 .img（同 SDK 的 data URL）。
 # 导入只认 store/media.py 的 ACCEPTED_FORMATS（MPO 经 JPEG 的解码器打开）
 _FORMAT_SUFFIX = {
@@ -72,48 +76,138 @@ _FORMAT_SUFFIX = {
 }
 
 
-def export_space(
-    system: MemorySystem | MemoryDB, space_id: str, *, derived: bool = True
-) -> dict[str, Any]:
-    """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。
+@dataclass(frozen=True)
+class ExportPlan:
+    """export_plan 的结果：导出一个空间要的、不带原图的那些（会话按开始时间排好，发言与原图在
+    写出时再读）。"""
 
-    只读数据库与原图，不用向量库：cuemem export 只打开数据库（向量库打不开、或者 serve 正开着
-    它的时候也能导出）。"""
+    db: MemoryDB
+    space_id: str
+    sessions: list[tuple[str, datetime]]
+    media: dict[str, MediaItem]
+    meta: dict[str, TurnMeta]
+    log_only: set[str]
+    derived: dict[str, Any] | None
+
+
+def export_plan(
+    system: MemorySystem | MemoryDB, space_id: str, *, derived: bool = True
+) -> ExportPlan:
+    """导出的第一步：会话、图片记录、附加信息与派生记忆的快照，不读原图（便宜）。没有这个空间时
+    KeyError（HTTP 接口据此在开始写响应之前回 404）。"""
     db = system if isinstance(system, MemoryDB) else system.db
     sessions = db.get_sessions(space_id)
     if not sessions:
         raise KeyError(f"No memory space {space_id}")
-    media = {m.id: m for m in db.get_media(space_id)}
-    meta = db.get_turn_meta(space_id)
-    log_only = _log_only(system, space_id)
-    out_sessions = []
-    for session_id, started_at in sorted(sessions.items(), key=lambda item: item[1]):
-        turns = db.get_turns(space_id, session_id)
-        out: dict[str, Any] = {
-            "session_id": session_id,
-            "started_at": started_at.isoformat(),
-            "turns": [_turn_out(t, media, meta.get(t.id)) for t in turns],
-        }
-        if turns and session_id in log_only:
-            out["infer"] = False
-        out_sessions.append(out)
-    data: dict[str, Any] = {
-        "format": FORMAT,
-        "version": VERSION,
-        "exported_at": datetime.now().replace(microsecond=0).isoformat(),
-        "space_id": space_id,
-        "sessions": out_sessions,
-    }
+    snapshot: dict[str, Any] | None = None
     if derived:
         core = db.get_core_memory(space_id)
-        data["derived"] = {
+        snapshot = {
             "facts": [
                 f.model_dump(mode="json", exclude={"space_id", "entity_ids"})
                 for f in db.get_facts(space_id)
             ],
             "profile": core.text if core is not None else "",
         }
+    return ExportPlan(
+        db=db,
+        space_id=space_id,
+        sessions=sorted(sessions.items(), key=lambda item: item[1]),
+        media={m.id: m for m in db.get_media(space_id)},
+        meta=db.get_turn_meta(space_id),
+        log_only=_log_only(system, space_id),
+        derived=snapshot,
+    )
+
+
+def export_space(
+    system: MemorySystem | MemoryDB, space_id: str, *, derived: bool = True
+) -> dict[str, Any]:
+    """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。
+
+    只读数据库与原图，不用向量库：cuemem export 只打开数据库（向量库打不开、或者 serve 正开着
+    它的时候也能导出）。整个导出在内存里；HTTP 接口改用 iter_export_json 边读边写。"""
+    plan = export_plan(system, space_id, derived=derived)
+    out_sessions = []
+    for session_id, started_at in plan.sessions:
+        turns = plan.db.get_turns(space_id, session_id)
+        out: dict[str, Any] = {
+            "session_id": session_id,
+            "started_at": started_at.isoformat(),
+            "turns": [_turn_out(t, plan.media, plan.meta.get(t.id)) for t in turns],
+        }
+        if turns and session_id in plan.log_only:
+            out["infer"] = False
+        out_sessions.append(out)
+    data = _header(plan, _now())
+    data["sessions"] = out_sessions
+    if plan.derived is not None:
+        data["derived"] = plan.derived
     return data
+
+
+def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterator[bytes]:
+    """export_space 的 JSON（UTF-8），一段一段地写出：与 Starlette 的 JSONResponse 渲染
+    export_space 的结果逐字节相同（ensure_ascii=False、紧凑的分隔符、同样的键序），但同一时间只有
+    一句发言的原图在内存里（每段最多攒到 EXPORT_CHUNK_BYTES）。exported_at 不给时是现在。
+
+    第八轮体检 P7：以前 /api/v1/export 与 /api/spaces/{space}/export 先把整个空间（每张原图的
+    base64）放进一个 dict 再渲染成一个响应体，峰值约是响应体的三倍；同一张图写了 N 次时媒体库里
+    只有一份，导出里却有 N 份，一个只能写自己空间的令牌就能让一次导出占几 GB。写出途中出错时响应
+    已经开始，只能截断（调用方解析 JSON 时出错）；写出途中被遗忘删掉的原图照样跳过。"""
+    stamp = exported_at if exported_at is not None else _now()
+    head = _dumps({**_header(plan, stamp), "sessions": []})
+    pending = [head[:-2]]  # 去掉 "]}"：后面接各个会话
+    size = len(pending[0])
+    for i, (session_id, started_at) in enumerate(plan.sessions):
+        opening = {"session_id": session_id, "started_at": started_at.isoformat(), "turns": []}
+        pending.append(("," if i else "") + _dumps(opening)[:-2])
+        turns = plan.db.get_turns(plan.space_id, session_id)
+        for j, turn in enumerate(turns):
+            piece = _dumps(_turn_out(turn, plan.media, plan.meta.get(turn.id)))
+            if j:
+                pending.append(",")
+            if len(piece) >= EXPORT_CHUNK_BYTES:  # 带着原图的：不再拼接，免得多一份拷贝
+                if pending:
+                    yield "".join(pending).encode("utf-8")
+                    pending, size = [], 0
+                chunk = piece.encode("utf-8")
+                del piece  # 写出这一段时只留着它的 UTF-8
+                yield chunk
+                del chunk
+                continue
+            pending.append(piece)
+            size += len(piece)
+            if size >= EXPORT_CHUNK_BYTES:
+                yield "".join(pending).encode("utf-8")
+                pending, size = [], 0
+        tail = "," + _dumps({"infer": False})[1:-1] if turns and session_id in plan.log_only else ""
+        pending.append("]" + tail + "}")
+    pending.append("]")
+    if plan.derived is not None:
+        pending.append("," + _dumps({"derived": plan.derived})[1:-1])
+    pending.append("}")
+    yield "".join(pending).encode("utf-8")
+
+
+def _header(plan: ExportPlan, exported_at: str) -> dict[str, Any]:
+    return {
+        "format": FORMAT,
+        "version": VERSION,
+        "exported_at": exported_at,
+        "space_id": plan.space_id,
+    }
+
+
+def _now() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def _dumps(value: Any) -> str:
+    """与 Starlette 的 JSONResponse.render 相同的写法（只是还没编码成 UTF-8）。"""
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
+    )
 
 
 def _log_only(system: MemorySystem | MemoryDB, space_id: str) -> set[str]:
@@ -215,7 +309,10 @@ def _turn_out(turn: Turn, media: Mapping[str, Any], meta: TurnMeta | None) -> di
         if item is None or not Path(item.path).is_file():
             continue  # 原图已不在（例如被遗忘删掉）：只留文本里的 <image> 标记
         mime = mimetypes.guess_type(item.path)[0] or "image/jpeg"
-        payload = base64.b64encode(Path(item.path).read_bytes()).decode("ascii")
+        try:  # 读出的原图只是 b64encode 的参数：编码完就放掉（导出时内存里少一份）
+            payload = base64.b64encode(Path(item.path).read_bytes()).decode("ascii")
+        except FileNotFoundError:  # 刚被遗忘删掉（边读边写的导出途中）：同上
+            continue
         images.append({"sha256": item.sha256, "mime": mime, "data": payload})
     out: dict[str, Any] = {
         "idx": turn.idx,

@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Annotated, Any, get_args
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -78,7 +78,7 @@ from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError, SessionLimitError, VectorStoreFullError
 from cuemem.memory import MemorySystem, RecallMode
-from cuemem.portable import export_space, import_space
+from cuemem.portable import export_plan, import_space, iter_export_json
 from cuemem.read.controller import Router
 from cuemem.sdk import Memory
 
@@ -685,11 +685,14 @@ def create_app(
             )
         return out
 
-    @api.get("/api/spaces/{space:path}/export")
-    def export(space: AllowedSpace, derived: bool = True) -> dict[str, Any]:
-        """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。"""
+    @api.get("/api/spaces/{space:path}/export", response_class=StreamingResponse)
+    def export(space: AllowedSpace, derived: bool = True) -> StreamingResponse:
+        """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。边读边写（第八轮体检 P7，
+        portable.iter_export_json）：与以前的响应逐字节相同，同一时间只有一句发言的原图在内存里；
+        没有这个空间时在开始写之前 404。"""
         with _errors():
-            return export_space(service.system, space, derived=derived)
+            plan = export_plan(service.system, space, derived=derived)
+        return StreamingResponse(iter_export_json(plan), media_type="application/json")
 
     @api.post("/api/spaces/import")
     def import_(http: Request, data: dict[str, Any], space: str | None = None) -> dict[str, Any]:

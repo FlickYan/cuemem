@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import math
+import os
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ import httpx2
 import pytest
 from fakes import NO_BALANCE, PROJECT_ROOT, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -67,8 +69,10 @@ from cuemem.errors import (
 )
 from cuemem.evidence import MEMORY_NOTE, RAISED_REASON, inject_evidence, recall_evidence
 from cuemem.memory import MemorySystem
+from cuemem.portable import ExportPlan
 from cuemem.sdk import space_for
 from cuemem.store.media import ACCEPTED_FORMATS
+from cuemem.store.sqlite import MemoryDB
 
 Mem = Memory | MemoryClient
 
@@ -249,6 +253,8 @@ RETURNS: dict[str, Any] = {
     "spaces": [],
     "media": b"image",
     "wait": None,
+    # GET /api/v1/export 边读边写（第八轮体检 P7）：调用 Memory._export_plan，再写出这个计划
+    "_export_plan": ExportPlan(cast(MemoryDB, None), "alice", [], {}, {}, set(), None),
 }
 
 
@@ -320,6 +326,8 @@ def test_every_argument_reaches_memory(name: str) -> None:
     called, got = recorder.calls[0]  # open_run 之后，关掉客户端时还会 end_run
     if name == "batch_delete":  # 客户端换成 delete_many 的请求，服务端照样调用 delete_many
         name, args = "delete_many", {"memory_ids": ["m1", "m2"], "dry_run": False}
+    if name == "export":  # 边读边写：服务端调用 Memory._export_plan，参数与 export 相同
+        name = "_export_plan"
     assert called == name
     assert _meaning(name, got) == _meaning(name, args)
 
@@ -993,6 +1001,114 @@ def test_the_proxy_evidence_bytes_are_unchanged(system: MemorySystem) -> None:
         notes.append([found.level, found.recalled, inject_evidence(messages, found.block)])
     digest = hashlib.sha256(json.dumps(notes, sort_keys=True).encode()).hexdigest()
     assert digest == PROXY_NOTE_SHA256
+
+
+EXPORTED_AT = "2026-08-01T10:00:00"
+
+
+def _photo(size: tuple[int, int], color: str | None = None) -> str:
+    """一张 PNG 的 data URL；color 不给时是随机的噪点（压不小）。"""
+    image = (
+        Image.new("RGB", size, color)
+        if color
+        else Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3))
+    )
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode()
+
+
+def _with_image(text: str, url: str) -> list[dict[str, Any]]:
+    block = {"type": "image_url", "image_url": {"url": url}}
+    return [{"role": "user", "content": [{"type": "text", "text": text}, block]}]
+
+
+def test_streamed_export_is_byte_identical_to_the_old_response(
+    system: MemorySystem, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /api/v1/export 与 /api/spaces/{space}/export 边读边写（第八轮体检 P7），响应体与以前
+    JSONResponse 渲染 export_space 的结果逐字节相同：图片、metadata、过期时间、只写日志的会话、
+    不是 ASCII 的文字，派生记忆的快照带与不带。不再有 Content-Length（不是一次渲染好的）。没有
+    这个空间时照旧 404（/api/v1 的出错格式与 /api 的 {"detail": …}）。"""
+    from cuemem import portable
+
+    monkeypatch.setattr(portable, "_now", lambda: EXPORTED_AT)
+    local = Memory.from_system(system)
+    local.add("I live in Berlin", user_id="alice", run_id="s1", timestamp=AUG, wait=True)
+    photo = _with_image("same photo", _photo((9, 9), "green"))
+    local.add(photo, user_id="alice", run_id="s2", wait=True)
+    local.add(  # 最后写：之后的 wait=True 会把它一起抽取
+        _with_image("我住在柏林 — café ☕ </memory>", _photo((9, 9), "green")),
+        user_id="alice",
+        run_id="s3",
+        metadata={"source": "相册", "n": 1.5},
+        expiration_date="2030-01-01",
+        infer=False,
+    )
+    assert system.facts("alice") and system.worker is None  # 后台不会再改它
+    service = ChatService(system, Agent(system, router="rule"))
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, mcp=False)
+    with TestClient(app) as http:
+        for derived in (True, False):
+            old = JSONResponse(portable.export_space(system, "alice", derived=derived)).body
+            plan = portable.export_plan(system, "alice", derived=derived)
+            assert b"".join(portable.iter_export_json(plan, EXPORTED_AT)) == old
+            assert b"".join(portable.iter_export_json(plan)) == old  # 不给时是现在（_now）
+            flag = str(derived).lower()
+            for path in (
+                f"/api/v1/export?user_id=alice&derived={flag}",
+                f"/api/spaces/alice/export?derived={flag}",
+            ):
+                response = http.get(path)
+                assert response.status_code == 200 and response.content == old, path
+                assert "content-length" not in response.headers, path
+                assert response.headers["content-type"] == "application/json"
+        assert [s.get("infer") for s in json.loads(old)["sessions"]].count(False) == 1
+        assert "café" in old.decode() and "derived" not in json.loads(old)
+
+        missing = http.get("/api/v1/export?user_id=nobody")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["type"] == "KeyError"
+        assert http.get("/api/spaces/nobody/export").json() == {"detail": "No memory space nobody"}
+    service.close()
+
+
+def test_an_export_holds_one_turn_of_images_at_a_time(system: MemorySystem) -> None:
+    """同一张约 2 MB 的图写 20 次：媒体库里只有一份，导出里有 20 份。以前整个导出先放进一个
+    dict 再渲染，峰值约是响应体（20 份 base64）的三倍，一个只能写自己空间的令牌就能让并发的几次
+    导出占几 GB；现在边读边写，峰值与写了几次无关，只是一份 base64 的几倍（第八轮体检 P7）。"""
+    import tracemalloc
+
+    from cuemem import portable
+
+    url = _photo((1000, 700))
+    encoded = len(url.split(",", 1)[1])
+    token = "alice-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: alice-app\n    token: {token}\n    scopes:\n      - user: alice\n"
+    )
+    local = Memory.from_system(system)
+    for i in range(20):
+        local.add(_with_image(f"pic {i}", url), user_id="alice", infer=False)
+    with TestClient(v1_app(system, keys)) as http:
+        response = http.get(
+            "/api/v1/export?user_id=alice", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200 and "content-length" not in response.headers
+        assert len(response.content) > 20 * encoded
+    del response
+    plan = portable.export_plan(system, "alice")
+    tracemalloc.start()
+    try:
+        total = 0
+        for chunk in portable.iter_export_json(plan):
+            total += len(chunk)
+            del chunk
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert total > 20 * encoded
+    assert peak < 6 * encoded, (peak, encoded)  # 以前约 60 倍
 
 
 def test_runs_scopes_export_and_load(mem: Mem) -> None:

@@ -82,6 +82,7 @@ from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 # 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
 if TYPE_CHECKING:
     from cuemem.memory import ForgetReport, MemorySystem, Recall
+    from cuemem.portable import ExportPlan
     from cuemem.store.sqlite import MemoryKind
 
 logger = logging.getLogger(__name__)
@@ -1229,6 +1230,15 @@ class Memory:
         from cuemem.portable import export_space
 
         return export_space(self.system, space_for(user_id, agent_id), derived=derived)
+
+    def _export_plan(
+        self, *, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
+    ) -> ExportPlan:
+        """export 的第一步（portable.export_plan，不读原图）：/api/v1/export 接着用
+        portable.iter_export_json 边读边写，不把整个导出放进内存。没有这个空间时 KeyError。"""
+        from cuemem.portable import export_plan
+
+        return export_plan(self.system, space_for(user_id, agent_id), derived=derived)
 
     def load(
         self,

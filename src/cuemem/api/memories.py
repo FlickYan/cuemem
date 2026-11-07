@@ -60,7 +60,7 @@ from fastapi.exception_handlers import (
     request_validation_exception_handler,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, WithJsonSchema
@@ -1080,9 +1080,17 @@ def memories_router(
     def export(
         http: Request, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
     ) -> V1Json:
+        # 边读边写（第八轮体检 P7）：与 Memory.export 的 JSON 逐字节相同，同一时间只有一句发言的
+        # 原图在内存里。以前整个导出（每张原图的 base64）先放进一个 dict 再渲染，峰值约是响应体的
+        # 三倍。没有这个空间时在开始写之前 404；写出途中出错只能截断（MemoryClient 解析时出错）。
+        # 文档里的形状照旧（ExportDocument，docs/openapi-v1.json 不变）
+        from cuemem.portable import iter_export_json
+
         with _sdk_errors(by_id=True):  # 没有这个空间：KeyError（404），与本地相同
             allow(http, user_id, agent_id)
-            return memory.export(user_id=user_id, agent_id=agent_id, derived=derived)
+            plan = memory._export_plan(user_id=user_id, agent_id=agent_id, derived=derived)
+        stream = StreamingResponse(iter_export_json(plan), media_type="application/json")
+        return cast(V1Json, stream)
 
     @router.post("/import", responses=_ok(ImportReport))
     def load(http: Request, request: ImportRequest) -> V1Json:
