@@ -517,6 +517,7 @@ def main() -> None:
     existing = json.loads(path.read_text("utf-8")) if path.exists() else {}
     existing[mode] = {
         "machine": f"{platform.platform()}, {os.cpu_count()} CPUs",
+        "date": datetime.now().date().isoformat(),  # 延迟随代码而变（D-072 的类型掩码快了约 3 倍）
         "embedder": "hash-1024 (no API call; production adds ~110 ms per query)",
         **(
             {"entities_per_round": args.entities_per_round, "photos": args.photos}

@@ -664,17 +664,19 @@ Human audit: 50 judgements were sampled from N9, stratified by dataset (LongMemE
 
 ### 12.5 Scale and deployment
 
-Offline latency benchmark (`scripts/n11_latency.py`, hash embeddings, excluding the ~110 ms query embedding call in production; Apple M2, median of 3 runs per size):
+Offline latency benchmark (`scripts/n11_latency.py`, hash embeddings, excluding the ~110 ms query embedding call in production, median of 3 runs per size). Local mode was re-measured after D-072's kind mask (P9) on a 4-CPU x86 VM (Intel Xeon, 2.1 GHz) on 2026-11-07 ([record](../results/n11-improvements/d072/latency.json)); the Qdrant server column is N11's Apple M2 measurement, not re-measured since (the kind mask only changes local mode), so each column comes from one machine:
 
-| Rounds (retrieval units) | Read path p50: local mode | Read path p50: Qdrant server |
+| Rounds (retrieval units) | Read path p50: local mode, after D-072 (x86 VM) | Read path p50: Qdrant server, N11 (Apple M2) |
 |---|---|---|
-| 500 (1.3k) | 32 ms | 14 ms |
-| 2,000 (4.7k) | 111 ms | 20 ms |
-| 8,000 (19k) | 445 ms | 33 ms |
-| 20,000 (46k) | 1,076 ms | 91 ms |
+| 500 (1.3k) | 20 ms | 14 ms |
+| 2,000 (4.7k) | 80 ms | 20 ms |
+| 8,000 (19k) | 315 ms | 33 ms |
+| 20,000 (46k) | 872 ms | 91 ms |
 
-- Local mode is exact search in Python and grows linearly. A year of daily chats is about 3,600 rounds, or about 0.2 s of local work; beyond that, switch to the server (which now gets payload indexes).
-- Concurrency in one process (2,000 rounds, a simulated 110 ms embedding call): local mode saturates at about 9 reads per second; the server reaches 55 per second with 16 threads.
+N11 measured local mode on the Apple M2 before the kind mask at 32 / 111 / 445 / 1,076 ms ([record](../results/n11-improvements/latency.json)). The two machines differ, so compare the ratio rather than these columns: on the same VM, turning the mask off makes local-mode reads about 2.7 times slower (2,000 rounds, one run: 226 ms against 83 ms; D-072 P9 measured L1-shaped searches at 25k points going from 1.9 s to 0.35 s).
+
+- Local mode is exact search in Python and grows linearly. A year of daily chats is about 3,600 rounds, or about 0.15 s of local work on that VM; beyond that, switch to the server (which now gets payload indexes).
+- Concurrency in one process (2,000 rounds, a simulated 110 ms embedding call): on the VM after D-072, local mode saturates at about 10 reads per second (4.4 with one thread, 9.7 with 4, 10.4 with 16); in N11 the server reached 55 per second with 16 threads on the Apple M2.
 - When another process holds the local vector store, CueMem now says so and explains how to switch to a server. The HTTP API and the UI take an optional access token (`CUEMEM_API_TOKEN`, D-056).
 
 ## 13. N12: external systems under the same protocol
