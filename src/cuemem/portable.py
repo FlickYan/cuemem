@@ -71,6 +71,8 @@ _MEM0_STR_KEYS = ("user_id", "agent_id", "run_id", "actor_id", "role", "attribut
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
 # iter_export_json 攒到这么多个字符就写出一段（只有文字的空间不必每句发言一段）
 EXPORT_CHUNK_BYTES = 1 << 16
+# iter_export_json 每次编码原图的这么多个字节（3 的倍数，编出 1 MiB 的 base64）
+EXPORT_IMAGE_SLICE = 3 << 18
 # PIL 认出的格式 → 临时文件的后缀（媒体库按后缀存放）；没列出的格式用 .img（同 SDK 的 data URL）。
 # 导入只认 store/media.py 的 ACCEPTED_FORMATS（MPO 经 JPEG 的解码器打开）
 _FORMAT_SUFFIX = {
@@ -157,7 +159,8 @@ def export_space(
 def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterator[bytes]:
     """export_space 的 JSON（UTF-8），一段一段地写出：与 Starlette 的 JSONResponse 渲染
     export_space 的结果逐字节相同（ensure_ascii=False、紧凑的分隔符、同样的键序），但同一时间只有
-    一句发言的原图在内存里（每段最多攒到 EXPORT_CHUNK_BYTES）。exported_at 不给时是现在。
+    一张原图在内存里，它的 base64 一段一段地编出、写出（_turn_pieces；文字每段最多攒到
+    EXPORT_CHUNK_BYTES）。exported_at 不给时是现在。
 
     第八轮体检 P7：以前 /api/v1/export 与 /api/spaces/{space}/export 先把整个空间（每张原图的
     base64）放进一个 dict 再渲染成一个响应体，峰值约是响应体的三倍；同一张图写了 N 次时媒体库里
@@ -172,23 +175,20 @@ def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterat
         pending.append(("," if i else "") + _dumps(opening)[:-2])
         turns = plan.db.get_turns(plan.space_id, session_id)
         for j, turn in enumerate(turns):
-            piece = _dumps(_turn_out(turn, plan.media, plan.meta.get(turn.id)))
             if j:
                 pending.append(",")
-            if len(piece) >= EXPORT_CHUNK_BYTES:  # 带着原图的：不再拼接，免得多一份拷贝
-                if pending:
+            for piece in _turn_pieces(turn, plan.media, plan.meta.get(turn.id)):
+                if len(piece) >= EXPORT_CHUNK_BYTES:  # 一段 base64 或很长的文字：不再拼接
+                    if pending:
+                        yield "".join(pending).encode("utf-8")
+                        pending, size = [], 0
+                    yield piece.encode("utf-8")
+                    continue
+                pending.append(piece)
+                size += len(piece)
+                if size >= EXPORT_CHUNK_BYTES:
                     yield "".join(pending).encode("utf-8")
                     pending, size = [], 0
-                chunk = piece.encode("utf-8")
-                del piece  # 写出这一段时只留着它的 UTF-8
-                yield chunk
-                del chunk
-                continue
-            pending.append(piece)
-            size += len(piece)
-            if size >= EXPORT_CHUNK_BYTES:
-                yield "".join(pending).encode("utf-8")
-                pending, size = [], 0
         tail = "," + _dumps({"infer": False})[1:-1] if turns and session_id in plan.log_only else ""
         pending.append("]" + tail + "}")
     pending.append("]")
@@ -335,6 +335,41 @@ def _turn_out(turn: Turn, media: Mapping[str, Any], meta: TurnMeta | None) -> di
     if meta is not None:  # version 2：只写有的那几项
         out.update(meta.model_dump(exclude_defaults=True))
     return out
+
+
+def _turn_pieces(turn: Turn, media: Mapping[str, Any], meta: TurnMeta | None) -> Iterator[str]:
+    """_dumps(_turn_out(...)) 一段一段地给出（iter_export_json）：拼起来逐字符相同，但原图的
+    base64 每段只有 EXPORT_IMAGE_SLICE 个原始字节编出的那么多（base64 不用 JSON 转义，直接写）。
+    第八轮复审：以前整句发言先 json.dumps，一张图同时在内存里有原始字节、base64、转义后与拼接后
+    的字符串、UTF-8 共约五份 base64 那么多；现在只有原始字节（约 0.75 份）加一段。"""
+    head = _dumps(
+        {
+            "idx": turn.idx,
+            "role": turn.role,
+            "text": turn.text,
+            "ts": turn.ts.isoformat(),
+            "speaker": turn.speaker,
+        }
+    )
+    yield head[:-1] + ',"images":['
+    sep = ""
+    for media_id in turn.media_ids:
+        item = media.get(media_id)
+        if item is None or not Path(item.path).is_file():
+            continue  # 原图已不在（例如被遗忘删掉）：只留文本里的 <image> 标记
+        mime = mimetypes.guess_type(item.path)[0] or "image/jpeg"
+        try:
+            raw = memoryview(Path(item.path).read_bytes())
+        except FileNotFoundError:  # 刚被遗忘删掉（边读边写的导出途中）：同上
+            continue
+        yield f'{sep}{{"sha256":{_dumps(item.sha256)},"mime":{_dumps(mime)},"data":"'
+        for start in range(0, len(raw), EXPORT_IMAGE_SLICE):  # 3 的倍数：拼起来同一个 base64
+            yield base64.b64encode(raw[start : start + EXPORT_IMAGE_SLICE]).decode("ascii")
+        del raw
+        yield '"}'
+        sep = ","
+    extra = meta.model_dump(exclude_defaults=True) if meta is not None else {}
+    yield "]" + ("," + _dumps(extra)[1:-1] if extra else "") + "}"
 
 
 def _turn_in(turn: Mapping[str, Any], scratch: Path) -> TurnIn:

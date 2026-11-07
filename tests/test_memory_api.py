@@ -1158,7 +1158,9 @@ def test_streamed_export_is_byte_identical_to_the_old_response(
     service.close()
 
 
-def test_an_export_holds_one_turn_of_images_at_a_time(system: MemorySystem) -> None:
+def test_an_export_holds_one_turn_of_images_at_a_time(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """同一张约 2 MB 的图写 20 次：媒体库里只有一份，导出里有 20 份。以前整个导出先放进一个
     dict 再渲染，峰值约是响应体（20 份 base64）的三倍，一个只能写自己空间的令牌就能让并发的几次
     导出占几 GB；现在边读边写，峰值与写了几次无关，只是一份 base64 的几倍（第八轮体检 P7）。"""
@@ -1183,6 +1185,9 @@ def test_an_export_holds_one_turn_of_images_at_a_time(system: MemorySystem) -> N
         assert len(response.content) > 20 * encoded
     del response
     plan = portable.export_plan(system, "alice")
+    whole = portable.export_space(system, "alice")
+    # 原图的 base64 一段一段地编（第八轮复审）：段小一些，看得出一张图只剩原始字节那么多
+    monkeypatch.setattr(portable, "EXPORT_IMAGE_SLICE", 3 << 12, raising=False)
     tracemalloc.start()
     try:
         total = 0
@@ -1193,7 +1198,10 @@ def test_an_export_holds_one_turn_of_images_at_a_time(system: MemorySystem) -> N
     finally:
         tracemalloc.stop()
     assert total > 20 * encoded
-    assert peak < 6 * encoded, (peak, encoded)  # 以前约 60 倍
+    # 以前约 60 倍；第八轮体检之后约 5 倍（整句发言 json.dumps 时原图有约五份 base64 那么多）
+    assert peak < 1.5 * encoded, (peak, encoded)
+    streamed = b"".join(portable.iter_export_json(plan, whole["exported_at"]))
+    assert streamed == JSONResponse(whole).body  # 一段一段编出的 base64 拼起来逐字节照旧
 
 
 def test_runs_scopes_export_and_load(mem: Mem) -> None:
