@@ -276,33 +276,39 @@ class MemoryDB:
         self._turn_generation = 0  # _turn_writes 清空过几次（见 _count_turn_writes）
         self._rollbacks = 0  # 回滚过的事务与保存点
         with self._lock:
-            # 先读版本，再切 WAL（切换就会写文件头）、建表、补列：更新的 CueMem 写的库原样不动。
-            # 以前每次打开都把 user_version 设成 SCHEMA_VERSION，旧版本打开新库时悄悄调低，
-            # 新的集合名与 turn_meta 都被忽略（检索为空）
-            stored = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-            if stored > SCHEMA_VERSION:
-                self._conn.close()  # 不留句柄：serve、proxy 这样长时间运行的进程里会泄漏
-                raise ConfigMismatchError(
-                    f"{path} 是更新的 CueMem 写的（数据格式 v{stored}，这个版本只支持到"
-                    f" v{SCHEMA_VERSION}）：升级 CueMem（各种安装方式的做法见 README 的“升级”"
-                    "一节），或者用新版本导出（cuemem export）再在这里导入"
-                )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
-            self._conn.executescript(_SCHEMA)
-            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
-            if "speaker" not in columns:  # 从 v1 升级
-                self._conn.execute("ALTER TABLE turns ADD COLUMN speaker TEXT")
-            media_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(media)")}
-            for column, ddl in (
-                ("caption_iso", "TEXT NOT NULL DEFAULT ''"),
-                ("width", "INTEGER NOT NULL DEFAULT 0"),
-                ("height", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                if column not in media_columns:  # 从 v3 升级
-                    self._conn.execute(f"ALTER TABLE media ADD COLUMN {column} {ddl}")
-            self._conn.execute(f"PRAGMA user_version = {max(stored, SCHEMA_VERSION)}")  # 从不调低
-            self._conn.commit()
+            try:
+                # 先读版本，再切 WAL（切换就会写文件头）、建表、补列：更新的 CueMem 写的库原样不动。
+                # 以前每次打开都把 user_version 设成 SCHEMA_VERSION，旧版本打开新库时悄悄调低，
+                # 新的集合名与 turn_meta 都被忽略（检索为空）
+                stored = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+                if stored > SCHEMA_VERSION:
+                    raise ConfigMismatchError(
+                        f"{path} 是更新的 CueMem 写的（数据格式 v{stored}，这个版本只支持到"
+                        f" v{SCHEMA_VERSION}）：升级 CueMem（各种安装方式的做法见 README 的“升级”"
+                        "一节），或者用新版本导出（cuemem export）再在这里导入"
+                    )
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
+                self._conn.executescript(_SCHEMA)
+                columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
+                if "speaker" not in columns:  # 从 v1 升级
+                    self._conn.execute("ALTER TABLE turns ADD COLUMN speaker TEXT")
+                media_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(media)")}
+                for column, ddl in (
+                    ("caption_iso", "TEXT NOT NULL DEFAULT ''"),
+                    ("width", "INTEGER NOT NULL DEFAULT 0"),
+                    ("height", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if column not in media_columns:  # 从 v3 升级
+                        self._conn.execute(f"ALTER TABLE media ADD COLUMN {column} {ddl}")
+                # 从不调低
+                self._conn.execute(f"PRAGMA user_version = {max(stored, SCHEMA_VERSION)}")
+                self._conn.commit()
+            except BaseException:
+                # 打开时出错（更新的 CueMem 写的库、文件损坏、不是 SQLite 数据库、磁盘满了）：不留
+                # 句柄，serve、proxy 这样长时间运行的进程里会泄漏
+                self._conn.close()
+                raise
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

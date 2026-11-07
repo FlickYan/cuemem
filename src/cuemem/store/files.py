@@ -20,7 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
-from cuemem.errors import DatabaseOpenError, StorageLockedError
+from cuemem.errors import CueMemError, DatabaseOpenError, StorageLockedError
 
 if TYPE_CHECKING:
     from cuemem.config import Settings
@@ -73,11 +73,30 @@ def opening(path: Path) -> Iterator[None]:
     """打开数据库、账本或缓存（MemorySystem.from_settings）：SQLite 打不开（目录只读、磁盘满了）
     或者建不了上级目录（挡在路上的是文件，OSError）时换成 DatabaseOpenError，一行说明哪个文件，
     格式与 cli._unopenable 相同。以前原样抛出，cuemem serve、proxy、chat、demo 与 mcp 打印调用栈，
-    也看不出是哪个文件（第七轮体检）。只包打开：用的时候出的错照常抛出。"""
+    也看不出是哪个文件（第七轮体检）。只包打开：用的时候出的错照常抛出。
+
+    文件损坏或者根本不是 SQLite 数据库（SQLITE_NOTADB、SQLITE_CORRUPT*，抛的是 OperationalError
+    的父类 sqlite3.DatabaseError）也一样，换成从备份恢复的说明：以前原样抛出 "file is not a
+    database"，不说是四个文件里的哪一个（第八轮体检）。"""
     try:
         yield
-    except (sqlite3.OperationalError, OSError) as exc:
+    except CueMemError:  # 已经说明了（DatabaseOpenError、StorageLockedError、配置不符）：不再包一层
+        raise
+    except (sqlite3.DatabaseError, OSError) as exc:
+        if corrupt_database(exc):
+            raise DatabaseOpenError(
+                f"{path} 打不开（{exc}）：文件损坏或不是 SQLite 数据库，从备份恢复（见 README 的"
+                "备份与恢复）；缓存与账本可以删掉重建"
+            ) from exc
         raise DatabaseOpenError(f"{path} 打不开（{exc}）：检查目录权限与磁盘空间") from exc
+
+
+def corrupt_database(exc: BaseException) -> bool:
+    """SQLite 认不出这个文件（SQLITE_NOTADB）或者文件损坏了（SQLITE_CORRUPT*）。"""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    name = getattr(exc, "sqlite_errorname", "") or ""
+    return name.startswith(("SQLITE_NOTADB", "SQLITE_CORRUPT"))
 
 
 def lock_database(db: Path) -> IO[str] | None:

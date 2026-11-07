@@ -39,13 +39,17 @@ class EmbeddingCache:
         self._lock = threading.Lock()
         self._deletes = 0  # 删过几次条目（见 version）
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS embed_cache ("
-                " key TEXT PRIMARY KEY, dense BLOB NOT NULL, sparse_idx BLOB, sparse_val BLOB)"
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS embed_cache ("
+                    " key TEXT PRIMARY KEY, dense BLOB NOT NULL, sparse_idx BLOB, sparse_val BLOB)"
+                )
+                self._conn.commit()
+            except BaseException:  # 打开时出错（文件损坏、不是 SQLite 数据库）：不留句柄
+                self._conn.close()
+                raise
 
     def get_many(self, keys: Sequence[str]) -> dict[str, CachedVector]:
         found: dict[str, CachedVector] = {}

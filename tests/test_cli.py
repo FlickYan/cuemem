@@ -245,6 +245,55 @@ def test_unopenable_database_is_one_line_for_servers(
         assert result.stdout == "" and "打不开" in result.stderr
 
 
+@pytest.mark.parametrize("which", ["db", "ledger", "llm_cache", "embed_cache"])
+@pytest.mark.parametrize(
+    "command", [["ask", "hello", "--space", "x"], ["serve", "--no-ui", "--scenario", "plain"]]
+)
+def test_corrupt_store_is_one_line(
+    isolated_paths: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: list[str],
+    which: str,
+) -> None:
+    """数据库、账本或缓存损坏、不是 SQLite 数据库：以前打印 sqlite3.DatabaseError（file is not a
+    database）的调用栈，不说是四个文件里的哪一个；现在一行说明那个文件与从备份恢复，退出码 1
+    （第八轮体检）。"""
+    import sqlite3
+
+    from cuemem.errors import DatabaseOpenError
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    path = tmp_path / which
+    path.write_bytes(os.urandom(8192))
+    calls: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, sqlite3.DatabaseError) or isinstance(
+        result.exception, DatabaseOpenError
+    ), result.exception
+    flat = _flat(result.output)
+    assert _flat(str(path)) in flat and "不是SQLite" in flat and "从备份恢复" in flat, flat
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", [["spaces"], ["export", "--space", "demo"], ["usage"]])
+def test_corrupt_database_is_one_line_for_readers(
+    isolated_paths: None, tmp_path: Path, command: list[str]
+) -> None:
+    """只读数据库（spaces、export）或账本（usage）的命令遇到损坏的文件：一行说明是哪个文件，
+    退出码 1，以前打印调用栈。"""
+    target = tmp_path / ("ledger" if command == ["usage"] else "db")
+    target.write_bytes(os.urandom(8192))
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    flat = _flat(result.output)
+    assert flat.startswith("错误：") and _flat(str(target)) in flat and "不是SQLite" in flat, flat
+
+
 def test_doctor_reports_free_space(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

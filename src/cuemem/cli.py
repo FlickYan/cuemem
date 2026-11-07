@@ -262,13 +262,17 @@ def _unopenable(settings: Settings, exc: sqlite3.OperationalError) -> str:
 def _open_db_only() -> Iterator[MemoryDB]:
     """只打开数据库（cuemem export、spaces、inspect）：不用向量库、模型与缓存，向量库打不开、
     或者 cuemem serve 正开着它的时候也能用（不拿 MemorySystem.from_settings 的数据库锁）。"""
-    from cuemem.store.files import private_dirs, storage_dirs
+    from cuemem.store.files import opening, private_dirs, storage_dirs
     from cuemem.store.sqlite import MemoryDB
 
     settings = _settings()
     private_dirs(*storage_dirs(settings))
     try:
-        db = MemoryDB(settings.paths.db)
+        with opening(settings.paths.db):  # 文件损坏、不是 SQLite 数据库时也是一行（第八轮体检）
+            db = MemoryDB(settings.paths.db)
+    except DatabaseOpenError as exc:  # 已经说明了哪个文件，与 _open_system 相同
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     except sqlite3.OperationalError as exc:
         console.print(_unopenable(settings, exc))
         raise typer.Exit(1) from exc
@@ -730,9 +734,15 @@ def usage(
 ) -> None:
     """汇总模型调用量与成本。"""
     from cuemem.llm.ledger import Ledger
+    from cuemem.store.files import opening
 
     settings = _settings()
-    ledger = Ledger(settings.paths.ledger)
+    try:
+        with opening(settings.paths.ledger):  # 账本损坏、打不开时一行说明哪个文件
+            ledger = Ledger(settings.paths.ledger)
+    except DatabaseOpenError as exc:
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) if today else None
     rows = ledger.summary(run_id=run, since=since)
     ledger.close()

@@ -2551,6 +2551,42 @@ def test_data_path_blocked_by_a_file_raises_database_open_error(
         Memory(offline_settings.model_copy(update={"paths": paths}), background=False)
 
 
+@pytest.mark.parametrize("which", ["db", "ledger", "llm_cache", "embed_cache"])
+def test_corrupt_store_raises_database_open_error(
+    offline_settings: Settings, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    """数据库、账本或缓存损坏、不是 SQLite 数据库（崩溃之后、拷坏了）：以前抛出不带路径的
+    sqlite3.DatabaseError（file is not a database），看不出是四个文件里的哪一个；现在
+    DatabaseOpenError 写明文件与从备份恢复，数据库的锁放掉，坏文件的连接也关掉（第八轮体检）。"""
+    from cuemem.errors import DatabaseOpenError
+    from cuemem.store.files import lock_database, unlock_database
+
+    path: Path = getattr(offline_settings.paths, which)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(os.urandom(8192))
+    opened: list[sqlite3.Connection] = []
+    connect = sqlite3.connect
+
+    def tracking(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = connect(*args, **kwargs)
+        if str(args[0]) == str(path):
+            opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking)
+    with pytest.raises(DatabaseOpenError) as caught:
+        Memory(offline_settings, background=False)
+    assert isinstance(caught.value, sqlite3.OperationalError)
+    assert str(path) in str(caught.value)
+    assert "不是 SQLite 数据库" in str(caught.value) and "从备份恢复" in str(caught.value)
+    assert "检查目录权限" not in str(caught.value)
+    assert opened
+    for conn in opened:  # 已经关掉：再用就是 ProgrammingError
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+    unlock_database(lock_database(offline_settings.paths.db))  # 锁已经放掉
+
+
 def _second_vector_dir(settings: Settings) -> Settings:
     """同一个数据库、另一个向量库目录：两个进程共用数据库、向量在 Qdrant 服务端时的样子
     （本地模式的 Qdrant 锁挡不住它们）。"""
