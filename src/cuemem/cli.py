@@ -2700,6 +2700,7 @@ def _print_jobs(settings: Settings) -> None:
     只读：数据库还不存在时什么都不做、不新建；与 cuemem spaces 一样不拿数据库锁，cuemem serve
     开着时也能看。失败的任务自动重试 MAX_ATTEMPTS 次之后就停了（例如 Key 过期、余额不足），写入
     照样成功、健康检查照样正常，以前只有按用户查 /api/v1/status 才看得到。"""
+    from cuemem.store.files import opening
     from cuemem.store.sqlite import MemoryDB
     from cuemem.write.consolidate import (
         PIPELINE_VERSION,
@@ -2710,7 +2711,9 @@ def _print_jobs(settings: Settings) -> None:
     if not settings.paths.db.is_file():
         return
     try:
-        db = MemoryDB(settings.paths.db)
+        # 文件损坏、不是 SQLite 数据库时说明是哪个文件、从备份恢复（DatabaseOpenError）
+        with opening(settings.paths.db):
+            db = MemoryDB(settings.paths.db)
     except (sqlite3.Error, CueMemError) as exc:
         console.print(f"[yellow]读不了巩固任务[/yellow]：{escape(str(exc))}")
         return

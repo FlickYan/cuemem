@@ -37,6 +37,7 @@ from cuemem.api.proxy import (
     create_proxy_app,
 )
 from cuemem.config import PathsConfig, Settings, load_settings
+from cuemem.core.models import SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
@@ -904,6 +905,44 @@ def test_a_parked_implicit_session_keeps_its_id(
     assert system.worker is not None
     system.worker.wait()
     assert [j["session_id"] for j in system.db.get_jobs("alice")] == [session]
+
+
+def test_forgetting_beside_a_parked_session_keeps_the_replay(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停放（第八轮体检 P1）与遗忘的快速路径（P4）合在一起：停放的会话还在进行中、没有任务，
+    快速路径不把它当作只记了日志的会话：删掉它照旧重放。删掉别的只记了日志的会话照样走快速
+    路径（重放本来就跳过进行中的会话）。之后停放的会话照常闲置结束、交给抽取。"""
+    proxy.max_open_runs = 1
+    for i, sid in enumerate(("s1", "s2")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    assert proxy.parked_runs() == 1 and system.db.get_jobs("alice") == []
+    turns = [TurnIn(role="user", text="I like opera")]  # 只记日志（SDK 的 infer=False）
+    session = SessionIn(session_id="logged", started_at=datetime(2026, 5, 1), turns=turns)
+    system.append("alice", session, 0, enqueue=False)
+    fast: list[bool] = []
+    inert = MemorySystem._inert_sessions
+
+    def spy(self: MemorySystem, *args: Any, **kwargs: Any) -> bool:
+        fast.append(inert(self, *args, **kwargs))
+        return fast[-1]
+
+    monkeypatch.setattr(MemorySystem, "_inert_sessions", spy)
+    assert system.forget("alice", session_ids=["logged"]).turns_deleted == 1
+    assert system.forget("alice", session_ids=["s1"]).turns_deleted == 2
+    assert fast == [True, False]  # 停放的会话进行中、有进行中的标记：不走快速路径
+    clock.now += proxy.idle_s + 2
+    assert proxy.close_idle() == 2
+    assert system.worker is not None
+    system.worker.wait()
+    assert proxy.parked_runs() == 0 and system.open_sessions("alice") == set()
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == ["s2"]
 
 
 def test_a_session_that_is_writing_back_is_not_ended_to_make_room(

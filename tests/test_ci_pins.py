@@ -290,6 +290,12 @@ def test_ci_runs_a_real_server_lifecycle() -> None:
     fastembed = _job_script(workflows / "compat.yml", "fastembed")
     assert "CUEMEM_PRESET=deepseek" in fastembed and "EMBEDDING__BACKEND" not in fastembed
     assert "/api/v1/memories/search" in fastembed and "docker stop cuemem" in fastembed
+    # 收到 SIGTERM 时照样收尾、照 SIGTERM 退出（第八轮体检 P2）：退出码只认 143
+    assert '[ "$s" -eq 143 ]' in package
+    for script in (docker, fastembed):
+        assert '[ "$code" -eq 143 ]' in script
+    for script in (package, docker, fastembed):
+        assert "-eq 0 ]" not in script
 
 
 def test_compose_stop_grace_covers_the_shutdown() -> None:

@@ -143,14 +143,14 @@ jobs:
             for _ in $(seq 60); do curl -fsS "$api/api/health" && return 0; sleep 1; done
             curl -fsS "$api/api/health" || { cat "$1"; exit 1; }
           }
-          # 真的发 SIGTERM（第八轮体检 P20）：40 秒内退出，退出码 0 或 143（收到 SIGTERM 之后
-          # 退出），不是被杀（137）或出错；日志里没有 Traceback。以前只 kill、不看结果
+          # 真的发 SIGTERM（第八轮体检 P20）：40 秒内退出，退出码 143（收尾完、照 SIGTERM 退出，
+          # 第八轮体检 P2），不是被杀（137）或出错；日志里没有 Traceback。以前只 kill、不看结果
           stop() {
             kill -TERM "$1"
             timeout 40 tail --pid="$1" -f /dev/null || { echo "40 秒内没有退出"; cat "$2"; exit 1; }
             s=0
             wait "$1" || s=$?
-            [ "$s" -eq 0 ] || [ "$s" -eq 143 ] || { echo "退出码 $s"; cat "$2"; exit 1; }
+            [ "$s" -eq 143 ] || { echo "退出码 $s"; cat "$2"; exit 1; }
             if grep -F Traceback "$2"; then cat "$2"; exit 1; fi
           }
           cuemem serve --port 7860 > serve.log 2>&1 &
@@ -200,14 +200,14 @@ jobs:
             '{"messages":[{"role":"user","content":"I have a golden retriever"}],"user_id":"ci",
             "infer":false}'
           # docker stop：SIGTERM 之后 30 秒内退出（--stop-timeout 90 秒之后才 SIGKILL，退出码
-          # 137），退出码 0 或 143（cuemem 是 PID 1，收尾完再退出），日志里没有 Traceback
+          # 137），退出码 143（cuemem 是 PID 1，收尾完再照 SIGTERM 退出），日志里没有 Traceback
           start=$(date +%s)
           docker stop cuemem
           took=$(( $(date +%s) - start ))
           code=$(docker inspect -f '{{.State.ExitCode}}' cuemem)
           echo "docker stop 用了 $took 秒，退出码 $code"
           [ "$took" -lt 30 ] || { docker logs cuemem; exit 1; }
-          [ "$code" -eq 0 ] || [ "$code" -eq 143 ] || { docker logs cuemem; exit 1; }
+          [ "$code" -eq 143 ] || { docker logs cuemem; exit 1; }
           if docker logs cuemem 2>&1 | grep -F Traceback; then docker logs cuemem; exit 1; fi
           # 再启动：写过的还在（镜像的 /data 卷）
           docker start cuemem

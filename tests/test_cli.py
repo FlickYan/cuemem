@@ -448,6 +448,17 @@ def test_doctor_does_not_create_the_database(isolated_paths: None, tmp_path: Pat
     assert "排队等待巩固" not in result.output
 
 
+def test_doctor_explains_a_corrupt_database(isolated_paths: None, tmp_path: Path) -> None:
+    """数据库损坏、不是 SQLite 数据库时 doctor 照样跑完，读巩固任务的那一行写明是哪个文件、
+    从备份恢复（第八轮体检 P16 与 P11 合在一起）：以前只有 "file is not a database"。"""
+    (tmp_path / "db").write_bytes(os.urandom(8192))
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "读不了巩固任务" in flat and _flat(str(tmp_path / "db")) in flat
+    assert "从备份恢复" in flat
+
+
 def test_doctor_reports_cache_sizes(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

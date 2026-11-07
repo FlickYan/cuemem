@@ -106,5 +106,5 @@ jobs:
           grep -F 'golden retriever' search.json || { docker logs cuemem; exit 1; }
           docker stop cuemem
           code=$(docker inspect -f '{{.State.ExitCode}}' cuemem)
-          [ "$code" -eq 0 ] || [ "$code" -eq 143 ] || { docker logs cuemem; exit 1; }
+          [ "$code" -eq 143 ] || { docker logs cuemem; exit 1; }
           if docker logs cuemem 2>&1 | grep -F Traceback; then docker logs cuemem; exit 1; fi
