@@ -3,7 +3,7 @@
   "info": {
     "title": "CueMem memory API",
     "description": "The /api/v1 memory API of `cuemem serve`, one endpoint per method of the Python SDK (cuemem.Memory); cuemem.MemoryClient is its Python client.",
-    "version": "0.1.0"
+    "version": "0.8.0"
   },
   "paths": {
     "/api/v1/memories": {
