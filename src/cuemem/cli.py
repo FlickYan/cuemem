@@ -1104,6 +1104,7 @@ def _gradio_temp_dir(ui: bool) -> Iterator[None]:
 
 LOG_LEVEL_ENV = "CUEMEM_LOG_LEVEL"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 def _configure_logging() -> None:
@@ -1120,14 +1121,14 @@ def _configure_logging() -> None:
     raw = os.environ.get(LOG_LEVEL_ENV, "").strip()
     level = logging.WARNING
     if raw:
-        named = logging.getLevelNamesMapping().get(raw.upper())
-        if named is None or named == logging.NOTSET:
+        # 只认这五个名字：getLevelNamesMapping 还认 WARN、FATAL 与 NOTSET
+        if raw.upper() not in LOG_LEVELS:
             Console(stderr=True).print(
                 f"[red]{LOG_LEVEL_ENV} 只能是 DEBUG、INFO、WARNING、ERROR、CRITICAL[/red]"
                 f"（现在是 {escape(raw)}）"
             )
             raise typer.Exit(2)
-        level = named
+        level = logging.getLevelNamesMapping()[raw.upper()]
     logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
 
 

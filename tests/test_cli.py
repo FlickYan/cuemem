@@ -1177,12 +1177,17 @@ def test_server_logs_are_plain_lines(
 
 
 def test_bad_log_level_is_refused(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    """CUEMEM_LOG_LEVEL 写错时说明并退出（退出码 2），不启动；大小写不论。"""
+    """CUEMEM_LOG_LEVEL 不是那五个名字时说明并退出（退出码 2），不启动；大小写不论。"""
     monkeypatch.setenv("CUEMEM_LOG_LEVEL", "loud")
     for command in (["serve", "--no-ui", "--scenario", "plain"], ["proxy"], ["mcp"]):
         result = runner.invoke(app, command)
         assert result.exit_code == 2 and served == [], result.output
         assert "CUEMEM_LOG_LEVEL" in _flat(result.output) and "loud" in result.output
+    # 只认文档里的五个名字：Python 的别名 WARN、FATAL 与 NOTSET 也拒绝
+    for alias in ("warn", "FATAL", "notset"):
+        monkeypatch.setenv("CUEMEM_LOG_LEVEL", alias)
+        result = runner.invoke(app, ["proxy"])
+        assert result.exit_code == 2 and served == [], (alias, result.output)
     monkeypatch.setenv("CUEMEM_LOG_LEVEL", "info")
     assert runner.invoke(app, ["proxy"]).exit_code == 0 and len(served) == 1
 
