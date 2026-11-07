@@ -1568,3 +1568,12 @@ def test_image_bytes_sent_to_models_are_unchanged(
             for path in sorted(folder.iterdir())
         }
         assert found == SENT_IMAGE_DIGESTS[kind], kind
+
+
+def test_ping_is_true_without_a_server(tmp_path: Path) -> None:
+    """本地模式（磁盘上、只在内存里）的 ping 总是 True，不建探活的客户端（第八轮体检 P9）。"""
+    for store in (VectorStore(tmp_path / "qdrant", dim=4), VectorStore(None, dim=4)):
+        try:
+            assert store.ping() and store._probe is None
+        finally:
+            store.close()

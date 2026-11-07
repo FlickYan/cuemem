@@ -171,3 +171,14 @@ def test_a_keyed_server_refuses_a_store_without_the_key(server: VectorStore, tok
         assert refused.value.status_code == 401
     finally:
         keyless.close()
+
+
+def test_ping_reaches_the_server(server: VectorStore) -> None:
+    """/api/ready 的探活（第八轮体检 P9）：服务端在时 True（带着 Key）；Key 不对时 False。"""
+    assert server.ping()
+    if KEY:
+        wrong = VectorStore(None, dim=4, url=URL, api_key="not-the-key")
+        try:
+            assert not wrong.ping()
+        finally:
+            wrong.close()

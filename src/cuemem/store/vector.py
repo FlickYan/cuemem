@@ -63,6 +63,9 @@ class VectorStore:
         self.owned_units: Callable[[str], Sequence[str]] | None = None
         self._names: dict[str, str] = {}  # 空间 → 集合名（解析一次）
         self._path = path if url is None else None  # 本地模式的目录（出错时的说明用）
+        self._remote = (url, api_key) if url is not None else None  # 探活的客户端用（见 ping）
+        self._probe: QdrantClient | None = None
+        self._probe_lock = threading.Lock()
         if url is not None:
             self._client = QdrantClient(url=url, api_key=api_key)
         elif path is None:
@@ -547,7 +550,26 @@ class VectorStore:
                     self._client.delete_collection(name)
             self._names.pop(space_id, None)
 
+    def ping(self, timeout_s: int = 2) -> bool:
+        """服务端模式下向量库能不能用（/api/ready 用）：另一个超时 timeout_s 秒的客户端
+        get_collections，不排在正在检索、写入的请求后面（它们持有 _lock）。本地模式总是 True：
+        同一个进程里的文件，打开时已经检查过。"""
+        if self._remote is None:
+            return True
+        with self._probe_lock:
+            if self._probe is None:
+                url, api_key = self._remote
+                self._probe = QdrantClient(url=url, api_key=api_key, timeout=timeout_s)
+            try:
+                self._probe.get_collections()
+            except Exception:  # 连不上、超时、5xx、Key 不对：都算不能用
+                return False
+            return True
+
     def close(self) -> None:
+        with self._probe_lock:
+            if self._probe is not None:
+                self._probe.close()
         with self._lock:
             self._client.close()
 

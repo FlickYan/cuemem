@@ -1236,7 +1236,14 @@ def create_proxy_app(
     api.app.create_app。
     max_body_bytes：请求体的上限（字节，超过时 413，见 api/limits.py），cuemem proxy 从环境变量
     CUEMEM_MAX_BODY_BYTES 读。"""
-    from cuemem.api.app import SWEEP_INTERVAL_S, _adopt_after, _guard, _sweep, _sweep_jobs
+    from cuemem.api.app import (
+        SWEEP_INTERVAL_S,
+        _adopt_after,
+        _guard,
+        _readiness,
+        _sweep,
+        _sweep_jobs,
+    )
 
     stop = threading.Event()
 
@@ -1266,9 +1273,15 @@ def create_proxy_app(
         lifespan=lifespan,
     )
 
-    @app.get("/health")
-    def health() -> dict[str, Any]:
+    @app.get("/health")  # async：不排在默认线程池后面（open_runs 只拿一下锁）
+    async def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__, "open_runs": proxy.open_runs()}
+
+    ready_limiter = anyio.CapacityLimiter(2)
+
+    @app.get("/ready")  # 向量库与后台抽取能不能用，同 serve 的 /api/ready
+    async def ready() -> JSONResponse:
+        return await _readiness(proxy.system, ready_limiter)
 
     keys = keys if keys is not None else Keys.from_token(token)
     app.include_router(proxy_router(proxy, dependencies=guard(keys)))

@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, get_args
 from urllib.parse import urlsplit
 
+import anyio
+import anyio.to_thread
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -351,6 +353,23 @@ SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话与过期�
 RECOVER_MEDIA_INTERVAL_S = 3600.0
 
 
+async def _readiness(system: MemorySystem, limiter: anyio.CapacityLimiter) -> JSONResponse:
+    """就绪检查（第八轮体检 P9）：服务端模式的向量库 2 秒内回应、后台巩固线程都还在。不鉴权：
+    只回出问题的部件名，不带异常的文字。不查数据库（遗忘重放时 SELECT 1 排在 MemoryDB 的锁后面，
+    就绪状态跟着来回跳）与磁盘（cuemem doctor 查）。/api/health 只说明进程活着。
+
+    limiter：应用自己的线程上限（两个）。不排在 40 个线程的默认线程池后面（第六轮体检量到那个
+    池子占满时排队 59.4 秒），探活本身也最多占两个线程。"""
+    failing = []
+    if not await anyio.to_thread.run_sync(system.vectors.ping, limiter=limiter):
+        failing.append("vector_store")
+    if system.worker is not None and not system.worker.alive():
+        failing.append("worker")
+    if failing:
+        return JSONResponse({"ok": False, "failing": failing}, 503, headers={"Retry-After": "5"})
+    return JSONResponse({"ok": True})
+
+
 def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]) -> None:
     """清理线程的循环：先依次做一遍 jobs（结束闲置的会话、删过期的 trace），之后每 interval_s
     秒一遍，直到 stop。一个出错不影响别的、也不让线程退出（记一条警告）。以前先等 interval_s
@@ -526,9 +545,17 @@ def create_app(
         if not principal_of(http).allows(space):
             raise HTTPException(404, f"没有进行中的会话 {session_id}")
 
-    @app.get("/api/health")  # 不鉴权：给负载均衡与监控探活用
-    def health() -> dict[str, Any]:
+    ready_limiter = anyio.CapacityLimiter(2)  # 就绪检查自己的线程（见 _readiness）
+
+    # 不鉴权：给负载均衡与监控探活用。async：不排在默认线程池后面（以前是普通函数，线程池占满时
+    # 探活跟着等，Docker 的 HEALTHCHECK 5 秒就超时）
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__, "open_sessions": len(service.sessions)}
+
+    @app.get("/api/ready")  # 不鉴权：向量库与后台巩固能不能用（见 _readiness）
+    async def ready() -> JSONResponse:
+        return await _readiness(service.system, ready_limiter)
 
     @api.get("/api/spaces")
     def spaces(http: Request) -> list[dict[str, Any]]:

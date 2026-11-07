@@ -18,7 +18,7 @@ import anyio
 import httpx2
 import numpy as np
 import pytest
-from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
+from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI, QdrantDown
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
@@ -1010,6 +1010,22 @@ def test_access_token(proxy: MemoryProxy, upstream: Upstream) -> None:
         assert chat(client, "hi", user="alice").status_code == 401
         ok = chat(client, "hi", user="alice", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200
+
+
+def test_vector_store_outage_keeps_answering_and_fails_readiness(
+    system: MemorySystem, proxy: MemoryProxy, upstream: Upstream
+) -> None:
+    """Qdrant 服务端连不上时（第八轮体检 P9）：对话照常转发、只是不带记忆（召回本来就是
+    fail-open）；/health 照旧 200，/ready 503 说出向量库。"""
+    Memory.from_system(system).add("I like green tea.", user_id="alice", infer=False)
+    with TestClient(create_proxy_app(proxy)) as client:
+        assert client.get("/ready").json() == {"ok": True}
+        with QdrantDown(system.vectors):
+            assert chat(client, "What tea do I like?", user="alice").status_code == 200
+            assert client.get("/health").status_code == 200
+            ready = client.get("/ready")
+            assert ready.status_code == 503 and ready.json()["failing"] == ["vector_store"]
+        assert client.get("/ready").status_code == 200
 
 
 @pytest.mark.parametrize(

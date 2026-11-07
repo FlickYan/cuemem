@@ -32,7 +32,8 @@
 ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此抛出同样的异常。请求体不合
 格式（422）、令牌不对（401）在 /api/v1 下也写成这个形状（install_error_format）。模型与向量供应商
 出错时的状态码与 /api 相同（api/failures.py：限流 429 带 Retry-After、余额不足 402、超时 504……），
-code 是出错的类别（rate_limited、no_balance、timeout 等）；向量接口的出错另带 upstream_status
+code 是出错的类别（rate_limited、no_balance、timeout 等；向量库连不上是 503
+vector_store_unavailable，超时是 504 vector_store_timeout）；向量接口的出错另带 upstream_status
 （上游原来的状态码），MemoryClient 抛出的 EmbeddingAPIError 与本地一样带着 status 与 retry_after，
 没有对应的本地异常时抛出的 MemoryAPIError 带着 status、code、type 与 retry_after（Retry-After 头）。
 
@@ -614,8 +615,10 @@ _ERRORS = {
     422: "Malformed request body or parameters (type ValueError).",
     429: "Rate-limited by the model provider; see Retry-After.",
     502: "The model or embedding provider failed.",
-    503: "The model provider is temporarily unavailable; see Retry-After.",
-    504: "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+    503: "The model provider or the vector store is temporarily unavailable (see Retry-After), "
+    "or the local vector store has no room for a new space (code capacity).",
+    504: "The model provider or the vector store timed out, or POST /wait reached its timeout "
+    "(type TimeoutError).",
     500: "Unexpected server error (a bug); the traceback is in the server log.",
 }
 

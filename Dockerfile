@@ -32,8 +32,10 @@ RUN useradd --create-home --uid 1000 cuemem && mkdir -p /data && chown cuemem /d
 USER cuemem
 VOLUME /data
 EXPOSE 7860
+# 就绪检查（/api/ready：Qdrant 服务端连得上、后台巩固线程都还在）；不经 HTTP_PROXY（.env 里设了
+# 代理时，以前 urlopen 把 127.0.0.1 也交给代理，探活一直失败）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/health')"
+  CMD python -c "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:7860/api/ready', timeout=4)"
 ENTRYPOINT ["cuemem"]
 # 演示的导购场景要用仓库里的商品目录，镜像里用通用助手；访问令牌 CUEMEM_API_TOKEN 必须设置
 # （不鉴权在可信网络里跑：命令后面加 --insecure-no-auth。这时防 DNS 重绑定，只接受 IP 地址与

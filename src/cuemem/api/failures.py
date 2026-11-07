@@ -4,6 +4,9 @@
 不可用时带上上游的 Retry-After。以前 HTTP 接口把 OpenAI SDK 的异常变成没有说明的 500，MCP 只回
 "Error executing tool <name>"：调用方分不清是 CueMem 坏了，还是该等一会儿再试。
 
+向量库（Qdrant 服务端）连不上或回 502/503/504 时 503 vector_store_unavailable（Retry-After: 5），
+超时时 504 vector_store_timeout（第八轮体检 P9：以前三个接口都是没有说明的 500）。
+
 LLM 客户端与向量器在抛出之前已经按各自的规则重试过（providers.*.max_retries、
 embedding.max_attempts），这里不再重试。
 """
@@ -11,6 +14,7 @@ embedding.max_attempts），这里不再重试。
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -21,7 +25,14 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError
 from cuemem.errors import ContentFilteredError, EmbeddingAPIError
 
 Kind = Literal[
-    "rate_limited", "no_balance", "unavailable", "timeout", "upstream_error", "content_filtered"
+    "rate_limited",
+    "no_balance",
+    "unavailable",
+    "timeout",
+    "upstream_error",
+    "content_filtered",
+    "vector_store_unavailable",
+    "vector_store_timeout",
 ]
 
 _ZH: dict[Kind, str] = {
@@ -31,6 +42,8 @@ _ZH: dict[Kind, str] = {
     "timeout": "模型供应商迟迟没有回应（请求超时），请稍后再试",
     "upstream_error": "模型供应商出错",
     "content_filtered": "模型供应商的内容审核拒绝了这次请求，换个说法再试",
+    "vector_store_unavailable": "向量库（Qdrant）连不上或暂时不可用，请稍后再试",
+    "vector_store_timeout": "向量库（Qdrant）迟迟没有回应（请求超时），请稍后再试",
 }
 _EN: dict[Kind, str] = {
     "rate_limited": "The model provider is rate-limiting requests (HTTP 429). Try again later",
@@ -41,6 +54,9 @@ _EN: dict[Kind, str] = {
     "upstream_error": "The model provider returned an error",
     "content_filtered": "The model provider's content filter rejected this request. Rephrase it "
     "and try again",
+    "vector_store_unavailable": "The vector store (Qdrant) is unreachable or temporarily "
+    "unavailable. Try again later",
+    "vector_store_timeout": "The vector store (Qdrant) did not respond in time. Try again later",
 }
 
 
@@ -80,6 +96,34 @@ def provider_failure(exc: BaseException) -> ProviderFailure | None:
         if isinstance(exc.__cause__, httpx2.TimeoutException):
             return ProviderFailure("timeout", 504, detail)
         return ProviderFailure("upstream_error", 502, detail)  # 连不上、返回的格式不对
+    return _vector_store_failure(exc, detail)
+
+
+# 向量库暂时不可用时建议多久之后再试（秒）：Qdrant 重启、网络抖动通常几秒就好
+VECTOR_STORE_RETRY_AFTER = "5"
+
+
+def _vector_store_failure(exc: BaseException, detail: str) -> ProviderFailure | None:
+    """Qdrant 服务端连不上（ResponseHandlingException，原因是 httpx 的连接错误）、超时或回
+    502/503/504。别的状态码（4xx：请求不合法）是程序错误，照常 500。没加载 qdrant_client 时
+    exc 不会是它的异常（这里不为了判断去导入它）。说明里没有向量库的地址与 Key：异常的文字只是
+    httpx 的原话。"""
+    if "qdrant_client" not in sys.modules:
+        return None
+    import httpx
+    from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+
+    if isinstance(exc, ResponseHandlingException):
+        if isinstance(exc.source, httpx.TimeoutException):
+            return ProviderFailure("vector_store_timeout", 504, detail)
+        if isinstance(exc.source, httpx.TransportError):
+            return ProviderFailure(
+                "vector_store_unavailable", 503, detail, VECTOR_STORE_RETRY_AFTER
+            )
+        return None  # 返回的格式不对（解析出错）：照常 500
+    if isinstance(exc, UnexpectedResponse) and exc.status_code in (502, 503, 504):
+        detail = f"HTTP {exc.status_code}"  # 不带响应体
+        return ProviderFailure("vector_store_unavailable", 503, detail, VECTOR_STORE_RETRY_AFTER)
     return None
 
 

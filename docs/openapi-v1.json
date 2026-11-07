@@ -161,7 +161,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -171,7 +171,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -466,7 +466,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -476,7 +476,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -689,7 +689,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -699,7 +699,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -851,7 +851,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -861,7 +861,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1018,7 +1018,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1028,7 +1028,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1209,7 +1209,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1219,7 +1219,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1385,7 +1385,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1395,7 +1395,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1568,7 +1568,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1578,7 +1578,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1739,7 +1739,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1749,7 +1749,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1909,7 +1909,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1919,7 +1919,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2125,7 +2125,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2135,7 +2135,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2278,7 +2278,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2288,7 +2288,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2445,7 +2445,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2455,7 +2455,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2641,7 +2641,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2651,7 +2651,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2803,7 +2803,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2813,7 +2813,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2970,7 +2970,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -2980,7 +2980,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3137,7 +3137,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3147,7 +3147,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3312,7 +3312,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3322,7 +3322,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3508,7 +3508,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3518,7 +3518,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3709,7 +3709,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3719,7 +3719,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3871,7 +3871,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3881,7 +3881,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4031,7 +4031,7 @@
             }
           },
           "503": {
-            "description": "The model provider is temporarily unavailable; see Retry-After.",
+            "description": "The model provider or the vector store is temporarily unavailable (see Retry-After), or the local vector store has no room for a new space (code capacity).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4041,7 +4041,7 @@
             }
           },
           "504": {
-            "description": "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+            "description": "The model provider or the vector store timed out, or POST /wait reached its timeout (type TimeoutError).",
             "content": {
               "application/json": {
                 "schema": {

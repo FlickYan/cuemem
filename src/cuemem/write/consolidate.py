@@ -1018,6 +1018,10 @@ class ConsolidationWorker:
                 self._cond.wait(remaining)
         return True
 
+    def alive(self) -> bool:
+        """后台线程都还在（/api/ready 用）：_loop 抛出没接住的异常时线程会退出，任务从此不再做。"""
+        return all(thread.is_alive() for thread in self._threads)
+
     def stop(self) -> None:
         """已经排着的空间做完再退出（之后到期的重试不再排），所有线程一共最多等 stop_timeout_s
         秒。等不到时不再等：调用方随后关闭数据库，线程之后的报错不再记录，没做完的任务留在数据库

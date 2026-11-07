@@ -15,13 +15,15 @@ from pathlib import Path
 from typing import Any
 
 import gradio as gr
+import httpx
 import httpx2
 import pytest
-from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
+from fakes import NO_BALANCE, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI, QdrantDown
 from fastapi.testclient import TestClient
 from mcp.server.mcpserver.exceptions import ToolError
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 from PIL import Image
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from scripted import ScriptedModel, echo_extraction
 
 from cuemem.agent import Agent, ChatSession
@@ -42,7 +44,7 @@ from cuemem.errors import (
     SessionLimitError,
 )
 from cuemem.memory import MemorySystem, _open_mark
-from cuemem.sdk import Memory
+from cuemem.sdk import Memory, space_for
 from cuemem.store.media import image_data_url
 
 DAY = datetime(2026, 8, 28, 19, 30)
@@ -1154,6 +1156,19 @@ FAILURES: list[tuple[BaseException, tuple[int, str, str | None]]] = [
     (EmbeddingAPIError("throttled", status=429, retry_after="3"), (429, "rate_limited", "3")),
     (EmbeddingAPIError("bad json"), (502, "upstream_error", None)),
     (_embedding_timeout(), (504, "timeout", None)),
+    # Qdrant 服务端连不上、超时、回 502/503/504（第八轮体检 P9：以前是没有说明的 500）
+    (
+        ResponseHandlingException(httpx.ConnectError("refused")),
+        (503, "vector_store_unavailable", "5"),
+    ),
+    (
+        ResponseHandlingException(httpx.ReadTimeout("timed out")),
+        (504, "vector_store_timeout", None),
+    ),
+    (
+        UnexpectedResponse(503, "Unavailable", b"", httpx.Headers()),
+        (503, "vector_store_unavailable", "5"),
+    ),
 ]
 
 
@@ -1171,6 +1186,60 @@ def test_provider_failures_map_to_documented_statuses(
     assert failure is not None
     assert (failure.status, failure.kind, failure.retry_after) == expected
     assert provider_failure(ValueError("ours")) is None  # 不是供应商的错误：照常处理
+    # Qdrant 的 4xx（请求不合法）与返回的格式不对是程序错误：照常 500
+    assert provider_failure(UnexpectedResponse(400, "Bad Request", b"", httpx.Headers())) is None
+    assert provider_failure(ResponseHandlingException(ValueError("bad body"))) is None
+
+
+def test_vector_store_outage_is_explained_and_seen_by_readiness(
+    service: ChatService, tmp_path: Path
+) -> None:
+    """Qdrant 服务端连不上时（第八轮体检 P9）：/api、/api/v1 与 /mcp 回 503（/api/v1 的 code 是
+    vector_store_unavailable，带 Retry-After: 5；MCP 说明是向量库），以前都是没有说明的 500；
+    /api/health 照旧 200（进程活着），/api/ready 503 只说出问题的部件。说明里没有向量库的地址。"""
+    space = space_for(user_id="alice")
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        written = {"messages": "I like green tea.", "user_id": "alice", "infer": False}
+        assert client.post("/api/v1/memories", json=written).status_code == 200
+        assert client.get("/api/ready").json() == {"ok": True}
+        with QdrantDown(service.system.vectors):
+            assert client.get("/api/health").status_code == 200
+            ready = client.get("/api/ready")
+            assert ready.status_code == 503 and ready.headers["retry-after"] == "5"
+            assert ready.json() == {"ok": False, "failing": ["vector_store"]}
+            search = {"query": "green tea", "user_id": "alice", "mode": "l1"}
+            for path, body in (("/api/v1/memories/search", search), ("/api/v1/memories", written)):
+                response = client.post(path, json=body)
+                assert response.status_code == 503, response.text
+                assert response.headers["retry-after"] == "5"
+                error = response.json()["error"]
+                assert error["code"] == "vector_store_unavailable"
+                assert "vector store (Qdrant)" in error["message"]
+                assert "qdrant.invalid" not in response.text
+            recall = client.post(
+                f"/api/spaces/{space}/recall", json={"query": "green tea", "mode": "l1"}
+            )
+            assert recall.status_code == 503 and "向量库" in recall.json()["detail"]
+            with pytest.raises(ToolError, match=r"vector store \(Qdrant\) is unreachable"):
+                asyncio.run(build_server(service, space).call_tool("recall", {"query": "tea"}))
+        assert client.get("/api/ready").status_code == 200
+
+
+def test_readiness_sees_a_dead_worker(service: ChatService, tmp_path: Path) -> None:
+    """后台巩固线程都退出了（_loop 抛出没接住的异常）：/api/ready 503 worker。"""
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False)
+    worker = service.system.worker
+    assert worker is not None
+    with TestClient(app) as client:
+        assert client.get("/api/ready").status_code == 200
+        threads = worker._threads
+        worker._threads = [threading.Thread(target=lambda: None)]  # 没启动：is_alive() 是 False
+        try:
+            ready = client.get("/api/ready")
+        finally:
+            worker._threads = threads
+        assert ready.status_code == 503 and ready.json()["failing"] == ["worker"]
 
 
 def test_http_photo_stays_in_the_conversation(

@@ -485,10 +485,11 @@ def test_api_escapes_through_the_path_are_refused(world: World) -> None:
 
 
 def test_every_api_route_needs_a_token(world: World) -> None:
-    """/api 与 /v1 下的每个接口（探活除外）都要令牌：以后新加的接口忘了挂 guard 时这里失败。"""
+    """/api 与 /v1 下的每个接口（探活与就绪检查除外）都要令牌：以后新加的接口忘了挂 guard 时
+    这里失败。"""
     checked = 0
     for path, methods in world.app.openapi()["paths"].items():
-        if not path.startswith(("/api/", "/v1/")) or path == "/api/health":
+        if not path.startswith(("/api/", "/v1/")) or path in ("/api/health", "/api/ready"):
             continue
         url = re.sub(r"\{[^}]+\}", "x", path)
         for method in methods:
