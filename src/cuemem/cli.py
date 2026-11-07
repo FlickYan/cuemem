@@ -1299,6 +1299,13 @@ def keys_add(
             help="同时在处理的请求最多这么多个（429）；不给时用 CUEMEM_MAX_CONCURRENT_PER_KEY",
         ),
     ] = None,
+    max_spaces: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="最多这么多个记忆空间：要建新空间的写入 429，已有的照常；不给时不限",
+        ),
+    ] = None,
     file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
 ) -> None:
     """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
@@ -1343,6 +1350,7 @@ def keys_add(
             models=models,
             max_output_tokens=max_output_tokens,
             max_concurrent=max_concurrent,
+            max_spaces=max_spaces,
             indent=indent,
         )
 
@@ -1383,6 +1391,12 @@ def keys_add(
                 f"CUEMEM_API_KEYS_FILE={shown} 启动时才读它（在 Docker 里是容器里的路径）："
                 "带上这个设置启动或重启它们"
             )
+        if user and not agent and max_spaces is None:
+            err.print(
+                "[yellow]提醒[/yellow]：只给了 --user、没给 --agent，这个令牌可以用任意 agent_id，"
+                "每个新的 agent_id 是一个新的记忆空间（各有一个向量集合，本地模式下一直开着一个"
+                "文件）。交给不太可信的调用方时加上 --agent 或 --max-spaces"
+            )
     print(token)
 
 
@@ -1414,7 +1428,8 @@ def keys_list(
         console.print("没有设置限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）")
         return
     table = Table(title=f"{escape(where)}：{len(keys.names)} 个令牌")
-    for column in ("名字", "作用域", "每分钟写", "同时处理", "模型", "max_output_tokens"):
+    columns = ("名字", "作用域", "每分钟写", "同时处理", "空间上限", "模型", "max_output_tokens")
+    for column in columns:
         table.add_column(column)
     for _, p in keys.scoped:
         table.add_row(
@@ -1422,6 +1437,7 @@ def keys_list(
             escape("；".join(_scope_text(s) for s in p.scopes)),
             str(p.rate_per_minute or "—"),
             str(p.max_concurrent or "—"),
+            str(p.max_spaces or "—"),
             escape(", ".join(p.models)) if p.models is not None else "—",
             str(p.max_output_tokens or "—"),
         )
@@ -2321,7 +2337,8 @@ def _print_config(settings: Settings) -> None:
 def _print_local_store(settings: Settings) -> None:
     """本地模式的向量库有几个集合，与打开文件数的上限（main 已经调到硬上限）比一比：每个集合
     一直开着一个文件、启动时全部打开。只读 meta.json、不打开向量库，cuemem serve 正在用它时也能
-    查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端。"""
+    查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端；多到再建一个就占到留给别的文件的
+    余量（store.vector.reserved_files，VectorStore._room_for 拒绝建新空间的同一条线）时标红。"""
     meta = settings.paths.qdrant / "meta.json"
     if settings.vector_store.url:
         return
@@ -2353,6 +2370,16 @@ def _print_local_store(settings: Settings) -> None:
     line += f"，打开文件数上限 {shown[0]}（硬上限 {shown[1]}）"
     if soft == resource.RLIM_INFINITY or collections <= soft / 2:
         console.print(line)
+        return
+    from cuemem.store.vector import reserved_files
+
+    if collections + 1 > soft - reserved_files(soft):  # 与 VectorStore._room_for 同一条线
+        console.print(
+            f"[red]{line}：已经不能再建新的记忆空间（写入新空间的请求 503 capacity，已有的"
+            f"照常可用；打开文件数要给数据库、图片与连接留 {reserved_files(soft)} 个）。删掉"
+            "不用的空间、调高 ulimit -n，或者改用 Qdrant 服务端："
+            f"{cli_command('migrate-vectors --to URL')}，再设置 CUEMEM_VECTOR_STORE__URL[/red]"
+        )
         return
     console.print(
         f"[yellow]{line}：集合再多就打不开、建不了新的空间。用户多时改用 Qdrant 服务端："

@@ -109,7 +109,8 @@ def test_doctor_counts_local_collections(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """doctor 读本地向量库的 meta.json（不打开向量库，serve 正在用时也能查）：集合数与打开文件数
-    的上限；集合超过软上限的一半时提醒改用 Qdrant 服务端。"""
+    的上限；集合超过软上限的一半时提醒改用 Qdrant 服务端，到了 VectorStore 不再建新空间的那条线时
+    说已经不能再建。"""
     meta = tmp_path / "qdrant" / "meta.json"
     meta.parent.mkdir(parents=True)
     meta.write_text(json.dumps({"collections": {f"space_{i}": {} for i in range(3)}}), "utf-8")
@@ -124,6 +125,15 @@ def test_doctor_counts_local_collections(
     flat = _flat(result.output)
     assert "打开文件数上限4（硬上限4）" in flat
     assert "migrate-vectors--toURL" in flat and "CUEMEM_VECTOR_STORE__URL" in flat
+    # 再建一个就占到留给别的文件的余量（store.vector.reserved_files）：VectorStore 拒绝建新空间
+    # 的同一条线，doctor 说已经不能再建（第八轮体检 P3）
+    assert "已经不能再建新的记忆空间" in flat and "503capacity" in flat
+
+    meta.write_text(json.dumps({"collections": {f"s{i}": {} for i in range(3000)}}), "utf-8")
+    monkeypatch.setattr("cuemem.cli._raise_open_file_limit", lambda: (5000, 5000))
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "本地向量库：3000个集合" in flat and "migrate-vectors--toURL" in flat
+    assert "已经不能再建新的记忆空间" not in flat  # 过了一半只是提醒
 
 
 def test_empty_vector_meta_export_still_works_and_doctor_repairs_it(
@@ -1032,6 +1042,31 @@ def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
     assert agent_key is not None and agent_key.allows("agent/bot")
     assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
     assert runner.invoke(app, ["keys", "add", "b", "--file", str(fresh)]).exit_code == 1
+
+
+def test_keys_add_max_spaces_and_the_any_agent_reminder(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """keys add --max-spaces 写进令牌文件（keys list 列出）；只给 --user 不给 --agent、又没给
+    --max-spaces 时在标准错误提醒：任意 agent_id 都是新的空间（第八轮体检 P3）。"""
+    from cuemem.api.auth import Keys
+
+    path = tmp_path / "keys.yaml"
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
+    loose = runner.invoke(app, ["keys", "add", "a", "--user", "alice"])
+    assert loose.exit_code == 0, loose.output
+    assert "任意agent_id" in _flat(loose.stderr) and "--max-spaces" in loose.stderr
+    capped = runner.invoke(app, ["keys", "add", "b", "--user", "bob", "--max-spaces", "2"])
+    assert capped.exit_code == 0 and "任意" not in capped.stderr
+    bound = runner.invoke(app, ["keys", "add", "c", "--user", "carol", "--agent", "shop"])
+    assert bound.exit_code == 0 and "任意" not in bound.stderr
+    keys = Keys.parse(path.read_text(encoding="utf-8"))
+    principal = keys.resolve(capped.stdout.strip())
+    assert principal is not None and principal.max_spaces == 2
+    assert [p.max_spaces for _, p in keys.scoped] == [None, 2, None]
+    listed = runner.invoke(app, ["keys", "list"], terminal_width=200)
+    assert "空间上限" in listed.stdout
+    assert runner.invoke(app, ["keys", "add", "d", "--user", "d", "--max-spaces", "0"]).exit_code
 
 
 def test_keys_add_says_where_the_file_is_and_never_makes_directories(

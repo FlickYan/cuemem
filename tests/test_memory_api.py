@@ -40,6 +40,7 @@ from test_sdk import (
     without_balance_for_extracting,
     without_balance_for_reconciling,
 )
+from test_store import small_open_file_limit
 
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
@@ -62,6 +63,7 @@ from cuemem.errors import (
     IdempotencyConflictError,
     MemoryAPIError,
     SessionLimitError,
+    VectorStoreFullError,
 )
 from cuemem.evidence import MEMORY_NOTE, RAISED_REASON, inject_evidence, recall_evidence
 from cuemem.memory import MemorySystem
@@ -931,6 +933,42 @@ def test_context_respects_the_key_scope(system: MemorySystem) -> None:
             eve.context("Where do I live?", user_id="zoe")
         assert raised.value.status == 403
         assert eve.context("Where do I live?", user_id="eve")["context"] == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")
+def test_new_spaces_get_503_capacity_near_the_open_file_limit(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只写 user 的令牌可以用任意 agent_id，每个都是新的空间、本地模式下一个一直开着的文件。快到
+    打开文件数的上限时新的空间 503（code capacity，type VectorStoreFullError），什么都没写；已有的
+    空间照常写。以前一直写到文件用光，那时所有用户的请求都出错（第八轮体检 P3）。"""
+    assert not system.vectors.remote
+    token = "alice-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: alice-app\n    token: {token}\n    scopes:\n      - user: alice\n",
+        "admin-token-0123456789",
+    )
+    with TestClient(v1_app(system, keys)) as http:
+        auth = {"Authorization": f"Bearer {token}"}
+
+        def add(agent_id: str) -> httpx2.Response:
+            body = {"messages": "I like tea", "user_id": "alice", "agent_id": agent_id}
+            return http.post("/api/v1/memories", json={**body, "infer": False}, headers=auth)
+
+        assert add("a0").status_code == 200
+        collections = len(system.vectors._client.get_collections().collections)
+        small_open_file_limit(monkeypatch, collections + 256)  # 软上限只剩 reserved_files 个
+        full = add("a1")
+        assert full.status_code == 503, full.text
+        error = full.json()["error"]
+        assert error["code"] == "capacity" and error["type"] == "VectorStoreFullError"
+        assert "ulimit -n" in error["message"]
+        assert str(system.settings.paths.qdrant) not in full.text
+        assert space_for("alice", "a1") not in {row["space_id"] for row in system.db.list_spaces()}
+        assert add("a0").status_code == 200  # 已有的空间照常
+        alice = MemoryClient("http://testserver", api_key=token, http_client=http)
+        with pytest.raises(VectorStoreFullError, match="open-file limit"):
+            alice.add("I like tea", user_id="alice", agent_id="a2", infer=False)
 
 
 # 记忆代理与各框架集成的证据块（recall_evidence → inject_evidence）在一个固定的场景里的摘要。

@@ -21,12 +21,17 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from cuemem.core.models import Conversation, Fact, MemoryUnit, SessionIn, Turn, TurnIn, TurnMeta
 from cuemem.embed import SparseVector
 from cuemem.embed.base import l2_normalize
-from cuemem.errors import ConfigMismatchError, StorageLockedError, VectorStoreOpenError
+from cuemem.errors import (
+    ConfigMismatchError,
+    StorageLockedError,
+    VectorStoreFullError,
+    VectorStoreOpenError,
+)
 from cuemem.store import MemoryDB, VectorStore, media
 from cuemem.store import sqlite as sqlite_module
 from cuemem.store.media import MediaStore, image_data_url
 from cuemem.store.sqlite import SCHEMA_VERSION, legacy_idx_key, next_idx_key
-from cuemem.store.vector import _NoCommit
+from cuemem.store.vector import _NoCommit, reserved_files
 from cuemem.write import build_rounds, build_turns
 
 
@@ -637,6 +642,67 @@ def test_local_store_errors_say_what_to_check(
     store.close()
     with pytest.raises(VectorStoreOpenError, match="unable to open database file"):
         VectorStore(tmp_path / "qdrant", dim=4)
+
+
+def small_open_file_limit(monkeypatch: pytest.MonkeyPatch, soft: int) -> None:
+    """让 resource.getrlimit 报一个小的打开文件数软上限（不真的调低：别的测试照常打开文件）。"""
+    import resource
+
+    real = resource.getrlimit
+
+    def getrlimit(which: int) -> tuple[int, int]:
+        limits = real(which)
+        return (soft, limits[1]) if which == resource.RLIMIT_NOFILE else limits
+
+    monkeypatch.setattr(resource, "getrlimit", getrlimit)
+
+
+def _open_files() -> int:
+    return len(list(Path("/proc/self/fd").iterdir()))
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="要 /proc/self/fd 数打开的文件")
+def test_a_local_store_keeps_headroom_below_the_open_file_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """本地模式每个集合一直开着一个文件：集合多到软上限只剩 reserved_files 个时不再建新的
+    （VectorStoreFullError），留着的文件够数据库、图片与连接用，已有的空间照常读写。以前一直建到
+    open() 失败（EMFILE），那时所有用户的请求都出错，重启也打不开（第八轮体检 P3）。"""
+    others = _open_files()  # 集合之外的文件（这个测试进程本来就开着的）
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    vector = l2_normalize(np.ones((1, 4), dtype=np.float32))
+    payload = [{"kind": "round", "ts": 0.0}]
+    store.upsert("old", ["u"], vector, None, payload)
+    soft = others + 300
+    small_open_file_limit(monkeypatch, soft)
+    reserve = reserved_files(soft)
+    created = 0
+    with pytest.raises(VectorStoreFullError, match="ulimit -n") as caught:
+        for i in range(400):
+            store.ensure_space(f"agent-{i}")
+            created += 1
+    assert 0 < created < 400
+    assert caught.value.limit == soft and caught.value.collections == created + 1
+    # 留着的文件还在：余量是给集合之外的文件的，这个进程本来就开着的与向量库的锁文件也算在里面
+    assert soft - _open_files() >= reserve - others - 1 > 0
+    assert "CUEMEM_VECTOR_STORE__URL" in caught.value.for_client()
+    assert str(tmp_path) not in caught.value.for_client()  # 给调用方的说明不带服务器上的路径
+    with pytest.raises(VectorStoreFullError):  # 新空间的图片集合同样
+        store.upsert_images("new", ["m"], l2_normalize(np.ones((1, 2), dtype=np.float32)), [{}])
+
+    store.upsert("old", ["v"], vector, None, payload)  # 已有的空间照常可用
+    assert store.count("old") == 2
+    assert [h.unit_id for h in store.search_dense("old", vector[0], 5)] in (["u", "v"], ["v", "u"])
+    store.ensure_space("agent-0")  # 已有的集合不用余量
+
+    store.delete_space("agent-0")  # 删掉一个空间就又能建一个
+    store.ensure_space("fresh")
+    store.close()
+
+    memory_only = VectorStore(None, dim=4)  # 只在内存里：不占文件，不查
+    for i in range(created + 5):
+        memory_only.ensure_space(f"agent-{i}")
+    memory_only.close()
 
 
 # qdrant-client 经 http:// 发 Key 时警告；它在后台线程里向 "/" 核对版本，替身先关掉时也警告

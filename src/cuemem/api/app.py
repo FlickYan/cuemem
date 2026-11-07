@@ -62,6 +62,7 @@ from cuemem.api.auth import (
     authenticated_route,
     guard,
     principal_of,
+    spaces_over_cap,
     ui_login,
 )
 from cuemem.api.failures import provider_failure
@@ -75,7 +76,7 @@ from cuemem.api.limits import (
 from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
-from cuemem.errors import CueMemError, SessionLimitError
+from cuemem.errors import CueMemError, SessionLimitError, VectorStoreFullError
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.portable import export_space, import_space
 from cuemem.read.controller import Router
@@ -287,13 +288,20 @@ class ForgetRequest(BaseModel):
 def _errors() -> Iterator[None]:
     """把服务层的已知错误转成 HTTP 状态码。模型与向量供应商的错误各有状态码与说明：限流 429、
     余额不足 402、暂时不可用 503（这两个带上游的 Retry-After）、超时 504、内容审核拒绝 422、
-    其余 502（见 api/failures.py）。以前 OpenAI SDK 的异常是没有说明的 500。"""
+    其余 502（见 api/failures.py）。以前 OpenAI SDK 的异常是没有说明的 500。本地向量库没有余量
+    建新的空间（VectorStoreFullError）时 503。"""
     try:
         yield
     except KeyError as exc:
         raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except VectorStoreFullError as exc:  # 已有的空间照常可用；说明里不带服务器上的路径
+        raise HTTPException(
+            503,
+            "服务器本地的向量库快到打开文件数的上限了，不能再建新的记忆空间（已有的照常可用）："
+            "请运营者删掉不用的空间、调高 ulimit -n，或者改用 Qdrant 服务端",
+        ) from exc
     except Exception as exc:
         failure = provider_failure(exc)
         if failure is not None:
@@ -527,9 +535,21 @@ def create_app(
         who = principal_of(http)
         return [row for row in service.spaces() if who.allows(row["space_id"])]
 
+    def room(http: Request, space: str | None) -> None:
+        """令牌写了 max_spaces、空间已经这么多个、这次又要建新的空间时 429（见 api/auth.py）。"""
+        who = principal_of(http)
+        held = spaces_over_cap(who, space, service.system.db.space_ids)
+        if held is not None:
+            raise HTTPException(
+                429,
+                f"这个访问令牌最多有 {who.max_spaces} 个记忆空间，已经有 {held} 个：已有的空间照常"
+                "可用。删掉不用的空间，或者请运营者调高这个令牌的 max_spaces",
+            )
+
     @api.post("/api/sessions")
     def start(http: Request, request: StartRequest) -> SessionOut:
         _check_space(principal_of(http), request.space or service.default_space)
+        room(http, request.space or service.default_space)
         try:
             session = service.start(request.space, at=request.at)
         except SessionLimitError as exc:  # 结束一个会话或等闲置的会话被清理（每分钟一次）
@@ -678,6 +698,7 @@ def create_app(
         target = _import_target(data, space)
         if not principal_of(http).allows(target):
             raise HTTPException(403, f"这个访问令牌不能导入到记忆空间 {target}")
+        room(http, target)
         with _errors():
             report = import_space(service.system, data, space_id=space)
         if service.system.worker is not None:
@@ -685,7 +706,8 @@ def create_app(
         return report
 
     @api.post("/api/spaces/{space:path}/consolidate")
-    def consolidate(space: AllowedSpace) -> dict[str, Any]:
+    def consolidate(http: Request, space: AllowedSpace) -> dict[str, Any]:
+        room(http, space)
         with _errors():
             return service.consolidate(space)
 

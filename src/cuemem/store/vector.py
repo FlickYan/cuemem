@@ -2,7 +2,8 @@
 
 本地模式不需要启动服务，适合笔记本；接口不变即可切换到 Qdrant 服务端（D-005）。本地模式每个集合
 一直开着一个 SQLite 文件（有图片的空间另有一个图片集合），启动时全部打开、全部向量读进内存：用户
-多的服务改用服务端（打不开时的说明见 _open_failed）。
+多的服务改用服务端（打不开时的说明见 _open_failed）。集合多到打开文件数的软上限只剩
+reserved_files 个时不再建新的（VectorStoreFullError，见 VectorStore._room_for）。
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from qdrant_client import QdrantClient, models
 from cuemem.config import cli_command
 from cuemem.core.ids import point_uuid, stable_id
 from cuemem.embed.base import FloatArray, SparseVector
-from cuemem.errors import StorageLockedError, VectorStoreOpenError
+from cuemem.errors import StorageLockedError, VectorStoreFullError, VectorStoreOpenError
 
 DENSE = "dense"
 SPARSE = "sparse"
@@ -128,6 +129,7 @@ class VectorStore:
         name = self.collection_name(space_id)
         with self._lock:
             if not self._client.collection_exists(name):
+                self._room_for(1)
                 with self._creating():
                     self._client.create_collection(
                         name,
@@ -268,6 +270,7 @@ class VectorStore:
         ]
         with self._lock:
             if not self._client.collection_exists(name):
+                self._room_for(1)
                 with self._creating():
                     self._client.create_collection(
                         name,
@@ -375,6 +378,50 @@ class VectorStore:
             _fast_mask, collection, upstream
         )
         collection._cuemem_fast_mask = True
+
+    def check_room(self, space_id: str) -> None:
+        """这个空间的文字集合还没有、又没有余量建时 VectorStoreFullError（见 _room_for）；记忆代理
+        在转发之前查，不让调用方的话先发给模型、之后才写不进去。服务端模式与只在内存里时什么也不
+        做（不多发请求）。"""
+        if self._path is None:
+            return
+        name = self.collection_name(space_id)
+        with self._lock:
+            if not self._client.collection_exists(name):
+                self._room_for(1)
+
+    def _room_for(self, n_new: int) -> None:
+        """建 n_new 个集合之前（调用方持有 self._lock）：本地模式（磁盘上）的集合数加上 n_new 超过
+        打开文件数的软上限减去留给别的文件的 reserved_files 时 VectorStoreFullError。服务端模式、
+        只在内存里与没有 resource 模块（Windows）、软上限是不限时不查。
+
+        第八轮体检 P3：本地模式每个集合一直开着一个文件，以前一直建到 open() 失败（EMFILE）才报
+        VectorStoreOpenError，那时文件已经用光，数据库、图片与连接对所有用户都出错，重启时也打不开
+        （启动时打开全部集合）。限定作用域的令牌只写 user 时可以用任意 agent_id，每个都是新的空间。
+        现在留着余量：新的空间被拒绝（HTTP 503），已有的照常可用，进程还能重启、还能删空间。"""
+        if self._path is None:
+            return
+        try:
+            import resource
+        except ImportError:  # Windows
+            return
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft == resource.RLIM_INFINITY:
+            return
+        collections = len(self._client.get_collections().collections)  # 在内存里，不用文件
+        reserve = reserved_files(soft)
+        if collections + n_new <= soft - reserve:
+            return
+        migrate = cli_command("migrate-vectors --to URL")
+        raise VectorStoreFullError(
+            f"本地模式的向量库 {self._path} 已有 {collections} 个集合，打开文件数的软上限是"
+            f" {soft}：再建集合（新的记忆空间）就占到留给数据库、图片与连接的 {reserve} 个"
+            "文件，没有建。已有的空间照常可用。办法：删掉不用的空间，调高 ulimit -n，或者用"
+            f" {migrate} 把向量复制到 Qdrant 服务端并设置 CUEMEM_VECTOR_STORE__URL（见"
+            " docs/design.md 的部署一节）",
+            collections=collections,
+            limit=soft,
+        )
 
     @contextmanager
     def _creating(self) -> Iterator[None]:
@@ -652,6 +699,12 @@ def _fast_mask(
     if vector_name is not None:
         mask = mask & ~collection.deleted_per_vector[vector_name]
     return mask
+
+
+def reserved_files(soft: int) -> int:
+    """本地模式建集合时，打开文件数的软上限 soft 里留给集合之外的文件（数据库、缓存、图片、
+    连接）的个数（VectorStore._room_for；cuemem doctor 按同样的数说还能建几个）。"""
+    return max(256, soft // 10)
 
 
 def _safe(space_id: str) -> str:

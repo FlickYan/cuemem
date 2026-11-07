@@ -19,11 +19,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from scripted import Reply, ScriptedModel, _fact, echo_extraction
 from starlette.datastructures import Headers
+from test_store import small_open_file_limit
 
 from cuemem import Memory
 from cuemem.agent import Agent
 from cuemem.api.app import LOOPBACK_HOSTS, create_app
-from cuemem.api.auth import Keys
+from cuemem.api.auth import ADMIN, Keys
 from cuemem.api.mcp import McpEndpoint, build_server
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
@@ -143,6 +144,26 @@ def test_tokens_and_scopes_are_checked_before_mcp(app: FastAPI, service: ChatSer
         assert "tea" in said(http.post("/mcp", json=call("recall", query="tea"), headers=alice))
 
 
+def test_remember_in_a_new_space_near_the_open_file_limit_says_why(
+    app: FastAPI, service: ChatService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只写 user 的令牌经 X-CueMem-Agent 可以开任意多的空间：本地向量库快到打开文件数的上限时，
+    新空间的 remember 是说明了原因的工具出错（不是 "Error executing tool"），什么都没写；已有的
+    空间照常（第八轮体检 P3）。"""
+    with TestClient(app, base_url=URL) as http:
+        alice = headers(ALICE_TOKEN)
+        said(http.post("/mcp", json=call("remember", text="I like tea"), headers=alice))
+        vectors = service.system.vectors
+        collections = len(vectors._client.get_collections().collections)
+        small_open_file_limit(monkeypatch, collections + 256)
+        other = headers(ALICE_TOKEN, **{"X-CueMem-User": "alice", "X-CueMem-Agent": "x1"})
+        refused = http.post("/mcp", json=call("remember", text="I like milk"), headers=other)
+        assert refused.status_code == 200 and refused.json()["result"]["isError"] is True
+        assert "open-file limit" in said(refused)
+        said(http.post("/mcp", json=call("remember", text="I like rain"), headers=alice))
+        assert turns(service) == {"alice": ["I like tea", "I like rain"]}
+
+
 def test_recall_over_mcp_drops_expired_memories(app: FastAPI, service: ChatService) -> None:
     """第五轮体检 P7：MCP 的 recall（与 /recall 同一份清单）不给过期的记忆，画像里也去掉。"""
     memory = Memory.from_system(service.system)
@@ -201,8 +222,9 @@ def test_non_ascii_user_ids_in_the_headers(service: ChatService, tmp_path: Path)
     latin1 = Headers(
         raw=[(b"authorization", f"Bearer {ADMIN_TOKEN}".encode()), (b"x-cuemem-user", b"Jos\xe9")]
     )
-    assert endpoint._space(latin1) == "José"
-    assert endpoint._space(Headers(raw=[*latin1.raw[:1], (b"x-cuemem-user", b"alice")])) == "alice"
+    assert endpoint._space(latin1) == ("José", ADMIN)
+    alice = Headers(raw=[*latin1.raw[:1], (b"x-cuemem-user", b"alice")])
+    assert endpoint._space(alice) == ("alice", ADMIN)
 
 
 def test_the_browser_and_host_checks_cover_mcp(app: FastAPI) -> None:

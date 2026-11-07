@@ -1645,6 +1645,11 @@ class MemoryDB:
             for key in [k for k in self._turn_writes if k[0] == space_id]:
                 del self._turn_writes[key]
 
+    def space_ids(self) -> list[str]:
+        """全部记忆空间的 ID（只读 spaces 表，不像 list_spaces 那样数会话与记忆）。"""
+        with self._lock:
+            return [row[0] for row in self._conn.execute("SELECT id FROM spaces")]
+
     def list_spaces(self) -> list[dict[str, Any]]:
         sql = (
             "SELECT s.id, s.created_at,"

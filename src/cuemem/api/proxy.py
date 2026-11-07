@@ -78,14 +78,23 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from cuemem import __version__
-from cuemem.api.auth import AnyKeys, Keys, Principal, guard, identity_headers, principal_of
+from cuemem.api.auth import (
+    AnyKeys,
+    Keys,
+    Principal,
+    guard,
+    identity_headers,
+    principal_of,
+    space_cap_message,
+    spaces_over_cap,
+)
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import MAX_BODY_BYTES, MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
 from cuemem.core.trace import record_event
 from cuemem.embed import CachedEmbedder, TextEmbedder
-from cuemem.errors import EmbeddingAPIError
+from cuemem.errors import EmbeddingAPIError, VectorStoreFullError
 from cuemem.evidence import (
     in_context_rounds,
     inject_evidence,
@@ -532,6 +541,25 @@ class MemoryProxy:
         if user_id is None or not messages:
             return Turn(space=None)
         space = space_for(user_id, agent_id)
+        held = spaces_over_cap(principal, space, self.system.db.space_ids)
+        if held is not None and principal is not None:  # 令牌的 max_spaces（api/auth.py）
+            raise ProxyError(
+                429,
+                space_cap_message(principal, held),
+                kind="rate_limit_error",
+                code="rate_limited",
+                headers={"x-should-retry": "false"},  # 等也没用：要删空间或调高上限
+            )
+        try:  # 新的空间、本地向量库又没有余量建它：在开会话、转发之前 503，不让这一轮写不进去
+            self.system.vectors.check_room(space)
+        except VectorStoreFullError as exc:
+            raise ProxyError(
+                503,
+                exc.for_client(),
+                kind="server_error",
+                code="capacity",
+                headers={"x-should-retry": "false"},  # 要运营者处理，自动重试也一样
+            ) from exc
         explicit = headers.get("x-cuemem-session")
         session = _SESSION_ID.sub("_", explicit)[:80] if explicit else None
         earlier = [m for m in messages[:-1] if m.get("role") in ("user", "assistant")]

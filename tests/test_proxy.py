@@ -25,6 +25,7 @@ from openai.types.responses import Response as OpenAIResponse
 from PIL import Image, UnidentifiedImageError
 from scripted import ScriptedModel
 from test_sdk import where_i_live
+from test_store import small_open_file_limit
 
 from cuemem import Memory
 from cuemem.api import proxy as proxy_module
@@ -33,6 +34,7 @@ from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.sdk import space_for
 from cuemem.write.consolidate import Consolidator
 from cuemem.write.online import worth_retrying
 
@@ -518,6 +520,27 @@ def test_upstream_errors_are_returned_and_not_remembered(
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "data_inspection_failed"
     assert system.db.get_turns("alice") == []
+
+
+def test_a_new_user_near_the_open_file_limit_gets_503_before_forwarding(
+    client: TestClient, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """本地向量库快到打开文件数的上限、请求的用户（X-CueMem-Agent 下）又是新的空间：在开会话、
+    转发之前回 OpenAI 格式的 503（server_error，code capacity），话没发给模型、什么都没写；已有的
+    空间照常（第八轮体检 P3）。以前转发、回答之后写回才失败（文件用光时所有请求都出错）。"""
+    assert chat(client, "I live in Berlin", user="alice").status_code == 200
+    collections = len(system.vectors._client.get_collections().collections)
+    small_open_file_limit(monkeypatch, collections + 256)
+    sent = len(upstream.proxied)
+    full = chat(client, "hi", user="alice", headers={"X-CueMem-Agent": "x1"})
+    assert full.status_code == 503, full.text
+    error = full.json()["error"]
+    assert (error["type"], error["code"]) == ("server_error", "capacity")
+    assert full.headers["x-should-retry"] == "false"
+    assert len(upstream.proxied) == sent and space_for("alice", "x1") not in {
+        row["space_id"] for row in system.db.list_spaces()
+    }
+    assert chat(client, "Recommend a coat", user="alice").status_code == 200
 
 
 @pytest.mark.parametrize("stream", [False, True])

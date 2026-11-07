@@ -67,7 +67,15 @@ from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, WithJ
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cuemem import __version__
-from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of
+from cuemem.api.auth import (
+    Keys,
+    Principal,
+    authenticated_route,
+    guard,
+    principal_of,
+    space_cap_message,
+    spaces_over_cap,
+)
 from cuemem.api.failures import provider_failure
 from cuemem.core.models import FactCategory, SupersedeReason
 from cuemem.errors import (
@@ -76,6 +84,7 @@ from cuemem.errors import (
     EmbeddingAPIError,
     IdempotencyConflictError,
     SessionLimitError,
+    VectorStoreFullError,
 )
 from cuemem.read.controller import Router
 from cuemem.sdk import (
@@ -635,6 +644,10 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(
             429, str(exc), error_type="SessionLimitError", headers={"Retry-After": "60"}
         ) from exc
+    except VectorStoreFullError as exc:  # 本地向量库没有余量建新的空间（已有的照常可用）
+        raise V1Error(
+            503, exc.for_client(), error_type="VectorStoreFullError", code="capacity"
+        ) from exc
     except Exception as exc:
         failure = provider_failure(exc)
         if failure is not None:
@@ -735,11 +748,24 @@ def memories_router(
         user_id: str | None,
         agent_id: str | None,
         filters: dict[str, Any] | None = None,
+        *,
+        creates: bool = False,
     ) -> None:
         """user_id、agent_id 定下的空间（filters 里的 user_id、agent_id 优先）要在作用域里。与 SDK
-        用同一个函数解析 filters：检查的空间就是 SDK 要读的空间。都没给时报 SDK 的 ValueError。"""
+        用同一个函数解析 filters：检查的空间就是 SDK 要读的空间。都没给时报 SDK 的 ValueError。
+        creates：这个接口会建新的空间（add、runs、consolidate），另查令牌的 max_spaces。"""
         user_id, agent_id, _, _ = _scope(user_id, agent_id, None, filters)
-        _allow(principal_of(http), space_for(user_id, agent_id))
+        space = space_for(user_id, agent_id)
+        _allow(principal_of(http), space)
+        if creates:
+            room(http, space)
+
+    def room(http: Request, space: str | None) -> None:
+        """令牌写了 max_spaces、空间已经这么多个、这次写入又要建新的空间时 429（rate_limited）。"""
+        who = principal_of(http)
+        held = spaces_over_cap(who, space, lambda: memory.system.db.space_ids())
+        if held is not None:
+            raise V1Error(429, space_cap_message(who, held))
 
     def visible(http: Request, memory_id: str) -> bool:
         """按 ID 找的记忆：不存在的，或者在作用域里的。作用域之外的与不存在的一样处理。事实、
@@ -769,7 +795,7 @@ def memories_router(
         ] = None,
     ) -> V1Json:
         with _sdk_errors():
-            allow(http, request.user_id, request.agent_id)
+            allow(http, request.user_id, request.agent_id, creates=True)
             _no_server_files(request.messages)
             return memory.add(
                 request.messages,
@@ -977,7 +1003,7 @@ def memories_router(
     @router.post("/runs", responses=_ok(RunResult))
     def open_run(http: Request, request: RunRequest) -> V1Json:
         with _sdk_errors():
-            allow(http, request.user_id, request.agent_id)
+            allow(http, request.user_id, request.agent_id, creates=True)
             run_id = memory.open_run(
                 request.run_id, user_id=request.user_id, agent_id=request.agent_id
             )
@@ -997,7 +1023,7 @@ def memories_router(
     @router.post("/consolidate", responses=_ok(ConsolidationReport))
     def consolidate(http: Request, request: ConsolidateRequest) -> V1Json:
         with _sdk_errors():
-            allow(http, request.user_id, request.agent_id)
+            allow(http, request.user_id, request.agent_id, creates=True)
             return memory.consolidate(
                 user_id=request.user_id, agent_id=request.agent_id, rebuild=request.rebuild
             )
@@ -1067,6 +1093,7 @@ def memories_router(
         else:
             target = str(request.data["space_id"]) if "space_id" in request.data else None
         _allow(principal_of(http), target)
+        room(http, target)
         with _sdk_errors():
             return memory.load(
                 request.data,

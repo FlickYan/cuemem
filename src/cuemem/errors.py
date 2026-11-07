@@ -75,6 +75,34 @@ class VectorStoreOpenError(CueMemError):
     """本地模式的向量库打不开或建不了集合：多半是打开的文件太多（每个集合一直开着一个文件）。"""
 
 
+class VectorStoreFullError(CueMemError):
+    """本地模式的向量库没有余量建新的集合（新的记忆空间）了：集合数加上要建的，会占到打开文件数
+    软上限里留给数据库、图片与连接的那部分（store.vector.reserved_files）。没有建，什么都没写；
+    已有的空间照常可用（HTTP 503，错误码 capacity）。collections、limit：集合数与软上限（客户端
+    还原的异常里是 None）。"""
+
+    def __init__(
+        self, message: str, *, collections: int | None = None, limit: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.collections = collections
+        self.limit = limit
+
+    def for_client(self) -> str:
+        """HTTP 接口与 MCP 给调用方的说明（英文，不带服务器上的路径）。"""
+        count = (
+            f" (it has {self.collections} collections; the open-file limit is {self.limit})"
+            if self.collections is not None and self.limit is not None
+            else ""
+        )
+        return (
+            "The server cannot create new memory spaces: its local vector store is close to the "
+            f"process's open-file limit{count}. Existing memory spaces still work. The operator "
+            "can delete unused spaces, raise `ulimit -n`, or move the vectors to a Qdrant server "
+            "(CUEMEM_VECTOR_STORE__URL)."
+        )
+
+
 class SessionLimitError(CueMemError):
     """这个记忆空间进行中的对话会话（/api/sessions、界面）已经到了 CUEMEM_MAX_OPEN_SESSIONS，又都
     说过话：没有开新的会话（HTTP 429）。结束一个会话（/api/sessions/{id}/end）或等闲置的会话被
