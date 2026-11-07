@@ -302,7 +302,7 @@ MemoryClient(
 - 没有配任何令牌时不鉴权，只能监听没有对外的本机地址：监听非本机地址又没有令牌时拒绝启动，除非加 `--insecure-no-auth`；监听本机地址、`CUEMEM_ALLOWED_HOSTS` 却列了不只指本机的主机名或 `*` 时（经反向代理对外；只指本机的项是 127.x、::1、localhost 与 *.localhost，可带端口或方括号）也一样。加了 `--insecure-no-auth` 又监听非本机地址时，Host 只能是 IP 地址、localhost、监听的主机名或 `CUEMEM_ALLOWED_HOSTS` 里的名字；监听本机地址时，不管有没有令牌，只能是 127.0.0.1、localhost、[::1]、监听地址或 `CUEMEM_ALLOWED_HOSTS` 里的名字（否则 400，防 DNS 重绑定；列表里有 `*` 时不查 Host）。
 - 监听非本机地址、以及像上面那样在反向代理后面监听本机地址时，每个令牌至少 16 个字符（`cuemem.api.auth.MIN_TOKEN_CHARS`）：管理令牌与直接写出的 `token:` 都算，每个 Docker 容器也是。更短的让 `cuemem serve` 与 `cuemem proxy` 在打开记忆系统之前以退出码 2 退出，说明里写着是哪一项、从不打印令牌本身，除非加 `--insecure-weak-token`（compose 里加进 `command:`）。`--insecure-no-auth` 也跳过这项检查：设了令牌时服务带着这个短令牌启动，请求仍要带它；监听非本机地址时与那里任何设了令牌的监听一样不查 Host，监听本机地址时照上面查 Host。用 `openssl rand -hex 32` 生成令牌。`sha256:` 的条目量不出长度，不查。
 - 服务说的是明文 HTTP。设了令牌又监听非本机地址（或 `CUEMEM_ALLOWED_HOSTS` 让本机地址对外）时，启动时提示令牌（也是界面的密码）与记忆都不加密地经过网络；可信网络之外要在前面放 TLS 反向代理，见 README 的[公网部署](../README.zh-CN.md#公网部署)。CueMem 不限制登录与令牌出错的次数，在反向代理里做。
-- `CUEMEM_API_TOKEN` 是管理令牌，请求带 `Authorization: Bearer <令牌>`。`GET /api/health` 不要令牌。`/api` 与 `/api/v1` 在读请求体之前就认令牌，没认上的请求不论请求体是什么都回 401。
+- `CUEMEM_API_TOKEN` 是管理令牌，请求带 `Authorization: Bearer <令牌>`。`GET /api/health` 与 `GET /api/ready` 不要令牌。`/api` 与 `/api/v1` 在读请求体之前就认令牌，没认上的请求不论请求体是什么都回 401。
 - 限定作用域的令牌（`CUEMEM_API_KEYS_FILE` 是 YAML 文件的路径，`CUEMEM_API_KEYS` 是同样内容的 YAML 或 JSON 文本，只能设一个）给每个令牌列出它能访问的用户与 Agent：
 
   ```yaml
@@ -376,7 +376,7 @@ SDK 的每个方法一个接口。请求体与查询参数的名字、缺省值�
 
 | 接口 | SDK 方法 |
 |---|---|
-| `POST /api/v1/memories`，`{messages, user_id, agent_id, run_id, metadata, expiration_date, timestamp, infer, wait}`，可选的请求头 `Idempotency-Key` | `add`（这个头就是 `idempotency_key`：24 小时内重发回 200，`status` 是 `duplicate` 或 `forgotten`，`"replayed": true`；同一个键用于不同的请求回 409 `conflict`，type `IdempotencyConflictError`；键写错回 400）。会重新打开闲置结束或留下的 run、而这个空间已经有 `CUEMEM_MAX_OPEN_SESSIONS` 个进行中的 run 时（什么都不写；有 run 结束之后重试），或者要建超过令牌 `max_spaces` 的空间时，回 429 `rate_limited`（type `SessionLimitError`，`Retry-After: 60`，前一种） |
+| `POST /api/v1/memories`，`{messages, user_id, agent_id, run_id, metadata, expiration_date, timestamp, infer, wait}`，可选的请求头 `Idempotency-Key` | `add`（这个头就是 `idempotency_key`：24 小时内重发回 200，`status` 是 `duplicate` 或 `forgotten`，`"replayed": true`；同一个键用于不同的请求回 409 `conflict`，type `IdempotencyConflictError`；键写错回 400）。会重新打开闲置结束或留下的 run、而这个空间已经有 `CUEMEM_MAX_OPEN_SESSIONS` 个进行中的 run 时（type `SessionLimitError`，`Retry-After: 60`；什么都不写；有 run 结束之后重试），或者要建超过令牌 `max_spaces` 的空间时，回 429 `rate_limited` |
 | `POST /api/v1/memories/search`，`{query, user_id, agent_id, run_id, limit, mode, at, router, lam, filters, top_k, min_level, show_expired}` | `search` |
 | `GET /api/v1/memories?user_id&agent_id&run_id&include_superseded&valid_at&known_at&limit&top_k&show_expired&filters=<JSON>` | `get_all` |
 | `GET /api/v1/memories/{id}` | `get`（不存在时 404） |
