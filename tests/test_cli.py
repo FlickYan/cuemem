@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -292,6 +293,24 @@ def test_corrupt_database_is_one_line_for_readers(
     assert "Traceback" not in result.output
     flat = _flat(result.output)
     assert flat.startswith("错误：") and _flat(str(target)) in flat and "不是SQLite" in flat, flat
+
+
+def test_doctor_live_with_a_corrupt_ledger_is_one_line(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor --live 打开账本测连通性：账本损坏时一行说明是哪个文件，退出码 1；以前打印调用栈，
+    只说 file is not a database（第八轮复审）。不用 Key：缺 Key 的模型跳过，不发请求。"""
+    for name in ("DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    target = tmp_path / "ledger"
+    target.write_bytes(os.urandom(8192))
+    result = runner.invoke(app, ["doctor", "--live"])
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, sqlite3.DatabaseError), result.exception
+    flat = _flat(result.output)
+    assert "错误：" in flat and _flat(str(target)) in flat and "从备份恢复" in flat, flat
 
 
 def test_doctor_reports_free_space(

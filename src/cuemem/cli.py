@@ -2851,8 +2851,14 @@ def _live_check(settings: Settings) -> None:
     from cuemem.embed import build_embedder
     from cuemem.llm.client import LLMClient
     from cuemem.llm.ledger import Ledger
+    from cuemem.store.files import opening
 
-    ledger = Ledger(settings.paths.ledger)
+    try:  # 账本损坏、不是 SQLite 数据库时一行说明，与 _open_system 相同（第八轮复审）
+        with opening(settings.paths.ledger):
+            ledger = Ledger(settings.paths.ledger)
+    except DatabaseOpenError as exc:
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     llm = LLMClient(settings, ledger=ledger)  # 不挂缓存：要测的是真实连通性
     table = Table(title="连通性测试（不走缓存）")
     for column in ("模型", "结果", "延迟", "输入 / 输出 tokens", "回复或错误"):
