@@ -27,11 +27,13 @@ from scripted import ScriptedModel
 from test_sdk import where_i_live
 
 from cuemem import Memory
+from cuemem.api import proxy as proxy_module
 from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
 from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.write.consolidate import Consolidator
 from cuemem.write.online import worth_retrying
 
 SYSTEM = {"role": "system", "content": "You are a helpful shopping assistant."}
@@ -731,16 +733,17 @@ def test_open_proxy_sessions_per_user_are_capped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """第七轮复审 P14：一个用户同时进行中的代理会话最多 max_open_runs 个
-    （CUEMEM_MAX_OPEN_SESSIONS，默认 64）。再开新的时先结束最久没有请求、没有留着写回的那个
-    （与闲置结束相同）；都留着写回（故障期间）时 429。以前每个会话的写回有上限，会话数却不限：
-    调用方每次换一个 X-CueMem-Session，故障期间每个都能留 32 MiB。"""
+    （CUEMEM_MAX_OPEN_SESSIONS，默认 64）。再开新的时先停放最久没有请求、没有留着写回的那个
+    （第八轮体检 P1：会话照旧进行中，见 test_parked_proxy_sessions_are_not_replayed）；都留着写回
+    （故障期间）时 429。以前每个会话的写回有上限，会话数却不限：调用方每次换一个
+    X-CueMem-Session，故障期间每个都能留 32 MiB。"""
     assert proxy.max_open_runs == 64
     proxy.max_open_runs = 2
     for i, sid in enumerate(("s1", "s2", "s3")):
         clock.now = float(i)
         assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
-    assert sorted(sid for _, sid in proxy._runs) == ["s2", "s3"]  # s1 最久没有请求：结束了
-    assert system.open_sessions("alice") == {"s2", "s3"}
+    assert sorted(sid for _, sid in proxy._runs) == ["s2", "s3"]  # s1 最久没有请求：停放了
+    assert system.open_sessions("alice") == {"s1", "s2", "s3"}  # 照旧进行中
     assert chat(client, "hi", user="bob", headers={"X-CueMem-Session": "s1"}).is_success  # 各算各的
 
     outage = Outage(system, monkeypatch)
@@ -758,15 +761,120 @@ def test_open_proxy_sessions_per_user_are_capped(
     chat(client, "back", user="alice", headers={"X-CueMem-Session": "s2"})  # s2 留着的写进去了
     clock.now = 20.0
     assert chat(client, "one more", user="alice", headers={"X-CueMem-Session": "s4"}).is_success
-    # s2 刚有过请求，却是唯一没有留着写回的：结束它；s3 留着的写回不丢
+    # s2 刚有过请求，却是唯一没有留着写回的：停放它；s3 留着的写回不丢
     assert sorted(sid for space, sid in proxy._runs if space == "alice") == ["s3", "s4"]
-    assert "s2" not in system.open_sessions("alice")
+    assert "s2" in system.open_sessions("alice")
     assert [t.text for t in system.db.get_turns("alice", "s2") if t.role == "user"] == [
         "note 1",
         "later 0",
         "back",
     ]
     assert [u.messages[0]["content"] for u in proxy._runs[("alice", "s3")].unsaved] == ["later 1"]
+
+
+def test_parked_proxy_sessions_are_not_replayed(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第八轮体检 P1：一个用户并行的会话多于上限时，为腾名额停放的会话照旧进行中，不交给抽取。
+    以前直接结束它（交给抽取），调用方回来接着写时会话又打开、长了，下次腾名额时整个空间重放
+    （rebuild(replay=True)）：3 个会话轮流、上限 2 时 4 轮重放 3 次。停放的会话闲置太久时照常
+    交给抽取，每个会话只抽取一次。"""
+    proxy.max_open_runs = 2
+    replays: list[bool] = []
+    rebuild = Consolidator.rebuild
+
+    def spy(self: Consolidator, space_id: str, *, replay: bool = False) -> Any:
+        replays.append(replay)
+        return rebuild(self, space_id, replay=replay)
+
+    monkeypatch.setattr(Consolidator, "rebuild", spy)
+    sessions = ("s1", "s2", "s3")
+    assert system.worker is not None
+    for r in range(4):
+        for i, sid in enumerate(sessions):
+            clock.now = float(r * 3 + i)
+            headers = {"X-CueMem-Session": sid}
+            assert chat(client, f"note {r} {sid}", user="alice", headers=headers).is_success
+        system.worker.wait()
+    assert not any(replays)
+    assert system.open_sessions("alice") == set(sessions)
+    assert system.db.get_jobs("alice") == []  # 进行中：都还没交给抽取
+    assert proxy.open_runs() == 2 and proxy.parked_runs() == 1
+
+    clock.now += proxy.idle_s
+    assert proxy.close_idle() == 3  # 停放的也闲置结束
+    system.worker.wait()
+    assert proxy.open_runs() == 0 and proxy.parked_runs() == 0
+    assert system.open_sessions("alice") == set()
+    jobs = system.db.get_jobs("alice")
+    assert sorted(j["session_id"] for j in jobs) == sorted(sessions)
+    assert all(j["status"] == "done" for j in jobs)
+    assert "note 3 s1" in {f.statement for f in system.facts("alice")}
+    assert not any(replays)
+
+
+def test_parked_proxy_sessions_beyond_the_limit_are_ended(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停放的会话最多 PARKED_KEPT 个（整个进程）：再多时最早停放的那个交给抽取；退出时
+    （close_all）停放的也交出去。"""
+    monkeypatch.setattr(proxy_module, "PARKED_KEPT", 1)
+    proxy.max_open_runs = 1
+    assert system.worker is not None
+    for i, sid in enumerate(("s1", "s2")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    assert proxy.parked_runs() == 1 and system.db.get_jobs("alice") == []
+    clock.now = 2.0
+    assert chat(client, "note 2", user="alice", headers={"X-CueMem-Session": "s3"}).is_success
+    system.worker.wait()
+    assert proxy.parked_runs() == 1  # 停放了 s2，最早停放的 s1 交给抽取
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == ["s1"]
+    assert system.open_sessions("alice") == {"s2", "s3"}
+
+    proxy.close_all()
+    system.worker.wait()
+    assert proxy.parked_runs() == 0 and system.open_sessions("alice") == set()
+    assert sorted(j["session_id"] for j in system.db.get_jobs("alice")) == ["s1", "s2", "s3"]
+
+
+def test_a_parked_implicit_session_keeps_its_id(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """没指定会话头的会话也会被停放：调用方接着这段对话时写进原来的会话；开始新的一段时先把它
+    交给抽取。"""
+    proxy.max_open_runs = 1
+    first = chat(client, "I live in Berlin", user="alice")
+    session = first.headers["x-cuemem-session"]
+    clock.now = 1.0
+    assert chat(client, "hi", user="alice", headers={"X-CueMem-Session": "s1"}).is_success
+    assert proxy.parked_runs() == 1 and session in system.open_sessions("alice")
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    clock.now = 2.0
+    second = chat(client, "Recommend a coat", history, user="alice")
+    assert second.headers["x-cuemem-session"] == session
+    assert system.db.get_jobs("alice") == []
+    clock.now = 3.0
+    assert chat(client, "hi again", user="alice", headers={"X-CueMem-Session": "s1"}).is_success
+    clock.now = 4.0
+    third = chat(client, "A new topic", user="alice")  # 新的一段：停放的那段交给抽取
+    assert third.headers["x-cuemem-session"] != session
+    assert system.worker is not None
+    system.worker.wait()
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == [session]
 
 
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）

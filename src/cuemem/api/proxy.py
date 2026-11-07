@@ -25,8 +25,10 @@
 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id，或者放进 user 字段）；
 会话：请求头 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）
 或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
-一个用户（记忆空间）同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时先结束
-最久没有请求的那个（与闲置结束相同，交给抽取）；都留着没写进去的写回时 429（见 _make_room）。
+一个用户（记忆空间）内存里同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时
+先停放最久没有请求的那个（会话照旧进行中、不抽取，调用方回来时接着写，闲置太久时照常交给抽取；
+整个进程最多停放 PARKED_KEPT 个，再多时最早停放的交给抽取）；都留着没写进去的写回时 429
+（见 _make_room）。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
@@ -60,6 +62,7 @@ import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -103,6 +106,11 @@ MAX_EMBED_INPUTS = 2048  # 与 OpenAI 的上限相同
 # evidence.payload_size）：长时间故障而调用方一直在说话时，超出的丢掉最早的，不让内存一直长
 MAX_UNSAVED = 100
 MAX_UNSAVED_BYTES = 32 * 1024 * 1024
+# 为腾出名额而停放的会话（见 MemoryProxy._make_room）最多记这么多个（每个空间各自的
+# CUEMEM_MAX_OPEN_SESSIONS 之外，整个进程合计）：再多时最早停放的那个照闲置结束交给抽取。
+# 停放的会话照旧进行中（数据库里的进行中标记与 MemorySystem 的登记都留着），每个只占一个键与
+# 一个时间
+PARKED_KEPT = 4096
 
 
 class ProxyError(Exception):
@@ -215,6 +223,8 @@ class MemoryProxy:
         self._http = http_client or httpx2.Client(timeout=300.0)
         self._clock = clock
         self._runs: dict[tuple[str, str | None], Run] = {}
+        # 停放的会话（_make_room）：键 -> (会话 ID, 最后一次请求的时间)，按停放的先后
+        self._parked: OrderedDict[tuple[str, str | None], tuple[str, float]] = OrderedDict()
         self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间
         self._warned: set[str] = set()  # 已经警告过的不认识的模型名
         self._lock = threading.Lock()
@@ -339,25 +349,41 @@ class MemoryProxy:
     # ---------- 会话 ----------
 
     def close_idle(self) -> int:
-        """空闲超过 idle_minutes 的会话交给后台抽取；返回关掉的会话数。"""
+        """空闲超过 idle_minutes 的会话（包括停放的，见 _make_room）交给后台抽取；返回关掉的
+        会话数。"""
         now = self._clock()
         with self._lock:
             stale = [k for k, r in self._runs.items() if now - r.last_seen >= self.idle_s]
             runs = [self._runs.pop(k) for k in stale]
+            parked = [k for k, (_, seen) in self._parked.items() if now - seen >= self.idle_s]
+            runs += [self._unpark(k) for k in parked]
         for run in runs:
             self._finish(run)
         return len(runs)
 
     def open_runs(self) -> int:
+        """内存里进行中的会话数（不含停放的，见 parked_runs）。"""
         with self._lock:
             return len(self._runs)
+
+    def parked_runs(self) -> int:
+        """停放的会话数（见 _make_room）。"""
+        with self._lock:
+            return len(self._parked)
 
     def close_all(self) -> None:
         with self._lock:
             runs = list(self._runs.values())
             self._runs.clear()
+            runs += [self._unpark(k) for k in list(self._parked)]
         for run in runs:
             self._finish(run)
+
+    def _unpark(self, key: tuple[str, str | None]) -> Run:
+        """取走一个停放的会话（调用方持有 self._lock），还原成 Run 交给 _finish：它没有留着的
+        写回（停放时就没有），_finish 只是把它交给抽取。"""
+        sid, seen = self._parked.pop(key)
+        return Run(key[0], sid, seen)
 
     def _finish(self, run: Run) -> None:
         """会话结束：没写进去的写回最后再写一次（见 Run），再交给后台抽取。"""
@@ -387,26 +413,44 @@ class MemoryProxy:
             if run is not None and fresh and explicit is None:
                 ended.append(self._runs.pop(key))
                 run = None
+            # 停放的会话（_make_room）：接着用原来的会话 ID，没交给过抽取；没指定会话、调用方
+            # 开始了新的一段时与进行中的相同，先结束它
+            parked = self._parked.pop(key, None) if run is None else None
+            if parked is not None and fresh and explicit is None:
+                ended.append(Run(space, parked[0], parked[1]))
+                parked = None
             if run is None:
                 evicted = self._make_room(space)
                 if evicted is not None:
                     ended.append(evicted)
                 when = datetime.now()
-                sid = explicit or sortable_session_id("proxy", when)
+                sid = (
+                    parked[0]
+                    if parked is not None
+                    else explicit or sortable_session_id("proxy", when)
+                )
                 run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
                 self._runs[key] = run
-                self.system.open_session(space, sid)  # 进行中：每轮照常写入，但不抽取
+                # 进行中：每轮照常写入，但不抽取（停放过的会话还开着，open_session 什么也不做）
+                self.system.open_session(space, sid)
             run.last_seen = now
         for done in ended:
             self._finish(done)
         return run
 
     def _make_room(self, space: str) -> Run | None:
-        """_run 开新会话之前（调用方持有 self._lock）：这个空间进行中的会话没到 max_open_runs 个时
-        None；到了时取走其中最久没有请求、没有留着重试的写回、也没在写回的那个（调用方结束它，与
-        闲置结束相同：交给抽取），没有这样的会话时 ProxyError 429。以前不限：调用方每换一个
-        X-CueMem-Session 就多一个会话，故障期间每个会话还能留 MAX_UNSAVED_BYTES 的写回，内存跟着
-        会话数一直长。"""
+        """_run 开新会话之前（调用方持有 self._lock）：这个空间内存里进行中的会话没到 max_open_runs
+        个时 None；到了时把其中最久没有请求、没有留着重试的写回、也没在写回的那个停放，没有这样的
+        会话时 ProxyError 429。以前不限：调用方每换一个 X-CueMem-Session 就多一个会话，故障期间每个
+        会话还能留 MAX_UNSAVED_BYTES 的写回，内存跟着会话数一直长。
+
+        停放只丢掉内存里的 Run（它没有留着的写回，丢掉不丢东西），只记下会话 ID 与最后一次请求的
+        时间（_parked）；会话照旧进行中：不交给抽取，数据库里的进行中标记与 MemorySystem 的登记
+        都留着（巩固照旧跳过它，崩溃后照旧由 adopt_open 接手）。调用方再用这个会话时接着写，
+        闲置太久时由 close_idle 交给抽取，退出时由 close_all。第八轮体检 P1：以前这里直接结束它
+        （交给抽取），调用方回来接着写时会话又打开、长了，下次结束时整个空间重放
+        （Consolidator._replay_regrown）：一个用户的并行会话多于上限时每次腾名额都重放一遍。
+        停放的会话超过 PARKED_KEPT 个时返回最早停放的那个（调用方结束它，交给抽取）。"""
         mine = [k for k, r in self._runs.items() if r.space == space]
         if len(mine) < self.max_open_runs:
             return None
@@ -422,7 +466,11 @@ class MemoryProxy:
                 headers={"Retry-After": "60"},
             )
         oldest = min(idle, key=lambda k: self._runs[k].last_seen)
-        return self._runs.pop(oldest)
+        run = self._runs.pop(oldest)
+        self._parked[oldest] = (run.session_id, run.last_seen)
+        if len(self._parked) > PARKED_KEPT:
+            return self._unpark(next(iter(self._parked)))
+        return None
 
     def _adopt(self, space: str, explicit: str | None) -> None:
         """这个进程第一次碰到这个空间：之前的进程崩溃时还在进行中的会话（正常退出时 close_all
