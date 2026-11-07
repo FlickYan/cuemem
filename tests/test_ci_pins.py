@@ -261,3 +261,22 @@ def test_compose_stop_grace_covers_the_shutdown() -> None:
     assert match, grace
     worker = ConsolidationWorker(MagicMock())
     assert int(match.group(1)) >= worker.stop_timeout_s + GRACEFUL_SHUTDOWN_S + 30
+
+
+def test_image_and_compose_carry_the_build_id() -> None:
+    """镜像带着构建标识（第八轮体检 P19）：Dockerfile 的 ARG → ENV CUEMEM_BUILD（cuemem --version
+    与 doctor 读它）与 OCI 的 revision 标签，放在装依赖与源码的层之后；compose 把提交号传进去，
+    每次 up 都构建（以前 git pull 之后的 docker compose up -d 照旧跑旧镜像）；CI 构建时给提交号并
+    核对 --version。"""
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text("utf-8")
+    final = dockerfile.split("\nFROM ")[-1]
+    assert "ARG CUEMEM_BUILD=unknown" in final and "ENV CUEMEM_BUILD=$CUEMEM_BUILD" in final
+    assert "org.opencontainers.image.revision=$CUEMEM_BUILD" in final
+    assert final.index("ARG CUEMEM_BUILD") > final.index("RUN ")  # 不让前面的层跟着重建
+    compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text("utf-8"))
+    service = compose["services"]["cuemem"]
+    assert service["build"]["args"]["CUEMEM_BUILD"] == "${CUEMEM_BUILD:-unknown}"
+    assert service["pull_policy"] == "build"
+    ci = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    assert '--build-arg CUEMEM_BUILD="${GITHUB_SHA::12}"' in ci
+    assert "cuemem:ci --version" in ci

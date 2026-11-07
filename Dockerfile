@@ -36,6 +36,13 @@ EXPOSE 7860
 # 代理时，以前 urlopen 把 127.0.0.1 也交给代理，探活一直失败）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
   CMD python -c "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:7860/api/ready', timeout=4)"
+# 构建标识（提交号）：cuemem --version 与 doctor 的第一行、镜像的 OCI 标签都写着它，看得出跑着的是
+# 哪一版（.dockerignore 不带 .git，镜像里查不了）。放在依赖与源码的层之后：换提交号不让它们重建
+#   docker build --build-arg CUEMEM_BUILD=$(git rev-parse --short=12 HEAD) -t cuemem .
+ARG CUEMEM_BUILD=unknown
+ENV CUEMEM_BUILD=$CUEMEM_BUILD
+LABEL org.opencontainers.image.revision=$CUEMEM_BUILD \
+      org.opencontainers.image.source=https://github.com/FlickYan/cuemem
 ENTRYPOINT ["cuemem"]
 # 演示的导购场景要用仓库里的商品目录，镜像里用通用助手；访问令牌 CUEMEM_API_TOKEN 必须设置
 # （不鉴权在可信网络里跑：命令后面加 --insecure-no-auth。这时防 DNS 重绑定，只接受 IP 地址与

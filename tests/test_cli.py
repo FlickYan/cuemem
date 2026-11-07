@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -258,6 +259,82 @@ def test_doctor_reports_free_space(
     monkeypatch.setattr(shutil, "disk_usage", lambda _: usage._replace(free=50 * 2**20))
     result = runner.invoke(app, ["doctor"])
     assert "剩余空间50MB" in _flat(result.output) and "空间不够" in result.output
+
+
+@pytest.fixture
+def fresh_build_id(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """build_id 缓存结果：每个测试前后清掉，环境变量的改动才看得见。"""
+    from cuemem._build import build_id
+
+    monkeypatch.delenv("CUEMEM_BUILD", raising=False)
+    build_id.cache_clear()
+    yield
+    build_id.cache_clear()
+
+
+def test_version_option_and_doctor_show_the_build(
+    isolated_paths: None, fresh_build_id: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cuemem --version 与 doctor 的第一行写着版本号与构建标识（第八轮体检 P19）：版本号不随每次
+    提交变，以前看不出跑着的是哪一版，--version 也没有（No such option）。"""
+    from cuemem import __version__
+
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith(f"cuemem {__version__} (build ")
+
+    monkeypatch.setenv("CUEMEM_BUILD", "deadbeef")
+    from cuemem._build import build_id
+
+    build_id.cache_clear()
+    result = runner.invoke(app, ["--version"])
+    assert result.output == f"cuemem {__version__} (build deadbeef)\n"
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == f"cuemem {__version__} (build deadbeef)"
+
+
+def test_build_id_without_git_or_direct_url(
+    fresh_build_id: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有 git、也不是从 git 安装（没有 direct_url.json）时 build_id 是 None，不抛异常；
+    CUEMEM_BUILD=unknown（Dockerfile 没给 --build-arg 时的默认值）不算。从 git 安装时取
+    direct_url.json 里的提交号，工作区改过时加 +dirty。"""
+    import importlib.metadata
+
+    from cuemem import _build
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("CUEMEM_BUILD", "unknown")
+
+    class Dist:
+        def __init__(self, text: str | None) -> None:
+            self.text = text
+
+        def read_text(self, name: str) -> str | None:
+            assert name == "direct_url.json"
+            return self.text
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _: Dist(None))
+    assert _build.build_id() is None
+
+    _build.build_id.cache_clear()
+    vcs = {"vcs": "git", "commit_id": "0123456789abcdef0123", "dirty": True}
+    text = json.dumps({"url": "https://example.invalid/x.git", "vcs_info": vcs})
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _: Dist(text))
+    assert _build.build_id() == "0123456789ab+dirty"
+
+
+def test_import_cuemem_does_not_load_the_build_module() -> None:
+    """import cuemem 不导入 cuemem._build（可能起 git 子进程）：启动时间不变。"""
+    done = subprocess.run(
+        [sys.executable, "-c", "import sys, cuemem; print('cuemem._build' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
 
 
 def _jobs_db(tmp_path: Path) -> Any:

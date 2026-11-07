@@ -94,8 +94,26 @@ CACHE_WARN = 2**30  # doctor：缓存与 trace 合计超过它、又没设 trace
 JOB_LINES = 20  # doctor 最多列出这么多条巩固任务的提醒，其余只说还有几条
 
 
+def _show_version(value: bool) -> None:
+    """--version：版本号与构建标识（提交号，见 cuemem/_build.py），然后退出。"""
+    if value:
+        from cuemem._build import version_line
+
+        typer.echo(version_line())
+        raise typer.Exit()
+
+
 @app.callback()
 def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_show_version,
+            is_eager=True,
+            help="显示版本号与构建标识（提交号）后退出",
+        ),
+    ] = False,
     preset: Annotated[
         str | None,
         typer.Option(
@@ -327,6 +345,9 @@ def doctor(
 ) -> None:
     """检查配置、API Key、数据目录与密钥文件的权限、剩余空间，以及（可选）向量库与数据库是否
     一致、各模型的连通性。"""
+    from cuemem._build import version_line
+
+    console.print(escape(version_line()), highlight=False)
     settings = _settings()
     if repair_vectors:
         _repair_vectors(settings)

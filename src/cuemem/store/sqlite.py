@@ -284,8 +284,8 @@ class MemoryDB:
                 self._conn.close()  # 不留句柄：serve、proxy 这样长时间运行的进程里会泄漏
                 raise ConfigMismatchError(
                     f"{path} 是更新的 CueMem 写的（数据格式 v{stored}，这个版本只支持到"
-                    f" v{SCHEMA_VERSION}）：升级 CueMem，或者用新版本导出（cuemem export）再在"
-                    "这里导入"
+                    f" v{SCHEMA_VERSION}）：升级 CueMem（各种安装方式的做法见 README 的“升级”"
+                    "一节），或者用新版本导出（cuemem export）再在这里导入"
                 )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里

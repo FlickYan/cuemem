@@ -154,7 +154,9 @@ jobs:
         with:
           persist-credentials: false
       - name: 构建镜像
-        run: docker build -t cuemem:ci .
+        run: docker build --build-arg CUEMEM_BUILD="${GITHUB_SHA::12}" -t cuemem:ci .
+      - name: cuemem --version 写着构建的提交号
+        run: docker run --rm cuemem:ci --version | grep -F "(build ${GITHUB_SHA::12})"
       - name: 界面与本机向量的可选依赖在镜像里
         run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed, gradio"
       - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设至少 16 个字符的访问令牌）
