@@ -645,8 +645,9 @@ def create_app(
         return service.facts(space, current_only=current_only, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/entities")
-    def entities(space: AllowedSpace) -> list[dict[str, Any]]:
-        return service.entities(space)
+    def entities(space: AllowedSpace, show_expired: bool = False) -> list[dict[str, Any]]:
+        # 只出现在已经过期的事实里的实体默认不列出（第八轮体检），同事实表与实体图
+        return service.entities(space, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/graph")
     def graph(space: AllowedSpace, show_expired: bool = False) -> dict[str, Any]:

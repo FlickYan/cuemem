@@ -7,17 +7,19 @@ retrieve / ask（hide_expired=True）也用它：answer()、记忆代理、MCP �
 记忆。cuemem ask 也打开它（--show-expired 时不打开）；记忆浏览器的事实、实体图与图库
 （ChatService.facts / graph / media、/api/spaces/{space}/facts|graph|media）默认也不列出过期的，
 show_expired 时列出、标着 expired；cuemem inspect facts 是检查用的，照样列出、标"已过期"
-（第七轮体检 P17）。评测不打开 hide_expired：它们的空间从不写 turn_meta，打开了请求也不会变。
+（第七轮体检 P17）。实体列表（/api/spaces/{space}/entities、cuemem inspect entities）同样处理
+只出现在过期事实里的实体（expired_entity_ids，第八轮体检）。评测不打开 hide_expired：它们的空间
+从不写 turn_meta，打开了请求也不会变。
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from cuemem.core.models import CoreMemory, TurnMeta
+from cuemem.core.models import CoreMemory, Fact, TurnMeta
 from cuemem.core.timeutil import expiry_instant
 
 if TYPE_CHECKING:
@@ -105,3 +107,24 @@ def expired_ids(db: MemoryDB, space: str, now: datetime) -> frozenset[str]:
     ids = {uid for uid, sources in db.sources_in(space, within) if dead(sources)}
     ids.update(db.media_of_turns(space, turns))
     return frozenset(ids)
+
+
+def expired_entity_ids(
+    facts: Iterable[Fact], gone: Collection[str], find: Callable[[str], set[str]]
+) -> frozenset[str]:
+    """只出现在已经过期的事实里的实体（第八轮体检）：实体的检索单元没有出处（source_turn_ids
+    为空），expired_ids 标不出它们，实体列表（/api/spaces/{space}/entities、inspect entities）
+    以前照样列出过期会话里抽出的名字与描述。
+
+    facts 要包括被取代的版本（只出现在还没过期、只是被取代的事实里的实体照旧列出，同
+    /facts?current_only=false）；gone 是 expired_ids 的结果。一条事实提到的实体：主语、关联的
+    实体，以及陈述与宾语里出现了名字或别名的（find，与实体图的规则相同）。没有任何事实提到的
+    实体不算：没有出处可以判断。合并过的描述可能还带着过期会话里的说法（描述不按会话记出处）。"""
+    if not gone:
+        return frozenset()
+    live: set[str] = set()
+    dead: set[str] = set()
+    for fact in facts:
+        refs = {fact.subject_id, *fact.entity_ids} | find(f"{fact.statement} {fact.object}")
+        (dead if fact.id in gone else live).update(refs)
+    return frozenset(dead - live)

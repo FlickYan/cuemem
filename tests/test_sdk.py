@@ -1321,6 +1321,81 @@ def test_memory_browser_hides_expired_memories(memory: Memory, tmp_path: Path) -
     assert berlin not in statements(service.facts("u", show_expired=True))
 
 
+def doctors(prompt: str) -> dict[str, Any]:
+    """抽取替身：'I see Dr. X for my Y' → 宾语是医生的事实，外加医生的实体（带描述）；其余发言
+    各记一条多值事实（陈述里提到医生的名字时，实体图与实体列表按名字找到它）。"""
+    facts, entities = [], []
+    for n, text in re.findall(r"\[t(\d+)\] User: (.*)", prompt):
+        seen = re.search(r"I see (Dr\. \w+) .*for my (\w+)", text)
+        if seen:
+            doctor, issue = seen.groups()
+            facts.append(
+                {"statement": f"The user sees {doctor} for {issue}.", "subject": "User",
+                 "predicate": "sees", "object": doctor, "cardinality": "multi",
+                 "importance": 5, "turns": [int(n)]}
+            )  # fmt: skip
+            entities.append(
+                {"name": doctor, "type": "person", "description": f"the user's {issue} doctor"}
+            )
+        else:
+            facts.append(
+                {"statement": text, "predicate": "said", "object": text[:40],
+                 "cardinality": "multi", "importance": 4, "turns": [int(n)]}
+            )  # fmt: skip
+    return {"summary": "", "facts": facts, "entities": entities}
+
+
+def test_entity_list_hides_entities_known_only_from_expired_facts(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """第八轮体检 P5：实体的检索单元没有出处，expired_ids 标不出它们；/api/spaces/{space}/entities
+    以前照样列出过期会话里抽出的实体，连同描述（"the user's depression doctor"），事实表、
+    实体图与检索都已经不给了。默认不列出，show_expired 时列出、标着 expired。还有一条没过期的
+    事实（陈述里按名字提到它）的实体照旧列出；用户本人与没有事实提到的实体不受影响。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.agent import Agent
+    from cuemem.api.app import create_app
+    from cuemem.api.service import ChatService
+
+    fake_api.chat_replies = [ScriptedModel(doctors)]
+    yesterday = date.today() - timedelta(days=1)
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        for text in ("I see Dr. Kim every week for my depression", "I see Dr. Lee for my knee"):
+            memory.add(text, user_id="u", expiration_date=yesterday, wait=True)
+        memory.add("Dr. Lee fixed my knee last year", user_id="u", wait=True)
+        memory.add("I like jazz", user_id="u", wait=True)
+        service = ChatService(memory.system, Agent(memory.system, router="rule"))
+
+        def listing(rows: list[dict[str, Any]]) -> dict[str, bool]:
+            return {r["name"]: r["expired"] for r in rows}
+
+        shown = listing(service.entities("u", show_expired=True))
+        assert shown["Dr. Kim"] is True and shown["Dr. Lee"] is False
+        assert not any(shown[name] for name in shown if name != "Dr. Kim")
+        assert "Dr. Kim" not in listing(service.entities("u"))
+        assert listing(service.entities("u")) == {k: v for k, v in shown.items() if k != "Dr. Kim"}
+        app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
+        with TestClient(app) as http:
+            rows = http.get("/api/spaces/u/entities").json()
+            assert "Dr. Kim" not in listing(rows) and "Dr. Lee" in listing(rows)
+            assert "depression" not in json.dumps(rows)
+            rows = http.get("/api/spaces/u/entities", params={"show_expired": "true"}).json()
+            assert listing(rows) == shown
+
+
+def test_entity_list_is_unchanged_without_expiries(memory: Memory) -> None:
+    """没有过期的发言时（评测的空间都是）照旧列出全部实体，只多了 expired: false。"""
+    from cuemem.agent import Agent
+    from cuemem.api.service import ChatService
+
+    memory.add("I live in Berlin", user_id="u", wait=True)
+    service = ChatService(memory.system, Agent(memory.system, router="rule"))
+    rows = service.entities("u")
+    assert [r["id"] for r in rows] == [e.id for e in memory.system.entities("u")]
+    assert rows and all(r["expired"] is False for r in rows)
+
+
 def test_purge_expired_deletes_expired_memories(memory: Memory, fake_api: FakeAPI) -> None:
     """第七轮体检 P20：expiration_date 以前只是读取时不给出，过期的发言、事实、向量与缓存一直
     留着，要逐条 delete。purge_expired 真的删掉过期的发言（遗忘），同一件事后来又说过一次、

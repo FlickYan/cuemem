@@ -408,7 +408,7 @@ def test_graph_name_index_matches_the_regex_scan() -> None:
     两头是标点、带重音、中文、下划线与数字。"""
     import random
 
-    from cuemem.api.service import _Mentions
+    from cuemem.core.mentions import Mentions
     from cuemem.core.models import Entity
 
     rng = random.Random(7)
@@ -431,7 +431,7 @@ def test_graph_name_index_matches_the_regex_scan() -> None:
         ]
         text = "".join(rng.choice(pieces) + rng.choice(glue) for _ in range(rng.randint(0, 8)))
         expected = _mentions_by_regex(entities, text)
-        assert _Mentions(entities).find(text) == expected, (case, text, entities)
+        assert Mentions(entities).find(text) == expected, (case, text, entities)
 
 
 def test_graph_is_unchanged_by_the_name_index(service: ChatService) -> None:

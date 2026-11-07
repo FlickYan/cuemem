@@ -1881,10 +1881,28 @@ def inspect_facts(
 
 
 @inspect_app.command("entities")
-def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
-    """实体列表：名字、类型、别名、提及次数。"""
+def inspect_entities(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    hide_expired: Annotated[
+        bool,
+        typer.Option("--hide-expired", help="不列出只出现在已经过期的事实里的实体"),
+    ] = False,
+) -> None:
+    """实体列表：名字、类型、别名、提及次数。只出现在已经过期的事实里的实体标"已过期"
+    （检查用，默认都列出；--hide-expired 时不列出，同记忆浏览器，规则见
+    expiry.expired_entity_ids）。"""
+    from cuemem.core.mentions import Mentions
+    from cuemem.expiry import expired_entity_ids, expired_ids
+
     with _open_db_only() as db:
         entities = db.get_entities(space)
+        gone = expired_ids(db, space, datetime.now())
+        dead: frozenset[str] = frozenset()
+        if gone:
+            facts = db.get_facts(space, current_only=False)
+            dead = expired_entity_ids(facts, gone, Mentions(entities).find)
+        if hide_expired:
+            entities = [e for e in entities if e.id not in dead]
         if not entities:
             console.print("没有实体。还没巩固的话，先运行 cuemem consolidate。")
             return
@@ -1893,7 +1911,7 @@ def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]
             table.add_column(column, overflow="fold")
         for e in sorted(entities, key=lambda e: (-e.mentions, e.name)):
             table.add_row(
-                e.name,
+                f"{escape(e.name)} · [red]已过期[/red]" if e.id in dead else escape(e.name),
                 e.type,
                 ", ".join(e.aliases) or "-",
                 e.description or "-",

@@ -577,8 +577,9 @@ def test_consolidate_inspect_and_forget(
     assert "新加坡一家电商公司" not in _flat(result.output)
 
 
-def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """一个用户 u：昨天到期的住址与没有过期时间的爱好，都已巩固（离线的脚本化模型）。返回模型。"""
+def _expired_space(monkeypatch: pytest.MonkeyPatch, *, doctor: bool = False) -> Any:
+    """一个用户 u：昨天到期的住址与没有过期时间的爱好，都已巩固（离线的脚本化模型）。返回模型。
+    doctor=True 时另有一段昨天到期的看医生，抽出实体 Dr. Kim（带描述）。"""
     from datetime import date, timedelta
 
     from fakes import FakeAPI
@@ -599,7 +600,10 @@ def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
              "cardinality": "multi", "importance": 4, "turns": [int(n)]}
             for n, text in lines
         ]  # fmt: skip
-        return {"summary": "", "facts": facts, "entities": []}
+        entities = []
+        if any("Dr. Kim" in text for _, text in lines):
+            entities = [{"name": "Dr. Kim", "type": "person", "description": "the user's doctor"}]
+        return {"summary": "", "facts": facts, "entities": entities}
 
     model = ScriptedModel(said)
     api = FakeAPI()
@@ -614,6 +618,8 @@ def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
     with Memory(load_settings(), background=False) as memory:
         yesterday = date.today() - timedelta(days=1)
         memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+        if doctor:
+            memory.add("I see Dr. Kim weekly", user_id="u", expiration_date=yesterday, wait=True)
         memory.add("I like jazz", user_id="u", wait=True)
     return model
 
@@ -642,6 +648,22 @@ def test_ask_and_inspect_leave_out_expired_memories(
     result = runner.invoke(app, ["inspect", "facts", "--space", "u", "--hide-expired"])
     assert result.exit_code == 0, result.output
     assert "Berlin" not in result.output and "jazz" in result.output
+
+
+def test_inspect_entities_marks_entities_known_only_from_expired_facts(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第八轮体检 P5：inspect entities 以前不标过期，过期会话里抽出的实体与描述照样列着；
+    现在标"已过期"（检查用，照样列出），--hide-expired 时不列出。"""
+    _expired_space(monkeypatch, doctor=True)
+    result = runner.invoke(app, ["inspect", "entities", "--space", "u"])
+    assert result.exit_code == 0, result.output
+    rows = [line for line in result.output.splitlines() if "Dr. Kim" in line or "User" in line]
+    assert len(rows) == 2, result.output
+    assert all(("已过期" in line) == ("Dr. Kim" in line) for line in rows), rows
+    result = runner.invoke(app, ["inspect", "entities", "--space", "u", "--hide-expired"])
+    assert result.exit_code == 0, result.output
+    assert "Dr. Kim" not in result.output and "User" in result.output
 
 
 def test_inspect_reads_next_to_a_running_server(
