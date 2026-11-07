@@ -465,17 +465,23 @@ class Memory:
                 self._run_seen[(space, rid)] = time.monotonic()
                 self._idle_closed.pop((space, rid), None)
         finally:
-            with self._runs_lock:
-                self._opening[space] -= 1
-                if not self._opening[space]:
-                    del self._opening[space]
+            self._opened(space)
         return rid
 
+    def _opened(self, space: str) -> None:
+        """open_run、_resume 开完（或开失败）一个 run 之后：去掉 _make_room 之后记下的“正在开”。"""
+        with self._runs_lock:
+            self._opening[space] -= 1
+            if not self._opening[space]:
+                del self._opening[space]
+
     def _make_room(self, space: str, run_id: str) -> None:
-        """open_run 的上限（调用方持有 _runs_lock）：max_open_runs 给了、这个空间开着的（加上正在
-        开的）run 已经这么多、run_id 又不是其中之一时 SessionLimitError（/api/v1 回 429）。不替
-        调用方结束别的 run：那会让它们提前抽取。以前 /api/v1 不限，一个令牌可以一直 open_run，
-        每个都占着内存与一个进行中的标记，直到闲置 30 分钟才结束。"""
+        """open_run 与 add 重新打开 run（_resume）的上限（调用方持有 _runs_lock）：max_open_runs
+        给了、这个空间开着的（加上正在开的）run 已经这么多、run_id 又不是其中之一时
+        SessionLimitError（/api/v1 回 429）。不替调用方结束别的 run：那会让它们提前抽取。以前
+        /api/v1 不限，一个令牌可以一直 open_run，每个都占着内存与一个进行中的标记，直到闲置 30
+        分钟才结束。add 重新打开闲置结束的或之前的进程留下的 run 也算开一个新的 run（第八轮体检
+        P8：以前 add 绕过上限，一个空间开着的 run 可以多到 IDLE_CLOSED_KEPT 个）。"""
         limit = self.max_open_runs
         if limit is None or (space, run_id) in self._runs:
             return
@@ -576,23 +582,44 @@ class Memory:
                 return
             idle = key in self._idle_closed
         # 锁的顺序与 close_idle_runs 相同：先会话锁，再 _runs_lock（resume_left_open 拿 _open_lock）
+        # 重新打开也受 max_open_runs 限制（_make_room）：到了上限时 SessionLimitError，什么都不改
         with self.system.session_lock(space, run_id):
             if not idle:
-                if self.system.resume_left_open(space, run_id):
+                reserved = False
+                if self.max_open_runs is not None:
+                    # 在 resume_left_open 改动任何东西之前查：不会重新打开的（普通的会话）照常写，
+                    # 不受上限限制；会重新打开的到了上限时拒绝，标记留着，之后再 add 照样接着写
+                    if not self.system.can_resume_left_open(space, run_id):
+                        return
                     with self._runs_lock:
-                        self._runs.add(key)
-                        self._run_seen[key] = time.monotonic()
+                        self._make_room(space, run_id)
+                        self._opening[space] = self._opening.get(space, 0) + 1
+                        reserved = True
+                try:
+                    if self.system.resume_left_open(space, run_id):
+                        with self._runs_lock:
+                            self._runs.add(key)
+                            self._run_seen[key] = time.monotonic()
+                finally:
+                    if reserved:
+                        self._opened(space)
                 return
             with self._runs_lock:
                 if key not in self._idle_closed:  # 期间别的 add 已经重新打开了
                     if key in self._runs:
                         self._run_seen[key] = time.monotonic()
                     return
+                # 在去掉 _idle_closed 的记录之前：拒绝之后再 add 时照样重新打开，不变成普通的会话
+                self._make_room(space, run_id)
                 del self._idle_closed[key]
-            self.system.open_session(space, run_id)
-            with self._runs_lock:
-                self._runs.add(key)
-                self._run_seen[key] = time.monotonic()
+                self._opening[space] = self._opening.get(space, 0) + 1
+            try:
+                self.system.open_session(space, run_id)
+                with self._runs_lock:
+                    self._runs.add(key)
+                    self._run_seen[key] = time.monotonic()
+            finally:
+                self._opened(space)
 
     def update(
         self,

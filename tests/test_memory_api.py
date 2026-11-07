@@ -1441,6 +1441,79 @@ def test_open_runs_per_space_are_capped_on_the_server(system: MemorySystem) -> N
         client.close()
 
 
+def test_reopening_an_idle_run_counts_against_the_cap(system: MemorySystem) -> None:
+    """第八轮体检 P8：add 重新打开闲置结束的 run 也受 max_open_runs 限制：到了上限时
+    SessionLimitError（/api/v1 回 429），什么都不写，run 照旧记着是闲置结束的，有名额之后再 add
+    照样重新打开（不登记新的任务）。以前 add 绕过上限，一个空间开着的 run 可以多到
+    IDLE_CLOSED_KEPT 个，调用方自己的 open_run 反而 429。"""
+    server = Memory.from_system(system)
+    server.max_open_runs = 2
+    app = FastAPI()
+    app.include_router(memories_router(server, dependencies=guard(Keys())))
+    install_error_format(app)
+    with TestClient(app) as http:
+        client = MemoryClient("http://testserver", http_client=http)
+        a = client.open_run(user_id="eve")
+        b = client.open_run(user_id="eve")
+        client.add("I live in Lisbon", user_id="eve", run_id=a)
+        client.add("I like tea", user_id="eve", run_id=b)
+        assert server.close_idle_runs(0.0) == 2
+        c = client.open_run(user_id="eve")
+        d = client.open_run(user_id="eve")
+        with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            client.add("I like jazz", user_id="eve", run_id=a)
+        refused = http.post(
+            "/api/v1/memories",
+            json={"messages": "I like jazz", "user_id": "eve", "run_id": b, "infer": False},
+        )
+        assert refused.status_code == 429 and refused.headers["retry-after"] == "60"
+        assert refused.json()["error"]["code"] == "rate_limited"
+        assert system.open_sessions("eve") == {c, d}
+        assert [t.text for t in system.db.get_turns("eve", a)] == ["I live in Lisbon"]
+        assert [t.text for t in system.db.get_turns("eve", b)] == ["I like tea"]
+        jobs = len(system.db.get_jobs("eve"))
+
+        client.end_run(c, user_id="eve")
+        client.add("I like jazz", user_id="eve", run_id=a)  # 有名额了：重新打开
+        assert system.open_sessions("eve") == {a, d}
+        assert len(system.db.get_jobs("eve")) == jobs  # 重新打开，不是普通的会话
+        assert client.add("hello", user_id="eve", run_id="never-opened")  # 普通的会话不受限
+        client.close()
+
+
+def test_resuming_a_left_open_run_counts_against_the_cap(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """第八轮体检 P8：重启之后 add 接着写之前的进程留下的 run 也受 max_open_runs 限制：到了上限时
+    SessionLimitError，进行中的标记留着，有名额之后再 add 照样接着写。不会重新打开的 run_id
+    （普通的会话）照常写。"""
+    fake_api.chat_replies = [model]
+    _left_open_runs(n3_settings, fake_api, "a", "b")
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    _adopt_after(after, 60, clock=lambda: 0.0)  # 与 cuemem serve 相同：留给调用方接着写
+    try:
+        server = Memory.from_system(after)
+        server.max_open_runs = 2
+        server.open_run("c", user_id="eve")
+        server.open_run("d", user_id="eve")
+        with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            server.add("I like jazz", user_id="eve", run_id="a")
+        assert after.open_sessions("eve") == {"c", "d"}
+        assert after.can_resume_left_open("eve", "a")
+        assert len(after.db.meta_keys("open-session:")) == 4  # a、b 的标记留着
+        assert [t.text for t in after.db.get_turns("eve", "a")] == ["I like a"]
+        assert server.add("hello", user_id="eve", run_id="never-opened")  # 普通的会话不受限
+        assert after.open_sessions("eve") == {"c", "d"}
+
+        server.end_run("c", user_id="eve")
+        server.add("I like jazz", user_id="eve", run_id="a")
+        assert after.open_sessions("eve") == {"a", "d"}
+        assert not after.can_resume_left_open("eve", "a")
+        assert "a" not in {j["session_id"] for j in after.db.get_jobs("eve")}
+    finally:
+        after.close()
+
+
 @pytest.mark.parametrize("where", ["local", "remote"])
 def test_idle_remote_run_is_ended_and_reopened(system: MemorySystem, where: str) -> None:
     """open_run 之后闲置的 run 由服务端的 close_idle_runs 交给抽取（cuemem serve 每分钟调用）：以前

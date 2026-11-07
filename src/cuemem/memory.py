@@ -843,6 +843,18 @@ class MemorySystem:
                 spaces.add(parsed[0])
         return sum(self.adopt_open(space) for space in sorted(spaces))
 
+    def can_resume_left_open(self, space_id: str, session_id: str) -> bool:
+        """resume_left_open 现在会不会重新打开这个会话（只看，不改任何东西）：Memory._resume 在
+        run 的上限（max_open_runs）已满时据此决定拒绝，还是照普通的会话写。"""
+        key = (space_id, session_id)
+        with self._open_lock:
+            if key in self._open:
+                return False
+            return (
+                self.db.get_meta(_open_mark(space_id, session_id)) is not None
+                or key in self._handed_over
+            )
+
     def resume_left_open(self, space_id: str, session_id: str) -> bool:
         """接着写之前的进程留下、还开着的会话（cuemem serve 停止或崩溃时没有结束的 /api/v1 的
         run）：数据库里有它的标记、本进程里却不在进行中时，在本进程里重新算作进行中（标记留着），

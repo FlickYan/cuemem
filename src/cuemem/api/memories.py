@@ -631,7 +631,7 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(400, str(exc), error_type=type(exc).__name__) from exc
     except (ConcurrentWriteError, IdempotencyConflictError) as exc:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
-    except SessionLimitError as exc:  # open_run 到了上限：结束一个 run 或等闲置的被结束
+    except SessionLimitError as exc:  # open_run 或 add 重新打开 run 到了上限
         raise V1Error(
             429, str(exc), error_type="SessionLimitError", headers={"Retry-After": "60"}
         ) from exc
