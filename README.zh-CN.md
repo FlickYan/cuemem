@@ -254,7 +254,7 @@ uv run python scripts/reproduce.py --only N9      # 最终评测（有原来的�
 uv run python scripts/reproduce.py --only N9 --cache-only   # LLM 只读本地缓存
 ```
 
-一条命令重新生成这些数字，只在存着原来那份响应缓存的机器上成立：`data/`（缓存与评测的记忆空间）和 `runs/` 都不在仓库里，新克隆的仓库上脚本会真的调用 API（加 `--cache-only` 时停在第一个未命中）。请求的字节与缓存键有离线测试钉住（D-068、D-070），但两轮体检之后没有重放过全部 N2–N11：体检的机器上只有 N12 时期的缓存。复现脚本不改写冻结的控制器文件（训练那几步只与仓库里的文件核对），出错或达到花费上限时停下，不把不完整的报告复制进 `docs/results`。要读别的运行的分析步骤缺了运行就跳过，分析脚本本身（`n11_variance.py`、`n11_mem0.py`、`n11_second_judge.py report`、`n12_leak.py`）缺了运行也退出码 1、什么都不写；随机器而变的 N11 延迟基准与 N8 演示摘要写到 `runs/` 下，不覆盖发表的文件。加 `--cache-only` 时未命中缓存就报错、不调用 API，构建时由备用模型回答的请求按缓存里备用模型的回复重放；跑完用 `git diff docs/results src/cuemem/read` 核对。N12 的数字不在脚本里，运行的命令见 `scripts/n12_baselines.py` 的说明。
+一条命令重新生成这些数字，只在存着原来那份响应缓存的机器上成立：`data/`（缓存与评测的记忆空间）和 `runs/` 都不在仓库里，新克隆的仓库上脚本会真的调用 API（加 `--cache-only` 时 LLM 未命中记为出错，这一步跑完后以非零退出码停下，不往 `docs/results` 复制；向量请求未命中时照常调用，花费很小）。请求的字节与缓存键有离线测试钉住（D-068、D-070），但两轮体检之后没有重放过全部 N2–N11：体检的机器上只有 N12 时期的缓存。复现脚本不改写冻结的控制器文件（训练那几步只与仓库里的文件核对），出错或达到花费上限时停下，不把不完整的报告复制进 `docs/results`。要读别的运行的分析步骤缺了运行就跳过，分析脚本本身（`n11_variance.py`、`n11_mem0.py`、`n11_second_judge.py report`、`n12_leak.py`）缺了运行也退出码 1、什么都不写；随机器而变的 N11 延迟基准与 N8 演示摘要写到 `runs/` 下，不覆盖发表的文件。加 `--cache-only` 时 LLM 请求未命中缓存就报错、不调用 API，构建时由备用模型回答的请求按缓存里备用模型的回复重放；跑完用 `git diff docs/results src/cuemem/read` 核对。N12 的数字不在脚本里，运行的命令见 `scripts/n12_baselines.py` 的说明。
 
 开发：
 

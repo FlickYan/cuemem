@@ -318,7 +318,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--cache-only",
         action="store_true",
-        help="只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：未命中即报错、不调用 API",
+        help=(
+            "LLM 请求只读本地缓存（CUEMEM_LLM_CACHE_MODE=read_only）：LLM 未命中即报错、"
+            "不调用 API；向量请求照常"
+        ),
     )
     args = parser.parse_args(argv)
     steps = [s for s in STEPS if args.only is None or s.node == args.only]
@@ -327,7 +330,7 @@ def main(argv: list[str] | None = None) -> None:
     extra = CACHE_ONLY if args.cache_only else {}
     if args.cache_only:
         cache_only = " ".join(f"{k}={v}" for k, v in CACHE_ONLY.items())
-        print(f"（--cache-only：每一步都设了 {cache_only}，未命中缓存即报错）", flush=True)
+        print(f"（--cache-only：每一步都设了 {cache_only}，LLM 未命中缓存即报错）", flush=True)
     skipped: set[str] = set()  # --cache-only 时演示回放未命中、余下步骤跳过的节点
     for step in steps:
         if step.optional and not args.with_optional:
