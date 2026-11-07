@@ -1935,6 +1935,8 @@ def _fact_item(
         "subject": fact.subject,
         "predicate": fact.predicate,
         "object": fact.object,
+        "negated": fact.negated,  # 否定的事实：主谓宾说的是不成立的事（第八轮体检）
+        "cardinality": fact.cardinality,
         "category": fact.category,
         "importance": fact.importance,
         "status": fact_status(fact, {}),

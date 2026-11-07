@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -32,7 +33,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import BaseModel, TypeAdapter
-from scripted import ScriptedModel
+from scripted import ScriptedModel, _fact
 from test_forget import embed_cache_full_once, no_space_for_trace_rewrites
 from test_sdk import (
     AUG,
@@ -417,6 +418,47 @@ def test_add_events_history_and_time_travel(mem: Mem) -> None:
     ]
     assert mem.get("no-such-id") is None and mem.history("no-such-id") == []
     assert "Munich" in mem.profile(user_id="alice")
+
+
+def no_coffee(prompt: str) -> dict[str, Any]:
+    """抽取替身：每句发言抽成一条否定的单值事实（"no longer drinks coffee"）。"""
+    facts = [
+        _fact("The user no longer drinks coffee.", "drinks", "coffee", turns=[int(n)],
+              negated=True)
+        for n, _ in re.findall(r"\[t(\d+)\] User: (.*)", prompt)
+    ]  # fmt: skip
+    return {"summary": "", "facts": facts, "entities": []}
+
+
+def test_fact_items_carry_negated_and_cardinality(mem: Mem, fake_api: FakeAPI) -> None:
+    """第八轮体检 P18：事实条目以前只有主谓宾，没有 negated 与 cardinality：按三元组同步的
+    客户端把"不再喝咖啡"记成"喝咖啡"。本地与经 /api/v1 的 MemoryClient 都给出（远程的响应按
+    OpenAPI 的模型校验，见 documented）。"""
+    fake_api.chat_replies = [ScriptedModel(no_coffee)]
+    added = mem.add("I no longer drink coffee", user_id="u", wait=True)["results"]
+    found = mem.search("coffee", user_id="u", mode="l1")["results"]
+    listed = mem.get_all(user_id="u")["results"]
+    (fact,) = listed
+    items = [*added, *[f for f in found if f["type"] == "fact"], fact, mem.get(fact["id"])]
+    items += mem.history(fact["id"])
+    assert len(items) == 5
+    for item in items:
+        assert item["negated"] is True and item["cardinality"] == "single", item
+        assert (item["subject"], item["predicate"], item["object"]) == ("User", "drinks", "coffee")
+
+
+def test_the_client_takes_fact_items_from_an_older_server() -> None:
+    """MemoryClient 不按模型校验响应：0.8.0 之前的服务端给的事实条目没有 negated 与 cardinality，
+    照样原样交给调用方（调用方用 item.get("negated", False)）。"""
+    old = {"id": "f1", "memory": "The user drinks tea.", "type": "fact", "subject": "User",
+           "predicate": "drinks", "object": "tea"}  # fmt: skip
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"results": [old]})
+
+    http = httpx2.Client(transport=httpx2.MockTransport(handle), base_url="http://old")
+    with MemoryClient("http://old", http_client=http) as client:
+        assert client.get_all(user_id="u")["results"] == [old]
 
 
 def test_valid_at_takes_a_year_month_or_day(mem: Mem) -> None:

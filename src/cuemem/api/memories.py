@@ -78,7 +78,7 @@ from cuemem.api.auth import (
     spaces_over_cap,
 )
 from cuemem.api.failures import provider_failure
-from cuemem.core.models import FactCategory, SupersedeReason
+from cuemem.core.models import Cardinality, FactCategory, SupersedeReason
 from cuemem.errors import (
     ConcurrentWriteError,
     CueMemError,
@@ -290,6 +290,14 @@ class FactItem(_Out):
     subject: str
     predicate: str
     object: str
+    negated: bool = Field(
+        description='True for a negative fact ("no longer drinks coffee"): subject, predicate '
+        "and object then describe what is NOT true."
+    )
+    cardinality: Cardinality = Field(
+        description='"single": a newer value replaces the old one (where the user lives); '
+        '"multi": values accumulate (what the user likes).'
+    )
     category: FactCategory
     importance: int
     status: str = Field(description='"current", or since when it is no longer true or corrected.')
