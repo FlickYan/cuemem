@@ -30,6 +30,7 @@ from cuemem.api.service import ChatService
 from cuemem.config import Settings
 from cuemem.evidence import LISTING_END, LISTING_NOTE
 from cuemem.memory import MemorySystem
+from cuemem.store.vector import reserved_files
 
 ADMIN_TOKEN = "admin-token-0123456789"
 ALICE_TOKEN = "alice-token-0123456789"
@@ -155,7 +156,9 @@ def test_remember_in_a_new_space_near_the_open_file_limit_says_why(
         said(http.post("/mcp", json=call("remember", text="I like tea"), headers=alice))
         vectors = service.system.vectors
         collections = len(vectors._client.get_collections().collections)
-        small_open_file_limit(monkeypatch, collections + 256)
+        # 最小的、余量正好够已有集合的软上限（reserved_files 在软上限小时最多留一半）
+        soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+        small_open_file_limit(monkeypatch, soft)
         other = headers(ALICE_TOKEN, **{"X-CueMem-User": "alice", "X-CueMem-Agent": "x1"})
         refused = http.post("/mcp", json=call("remember", text="I like milk"), headers=other)
         assert refused.status_code == 200 and refused.json()["result"]["isError"] is True

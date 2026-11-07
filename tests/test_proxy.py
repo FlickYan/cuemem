@@ -42,6 +42,7 @@ from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
+from cuemem.store.vector import reserved_files
 from cuemem.write.consolidate import Consolidator
 from cuemem.write.online import worth_retrying
 
@@ -537,7 +538,9 @@ def test_a_new_user_near_the_open_file_limit_gets_503_before_forwarding(
     空间照常（第八轮体检 P3）。以前转发、回答之后写回才失败（文件用光时所有请求都出错）。"""
     assert chat(client, "I live in Berlin", user="alice").status_code == 200
     collections = len(system.vectors._client.get_collections().collections)
-    small_open_file_limit(monkeypatch, collections + 256)
+    # 最小的、余量正好够已有集合的软上限（reserved_files 在软上限小时最多留一半）
+    soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+    small_open_file_limit(monkeypatch, soft)
     sent = len(upstream.proxied)
     full = chat(client, "hi", user="alice", headers={"X-CueMem-Agent": "x1"})
     assert full.status_code == 503, full.text
