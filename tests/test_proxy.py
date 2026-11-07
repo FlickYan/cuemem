@@ -29,7 +29,13 @@ from test_store import small_open_file_limit
 
 from cuemem import Memory
 from cuemem.api import proxy as proxy_module
-from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
+from cuemem.api.proxy import (
+    MemoryProxy,
+    ProxyError,
+    _chat_to_response,
+    _responses_to_chat,
+    create_proxy_app,
+)
 from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
@@ -898,6 +904,28 @@ def test_a_parked_implicit_session_keeps_its_id(
     assert system.worker is not None
     system.worker.wait()
     assert [j["session_id"] for j in system.db.get_jobs("alice")] == [session]
+
+
+def test_a_session_that_is_writing_back_is_not_ended_to_make_room(
+    client: TestClient, proxy: MemoryProxy, clock: Clock
+) -> None:
+    """第八轮体检 P10：到了 max_open_runs 时不停放正在写回的会话（它的锁被持有），即使它最久
+    没有请求；都在写回时 429。直接调用 _make_room（调用方持有 proxy._lock），只看选了哪个。"""
+    proxy.max_open_runs = 2
+    for i, sid in enumerate(("s1", "s2")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    s1, s2 = proxy._runs[("alice", "s1")], proxy._runs[("alice", "s2")]
+    with s1.lock:  # s1 最久没有请求，但正在写回
+        with proxy._lock:
+            assert proxy._make_room("alice") is None
+        assert list(proxy._parked) == [("alice", "s2")]  # 停放的是 s2（第八轮体检 P1）
+        proxy._parked.clear()
+        proxy._runs[("alice", "s2")] = s2  # 放回去：只看选了哪个
+        with s2.lock, proxy._lock, pytest.raises(ProxyError) as refused:
+            proxy._make_room("alice")
+    assert refused.value.status == 429
+    assert sorted(sid for _, sid in proxy._runs) == ["s1", "s2"]
 
 
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）

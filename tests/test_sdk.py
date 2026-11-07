@@ -14,9 +14,10 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from fakes import NO_BALANCE, FakeAPI
@@ -30,6 +31,8 @@ from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
 from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, stored_text
 from cuemem.memory import _open_mark
+from cuemem.read.l1 import L1Config
+from cuemem.read.l2 import L2Config
 from cuemem.sdk import _key_hash, _matches, parse_messages, space_for
 from cuemem.store.vector import VectorStore
 
@@ -1190,6 +1193,27 @@ def test_answer_does_not_use_expired_memories(
     assert "Berlin" not in prompt and "jazz" in prompt
 
 
+@pytest.mark.parametrize("mode", ["l1", "l2"])
+def test_version_chain_does_not_bring_back_expired_facts(
+    memory: Memory, model: ScriptedModel, mode: Literal["l1", "l2"]
+) -> None:
+    """第八轮体检 P10：hidden 挡住了各路检索，但版本链会把被取代的旧事实补回来（"已经不对了，
+    见 [f2]"）。过期的旧住址要在 MemorySystem._without 里再去掉一次，不然它随新住址一起进了
+    回答模型的提示与 recall 的清单（auto 选的层不补版本链，查不出来，所以只测 L1、L2）。"""
+    memory.add(
+        "I live in Berlin",
+        user_id="u",
+        expiration_date=date.today() - timedelta(days=1),
+        wait=True,
+    )
+    memory.add("I moved to Munich", user_id="u", wait=True)
+    memory.answer("Where do I live?", user_id="u", mode=mode)
+    (prompt,) = model.prompts["read"]
+    assert "Munich" in prompt and "Berlin" not in prompt
+    listing = recall_listing(memory.system, "u", "Where do I live?", mode=mode, at_least_l1=True)
+    assert "Munich" in json.dumps(listing) and "Berlin" not in json.dumps(listing)
+
+
 def test_hatch_search_does_not_find_expired_memories(
     memory: Memory, model: ScriptedModel, fake_api: FakeAPI
 ) -> None:
@@ -1319,6 +1343,51 @@ def test_memory_browser_hides_expired_memories(memory: Memory, tmp_path: Path) -
         assert len(http.get("/api/spaces/u/media?show_expired=true").json()) == 1
     assert _forget(service, "u", "Berlin")["facts"] == [berlin]
     assert berlin not in statements(service.facts("u", show_expired=True))
+
+
+@pytest.mark.parametrize("mode", ["l1", "l2"])
+def test_expired_image_in_a_live_round_is_not_loaded(
+    memory: Memory, tmp_path: Path, mode: Literal["l1", "l2"]
+) -> None:
+    """第八轮体检 P10：一轮里的用户发言带着图片、已经过期，同一轮里助手的回复没有过期——这一轮
+    照样检索得到（出处各句都过期了才算过期），装入的轮里的图片却要在 MemorySystem._without
+    里去掉：它不经过各路检索的 hidden，以前会作为描述或原图交给回答模型。
+
+    两次 add 各成一轮；后写的回复并进前一轮的做法同 OpenAI Agents 集成（_merge_round）。"""
+    picture = tmp_path / "flat.png"
+    Image.new("RGB", (16, 16), "green").save(picture)
+    content = [
+        {"type": "text", "text": "My old flat"},
+        {"type": "image_url", "image_url": {"url": str(picture)}},
+    ]
+    yesterday = date.today() - timedelta(days=1)
+    memory.add(
+        [{"role": "user", "content": content}],
+        user_id="u",
+        run_id="flat",
+        expiration_date=yesterday,
+        infer=False,
+    )
+    memory.add(
+        [{"role": "assistant", "content": "What a bright flat"}],
+        user_id="u",
+        run_id="flat",
+        infer=False,
+    )
+    system = memory.system
+    stale = [u.id for u in system.db.list_units("u", kinds=["round"], session_ids=["flat"])]
+    system.writer.replace_rounds("u", "flat", stale)
+    (merged,) = system.db.list_units("u", kinds=["round"], session_ids=["flat"])
+    (image,) = system.db.get_media("u")
+    assert merged.meta["media_ids"] == [image.id] and "bright flat" in merged.text
+    gone = system.expired_ids("u", datetime.now())
+    assert image.id in gone and merged.id not in gone
+
+    l1 = replace(L1Config(), attach_images=2)  # 附上原图：attach 也要去掉它
+    l2 = replace(L2Config(), l1=l1)
+    recall = system.retrieve("u", "my old flat", mode=mode, l1=l1, l2=l2, hide_expired=True)
+    assert [h.unit.id for h in recall.view.rounds] == [merged.id]
+    assert image.id not in recall.view.media and image.id not in recall.view.attach
 
 
 def doctors(prompt: str) -> dict[str, Any]:

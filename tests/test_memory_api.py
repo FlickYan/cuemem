@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx2
 import pytest
@@ -912,10 +912,14 @@ def test_context_leaves_out_expired_memories(mem: Mem) -> None:
     assert "snow" in text and "rain" not in text
 
 
-def test_expired_memories_do_not_take_recall_slots(system: MemorySystem) -> None:
+@pytest.mark.parametrize("mode", ["l1", "l2"])
+def test_expired_memories_do_not_take_recall_slots(
+    system: MemorySystem, mode: Literal["l1", "l2"]
+) -> None:
     """过期的近似说法不再占召回的名额（第七轮体检 P5）：以前它们加进 exclude，各路先取前 30 条、
     再去掉它们，有效的记忆被挤出候选（300 条过期的近似说法时装入的对话片段从 33 条降到 29 条）；
-    现在在检索里就排除，各路的前 30 条都是有效的记忆，召回的不比没有过期记忆的空间少。"""
+    现在在检索里就排除，各路的前 30 条都是有效的记忆，召回的不比没有过期记忆的空间少。
+    L2 的各次 L1 检索也要带上 hidden（第八轮体检 P10：以前只测了 L1）。"""
     mem = Memory.from_system(system)
     question = "what is the daily special at the cafe?"
     yesterday = date.today() - timedelta(days=1)
@@ -929,13 +933,13 @@ def test_expired_memories_do_not_take_recall_slots(system: MemorySystem) -> None
             text = f"what is the daily special at the cafe? it is the soup {i}"
             mem.add(text, user_id=user, infer=False, expiration_date=yesterday)
         mem.consolidate(user_id=user)
-    plain = mem.context(question, user_id="plain", mode="l1")
-    crowded = mem.context(question, user_id="crowded", mode="l1")
+    plain = mem.context(question, user_id="plain", mode=mode)
+    crowded = mem.context(question, user_id="crowded", mode=mode)
     assert crowded["recalled"] >= plain["recalled"]
     assert "pasta" in crowded["context"] and "soup" not in crowded["context"]
-    recall = system.retrieve("crowded", question, mode="l1", hide_expired=True)
+    recall = system.retrieve("crowded", question, mode=mode, hide_expired=True)
     rounds = [h.unit.text for h in recall.view.rounds]
-    plain_rounds = system.retrieve("plain", question, mode="l1", hide_expired=True).view.rounds
+    plain_rounds = system.retrieve("plain", question, mode=mode, hide_expired=True).view.rounds
     assert len(rounds) >= len(plain_rounds) and not any("soup" in t for t in rounds)
     # 改走 L1 的第二次检索用第一次算出的过期记忆，不再算一遍
     assert recall.expired is not None and len(recall.expired) >= 300
