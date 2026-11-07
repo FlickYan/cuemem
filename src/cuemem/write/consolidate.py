@@ -86,6 +86,17 @@ MIRRORED_SPACES = 4
 DIGESTS_KEPT = 100_000  # 记着内容指纹的会话数（见 enqueue），超过时清空重算
 
 
+def consolidation_fingerprint(model: str, config: ConsolidationConfig) -> str:
+    """影响巩固结果的配置指纹（见 Consolidator.fingerprint）：流水线版本、抽取模型与巩固配置，
+    并发数不算。单独成函数，cuemem doctor 不组装 Consolidator 也能按配置判断空间是否过期。"""
+    # 没有补充说明时不计入指纹：加这个字段之前巩固过的空间不会被判为过期
+    exclude = {"workers", "background_workers"}
+    if config.instructions is None:
+        exclude.add("instructions")
+    dumped = json.dumps(config.model_dump(exclude=exclude), sort_keys=True)
+    return stable_id(PIPELINE_VERSION, model, dumped)
+
+
 @dataclass
 class ConsolidationReport:
     space_id: str
@@ -258,12 +269,7 @@ class Consolidator:
         也要放进 exclude。"""
         role = self.extractor.llm.settings.roles.get(self.extractor.role)
         model = self.extractor.model or (role.model if role else "")
-        # 没有补充说明时不计入指纹：加这个字段之前巩固过的空间不会被判为过期
-        exclude = {"workers", "background_workers"}
-        if self.config.instructions is None:
-            exclude.add("instructions")
-        config = json.dumps(self.config.model_dump(exclude=exclude), sort_keys=True)
-        return stable_id(PIPELINE_VERSION, model, config)
+        return consolidation_fingerprint(model, self.config)
 
     def stale(self, space_id: str) -> bool:
         """派生记忆是否过期：有用旧版本流水线处理过的会话，或巩固配置变了（需要重建）。

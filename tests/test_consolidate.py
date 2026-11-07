@@ -1517,6 +1517,21 @@ def test_default_consolidation_fingerprint_is_unchanged(
         assert system.consolidator.fingerprint() == "2f0adc7890b6a52e"
 
 
+def test_fingerprint_function_matches_the_method(settings: Settings, fake_api: FakeAPI) -> None:
+    """cuemem doctor 不组装 Consolidator、按配置算指纹（consolidation_fingerprint，第八轮体检
+    P16）：与 Consolidator.fingerprint 逐字节相同，有没有补充说明都是，否则 doctor 把每个空间都
+    报成过期。"""
+    from cuemem.write.consolidate import consolidation_fingerprint
+
+    model = settings.roles["extractor"].model
+    for instructions in (None, "只记饮食偏好"):
+        config = settings.consolidation.model_copy(update={"instructions": instructions})
+        current = settings.model_copy(update={"consolidation": config})
+        with MemorySystem.from_settings(current, http_client=fake_api.client()) as system:
+            assert consolidation_fingerprint(model, config) == system.consolidator.fingerprint()
+    assert consolidation_fingerprint(model, settings.consolidation) == "2f0adc7890b6a52e"
+
+
 def test_reused_state_notices_writes_from_another_connection(
     n3_settings: Settings, fake_api: FakeAPI
 ) -> None:

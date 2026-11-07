@@ -1522,6 +1522,48 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: int(r[1]) for r in rows}
 
+    def job_summary(self, version: str) -> list[dict[str, Any]]:
+        """全部空间的任务概况（cuemem doctor，第八轮体检）：每个有任务的空间一项，按空间 ID 排序，
+        有 space_id、counts（状态 → 个数）、other_version（按别的流水线版本登记的任务数）、
+        error（失败任务里的一条错误：第一行、最多 200 个字符，错误可能引用模型输出里的用户原文）
+        与 recorded（巩固指纹 consolidation:<空间>，没有时 None）。
+
+        一次分组查询扫一遍任务表（命令行里用，不走索引也够快），失败的错误与指纹各一次查询。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT space_id, status, COUNT(*), SUM(version != ?) FROM jobs"
+                " GROUP BY space_id, status",
+                (version,),
+            ).fetchall()
+            errors = dict(
+                self._conn.execute(
+                    "SELECT space_id, MIN(error) FROM jobs WHERE status = 'failed'"
+                    " GROUP BY space_id"
+                ).fetchall()
+            )
+            prefix = "consolidation:"
+            recorded = {
+                str(key)[len(prefix) :]: value
+                for key, value in self._conn.execute(
+                    "SELECT key, value FROM meta WHERE key >= ? AND key < ?",
+                    (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)),
+                ).fetchall()
+            }
+        spaces: dict[str, dict[str, Any]] = {}
+        for space_id, status, count, other in rows:
+            item = spaces.setdefault(
+                space_id,
+                {"space_id": space_id, "counts": {}, "other_version": 0, "error": None},
+            )
+            item["counts"][status] = int(count)
+            item["other_version"] += int(other or 0)
+        for space_id, item in spaces.items():
+            error = errors.get(space_id)
+            if error:
+                item["error"] = (str(error).splitlines() or [""])[0][:200]
+            item["recorded"] = recorded.get(space_id)
+        return [spaces[key] for key in sorted(spaces)]
+
     def get_jobs(self, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
         sql = (
             "SELECT id, session_id, version, content_hash, status, attempts, error, stats,"

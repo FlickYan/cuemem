@@ -260,6 +260,87 @@ def test_doctor_reports_free_space(
     assert "剩余空间50MB" in _flat(result.output) and "空间不够" in result.output
 
 
+def _jobs_db(tmp_path: Path) -> Any:
+    from cuemem.store.sqlite import MemoryDB
+    from cuemem.write.consolidate import PIPELINE_VERSION
+
+    db = MemoryDB(tmp_path / "db")
+    db.enqueue_jobs("alice", [("j1", "s1", PIPELINE_VERSION, "h1")])
+    db.enqueue_jobs("bob", [("j2", "s2", PIPELINE_VERSION, "h2")])
+    return db
+
+
+def test_doctor_reports_failed_jobs(isolated_paths: None, tmp_path: Path) -> None:
+    """doctor 列出抽取失败的任务（数目、错误的第一行、补做的命令）与排队的任务总数（第八轮体检
+    P16）。自动重试用完之后（Key 过期、余额不足）写入照样成功、健康检查照样正常，以前 doctor
+    什么都不说。错误只取第一行、最多 200 个字符：可能引用了模型输出里的用户原文。"""
+    db = _jobs_db(tmp_path)
+    db.fail_job("j1", "APIConnectionError: unreachable\nsecond line with user text")
+    db.close()
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "记忆空间alice有1个抽取失败的任务" in flat
+    assert "APIConnectionError:unreachable" in flat and "secondline" not in flat
+    assert "cuememconsolidate--spacealice" in flat
+    assert "排队等待巩固的任务：1个" in flat  # bob 的
+    assert "bob有" not in flat and "按旧的配置" not in flat
+
+
+def test_doctor_reports_stale_spaces(isolated_paths: None, tmp_path: Path) -> None:
+    """按旧流水线版本登记过任务、或巩固指纹与当前配置不同的空间是过期的：后台线程不重建（D-073
+    P2），doctor 提醒显式巩固（第八轮体检 P16）。清空重建没做完的另起一行，不算过期。"""
+    from cuemem.write.consolidate import REBUILD_PENDING
+
+    db = _jobs_db(tmp_path)
+    db.enqueue_jobs("carol", [("j3", "s3", "old", "h3")])
+    db.set_meta("consolidation:bob", "fingerprint-of-another-config")
+    db.set_meta("consolidation:alice", REBUILD_PENDING)
+    db.close()
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "记忆空间carol是按旧的配置抽取的" in flat and "cuememconsolidate--spacecarol" in flat
+    assert "记忆空间bob是按旧的配置抽取的" in flat
+    assert "alice是按旧的配置" not in flat and "记忆空间alice有没做完的重建" in flat
+
+
+def test_doctor_caps_the_job_listing(isolated_paths: None, tmp_path: Path) -> None:
+    from cuemem.cli import JOB_LINES
+
+    db = _jobs_db(tmp_path)
+    for i in range(JOB_LINES + 3):
+        db.enqueue_jobs(f"u{i:02d}", [(f"o{i}", "s", "old", "h")])
+    db.close()
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert flat.count("是按旧的配置抽取的") == JOB_LINES and "……还有3条" in flat
+
+
+def test_doctor_does_not_create_the_database(isolated_paths: None, tmp_path: Path) -> None:
+    """数据库还不存在时 doctor 不新建它（只读的检查）。"""
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "db").exists()
+    assert "排队等待巩固" not in result.output
+
+
+def test_doctor_reports_cache_sizes(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor 写明 LLM 缓存、向量缓存（连同 -wal）与 trace 目录多大；没设 trace 保留天数、合计
+    超过门槛时标黄并指向 CUEMEM_TRACES_RETENTION_DAYS（第八轮体检 P16）。"""
+    monkeypatch.setattr("cuemem.cli.CACHE_WARN", 2**20)
+    (tmp_path / "llm_cache").write_bytes(b"x" * 2**20)
+    (tmp_path / "embed_cache-wal").write_bytes(b"x" * 2**20)
+    (tmp_path / "traces" / "2026").mkdir(parents=True)
+    (tmp_path / "traces" / "2026" / "a.jsonl").write_bytes(b"x" * 3 * 2**20)
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "缓存2MB" in flat and "trace3MB" in flat
+    assert "CUEMEM_TRACES_RETENTION_DAYS" in flat
+
+    monkeypatch.setenv("CUEMEM_TRACES_RETENTION_DAYS", "30")
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "缓存2MB" in flat and "CUEMEM_TRACES_RETENTION_DAYS" not in flat
+
+
 @pytest.mark.filterwarnings(
     "ignore:Api key is used with an insecure connection", "ignore:Failed to obtain server version"
 )

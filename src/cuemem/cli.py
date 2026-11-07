@@ -90,6 +90,8 @@ app = typer.Typer(
 )
 console = Console()
 LOW_DISK = 200 * 2**20  # doctor 在数据目录剩余空间低于它时标黄
+CACHE_WARN = 2**30  # doctor：缓存与 trace 合计超过它、又没设 trace 保留天数时标黄
+JOB_LINES = 20  # doctor 最多列出这么多条巩固任务的提醒，其余只说还有几条
 
 
 @app.callback()
@@ -332,6 +334,8 @@ def doctor(
     _print_local_store(settings)
     _print_disk(settings)
     _print_media_journal(settings)
+    _print_jobs(settings)
+    _print_cache_sizes(settings)
     if vectors:
         _print_vector_gaps(settings)
     for line in _loose_modes(settings):
@@ -2582,6 +2586,112 @@ def _print_media_journal(settings: Settings) -> None:
             f"[yellow]媒体库里有 {stale} 个被中断的写入或遗忘[/yellow]：可能留下了没有记录的原图，"
             "运行 [bold]cuemem reindex --all[/bold] 删掉（cuemem serve 与 proxy 启动时也会删）"
         )
+
+
+def _print_jobs(settings: Settings) -> None:
+    """各记忆空间的巩固任务（第八轮体检）：抽取失败的（数目、一条错误与补做的命令）、按旧配置
+    或旧流水线抽取过的（过期，要显式的巩固重建：后台线程不重建，见 D-073 P2），清空重建没做完
+    的，以及排着队的任务总数。
+
+    只读：数据库还不存在时什么都不做、不新建；与 cuemem spaces 一样不拿数据库锁，cuemem serve
+    开着时也能看。失败的任务自动重试 MAX_ATTEMPTS 次之后就停了（例如 Key 过期、余额不足），写入
+    照样成功、健康检查照样正常，以前只有按用户查 /api/v1/status 才看得到。"""
+    from cuemem.store.sqlite import MemoryDB
+    from cuemem.write.consolidate import (
+        PIPELINE_VERSION,
+        REBUILD_PENDING,
+        consolidation_fingerprint,
+    )
+
+    if not settings.paths.db.is_file():
+        return
+    try:
+        db = MemoryDB(settings.paths.db)
+    except (sqlite3.Error, CueMemError) as exc:
+        console.print(f"[yellow]读不了巩固任务[/yellow]：{escape(str(exc))}")
+        return
+    try:
+        summary = db.job_summary(PIPELINE_VERSION)
+    except sqlite3.Error as exc:
+        console.print(f"[yellow]读不了巩固任务[/yellow]：{escape(str(exc))}")
+        return
+    finally:
+        db.close()
+    role = settings.roles.get("extractor")
+    current = consolidation_fingerprint(role.model if role else "", settings.consolidation)
+    lines: list[str] = []
+    pending = 0
+    for item in summary:
+        space = escape(item["space_id"])
+        fix = f"[bold]cuemem consolidate --space {space}[/bold]"
+        counts = item["counts"]
+        pending += counts.get("pending", 0)
+        if counts.get("failed"):
+            lines.append(
+                f"[yellow]记忆空间 {space} 有 {counts['failed']} 个抽取失败的任务[/yellow]"
+                f"（{escape(item['error'] or '没有记下错误')}）：查明原因后运行 {fix} 补做"
+            )
+        recorded = item["recorded"]
+        if item["other_version"] or recorded not in (None, REBUILD_PENDING, current):
+            lines.append(
+                f"[yellow]记忆空间 {space} 是按旧的配置抽取的[/yellow]：{fix} 重建它"
+                "（命中 LLM 缓存的部分不再付费）"
+            )
+        elif recorded == REBUILD_PENDING:
+            lines.append(f"记忆空间 {space} 有没做完的重建：后台线程下一次巩固时做完，或运行 {fix}")
+    for line in lines[:JOB_LINES]:
+        console.print(line)
+    if len(lines) > JOB_LINES:
+        console.print(f"……还有 {len(lines) - JOB_LINES} 条")
+    console.print(f"排队等待巩固的任务：{pending} 个")
+
+
+def _print_cache_sizes(settings: Settings) -> None:
+    """LLM 缓存、向量缓存（各连同 -wal）与 trace 目录占了多少空间（第八轮体检）。trace 每个不同
+    的提问约 6-7 KB、一直留着：没设 CUEMEM_TRACES_RETENTION_DAYS 且合计超过 CACHE_WARN 时标黄。"""
+    paths = settings.paths
+    files = [paths.llm_cache, paths.embed_cache]
+    files += [path.with_name(path.name + "-wal") for path in files]
+    caches = sum(_file_size(path) for path in files)
+    traces = _tree_size(paths.traces)
+    line = (
+        f"缓存 {caches / 2**20:,.0f} MB（{escape(str(paths.llm_cache.parent))}），"
+        f"trace {traces / 2**20:,.0f} MB（{escape(str(paths.traces))}）"
+    )
+    if settings.traces_retention_days is None and caches + traces > CACHE_WARN:
+        console.print(
+            f"[yellow]{line}[/yellow]：trace 一直留着，设环境变量 "
+            "[bold]CUEMEM_TRACES_RETENTION_DAYS[/bold]（天数）定期清掉旧的"
+        )
+    else:
+        console.print(line)
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _tree_size(root: Path) -> int:
+    """目录里全部文件的大小之和（不跟随符号链接）；目录不存在或读不了的部分算 0。"""
+    total = 0
+    stack = [root]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
 
 
 def _loose_modes(settings: Settings | None = None) -> list[str]:
