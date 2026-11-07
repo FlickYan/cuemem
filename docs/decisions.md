@@ -63,25 +63,26 @@
 | D-053 | 对账提示分清"范围不同""现实变了""说错了"，并附上原话；不改流水线版本号 | 已采纳（N11） |
 | D-054 | Agent 的回答缓存按会话归属 | 已采纳（N11） |
 | D-055 | 外部基线 Mem0：同样的模型、同样的回答与判分，按它自己的流程写入与检索 | 已采纳（N11） |
-| D-056 | 部署：本地向量库被占用时明确报错；服务端建 payload 索引；迁移命令；可选访问令牌 | 已采纳（N11；第二轮体检：限定作用域的令牌，D-069；N12 之后修订：非本机地址必须有令牌，D-068；第四轮体检：令牌至少 16 个字符、Qdrant 的 API Key，D-071；第五轮体检：反向代理后面也要令牌、doctor --repair-vectors 与 --vectors、cuemem reindex，D-072；第六轮体检：cuemem keys 与令牌文件的热加载、每个令牌同时处理的请求有上限，D-073；第七轮体检：不论哪种模式都锁住数据库，D-074） |
+| D-056 | 部署：本地向量库被占用时明确报错；服务端建 payload 索引；迁移命令；可选访问令牌 | 已采纳（N11；第二轮体检：限定作用域的令牌，D-069；N12 之后修订：非本机地址必须有令牌，D-068；第四轮体检：令牌至少 16 个字符、Qdrant 的 API Key，D-071；第五轮体检：反向代理后面也要令牌、doctor --repair-vectors 与 --vectors、cuemem reindex，D-072；第六轮体检：cuemem keys 与令牌文件的热加载、每个令牌同时处理的请求有上限，D-073；第七轮体检：不论哪种模式都锁住数据库，D-074；第八轮体检：离打开文件数的上限留余量、就绪检查、doctor 的任务与构建标识，D-075） |
 | D-057 | 门控在真实流量上的检验：WildChat 里真实用户消息的第一句 | 已采纳（N11） |
 | D-058 | 控制器 v3：有图的空间里，只在问到图时才看图 | 已采纳（N11 之后） |
 | D-059 | 遗忘留下的空缺在重新抽取时标出来；挨着空缺的代词不套到别人身上 | 已采纳（N11 之后） |
-| D-060 | 换模型供应商：配置随包发布、数据目录、预设（openai、ollama）与 OpenAI 兼容的向量接口；Docker | 已采纳（N12；第六轮体检：记忆代理不转发没有 Key 的目录模型，D-073） |
-| D-061 | Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义（版本链、控制器、遗忘） | 已采纳（N12；第二轮体检：metadata、update、reset 与远程的 MemoryClient，D-069；第五轮体检：过期在召回、回答与画像里生效、valid_at 按时间段、本地检查参数、Mem0 保留的过滤名、按作用域等，D-072；第六轮体检：context、幂等的 add、valid_at 对部分日期的结束与更正，D-073；第七轮体检：本地与 HTTP 同样的 `at`、delete_many 与预演，D-074） |
-| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12；第二轮体检：/v1/embeddings、/v1/responses 的子集，D-069；第四轮体检：可选的按令牌上限，D-071；第五轮体检：输出上限按模型自己的参数名写上、不给过期的记忆，D-072；第六轮体检：没有 Key 时回 503 model_not_available，不再不带 Key 转发，D-073；第七轮体检：留着重试的写回与进行中的会话有上限，D-074） |
-| D-063 | 导出与导入只搬原始日志；遗忘可以预演 | 已采纳（N12；第二轮体检：导出格式 2，D-069；第五轮体检：只写了日志的会话导入后不抽取、原子地写导出文件，D-072；第七轮体检：按会话或按批遗忘也能预演，D-074） |
+| D-060 | 换模型供应商：配置随包发布、数据目录、预设（openai、ollama）与 OpenAI 兼容的向量接口；Docker | 已采纳（N12；第六轮体检：记忆代理不转发没有 Key 的目录模型，D-073；第八轮体检：构建标识、按就绪检查健康、compose 每次 up 都构建、版本号 0.8.0，D-075） |
+| D-061 | Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义（版本链、控制器、遗忘） | 已采纳（N12；第二轮体检：metadata、update、reset 与远程的 MemoryClient，D-069；第五轮体检：过期在召回、回答与画像里生效、valid_at 按时间段、本地检查参数、Mem0 保留的过滤名、按作用域等，D-072；第六轮体检：context、幂等的 add、valid_at 对部分日期的结束与更正，D-073；第七轮体检：本地与 HTTP 同样的 `at`、delete_many 与预演，D-074；第八轮体检：事实条目带 negated 与 cardinality、导入 Mem0、重新打开的 run 算进上限，D-075） |
+| D-062 | OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面 | 已采纳（N12；第二轮体检：/v1/embeddings、/v1/responses 的子集，D-069；第四轮体检：可选的按令牌上限，D-071；第五轮体检：输出上限按模型自己的参数名写上、不给过期的记忆，D-072；第六轮体检：没有 Key 时回 503 model_not_available，不再不带 Key 转发，D-073；第七轮体检：留着重试的写回与进行中的会话有上限，D-074；第八轮体检：停放会话、503 capacity、max_spaces、/ready，D-075） |
+| D-063 | 导出与导入只搬原始日志；遗忘可以预演 | 已采纳（N12；第二轮体检：导出格式 2，D-069；第五轮体检：只写了日志的会话导入后不抽取、原子地写导出文件，D-072；第七轮体检：按会话或按批遗忘也能预演，D-074；第八轮体检：边读边写的导出、导入 Mem0，D-075） |
 | D-064 | 抽取的补充说明（custom instructions） | 已采纳（N12） |
 | D-065 | 同一协议下对比更多外部基线：Graphiti、LangMem、Cognee、A-MEM；只用 DeepSeek（pds）与只用通义（pq）两个协议 | 已采纳（N12；Holm 校正后 pds 下 L2 对 Mem0 不再显著，D-069） |
 | D-066 | 框架集成：OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool；召回证据收拢成一份 | 已采纳（N12；第六轮体检：召回清单逐行标出引用的文字，D-073；第七轮体检：MCP 的画像加引用、删空间时删掉 Claude 记忆工具的文件，D-074） |
 | D-067 | LongMemEval 的会话 ID 泄漏：修复、量影响、照实披露 | 已采纳（N12） |
 | D-068 | 全面体检：七个视角找问题，离线复现、对抗式核实，修掉 24 处；评测请求与发表的数字不变 | 已采纳（N12 之后；留到以后的 17 条有 14 条由 D-069 做了；D-070、D-071、D-072、D-073、D-074 补记） |
-| D-069 | 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变 | 已采纳（N12 之后；D-070、D-071、D-072、D-073、D-074 补记） |
-| D-070 | 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变 | 已采纳（N12 之后；D-071、D-072、D-073、D-074 补记） |
-| D-071 | 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-072、D-073 补记） |
-| D-072 | 第五轮体检：合并到 main 之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-073、D-074 补记） |
-| D-073 | 第六轮体检：第五轮合并到 main 之后从六个视角再查，核实为真的 18 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-074 补记） |
-| D-074 | 第七轮体检：第六轮合并到 main 之后从六个视角再查，核实为真的 20 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后） |
+| D-069 | 第二轮体检：留到以后的 17 条做了 14 条，3 条仍留着；评测请求与发表的数字不变 | 已采纳（N12 之后；D-070、D-071、D-072、D-073、D-074、D-075 补记） |
+| D-070 | 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变 | 已采纳（N12 之后；D-071、D-072、D-073、D-074、D-075 补记） |
+| D-071 | 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-072、D-073、D-075 补记） |
+| D-072 | 第五轮体检：合并到 main 之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-073、D-074、D-075 补记） |
+| D-073 | 第六轮体检：第五轮合并到 main 之后从六个视角再查，核实为真的 18 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-074、D-075 补记） |
+| D-074 | 第七轮体检：第六轮合并到 main 之后从六个视角再查，核实为真的 20 处；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后；D-075 补记） |
+| D-075 | 第八轮体检：第七轮合并到 main 之后从六个视角再查，核实为真的 22 处；版本号 0.8.0；评测请求、图片请求与发表的数字不变 | 已采纳（N12 之后） |
 
 ## D-001 检索时机与深度由解耦的控制器决定，而不是由 LLM 自主决定
 
@@ -1029,6 +1030,7 @@
   - **降级**：更新的 CueMem 写的库（`user_version` 大于 `SCHEMA_VERSION`，现在是 7）拒绝打开，不再悄悄降级。
 - **第六轮体检之后（D-073）**：`cuemem serve` 与 `cuemem proxy` 运行期间重新读入 `CUEMEM_API_KEYS_FILE` 的文件（最多每秒一次；文件不在了、写错了或清空了时留着原来的令牌），`cuemem keys add|list|revoke` 在这个文件里生成、列出与吊销限定作用域的令牌，加、吊销令牌都不用重启；管理令牌与写在 `CUEMEM_API_KEYS` 里的仍只在启动时读。每个限定作用域的令牌同时在处理的请求最多 `CUEMEM_MAX_CONCURRENT_PER_KEY`（默认 8）个，或者它自己写的 `max_concurrent`（超过时 429）；`POST /api/v1/wait` 不再占着服务器的线程。
 - **第七轮体检之后（D-074）**：`StorageLockedError` 也管数据库，不论哪种模式：`MemorySystem.from_settings` 锁住 `<数据库>.lock`（例如 `data/cuemem.sqlite.lock`），serve 运行时第二个进程（stdio 的 `cuemem mcp`、`cuemem reindex`、SDK 的 `Memory()`）被拒绝，用 Qdrant 服务端时也一样，说明里写着拿着锁的进程的 pid 与命令。只读数据库的命令（export、spaces、inspect、doctor、keys、usage）不加锁；`CUEMEM_ALLOW_SHARED_DB=1` 时不加锁，风险由运营者承担。docker-compose 停止时等 90 秒（`stop_grace_period`；`docker run --stop-timeout 90`），serve 与 proxy 等进行中的请求最多 20 秒。
+- **第八轮体检之后（D-075）**：本地模式下，要建新集合的写入在集合数会占到打开文件数软上限减去余量（软上限的十分之一、至少 256 个、最多一半）时以 `VectorStoreFullError` 拒绝（503 `capacity`），已有的空间照常可用，服务器照样能重启；令牌可以写 `max_spaces`。`GET /api/ready`（serve）与 `GET /ready`（proxy）说明 Qdrant 服务端有没有回应、后台线程还在不在，`/api/health` 仍只说明进程活着；Qdrant 故障是 503 `vector_store_unavailable` 或 504 `vector_store_timeout`，不再是 500。`cuemem doctor` 还列出抽取失败与排着队的任务、过期的空间、缓存与 trace 的大小，第一行是 `cuemem --version` 的那一行。
 
 ## D-057 门控在真实流量上的检验：WildChat 里真实用户消息的第一句
 
@@ -1109,6 +1111,7 @@
   - **启动**：包的 `__init__` 与命令行按需导入，`cuemem --help` 3.8 → 0.42 秒，`import cuemem.sdk` 2.7 → 0.30 秒。
 - **第四轮体检之后（D-071）**：CueMem 没有发布到 PyPI，源码仓库之外每个安装提示都是 `pip install "cuemem[<extra>] @ git+https://github.com/FlickYan/cuemem"`（`cuemem.config.INSTALL_URL`），Docker 镜像里是用 `--build-arg EXTRAS=…` 重新构建；配置写错（预设名不对、`CUEMEM_*` 的值不合法）只打印一行"错误：配置有误：…"并以 1 退出，不再打印调用栈；命令行收紧 umask，数据目录、`.env` 与它写的每个文件都只给本人；`.env.example` 的注释单独成行，因为 `docker run --env-file` 把行尾注释算进值里。
 - **第六轮体检之后（D-073）**：预设叠在默认的模型目录上，所以 `--preset openai`、`deepseek` 或 `ollama` 下默认的通义与 DeepSeek 别名仍在目录里；记忆代理对供应商 Key 没设的这些别名回 503 `model_not_available`，`GET /v1/models` 也不列它们（以前不带 Key 照样转发）。`--preset ollama` 不要 Key 的是它自己的模型，不是目录里的每个模型。`--preset` 的帮助列出全部四个预设（openai、ollama、deepseek、qwen）；换预设要用新的数据目录，因为数据目录记着它的向量模型。
+- **第八轮体检之后（D-075）**：镜像的 `HEALTHCHECK` 探 `/api/ready`，不经任何 HTTP 代理；最后一段收 `ARG CUEMEM_BUILD`（提交号，`cuemem --version`、`cuemem doctor` 与 OCI 标签 `org.opencontainers.image.revision` 里看得到）；docker-compose 设了 `pull_policy: build`，`docker compose up -d` 会重新构建镜像；`docker stop` 之后容器以 143 退出，因为 SIGTERM 现在在任何部署里都走收尾。版本号是 0.8.0，每合入一轮体检升一次。
 
 ## D-061 Python SDK：照 Mem0 的接口形状，保留 CueMem 的语义
 
@@ -1149,6 +1152,7 @@
 - **第五轮体检之后（D-072）**：本地的 `search` 与 `answer` 与 `/api/v1` 一样检查 `mode`、`router`、`min_level` 与 `lam`（同一句话的 ValueError；`answer` 只接受 `auto`、`l0`、`l1`、`l2`、`agent` 与 `hatch`）；`get_all(valid_at=)` 接受 `YYYY`、`YYYY-MM` 或 `YYYY-MM-DD`（或 date、datetime），年或月指那段时间里任何时候成立的事实，别的写法报错；filters 里 Mem0 保留的 `created_at`、`updated_at` 与 `categories` 也对记忆自己的字段；`wait(*, user_id, agent_id, timeout)` 可以只等一个用户的抽取、可以超时；`answer()` 与别的产品入口不再给出过期的记忆；`MemoryAPIError` 多了 `sent` 与客户端一侧的代码（`unreachable`、`timeout`、`disconnected`、`transport`）。
 - **第六轮体检之后（D-073）**：新增、要显式用的：`context(query, ...)` 返回记忆代理注入的那段证据块，直接放进提示词（也有 `POST /api/v1/context`）；`add(idempotency_key=)`（HTTP 上是 `Idempotency-Key` 头）让 24 小时内重发的 add 只写一次，返回 status `duplicate`，那次的发言已经遗忘时是 `forgotten`；同一个键用于不同的请求时抛 `IdempotencyConflictError`（409）。`get_all(valid_at=)` 查一年或一个月时，结束时间只知道年或月、落在这段时间里的值也给出；更正了的值从被更正那一版的开始算起。
 - **第七轮体检之后（D-074）**：`at`（`search`、`context`、`answer`）与 `known_at`（`get_all`）本地与 HTTP 一样收 datetime、date、ISO 8601 文本或 Unix 时间戳（同一个解析；以前本地的 `Memory` 遇到文本与日期就出错）。四个类都新增 `delete_many(memory_ids, *, dry_run=False)` 与 Mem0 的 `batch_delete(memories=...)`，每个空间只重放一次；`delete_all(..., dry_run=True)` 与 `run_id` 一起用；没有发言的 `run_id` 返回 "No such run: nothing deleted"。`add` 的 `ConcurrentWriteError` 之后什么都没写；`wait=True` 的带键重试遇到 `duplicate` 时等抽取做完。取消异步调用停不下它：用 `timeout=` 与 `idempotency_key`。打开别的进程拿着的数据库抛 `StorageLockedError`，打不开的抛 `DatabaseOpenError`。
+- **第八轮体检之后（D-075）**：事实条目带 `negated` 与 `cardinality`；`load(..., format="mem0")` 导入 Mem0 `get_all` 的结果；`cuemem serve` 的 `/api/v1` 上，重新打开闲置结束或留下的 run 的 `add` 也算进 `CUEMEM_MAX_OPEN_SESSIONS`（到了上限 429，run 照样能再打开）。
 
 ## D-062 OpenAI 兼容的记忆代理：控制器先选，证据放在最后一句用户消息前面
 
@@ -1192,6 +1196,7 @@
   - **过期的记忆**不再作为证据（或画像的行）注入；空间里没有会过期的行时请求逐字节不变。
 - **第六轮体检之后（D-073）**：服务端没设供应商 Key 的目录模型（例如 `--preset openai` 下没有 `DASHSCOPE_API_KEY` 时默认的 `qwen3.8-flash`）在检索、开会话之前回 503 `model_not_available`（type `server_error`，`x-should-retry: false`），不再连同用户的话与想起的记忆、不带 `Authorization` 头转发出去；`GET /v1/models` 与 `reject` 的 400 只列服务端有 Key 的模型。限定作用域的令牌同时处理的请求也有上限（D-056）。Key 都设了时转发的字节不变。
 - **第七轮体检之后（D-074）**：一个会话留着重试的写回最多 100 次或 32 MiB（丢掉最早的，记警告与 `proxy_write_dropped`，`reason=backlog`）；进行中的代理会话按记忆空间受 `CUEMEM_MAX_OPEN_SESSIONS`（默认 64）限制：开新会话先结束最久没有请求、没有留着重试的写回的那个，没有这样的会话时回 OpenAI 格式的 429。过期的记忆不再占注入的证据的候选名额。
+- **第八轮体检之后（D-075）**：到了会话上限时，记忆代理停放最久没有请求的空闲会话，而不是结束它：会话照旧进行中，用同一个 ID 接着写，只在 `--idle-minutes` 之后或停止时抽取一次（每个进程最多停放 `PARKED_KEPT` = 4,096 个）；以前每次腾名额、调用方又回来，都要重放整个空间。本地打开文件数快到上限时，新的空间在转发之前得到 OpenAI 格式的 503（code `capacity`），超过 `max_spaces` 的令牌得到 429；`cuemem proxy` 有 `GET /ready`、一条一行的日志与 `--no-access-log`。
 
 ## D-063 导出与导入只搬原始日志；遗忘可以预演
 
@@ -1219,6 +1224,7 @@
 - **第三轮体检之后（D-070）**：坏的导出文件（缺键、类型不对）抛 `ValueError("Malformed export: …")`，HTTP `/api` 409、`/api/v1` 400，什么都不写（以前 KeyError 或 TypeError，404 或 500）。导入的请求体上限 1 GiB（`CUEMEM_MAX_IMPORT_BYTES`），限定作用域的令牌按 64 MiB 的请求体上限。
 - **第五轮体检之后（D-072）**：只写了日志的会话（`add(infer=False)`，没有任务）导出时带 `"infer": false`，导入时不登记抽取任务，后台线程与源空间一样不去抽取（显式的巩固照样抽取）；格式仍是版本 2。`cuemem export -o FILE` 先写临时文件、落盘之后换名替换 FILE，导出失败时旧的备份不动（替换之后是 0600）；`cuemem import` 遇到截断的或不是 UTF-8 的文件只打印一行、以 1 退出。`cuemem export` 只打开数据库，`cuemem serve` 开着或向量库坏了时照样能用。
 - **第七轮体检之后（D-074）**：按会话遗忘也能预演：`delete_all(run_id=..., dry_run=True)`（`DELETE /api/v1/memories?dry_run=true`）；`delete_many(..., dry_run=True)`（`POST /api/v1/memories/batch-delete`）预演一批；删整个用户没有预演（ValueError）。
+- **第八轮体检之后（D-075）**：两个导出接口边读边写地给出同样的字节（分块；服务器同一时间约只留一张图的原始字节，而不是整个响应体的几份），写出第一个字节之后出错时响应体被截断；`cuemem import --from mem0`、`load(format="mem0")` 与带 `"format": "mem0"` 的 `POST /api/v1/import` 把 Mem0 的导出换成一条记忆一个会话、ID 是确定的，重复导入什么都不加。
 
 ## D-064 抽取的补充说明（custom instructions）
 
@@ -1684,6 +1690,7 @@
   - **备选与取舍**："在线写入用幂等键"以要显式用的形式采纳了：`add(idempotency_key=)` 与 `POST /api/v1/memories` 的 `Idempotency-Key` 头。全有或全无的写入照旧管失败；这个键管的是响应丢了（D-072 的 `timeout` 与 `disconnected`），那时调用方没有办法安全地重发，`get_all` 也看不到排着队的 add。键按用户（空间）记 24 小时，只存 sha256，删整个用户的 `delete_all` 与 `reset` 连它一起删掉。
   - **第 6 组**：运行中的 serve 与 proxy 会重新读入 `CUEMEM_API_KEYS_FILE` 里的限定作用域的令牌，`cuemem keys add|list|revoke` 修改这个文件。
 - **第七轮体检之后（D-074）**：留着重试的写回有上限：每个代理会话最多 100 次写回或 32 MiB，每个 `CueMemSession` 最多 100 批或 32 MiB（按文字与图片 data URL 的字符数算）；更早的丢掉，记警告与 `proxy_write_dropped` 或 `agents_mirror_dropped` trace 事件（`reason=backlog`）。记忆代理的会话、`/api/v1` 的 run 与 `/api` 的对话会话按空间限数（`CUEMEM_MAX_OPEN_SESSIONS`，64）。`add` 的 `ConcurrentWriteError` 现在整次回滚。`update()` 的更正抽不出事实时，再遗忘它不重放空间。第 5 组（过期）：在 `hide_expired` 的各处，过期的记忆也不再进检索的候选池（SDK 的 `search` 不在其中，仍在检索之后过滤）；浏览原始数据的事实列表、实体图与图库不给出它们，除非 `show_expired=true`；`cuemem ask` 不用它们，除非 `--show-expired`；`cuemem inspect facts` 给它们标 `已过期`。所以浏览的接口与命令行不再是第 5 条的例外，只剩实体接口与按实体召回的那一路仍列出只出现在过期事实里的实体。设了 `CUEMEM_EXPIRED_RETENTION_DAYS`（`cuemem serve` 与 `cuemem proxy` 在过期 N 天之后遗忘这些发言）或运行 `cuemem forget --expired` 时，"要 delete 才删"不再成立。
+- **第八轮体检之后（D-075）**：第 1 组供应商出错的对应（`api/failures.py`）也管向量库：Qdrant 服务端连不上或回 502、503、504 时 `vector_store_unavailable`（503，`Retry-After: 5`），超时时 `vector_store_timeout`（504）；`/api`、`/api/v1` 与 MCP 经 `provider_failure` 用上它们，记忆代理的召回仍是出错就不注入。
 
 ## D-070 第三轮体检：七个视角从头再查一遍，核实为真的 22 处都修掉；评测请求与发表的数字不变
 
@@ -1789,6 +1796,9 @@
 - **第六轮体检之后（D-073）**：
   - **留到以后的第 7 条**：运行中的 serve 与 proxy 会重新读入令牌文件，`cuemem keys add|list|revoke` 生成、列出与吊销限定作用域的令牌（D-073 第 2 组）；写在 `CUEMEM_API_KEYS` 里的与 `CUEMEM_API_TOKEN` 仍要重启才换。
 - **第七轮体检之后（D-074）**："`ConcurrentWriteError` 是唯一在提交之后抛出的"不再成立：提交之后什么都不抛出；`ConcurrentWriteError` 在写入事务里抛出，不留发言、也不留幂等记录。第 2 组的"不留残余"现在也管被杀时留下的原图：主数据库的图片写入与遗忘在 `media/.journal/` 里写标记，`MemorySystem.recover_media`（serve 与 proxy 启动时与之后每小时，以及 `cuemem reindex`）删掉失效的标记点名、又没有记录引用的文件；评测用的系统不写标记。仍有的局限"一个数据库同一时间只有一个进程写"由锁保证（`StorageLockedError`）。
+- **第八轮体检之后（D-075）**：
+  - **第 3 组（T8）**：本地模式的多用户服务器不再撞上 EMFILE：打开文件数的软上限还剩一份余量时，要建新集合的写入就以 503 `capacity`（`VectorStoreFullError`）拒绝，已有的空间、重启与删除都照常。
+  - **第 7 组（T9）**：缺运行时不写的保护是对的，但 `n11_mem0.py` 自己在四个运行都在时 TypeError（d042443、第三轮起变量同名）；现在又能跑了，有测试跑这条正常的路，输出与 d042443 之前的版本相同。
 
 ## D-071 第四轮体检：仓库公开之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变
 
@@ -1895,6 +1905,7 @@
   - **第 5 组（P15）**：wheel 现在带 Python 3、3.12、3.13 与 3.14 的分类，README 写"Python 3.12 或更新"；Intel Mac 上锁文件给 `local` 装 onnxruntime 1.23.2（1.24 起没有 Intel macOS 的 wheel），`uv sync` 要从源码构建 cryptography（需要 Rust）；`local` 在 Apple Silicon 上要 macOS 14（D-073 第 6 组）。
   - **第 2 组（P7）**："`SameOriginOnly` 也管 `/login`（……不管 `/logout`）"：现在也管带着登录的令牌名字的 `/config` 与界面的首页 `/`。`/logout` 仍不按 `Origin` 查（`<img>` 与页面跳转不带 `Origin`），但带 `Sec-Fetch-Site: cross-site` 的 `/logout` 回 403。
   - **第 2 组（P10）**：令牌还可以写 `max_concurrent`（默认 `CUEMEM_MAX_CONCURRENT_PER_KEY`，8：同时在处理的请求数）；运行中的 serve 与 proxy 会重新读入令牌文件，加、吊销、换一个限定作用域的令牌都不用重启（`cuemem keys`）。
+- **第八轮体检之后（D-075）**：留到以后的 `v0.1.0` 标签由主人定下：每合入一轮体检升一次次版本号（第八轮是 0.8.0），每次合并之后由维护者在 main 上打带注释的标签 `vX.Y.Z`；仍不发布到 PyPI。
 
 ## D-072 第五轮体检：合并到 main 之后从六个视角再查，核实为真的 22 处；评测请求、图片请求与发表的数字不变
 
@@ -1985,6 +1996,9 @@
   - **第 5 组（P7）**：过期的记忆现在在每一路检索里就排除（单独的 `hidden`、Qdrant 的 `must_not` 过滤、BM25 多取再截断），在 `hide_expired` 的各处不再占候选池的名额；Agent 的 `exclude` 仍在取池之后过滤。"仍给出过期的记忆：原始的浏览接口……"已经过时：事实浏览器、图与图库（`show_expired=true` 时才给），以及 `cuemem ask`（`--show-expired`）不给出它们，`cuemem inspect facts` 标 `已过期`（`--hide-expired` 不列）；`get`、`history` 与导出照旧给出。设了 `CUEMEM_EXPIRED_RETENTION_DAYS` 时还会真的删掉。
   - **留到以后的第 2 条**做了（见上），只剩实体接口与按实体召回的那一路，仍列出只出现在过期事实里的实体。
   - **仍有的局限**：一个数据库一个进程现在由锁保证（`StorageLockedError`；不要时设 `CUEMEM_ALLOW_SHARED_DB=1`）。
+- **第八轮体检之后（D-075）**：
+  - **第 4 组（P9）**：README 与报告引用的本地模式延迟在加了掩码之后重测（4 核 x86 虚拟机，2026-11-07：4.6 万个单元 872 ms，约 10 次 / 秒；`docs/results/n11-improvements/d072/latency.json`）；Qdrant 服务端一列仍是 N11 的数字。
+  - **去掉的提议（幂等的批量导入）**：`import_space` 之上的 Mem0 导入（会话 ID 是确定的，每个空间一个事务）现在管住了迁移的情形；通用的批量导入接口仍没做。
 
 ## D-073 第六轮体检：第五轮合并到 main 之后从六个视角再查，核实为真的 18 处；评测请求、图片请求与发表的数字不变
 
@@ -2066,6 +2080,7 @@
   - **第 5 组**：MCP 的 `profile` 工具现在像召回清单一样引用画像（P8）；Claude 示例传 `thread=False`，有意把下限留在 `anthropic>=1.14`（P13）。
   - **留到以后**：第 1 条的调用栈没有了（`DatabaseOpenError`）；第 5 条 ConcurrentWriteError 的边角情况补上了；第 7 条的示例现在传 `thread=False`，下限有意不升。
   - **仍有的局限**：一个数据库一个进程现在由锁保证（`StorageLockedError`；不要时设 `CUEMEM_ALLOW_SHARED_DB=1`）；令牌的重新读入仍假定一台服务器一个进程。
+- **第八轮体检之后（D-075）**：第 6 组的兼容性工作流也在 Python 3.13 上跑锁文件的测试（`newest-3.12`、`floors-3.12`、`locked-3.13`、`locked-3.14` 四种），另有一个不是必需检查的 `fastembed` 任务，用预设 `deepseek` 跑镜像；配置改了之后过期、后台线程不重建的空间（第 3 组的 P2）现在由 `cuemem doctor` 列出。
 
 ## D-074 第七轮体检：第六轮合并到 main 之后从六个视角再查，核实为真的 20 处；评测请求、图片请求与发表的数字不变
 
@@ -2140,4 +2155,90 @@
     9. D-073 仍留着的：很多令牌加起来仍能占满线程，界面的路由也不计入每个令牌的上限（P3）；一次多条消息的 `add()` 抽出的事实仍按抽取的顺序（P6）；`MemoryClient` 不用生成的键自动重试，`delete_all()` 删整个用户或 `reset()` 之后的重发会再写一次（P18）；写在 `CUEMEM_API_KEYS` 里的令牌与 `CUEMEM_API_TOKEN` 改了仍要重启（P22）；Python 3.14 下的 Intel Mac 装不了 `local`，macOS 13 上的 Apple Silicon 也不支持它（P14）。
   - **仍有的局限**：
     - 一个数据库一个写入进程现在由锁保证（`CUEMEM_ALLOW_SHARED_DB=1` 时除外）；令牌的重新读入与会话的上限仍假定一台服务器一个 uvicorn worker；
+    - 召回清单与 MCP 的画像标出了引用的文字，但拦不住模型照着做。
+- **第八轮体检之后（D-075）**：
+  - **第 2 组（P21）**："结果与完整重放相同"漏了一条前提：巩固过、之后又经 `add(..., infer=False)` 长了的会话没有新的任务，`stale()` 与 `regrown_sessions` 都看不见，而重放会重新抽取它。现在遗忘把每个做完的任务与它的会话现在的内容比一比（`Consolidator.changed_sessions`），不同就重放；一个任务都没有的会话（`infer=False` 写的）不在本进程里进行中、也没有进行中的标记时走快速路径。
+  - **第 3 组**："数据库打不开时一行说明"（P11）只对 `OperationalError` 与 `OSError` 成立；文件损坏或不是 SQLite 数据库时现在也是一行，并说明从备份恢复。停止时的收尾（P8）只在 cuemem 是 1 号进程（自带的镜像）时才在 SIGTERM 之后执行；现在 serve 与 proxy 在任何部署里都执行，以 143 退出（镜像以前是 0）。
+  - **第 4 组（P14）**：(b) 记忆代理停放最久没有请求的空闲会话，而不是结束它：会话照旧进行中，用同一个 ID 接着写，只在 `--idle-minutes` 之后或停止时抽取一次（每个进程最多 `PARKED_KEPT` = 4,096 个）；(c) 重新打开闲置结束或留下的 run 的 `add` 算开一个 run（到了上限 429、什么都不写，run 照样能再打开），什么都不重新打开的 add 从不拒绝。
+  - **留到以后**：第 3 条在实体列表上做了（`show_expired`，各行带 `expired`）；L2 的实体种子与探针的实体数有意不动。第 5 条在 `cuemem doctor` 里做了（监控指标的接口仍没做）。第 8 条做了（事实条目带 `negated` 与 `cardinality`）。
+
+## D-075 第八轮体检：第七轮合并到 main 之后从六个视角再查，核实为真的 22 处；版本号 0.8.0；评测请求、图片请求与发表的数字不变
+
+- **状态**：已采纳（N12 之后）
+- **背景**：
+  - 第七轮（D-074）合并到了 main（aec5303）。第八轮从六个视角查：第七轮新加的代码（遗忘的快速路径、会话的上限、过期记忆的过滤、数据库锁）；公开接口的安全（`/api`、`/api/v1`、`/mcp` 与记忆代理上限定作用域的令牌，离线对 ASGI 应用跑）；运维与升级（真的 `cuemem serve` 进程，用 SIGTERM 与 SIGINT 停下；连不上的 Qdrant 服务端；抽取出错；`doctor`、`reindex`；从 v6 的数据目录升级；备份与恢复）；测试与 CI 的质量（D-074 那些前提的变异、负载下的计时断言、CI 实际跑了什么）；发表的说法与可复现性（README 与报告里的数字对照存下的结果，分析脚本在合成的运行上跑）；路线图上的功能（D-072 到 D-074 推后的提议，对照 Mem0、Supermemory、Graphiti、LangMem 与 Memobase 重新排）。规矩与 D-068 相同：只读代码，每个候选都离线复现（FakeAPI、ScriptedModel、TestClient、哈希向量、本地模式的 Qdrant、数据库的临时副本），量一量多常见、影响多大，并说明修法会不会改变评测的请求。
+  - 22 个候选去做对抗式核实，22 个都留下（P1–P22），其中几个收窄了说法、重写了修法（"改定的修法"），一个都没否掉。核实之前去掉 9 项原始发现：5 项并进留下的候选（CI 里真的起服务器并进 P2 与 P20，Python 3.13 并进 P20，服务端的 `must_not` 过滤并进 P10，可选的 `/metrics` 并进 P16，landscape 那一列的日期并进 P15），4 项推后：fork 出来的子进程用父进程已经打开的 `Memory`（要设计热路径上怎么认出 fork 之后的使用；D-074 一个进程的前提已经在文字里写了）；`at="2030"` 读成 Unix 秒数（与 D-074 统一的数字时间戳的约定一致）；记下记忆代理转发了什么、按令牌设可选的每日预算（要改账本的表）；按给定结构填出的画像（新的、要显式打开的 LLM 功能；P18 以小得多的代价补上了 D-074 否掉的 P22 背后那个具体的缺口）。一项要主人决定（P21）：主人定下每合入一轮体检升一次次版本号，这一轮是 0.8.0；合并之后由维护者（不是实现的人）在 main 上打带注释的标签 `v0.8.0`；这一轮的 ADR 就是发布说明；仍不发布到 PyPI。P14 与 P17 只改文档；P10、P12 与 P20 只改测试与 CI。
+  - 修复每条一个提交，用一个合并提交合在一起（P2 进来之后 CI 只认退出码 143；`cuemem doctor` 经 `store.files.opening` 读巩固任务；一个测试确认记忆代理停放的会话让遗忘照常重放）。合并之后整体复审，又找出 6 处，都修掉了，每处都有在修正之前失败的测试：回到停放的代理会话的请求得到 429 时，这个会话从内存里的会话与停放的集合里都丢了（P1）；打开文件数的余量在软上限 256（macOS 终端与 Jupyter 的默认）时一点不剩，库的进程连第一个空间都建不了（P3）；`cuemem doctor --live` 遇到损坏的账本打印调用栈（P11）；Mem0 带时区、在日期范围边上的时间抛 OverflowError（调用栈，`/api/v1/import` 回 500），`cuemem import` 不带 `--from mem0` 导入 Mem0 的文件时说明不得要领（P22）；边读边写的导出仍要约五份一张图的 base64（P7）。有一条复审意见没有改代码：P15 初稿里引的同一台机器关掉掩码的对比不在任何提交的记录里，所以文档不再引它。P3 的两个 503 测试（经 MCP 与经记忆代理）仍按第一版的余量算，复审改了之后失败，写文档时跟着改了（只改测试）。下面按领域分组，写的是复审之后的状态。
+  - 不变量与 D-071 相同：默认配置与评测发出的 LLM、向量请求逐字节不变，缓存键不变，发给模型的图片字节也不变；冻结的方法（B1、B2、B4-nobm25 即 L1、B5 即 L2、B6，以及三个控制器文件）行为不变；每个行为修复都有在修复之前失败的回归测试；有意改变的缺省值都在各组里写明；新的能力都要显式打开。没有调用付费 API，没有跑评测。
+- **决策**：
+  1. **长期运行的服务器：会话、run 与容量**（P1、P8、P3；修订 D-062、D-070 第 3 组、D-074 第 4 组）：
+     - **记忆代理停放会话，而不是结束它**（P1 与复审）：到了 `CUEMEM_MAX_OPEN_SESSIONS` 时，D-074 像闲置结束一样结束最久没有请求的代理会话、交给抽取；调用方回到这个会话时它被重新打开，到下一次腾名额时它长了，`Consolidator._replay_regrown` 就重放整个空间（D-074 量过 2 万句的空间约 58 秒，期间独占）。三个带会话头的会话轮流来、上限 2、4 轮，整空间重放 3 次；现在 0 次。挑哪个的规则不变（最久没有请求、没有留着重试的写回、不在用的那个，否则 429），但挑中的会话现在是停放：丢掉它在内存里的 `Run`（按构造它没有没写进去的写回），把（session_id，last_seen）记进一个有序的表。别的都不变：数据库里进行中的标记与 `MemorySystem._open` 留着，重建与接手照旧跳过它，崩溃之后照样能接手；不抽取。点名它的请求用同一个 ID 接着写（`open_session` 是幂等的），没带 `X-CueMem-Session` 的隐式会话也保留生成的 ID；调用方开了新的隐式对话时，先结束停放的那个，与内存里的隐式会话相同。停放的会话只交给抽取一次：`--idle-minutes` 没有请求之后（`close_idle`，也算进它的返回值），或者停止时（`close_all`）。每个代理进程最多停放 `PARKED_KEPT` = 4,096 个（`cuemem.api.proxy.PARKED_KEPT`，代码里的常量）；再多时最早停放的照旧交给抽取。代价：进行中的标记与 `MemorySystem._open` 现在每个进程最多是上限加 4,096 个，而不是上限。`GET /health` 的 `open_runs` 只数内存里的会话。复审：回到停放的会话、又腾不出名额（429）的请求让它照旧停放，闲置清理与停止时照样抽取它，隐式会话保留 ID；已经选定要结束的会话在那个请求得到 429 时照样交给抽取。否掉了对已经有做完的任务的会话回 429：回到旧对话的正常客户端会被拒。
+     - **重新打开 run 也算进 run 的上限**（P8）：`Memory._make_room` 只有 `open_run` 调用，`add(run_id=...)` 重新打开闲置结束的 run（`_idle_closed`，最多记 10,000 个）或接手之前的进程留下的 run 时不查上限就加回去；上限 2 时开着的 run 有 4 个，实际的上限约是 10,000 加上留下的 run，而不是 64。`cuemem serve` 的 `/api/v1`（`max_open_runs` = `CUEMEM_MAX_OPEN_SESSIONS`）上，这样的 add 现在算开一个 run：到了上限得到 429 `rate_limited`（`Retry-After: 60`，type `SessionLimitError`，`MemoryClient` 抛出它），什么都不写。run 照样能重新打开：占到名额之后才删掉闲置的记录；留下的 run 先用新的只读方法 `MemorySystem.can_resume_left_open(space_id, session_id)` 查，再让 `resume_left_open` 改任何东西，所以腾出名额之后的重试接着这个 run 写，不重新抽取。`run_id` 不会重新打开任何东西的 add（普通会话）从不拒绝。两条路都像 `open_run` 那样先占名额（`_opening`），并发的接手越不过上限。本地 SDK（`max_open_runs = None`）不变，也不多读一次。否掉了超过上限时改写成普通会话：那样每次 add 都要把整个 run 再抽取一遍。
+     - **离打开文件数的上限留出余量**（P3 的 A 部分与复审；修订 D-070 第 3 组的 T8）：本地模式的 Qdrant 每个集合一直开着一个文件，而限定为 `{user: alice}` 的令牌可以用任意 `agent_id`，每个都是新的空间、有自己的集合：用新的 agent_id add 400 次，3.9 秒占掉 400 个文件描述符。以前一直建到 `open()` 因 EMFILE 失败才停，那时数据库、图片与连接对所有租户都出错，服务器也重启不了（启动时打开全部集合）。现在 `VectorStore` 建集合之前（空间的文字集合或图片集合）查 `集合数 + 1 ≤ 软 RLIMIT_NOFILE − reserved_files(soft)`，`store.vector.reserved_files(soft) = min(max(256, soft // 10), soft // 2)`：软上限的十分之一、至少 256 个，但最多一半（复审：第一版在软上限 256 时也留 256 个，那是 macOS 终端与 Jupyter 的默认、库从不调高它，一个空间都建不了；现在 256 时留 128 个，300 时留 150 个，512 起与原来相同）。不满足时抛新的 `cuemem.errors.VectorStoreFullError`（`CueMemError`，带 `collections` 与 `limit`），什么都不建。已有的空间照常可用，进程照样能重启、能删空间。用 Qdrant 服务端、`:memory:`、Windows 与软上限不限时不查。对应：`/api/v1` 回 503，code `capacity`、type `VectorStoreFullError`（`MemoryClient` 抛 `VectorStoreFullError`），`/api` 回 503 与一句中文说明，MCP 回 ToolError，记忆代理在开会话与转发之前查（`VectorStore.check_room`，用服务端时什么都不做），回 OpenAI 格式的 503（`server_error`，code `capacity`，`x-should-retry: false`）。英文说明写着集合数与上限，不带服务器上的路径，给出办法：删掉不用的空间、调高 `ulimit -n`，或改用 Qdrant 服务端（`cuemem migrate-vectors --to URL`、`CUEMEM_VECTOR_STORE__URL`）。`cuemem doctor` 在同一条线上把集合数标红。
+     - **可选：每个令牌最多几个空间**（P3 的 B 部分）：令牌新的字段 `max_spaces`（正整数；`cuemem keys add --max-spaces N`；`cuemem keys list` 多一列）。令牌在作用域里已经有这么多个空间时，要建新空间的写入得到 429 `rate_limited`（已有的空间照常可用）：`/api/v1` 的 add、runs、consolidate 与 import；`/api` 的开会话、导入与巩固；记忆代理（OpenAI 格式的 `rate_limit_error`，带 `x-should-retry: false`）；MCP 的 `remember`（ToolError）。管理令牌、不鉴权与没写这个字段的令牌不限，也只为写了它的令牌数空间（`MemoryDB.space_ids` 按令牌的作用域筛；`auth.spaces_over_cap`）；并发地建空间可能多出一两个。`keys add` 给了 `--user`、没给 `--agent` 也没给 `--max-spaces` 时，在标准错误上提醒这个令牌可以用任意 `agent_id`，每个新的都是一个新空间。否掉了缺省就有的上限：文档里 `{user: "*", agent: shop}` 那样的后端令牌每个终端用户一个空间，到了上限就会出错。
+     - **改变的缺省值**：超过上限的代理会话停放、不抽取；`/api/v1` 上重新打开 run 的 `add` 可能 429；本地模式下打开文件数快到上限时，要建新集合的写入回 503 `capacity`；`keys add --user` 不带 `--agent` 时提醒。新增：`PARKED_KEPT`、`MemoryProxy.parked_runs`、`MemorySystem.can_resume_left_open`、`VectorStoreFullError`、`VectorStore.check_room`、`store.vector.reserved_files`、令牌字段 `max_spaces`、`keys add --max-spaces`、`MemoryDB.space_ids`、`auth.spaces_over_cap` 与 `space_cap_message`。
+     - **评测**：评测不用记忆代理与 `/api/v1`；它们的本地库里的集合远少于留的余量，这项检查不发任何请求。
+  2. **运维：停止、健康检查、日志、诊断与升级**（P2、P9、P13、P16、P19、P21、P17；修订 D-056、D-060、D-069 第 1 组、D-071 第 5 组、D-074 第 3 组）：
+     - **SIGTERM 也走收尾**（P2；修订 D-074 第 3 组的 P8）：uvicorn 等完进行中的请求之后，恢复原来的 SIGTERM 处理并把信号重发给自己；原来是默认处理，进程就在 `uvicorn.run` 里结束，serve 与 proxy 的 `finally`（记忆代理缓冲的写回、结束会话、`ConsolidationWorker.stop`、WAL 检查点）都没执行，界面放着用户照片副本的私有临时目录也没删。自带的 Docker 部署里 cuemem 是 1 号进程，内核忽略发给自己、按默认处理的信号，所以那里照样收尾；systemd、`kill`、各种守护进程、`docker run --init`、compose 的 `init: true` 或 tini 下都不收尾。现在 `serve` 与 `proxy` 只在 `uvicorn.run` 期间装一个处理函数（`_sigterm_runs_cleanup`，只在主线程），在 uvicorn 收尾之后把 SIGTERM 变成 `SystemExit(143)`：收尾照常执行，退出码仍是 143；收尾时再来一次 SIGTERM 立即结束。Docker 镜像在 `docker stop` 之后的退出码由 0 变成 143（`restart: unless-stopped` 不重启手动停下的容器）。
+     - **向量库故障说清楚，就绪与存活分开**（P9；修订 D-069 第 1 组）：连不上 Qdrant 服务端时，`/api/health` 说一切正常，而非空空间的每次写入与检索都是没有说明的 500（`internal_error`），MCP 只说 "Error executing tool"。`api/failures.py` 多了两种：`vector_store_unavailable`（503，`Retry-After: 5`），对应 qdrant-client 因 httpx 的传输错误抛出的 `ResponseHandlingException`，或者状态码 502、503、504 的 `UnexpectedResponse`（这时说明只有 `HTTP <状态码>`）；`vector_store_timeout`（504），对应因 httpx 超时抛出的那种。Qdrant 别的 4xx 与解析出错仍是 500（程序错误）；从不为了判断而导入 `qdrant_client`；说明里没有地址与 Key。`/api`、`/api/v1`（code 就是种类）与 MCP（ToolError："The vector store (Qdrant) is unreachable or temporarily unavailable. Try again later."）都用上它；记忆代理的召回仍是出错就不注入、照常转发。新的不鉴权的就绪检查：`cuemem serve` 的 `GET /api/ready` 与 `cuemem proxy` 的 `GET /ready`，回 200 `{"ok": true}`，或者 503 `{"ok": false, "failing": [...]}` 带 `Retry-After: 5`，只写部件名：`vector_store`（用服务端时，另一个 2 秒超时的客户端 `get_collections`，`VectorStore.ping`；本地模式总是就绪）与 `worker`（后台巩固线程退出了，`ConsolidationWorker.alive`）。它们用自己的两个线程，不查数据库（遗忘重放时 `SELECT 1` 排在锁后面，就绪状态会来回跳），也不查磁盘（`cuemem doctor` 查）。`/api/health` 与 `/health` 仍只说明进程活着，现在是 `async`，不再排在 40 个线程的线程池后面。Docker 的 `HEALTHCHECK` 经 `build_opener(ProxyHandler({}))` 探 `/api/ready`，超时 4 秒，`.env` 里的 `HTTP_PROXY` 不再让它失败；Qdrant 故障或巩固线程退出时容器变成 unhealthy。`docs/openapi-v1.json` 里 `/api/v1` 的 503 与 504 的说明现在提到向量库（与 code `capacity`）；CI 里 curl 探的仍是 `/api/health`。
+     - **日志一条一行**（P13）：CueMem 从不设置日志；装了 `/mcp`（默认）时，MCP 服务的构造函数装上 Rich 的处理器，在 `docker logs` 里按 80 列折行（`grep APIConnectionError` 找不到）、每个调用栈都画成框；`--no-mcp` 时警告走 Python 的 lastResort，没有时间、级别与 logger 名字。现在 `serve`、`proxy` 与 `mcp` 先调用 `logging.basicConfig`（不用 `force`，pytest 与嵌入 CueMem 的应用装的处理器都留着）：每条记录在 stderr 上一行，`YYYY-MM-DD HH:MM:SS,mmm LEVEL logger 名字: 消息`，有调用栈时接着打印普通的调用栈，装没装 MCP 都一样。新增：`CUEMEM_LOG_LEVEL`（DEBUG、INFO、WARNING、ERROR、CRITICAL，不分大小写；默认 WARNING；写错时打印一行红字、以 2 退出），在读入 `.env` 之前从进程的环境变量读，只写在本地 `.env` 里不起作用（Docker 的 `env_file` 与 compose 的 `environment` 都传得进去）；`serve` 的 `--access-log/--no-access-log`（默认关；打开时 uvicorn 的级别变成 info，启动的几行也会打印）与 `proxy` 的（默认开）。SDK 与库的导入路径不碰日志设置。
+     - **`cuemem doctor` 看得见任务、过期的空间与增长**（P16；D-074 留到以后的第 5 条）：失败三次之后（Key 过期、余额不足）后台线程不再重试，写入照样 200、健康检查照样正常，除了按用户查 `/api/v1/status` 什么都看不出来。`doctor` 现在还打印（只读、不加锁，全新的数据目录里不新建数据库）：每个空间抽取失败的任务的数目、一条错误的第一行（最多 200 个字符）与 `cuemem consolidate --space S`；按旧的配置或旧的流水线版本抽取的空间（"过期的"，后台线程不重建：D-073 的 P2，按 D-074 的更正），同样给出这条命令，能命中 LLM 缓存的部分不再付费；没做完的重建（`rebuild-pending`），后台线程下一次巩固时做完；排着队的任务数；以及一行 LLM 缓存与向量缓存（各连同 `-wal`）和 `runs/traces` 的大小，没设 `CUEMEM_TRACES_RETENTION_DAYS`、合计又超过 1 GiB 时标黄并指向它。任务的提醒最多列 20 行（`……还有 N 条`）；打不开数据库时一行黄字。一次分组查询（`MemoryDB.job_summary`）读出这些；指纹由新的 `consolidation_fingerprint(model, config)` 算，`Consolidator.fingerprint` 现在调用它，逐字节相同（有测试钉着）。评测空间（`data/eval-spaces`）不在其中。可选的 Prometheus `/metrics` 拆出去，仍在清单上。
+     - **构建标识与版本号**（P19、P21；主人的决定；修订 D-060、D-071 第 5 组）：版本号 391 个提交都是 0.1.0，从 GitHub `pip install -U` 什么都不做，`git pull && docker compose up -d` 重启的是旧镜像，也看不出跑着的是哪一版。现在：`cuemem --version` 打印 `cuemem 0.8.0 (build <12 位提交号>)` 或 `(build unknown)`，`cuemem doctor` 的第一行也是它。构建标识依次取：新的环境变量 `CUEMEM_BUILD`（镜像设它）、从 git 安装时 pip 记下的提交号（`direct_url.json`，改过时加 `+dirty`）、源码仓库里的 `git rev-parse --short=12 HEAD`（2 秒超时）；`import cuemem` 不加载这段代码（有测试核对）。Dockerfile 的最后一段在依赖与源码的层之后才有 `ARG CUEMEM_BUILD=unknown`，设 `ENV CUEMEM_BUILD` 与 OCI 标签 `org.opencontainers.image.revision`、`org.opencontainers.image.source`；docker-compose.yml 把 `CUEMEM_BUILD` 作为构建参数传进去，并设 `pull_policy: build`，普通的 `docker compose up -d` 也重新构建镜像（有构建缓存时很快）；CI 用提交号构建并核对 `--version`。`/api/health` 有意不写构建标识：它不鉴权，提交号会告诉任何人缺哪些修复；用 `docker compose exec cuemem cuemem --version`、`docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' <容器>` 或 `cuemem doctor` 看。库太新时的 `ConfigMismatchError` 现在指向 README 的"升级"一节，那里每种安装方式各有做法。主人的决定（P21）：每合入一轮体检升一次次版本号，这一轮是 0.8.0（`pyproject.toml` 与 `cuemem.__version__`，`tests/test_version.py` 核对两处一致；`uv.lock` 只改了 cuemem 自己那一项；`docs/openapi-v1.json` 重新生成）；合并之后维护者在 main 上打带注释的标签 `v0.8.0`，有了之后就能固定在 `@v0.8.0`；这份 ADR 就是发布说明；仍不发布到 PyPI。版本号不在任何请求与缓存键里。
+     - **Docker 的备份做法**（P17，只改文档）：备份的做法（`sqlite3 FILE ".backup DEST"` 或 Python 的 `sqlite3.Connection.backup`）在镜像里行得通（镜像里有 Python，没有 sqlite3 命令），但没有一处说镜像里的数据目录是 `/data/data`，也没说复制运行中的 Qdrant 服务端的卷不一致，以及 `docker compose cp` 复制进去的文件属于 root、而镜像以 uid 1000 运行。README 与接口参考现在给出 compose 的命令：停掉 cuemem 再备份（`docker compose cp` 对停着的容器也能用），或者运行中用 `docker compose exec cuemem python -c …` 与 `Connection.backup`；qdrant 服务运行时不动 `qdrant-storage` 卷，恢复之后用 `reindex --all` 重建向量；恢复时先删掉留下的 `-wal` / `-shm`，`docker compose cp`，`chown` 给 cuemem 用户，再 `doctor --vectors` 与 `reindex --all`。这些命令没有在真的 compose 上跑过（体检的机器上没有 Docker）。`cuemem backup` 命令仍然否掉（D-072）。
+     - **改变的缺省值**：不是 1 号进程时 SIGTERM 也走收尾，镜像在 `docker stop` 之后以 143 退出；Qdrant 故障是 503 或 504 而不是 500；日志行换成新的固定格式；Docker 的健康检查探的是就绪；`docker compose up -d` 重新构建镜像；版本号是 0.8.0。新增：`CUEMEM_LOG_LEVEL`、`--access-log/--no-access-log`、`GET /api/ready`、`GET /ready`、`VectorStore.ping`、`ConsolidationWorker.alive`、错误码 `vector_store_unavailable` 与 `vector_store_timeout`、`cuemem --version`、`CUEMEM_BUILD`、`cuemem._build.build_id` 与 `version_line`、`MemoryDB.job_summary`、`consolidation_fingerprint`。
+     - **评测**：这些都不在评测的路径上；版本号与构建标识不在任何请求里。
+  3. **记忆的语义**（P4、P5、P18；修订 D-074 第 1 组与第 2 组）：
+     - **遗忘的快速路径比对内容**（P4；修订 D-074 第 2 组的 P21）：D-074 说快速路径"与完整重放相同"，漏了一条前提：巩固过、之后又经 `add(..., infer=False)` 长了的会话没有新的任务，`stale()` 与 `regrown_sessions` 都看不见它，而重放会按它现在的内容重新排队、抽取新的发言。用 `tests/test_forget_fast.py` 的对照，遗忘另一个会话走了快速路径，留下 4 条事实，重放有 6 条。现在 `_inert_sessions` 把别的会话做完的任务与这个会话现在的内容比一比（`Consolidator.changed_sessions`，与 `enqueue` 用同一个缓存的摘要；会话不见了也算变了），有不同的就照常重放。反过来，一个任务都没有的会话（`infer=False` 写的）以前总要重放；现在它不在本进程里进行中（`_open`、`_deferred`）、数据库里没有进行中的标记、又满足原有的前提时走快速路径；对它强行走快速路径，表与向量点都相同。有任务的会话仍要正好一个做完、统计里没有事实的任务。这两种情况都逐表、逐个点与强行重放对照；记忆代理停放的会话（P1）是进行中的，照常重放。
+     - **实体列表不再列出只出现在过期事实里的实体**（P5；D-074 留到以后的第 3 条）：一个实体的事实全都过期之后，`GET /api/spaces/{space}/entities` 与 `ChatService.entities` 仍给出它，连同从过期的会话抽出的描述（"the user's depression therapist"）。现在引用它的事实全都过期时不列出它；事实引用的是它的主语、它的 `entity_ids`，以及名字或别名出现在陈述或宾语里的实体（与实体图相同的别名规则，现在是 `cuemem.core.mentions.Mentions`，由 `api.service._Mentions` 移过来；`expiry.expired_entity_ids`）。被取代的事实也算，所以只出现在仍有效、但被取代的事实里的实体照样列出。`show_expired=true` 时照旧都列出；每行多了 `expired`（布尔值），没有过期发言的空间只多这一项，也不读事实。没有任何事实引用的实体照样列出（没有出处可以判断），合并过的描述里仍可能有过期会话的措辞（描述没有按会话的出处）。`cuemem inspect entities` 给这样的行标 `· 已过期`，新增 `--hide-expired`，名字按 Rich 的标记转义。界面没有实体列表（它的实体图本来就不显示它们）。L2 的实体种子与控制器探针的实体数有意不动：它们不给模型看实体的文字，改了会碰到冻结的路径。
+     - **事实条目带上 `negated` 与 `cardinality`**（P18；D-074 留到以后的第 8 条）：抽出的否定事实（"no longer drinks coffee"）给出来是 `{subject: User, predicate: drinks, object: coffee}`，看不出是否定的（28 个评测数据库里 2,048 条事实中有 62 条，3.0%）。`Memory`、`AsyncMemory`、`MemoryClient` 与 `AsyncMemoryClient` 的每个事实条目（search、get、get_all、history，以及 add 与 update 的事件）现在在 `object` 之后带 `negated`（布尔值）与 `cardinality`（`"single"`：新的值取代旧的；`"multi"`：值累加）；`/api/v1` 的 `FactItem` 把两者列为必有（`FactEvent` 与 `HistoryItem` 也是），`docs/openapi-v1.json` 重新生成了。`MemoryClient` 不校验响应，旧服务器给出的、没有这两项的条目照样通过。没有加 `negated` 的过滤键：别的过滤键都是 metadata 的条件。
+     - **改变的缺省值**：旁边有不经推断就长了的会话时，遗忘照常重放；遗忘只记了日志的会话可以不重放；实体列表不给出只在过期事实里的实体，各行多了 `expired`；事实条目多两项。新增：`Consolidator.changed_sessions`、`cuemem.core.mentions`、`expiry.expired_entity_ids`、`/entities` 的 `show_expired`、`inspect entities --hide-expired`。
+     - **评测**：评测从不遗忘、没有过期的发言、也不读 SDK 的条目；请求不变。
+  4. **数据的导出与导入**（P7、P11、P22；修订 D-063、D-073 留到以后的清单、D-074 第 3 组）：
+     - **导出边读边写**（P7 与复审）：导出把整个空间、每次引用一份原图的 base64 放进一个 dict，再渲染成一个 `JSONResponse`。媒体按 sha256 只存一份，导出时却按引用它的每句发言各编一次，所以同一张图写进十次，磁盘上 6.8 MB，导出的响应体 90.2 MB，峰值 270.8 MB，一个限定作用域的令牌还能同时导出 8 次。`portable.export_space` 拆成 `export_plan`（会话、媒体、附加信息与派生快照，不读图片字节；没有这个空间时抛 KeyError，所以仍在第一个字节之前 404）与 `iter_export_json`，后者给出的字节与同一份文件 `json.dumps(..., ensure_ascii=False, allow_nan=False, separators=(",", ":"))` 的完全相同；`GET /api/v1/export` 与 `GET /api/spaces/{space}/export` 边读边写地返回它（分块，没有 `Content-Length`），与以前逐字节相同（有测试钉着）。文字最多攒 64 KiB 再写，每张图的 base64 每次编出、写出 1 MiB（`EXPORT_IMAGE_SLICE` = 768 KiB 原始字节，复审）：峰值现在约是一张图的原始字节（base64 的 0.75 倍）加几 MB，与它出现几次无关（复审之前，按发言边读边写已把十份的情形降到 38.3 MB；分段之后，三份 base64 为 5.8 MB 的图从 19.1 MB 降到 7.8 MB）。`export_space`、SDK、命令行与 `MemoryClient` 照旧返回同样的 dict，OpenAPI 快照不变。写出第一个字节之后出错时响应体被截断（`MemoryClient` 这时报 JSON 解析出错），中途文件不见了的图片跳过，每个令牌的并发上限一直管到发送完。去掉了"每个令牌同时只能导出一次"与字节配额：边读边写之后前者用不着，后者管不住同一张图反复写入的情形。
+     - **文件损坏时也是一行**（P11 与复审；修订 D-074 第 3 组的 P11）：D-074 的"数据库打不开时一行说明"只对 `OperationalError` 与 `OSError` 成立；不是 SQLite 数据库或已经损坏的文件抛 `sqlite3.DatabaseError`，`MemorySystem.from_settings` 抛出不带路径的 `file is not a database`，命令行打印调用栈。现在 `store.files.opening` 也接住 `DatabaseError`；`SQLITE_NOTADB` 与 `SQLITE_CORRUPT*` 时 `DatabaseOpenError` 写的是 `<路径> 打不开（<错误>）：文件损坏或不是 SQLite 数据库，从备份恢复（见 README 的备份与恢复）；缓存与账本可以删掉重建`，别的照旧。这管到数据库、账本、LLM 缓存与向量缓存，打开它们的每个命令（`export`、`spaces` 与 `inspect` 经 `_open_db_only`，`usage` 经 `opening`，复审时补上 `doctor --live` 打开的账本）与 SDK。`MemoryDB`、`Ledger`、`ResponseCache` 与 `EmbeddingCache` 在打开时的语句出错时关掉连接，接住这个错误的 SDK 进程不漏句柄。`DatabaseOpenError` 仍是 `sqlite3.OperationalError`，原有的处理照样接得住。本地 Qdrant 的集合文件没管（没有复现）。
+     - **导入 Mem0 的导出**（P22 与复审；修订 D-073 留到以后的清单）：从 Mem0 搬过来只能循环调用 `add`，它的幂等键只记 24 小时，也不是原子的。新的 `portable.from_mem0(records, *, user_id=None, agent_id=None)` 把 Mem0 `get_all` 的结果（列表、`{"results": [...]}`，或分页的 `{count, next, results}`）换成一份 `cuemem.space` v2 的文件，交给原有的 `import_space`：它是一个事务，已有的发言跳过。每条记忆一个会话 `mem0-<sha256(id NUL (updated_at 或 created_at))[:16]>`、一句发言：时间是 `updated_at`（没有时 `created_at`），带时区的换算成本机时间；Mem0 的 `role` 或 `attributed_to` 是 assistant 时 role 为 `assistant`，否则 `user`；speaker 是 `actor_id`；metadata 是 Mem0 的加上 `mem0_id`、`mem0_run_id` 与 `mem0_updated_at`；`expiration_date` 成为过期时间。同一份导出再导入什么都不加、不调用模型；在 Mem0 里改过的记忆作为新会话进来，对账取代旧的事实，旧的留作历史。先检查完全部输入，哪一条不合格式都什么都不写（`ValueError("Malformed Mem0 export: …")`：ID、文字、metadata、时间，复审补上了带时区、在日期范围边上的时间，以及 `expiration_date`，它的 `normalize_expiry` 现在也接住溢出）。给了 `user_id` 或 `agent_id` 时目标是 `space_for(user_id, agent_id)`；否则所有记忆要属于同一对（混着几对或一对都没有时 ValueError）。文字为空的记忆跳过并计数（`skipped`）。入口：`cuemem import FILE --from mem0 [--user U] [--agent A] [--consolidate]`（不给 `--user`、`--agent` 时按 Mem0 的 `user_id`、`agent_id` 分组，先把每组都换算、检查完，再每组一个事务地导入；`--from mem0` 时不收 `--space`；`--user`、`--agent` 在默认的 `--from cuemem` 下也能用；不带 `--from mem0` 导入 Mem0 形状的文件时一行提示，复审）；四个类的 `load(data, *, user_id=None, agent_id=None, wait=False, format="cuemem")`（`format="mem0"`；别的值 ValueError；报告多一项 `skipped`）；`POST /api/v1/import` 多了 `format`，`data` 可以是对象或数组（换算在查作用域之前：别的用户的令牌 403，混着几个用户又没给 `user_id` 时 400；`ImportReport.skipped`）。每条记忆要一次抽取的调用；Mem0 的历史版本不导入；事实由 CueMem 的抽取得出，它把 Mem0 第三人称的笔记当作用户的发言读。这是原有导入之上的格式转换，不是 D-073 去掉的幂等批量导入接口。`import_space` 现在也拒绝不是对象的文件（`Malformed export: a CueMem export is a JSON object`），与 `Memory.load` 原来的相同。
+     - **改变的缺省值**：两个导出接口边读边写；损坏或不是 SQLite 的文件给出带新说明的 `DatabaseOpenError`；`cuemem import` 不带 `--from mem0` 导入 Mem0 形状的文件时以 1 退出并提示。新增：`export_plan`、`ExportPlan`、`iter_export_json`、`EXPORT_IMAGE_SLICE`、`store.files.corrupt_database`、`from_mem0`、`mem0_records`、`mem0_groups`、`MEM0_PREFIX`、`load(format=)`、`cuemem import --from/--user/--agent`、`ImportRequest.format`、`ImportReport.skipped`。
+     - **评测**：评测既不导出也不导入；评测的存储遇到损坏的文件与别的打开出错一样抛 `DatabaseOpenError`。
+  5. **复现与发表的说法**（P6、P14、P15；修订 D-070 第 7 组、D-072 第 4 组）：
+     - **`n11_mem0.py` 又能跑了**（P6）：d042443（第三轮）起，方法循环里的列表叫 `rows`，与外面装着各次运行的 dict 同名，四个运行都在时（两个 Mem0 的与两个 N9 的），第二个 Mem0 运行在写任何东西之前就 TypeError，`reproduce.py` 的 N11 一步失败。列表改名为 `method_rows`；在合成的四个运行上，输出与 d042443 之前的版本逐字节相同。发表的 `mem0.json` 与 `mem0-holm.json` 是 d042443 之前写的，不受影响。有测试跑这条正常的路。在 CI 里对分析脚本跑 mypy 留到以后。
+     - **`--cache-only` 照实说**（P14，只改文档与命令行的文字）：它只让 LLM 请求只读缓存（`CUEMEM_LLM_CACHE_MODE=read_only`）；LLM 未命中记为出错，这一步在那次运行跑完之后以非零退出码停下，不往 `docs/results` 复制任何东西；向量请求未命中时照常调用供应商（花费很小）。README、报告与 `reproduce.py` 的帮助和开头的提示原来说脚本停在第一个未命中、任何未命中都报错。没有做向量的只读缓存与在第一个未命中就停的运行：前者每一步约省一美元，后者要改每次评测都依赖的出错处理。
+     - **D-072 之后本地模式的延迟**（P15；修订 D-072 第 4 组的 P9）：README 与报告 §12.5 仍引用 N11 的本地模式数字（Apple M2，4.6 万个单元 1,076 ms，约 9 次 / 秒），是在 D-072 的按类型过滤的掩码之前测的。在一台 4 核 x86 虚拟机上（2026-11-07）离线重跑了 `scripts/n11_latency.py` 的本地模式（哈希向量、默认的规模、3 次）：500 / 2,000 / 8,000 / 20,000 轮（1,279 / 4,729 / 18,529 / 46,129 个单元）时读路径 p50 为 20 / 80 / 315 / 872 ms；2,000 轮、模拟 110 ms 的向量接口时约 10 次 / 秒（1 / 4 / 16 个线程时 4.4 / 9.7 / 10.4）；记录在 `docs/results/n11-improvements/d072/latency.json`，脚本现在写一个 `date` 键。没有 Qdrant 服务端可用，服务端一列保留 N11 在 M2 上的数字并写明机器，没有一列混着两台机器；N11 自己的 `latency.json` 不动。landscape 里 CueMem 那一列现在说的是第七轮之后的代码。
+     - **评测**：请求、缓存与发表的数字都不变。
+  6. **测试与 CI**（P10、P12、P20；修订 D-073 第 6 组、D-074 第 1 组）：
+     - **排除过期记忆的每道前提都有测试**（P10）：D-074 P5 那几道排除的变异整套测试都发现不了。新的测试在去掉任何一道时失败：`MemorySystem._without` 里版本链的过滤与图片的过滤（过期的 Berlin 事实被带回 Munich 旁边；有效的对话轮里一张过期的图），L2 的 `hidden`（`test_expired_memories_do_not_take_recall_slots` 现在 L1、L2 都跑），视觉一路的 `hidden_ids`，记忆代理 `_make_room` 里看锁的那一条，以及服务端的 `must_not` `HasIdCondition`（`tests/test_qdrant_server.py`，只在 CI 的 `qdrant-server` 任务里跑；这里对本地模式核对过）。
+     - **图片格式的测试不再靠计时**（P12）：`test_uncommon_image_formats_are_refused_at_once` 在 6 次带负载的整套运行里有一次因 `< 1.0 s` 失败，而在锁定的 Pillow 13 上这条界线什么都管不住（XBM 的卡顿已经没了）。它现在记下 Pillow 探了哪些解码器，断言接受的格式之外一个都没有跑；时间界线放到 5 秒，给兼容性任务里的 Pillow 12 兜底。`tests/test_auth.py` 里两条洪泛的界线由 1 秒放到 3 秒，仍低于它们守着的 4 秒等待。
+     - **CI 真的起停服务器、跑真的 fastembed 与 Python 3.13**（P20）：package 任务现在用 `infer=false` 写一条记忆，给 `cuemem serve` 发 SIGTERM，要求 40 秒内退出、退出码 143、日志里没有 `Traceback`，在同一个 `CUEMEM_HOME` 上重启、把那条记忆读回来；docker 任务经镜像做同样的事（`docker stop` 30 秒以内、退出码 143、`docker start`、从 `/data` 卷读回来），并核对 `cuemem --version` 写着提交号。兼容性工作流（`compat.yml`，每周，以及改到 `pyproject.toml`、`uv.lock` 或它自己的 PR；不是必需的检查）在 3.14 之外也在 Python 3.13 上跑锁文件的测试（`newest-3.12`、`floors-3.12`、`locked-3.13`、`locked-3.14` 四种），新的 `fastembed` 任务用 `CUEMEM_PRESET=deepseek` 与假的 Key 跑镜像，下载 bge-small，为一次写入与一次 L1 检索跑真的 ONNX 向量化，不调用任何 LLM。`tests/test_ci_pins.py` 钉住这几种（锁文件跑的 Python 版本要等于 3.12 之外的 3.x 分类）与起停的步骤。必需的检查（test、package、docker、qdrant-server）与规则集不变。
+     - **评测**：只改测试与 CI。
+- **备选方案**：
+  - **对已经有做完的任务的代理会话回 429**（P1）：见上面否掉的原因；**什么都不停放、直接 429**：有很多短对话的客户端用不了。
+  - **重新打开的 run 超过上限时改写成普通会话**（P8）：见上。
+  - **缺省就有的每个令牌的空间上限，或全局的 `CUEMEM_MAX_SPACES_PER_KEY`**（P3）：会弄坏 `{user: "*"}` 的后端令牌，也管不住管理令牌；留余量的检查管得住。**按令牌缓存空间数**：`space_ids()` 很便宜，只为写了 `max_spaces` 的令牌读。
+  - **每个令牌同时只导出一次，或按令牌、按空间的字节配额**（P7）：见第 4 组。
+  - **`/api/health` 写出构建标识**（P19）：它不鉴权。**就绪检查里 `SELECT 1` 与查磁盘**（P9）：见第 2 组。**Qdrant 超时沿用原有的 `timeout`**：它的说明写的是模型供应商。
+  - **`logging.basicConfig` 用 `force=True`，或者只在 DEBUG 时带 `exc_info`**（P13）：前者拆掉嵌入 CueMem 的应用与 pytest 装的处理器；后者要改十几处调用，日志变成普通的行之后得益不大。
+  - **`/metrics` 接口**（P16）：拆出去；要只给管理员用的鉴权与标签的规则。
+  - **用 `importlib.metadata` 取 `__version__`**（P21）：拖慢 `import cuemem`；改用测试钉住字面值与 `pyproject.toml` 一致。**日历版本号**：主人选了每轮一个次版本号。
+  - **`cuemem backup` 命令**（P17）：写下 Docker 的步骤之后，D-072 的理由仍然成立。
+  - **向量的只读缓存与在第一个未命中就停**（P14）：见第 5 组。
+  - **为过期改 L2 的实体种子或探针的实体数**（P5）：没有实体的文字交给模型，两者都是冻结的路径。
+  - **`negated` 过滤键**（P18）：会与同名的 metadata 键冲突。
+- **后果**：
+  - 代码与测试：改了 54 个文件（不计文字的文档，含 `docs/openapi-v1.json`、`docs/results/n11-improvements/d072/latency.json`、Dockerfile、`docker-compose.yml`、两个工作流与 `uv.lock`），新增 61 个测试函数（新文件 `tests/test_version.py`；新模块 `src/cuemem/_build.py` 与 `src/cuemem/core/mentions.py`）；共收集 1,629 个测试，去掉 6 个联网的，离线跑 1,623 个，其中 25 个在没装外部基线的包（18 个）或没有 Qdrant 服务端（7 个）时跳过、改由 CI 跑；ruff、mypy 通过。每个行为修复都核对过在修复之前的代码上失败。
+  - **评测请求、图片请求与发表的数字不变**：`tests/test_eval_leak.py`、`tests/test_frozen_config.py`、`tests/test_embedding.py` 与 `tests/test_llm_client.py` 与这一轮开始时的文件逐字节相同、照常通过，一个都没有重新钉；默认的巩固指纹仍是 `2f0adc7890b6a52e`（现在 `consolidation_fingerprint` 也钉着它）；发给模型的图片字节由没有改动的 `tests/test_store.py::test_image_bytes_sent_to_models_are_unchanged` 钉住。与以前相同，钉住的是请求的字节与缓存键；N2–N11 的重放没有重跑。新的结果文件是放在 N11 记录旁边的重测，不替换任何东西。
+  - **有意改变的请求**：默认配置与评测的路径上没有。导入的 Mem0 记忆巩固时每条要一次抽取的调用（P22）；旁边有不经推断就长了的会话时遗忘照常重放（P4）；记忆代理提前抽取的会话少了（P1）。
+  - **留到以后或只做了一部分**：
+    1. D-072 到 D-074 留下的：逐位比对检索之后把下限升到 qdrant-client ≥ 1.20（原子写 `meta.json`）；
+    2. D-072 到 D-074 清单里仍没做的：`get_all` 的游标分页、变更流或事件钩子、监控指标的接口（现在也包括 P16 拆出去的 `/metrics`）与追踪钩子、`/api/v1` 上的实体与图、Kubernetes 清单或 Helm chart、带类型的返回值、TypeScript 客户端包、测试子进程的网络守卫、分段记下进度的遗忘重放、原生的异步客户端；
+    3. 这一轮去掉的候选：记下记忆代理转发了什么、按令牌的可选每日预算；按给定结构填出的画像；认出 `fork()` 之后被使用的 `Memory`；说明 `at="2030"` 读作 Unix 秒数；
+    4. P1：每个代理进程进行中的标记与 `MemorySystem._open` 最多是上限加 `PARKED_KEPT`；停放之后又交给抽取的会话，调用方在闲置结束之后回来时仍要重放，与 D-074 之前相同；
+    5. P3：用 Qdrant 服务端时，不设上限的集合压到服务端身上（Qdrant 建议按 payload 区分租户），只有 `max_spaces` 管得住；并发地建空间可能比 `max_spaces` 多一两个；
+    6. P5：抽取时给出、没有任何事实引用、又来自过期会话的实体照样列出，合并过的描述留着过期的措辞；
+    7. P6：对改写发表结果的分析脚本（`n11_mem0.py`、`n11_second_judge.py`、`n12_leak.py`）跑 mypy；
+    8. P11：本地 Qdrant 的集合文件损坏时仍报它们自己的错；
+    9. P15：§12.5 的 Qdrant 服务端一列没有重测；
+    10. P17：Docker 的备份与恢复命令没有在真的 compose 上跑过；
+    11. P20：退出码只认 143，靠的是 P2 装的处理函数；
+    12. D-073 与 D-074 仍留着的：很多令牌加起来仍能占满线程，界面的路由不计入每个令牌的上限；一次多条消息的 `add()` 抽出的事实按抽取的顺序；不用生成的键自动重试；写在 `CUEMEM_API_KEYS` 里的令牌与 `CUEMEM_API_TOKEN` 改了要重启；Python 3.14 下的 Intel Mac 装不了 `local`；Claude 记忆工具的 `profile.md` 原样插入画像；`kill -9` 之后可能留下 SDK 给 data URL 图片的临时文件；锁靠 `flock`。
+  - **仍有的局限**：
+    - 一个数据库一个写入进程（由锁保证），一台服务器一个 uvicorn worker（令牌的重新读入、会话的上限与停放的集合都这样假定）；
     - 召回清单与 MCP 的画像标出了引用的文字，但拦不住模型照着做。
