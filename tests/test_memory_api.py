@@ -2315,17 +2315,36 @@ def _xbm_stall(k: int) -> bytes:
     return data + b"A" * (512 - len(data))
 
 
-def test_uncommon_image_formats_are_refused_at_once(system: MemorySystem) -> None:
+def test_uncommon_image_formats_are_refused_at_once(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """不是 JPEG、PNG、WEBP、GIF、BMP、TIFF 的图片（store/media.py 的 ACCEPTED_FORMATS）：400
     ValueError，不交给 Pillow 别的格式的解码器去试，什么都不写、不存原图。以前一个只能写自己空间
     的令牌发 512 字节的 XBM 文件头，Pillow 12 上卡住整个服务十几秒之后回 500；认不出的文件也是
-    500（UnidentifiedImageError 没有算成请求的错）。"""
+    500（UnidentifiedImageError 没有算成请求的错）。
+
+    断言的是"别的格式的识别函数一个都没被调用"（第八轮体检 P12）：锁定的 Pillow 13 上这个文件头
+    不再卡住，以前那个 1 秒的计时什么也守不住，负载重时却会失败。计时留着、放宽到 5 秒：compat
+    任务用 Pillow 12 时卡住要十几秒。"""
     keys = Keys.parse(
         "keys:\n  - name: m-app\n    token: m-token-0123456789\n    scopes:\n"
         "      - user: mallory\n"
     )
     xbm = io.BytesIO()
     Image.new("1", (8, 8)).save(xbm, format="XBM")  # 一张正常的 XBM：以前照样存下
+    Image.init()  # 先注册全部格式，再换掉别的格式的识别函数
+    probed: list[str] = []
+
+    def recording(fmt: str, accept: Callable[[bytes], Any]) -> Callable[[bytes], Any]:
+        def probe(prefix: bytes) -> Any:
+            probed.append(fmt)
+            return accept(prefix)
+
+        return probe
+
+    for fmt, (factory, accept) in list(Image.OPEN.items()):
+        if fmt not in ACCEPTED_FORMATS and accept is not None:
+            monkeypatch.setitem(Image.OPEN, fmt, (factory, recording(fmt, accept)))
     with TestClient(v1_app(system, keys), raise_server_exceptions=False) as http:
         for data in (_xbm_stall(28), xbm.getvalue(), b"hello, not an image"):
             url = "data:image/png;base64," + base64.b64encode(data).decode()
@@ -2338,10 +2357,11 @@ def test_uncommon_image_formats_are_refused_at_once(system: MemorySystem) -> Non
                 json=body,
                 headers={"Authorization": "Bearer m-token-0123456789"},
             )
-            assert time.perf_counter() - started < 1.0
+            assert time.perf_counter() - started < 5.0
             assert response.status_code == 400, response.text
             error = response.json()["error"]
             assert error["type"] == "ValueError" and "Not a valid image" in error["message"]
+    assert probed == []
     assert system.db.list_spaces() == [] and system.db.get_media("mallory") == []
     assert not [p for p in system.settings.paths.media.rglob("*") if p.is_file()]
 

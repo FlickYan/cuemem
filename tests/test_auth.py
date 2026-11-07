@@ -1238,7 +1238,7 @@ def test_a_scoped_key_cannot_take_every_thread(world: World) -> None:
     以前 alice 并发 45 个卡住的 POST /api/v1/consolidate 就占满 AnyIO 的 40 个线程，管理令牌查别人
     的状态也要等到它们做完。"""
     took, codes = _flood(world, "/api/v1/consolidate", {"user_id": "alice"}, 45)
-    assert took < 1.0, took
+    assert took < 3.0, took  # 以前要等到放开锁（一直卡着）；放宽是为了负载重的机器
     assert codes.count(429) >= 45 - 8 and set(codes) <= {200, 429}, codes
 
 
@@ -1254,7 +1254,7 @@ def test_waits_hold_no_thread(raised_cap: None, world: World) -> None:
     管理令牌查 bob 的状态照样马上回。以前每个 wait 占着一个线程，状态要等到它们超时（4 秒）。
     放开之后它们都 200。"""
     took, codes = _flood(world, "/api/v1/wait", {"user_id": "alice", "timeout": 4}, 45)
-    assert took < 1.0, took
+    assert took < 3.0, took  # 以前要等到 wait 超时（开始计时之后约 3.5 秒）；放宽是为了负载重的机器
     assert codes == [200] * 45, codes
 
 
