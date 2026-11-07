@@ -222,7 +222,66 @@ def test_update_that_extracts_nothing_does_not_replay_the_space(
         assert not any("Correction" in t["text"] for s in exported for t in s["turns"])
 
 
+def test_forgetting_a_logged_only_session_matches_the_replay(
+    tmp_path: Path, n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """第八轮体检：infer=False 只记了日志的会话没有任务，以前 len(jobs) != 1 一律重放整个空间；
+    重放不为它登记任务、它什么都不贡献，删掉它不再重放，结果与重放相同。"""
+
+    def act(m: Memory, sessions: list[str]) -> None:
+        out = m.add(
+            "I like opera, logged only chat",
+            user_id=SPACE,
+            timestamp=START + timedelta(days=20),
+            infer=False,
+        )
+        assert not [j for j in m.system.db.get_jobs(SPACE) if j["session_id"] == out["session_id"]]
+        assert m.system.forget(SPACE, session_ids=[out["session_id"]]).turns_deleted == 1
+
+    fast, slow, fast_runs, slow_runs = fast_vs_replay(
+        tmp_path, n3_settings, fake_api, model, HISTORY, act
+    )
+    assert fast == slow
+    assert fast_runs == [0] and slow_runs == [1]
+    assert not any("opera" in t[5] for t in fast["turns"])
+
+
 # ---------- 不走快速路径的情形：照旧重放 ----------
+
+
+def test_a_session_regrown_without_inference_keeps_the_replay(
+    tmp_path: Path, n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """第八轮体检：别的会话巩固过之后又用 infer=False 追加了发言（没有登记任务，stale() 与
+    regrown_sessions 都看不出来）。重放按现在的内容重新抽取它们（多出巴黎与歌剧），以前快速
+    路径不重放，结果与重放不同。"""
+
+    def act(m: Memory, sessions: list[str]) -> None:
+        later = timedelta(hours=1)
+        m.add(
+            "I live in Paris",
+            user_id=SPACE,
+            run_id=sessions[3],
+            timestamp=START + timedelta(days=3) + later,
+            infer=False,
+        )
+        m.add(
+            "I like opera",
+            user_id=SPACE,
+            run_id=sessions[2],
+            timestamp=START + timedelta(days=2) + later,
+            infer=False,
+        )
+        assert not m.system.consolidator.stale(SPACE)
+        m.system.forget(SPACE, session_ids=[sessions[1]])
+
+    fast, slow, fast_runs, slow_runs = fast_vs_replay(
+        tmp_path, n3_settings, fake_api, model, [*HISTORY, "I like chess"], act
+    )
+    assert fast_runs == [1] and slow_runs == [1]
+    assert fast == slow
+    statements = {x for row in fast["facts"] for x in row if isinstance(x, str)}
+    assert {"The user lives in Paris.", "The user likes opera."} <= statements
 
 
 def replays(m: Memory, act: Callable[[], Any]) -> bool:
@@ -320,7 +379,17 @@ def test_retried_jobs_match_the_replay(
 
 
 @pytest.mark.parametrize(
-    "case", ["cited_fact", "content_filter", "stale", "rebuild_pending", "cited_round", "open"]
+    "case",
+    [
+        "cited_fact",
+        "content_filter",
+        "stale",
+        "rebuild_pending",
+        "cited_round",
+        "open",
+        "open_logged",
+        "marked_logged",
+    ],
 )
 def test_each_guard_keeps_the_replay(
     tmp_path: Path, n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel, case: str
@@ -332,7 +401,10 @@ def test_each_guard_keeps_the_replay(
     - stale：派生记忆过期了（换了抽取版本等）；
     - rebuild_pending：之前的重建没做完；
     - cited_round：留下的发言引用过要删的片段（不沿引用扩散）；
-    - open：要删的会话巩固过、又在进行中（重放时跳过它）。"""
+    - open：要删的会话巩固过、又在进行中（重放时跳过它）；
+    - open_logged：要删的会话没有任务（infer=False），在本进程里进行中（第八轮体检）；
+    - marked_logged：同上，只有数据库里进行中的标记（之前的进程留下、等着接手的）。"""
+    from cuemem.memory import _open_mark
     from cuemem.write.consolidate import REBUILD_PENDING
 
     fake_api.chat_replies = [model]
@@ -365,6 +437,19 @@ def test_each_guard_keeps_the_replay(
             follow = False
         elif case == "open":
             m.system.open_session(SPACE, doomed)
+        elif case in ("open_logged", "marked_logged"):
+            out = m.add(
+                "smalltalk logged only",
+                user_id=SPACE,
+                timestamp=START + timedelta(days=30),
+                infer=False,
+            )
+            doomed = out["session_id"]
+            if case == "open_logged":
+                m.system.open_session(SPACE, doomed)
+                db.delete_meta(_open_mark(SPACE, doomed))  # 只差本进程里进行中这一条
+            else:
+                db.set_meta(_open_mark(SPACE, doomed), START.isoformat())
         conn.commit()
         assert replays(
             m, lambda: m.system.forget(SPACE, session_ids=[doomed], follow_citations=follow)

@@ -261,6 +261,28 @@ class Consolidator:
             self._digests[key] = (version, started_at, digest)
         return digest
 
+    def changed_sessions(self, space_id: str, jobs: Sequence[Mapping[str, Any]]) -> set[str]:
+        """这些任务里已完成（当前版本）的，会话的内容现在与任务记下的指纹不同的会话（第八轮
+        体检）：巩固之后又用 infer=False 追加了发言，没有登记新任务，regrown_sessions（要有待
+        处理的任务）看不出来，重放时 requeue 却会按现在的内容重新登记、重新抽取。会话或发言
+        已经没了的也算。用 enqueue 的同一个指纹缓存（_digest），只读不改任务。"""
+        done = [j for j in jobs if j["status"] == "done" and j["version"] == PIPELINE_VERSION]
+        sids = list(dict.fromkeys(j["session_id"] for j in done))
+        if not sids:
+            return set()
+        sessions = self.db.sessions_of(space_id, sids)
+        versions = self.db.turns_versions(space_id, [s for s in sids if s in sessions])
+        changed: set[str] = set()
+        for job in done:
+            sid = job["session_id"]
+            started = sessions.get(sid)
+            if (
+                started is None
+                or self._digest(space_id, sid, started, versions[sid]) != job["content_hash"]
+            ):
+                changed.add(sid)
+        return changed
+
     def fingerprint(self) -> str:
         """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。
 
