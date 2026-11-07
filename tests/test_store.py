@@ -705,6 +705,20 @@ def test_a_local_store_keeps_headroom_below_the_open_file_limit(
     memory_only.close()
 
 
+def test_a_small_open_file_limit_still_leaves_room_for_collections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS 的终端与 Jupyter 默认软上限只有 256，库不调高它：留给别的文件的余量最多一半，照样
+    能建集合。以前留 256 个，软上限 256 时第一个空间就 VectorStoreFullError（第八轮复审）。"""
+    assert [reserved_files(s) for s in (256, 300, 1024, 5000)] == [128, 150, 256, 500]
+    small_open_file_limit(monkeypatch, 256)
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    for i in range(3):
+        store.ensure_space(f"agent-{i}")
+    assert len(store._client.get_collections().collections) == 3
+    store.close()
+
+
 # qdrant-client 经 http:// 发 Key 时警告；它在后台线程里向 "/" 核对版本，替身先关掉时也警告
 QDRANT_WARNINGS = (
     "ignore:Api key is used with an insecure connection",

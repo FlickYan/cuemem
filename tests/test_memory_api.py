@@ -74,6 +74,7 @@ from cuemem.portable import ExportPlan
 from cuemem.sdk import space_for
 from cuemem.store.media import ACCEPTED_FORMATS
 from cuemem.store.sqlite import MemoryDB
+from cuemem.store.vector import reserved_files
 
 Mem = Memory | MemoryClient
 
@@ -1012,7 +1013,9 @@ def test_new_spaces_get_503_capacity_near_the_open_file_limit(
 
         assert add("a0").status_code == 200
         collections = len(system.vectors._client.get_collections().collections)
-        small_open_file_limit(monkeypatch, collections + 256)  # 软上限只剩 reserved_files 个
+        # 软上限只剩 reserved_files 个：最小的、余量正好够已有集合的软上限
+        soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+        small_open_file_limit(monkeypatch, soft)
         full = add("a1")
         assert full.status_code == 503, full.text
         error = full.json()["error"]

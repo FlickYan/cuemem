@@ -725,8 +725,12 @@ def _fast_mask(
 
 def reserved_files(soft: int) -> int:
     """本地模式建集合时，打开文件数的软上限 soft 里留给集合之外的文件（数据库、缓存、图片、
-    连接）的个数（VectorStore._room_for；cuemem doctor 按同样的数说还能建几个）。"""
-    return max(256, soft // 10)
+    连接）的个数（VectorStore._room_for；cuemem doctor 按同样的数说还能建几个）。
+
+    软上限的十分之一、至少 256 个，但最多一半：macOS 的终端与 Jupyter 默认软上限只有 256，库
+    （Memory()、MemorySystem、scripts/ 的脚本）不像 CLI 那样调高它；以前留 256 个就一个集合也
+    建不了（第八轮复审）。软上限 256 时留 128 个、能建 128 个集合。"""
+    return min(max(256, soft // 10), soft // 2)
 
 
 def _safe(space_id: str) -> str:
