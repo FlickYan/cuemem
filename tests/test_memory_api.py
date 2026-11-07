@@ -242,9 +242,10 @@ ARGUMENTS: dict[str, Any] = {
     "derived": False,
     "idempotency_key": "retry-0001",
     "timeout": 2.0,  # 比 TestClient 的读超时（5 秒）减去 WAIT_MARGIN_S 短，原样发出
+    "format": "mem0",  # load：Mem0 的导出（服务端先换算、查作用域，再交给 Memory.load）
 }
 PER_METHOD: dict[tuple[str, str], Any] = {
-    ("load", "data"): {"version": 2, "space_id": "alice"},
+    ("load", "data"): [{"id": "m1", "memory": "hi", "created_at": "2026-01-01T00:00:00"}],
     ("wait", "timeout"): 0.3,  # /wait 等不到（见 _Recorder 的 worker）：0.3 秒后 504
 }
 RETURNS: dict[str, Any] = {
@@ -1019,6 +1020,41 @@ def test_new_spaces_get_503_capacity_near_the_open_file_limit(
         alice = MemoryClient("http://testserver", api_key=token, http_client=http)
         with pytest.raises(VectorStoreFullError, match="open-file limit"):
             alice.add("I like tea", user_id="alice", agent_id="a2", infer=False)
+
+
+def test_mem0_import_respects_the_key_scope(system: MemorySystem) -> None:
+    """POST /api/v1/import 的 format=mem0（第八轮体检）：先换算再查作用域。限定作用域的令牌导入
+    别的用户的 Mem0 记忆 403、什么都不写；几个用户混在一起又没给 user_id 时 400；自己的照常导入，
+    MemoryClient.load(format="mem0") 再导入一次什么都不加。"""
+    eve_token = "eve-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: eve-app\n    token: {eve_token}\n    scopes:\n      - user: eve\n",
+        "admin-token-0123456789",
+    )
+    memories = [
+        {"id": "m1", "memory": "Likes tea", "created_at": "2026-05-01T09:00:00Z", "user_id": "zoe"},
+        {
+            "id": "m2",
+            "memory": "Likes rain",
+            "created_at": "2026-05-02T09:00:00Z",
+            "user_id": "eve",
+        },
+    ]
+    with TestClient(v1_app(system, keys)) as http:
+        auth = {"Authorization": f"Bearer {eve_token}"}
+        body = {"data": {"results": memories[:1]}, "format": "mem0"}
+        denied = http.post("/api/v1/import", json=body, headers=auth)
+        assert denied.status_code == 403, denied.text
+        mixed = http.post("/api/v1/import", json={"data": memories, "format": "mem0"}, headers=auth)
+        assert mixed.status_code == 400 and "mixes several users" in mixed.text
+        assert system.db.list_spaces() == []
+
+        eve = MemoryClient("http://testserver", api_key=eve_token, http_client=http)
+        report = eve.load(memories[1:], format="mem0")
+        assert report["space_id"] == "eve" and report["turns_added"] == 1
+        assert report["skipped"] == 0
+        assert eve.load(memories[1:], format="mem0")["turns_added"] == 0
+        assert [row["space_id"] for row in system.db.list_spaces()] == ["eve"]
 
 
 # 记忆代理与各框架集成的证据块（recall_evidence → inject_evidence）在一个固定的场景里的摘要。

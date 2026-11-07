@@ -321,15 +321,16 @@ class AsyncMethods:
 
     async def load(
         self,
-        data: Mapping[str, Any],
+        data: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
         wait: bool = False,
+        format: Literal["cuemem", "mem0"] = "cuemem",
     ) -> dict[str, Any]:
         """见 Memory.load。"""
         return await asyncio.to_thread(
-            self.sync.load, data, user_id=user_id, agent_id=agent_id, wait=wait
+            self.sync.load, data, user_id=user_id, agent_id=agent_id, wait=wait, format=format
         )
 
     # ---------- 其他 ----------

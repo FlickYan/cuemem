@@ -1242,18 +1242,33 @@ class Memory:
 
     def load(
         self,
-        data: Mapping[str, Any],
+        data: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
         wait: bool = False,
+        format: Literal["cuemem", "mem0"] = "cuemem",
     ) -> dict[str, Any]:
         """导入 export 的结果：写回原始日志，派生记忆重新抽取（wait=True 时同步完成）。
-        不给 user_id、agent_id 时导入到文件里原来的空间。"""
-        from cuemem.portable import import_space
+        不给 user_id、agent_id 时导入到文件里原来的空间。
 
+        format="mem0"：data 是 Mem0 get_all 的结果（列表或 {"results": [...]}），一条记忆一个
+        会话，重复导入什么都不加（portable.from_mem0）。不给 user_id、agent_id 时所有记忆要属于
+        同一个用户（与 Agent），否则 ValueError；返回值多一个 skipped（文字为空、跳过的记忆数）。"""
+        from cuemem.portable import from_mem0, import_space
+
+        if format not in ("cuemem", "mem0"):
+            raise ValueError(f"format must be 'cuemem' or 'mem0', not {format!r}")
+        skipped: int | None = None
+        if format == "mem0":
+            data = from_mem0(data, user_id=user_id, agent_id=agent_id)
+            skipped = data["skipped"]
+        elif not isinstance(data, Mapping):
+            raise ValueError("Malformed export: a CueMem export is a JSON object")
         space = space_for(user_id, agent_id) if user_id or agent_id else None
         report = import_space(self.system, data, space_id=space, consolidate=wait)
+        if skipped is not None:
+            report["skipped"] = skipped
         if not wait and self.system.worker is not None:
             self.system.worker.submit(report["space_id"])
         return report

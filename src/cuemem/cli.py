@@ -442,31 +442,86 @@ def export_cmd(
 
 @app.command("import")
 def import_cmd(
-    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="cuemem export 的文件")],
+    path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="cuemem export 或 Mem0 导出的文件")
+    ],
     space: Annotated[str | None, typer.Option(help="导入到这个空间（默认用文件里的）")] = None,
     consolidate: Annotated[
         bool, typer.Option("--consolidate", help="导入后立即巩固（重新抽取事实，需要 LLM）")
     ] = False,
+    source: Annotated[
+        str,
+        typer.Option(
+            "--from", help="文件的格式：cuemem（cuemem export）或 mem0（Mem0 get_all 的 JSON）"
+        ),
+    ] = "cuemem",
+    user: Annotated[str | None, typer.Option("--user", help="导入到这个用户的空间")] = None,
+    agent: Annotated[str | None, typer.Option("--agent", help="导入到这个 Agent 的空间")] = None,
 ) -> None:
-    """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。"""
-    from cuemem.portable import import_space
+    """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。
 
+    --from mem0 导入 Mem0 的导出（get_all 的结果）：一条记忆一个会话，重复导入什么都不加。不给
+    --user、--agent 时按文件里的 user_id、agent_id 分组，每组导入到各自的空间（各是一个事务）。"""
+    from cuemem.portable import from_mem0, import_space, mem0_groups
+    from cuemem.sdk import space_for
+
+    if source not in ("cuemem", "mem0"):
+        console.print("[red]--from 只能是 cuemem、mem0[/red]")
+        raise typer.Exit(1)
+    if space and (user or agent):
+        console.print("[red]--space 与 --user、--agent 只给一种[/red]")
+        raise typer.Exit(1)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:  # 以前是调用栈
-        console.print(f"[red]不是有效的 CueMem 导出文件（被截断了？）：{escape(str(exc))}[/red]")
+        what = "Mem0 导出" if source == "mem0" else "CueMem 导出"
+        console.print(f"[red]不是有效的 {what}文件（被截断了？）：{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    # 要导入的文件：cuemem 是文件本身；mem0 先全部换算、检查完（哪条不合格式都什么都不写），
+    # 不给 --user、--agent 时每个（user_id，agent_id）一份
+    skipped = 0
+    try:
+        if user or agent:
+            space = space_for(user, agent)
+        if source == "cuemem":
+            docs = [data]
+        elif user or agent:
+            docs = [from_mem0(data, user_id=user, agent_id=agent)]
+        else:
+            if space:
+                console.print("[red]--from mem0 用 --user 或 --agent 指定空间[/red]")
+                raise typer.Exit(1)
+            groups = sorted(mem0_groups(data).items(), key=lambda group: str(group[0]))
+            docs = [from_mem0(items, user_id=u, agent_id=a) for (u, a), items in groups]
+        if source == "mem0":
+            skipped = sum(int(doc["skipped"]) for doc in docs)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(1) from exc
     with _open_system() as system:
-        try:
-            report = import_space(system, data, space_id=space, consolidate=consolidate)
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(1) from exc
-        console.print(
-            f"记忆空间 [bold]{report['space_id']}[/bold]：{report['sessions']} 个会话，"
-            f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
-        )
-        if "consolidation" not in report:
+        reports = []
+        for doc in docs:
+            try:
+                report = import_space(system, doc, space_id=space, consolidate=consolidate)
+            except ValueError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+                raise typer.Exit(1) from exc
+            reports.append(report)
+            console.print(
+                f"记忆空间 [bold]{escape(report['space_id'])}[/bold]：{report['sessions']} 个会话，"
+                f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
+            )
+        if source == "mem0":
+            if len(reports) > 1:
+                console.print(
+                    f"[dim]{len(reports)} 个空间各自导入（各是一个事务）：中途出错时前面的"
+                    "已经写入，再运行一次只补上没写的。[/dim]"
+                )
+            if skipped:
+                console.print(f"[dim]跳过 {skipped} 条文字为空的记忆。[/dim]")
+        if not reports:
+            console.print("文件里没有记忆。")
+        elif "consolidation" not in reports[-1]:
             console.print(
                 "[dim]提示：运行 cuemem consolidate 重新抽取事实与实体（需要 LLM）。[/dim]"
             )

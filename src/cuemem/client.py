@@ -421,13 +421,28 @@ class MemoryClient:
 
     def load(
         self,
-        data: Mapping[str, Any],
+        data: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
         wait: bool = False,
+        format: Literal["cuemem", "mem0"] = "cuemem",
     ) -> dict[str, Any]:
-        body = {"data": dict(data), "user_id": user_id, "agent_id": agent_id, "wait": wait}
+        """见 Memory.load；format="mem0" 时由服务端换算（较旧的服务端不认这个键）。"""
+        if format not in ("cuemem", "mem0"):  # 与本地的 Memory.load 相同，发送之前报错
+            raise ValueError(f"format must be 'cuemem' or 'mem0', not {format!r}")
+        payload: dict[str, Any] | list[Any] = (
+            dict(data)
+            if isinstance(data, Mapping)
+            else [dict(item) if isinstance(item, Mapping) else item for item in data]
+        )
+        body = {
+            "data": payload,
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "wait": wait,
+            "format": format,
+        }
         return self._call("POST", "/import", body=body)
 
     # ---------- 其他 ----------

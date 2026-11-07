@@ -34,6 +34,11 @@ derived 只是给别的系统读的快照（带版本链的事实与画像），
 导入的文件不可信（可能是别人发来的，HTTP 接口也收）：图片的 sha256 与 mime 不拿来拼文件名，
 临时文件按重新算出的内容哈希命名、后缀按 PIL 认出的格式取；不是图片、哈希对不上时整个导入报错，
 一条发言也不写。
+
+Mem0 的导出（第八轮体检）：from_mem0 把 Mem0 get_all 的结果（列表、{"results": [...]}，或平台
+接口分页的 {"count", "next", "results"}）换成上面的格式，交给同一个 import_space：一条记忆是一个
+会话（session_id 由 Mem0 的 id 与更新时间派生），重复导入什么都不加，Mem0 里改过的记忆作为新会话
+进来、由对账取代旧的事实。见 from_mem0。
 """
 
 from __future__ import annotations
@@ -54,12 +59,15 @@ from typing import Any
 from PIL import Image
 
 from cuemem.core.models import MediaItem, SessionIn, Turn, TurnIn, TurnMeta
-from cuemem.core.timeutil import normalize_expiry
+from cuemem.core.timeutil import naive_local, normalize_expiry
 from cuemem.memory import MemorySystem, _open_mark
 from cuemem.store.media import ACCEPTED_FORMATS
 from cuemem.store.sqlite import MemoryDB
 
 FORMAT = "cuemem.space"
+MEM0_PREFIX = "mem0-"  # Mem0 导入的会话 ID 的前缀（from_mem0）
+# Mem0 记忆的这几个顶层键是字符串或者没有（mem0/memory/main.py 的 promoted_payload_keys）
+_MEM0_STR_KEYS = ("user_id", "agent_id", "run_id", "actor_id", "role", "attributed_to")
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
 # iter_export_json 攒到这么多个字符就写出一段（只有文字的空间不必每句发言一段）
 EXPORT_CHUNK_BYTES = 1 << 16
@@ -369,3 +377,139 @@ def _image_files(images: Sequence[Mapping[str, Any]], scratch: Path) -> Iterator
         path = scratch / f"{sha}{_FORMAT_SUFFIX.get(fmt, '.img')}"
         path.write_bytes(data)
         yield path
+
+
+def mem0_records(records: object) -> list[Mapping[str, Any]]:
+    """Mem0 导出的记忆列表：get_all 的列表、{"results": [...]} 或平台接口分页的
+    {"count", "next", "results"}。别的形状 ValueError("Malformed Mem0 export: …")。"""
+    items = records.get("results") if isinstance(records, Mapping) else records
+    if isinstance(items, str | bytes) or not isinstance(items, Sequence):
+        raise ValueError('Malformed Mem0 export: expected a list of memories or {"results": [...]}')
+    for n, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"Malformed Mem0 export: item {n} is not a JSON object")
+    return list(items)
+
+
+def mem0_groups(records: object) -> dict[tuple[str | None, str | None], list[Mapping[str, Any]]]:
+    """按（user_id，agent_id）分组 Mem0 的记忆：cuemem import --from mem0 每组导入一次，各是一个
+    事务。这里只检查形状与这两个键，别的由 from_mem0 检查。"""
+    groups: dict[tuple[str | None, str | None], list[Mapping[str, Any]]] = {}
+    for n, item in enumerate(mem0_records(records)):
+        groups.setdefault(_mem0_pair(item, n), []).append(item)
+    return groups
+
+
+def from_mem0(
+    records: object, *, user_id: str | None = None, agent_id: str | None = None
+) -> dict[str, Any]:
+    """Mem0 导出的记忆 → 一份 cuemem.space（version 2）文件，交给 import_space（第八轮体检）。
+
+    - 目标空间：给了 user_id 或 agent_id 时是 space_for(user_id, agent_id)；否则所有记忆的
+      （user_id，agent_id）必须相同，混着几个用户时 ValueError 并列出各组（一次导入是一个事务、
+      只查一次作用域；cuemem import 按组逐个导入）；
+    - 一条记忆一个会话：session_id 是 "mem0-" 加上 sha256(id、更新时间) 的前 16 位。同一条记忆
+      再导入时会话已在、发言跳过，什么都不加；在 Mem0 里改过的记忆更新时间不同，作为新会话进来，
+      对账取代旧的事实，旧的留作历史；
+    - 一句发言：text 是记忆的文字；时间是更新时间（没有时用创建时间），Mem0 写的带时区的时间换算
+      成本机时间；role 按 Mem0 的 role / attributed_to，是 assistant 时为 assistant，否则 user；
+      speaker 是 actor_id；metadata 是 Mem0 的 metadata 加上 mem0_id、mem0_run_id 与
+      mem0_updated_at；expires_at 是 expiration_date；
+    - 文字为空的记忆跳过，数目记在返回值的 "skipped" 里（import_space 不看这个键）。
+
+    先检查完所有记忆再返回：哪一条不合格式都 ValueError("Malformed Mem0 export: …")，什么都不写。
+    Mem0 的历史版本（history）不导入；事实由 CueMem 的抽取重新得出，措辞与 Mem0 的不同。"""
+    from cuemem.sdk import space_for
+
+    items = mem0_records(records)
+    pairs = {_mem0_pair(item, n) for n, item in enumerate(items)}
+    sessions = [_mem0_session(item, n) for n, item in enumerate(items)]
+    if user_id or agent_id:
+        target = space_for(user_id, agent_id)
+    elif len(pairs) > 1:
+        listed = ", ".join(f"(user_id={u!r}, agent_id={a!r})" for u, a in sorted(pairs, key=str))
+        raise ValueError(
+            "The Mem0 export mixes several users or agents; import each with its user_id or "
+            f"agent_id: {listed}"
+        )
+    elif not pairs or pairs == {(None, None)}:
+        raise ValueError(
+            "The Mem0 export names no user_id or agent_id: pass user_id or agent_id to import it."
+        )
+    else:
+        target = space_for(*next(iter(pairs)))
+    kept = [session for session in sessions if session is not None]
+    return {
+        "format": FORMAT,
+        "version": VERSION,
+        "space_id": target,
+        "sessions": kept,
+        "skipped": len(sessions) - len(kept),
+    }
+
+
+def _mem0_pair(item: Mapping[str, Any], n: int) -> tuple[str | None, str | None]:
+    """一条 Mem0 记忆的（user_id，agent_id）；顶层的几个 ID 键不是字符串时 ValueError。"""
+    for key in _MEM0_STR_KEYS:
+        if item.get(key) is not None and not isinstance(item[key], str):
+            raise ValueError(f"Malformed Mem0 export: item {n} has a {key} that is not a string")
+    return item.get("user_id") or None, item.get("agent_id") or None
+
+
+def _mem0_session(item: Mapping[str, Any], n: int) -> dict[str, Any] | None:
+    """一条 Mem0 记忆 → 导入文件里的一个会话（见 from_mem0）；文字为空时 None。"""
+    memory_id, text, metadata = item.get("id"), item.get("memory"), item.get("metadata")
+    if not isinstance(memory_id, str) or not memory_id:
+        raise ValueError(f"Malformed Mem0 export: item {n} has no id")
+    if not isinstance(text, str):
+        raise ValueError(f"Malformed Mem0 export: memory {memory_id!r} has no text")
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise ValueError(f"Malformed Mem0 export: memory {memory_id!r} has a non-object metadata")
+    try:  # 与 SDK 的 add 相同：metadata 要能写成 JSON
+        extra = json.loads(json.dumps(dict(metadata or {}), allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Malformed Mem0 export: memory {memory_id!r} has metadata that is not JSON: {exc}"
+        ) from exc
+    stamps: dict[str, datetime] = {}
+    for key in ("created_at", "updated_at"):
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            if not isinstance(value, str):
+                raise ValueError(f"{value!r} is not a string")
+            stamps[key] = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed Mem0 export: memory {memory_id!r} has a bad {key}: {exc}"
+            ) from exc
+    if not stamps:
+        raise ValueError(f"Malformed Mem0 export: memory {memory_id!r} has no created_at")
+    try:
+        expires = normalize_expiry(item.get("expiration_date"))
+    except ValueError as exc:
+        raise ValueError(f"Malformed Mem0 export: memory {memory_id!r}: {exc}") from exc
+    if not text.strip():
+        return None
+    version = item.get("updated_at") or item["created_at"]
+    ts = naive_local(stamps.get("updated_at") or stamps["created_at"]).isoformat()
+    who = item.get("role") or item.get("attributed_to") or ""
+    extra["mem0_id"] = memory_id
+    if item.get("run_id"):
+        extra["mem0_run_id"] = item["run_id"]
+    if item.get("updated_at"):
+        extra["mem0_updated_at"] = item["updated_at"]
+    turn: dict[str, Any] = {
+        "idx": 0,
+        "role": "assistant" if who.lower() == "assistant" else "user",
+        "text": text,
+        "ts": ts,
+        "speaker": item.get("actor_id") or None,
+        "images": [],
+        "metadata": extra,
+    }
+    if expires is not None:
+        turn["expires_at"] = expires
+    digest = hashlib.sha256(f"{memory_id}\0{version}".encode()).hexdigest()[:16]
+    return {"session_id": f"{MEM0_PREFIX}{digest}", "started_at": ts, "turns": [turn]}

@@ -243,10 +243,16 @@ class WaitRequest(BaseModel):
 
 
 class ImportRequest(BaseModel):
-    data: dict[str, Any]
+    data: dict[str, Any] | list[Any] = Field(
+        description="A CueMem export (format cuemem), or Mem0 get_all output: a list of memories "
+        'or {"results": [...]} (format mem0)'
+    )
     user_id: str | None = None
     agent_id: str | None = None
     wait: bool = False
+    format: Literal["cuemem", "mem0"] = Field(
+        "cuemem", description="cuemem: a CueMem export; mem0: Mem0 get_all output"
+    )
 
 
 # ---------- 返回值的形状（只用于 OpenAPI，第三轮体检）----------
@@ -578,6 +584,9 @@ class ImportReport(_Out):
     turns_added: int
     images_added: int
     consolidation: ConsolidationReport | None = None
+    skipped: int | None = Field(
+        None, description="format mem0 only: memories skipped because their text was empty"
+    )
 
 
 class SpaceRow(_Out):
@@ -1106,19 +1115,30 @@ def memories_router(
     @router.post("/import", responses=_ok(ImportReport))
     def load(http: Request, request: ImportRequest) -> V1Json:
         # 写进哪个空间与 Memory.load 的取法相同：给了 user_id、agent_id 时是它们的空间，否则是
-        # 文件里的 space_id
-        if request.user_id or request.agent_id:
-            target: str | None = space_for(request.user_id, request.agent_id)
+        # 文件里的 space_id。Mem0 的导出先换算（from_mem0），按换算出的空间查作用域：混着几个
+        # 用户、又没给 user_id 时 400，作用域之外的空间 403
+        data = request.data
+        if request.format == "mem0":
+            from cuemem.portable import from_mem0
+
+            with _sdk_errors():
+                converted = from_mem0(data, user_id=request.user_id, agent_id=request.agent_id)
+            target: str | None = str(converted["space_id"])
+        elif request.user_id or request.agent_id:
+            target = space_for(request.user_id, request.agent_id)
         else:
-            target = str(request.data["space_id"]) if "space_id" in request.data else None
+            target = (
+                str(data["space_id"]) if isinstance(data, dict) and "space_id" in data else None
+            )
         _allow(principal_of(http), target)
         room(http, target)
         with _sdk_errors():
             return memory.load(
-                request.data,
+                data,
                 user_id=request.user_id,
                 agent_id=request.agent_id,
                 wait=request.wait,
+                format=request.format,
             )
 
     @router.get("/spaces", responses=_ok(list[SpaceRow]))

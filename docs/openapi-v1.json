@@ -6264,6 +6264,18 @@
                 "type": "null"
               }
             ]
+          },
+          "skipped": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skipped",
+            "description": "format mem0 only: memories skipped because their text was empty"
           }
         },
         "additionalProperties": true,
@@ -6279,9 +6291,18 @@
       "ImportRequest": {
         "properties": {
           "data": {
-            "additionalProperties": true,
-            "type": "object",
-            "title": "Data"
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              }
+            ],
+            "title": "Data",
+            "description": "A CueMem export (format cuemem), or Mem0 get_all output: a list of memories or {\"results\": [...]} (format mem0)"
           },
           "user_id": {
             "anyOf": [
@@ -6309,6 +6330,16 @@
             "type": "boolean",
             "title": "Wait",
             "default": false
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "cuemem",
+              "mem0"
+            ],
+            "title": "Format",
+            "description": "cuemem: a CueMem export; mem0: Mem0 get_all output",
+            "default": "cuemem"
           }
         },
         "type": "object",
