@@ -28,12 +28,14 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
+import logging
 import os
 import shlex
 import shutil
 import signal
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -1001,6 +1003,35 @@ def _gradio_temp_dir(ui: bool) -> Iterator[None]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+LOG_LEVEL_ENV = "CUEMEM_LOG_LEVEL"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _configure_logging() -> None:
+    """serve、proxy 与 mcp 的日志（第八轮体检 P13）：一条一行，带时间、级别与 logger 名字，写到
+    stderr（stdio 的 MCP 用 stdout 当协议通道）。级别取 CUEMEM_LOG_LEVEL（DEBUG、INFO、WARNING、
+    ERROR、CRITICAL，默认 WARNING），写错时说明并退出（退出码 2）。只读进程的环境变量：这时还没有
+    读入 .env。
+
+    要在建 MCPServer 之前调用：它的构造函数调用 logging.basicConfig 装上 RichHandler，root 已经
+    有处理器时那次调用什么也不做。以前装了 MCP（serve 默认）时日志是 Rich 的框，非终端里按 80 列
+    折行（grep 找不到整句），一次出错几百行；--no-mcp 时 root 没有处理器，警告走 Python 的
+    lastResort，没有时间、级别与 logger 名字。不用 force=True：不拆掉别人（pytest 的 caplog、
+    嵌入 CueMem 的应用）已经装上的处理器；SDK 与库的导入路径不碰日志设置。"""
+    raw = os.environ.get(LOG_LEVEL_ENV, "").strip()
+    level = logging.WARNING
+    if raw:
+        named = logging.getLevelNamesMapping().get(raw.upper())
+        if named is None or named == logging.NOTSET:
+            Console(stderr=True).print(
+                f"[red]{LOG_LEVEL_ENV} 只能是 DEBUG、INFO、WARNING、ERROR、CRITICAL[/red]"
+                f"（现在是 {escape(raw)}）"
+            )
+            raise typer.Exit(2)
+        level = named
+    logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
+
+
 def _sigterm_to_exit(signum: int, frame: object) -> None:
     """SIGTERM 变成 SystemExit(143)：经过 serve 与 proxy 的 finally 收尾后再退出。"""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)  # 收尾时再来一次 SIGTERM：照旧直接结束
@@ -1049,6 +1080,9 @@ def serve(
     ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
     idle_minutes: Annotated[float, typer.Option(help=IDLE_HELP)] = 30.0,
+    access_log: Annotated[
+        bool, typer.Option("--access-log/--no-access-log", help="每个请求记一行访问日志")
+    ] = False,
 ) -> None:
     """启动 HTTP 接口（/api，文档在 /docs）、记忆代理（/v1）、MCP（/mcp）与演示界面（Gradio，
     根路径）。
@@ -1057,6 +1091,7 @@ def serve(
     cuemem mcp 的工具相同，共用这个进程的记忆系统（cuemem mcp 不能与 serve 同时打开数据目录），
     请求头 X-CueMem-User 选用户（不是 ASCII 的 ID 写成 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8
     百分号编码），令牌同 /api。"""
+    _configure_logging()  # 在建 MCPServer 之前（见 _configure_logging）
     import uvicorn
 
     from cuemem.api.app import create_app
@@ -1135,7 +1170,9 @@ def serve(
                     app_,
                     host=host,
                     port=port,
-                    log_level="warning",
+                    # 访问日志是 INFO：要它时 uvicorn 的启动信息也一起出来
+                    log_level="info" if access_log else "warning",
+                    access_log=access_log,
                     timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
                 )
     finally:
@@ -1162,8 +1199,12 @@ def proxy(
         bool, typer.Option("--insecure-weak-token", help=WEAK_TOKEN_HELP)
     ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
+    access_log: Annotated[
+        bool, typer.Option("--access-log/--no-access-log", help="每个请求记一行访问日志")
+    ] = True,
 ) -> None:
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
+    _configure_logging()
     import uvicorn
 
     from cuemem.api.limits import body_limits, concurrency_limit, open_session_limit
@@ -1226,7 +1267,13 @@ def proxy(
             max_body_bytes=max_body_bytes,
         )
         with _sigterm_runs_cleanup():
-            uvicorn.run(app_, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
+            uvicorn.run(
+                app_,
+                host=host,
+                port=port,
+                access_log=access_log,
+                timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+            )
     finally:
         memory_proxy.close_all()
         system.close()
@@ -1700,6 +1747,7 @@ def mcp_cmd(
     """以 MCP Server（stdio）提供记忆工具，让其他 Agent（如 Claude Code）直接使用这套记忆。
 
     独占数据目录：开着 cuemem serve 时改用它的 /mcp（同样的工具，HTTP）。"""
+    _configure_logging()  # 在导入 MCP、建 MCPServer 之前；日志写到 stderr
     from cuemem.api.mcp import build_server
     from cuemem.api.service import ChatService
 

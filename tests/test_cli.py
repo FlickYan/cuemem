@@ -867,6 +867,79 @@ def test_terminated_server_checkpoints_and_removes_its_temp_dir(
         memory.close()
 
 
+# 替身的 uvicorn.run 与 MCPServer.run：服务"运行"时记一条带调用栈的警告（像抽取失败时那样）
+LOG_ONE_WARNING = """
+import logging, sys
+import uvicorn
+from mcp.server.mcpserver import MCPServer
+
+def warn(*args, **kwargs):
+    try:
+        raise ConnectionError("APIConnectionError: Connection error " * 4)
+    except ConnectionError:
+        logging.getLogger("cuemem.x").warning("a b c " * 30, exc_info=True)
+
+uvicorn.run = warn
+MCPServer.run = warn
+from cuemem.cli import app
+app(sys.argv[1:], prog_name="cuemem")
+"""
+LOG_LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} WARNING cuemem\.x: (a b c ){30}$")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["serve", "--no-ui", "--scenario", "plain"],
+        ["serve", "--no-ui", "--scenario", "plain", "--no-mcp"],
+        ["proxy"],
+        ["mcp"],
+    ],
+)
+def test_server_logs_are_plain_lines(
+    isolated_paths: None, tmp_path: Path, command: list[str]
+) -> None:
+    """serve、proxy 与 mcp 的日志不论装没装 MCP 都是一条一行、带时间、级别与 logger 名字（第八轮
+    体检 P13）。以前装了 MCP 时是 Rich 的框（非终端里按 80 列折行，grep 找不到整句，一次出错几十
+    上百行），--no-mcp 与 proxy 时没有时间、级别与名字（Python 的 lastResort）。"""
+    done = subprocess.run(
+        [sys.executable, "-c", LOG_ONE_WARNING, *command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_server_env(tmp_path),
+    )
+    assert done.returncode == 0, done.stderr
+    lines = done.stderr.splitlines()
+    assert [line for line in lines if LOG_LINE.match(line)] == [lines[0]], done.stderr
+    assert lines[1] == "Traceback (most recent call last):", done.stderr
+    assert lines[-1] == "ConnectionError: " + "APIConnectionError: Connection error " * 4
+    assert not set("╭│╰─") & set(done.stderr) and len(lines) < 15, done.stderr
+
+
+def test_bad_log_level_is_refused(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUEMEM_LOG_LEVEL 写错时说明并退出（退出码 2），不启动；大小写不论。"""
+    monkeypatch.setenv("CUEMEM_LOG_LEVEL", "loud")
+    for command in (["serve", "--no-ui", "--scenario", "plain"], ["proxy"], ["mcp"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 2 and served == [], result.output
+        assert "CUEMEM_LOG_LEVEL" in _flat(result.output) and "loud" in result.output
+    monkeypatch.setenv("CUEMEM_LOG_LEVEL", "info")
+    assert runner.invoke(app, ["proxy"]).exit_code == 0 and len(served) == 1
+
+
+def test_access_log_flags(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """--access-log/--no-access-log：serve 默认不记（与以前相同），proxy 默认记。serve 加了
+    --access-log 时 uvicorn 用 INFO 级别（访问日志是 INFO）。"""
+    options: list[dict[str, Any]] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: options.append(kwargs))
+    serve = ["serve", "--no-ui", "--scenario", "plain"]
+    for command in (serve, [*serve, "--access-log"], ["proxy"], ["proxy", "--no-access-log"]):
+        assert runner.invoke(app, command).exit_code == 0
+    picked = [(o["access_log"], o.get("log_level")) for o in options]
+    assert picked == [(False, "warning"), (True, "info"), (True, None), (False, None)]
+
+
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_non_loopback_bind_needs_a_token(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]
