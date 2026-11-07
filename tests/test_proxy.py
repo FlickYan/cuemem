@@ -967,6 +967,45 @@ def test_a_session_that_is_writing_back_is_not_ended_to_make_room(
     assert sorted(sid for _, sid in proxy._runs) == ["s1", "s2"]
 
 
+def test_a_parked_session_survives_a_429(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """第八轮复审：回到停放的会话、名额都在写回（429）时，停放的会话照旧停放。以前先从 _parked
+    取走再腾名额，429 时它不在内存里也不在 _parked 里：close_idle、close_all 都看不到，一直进行中、
+    不交给抽取（没指定会话时连会话 ID 也丢了）。调用方开始新的一段时，取走的那段照常交给抽取。"""
+    proxy.max_open_runs = 1
+    first = chat(client, "I live in Berlin", user="alice")
+    implicit = first.headers["x-cuemem-session"]
+    clock.now = 1.0
+    assert chat(client, "hi", user="alice", headers={"X-CueMem-Session": "s1"}).is_success
+    clock.now = 2.0  # 停放了没指定会话的那段；s1 停放 s2，最早停放的仍留着（PARKED_KEPT）
+    assert chat(client, "hello", user="alice", headers={"X-CueMem-Session": "s2"}).is_success
+    assert proxy.parked_runs() == 2
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    with proxy._runs[("alice", "s2")].lock:  # s2 正在写回：腾不出名额
+        clock.now = 3.0
+        refused = chat(client, "again", user="alice", headers={"X-CueMem-Session": "s1"})
+        assert refused.status_code == 429
+        assert chat(client, "Recommend a coat", history, user="alice").status_code == 429
+        assert proxy.parked_runs() == 2
+        assert set(proxy._parked) == {("alice", "s1"), ("alice", None)}
+        assert proxy._parked[("alice", None)][0] == implicit
+        assert chat(client, "A new topic", user="alice").status_code == 429
+    assert system.worker is not None
+    system.worker.wait()  # 新的一段：取走的那段照常交给抽取，s1 照旧停放
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == [implicit]
+    assert set(proxy._parked) == {("alice", "s1")}
+    proxy.close_all()
+    system.worker.wait()
+    assert system.open_sessions("alice") == set()
+    assert sorted(j["session_id"] for j in system.db.get_jobs("alice")) == sorted(
+        [implicit, "s1", "s2"]
+    )
+
+
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）
 WORTH_RETRYING: list[tuple[BaseException, bool]] = [
     (EmbeddingAPIError("no balance", status=402), True),

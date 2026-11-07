@@ -417,34 +417,43 @@ class MemoryProxy:
         self._adopt(space, explicit)
         key = (space, explicit)
         ended: list[Run] = []
-        with self._lock:
-            run = self._runs.get(key)
-            if run is not None and fresh and explicit is None:
-                ended.append(self._runs.pop(key))
-                run = None
-            # 停放的会话（_make_room）：接着用原来的会话 ID，没交给过抽取；没指定会话、调用方
-            # 开始了新的一段时与进行中的相同，先结束它
-            parked = self._parked.pop(key, None) if run is None else None
-            if parked is not None and fresh and explicit is None:
-                ended.append(Run(space, parked[0], parked[1]))
-                parked = None
-            if run is None:
-                evicted = self._make_room(space)
-                if evicted is not None:
-                    ended.append(evicted)
-                when = datetime.now()
-                sid = (
-                    parked[0]
-                    if parked is not None
-                    else explicit or sortable_session_id("proxy", when)
-                )
-                run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
-                self._runs[key] = run
-                # 进行中：每轮照常写入，但不抽取（停放过的会话还开着，open_session 什么也不做）
-                self.system.open_session(space, sid)
-            run.last_seen = now
-        for done in ended:
-            self._finish(done)
+        try:
+            with self._lock:
+                run = self._runs.get(key)
+                if run is not None and fresh and explicit is None:
+                    ended.append(self._runs.pop(key))
+                    run = None
+                # 停放的会话（_make_room）：接着用原来的会话 ID，没交给过抽取；没指定会话、调用方
+                # 开始了新的一段时与进行中的相同，先结束它
+                parked = self._parked.pop(key, None) if run is None else None
+                if parked is not None and fresh and explicit is None:
+                    ended.append(Run(space, parked[0], parked[1]))
+                    parked = None
+                if run is None:
+                    try:
+                        evicted = self._make_room(space)
+                    except ProxyError:
+                        # 第八轮复审：腾不出名额（429）时停放的会话放回去，照旧由 close_idle、
+                        # close_all 交给抽取；以前它两边都不在，一直进行中
+                        if parked is not None:
+                            self._parked[key] = parked
+                        raise
+                    if evicted is not None:
+                        ended.append(evicted)
+                    when = datetime.now()
+                    sid = (
+                        parked[0]
+                        if parked is not None
+                        else explicit or sortable_session_id("proxy", when)
+                    )
+                    run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
+                    self._runs[key] = run
+                    # 进行中：每轮照常写入，但不抽取（停放过的会话还开着，open_session 什么也不做）
+                    self.system.open_session(space, sid)
+                run.last_seen = now
+        finally:  # 已经取走、要结束的会话 429 时也交给抽取
+            for done in ended:
+                self._finish(done)
         return run
 
     def _make_room(self, space: str) -> Run | None:
