@@ -31,9 +31,11 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -999,6 +1001,31 @@ def _gradio_temp_dir(ui: bool) -> Iterator[None]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def _sigterm_to_exit(signum: int, frame: object) -> None:
+    """SIGTERM 变成 SystemExit(143)：经过 serve 与 proxy 的 finally 收尾后再退出。"""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)  # 收尾时再来一次 SIGTERM：照旧直接结束
+    raise SystemExit(128 + signum)
+
+
+@contextmanager
+def _sigterm_runs_cleanup() -> Iterator[None]:
+    """uvicorn.run 期间 SIGTERM 也走收尾（第八轮体检 P2）。
+
+    uvicorn 收到 SIGTERM 先等进行中的请求，再恢复原来的处理函数并把信号重发给自己。原来是默认
+    处理（SIG_DFL）时进程当场结束：记忆代理缓冲着的写回、结束会话、等后台巩固、WAL 检查点与
+    界面的临时目录（原图的副本）都被跳过。容器里 cuemem 是 1 号进程时内核忽略这次重发，所以
+    以前只有 Docker 不加 init 时才收尾；systemd、kill、--init 都不收尾。这里装上的处理函数被
+    uvicorn 当作"原来的"，重发时抛 SystemExit，finally 照常执行，退出码仍是 143。"""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGTERM, _sigterm_to_exit)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
@@ -1103,13 +1130,14 @@ def serve(
                 _no_auth_hosts_note(hosts)
             for line in _loose_modes():
                 console.print(line)
-            uvicorn.run(
-                app_,
-                host=host,
-                port=port,
-                log_level="warning",
-                timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
-            )
+            with _sigterm_runs_cleanup():
+                uvicorn.run(
+                    app_,
+                    host=host,
+                    port=port,
+                    log_level="warning",
+                    timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+                )
     finally:
         proxy.close_all()
         service.close()
@@ -1197,7 +1225,8 @@ def proxy(
             allow_ip_hosts=hosts.ip_literals,
             max_body_bytes=max_body_bytes,
         )
-        uvicorn.run(app_, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
+        with _sigterm_runs_cleanup():
+            uvicorn.run(app_, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
     finally:
         memory_proxy.close_all()
         system.close()

@@ -7,6 +7,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -734,6 +735,136 @@ def test_servers_bound_the_graceful_shutdown(
     assert result.exit_code == 0, result.output
     [kwargs] = options
     assert kwargs["timeout_graceful_shutdown"] == GRACEFUL_SHUTDOWN_S == 20
+
+
+# 替身的 uvicorn.run 像 uvicorn 那样：排空之后把收到的 SIGTERM 重发给"原来的"处理函数
+SIGTERM_AFTER_DRAIN = """
+import signal, sys
+import uvicorn
+from cuemem.api.proxy import MemoryProxy
+from cuemem.memory import MemorySystem
+
+def fake_run(app_, **kwargs):
+    print("handler", getattr(signal.getsignal(signal.SIGTERM), "__name__", None), flush=True)
+    signal.raise_signal(signal.SIGTERM)
+    print("survived", flush=True)
+
+def logged(name, original):
+    def wrapper(self, *args, **kwargs):
+        print(name, flush=True)
+        return original(self, *args, **kwargs)
+    return wrapper
+
+uvicorn.run = fake_run
+MemoryProxy.close_all = logged("close_all", MemoryProxy.close_all)
+MemorySystem.close = logged("system_close", MemorySystem.close)
+from cuemem.cli import app
+app(sys.argv[1:], prog_name="cuemem")
+"""
+
+
+def _server_env(tmp_path: Path) -> dict[str, str]:
+    """子进程里的 serve / proxy：离线的哈希向量、临时目录里的数据与 TMPDIR；代理指向不通的端口，
+    子进程没有 netguard，漏网的联网请求也只会立刻失败。"""
+    env = dict(os.environ)
+    env.update(
+        CUEMEM_EMBEDDING__BACKEND="hash",
+        CUEMEM_EMBEDDING__DIM="128",
+        CUEMEM_PATHS__MEDIA=str(tmp_path / "media"),
+        DEEPSEEK_API_KEY="sk-test-deepseek",
+        DASHSCOPE_API_KEY="sk-test-dashscope",
+        HTTP_PROXY="http://127.0.0.1:9",
+        HTTPS_PROXY="http://127.0.0.1:9",
+        NO_PROXY="",
+        TMPDIR=str(tmp_path / "tmp"),
+    )
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    return env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 SIGTERM 的处理函数")
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_sigterm_runs_the_shutdown_sequence(
+    isolated_paths: None, tmp_path: Path, command: list[str]
+) -> None:
+    """uvicorn 排空之后把 SIGTERM 重发给原来的处理函数：以前是默认处理，进程当场结束（退出码
+    -15），serve 与 proxy 的 finally（结束会话、写回、关记忆系统）都不执行（第八轮体检 P2）。
+    现在变成 SystemExit(143)，收尾照常执行。"""
+    done = subprocess.run(
+        [sys.executable, "-c", SIGTERM_AFTER_DRAIN, *command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_server_env(tmp_path),
+    )
+    assert done.returncode == 143, (done.returncode, done.stdout, done.stderr)
+    lines = done.stdout.splitlines()
+    assert "handler _sigterm_to_exit" in lines and "survived" not in lines
+    assert lines.index("close_all") < lines.index("system_close")
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 SIGTERM")
+def test_terminated_server_checkpoints_and_removes_its_temp_dir(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真的启动 cuemem serve（带界面时）再发 SIGTERM（systemd、kill、docker --init 的停法）：退出码
+    143，WAL 已检查点（-wal 文件不在或为空），界面放原图副本的 cuemem-gradio-* 目录已删掉，同一个
+    数据目录随后能照常打开。"""
+    import urllib.request
+
+    pytest.importorskip("gradio")
+    env = _server_env(tmp_path)
+    port = _free_port()
+    command = [str(Path(sys.executable).parent / "cuemem"), "serve", "--scenario", "plain"]
+    server = subprocess.Popen(
+        [*command, "--port", str(port)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        deadline = time.monotonic() + 90
+        while True:
+            assert server.poll() is None, server.communicate()[1]
+            try:
+                opener.open(f"http://127.0.0.1:{port}/api/health", timeout=2).read()
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "serve 没有在 90 秒内启动"
+                time.sleep(0.2)
+        assert list((tmp_path / "tmp").glob("cuemem-gradio-*"))  # 界面的临时目录在用
+        server.terminate()
+        _, stderr = server.communicate(timeout=90)
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.communicate()
+    assert server.returncode == 143, stderr
+    assert not list((tmp_path / "tmp").glob("cuemem-gradio-*"))
+    for path in (Path(os.environ["CUEMEM_PATHS__DB"]), Path(os.environ["CUEMEM_PATHS__LEDGER"])):
+        wal = path.with_name(path.name + "-wal")
+        assert not wal.exists() or wal.stat().st_size == 0, wal
+    from cuemem.sdk import Memory
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope")
+    memory = Memory(background=False)
+    try:
+        assert memory.get_all(user_id="nobody")["results"] == []
+    finally:
+        memory.close()
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
