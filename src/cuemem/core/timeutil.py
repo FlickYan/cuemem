@@ -69,18 +69,18 @@ def normalize_expiry(value: object) -> str | None:
     调用方是 SDK 与导入。"""
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return naive_local(value).isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, str):
-        text = value.strip()
-        try:
+    try:  # 带时区、在日期范围边上的换算成本机时间时 OverflowError：同样报不合法（第八轮复审）
+        if isinstance(value, datetime):
+            return naive_local(value).isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, str):
+            text = value.strip()
             if len(text) == 10:
                 return date.fromisoformat(text).isoformat()
             return naive_local(datetime.fromisoformat(text)).isoformat()
-        except ValueError:
-            pass
+    except (ValueError, OverflowError):
+        pass
     raise ValueError(
         f"Invalid expiration date {value!r}: give an ISO date ('2026-12-31') or a datetime."
     )

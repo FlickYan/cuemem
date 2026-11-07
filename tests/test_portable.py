@@ -587,6 +587,10 @@ def test_mem0_import_refuses_mixed_users_and_malformed_items(memory: Memory) -> 
         ("memory", None),
         ("metadata", [1]),
         ("created_at", "yesterday"),
+        # 带时区、在日期范围边上：换算成本机时间时 OverflowError，以前原样抛出（第八轮复审）
+        ("created_at", "0001-01-01T00:00:00+05:00"),
+        ("updated_at", "9999-12-31T23:59:59-05:00"),
+        ("expiration_date", "9999-12-31T23:59:59-05:00"),
         ("expiration_date", "soon"),
         ("user_id", 42),
     ):
@@ -604,6 +608,9 @@ def test_mem0_import_refuses_mixed_users_and_malformed_items(memory: Memory) -> 
     assert report["turns_added"] == 1 and report["skipped"] == 1
     with pytest.raises(ValueError, match="format"):
         memory.load(blank, format="letta")  # type: ignore[arg-type]
+    # 不是对象的文件当作 CueMem 导出：与 Memory.load 相同的说明，以前说 AttributeError
+    with pytest.raises(ValueError, match="is a JSON object"):
+        import_space(memory.system, blank["results"])  # type: ignore[arg-type]
 
 
 def test_cli_import_from_mem0(
@@ -637,6 +644,14 @@ def test_cli_import_from_mem0(
     assert result.exit_code == 1 and "nouser_idoragent_id" in _flat(result.output)
     result = runner.invoke(app, ["import", str(path), "--from", "letta"])
     assert result.exit_code == 1 and "--from只能是" in _flat(result.output)
+
+    # 忘了 --from mem0（第八轮复审）：两种 Mem0 的形状都一行提示加上 --from mem0，什么都不写；
+    # 以前列表说 AttributeError，{"results": [...]} 说不是 CueMem 导出
+    for shape in (data["results"], data):
+        path.write_text(json.dumps(shape), encoding="utf-8")
+        result = runner.invoke(app, ["import", str(path)])
+        flat = _flat(result.output)
+        assert result.exit_code == 1 and "--frommem0" in flat and "Error" not in flat, flat
 
 
 @pytest.mark.parametrize("damage", ["truncated", "not-utf8"])

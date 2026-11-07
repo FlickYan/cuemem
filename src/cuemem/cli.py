@@ -477,6 +477,15 @@ def import_cmd(
         what = "Mem0 导出" if source == "mem0" else "CueMem 导出"
         console.print(f"[red]不是有效的 {what}文件（被截断了？）：{escape(str(exc))}[/red]")
         raise typer.Exit(1) from exc
+    if source == "cuemem" and (
+        isinstance(data, list)
+        or (isinstance(data, dict) and "results" in data and "format" not in data)
+    ):  # 忘了 --from mem0：以前说 AttributeError 或"不是 CueMem 导出"，不提示（第八轮复审）
+        console.print(
+            f"[red]{escape(str(path))} 像是 Mem0 的导出（get_all 的结果），不是 cuemem export 的"
+            "文件：加上 --from mem0（可以再给 --user U）[/red]"
+        )
+        raise typer.Exit(1)
     # 要导入的文件：cuemem 是文件本身；mem0 先全部换算、检查完（哪条不合格式都什么都不写），
     # 不给 --user、--agent 时每个（user_id，agent_id）一份
     skipped = 0

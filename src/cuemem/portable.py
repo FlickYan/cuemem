@@ -247,6 +247,8 @@ def import_space(
     KeyError、TypeError、AttributeError，本地与 MemoryClient 抛出的不同，/api 回 404 或 500，
     /api/v1 回 400 或没有说明的 500。
     """
+    if not isinstance(data, Mapping):  # 与 Memory.load 相同；以前说 AttributeError（第八轮复审）
+        raise ValueError("Malformed export: a CueMem export is a JSON object")
     turns_added = images_added = 0
     with tempfile.TemporaryDirectory(prefix="cuemem-import-") as scratch:
         try:
@@ -479,8 +481,10 @@ def _mem0_session(item: Mapping[str, Any], n: int) -> dict[str, Any] | None:
         try:
             if not isinstance(value, str):
                 raise ValueError(f"{value!r} is not a string")
-            stamps[key] = datetime.fromisoformat(value)
-        except ValueError as exc:
+            # 换算成本机时间也在这里：带时区、在日期范围边上的（0001-01-01T00:00+05:00）
+            # OverflowError，以前原样抛出（第八轮复审）
+            stamps[key] = naive_local(datetime.fromisoformat(value))
+        except (ValueError, OverflowError) as exc:
             raise ValueError(
                 f"Malformed Mem0 export: memory {memory_id!r} has a bad {key}: {exc}"
             ) from exc
@@ -493,7 +497,7 @@ def _mem0_session(item: Mapping[str, Any], n: int) -> dict[str, Any] | None:
     if not text.strip():
         return None
     version = item.get("updated_at") or item["created_at"]
-    ts = naive_local(stamps.get("updated_at") or stamps["created_at"]).isoformat()
+    ts = (stamps.get("updated_at") or stamps["created_at"]).isoformat()
     who = item.get("role") or item.get("attributed_to") or ""
     extra["mem0_id"] = memory_id
     if item.get("run_id"):
