@@ -28,12 +28,16 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
+import logging
 import os
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -86,10 +90,30 @@ app = typer.Typer(
 )
 console = Console()
 LOW_DISK = 200 * 2**20  # doctor 在数据目录剩余空间低于它时标黄
+CACHE_WARN = 2**30  # doctor：缓存与 trace 合计超过它、又没设 trace 保留天数时标黄
+JOB_LINES = 20  # doctor 最多列出这么多条巩固任务的提醒，其余只说还有几条
+
+
+def _show_version(value: bool) -> None:
+    """--version：版本号与构建标识（提交号，见 cuemem/_build.py），然后退出。"""
+    if value:
+        from cuemem._build import version_line
+
+        typer.echo(version_line())
+        raise typer.Exit()
 
 
 @app.callback()
 def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_show_version,
+            is_eager=True,
+            help="显示版本号与构建标识（提交号）后退出",
+        ),
+    ] = False,
     preset: Annotated[
         str | None,
         typer.Option(
@@ -238,13 +262,17 @@ def _unopenable(settings: Settings, exc: sqlite3.OperationalError) -> str:
 def _open_db_only() -> Iterator[MemoryDB]:
     """只打开数据库（cuemem export、spaces、inspect）：不用向量库、模型与缓存，向量库打不开、
     或者 cuemem serve 正开着它的时候也能用（不拿 MemorySystem.from_settings 的数据库锁）。"""
-    from cuemem.store.files import private_dirs, storage_dirs
+    from cuemem.store.files import opening, private_dirs, storage_dirs
     from cuemem.store.sqlite import MemoryDB
 
     settings = _settings()
     private_dirs(*storage_dirs(settings))
     try:
-        db = MemoryDB(settings.paths.db)
+        with opening(settings.paths.db):  # 文件损坏、不是 SQLite 数据库时也是一行（第八轮体检）
+            db = MemoryDB(settings.paths.db)
+    except DatabaseOpenError as exc:  # 已经说明了哪个文件，与 _open_system 相同
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     except sqlite3.OperationalError as exc:
         console.print(_unopenable(settings, exc))
         raise typer.Exit(1) from exc
@@ -321,6 +349,9 @@ def doctor(
 ) -> None:
     """检查配置、API Key、数据目录与密钥文件的权限、剩余空间，以及（可选）向量库与数据库是否
     一致、各模型的连通性。"""
+    from cuemem._build import version_line
+
+    console.print(escape(version_line()), highlight=False)
     settings = _settings()
     if repair_vectors:
         _repair_vectors(settings)
@@ -328,6 +359,8 @@ def doctor(
     _print_local_store(settings)
     _print_disk(settings)
     _print_media_journal(settings)
+    _print_jobs(settings)
+    _print_cache_sizes(settings)
     if vectors:
         _print_vector_gaps(settings)
     for line in _loose_modes(settings):
@@ -409,31 +442,95 @@ def export_cmd(
 
 @app.command("import")
 def import_cmd(
-    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="cuemem export 的文件")],
+    path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="cuemem export 或 Mem0 导出的文件")
+    ],
     space: Annotated[str | None, typer.Option(help="导入到这个空间（默认用文件里的）")] = None,
     consolidate: Annotated[
         bool, typer.Option("--consolidate", help="导入后立即巩固（重新抽取事实，需要 LLM）")
     ] = False,
+    source: Annotated[
+        str,
+        typer.Option(
+            "--from", help="文件的格式：cuemem（cuemem export）或 mem0（Mem0 get_all 的 JSON）"
+        ),
+    ] = "cuemem",
+    user: Annotated[str | None, typer.Option("--user", help="导入到这个用户的空间")] = None,
+    agent: Annotated[str | None, typer.Option("--agent", help="导入到这个 Agent 的空间")] = None,
 ) -> None:
-    """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。"""
-    from cuemem.portable import import_space
+    """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。
 
+    --from mem0 导入 Mem0 的导出（get_all 的结果）：一条记忆一个会话，重复导入什么都不加。不给
+    --user、--agent 时按文件里的 user_id、agent_id 分组，每组导入到各自的空间（各是一个事务）。"""
+    from cuemem.portable import from_mem0, import_space, mem0_groups
+    from cuemem.sdk import space_for
+
+    if source not in ("cuemem", "mem0"):
+        console.print("[red]--from 只能是 cuemem、mem0[/red]")
+        raise typer.Exit(1)
+    if space and (user or agent):
+        console.print("[red]--space 与 --user、--agent 只给一种[/red]")
+        raise typer.Exit(1)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:  # 以前是调用栈
-        console.print(f"[red]不是有效的 CueMem 导出文件（被截断了？）：{escape(str(exc))}[/red]")
+        what = "Mem0 导出" if source == "mem0" else "CueMem 导出"
+        console.print(f"[red]不是有效的 {what}文件（被截断了？）：{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    if source == "cuemem" and (
+        isinstance(data, list)
+        or (isinstance(data, dict) and "results" in data and "format" not in data)
+    ):  # 忘了 --from mem0：以前说 AttributeError 或"不是 CueMem 导出"，不提示（第八轮复审）
+        console.print(
+            f"[red]{escape(str(path))} 像是 Mem0 的导出（get_all 的结果），不是 cuemem export 的"
+            "文件：加上 --from mem0（可以再给 --user U）[/red]"
+        )
+        raise typer.Exit(1)
+    # 要导入的文件：cuemem 是文件本身；mem0 先全部换算、检查完（哪条不合格式都什么都不写），
+    # 不给 --user、--agent 时每个（user_id，agent_id）一份
+    skipped = 0
+    try:
+        if user or agent:
+            space = space_for(user, agent)
+        if source == "cuemem":
+            docs = [data]
+        elif user or agent:
+            docs = [from_mem0(data, user_id=user, agent_id=agent)]
+        else:
+            if space:
+                console.print("[red]--from mem0 用 --user 或 --agent 指定空间[/red]")
+                raise typer.Exit(1)
+            groups = sorted(mem0_groups(data).items(), key=lambda group: str(group[0]))
+            docs = [from_mem0(items, user_id=u, agent_id=a) for (u, a), items in groups]
+        if source == "mem0":
+            skipped = sum(int(doc["skipped"]) for doc in docs)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(1) from exc
     with _open_system() as system:
-        try:
-            report = import_space(system, data, space_id=space, consolidate=consolidate)
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(1) from exc
-        console.print(
-            f"记忆空间 [bold]{report['space_id']}[/bold]：{report['sessions']} 个会话，"
-            f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
-        )
-        if "consolidation" not in report:
+        reports = []
+        for doc in docs:
+            try:
+                report = import_space(system, doc, space_id=space, consolidate=consolidate)
+            except ValueError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+                raise typer.Exit(1) from exc
+            reports.append(report)
+            console.print(
+                f"记忆空间 [bold]{escape(report['space_id'])}[/bold]：{report['sessions']} 个会话，"
+                f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
+            )
+        if source == "mem0":
+            if len(reports) > 1:
+                console.print(
+                    f"[dim]{len(reports)} 个空间各自导入（各是一个事务）：中途出错时前面的"
+                    "已经写入，再运行一次只补上没写的。[/dim]"
+                )
+            if skipped:
+                console.print(f"[dim]跳过 {skipped} 条文字为空的记忆。[/dim]")
+        if not reports:
+            console.print("文件里没有记忆。")
+        elif "consolidation" not in reports[-1]:
             console.print(
                 "[dim]提示：运行 cuemem consolidate 重新抽取事实与实体（需要 LLM）。[/dim]"
             )
@@ -701,9 +798,15 @@ def usage(
 ) -> None:
     """汇总模型调用量与成本。"""
     from cuemem.llm.ledger import Ledger
+    from cuemem.store.files import opening
 
     settings = _settings()
-    ledger = Ledger(settings.paths.ledger)
+    try:
+        with opening(settings.paths.ledger):  # 账本损坏、打不开时一行说明哪个文件
+            ledger = Ledger(settings.paths.ledger)
+    except DatabaseOpenError as exc:
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) if today else None
     rows = ledger.summary(run_id=run, since=since)
     ledger.close()
@@ -999,6 +1102,61 @@ def _gradio_temp_dir(ui: bool) -> Iterator[None]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+LOG_LEVEL_ENV = "CUEMEM_LOG_LEVEL"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _configure_logging() -> None:
+    """serve、proxy 与 mcp 的日志（第八轮体检 P13）：一条一行，带时间、级别与 logger 名字，写到
+    stderr（stdio 的 MCP 用 stdout 当协议通道）。级别取 CUEMEM_LOG_LEVEL（DEBUG、INFO、WARNING、
+    ERROR、CRITICAL，默认 WARNING），写错时说明并退出（退出码 2）。只读进程的环境变量：这时还没有
+    读入 .env。
+
+    要在建 MCPServer 之前调用：它的构造函数调用 logging.basicConfig 装上 RichHandler，root 已经
+    有处理器时那次调用什么也不做。以前装了 MCP（serve 默认）时日志是 Rich 的框，非终端里按 80 列
+    折行（grep 找不到整句），一次出错几百行；--no-mcp 时 root 没有处理器，警告走 Python 的
+    lastResort，没有时间、级别与 logger 名字。不用 force=True：不拆掉别人（pytest 的 caplog、
+    嵌入 CueMem 的应用）已经装上的处理器；SDK 与库的导入路径不碰日志设置。"""
+    raw = os.environ.get(LOG_LEVEL_ENV, "").strip()
+    level = logging.WARNING
+    if raw:
+        # 只认这五个名字：getLevelNamesMapping 还认 WARN、FATAL 与 NOTSET
+        if raw.upper() not in LOG_LEVELS:
+            Console(stderr=True).print(
+                f"[red]{LOG_LEVEL_ENV} 只能是 DEBUG、INFO、WARNING、ERROR、CRITICAL[/red]"
+                f"（现在是 {escape(raw)}）"
+            )
+            raise typer.Exit(2)
+        level = logging.getLevelNamesMapping()[raw.upper()]
+    logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
+
+
+def _sigterm_to_exit(signum: int, frame: object) -> None:
+    """SIGTERM 变成 SystemExit(143)：经过 serve 与 proxy 的 finally 收尾后再退出。"""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)  # 收尾时再来一次 SIGTERM：照旧直接结束
+    raise SystemExit(128 + signum)
+
+
+@contextmanager
+def _sigterm_runs_cleanup() -> Iterator[None]:
+    """uvicorn.run 期间 SIGTERM 也走收尾（第八轮体检 P2）。
+
+    uvicorn 收到 SIGTERM 先等进行中的请求，再恢复原来的处理函数并把信号重发给自己。原来是默认
+    处理（SIG_DFL）时进程当场结束：记忆代理缓冲着的写回、结束会话、等后台巩固、WAL 检查点与
+    界面的临时目录（原图的副本）都被跳过。容器里 cuemem 是 1 号进程时内核忽略这次重发，所以
+    以前只有 Docker 不加 init 时才收尾；systemd、kill、--init 都不收尾。这里装上的处理函数被
+    uvicorn 当作"原来的"，重发时抛 SystemExit，finally 照常执行，退出码仍是 143。"""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGTERM, _sigterm_to_exit)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
@@ -1022,6 +1180,9 @@ def serve(
     ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
     idle_minutes: Annotated[float, typer.Option(help=IDLE_HELP)] = 30.0,
+    access_log: Annotated[
+        bool, typer.Option("--access-log/--no-access-log", help="每个请求记一行访问日志")
+    ] = False,
 ) -> None:
     """启动 HTTP 接口（/api，文档在 /docs）、记忆代理（/v1）、MCP（/mcp）与演示界面（Gradio，
     根路径）。
@@ -1030,6 +1191,7 @@ def serve(
     cuemem mcp 的工具相同，共用这个进程的记忆系统（cuemem mcp 不能与 serve 同时打开数据目录），
     请求头 X-CueMem-User 选用户（不是 ASCII 的 ID 写成 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8
     百分号编码），令牌同 /api。"""
+    _configure_logging()  # 在建 MCPServer 之前（见 _configure_logging）
     import uvicorn
 
     from cuemem.api.app import create_app
@@ -1103,13 +1265,16 @@ def serve(
                 _no_auth_hosts_note(hosts)
             for line in _loose_modes():
                 console.print(line)
-            uvicorn.run(
-                app_,
-                host=host,
-                port=port,
-                log_level="warning",
-                timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
-            )
+            with _sigterm_runs_cleanup():
+                uvicorn.run(
+                    app_,
+                    host=host,
+                    port=port,
+                    # 访问日志是 INFO：要它时 uvicorn 的启动信息也一起出来
+                    log_level="info" if access_log else "warning",
+                    access_log=access_log,
+                    timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+                )
     finally:
         proxy.close_all()
         service.close()
@@ -1134,8 +1299,12 @@ def proxy(
         bool, typer.Option("--insecure-weak-token", help=WEAK_TOKEN_HELP)
     ] = False,
     unknown_model: Annotated[str | None, typer.Option(help=UNKNOWN_MODEL_HELP)] = None,
+    access_log: Annotated[
+        bool, typer.Option("--access-log/--no-access-log", help="每个请求记一行访问日志")
+    ] = True,
 ) -> None:
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
+    _configure_logging()
     import uvicorn
 
     from cuemem.api.limits import body_limits, concurrency_limit, open_session_limit
@@ -1197,7 +1366,14 @@ def proxy(
             allow_ip_hosts=hosts.ip_literals,
             max_body_bytes=max_body_bytes,
         )
-        uvicorn.run(app_, host=host, port=port, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
+        with _sigterm_runs_cleanup():
+            uvicorn.run(
+                app_,
+                host=host,
+                port=port,
+                access_log=access_log,
+                timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+            )
     finally:
         memory_proxy.close_all()
         system.close()
@@ -1299,6 +1475,13 @@ def keys_add(
             help="同时在处理的请求最多这么多个（429）；不给时用 CUEMEM_MAX_CONCURRENT_PER_KEY",
         ),
     ] = None,
+    max_spaces: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="最多这么多个记忆空间：要建新空间的写入 429，已有的照常；不给时不限",
+        ),
+    ] = None,
     file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
 ) -> None:
     """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
@@ -1343,6 +1526,7 @@ def keys_add(
             models=models,
             max_output_tokens=max_output_tokens,
             max_concurrent=max_concurrent,
+            max_spaces=max_spaces,
             indent=indent,
         )
 
@@ -1383,6 +1567,12 @@ def keys_add(
                 f"CUEMEM_API_KEYS_FILE={shown} 启动时才读它（在 Docker 里是容器里的路径）："
                 "带上这个设置启动或重启它们"
             )
+        if user and not agent and max_spaces is None:
+            err.print(
+                "[yellow]提醒[/yellow]：只给了 --user、没给 --agent，这个令牌可以用任意 agent_id，"
+                "每个新的 agent_id 是一个新的记忆空间（各有一个向量集合，本地模式下一直开着一个"
+                "文件）。交给不太可信的调用方时加上 --agent 或 --max-spaces"
+            )
     print(token)
 
 
@@ -1414,7 +1604,8 @@ def keys_list(
         console.print("没有设置限定作用域的令牌（CUEMEM_API_KEYS_FILE 或 CUEMEM_API_KEYS）")
         return
     table = Table(title=f"{escape(where)}：{len(keys.names)} 个令牌")
-    for column in ("名字", "作用域", "每分钟写", "同时处理", "模型", "max_output_tokens"):
+    columns = ("名字", "作用域", "每分钟写", "同时处理", "空间上限", "模型", "max_output_tokens")
+    for column in columns:
         table.add_column(column)
     for _, p in keys.scoped:
         table.add_row(
@@ -1422,6 +1613,7 @@ def keys_list(
             escape("；".join(_scope_text(s) for s in p.scopes)),
             str(p.rate_per_minute or "—"),
             str(p.max_concurrent or "—"),
+            str(p.max_spaces or "—"),
             escape(", ".join(p.models)) if p.models is not None else "—",
             str(p.max_output_tokens or "—"),
         )
@@ -1655,6 +1847,7 @@ def mcp_cmd(
     """以 MCP Server（stdio）提供记忆工具，让其他 Agent（如 Claude Code）直接使用这套记忆。
 
     独占数据目录：开着 cuemem serve 时改用它的 /mcp（同样的工具，HTTP）。"""
+    _configure_logging()  # 在导入 MCP、建 MCPServer 之前；日志写到 stderr
     from cuemem.api.mcp import build_server
     from cuemem.api.service import ChatService
 
@@ -1763,10 +1956,28 @@ def inspect_facts(
 
 
 @inspect_app.command("entities")
-def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]) -> None:
-    """实体列表：名字、类型、别名、提及次数。"""
+def inspect_entities(
+    space: Annotated[str, typer.Option(help="记忆空间 ID")],
+    hide_expired: Annotated[
+        bool,
+        typer.Option("--hide-expired", help="不列出只出现在已经过期的事实里的实体"),
+    ] = False,
+) -> None:
+    """实体列表：名字、类型、别名、提及次数。只出现在已经过期的事实里的实体标"已过期"
+    （检查用，默认都列出；--hide-expired 时不列出，同记忆浏览器，规则见
+    expiry.expired_entity_ids）。"""
+    from cuemem.core.mentions import Mentions
+    from cuemem.expiry import expired_entity_ids, expired_ids
+
     with _open_db_only() as db:
         entities = db.get_entities(space)
+        gone = expired_ids(db, space, datetime.now())
+        dead: frozenset[str] = frozenset()
+        if gone:
+            facts = db.get_facts(space, current_only=False)
+            dead = expired_entity_ids(facts, gone, Mentions(entities).find)
+        if hide_expired:
+            entities = [e for e in entities if e.id not in dead]
         if not entities:
             console.print("没有实体。还没巩固的话，先运行 cuemem consolidate。")
             return
@@ -1775,7 +1986,7 @@ def inspect_entities(space: Annotated[str, typer.Option(help="记忆空间 ID")]
             table.add_column(column, overflow="fold")
         for e in sorted(entities, key=lambda e: (-e.mentions, e.name)):
             table.add_row(
-                e.name,
+                f"{escape(e.name)} · [red]已过期[/red]" if e.id in dead else escape(e.name),
                 e.type,
                 ", ".join(e.aliases) or "-",
                 e.description or "-",
@@ -2321,7 +2532,8 @@ def _print_config(settings: Settings) -> None:
 def _print_local_store(settings: Settings) -> None:
     """本地模式的向量库有几个集合，与打开文件数的上限（main 已经调到硬上限）比一比：每个集合
     一直开着一个文件、启动时全部打开。只读 meta.json、不打开向量库，cuemem serve 正在用它时也能
-    查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端。"""
+    查。集合超过软上限的一半时标黄，建议改用 Qdrant 服务端；多到再建一个就占到留给别的文件的
+    余量（store.vector.reserved_files，VectorStore._room_for 拒绝建新空间的同一条线）时标红。"""
     meta = settings.paths.qdrant / "meta.json"
     if settings.vector_store.url:
         return
@@ -2353,6 +2565,16 @@ def _print_local_store(settings: Settings) -> None:
     line += f"，打开文件数上限 {shown[0]}（硬上限 {shown[1]}）"
     if soft == resource.RLIM_INFINITY or collections <= soft / 2:
         console.print(line)
+        return
+    from cuemem.store.vector import reserved_files
+
+    if collections + 1 > soft - reserved_files(soft):  # 与 VectorStore._room_for 同一条线
+        console.print(
+            f"[red]{line}：已经不能再建新的记忆空间（写入新空间的请求 503 capacity，已有的"
+            f"照常可用；打开文件数要给数据库、图片与连接留 {reserved_files(soft)} 个）。删掉"
+            "不用的空间、调高 ulimit -n，或者改用 Qdrant 服务端："
+            f"{cli_command('migrate-vectors --to URL')}，再设置 CUEMEM_VECTOR_STORE__URL[/red]"
+        )
         return
     console.print(
         f"[yellow]{line}：集合再多就打不开、建不了新的空间。用户多时改用 Qdrant 服务端："
@@ -2480,6 +2702,115 @@ def _print_media_journal(settings: Settings) -> None:
         )
 
 
+def _print_jobs(settings: Settings) -> None:
+    """各记忆空间的巩固任务（第八轮体检）：抽取失败的（数目、一条错误与补做的命令）、按旧配置
+    或旧流水线抽取过的（过期，要显式的巩固重建：后台线程不重建，见 D-073 P2），清空重建没做完
+    的，以及排着队的任务总数。
+
+    只读：数据库还不存在时什么都不做、不新建；与 cuemem spaces 一样不拿数据库锁，cuemem serve
+    开着时也能看。失败的任务自动重试 MAX_ATTEMPTS 次之后就停了（例如 Key 过期、余额不足），写入
+    照样成功、健康检查照样正常，以前只有按用户查 /api/v1/status 才看得到。"""
+    from cuemem.store.files import opening
+    from cuemem.store.sqlite import MemoryDB
+    from cuemem.write.consolidate import (
+        PIPELINE_VERSION,
+        REBUILD_PENDING,
+        consolidation_fingerprint,
+    )
+
+    if not settings.paths.db.is_file():
+        return
+    try:
+        # 文件损坏、不是 SQLite 数据库时说明是哪个文件、从备份恢复（DatabaseOpenError）
+        with opening(settings.paths.db):
+            db = MemoryDB(settings.paths.db)
+    except (sqlite3.Error, CueMemError) as exc:
+        console.print(f"[yellow]读不了巩固任务[/yellow]：{escape(str(exc))}")
+        return
+    try:
+        summary = db.job_summary(PIPELINE_VERSION)
+    except sqlite3.Error as exc:
+        console.print(f"[yellow]读不了巩固任务[/yellow]：{escape(str(exc))}")
+        return
+    finally:
+        db.close()
+    role = settings.roles.get("extractor")
+    current = consolidation_fingerprint(role.model if role else "", settings.consolidation)
+    lines: list[str] = []
+    pending = 0
+    for item in summary:
+        space = escape(item["space_id"])
+        fix = f"[bold]cuemem consolidate --space {space}[/bold]"
+        counts = item["counts"]
+        pending += counts.get("pending", 0)
+        if counts.get("failed"):
+            lines.append(
+                f"[yellow]记忆空间 {space} 有 {counts['failed']} 个抽取失败的任务[/yellow]"
+                f"（{escape(item['error'] or '没有记下错误')}）：查明原因后运行 {fix} 补做"
+            )
+        recorded = item["recorded"]
+        if item["other_version"] or recorded not in (None, REBUILD_PENDING, current):
+            lines.append(
+                f"[yellow]记忆空间 {space} 是按旧的配置抽取的[/yellow]：{fix} 重建它"
+                "（命中 LLM 缓存的部分不再付费）"
+            )
+        elif recorded == REBUILD_PENDING:
+            lines.append(f"记忆空间 {space} 有没做完的重建：后台线程下一次巩固时做完，或运行 {fix}")
+    for line in lines[:JOB_LINES]:
+        console.print(line)
+    if len(lines) > JOB_LINES:
+        console.print(f"……还有 {len(lines) - JOB_LINES} 条")
+    console.print(f"排队等待巩固的任务：{pending} 个")
+
+
+def _print_cache_sizes(settings: Settings) -> None:
+    """LLM 缓存、向量缓存（各连同 -wal）与 trace 目录占了多少空间（第八轮体检）。trace 每个不同
+    的提问约 6-7 KB、一直留着：没设 CUEMEM_TRACES_RETENTION_DAYS 且合计超过 CACHE_WARN 时标黄。"""
+    paths = settings.paths
+    files = [paths.llm_cache, paths.embed_cache]
+    files += [path.with_name(path.name + "-wal") for path in files]
+    caches = sum(_file_size(path) for path in files)
+    traces = _tree_size(paths.traces)
+    line = (
+        f"缓存 {caches / 2**20:,.0f} MB（{escape(str(paths.llm_cache.parent))}），"
+        f"trace {traces / 2**20:,.0f} MB（{escape(str(paths.traces))}）"
+    )
+    if settings.traces_retention_days is None and caches + traces > CACHE_WARN:
+        console.print(
+            f"[yellow]{line}[/yellow]：trace 一直留着，设环境变量 "
+            "[bold]CUEMEM_TRACES_RETENTION_DAYS[/bold]（天数）定期清掉旧的"
+        )
+    else:
+        console.print(line)
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _tree_size(root: Path) -> int:
+    """目录里全部文件的大小之和（不跟随符号链接）；目录不存在或读不了的部分算 0。"""
+    total = 0
+    stack = [root]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
+
+
 def _loose_modes(settings: Settings | None = None) -> list[str]:
     """同一台机器上别的用户能读的数据目录（给了 settings 时）与密钥文件（.env、
     CUEMEM_API_KEYS_FILE）：每个一行黄字与收紧的命令（第四轮体检）。只提醒、不改：已经存在的
@@ -2530,8 +2861,14 @@ def _live_check(settings: Settings) -> None:
     from cuemem.embed import build_embedder
     from cuemem.llm.client import LLMClient
     from cuemem.llm.ledger import Ledger
+    from cuemem.store.files import opening
 
-    ledger = Ledger(settings.paths.ledger)
+    try:  # 账本损坏、不是 SQLite 数据库时一行说明，与 _open_system 相同（第八轮复审）
+        with opening(settings.paths.ledger):
+            ledger = Ledger(settings.paths.ledger)
+    except DatabaseOpenError as exc:
+        console.print(f"[red]错误：[/red]{escape(str(exc))}")
+        raise typer.Exit(1) from exc
     llm = LLMClient(settings, ledger=ledger)  # 不挂缓存：要测的是真实连通性
     table = Table(title="连通性测试（不走缓存）")
     for column in ("模型", "结果", "延迟", "输入 / 输出 tokens", "回复或错误"):

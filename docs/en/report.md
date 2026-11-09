@@ -539,7 +539,7 @@ Of the six hypotheses, only H5 holds fully; H1 and H2 hold in half. The refuted 
 
 ## 11. Reproduction
 
-Every N2–N11 result can be regenerated with `scripts/reproduce.py`, which has fixed run names and method lists. On the machine that holds the original response cache it only regenerates the reports and figures, at almost no cost. That cache, the evaluation spaces (`data/`) and the run records (`runs/`) are not in the repository: on a fresh clone the script makes paid API calls, and with `--cache-only` it stops at the first miss. The audits after N12 (D-068 to D-070) pinned request bytes and cache keys with offline tests (`FROZEN_REQUESTS`, the golden cache keys, the frozen configuration) and replayed the N12 evaluation spaces read-only, but the N2–N11 replay needs the original cache, which their machine does not have (its cache starts on 2026-10-14), so it was not re-run.
+Every N2–N11 result can be regenerated with `scripts/reproduce.py`, which has fixed run names and method lists. On the machine that holds the original response cache it only regenerates the reports and figures, at almost no cost. That cache, the evaluation spaces (`data/`) and the run records (`runs/`) are not in the repository: on a fresh clone the script makes paid API calls, and with `--cache-only` the LLM requests are served only from the local cache: an LLM cache miss is recorded as an error and the step exits non-zero once that run finishes, so nothing is copied into `docs/results`. Embedding requests still go to the provider on a miss (a small cost). The audits after N12 (D-068 to D-070) pinned request bytes and cache keys with offline tests (`FROZEN_REQUESTS`, the golden cache keys, the frozen configuration) and replayed the N12 evaluation spaces read-only, but the N2–N11 replay needs the original cache, which their machine does not have (its cache starts on 2026-10-14), so it was not re-run.
 
 ```bash
 uv run python scripts/reproduce.py --dry-run     # list every step
@@ -664,17 +664,19 @@ Human audit: 50 judgements were sampled from N9, stratified by dataset (LongMemE
 
 ### 12.5 Scale and deployment
 
-Offline latency benchmark (`scripts/n11_latency.py`, hash embeddings, excluding the ~110 ms query embedding call in production; Apple M2, median of 3 runs per size):
+Offline latency benchmark (`scripts/n11_latency.py`, hash embeddings, excluding the ~110 ms query embedding call in production, median of 3 runs per size). Local mode was re-measured after D-072's kind mask (P9) on a 4-CPU x86 VM on 2026-11-07 ([record](../results/n11-improvements/d072/latency.json)); the Qdrant server column is N11's Apple M2 measurement, not re-measured since (the kind mask only changes local mode), so each column comes from one machine:
 
-| Rounds (retrieval units) | Read path p50: local mode | Read path p50: Qdrant server |
+| Rounds (retrieval units) | Read path p50: local mode, after D-072 (x86 VM) | Read path p50: Qdrant server, N11 (Apple M2) |
 |---|---|---|
-| 500 (1.3k) | 32 ms | 14 ms |
-| 2,000 (4.7k) | 111 ms | 20 ms |
-| 8,000 (19k) | 445 ms | 33 ms |
-| 20,000 (46k) | 1,076 ms | 91 ms |
+| 500 (1.3k) | 20 ms | 14 ms |
+| 2,000 (4.7k) | 80 ms | 20 ms |
+| 8,000 (19k) | 315 ms | 33 ms |
+| 20,000 (46k) | 872 ms | 91 ms |
 
-- Local mode is exact search in Python and grows linearly. A year of daily chats is about 3,600 rounds, or about 0.2 s of local work; beyond that, switch to the server (which now gets payload indexes).
-- Concurrency in one process (2,000 rounds, a simulated 110 ms embedding call): local mode saturates at about 9 reads per second; the server reaches 55 per second with 16 threads.
+N11 measured local mode on the Apple M2 before the kind mask at 32 / 111 / 445 / 1,076 ms ([record](../results/n11-improvements/latency.json)). The two machines differ, so these numbers are not compared directly; what the mask itself changed is in D-072 P9, which measured an L1-shaped set of searches at 25k points going from 1.9 s to 0.35 s.
+
+- Local mode is exact search in Python and grows linearly. A year of daily chats is about 3,600 rounds, or about 0.15 s of local work on that VM; beyond that, switch to the server (which now gets payload indexes).
+- Concurrency in one process (2,000 rounds, a simulated 110 ms embedding call): on the VM after D-072, local mode saturates at about 10 reads per second (4.4 with one thread, 9.7 with 4, 10.4 with 16); in N11 the server reached 55 per second with 16 threads on the Apple M2.
 - When another process holds the local vector store, CueMem now says so and explains how to switch to a server. The HTTP API and the UI take an optional access token (`CUEMEM_API_TOKEN`, D-056).
 
 ## 13. N12: external systems under the same protocol

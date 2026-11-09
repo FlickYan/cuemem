@@ -333,3 +333,33 @@ def fill_to_capacity(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError:
                 conn.rollback()
                 break
+
+
+class QdrantDown:
+    """连不上的 Qdrant 服务端：替换 VectorStore 的客户端（与探活的客户端），任何调用都抛出
+    qdrant-client 连不上时的 ResponseHandlingException（原因是 httpx 的 ConnectError），不真的
+    连网络。用法：with QdrantDown(system.vectors): ..."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+
+    def __getattr__(self, name: str) -> Callable[..., Any]:
+        import httpx
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        def refused(*args: Any, **kwargs: Any) -> Any:
+            raise ResponseHandlingException(httpx.ConnectError("[Errno 111] Connection refused"))
+
+        return refused
+
+    def __enter__(self) -> QdrantDown:
+        store = self.store
+        self.saved = store._client, store._remote, store._probe, store.remote, store._path
+        store._client = store._probe = self
+        store._remote, store.remote = ("http://qdrant.invalid:6333", None), True
+        store._path = None  # 服务端模式没有本地目录
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        store = self.store
+        store._client, store._remote, store._probe, store.remote, store._path = self.saved

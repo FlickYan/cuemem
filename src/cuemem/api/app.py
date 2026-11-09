@@ -45,8 +45,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, get_args
 from urllib.parse import urlsplit
 
+import anyio
+import anyio.to_thread
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -62,6 +64,7 @@ from cuemem.api.auth import (
     authenticated_route,
     guard,
     principal_of,
+    spaces_over_cap,
     ui_login,
 )
 from cuemem.api.failures import provider_failure
@@ -75,9 +78,9 @@ from cuemem.api.limits import (
 from cuemem.api.memories import _error, install_error_format, memories_router
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
-from cuemem.errors import CueMemError, SessionLimitError
+from cuemem.errors import CueMemError, SessionLimitError, VectorStoreFullError
 from cuemem.memory import MemorySystem, RecallMode
-from cuemem.portable import export_space, import_space
+from cuemem.portable import export_plan, import_space, iter_export_json
 from cuemem.read.controller import Router
 from cuemem.sdk import Memory
 
@@ -287,13 +290,20 @@ class ForgetRequest(BaseModel):
 def _errors() -> Iterator[None]:
     """把服务层的已知错误转成 HTTP 状态码。模型与向量供应商的错误各有状态码与说明：限流 429、
     余额不足 402、暂时不可用 503（这两个带上游的 Retry-After）、超时 504、内容审核拒绝 422、
-    其余 502（见 api/failures.py）。以前 OpenAI SDK 的异常是没有说明的 500。"""
+    其余 502（见 api/failures.py）。以前 OpenAI SDK 的异常是没有说明的 500。本地向量库没有余量
+    建新的空间（VectorStoreFullError）时 503。"""
     try:
         yield
     except KeyError as exc:
         raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except VectorStoreFullError as exc:  # 已有的空间照常可用；说明里不带服务器上的路径
+        raise HTTPException(
+            503,
+            "服务器本地的向量库快到打开文件数的上限了，不能再建新的记忆空间（已有的照常可用）："
+            "请运营者删掉不用的空间、调高 ulimit -n，或者改用 Qdrant 服务端",
+        ) from exc
     except Exception as exc:
         failure = provider_failure(exc)
         if failure is not None:
@@ -341,6 +351,23 @@ SWEEP_INTERVAL_S = 60.0  # 清理线程多久查一次闲置的会话与过期�
 # 进程在别的主机、或者进程号被复用时，标记要过 store.media.RECOVER_AFTER_S 才算数，启动时那一遍
 # 收拾不到
 RECOVER_MEDIA_INTERVAL_S = 3600.0
+
+
+async def _readiness(system: MemorySystem, limiter: anyio.CapacityLimiter) -> JSONResponse:
+    """就绪检查（第八轮体检 P9）：服务端模式的向量库 2 秒内回应、后台巩固线程都还在。不鉴权：
+    只回出问题的部件名，不带异常的文字。不查数据库（遗忘重放时 SELECT 1 排在 MemoryDB 的锁后面，
+    就绪状态跟着来回跳）与磁盘（cuemem doctor 查）。/api/health 只说明进程活着。
+
+    limiter：应用自己的线程上限（两个）。不排在 40 个线程的默认线程池后面（第六轮体检量到那个
+    池子占满时排队 59.4 秒），探活本身也最多占两个线程。"""
+    failing = []
+    if not await anyio.to_thread.run_sync(system.vectors.ping, limiter=limiter):
+        failing.append("vector_store")
+    if system.worker is not None and not system.worker.alive():
+        failing.append("worker")
+    if failing:
+        return JSONResponse({"ok": False, "failing": failing}, 503, headers={"Retry-After": "5"})
+    return JSONResponse({"ok": True})
 
 
 def _sweep(stop: threading.Event, interval_s: float, *jobs: Callable[[], object]) -> None:
@@ -518,18 +545,38 @@ def create_app(
         if not principal_of(http).allows(space):
             raise HTTPException(404, f"没有进行中的会话 {session_id}")
 
-    @app.get("/api/health")  # 不鉴权：给负载均衡与监控探活用
-    def health() -> dict[str, Any]:
+    ready_limiter = anyio.CapacityLimiter(2)  # 就绪检查自己的线程（见 _readiness）
+
+    # 不鉴权：给负载均衡与监控探活用。async：不排在默认线程池后面（以前是普通函数，线程池占满时
+    # 探活跟着等，Docker 的 HEALTHCHECK 5 秒就超时）
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__, "open_sessions": len(service.sessions)}
+
+    @app.get("/api/ready")  # 不鉴权：向量库与后台巩固能不能用（见 _readiness）
+    async def ready() -> JSONResponse:
+        return await _readiness(service.system, ready_limiter)
 
     @api.get("/api/spaces")
     def spaces(http: Request) -> list[dict[str, Any]]:
         who = principal_of(http)
         return [row for row in service.spaces() if who.allows(row["space_id"])]
 
+    def room(http: Request, space: str | None) -> None:
+        """令牌写了 max_spaces、空间已经这么多个、这次又要建新的空间时 429（见 api/auth.py）。"""
+        who = principal_of(http)
+        held = spaces_over_cap(who, space, service.system.db.space_ids)
+        if held is not None:
+            raise HTTPException(
+                429,
+                f"这个访问令牌最多有 {who.max_spaces} 个记忆空间，已经有 {held} 个：已有的空间照常"
+                "可用。删掉不用的空间，或者请运营者调高这个令牌的 max_spaces",
+            )
+
     @api.post("/api/sessions")
     def start(http: Request, request: StartRequest) -> SessionOut:
         _check_space(principal_of(http), request.space or service.default_space)
+        room(http, request.space or service.default_space)
         try:
             session = service.start(request.space, at=request.at)
         except SessionLimitError as exc:  # 结束一个会话或等闲置的会话被清理（每分钟一次）
@@ -598,8 +645,9 @@ def create_app(
         return service.facts(space, current_only=current_only, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/entities")
-    def entities(space: AllowedSpace) -> list[dict[str, Any]]:
-        return service.entities(space)
+    def entities(space: AllowedSpace, show_expired: bool = False) -> list[dict[str, Any]]:
+        # 只出现在已经过期的事实里的实体默认不列出（第八轮体检），同事实表与实体图
+        return service.entities(space, show_expired=show_expired)
 
     @api.get("/api/spaces/{space:path}/graph")
     def graph(space: AllowedSpace, show_expired: bool = False) -> dict[str, Any]:
@@ -665,11 +713,14 @@ def create_app(
             )
         return out
 
-    @api.get("/api/spaces/{space:path}/export")
-    def export(space: AllowedSpace, derived: bool = True) -> dict[str, Any]:
-        """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。"""
+    @api.get("/api/spaces/{space:path}/export", response_class=StreamingResponse)
+    def export(space: AllowedSpace, derived: bool = True) -> StreamingResponse:
+        """导出记忆空间（N12）：原始日志、图片原文件与派生记忆的快照。边读边写（第八轮体检 P7，
+        portable.iter_export_json）：与以前的响应逐字节相同，同一时间只有一句发言的原图在内存里；
+        没有这个空间时在开始写之前 404。"""
         with _errors():
-            return export_space(service.system, space, derived=derived)
+            plan = export_plan(service.system, space, derived=derived)
+        return StreamingResponse(iter_export_json(plan), media_type="application/json")
 
     @api.post("/api/spaces/import")
     def import_(http: Request, data: dict[str, Any], space: str | None = None) -> dict[str, Any]:
@@ -678,6 +729,7 @@ def create_app(
         target = _import_target(data, space)
         if not principal_of(http).allows(target):
             raise HTTPException(403, f"这个访问令牌不能导入到记忆空间 {target}")
+        room(http, target)
         with _errors():
             report = import_space(service.system, data, space_id=space)
         if service.system.worker is not None:
@@ -685,7 +737,8 @@ def create_app(
         return report
 
     @api.post("/api/spaces/{space:path}/consolidate")
-    def consolidate(space: AllowedSpace) -> dict[str, Any]:
+    def consolidate(http: Request, space: AllowedSpace) -> dict[str, Any]:
+        room(http, space)
         with _errors():
             return service.consolidate(space)
 

@@ -35,11 +35,21 @@
         max_output_tokens: 2000      # 记忆代理转发的 max_tokens 不超过它，n 只能是 1
         max_concurrent: 4            # /api、/api/v1、/v1、/mcp 同时在处理的请求最多这么多个
                                      # （429；不写时是 CUEMEM_MAX_CONCURRENT_PER_KEY，默认 8）
+        max_spaces: 20               # 最多这么多个记忆空间（第八轮体检）：要建新空间的写入 429
 
-  后两项只管记忆代理（/v1/chat/completions、/v1/responses）；别的接口用配置里的角色与模型。
+  models、max_output_tokens 只管记忆代理（/v1/chat/completions、/v1/responses）；别的接口用配置里
+  的角色与模型。
   models 里的别名只放行这个别名（连同目录里它的 extra_body）：写 deepseek-flash 的令牌不能用
   同一个模型 ID 打开思考的 deepseek-flash-thinking。只写 max_output_tokens 管不住调用方的开关
   （enable_thinking、thinking 原样转发），要固定它们得写 models。
+
+  只写 user、不写 agent 的令牌可以用任意 agent_id（X-CueMem-Agent），每个新的 agent_id 是一个新的
+  空间，各有一个向量集合（本地模式下一直开着一个文件）。交给不太可信的调用方的令牌写上 agent，
+  或者写 max_spaces：它数的是作用域里已有的空间（数据库里有的），只在一次写入要建新的空间时查
+  （/api/v1 的 add、import、runs、consolidate，/api 开会话与导入，记忆代理开会话之前，/mcp 的
+  remember），到了时 429（/api/v1 下 code 为 rate_limited，记忆代理是 OpenAI 格式的
+  rate_limit_error），已有的空间照常读写；删掉空间就腾出名额。不写时不限（{user: "*"} 的后端令牌
+  本来就是每个用户一个空间）。同时建新空间的几个请求可能一起越过一两个。
 
 作用域之外：请求里点名了空间（user_id、agent_id、空间 ID）时 403；按 ID 找的记忆与会话当作不存在
 （404，history 是空列表），不让 ID 成为探测别人有没有某条记忆的途径。/api/spaces 与 /api/v1/spaces
@@ -71,7 +81,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
@@ -131,8 +141,8 @@ class Scope:
 class Principal:
     """一个令牌是谁、能访问什么。admin：不受作用域限制（管理令牌；没配令牌时的本机演示）。
 
-    rate_per_minute、models、max_output_tokens：限定作用域的令牌可选的用量限制（见模块说明），
-    None 是不限。max_concurrent：同时在处理的请求数的上限（api/limits.py），None 时用
+    rate_per_minute、models、max_output_tokens、max_spaces：限定作用域的令牌可选的用量限制（见模块
+    说明），None 是不限。max_concurrent：同时在处理的请求数的上限（api/limits.py），None 时用
     CUEMEM_MAX_CONCURRENT_PER_KEY（默认 8）；管理令牌不限。"""
 
     name: str
@@ -142,6 +152,7 @@ class Principal:
     models: tuple[str, ...] | None = None
     max_output_tokens: int | None = None
     max_concurrent: int | None = None
+    max_spaces: int | None = None
 
     def allows(self, space: str | None) -> bool:
         """能不能访问这个记忆空间：空间解回的（user_id，agent_id）要在作用域里。"""
@@ -164,6 +175,30 @@ class Principal:
 
 
 ADMIN = Principal("admin", admin=True)
+
+
+def spaces_over_cap(
+    who: Principal | None, space: str | None, spaces: Callable[[], Iterable[str]]
+) -> int | None:
+    """写入 space 要建新的空间、令牌又已经有 max_spaces 个空间时，它已有的空间数（调用方 429）；
+    否则 None。spaces：数据库里全部的空间 ID（MemoryDB.space_ids），只在令牌写了 max_spaces 时读。
+    管理令牌、不鉴权（who 为 None）与没写 max_spaces 的令牌不限。见模块说明。"""
+    if who is None or who.admin or who.max_spaces is None or space is None:
+        return None
+    known = set(spaces())
+    if space in known:
+        return None
+    held = sum(1 for s in known if who.allows(s))
+    return held if held >= who.max_spaces else None
+
+
+def space_cap_message(who: Principal, held: int) -> str:
+    """spaces_over_cap 拒绝时给调用方的说明（/api/v1、记忆代理与 MCP，英文）。"""
+    return (
+        f"This API key may hold at most {who.max_spaces} memory spaces and already has {held}: "
+        "writes to its existing spaces still work. Delete a space it no longer needs, or ask the "
+        "operator to raise max_spaces for this key."
+    )
 
 
 def _digest(token: str) -> bytes:
@@ -498,6 +533,7 @@ class _KeyIn(BaseModel):
     models: list[str] | None = None
     max_output_tokens: _PositiveInt | None = None
     max_concurrent: _PositiveInt | None = None
+    max_spaces: _PositiveInt | None = None
 
 
 class _KeysIn(BaseModel):
@@ -529,6 +565,7 @@ def _key(entry: _KeyIn, where: str) -> tuple[bytes, Principal]:
         models=tuple(entry.models) if entry.models is not None else None,
         max_output_tokens=entry.max_output_tokens,
         max_concurrent=entry.max_concurrent,
+        max_spaces=entry.max_spaces,
     )
 
 
@@ -587,6 +624,7 @@ def key_entry(
     models: Sequence[str] | None = None,
     max_output_tokens: int | None = None,
     max_concurrent: int | None = None,
+    max_spaces: int | None = None,
     indent: str = "  ",
 ) -> str:
     """一个限定作用域的令牌的 YAML（块状写法，列表项缩进 indent，以换行结尾）：一项作用域，
@@ -609,6 +647,8 @@ def key_entry(
         lines.append(f"{pad}max_output_tokens: {max_output_tokens}")
     if max_concurrent is not None:
         lines.append(f"{pad}max_concurrent: {max_concurrent}")
+    if max_spaces is not None:
+        lines.append(f"{pad}max_spaces: {max_spaces}")
     return "\n".join(lines) + "\n"
 
 

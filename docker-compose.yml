@@ -24,7 +24,15 @@ services:
       - qdrant-storage:/qdrant/storage
 
   cuemem:
-    build: .
+    # 每次 up 都按当前源码构建（pull_policy: build；有构建缓存时很快）：以前只在镜像不存在时构建，
+    # git pull 之后的 docker compose up -d 照旧跑旧镜像。CUEMEM_BUILD 是提交号（cuemem --version、
+    # doctor 与镜像标签里看得到），升级时：
+    #   git pull && CUEMEM_BUILD=$(git rev-parse --short=12 HEAD) docker compose up -d --build
+    build:
+      context: .
+      args:
+        CUEMEM_BUILD: ${CUEMEM_BUILD:-unknown}
+    pull_policy: build
     image: cuemem:latest
     restart: unless-stopped
     # 停止时先 SIGTERM，过了这段时间才 SIGKILL（Docker 默认 10 秒）。cuemem 要等进行中的请求（最多

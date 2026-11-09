@@ -211,23 +211,41 @@ def test_lock_installs_local_on_intel_macs_and_keeps_other_platforms() -> None:
 
 def test_compat_job_runs_unlocked_versions_weekly_and_is_not_required() -> None:
     """兼容性任务（compat.yml）：锁文件之外的版本——可选依赖取最新的、取下限（lowest-direct），
-    以及锁文件在 Python 3.14 上——每周跑一次。不读 [tool.uv]（--no-config，与 pip 用户相同）；
-    pytest 写着下限（lowest-direct 下不写时解到 pytest 2.0.0，构建失败）；不用 setup-uv 的缓存
-    （缓存键不分任务，最新、最低版本的包不能流进必需的任务）；不在规则集的必需检查里。"""
+    以及锁文件在 pyproject.toml 的分类写着的别的 Python 版本上（第八轮体检 P20：以前写着 3.13
+    却从没跑过）——每周跑一次。不读 [tool.uv]（--no-config，与 pip 用户相同）；pytest 写着下限
+    （lowest-direct 下不写时解到 pytest 2.0.0，构建失败）；不用 setup-uv 的缓存（缓存键不分任务，
+    最新、最低版本的包不能流进必需的任务）；不在规则集的必需检查里。"""
     path = PROJECT_ROOT / ".github" / "workflows" / "compat.yml"
     workflow = _workflow(path)
     triggers = workflow[True]  # PyYAML 把 "on" 读成 True
     assert triggers["schedule"] and "workflow_dispatch" in triggers
     assert {"pyproject.toml", "uv.lock"} <= set(triggers["pull_request"]["paths"])
-    [job] = workflow["jobs"].values()
+    assert set(workflow["jobs"]) == {"compat", "fastembed"}
+    job = workflow["jobs"]["compat"]
     assert job["strategy"]["fail-fast"] is False
-    cells = {cell["name"]: cell.get("resolution") for cell in job["strategy"]["matrix"]["include"]}
-    assert cells == {"newest-3.12": "highest", "floors-3.12": "lowest-direct", "locked-3.14": None}
+    include = job["strategy"]["matrix"]["include"]
+    cells = {cell["name"]: cell.get("resolution") for cell in include}
+    assert cells == {
+        "newest-3.12": "highest",
+        "floors-3.12": "lowest-direct",
+        "locked-3.13": None,
+        "locked-3.14": None,
+    }
+    locked = [cell for cell in include if "resolution" not in cell]
+    assert all(cell["name"] == f"locked-{cell['python']}" for cell in locked), locked
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text("utf-8"))
+    prefix = "Programming Language :: Python :: "
+    classified = {
+        c.removeprefix(prefix)
+        for c in pyproject["project"]["classifiers"]
+        if re.fullmatch(re.escape(prefix) + r"3\.\d+", c)
+    }
+    assert {cell["python"] for cell in locked} == classified - {"3.12"}, classified
     [setup] = [s for s in _steps(path) if s.get("uses", "").startswith("astral-sh/setup-uv@")]
     assert setup["with"]["enable-cache"] is False
     commands = [
         shlex.split(line)
-        for step in _steps(path)
+        for step in job["steps"]
         for line in step.get("run", "").replace("\\\n", " ").splitlines()
         if line.strip()
     ]
@@ -235,14 +253,49 @@ def test_compat_job_runs_unlocked_versions_weekly_and_is_not_required() -> None:
     assert "--no-config" in install and "--resolution" in install, install
     [pytest] = [Requirement(a) for a in install if a.startswith("pytest")]
     assert any(s.operator == ">=" for s in pytest.specifier), pytest
-    assert ["uv", "sync", "--locked", "--all-extras", "--python", "3.14"] in commands
+    assert ["uv", "sync", "--locked", "--all-extras", "--python", "$PYTHON"] in commands
+    assert ["uv", "run", "--python", "$PYTHON", "pytest"] in commands
+    [sync] = [s for s in job["steps"] if "--all-extras" in s.get("run", "")]
+    assert sync["env"] == {"PYTHON": "${{ matrix.python }}"}
 
     ruleset = json.loads(
         (PROJECT_ROOT / ".github" / "rulesets" / "protect-main.json").read_text("utf-8")
     )
     [checks] = [r for r in ruleset["rules"] if r["type"] == "required_status_checks"]
     required = {c["context"] for c in checks["parameters"]["required_status_checks"]}
-    assert not required & {"compat", *cells}, required
+    assert not required & {"compat", "fastembed", *cells}, required
+
+
+def _job_script(path: Path, job: str) -> str:
+    return "\n".join(s.get("run", "") for s in _workflow(path)["jobs"][job]["steps"])
+
+
+def test_ci_runs_a_real_server_lifecycle() -> None:
+    """第八轮体检 P20：package 任务对 cuemem serve 真的发 SIGTERM、等它退出并看退出码，再用同一个
+    数据目录启动、查回停下之前写的；docker 任务对镜像同样（docker stop 之后看退出码与用时，docker
+    start 之后查回来）。以前只探活 /api/health、kill 之后不看结果，关停与重启从没真的跑过。
+    compat.yml 的 fastembed 任务在镜像里用预设 deepseek、不覆盖向量后端，跑真的 fastembed。"""
+    workflows = PROJECT_ROOT / ".github" / "workflows"
+    package = _job_script(workflows / "ci.yml", "package")
+    assert 'kill -TERM "$1"' in package and 'wait "$1" || s=$?' in package
+    assert package.count("cuemem serve --port 7860") == 2
+    for script in (package, _job_script(workflows / "ci.yml", "docker")):
+        assert "/api/v1/memories" in script and '"infer":false' in script
+        assert "/api/v1/memories/search" in script and "grep -F 'golden retriever'" in script
+        assert "Traceback" in script
+    docker = _job_script(workflows / "ci.yml", "docker")
+    assert "--stop-timeout 90" in docker and "docker stop cuemem" in docker
+    assert "{{.State.ExitCode}}" in docker and "docker start cuemem" in docker
+    assert "CUEMEM_EMBEDDING__BACKEND=hash" in docker
+    fastembed = _job_script(workflows / "compat.yml", "fastembed")
+    assert "CUEMEM_PRESET=deepseek" in fastembed and "EMBEDDING__BACKEND" not in fastembed
+    assert "/api/v1/memories/search" in fastembed and "docker stop cuemem" in fastembed
+    # 收到 SIGTERM 时照样收尾、照 SIGTERM 退出（第八轮体检 P2）：退出码只认 143
+    assert '[ "$s" -eq 143 ]' in package
+    for script in (docker, fastembed):
+        assert '[ "$code" -eq 143 ]' in script
+    for script in (package, docker, fastembed):
+        assert "-eq 0 ]" not in script
 
 
 def test_compose_stop_grace_covers_the_shutdown() -> None:
@@ -261,3 +314,22 @@ def test_compose_stop_grace_covers_the_shutdown() -> None:
     assert match, grace
     worker = ConsolidationWorker(MagicMock())
     assert int(match.group(1)) >= worker.stop_timeout_s + GRACEFUL_SHUTDOWN_S + 30
+
+
+def test_image_and_compose_carry_the_build_id() -> None:
+    """镜像带着构建标识（第八轮体检 P19）：Dockerfile 的 ARG → ENV CUEMEM_BUILD（cuemem --version
+    与 doctor 读它）与 OCI 的 revision 标签，放在装依赖与源码的层之后；compose 把提交号传进去，
+    每次 up 都构建（以前 git pull 之后的 docker compose up -d 照旧跑旧镜像）；CI 构建时给提交号并
+    核对 --version。"""
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text("utf-8")
+    final = dockerfile.split("\nFROM ")[-1]
+    assert "ARG CUEMEM_BUILD=unknown" in final and "ENV CUEMEM_BUILD=$CUEMEM_BUILD" in final
+    assert "org.opencontainers.image.revision=$CUEMEM_BUILD" in final
+    assert final.index("ARG CUEMEM_BUILD") > final.index("RUN ")  # 不让前面的层跟着重建
+    compose = yaml.safe_load((PROJECT_ROOT / "docker-compose.yml").read_text("utf-8"))
+    service = compose["services"]["cuemem"]
+    assert service["build"]["args"]["CUEMEM_BUILD"] == "${CUEMEM_BUILD:-unknown}"
+    assert service["pull_policy"] == "build"
+    ci = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    assert '--build-arg CUEMEM_BUILD="${GITHUB_SHA::12}"' in ci
+    assert "cuemem:ci --version" in ci

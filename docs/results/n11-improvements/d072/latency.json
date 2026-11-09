@@ -1,0 +1,162 @@
+{
+  "local": {
+    "machine": "Linux-6.18.44-fc-v310-x86_64-with-glibc2.39, 4 CPUs",
+    "date": "2026-11-07",
+    "embedder": "hash-1024 (no API call; production adds ~110 ms per query)",
+    "repeats": 40,
+    "trials": 3,
+    "rows": [
+      {
+        "rounds": 500,
+        "units": 1279,
+        "append_ms": {
+          "p50": 3.5,
+          "p95": 4.7
+        },
+        "recall_ms": {
+          "p50": 13.4,
+          "p95": 28.3
+        },
+        "probe_ms": {
+          "p50": 19.4,
+          "p95": 38.4
+        },
+        "decide_ms": {
+          "p50": 0.2,
+          "p95": 0.2
+        },
+        "pack_ms": {
+          "p50": 0.4,
+          "p95": 0.6
+        },
+        "read_ms": {
+          "p50": 20.2,
+          "p95": 40.4
+        },
+        "build_s": 0.5,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 2000,
+        "units": 4729,
+        "append_ms": {
+          "p50": 3.8,
+          "p95": 5.1
+        },
+        "recall_ms": {
+          "p50": 69.6,
+          "p95": 112.6
+        },
+        "probe_ms": {
+          "p50": 78.6,
+          "p95": 128.7
+        },
+        "decide_ms": {
+          "p50": 0.2,
+          "p95": 0.3
+        },
+        "pack_ms": {
+          "p50": 0.5,
+          "p95": 0.8
+        },
+        "read_ms": {
+          "p50": 79.7,
+          "p95": 129.5
+        },
+        "build_s": 2.4,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 8000,
+        "units": 18529,
+        "append_ms": {
+          "p50": 3.8,
+          "p95": 8.6
+        },
+        "recall_ms": {
+          "p50": 290.5,
+          "p95": 376.1
+        },
+        "probe_ms": {
+          "p50": 313.9,
+          "p95": 426.8
+        },
+        "decide_ms": {
+          "p50": 0.3,
+          "p95": 0.4
+        },
+        "pack_ms": {
+          "p50": 0.6,
+          "p95": 0.9
+        },
+        "read_ms": {
+          "p50": 315.1,
+          "p95": 428.4
+        },
+        "build_s": 10.4,
+        "index_s": 0.0
+      },
+      {
+        "rounds": 20000,
+        "units": 46129,
+        "append_ms": {
+          "p50": 4.1,
+          "p95": 4.9
+        },
+        "recall_ms": {
+          "p50": 821.7,
+          "p95": 1325.6
+        },
+        "probe_ms": {
+          "p50": 866.7,
+          "p95": 1378.2
+        },
+        "decide_ms": {
+          "p50": 0.3,
+          "p95": 0.4
+        },
+        "pack_ms": {
+          "p50": 0.6,
+          "p95": 0.9
+        },
+        "read_ms": {
+          "p50": 872.3,
+          "p95": 1379.9
+        },
+        "build_s": 29.9,
+        "index_s": 0.0
+      }
+    ],
+    "concurrency": {
+      "rounds": 2000,
+      "reads": 64,
+      "embed_delay_ms": 110.0,
+      "rows": [
+        {
+          "threads": 1,
+          "qps": 4.4,
+          "latency_ms": {
+            "p50": 209.9,
+            "p95": 273.7
+          }
+        },
+        {
+          "threads": 4,
+          "qps": 9.7,
+          "latency_ms": {
+            "p50": 386.1,
+            "p95": 558.3
+          }
+        },
+        {
+          "threads": 16,
+          "qps": 10.4,
+          "latency_ms": {
+            "p50": 1354.0,
+            "p95": 2220.7
+          }
+        }
+      ]
+    }
+  }
+}

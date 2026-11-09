@@ -138,15 +138,41 @@ jobs:
           grep -F 'cuemem[eval]' eval.log || { cat eval.log; exit 1; }
           # 默认场景：包里没有导购演示的商品目录，cuemem serve 改用通用助手照常起来；
           # 没装界面时只启动接口，并说明怎么装
+          api=http://127.0.0.1:7860
+          up() {
+            for _ in $(seq 60); do curl -fsS "$api/api/health" && return 0; sleep 1; done
+            curl -fsS "$api/api/health" || { cat "$1"; exit 1; }
+          }
+          # 真的发 SIGTERM（第八轮体检 P20）：40 秒内退出，退出码 143（收尾完、照 SIGTERM 退出，
+          # 第八轮体检 P2），不是被杀（137）或出错；日志里没有 Traceback。以前只 kill、不看结果
+          stop() {
+            kill -TERM "$1"
+            timeout 40 tail --pid="$1" -f /dev/null || { echo "40 秒内没有退出"; cat "$2"; exit 1; }
+            s=0
+            wait "$1" || s=$?
+            [ "$s" -eq 143 ] || { echo "退出码 $s"; cat "$2"; exit 1; }
+            if grep -F Traceback "$2"; then cat "$2"; exit 1; fi
+          }
           cuemem serve --port 7860 > serve.log 2>&1 &
           pid=$!
-          for _ in $(seq 60); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 1; done
-          curl -fsS http://127.0.0.1:7860/api/health || { cat serve.log; exit 1; }
-          kill "$pid"
+          up serve.log
           grep -F 'cuemem[ui]' serve.log || { cat serve.log; exit 1; }
+          # 写一句（infer=false：不抽取、不调用模型），停下再用同一个 CUEMEM_HOME 启动，还查得到
+          curl -fsS "$api/api/v1/memories" -H 'Content-Type: application/json' -d \
+            '{"messages":[{"role":"user","content":"I have a golden retriever"}],"user_id":"ci",
+            "infer":false}'
+          stop "$pid" serve.log
+          cuemem serve --port 7860 > serve2.log 2>&1 &
+          pid=$!
+          up serve2.log
+          curl -fsS "$api/api/v1/memories/search" -H 'Content-Type: application/json' \
+            -d '{"query":"golden retriever","user_id":"ci","mode":"l1"}' | tee search.json
+          grep -F 'golden retriever' search.json
+          stop "$pid" serve2.log
 
   docker:
-    # 镜像能构建、带着界面与本机向量的可选依赖（预设 deepseek 要用），启动后 /api/health 正常
+    # 镜像能构建、带着界面与本机向量的可选依赖（预设 deepseek 要用），启动后能写能查；docker stop
+    # 在 30 秒内正常退出，再 docker start 时写过的还在（/data 卷）
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -154,12 +180,38 @@ jobs:
         with:
           persist-credentials: false
       - name: 构建镜像
-        run: docker build -t cuemem:ci .
+        run: docker build --build-arg CUEMEM_BUILD="${GITHUB_SHA::12}" -t cuemem:ci .
+      - name: cuemem --version 写着构建的提交号
+        run: docker run --rm cuemem:ci --version | grep -F "(build ${GITHUB_SHA::12})"
       - name: 界面与本机向量的可选依赖在镜像里
         run: docker run --rm --entrypoint python cuemem:ci -c "import fastembed, gradio"
-      - name: 启动并探活（哈希向量；容器里监听 0.0.0.0，要设至少 16 个字符的访问令牌）
+      - name: 启动、写入、停下、再启动（哈希向量；容器里监听 0.0.0.0，要设至少 16 个字符的令牌）
         run: |
-          docker run -d --name cuemem -p 127.0.0.1:7860:7860 \
+          api=http://127.0.0.1:7860
+          auth="Authorization: Bearer ci-token-0123456789"
+          up() {
+            for _ in $(seq 90); do curl -fsS "$api/api/health" && return 0; sleep 2; done
+            curl -fsS "$api/api/health" || { docker logs cuemem; exit 1; }
+          }
+          docker run -d --name cuemem --stop-timeout 90 -p 127.0.0.1:7860:7860 \
             -e CUEMEM_API_TOKEN=ci-token-0123456789 -e CUEMEM_EMBEDDING__BACKEND=hash cuemem:ci
-          for _ in $(seq 90); do curl -fsS http://127.0.0.1:7860/api/health && break; sleep 2; done
-          curl -fsS http://127.0.0.1:7860/api/health || { docker logs cuemem; exit 1; }
+          up
+          curl -fsS "$api/api/v1/memories" -H "$auth" -H 'Content-Type: application/json' -d \
+            '{"messages":[{"role":"user","content":"I have a golden retriever"}],"user_id":"ci",
+            "infer":false}'
+          # docker stop：SIGTERM 之后 30 秒内退出（--stop-timeout 90 秒之后才 SIGKILL，退出码
+          # 137），退出码 143（cuemem 是 PID 1，收尾完再照 SIGTERM 退出），日志里没有 Traceback
+          start=$(date +%s)
+          docker stop cuemem
+          took=$(( $(date +%s) - start ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' cuemem)
+          echo "docker stop 用了 $took 秒，退出码 $code"
+          [ "$took" -lt 30 ] || { docker logs cuemem; exit 1; }
+          [ "$code" -eq 143 ] || { docker logs cuemem; exit 1; }
+          if docker logs cuemem 2>&1 | grep -F Traceback; then docker logs cuemem; exit 1; fi
+          # 再启动：写过的还在（镜像的 /data 卷）
+          docker start cuemem
+          up
+          curl -fsS "$api/api/v1/memories/search" -H "$auth" -H 'Content-Type: application/json' \
+            -d '{"query":"golden retriever","user_id":"ci","mode":"l1"}' | tee search.json
+          grep -F 'golden retriever' search.json || { docker logs cuemem; exit 1; }

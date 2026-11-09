@@ -36,9 +36,18 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
-from cuemem.api.auth import UNAUTHORIZED, AnyKeys, bearer_principal, identity_headers
+from cuemem.api.auth import (
+    UNAUTHORIZED,
+    AnyKeys,
+    Principal,
+    bearer_principal,
+    identity_headers,
+    space_cap_message,
+    spaces_over_cap,
+)
 from cuemem.api.failures import provider_failure
 from cuemem.api.service import ChatService
+from cuemem.errors import VectorStoreFullError
 from cuemem.evidence import forget_summary, format_listing, format_profile
 from cuemem.sdk import space_for
 
@@ -47,6 +56,8 @@ Call recall before answering anything that may depend on the user's past (prefer
 
 # /mcp 上这次请求的记忆空间（McpEndpoint 设置）。同步的工具在线程池里执行，anyio 把上下文带过去
 _SPACE: ContextVar[str] = ContextVar("cuemem_mcp_space")
+# 与 _SPACE 一起设置：这次请求的令牌（remember 查它的 max_spaces）；stdio 与不鉴权时 None
+_WHO: ContextVar[Principal | None] = ContextVar("cuemem_mcp_principal", default=None)
 
 
 def build_server(service: ChatService, space_id: str | None = None) -> MCPServer[Any]:
@@ -61,6 +72,10 @@ def build_server(service: ChatService, space_id: str | None = None) -> MCPServer
     def remember(text: str) -> str:
         """Save something worth remembering about the user (a preference, a fact, a plan).
         It can be recalled right away and is turned into structured facts in the background."""
+        who = _WHO.get() if space_id is None else None
+        held = spaces_over_cap(who, space(), service.system.db.space_ids)
+        if who is not None and held is not None:  # 令牌的 max_spaces（api/auth.py）
+            raise ToolError(space_cap_message(who, held))
         with _provider_errors():
             saved = service.remember(space(), text)
         return f"Saved as {saved['turn_id']}."
@@ -103,7 +118,7 @@ class McpEndpoint:
       sdk.space_for）；都没给时是令牌作用域里的第一个用户（Principal.home），管理令牌、不鉴权与
       全是通配的令牌没有，400；utf-8'' 写错、不是 UTF-8 时也是 400；
     - 空间在令牌的作用域之外时 403，什么都不做；
-    - 空间放进 _SPACE，工具读它。
+    - 空间放进 _SPACE、令牌放进 _WHO，工具读它们（remember 查令牌的 max_spaces）。
 
     Host 与 Origin 由整个应用的 TrustedHostMiddleware 与 SameOriginOnly 检查（与 /api 相同），
     MCP SDK 自己的 Host 检查关掉：它只认 127.0.0.1 等带端口的 Host，Docker、局域网的地址与不带
@@ -133,22 +148,24 @@ class McpEndpoint:
                 self._manager = None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        space = self._space(Headers(scope=scope))
-        if isinstance(space, JSONResponse):
-            await space(scope, receive, send)
+        found = self._space(Headers(scope=scope))
+        if isinstance(found, JSONResponse):
+            await found(scope, receive, send)
             return
+        space, principal = found
         if self._manager is None:  # 应用的 lifespan 没有运行（uvicorn 总会运行它）
             refused = {"detail": "MCP is not running: the app's lifespan has not started."}
             await JSONResponse(refused, 503)(scope, receive, send)
             return
-        token = _SPACE.set(space)
+        token, who = _SPACE.set(space), _WHO.set(principal)
         try:
             await self._manager.handle_request(scope, receive, send)
         finally:
+            _WHO.reset(who)
             _SPACE.reset(token)
 
-    def _space(self, headers: Headers) -> str | JSONResponse:
-        """这个请求的记忆空间，或者拒绝它的响应（401、400、403；见类的说明）。"""
+    def _space(self, headers: Headers) -> tuple[str, Principal] | JSONResponse:
+        """这个请求的记忆空间与令牌，或者拒绝它的响应（401、400、403；见类的说明）。"""
         principal = bearer_principal(self.keys, headers.get("authorization"))
         if principal is None:
             return JSONResponse({"detail": UNAUTHORIZED}, 401, {"WWW-Authenticate": "Bearer"})
@@ -171,15 +188,18 @@ class McpEndpoint:
                 "(the X-CueMem-User and X-CueMem-Agent headers)."
             )
             return JSONResponse({"detail": message}, 403)
-        return space
+        return space, principal
 
 
 @contextmanager
 def _provider_errors() -> Iterator[None]:
     """供应商出错（限流、余额不足、超时……）时给调用方的模型一句看得懂的话。别的异常 MCP 只回
-    "Error executing tool <name>"：模型分不清是 CueMem 坏了，还是该等一会儿再试。"""
+    "Error executing tool <name>"：模型分不清是 CueMem 坏了，还是该等一会儿再试。本地向量库没有
+    余量建新的空间（VectorStoreFullError）时也说明。"""
     try:
         yield
+    except VectorStoreFullError as exc:
+        raise ToolError(exc.for_client()) from exc
     except Exception as exc:
         failure = provider_failure(exc)
         if failure is None:

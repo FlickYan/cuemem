@@ -276,33 +276,39 @@ class MemoryDB:
         self._turn_generation = 0  # _turn_writes 清空过几次（见 _count_turn_writes）
         self._rollbacks = 0  # 回滚过的事务与保存点
         with self._lock:
-            # 先读版本，再切 WAL（切换就会写文件头）、建表、补列：更新的 CueMem 写的库原样不动。
-            # 以前每次打开都把 user_version 设成 SCHEMA_VERSION，旧版本打开新库时悄悄调低，
-            # 新的集合名与 turn_meta 都被忽略（检索为空）
-            stored = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-            if stored > SCHEMA_VERSION:
-                self._conn.close()  # 不留句柄：serve、proxy 这样长时间运行的进程里会泄漏
-                raise ConfigMismatchError(
-                    f"{path} 是更新的 CueMem 写的（数据格式 v{stored}，这个版本只支持到"
-                    f" v{SCHEMA_VERSION}）：升级 CueMem，或者用新版本导出（cuemem export）再在"
-                    "这里导入"
-                )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
-            self._conn.executescript(_SCHEMA)
-            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
-            if "speaker" not in columns:  # 从 v1 升级
-                self._conn.execute("ALTER TABLE turns ADD COLUMN speaker TEXT")
-            media_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(media)")}
-            for column, ddl in (
-                ("caption_iso", "TEXT NOT NULL DEFAULT ''"),
-                ("width", "INTEGER NOT NULL DEFAULT 0"),
-                ("height", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                if column not in media_columns:  # 从 v3 升级
-                    self._conn.execute(f"ALTER TABLE media ADD COLUMN {column} {ddl}")
-            self._conn.execute(f"PRAGMA user_version = {max(stored, SCHEMA_VERSION)}")  # 从不调低
-            self._conn.commit()
+            try:
+                # 先读版本，再切 WAL（切换就会写文件头）、建表、补列：更新的 CueMem 写的库原样不动。
+                # 以前每次打开都把 user_version 设成 SCHEMA_VERSION，旧版本打开新库时悄悄调低，
+                # 新的集合名与 turn_meta 都被忽略（检索为空）
+                stored = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+                if stored > SCHEMA_VERSION:
+                    raise ConfigMismatchError(
+                        f"{path} 是更新的 CueMem 写的（数据格式 v{stored}，这个版本只支持到"
+                        f" v{SCHEMA_VERSION}）：升级 CueMem（各种安装方式的做法见 README 的“升级”"
+                        "一节），或者用新版本导出（cuemem export）再在这里导入"
+                    )
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA secure_delete=ON")  # 删除时覆写内容，不留在空闲页里
+                self._conn.executescript(_SCHEMA)
+                columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
+                if "speaker" not in columns:  # 从 v1 升级
+                    self._conn.execute("ALTER TABLE turns ADD COLUMN speaker TEXT")
+                media_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(media)")}
+                for column, ddl in (
+                    ("caption_iso", "TEXT NOT NULL DEFAULT ''"),
+                    ("width", "INTEGER NOT NULL DEFAULT 0"),
+                    ("height", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if column not in media_columns:  # 从 v3 升级
+                        self._conn.execute(f"ALTER TABLE media ADD COLUMN {column} {ddl}")
+                # 从不调低
+                self._conn.execute(f"PRAGMA user_version = {max(stored, SCHEMA_VERSION)}")
+                self._conn.commit()
+            except BaseException:
+                # 打开时出错（更新的 CueMem 写的库、文件损坏、不是 SQLite 数据库、磁盘满了）：不留
+                # 句柄，serve、proxy 这样长时间运行的进程里会泄漏
+                self._conn.close()
+                raise
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1522,6 +1528,48 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: int(r[1]) for r in rows}
 
+    def job_summary(self, version: str) -> list[dict[str, Any]]:
+        """全部空间的任务概况（cuemem doctor，第八轮体检）：每个有任务的空间一项，按空间 ID 排序，
+        有 space_id、counts（状态 → 个数）、other_version（按别的流水线版本登记的任务数）、
+        error（失败任务里的一条错误：第一行、最多 200 个字符，错误可能引用模型输出里的用户原文）
+        与 recorded（巩固指纹 consolidation:<空间>，没有时 None）。
+
+        一次分组查询扫一遍任务表（命令行里用，不走索引也够快），失败的错误与指纹各一次查询。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT space_id, status, COUNT(*), SUM(version != ?) FROM jobs"
+                " GROUP BY space_id, status",
+                (version,),
+            ).fetchall()
+            errors = dict(
+                self._conn.execute(
+                    "SELECT space_id, MIN(error) FROM jobs WHERE status = 'failed'"
+                    " GROUP BY space_id"
+                ).fetchall()
+            )
+            prefix = "consolidation:"
+            recorded = {
+                str(key)[len(prefix) :]: value
+                for key, value in self._conn.execute(
+                    "SELECT key, value FROM meta WHERE key >= ? AND key < ?",
+                    (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)),
+                ).fetchall()
+            }
+        spaces: dict[str, dict[str, Any]] = {}
+        for space_id, status, count, other in rows:
+            item = spaces.setdefault(
+                space_id,
+                {"space_id": space_id, "counts": {}, "other_version": 0, "error": None},
+            )
+            item["counts"][status] = int(count)
+            item["other_version"] += int(other or 0)
+        for space_id, item in spaces.items():
+            error = errors.get(space_id)
+            if error:
+                item["error"] = (str(error).splitlines() or [""])[0][:200]
+            item["recorded"] = recorded.get(space_id)
+        return [spaces[key] for key in sorted(spaces)]
+
     def get_jobs(self, space_id: str, status: str | None = None) -> list[dict[str, Any]]:
         sql = (
             "SELECT id, session_id, version, content_hash, status, attempts, error, stats,"
@@ -1644,6 +1692,11 @@ class MemoryDB:
             # 写入计数也不再记着这个空间的会话：删除次数（_turn_epochs）在上面加过，版本不会重复
             for key in [k for k in self._turn_writes if k[0] == space_id]:
                 del self._turn_writes[key]
+
+    def space_ids(self) -> list[str]:
+        """全部记忆空间的 ID（只读 spaces 表，不像 list_spaces 那样数会话与记忆）。"""
+        with self._lock:
+            return [row[0] for row in self._conn.execute("SELECT id FROM spaces")]
 
     def list_spaces(self) -> list[dict[str, Any]]:
         sql = (

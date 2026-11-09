@@ -14,9 +14,10 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from fakes import NO_BALANCE, FakeAPI
@@ -30,6 +31,8 @@ from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
 from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, stored_text
 from cuemem.memory import _open_mark
+from cuemem.read.l1 import L1Config
+from cuemem.read.l2 import L2Config
 from cuemem.sdk import _key_hash, _matches, parse_messages, space_for
 from cuemem.store.vector import VectorStore
 
@@ -1190,6 +1193,27 @@ def test_answer_does_not_use_expired_memories(
     assert "Berlin" not in prompt and "jazz" in prompt
 
 
+@pytest.mark.parametrize("mode", ["l1", "l2"])
+def test_version_chain_does_not_bring_back_expired_facts(
+    memory: Memory, model: ScriptedModel, mode: Literal["l1", "l2"]
+) -> None:
+    """第八轮体检 P10：hidden 挡住了各路检索，但版本链会把被取代的旧事实补回来（"已经不对了，
+    见 [f2]"）。过期的旧住址要在 MemorySystem._without 里再去掉一次，不然它随新住址一起进了
+    回答模型的提示与 recall 的清单（auto 选的层不补版本链，查不出来，所以只测 L1、L2）。"""
+    memory.add(
+        "I live in Berlin",
+        user_id="u",
+        expiration_date=date.today() - timedelta(days=1),
+        wait=True,
+    )
+    memory.add("I moved to Munich", user_id="u", wait=True)
+    memory.answer("Where do I live?", user_id="u", mode=mode)
+    (prompt,) = model.prompts["read"]
+    assert "Munich" in prompt and "Berlin" not in prompt
+    listing = recall_listing(memory.system, "u", "Where do I live?", mode=mode, at_least_l1=True)
+    assert "Munich" in json.dumps(listing) and "Berlin" not in json.dumps(listing)
+
+
 def test_hatch_search_does_not_find_expired_memories(
     memory: Memory, model: ScriptedModel, fake_api: FakeAPI
 ) -> None:
@@ -1319,6 +1343,126 @@ def test_memory_browser_hides_expired_memories(memory: Memory, tmp_path: Path) -
         assert len(http.get("/api/spaces/u/media?show_expired=true").json()) == 1
     assert _forget(service, "u", "Berlin")["facts"] == [berlin]
     assert berlin not in statements(service.facts("u", show_expired=True))
+
+
+@pytest.mark.parametrize("mode", ["l1", "l2"])
+def test_expired_image_in_a_live_round_is_not_loaded(
+    memory: Memory, tmp_path: Path, mode: Literal["l1", "l2"]
+) -> None:
+    """第八轮体检 P10：一轮里的用户发言带着图片、已经过期，同一轮里助手的回复没有过期——这一轮
+    照样检索得到（出处各句都过期了才算过期），装入的轮里的图片却要在 MemorySystem._without
+    里去掉：它不经过各路检索的 hidden，以前会作为描述或原图交给回答模型。
+
+    两次 add 各成一轮；后写的回复并进前一轮的做法同 OpenAI Agents 集成（_merge_round）。"""
+    picture = tmp_path / "flat.png"
+    Image.new("RGB", (16, 16), "green").save(picture)
+    content = [
+        {"type": "text", "text": "My old flat"},
+        {"type": "image_url", "image_url": {"url": str(picture)}},
+    ]
+    yesterday = date.today() - timedelta(days=1)
+    memory.add(
+        [{"role": "user", "content": content}],
+        user_id="u",
+        run_id="flat",
+        expiration_date=yesterday,
+        infer=False,
+    )
+    memory.add(
+        [{"role": "assistant", "content": "What a bright flat"}],
+        user_id="u",
+        run_id="flat",
+        infer=False,
+    )
+    system = memory.system
+    stale = [u.id for u in system.db.list_units("u", kinds=["round"], session_ids=["flat"])]
+    system.writer.replace_rounds("u", "flat", stale)
+    (merged,) = system.db.list_units("u", kinds=["round"], session_ids=["flat"])
+    (image,) = system.db.get_media("u")
+    assert merged.meta["media_ids"] == [image.id] and "bright flat" in merged.text
+    gone = system.expired_ids("u", datetime.now())
+    assert image.id in gone and merged.id not in gone
+
+    l1 = replace(L1Config(), attach_images=2)  # 附上原图：attach 也要去掉它
+    l2 = replace(L2Config(), l1=l1)
+    recall = system.retrieve("u", "my old flat", mode=mode, l1=l1, l2=l2, hide_expired=True)
+    assert [h.unit.id for h in recall.view.rounds] == [merged.id]
+    assert image.id not in recall.view.media and image.id not in recall.view.attach
+
+
+def doctors(prompt: str) -> dict[str, Any]:
+    """抽取替身：'I see Dr. X for my Y' → 宾语是医生的事实，外加医生的实体（带描述）；其余发言
+    各记一条多值事实（陈述里提到医生的名字时，实体图与实体列表按名字找到它）。"""
+    facts, entities = [], []
+    for n, text in re.findall(r"\[t(\d+)\] User: (.*)", prompt):
+        seen = re.search(r"I see (Dr\. \w+) .*for my (\w+)", text)
+        if seen:
+            doctor, issue = seen.groups()
+            facts.append(
+                {"statement": f"The user sees {doctor} for {issue}.", "subject": "User",
+                 "predicate": "sees", "object": doctor, "cardinality": "multi",
+                 "importance": 5, "turns": [int(n)]}
+            )  # fmt: skip
+            entities.append(
+                {"name": doctor, "type": "person", "description": f"the user's {issue} doctor"}
+            )
+        else:
+            facts.append(
+                {"statement": text, "predicate": "said", "object": text[:40],
+                 "cardinality": "multi", "importance": 4, "turns": [int(n)]}
+            )  # fmt: skip
+    return {"summary": "", "facts": facts, "entities": entities}
+
+
+def test_entity_list_hides_entities_known_only_from_expired_facts(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """第八轮体检 P5：实体的检索单元没有出处，expired_ids 标不出它们；/api/spaces/{space}/entities
+    以前照样列出过期会话里抽出的实体，连同描述（"the user's depression doctor"），事实表、
+    实体图与检索都已经不给了。默认不列出，show_expired 时列出、标着 expired。还有一条没过期的
+    事实（陈述里按名字提到它）的实体照旧列出；用户本人与没有事实提到的实体不受影响。"""
+    from fastapi.testclient import TestClient
+
+    from cuemem.agent import Agent
+    from cuemem.api.app import create_app
+    from cuemem.api.service import ChatService
+
+    fake_api.chat_replies = [ScriptedModel(doctors)]
+    yesterday = date.today() - timedelta(days=1)
+    with Memory(n3_settings, http_client=fake_api.client(), background=False) as memory:
+        for text in ("I see Dr. Kim every week for my depression", "I see Dr. Lee for my knee"):
+            memory.add(text, user_id="u", expiration_date=yesterday, wait=True)
+        memory.add("Dr. Lee fixed my knee last year", user_id="u", wait=True)
+        memory.add("I like jazz", user_id="u", wait=True)
+        service = ChatService(memory.system, Agent(memory.system, router="rule"))
+
+        def listing(rows: list[dict[str, Any]]) -> dict[str, bool]:
+            return {r["name"]: r["expired"] for r in rows}
+
+        shown = listing(service.entities("u", show_expired=True))
+        assert shown["Dr. Kim"] is True and shown["Dr. Lee"] is False
+        assert not any(shown[name] for name in shown if name != "Dr. Kim")
+        assert "Dr. Kim" not in listing(service.entities("u"))
+        assert listing(service.entities("u")) == {k: v for k, v in shown.items() if k != "Dr. Kim"}
+        app = create_app(service, upload_dir=tmp_path / "up", ui=False, idle_minutes=None)
+        with TestClient(app) as http:
+            rows = http.get("/api/spaces/u/entities").json()
+            assert "Dr. Kim" not in listing(rows) and "Dr. Lee" in listing(rows)
+            assert "depression" not in json.dumps(rows)
+            rows = http.get("/api/spaces/u/entities", params={"show_expired": "true"}).json()
+            assert listing(rows) == shown
+
+
+def test_entity_list_is_unchanged_without_expiries(memory: Memory) -> None:
+    """没有过期的发言时（评测的空间都是）照旧列出全部实体，只多了 expired: false。"""
+    from cuemem.agent import Agent
+    from cuemem.api.service import ChatService
+
+    memory.add("I live in Berlin", user_id="u", wait=True)
+    service = ChatService(memory.system, Agent(memory.system, router="rule"))
+    rows = service.entities("u")
+    assert [r["id"] for r in rows] == [e.id for e in memory.system.entities("u")]
+    assert rows and all(r["expired"] is False for r in rows)
 
 
 def test_purge_expired_deletes_expired_memories(memory: Memory, fake_api: FakeAPI) -> None:
@@ -2474,6 +2618,42 @@ def test_data_path_blocked_by_a_file_raises_database_open_error(
     paths = offline_settings.paths.model_copy(update={"db": blocker / "cuemem.sqlite"})
     with pytest.raises(DatabaseOpenError, match="plain-file"):
         Memory(offline_settings.model_copy(update={"paths": paths}), background=False)
+
+
+@pytest.mark.parametrize("which", ["db", "ledger", "llm_cache", "embed_cache"])
+def test_corrupt_store_raises_database_open_error(
+    offline_settings: Settings, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    """数据库、账本或缓存损坏、不是 SQLite 数据库（崩溃之后、拷坏了）：以前抛出不带路径的
+    sqlite3.DatabaseError（file is not a database），看不出是四个文件里的哪一个；现在
+    DatabaseOpenError 写明文件与从备份恢复，数据库的锁放掉，坏文件的连接也关掉（第八轮体检）。"""
+    from cuemem.errors import DatabaseOpenError
+    from cuemem.store.files import lock_database, unlock_database
+
+    path: Path = getattr(offline_settings.paths, which)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(os.urandom(8192))
+    opened: list[sqlite3.Connection] = []
+    connect = sqlite3.connect
+
+    def tracking(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = connect(*args, **kwargs)
+        if str(args[0]) == str(path):
+            opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking)
+    with pytest.raises(DatabaseOpenError) as caught:
+        Memory(offline_settings, background=False)
+    assert isinstance(caught.value, sqlite3.OperationalError)
+    assert str(path) in str(caught.value)
+    assert "不是 SQLite 数据库" in str(caught.value) and "从备份恢复" in str(caught.value)
+    assert "检查目录权限" not in str(caught.value)
+    assert opened
+    for conn in opened:  # 已经关掉：再用就是 ProgrammingError
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+    unlock_database(lock_database(offline_settings.paths.db))  # 锁已经放掉
 
 
 def _second_vector_dir(settings: Settings) -> Settings:

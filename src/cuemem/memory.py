@@ -843,6 +843,18 @@ class MemorySystem:
                 spaces.add(parsed[0])
         return sum(self.adopt_open(space) for space in sorted(spaces))
 
+    def can_resume_left_open(self, space_id: str, session_id: str) -> bool:
+        """resume_left_open 现在会不会重新打开这个会话（只看，不改任何东西）：Memory._resume 在
+        run 的上限（max_open_runs）已满时据此决定拒绝，还是照普通的会话写。"""
+        key = (space_id, session_id)
+        with self._open_lock:
+            if key in self._open:
+                return False
+            return (
+                self.db.get_meta(_open_mark(space_id, session_id)) is not None
+                or key in self._handed_over
+            )
+
     def resume_left_open(self, space_id: str, session_id: str) -> bool:
         """接着写之前的进程留下、还开着的会话（cuemem serve 停止或崩溃时没有结束的 /api/v1 的
         run）：数据库里有它的标记、本进程里却不在进行中时，在本进程里重新算作进行中（标记留着），
@@ -1045,7 +1057,8 @@ class MemorySystem:
           "遗忘失败"，调用方以为没删）。
 
         快速路径（第七轮体检）：整段删掉的会话在派生层里什么都没留下（_inert_sessions：没有事实、
-        没有新建或关联的实体，空间里没有待处理的任务；update() 抽不出事实的更正就是这样）时，
+        没有新建或关联的实体，空间里没有待处理的任务，别的会话巩固之后没有再追加发言；update()
+        抽不出事实的更正、infer=False 只记了日志的会话（第八轮体检）就是这样）时，
         事务里不清空派生层，只删这几个会话的片段、摘要与任务（MemoryDB.drop_inert_sessions），
         不重放；对账与消歧的缓存原样留着。结果与重放相同（tests/test_forget_fast.py），trace
         记 fast_path。
@@ -1304,10 +1317,13 @@ class MemorySystem:
 
         - 受影响的会话的每一句都在要删的里面（只删一部分时剩下的要重新抽取）；
         - 没有要删的图片，没有事实出自要删的发言；
-        - 每个受影响的会话恰好有一个没被取代的任务：已完成，统计里没有事实（facts 为 0，合并与
-          重复也不算），没有新建或关联实体，不是内容审核跳过的；
-        - 整个空间没有待处理或失败的任务，派生记忆没有过期（stale），之前的重建做完了：重放
-          除了跳过这几个会话不会做别的；
+        - 每个有任务的受影响会话恰好有一个没被取代的任务：已完成，统计里没有事实（facts 为 0，
+          合并与重复也不算），没有新建或关联实体，不是内容审核跳过的；
+        - 没有任何任务的受影响会话（infer=False 只记了日志，第八轮体检）：重放不为它登记任务、
+          它什么都不贡献，只要它不在进行中、也没有进行中的标记（之前的进程留下、等着接手的）；
+        - 整个空间没有待处理或失败的任务，派生记忆没有过期（stale），之前的重建做完了，别的会话
+          巩固之后没有再追加发言（Consolidator.changed_sessions：infer=False 追加的不登记任务，
+          重放却会按现在的内容重新抽取，第八轮体检）：重放除了跳过这几个会话不会做别的；
         - 没有别的发言引用过被删的记忆（沿引用扩散的已经在要删的里面，只删一部分会话不成立）；
         - 删掉之后说话人（核心记忆按他们挑实体）不变；没有巩固过的会话正在进行中。
 
@@ -1321,14 +1337,27 @@ class MemorySystem:
             return False
         sessions = set(affected)
         own: dict[str, list[dict[str, Any]]] = {}
+        others: list[dict[str, Any]] = []
         with_jobs: set[str] = set()
         for job in self.db.get_jobs(space_id):
             if job["status"] not in ("done", "superseded"):
                 return False
             with_jobs.add(job["session_id"])
-            if job["session_id"] in sessions and job["status"] == "done":
+            if job["session_id"] not in sessions:
+                others.append(job)
+            elif job["status"] == "done":
                 own.setdefault(job["session_id"], []).append(job)
+        jobless = [sid for sid in affected if sid not in with_jobs]
+        if jobless:  # 只记了日志的会话（infer=False）：进行中或留着进行中的标记时照旧重放
+            with self._open_lock:
+                live = self._open | self._deferred
+                if any((space_id, sid) in live for sid in jobless):
+                    return False
+            if any(self.db.get_meta(_open_mark(space_id, sid)) is not None for sid in jobless):
+                return False
         for sid in affected:
+            if sid not in with_jobs:
+                continue
             jobs = own.get(sid, [])
             if len(jobs) != 1:
                 return False
@@ -1338,6 +1367,10 @@ class MemorySystem:
             ):
                 return False
         if self.consolidator.stale(space_id):
+            return False
+        # 别的会话巩固过之后又用 infer=False 追加了发言（第八轮体检）：重放按现在的内容重新登记、
+        # 重新抽取它，这里不碰它就不一样
+        if self.consolidator.changed_sessions(space_id, others):
             return False
         if self.db.get_meta(f"consolidation:{space_id}") == REBUILD_PENDING:
             return False

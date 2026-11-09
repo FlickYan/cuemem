@@ -76,18 +76,22 @@ class Ledger:
         )
         self._lock = threading.Lock()
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS usage ("
-                " ts TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, role TEXT,"
-                " provider TEXT NOT NULL, model TEXT NOT NULL,"
-                " input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,"
-                " cached_input_tokens INTEGER NOT NULL, cost REAL NOT NULL,"
-                " cost_cached REAL NOT NULL, currency TEXT NOT NULL,"
-                " from_cache INTEGER NOT NULL, latency_ms REAL NOT NULL)"
-            )
-            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_run ON usage (run_id)")
-            self._conn.commit()
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS usage ("
+                    " ts TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, role TEXT,"
+                    " provider TEXT NOT NULL, model TEXT NOT NULL,"
+                    " input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,"
+                    " cached_input_tokens INTEGER NOT NULL, cost REAL NOT NULL,"
+                    " cost_cached REAL NOT NULL, currency TEXT NOT NULL,"
+                    " from_cache INTEGER NOT NULL, latency_ms REAL NOT NULL)"
+                )
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_run ON usage (run_id)")
+                self._conn.commit()
+            except BaseException:  # 打开时出错（文件损坏、不是 SQLite 数据库）：不留句柄
+                self._conn.close()
+                raise
 
     def record(self, rec: UsageRecord) -> None:
         row = rec.model_dump()

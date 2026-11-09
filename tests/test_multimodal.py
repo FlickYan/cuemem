@@ -241,6 +241,20 @@ def test_visual_route_reads_only_the_hit_turns(
     assert set(cands.media_score) == set(owner)
 
 
+def test_hidden_images_free_their_visual_slots(mm: tuple[MemorySystem, ScriptedModel]) -> None:
+    """以文搜图这一路同样在检索里就排除 hidden（过期的图片，第七轮体检 P5；第八轮体检 P10 补的
+    测试）：仍取满 pool 张，结果与"取全部再去掉"的前 pool 张相同。以前没带 hidden_ids 时先取前
+    pool 张、再去掉过期的，有效的图片被挤掉。"""
+    system, _ = mm
+    cfg = L1Config(image_kind=None, visual_weight=1.0, pool=1)
+    full = system.l1.candidates("pics", "car", ASKED, replace(cfg, pool=100))
+    order = [mid for mid, _ in full.routes[("media", "visual")]]
+    assert len(order) == 2
+    hidden = frozenset(order[:1])
+    found = system.l1.candidates("pics", "car", ASKED, cfg, hidden=hidden)
+    assert [mid for mid, _ in found.routes[("media", "visual")]] == order[1:]
+
+
 def test_history_blocks_interleave_images(images: dict[str, Path]) -> None:
     session = SessionIn(
         session_id="s",

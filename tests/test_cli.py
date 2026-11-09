@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +112,8 @@ def test_doctor_counts_local_collections(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """doctor 读本地向量库的 meta.json（不打开向量库，serve 正在用时也能查）：集合数与打开文件数
-    的上限；集合超过软上限的一半时提醒改用 Qdrant 服务端。"""
+    的上限；集合超过软上限的一半时提醒改用 Qdrant 服务端，到了 VectorStore 不再建新空间的那条线时
+    说已经不能再建。"""
     meta = tmp_path / "qdrant" / "meta.json"
     meta.parent.mkdir(parents=True)
     meta.write_text(json.dumps({"collections": {f"space_{i}": {} for i in range(3)}}), "utf-8")
@@ -124,6 +128,15 @@ def test_doctor_counts_local_collections(
     flat = _flat(result.output)
     assert "打开文件数上限4（硬上限4）" in flat
     assert "migrate-vectors--toURL" in flat and "CUEMEM_VECTOR_STORE__URL" in flat
+    # 再建一个就占到留给别的文件的余量（store.vector.reserved_files）：VectorStore 拒绝建新空间
+    # 的同一条线，doctor 说已经不能再建（第八轮体检 P3）
+    assert "已经不能再建新的记忆空间" in flat and "503capacity" in flat
+
+    meta.write_text(json.dumps({"collections": {f"s{i}": {} for i in range(3000)}}), "utf-8")
+    monkeypatch.setattr("cuemem.cli._raise_open_file_limit", lambda: (5000, 5000))
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "本地向量库：3000个集合" in flat and "migrate-vectors--toURL" in flat
+    assert "已经不能再建新的记忆空间" not in flat  # 过了一半只是提醒
 
 
 def test_empty_vector_meta_export_still_works_and_doctor_repairs_it(
@@ -233,6 +246,73 @@ def test_unopenable_database_is_one_line_for_servers(
         assert result.stdout == "" and "打不开" in result.stderr
 
 
+@pytest.mark.parametrize("which", ["db", "ledger", "llm_cache", "embed_cache"])
+@pytest.mark.parametrize(
+    "command", [["ask", "hello", "--space", "x"], ["serve", "--no-ui", "--scenario", "plain"]]
+)
+def test_corrupt_store_is_one_line(
+    isolated_paths: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: list[str],
+    which: str,
+) -> None:
+    """数据库、账本或缓存损坏、不是 SQLite 数据库：以前打印 sqlite3.DatabaseError（file is not a
+    database）的调用栈，不说是四个文件里的哪一个；现在一行说明那个文件与从备份恢复，退出码 1
+    （第八轮体检）。"""
+    import sqlite3
+
+    from cuemem.errors import DatabaseOpenError
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    path = tmp_path / which
+    path.write_bytes(os.urandom(8192))
+    calls: list[Any] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: calls.append(app_))
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, sqlite3.DatabaseError) or isinstance(
+        result.exception, DatabaseOpenError
+    ), result.exception
+    flat = _flat(result.output)
+    assert _flat(str(path)) in flat and "不是SQLite" in flat and "从备份恢复" in flat, flat
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", [["spaces"], ["export", "--space", "demo"], ["usage"]])
+def test_corrupt_database_is_one_line_for_readers(
+    isolated_paths: None, tmp_path: Path, command: list[str]
+) -> None:
+    """只读数据库（spaces、export）或账本（usage）的命令遇到损坏的文件：一行说明是哪个文件，
+    退出码 1，以前打印调用栈。"""
+    target = tmp_path / ("ledger" if command == ["usage"] else "db")
+    target.write_bytes(os.urandom(8192))
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    flat = _flat(result.output)
+    assert flat.startswith("错误：") and _flat(str(target)) in flat and "不是SQLite" in flat, flat
+
+
+def test_doctor_live_with_a_corrupt_ledger_is_one_line(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor --live 打开账本测连通性：账本损坏时一行说明是哪个文件，退出码 1；以前打印调用栈，
+    只说 file is not a database（第八轮复审）。不用 Key：缺 Key 的模型跳过，不发请求。"""
+    for name in ("DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    target = tmp_path / "ledger"
+    target.write_bytes(os.urandom(8192))
+    result = runner.invoke(app, ["doctor", "--live"])
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, sqlite3.DatabaseError), result.exception
+    flat = _flat(result.output)
+    assert "错误：" in flat and _flat(str(target)) in flat and "从备份恢复" in flat, flat
+
+
 def test_doctor_reports_free_space(
     isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -247,6 +327,174 @@ def test_doctor_reports_free_space(
     monkeypatch.setattr(shutil, "disk_usage", lambda _: usage._replace(free=50 * 2**20))
     result = runner.invoke(app, ["doctor"])
     assert "剩余空间50MB" in _flat(result.output) and "空间不够" in result.output
+
+
+@pytest.fixture
+def fresh_build_id(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """build_id 缓存结果：每个测试前后清掉，环境变量的改动才看得见。"""
+    from cuemem._build import build_id
+
+    monkeypatch.delenv("CUEMEM_BUILD", raising=False)
+    build_id.cache_clear()
+    yield
+    build_id.cache_clear()
+
+
+def test_version_option_and_doctor_show_the_build(
+    isolated_paths: None, fresh_build_id: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cuemem --version 与 doctor 的第一行写着版本号与构建标识（第八轮体检 P19）：版本号不随每次
+    提交变，以前看不出跑着的是哪一版，--version 也没有（No such option）。"""
+    from cuemem import __version__
+
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith(f"cuemem {__version__} (build ")
+
+    monkeypatch.setenv("CUEMEM_BUILD", "deadbeef")
+    from cuemem._build import build_id
+
+    build_id.cache_clear()
+    result = runner.invoke(app, ["--version"])
+    assert result.output == f"cuemem {__version__} (build deadbeef)\n"
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == f"cuemem {__version__} (build deadbeef)"
+
+
+def test_build_id_without_git_or_direct_url(
+    fresh_build_id: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有 git、也不是从 git 安装（没有 direct_url.json）时 build_id 是 None，不抛异常；
+    CUEMEM_BUILD=unknown（Dockerfile 没给 --build-arg 时的默认值）不算。从 git 安装时取
+    direct_url.json 里的提交号，工作区改过时加 +dirty。"""
+    import importlib.metadata
+
+    from cuemem import _build
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("CUEMEM_BUILD", "unknown")
+
+    class Dist:
+        def __init__(self, text: str | None) -> None:
+            self.text = text
+
+        def read_text(self, name: str) -> str | None:
+            assert name == "direct_url.json"
+            return self.text
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _: Dist(None))
+    assert _build.build_id() is None
+
+    _build.build_id.cache_clear()
+    vcs = {"vcs": "git", "commit_id": "0123456789abcdef0123", "dirty": True}
+    text = json.dumps({"url": "https://example.invalid/x.git", "vcs_info": vcs})
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _: Dist(text))
+    assert _build.build_id() == "0123456789ab+dirty"
+
+
+def test_import_cuemem_does_not_load_the_build_module() -> None:
+    """import cuemem 不导入 cuemem._build（可能起 git 子进程）：启动时间不变。"""
+    done = subprocess.run(
+        [sys.executable, "-c", "import sys, cuemem; print('cuemem._build' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
+
+
+def _jobs_db(tmp_path: Path) -> Any:
+    from cuemem.store.sqlite import MemoryDB
+    from cuemem.write.consolidate import PIPELINE_VERSION
+
+    db = MemoryDB(tmp_path / "db")
+    db.enqueue_jobs("alice", [("j1", "s1", PIPELINE_VERSION, "h1")])
+    db.enqueue_jobs("bob", [("j2", "s2", PIPELINE_VERSION, "h2")])
+    return db
+
+
+def test_doctor_reports_failed_jobs(isolated_paths: None, tmp_path: Path) -> None:
+    """doctor 列出抽取失败的任务（数目、错误的第一行、补做的命令）与排队的任务总数（第八轮体检
+    P16）。自动重试用完之后（Key 过期、余额不足）写入照样成功、健康检查照样正常，以前 doctor
+    什么都不说。错误只取第一行、最多 200 个字符：可能引用了模型输出里的用户原文。"""
+    db = _jobs_db(tmp_path)
+    db.fail_job("j1", "APIConnectionError: unreachable\nsecond line with user text")
+    db.close()
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "记忆空间alice有1个抽取失败的任务" in flat
+    assert "APIConnectionError:unreachable" in flat and "secondline" not in flat
+    assert "cuememconsolidate--spacealice" in flat
+    assert "排队等待巩固的任务：1个" in flat  # bob 的
+    assert "bob有" not in flat and "按旧的配置" not in flat
+
+
+def test_doctor_reports_stale_spaces(isolated_paths: None, tmp_path: Path) -> None:
+    """按旧流水线版本登记过任务、或巩固指纹与当前配置不同的空间是过期的：后台线程不重建（D-073
+    P2），doctor 提醒显式巩固（第八轮体检 P16）。清空重建没做完的另起一行，不算过期。"""
+    from cuemem.write.consolidate import REBUILD_PENDING
+
+    db = _jobs_db(tmp_path)
+    db.enqueue_jobs("carol", [("j3", "s3", "old", "h3")])
+    db.set_meta("consolidation:bob", "fingerprint-of-another-config")
+    db.set_meta("consolidation:alice", REBUILD_PENDING)
+    db.close()
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "记忆空间carol是按旧的配置抽取的" in flat and "cuememconsolidate--spacecarol" in flat
+    assert "记忆空间bob是按旧的配置抽取的" in flat
+    assert "alice是按旧的配置" not in flat and "记忆空间alice有没做完的重建" in flat
+
+
+def test_doctor_caps_the_job_listing(isolated_paths: None, tmp_path: Path) -> None:
+    from cuemem.cli import JOB_LINES
+
+    db = _jobs_db(tmp_path)
+    for i in range(JOB_LINES + 3):
+        db.enqueue_jobs(f"u{i:02d}", [(f"o{i}", "s", "old", "h")])
+    db.close()
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert flat.count("是按旧的配置抽取的") == JOB_LINES and "……还有3条" in flat
+
+
+def test_doctor_does_not_create_the_database(isolated_paths: None, tmp_path: Path) -> None:
+    """数据库还不存在时 doctor 不新建它（只读的检查）。"""
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "db").exists()
+    assert "排队等待巩固" not in result.output
+
+
+def test_doctor_explains_a_corrupt_database(isolated_paths: None, tmp_path: Path) -> None:
+    """数据库损坏、不是 SQLite 数据库时 doctor 照样跑完，读巩固任务的那一行写明是哪个文件、
+    从备份恢复（第八轮体检 P16 与 P11 合在一起）：以前只有 "file is not a database"。"""
+    (tmp_path / "db").write_bytes(os.urandom(8192))
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "读不了巩固任务" in flat and _flat(str(tmp_path / "db")) in flat
+    assert "从备份恢复" in flat
+
+
+def test_doctor_reports_cache_sizes(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor 写明 LLM 缓存、向量缓存（连同 -wal）与 trace 目录多大；没设 trace 保留天数、合计
+    超过门槛时标黄并指向 CUEMEM_TRACES_RETENTION_DAYS（第八轮体检 P16）。"""
+    monkeypatch.setattr("cuemem.cli.CACHE_WARN", 2**20)
+    (tmp_path / "llm_cache").write_bytes(b"x" * 2**20)
+    (tmp_path / "embed_cache-wal").write_bytes(b"x" * 2**20)
+    (tmp_path / "traces" / "2026").mkdir(parents=True)
+    (tmp_path / "traces" / "2026" / "a.jsonl").write_bytes(b"x" * 3 * 2**20)
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "缓存2MB" in flat and "trace3MB" in flat
+    assert "CUEMEM_TRACES_RETENTION_DAYS" in flat
+
+    monkeypatch.setenv("CUEMEM_TRACES_RETENTION_DAYS", "30")
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "缓存2MB" in flat and "CUEMEM_TRACES_RETENTION_DAYS" not in flat
 
 
 @pytest.mark.filterwarnings(
@@ -408,8 +656,9 @@ def test_consolidate_inspect_and_forget(
     assert "新加坡一家电商公司" not in _flat(result.output)
 
 
-def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """一个用户 u：昨天到期的住址与没有过期时间的爱好，都已巩固（离线的脚本化模型）。返回模型。"""
+def _expired_space(monkeypatch: pytest.MonkeyPatch, *, doctor: bool = False) -> Any:
+    """一个用户 u：昨天到期的住址与没有过期时间的爱好，都已巩固（离线的脚本化模型）。返回模型。
+    doctor=True 时另有一段昨天到期的看医生，抽出实体 Dr. Kim（带描述）。"""
     from datetime import date, timedelta
 
     from fakes import FakeAPI
@@ -430,7 +679,10 @@ def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
              "cardinality": "multi", "importance": 4, "turns": [int(n)]}
             for n, text in lines
         ]  # fmt: skip
-        return {"summary": "", "facts": facts, "entities": []}
+        entities = []
+        if any("Dr. Kim" in text for _, text in lines):
+            entities = [{"name": "Dr. Kim", "type": "person", "description": "the user's doctor"}]
+        return {"summary": "", "facts": facts, "entities": entities}
 
     model = ScriptedModel(said)
     api = FakeAPI()
@@ -445,6 +697,8 @@ def _expired_space(monkeypatch: pytest.MonkeyPatch) -> Any:
     with Memory(load_settings(), background=False) as memory:
         yesterday = date.today() - timedelta(days=1)
         memory.add("I live in Berlin", user_id="u", expiration_date=yesterday, wait=True)
+        if doctor:
+            memory.add("I see Dr. Kim weekly", user_id="u", expiration_date=yesterday, wait=True)
         memory.add("I like jazz", user_id="u", wait=True)
     return model
 
@@ -473,6 +727,22 @@ def test_ask_and_inspect_leave_out_expired_memories(
     result = runner.invoke(app, ["inspect", "facts", "--space", "u", "--hide-expired"])
     assert result.exit_code == 0, result.output
     assert "Berlin" not in result.output and "jazz" in result.output
+
+
+def test_inspect_entities_marks_entities_known_only_from_expired_facts(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第八轮体检 P5：inspect entities 以前不标过期，过期会话里抽出的实体与描述照样列着；
+    现在标"已过期"（检查用，照样列出），--hide-expired 时不列出。"""
+    _expired_space(monkeypatch, doctor=True)
+    result = runner.invoke(app, ["inspect", "entities", "--space", "u"])
+    assert result.exit_code == 0, result.output
+    rows = [line for line in result.output.splitlines() if "Dr. Kim" in line or "User" in line]
+    assert len(rows) == 2, result.output
+    assert all(("已过期" in line) == ("Dr. Kim" in line) for line in rows), rows
+    result = runner.invoke(app, ["inspect", "entities", "--space", "u", "--hide-expired"])
+    assert result.exit_code == 0, result.output
+    assert "Dr. Kim" not in result.output and "User" in result.output
 
 
 def test_inspect_reads_next_to_a_running_server(
@@ -724,6 +994,214 @@ def test_servers_bound_the_graceful_shutdown(
     assert result.exit_code == 0, result.output
     [kwargs] = options
     assert kwargs["timeout_graceful_shutdown"] == GRACEFUL_SHUTDOWN_S == 20
+
+
+# 替身的 uvicorn.run 像 uvicorn 那样：排空之后把收到的 SIGTERM 重发给"原来的"处理函数
+SIGTERM_AFTER_DRAIN = """
+import signal, sys
+import uvicorn
+from cuemem.api.proxy import MemoryProxy
+from cuemem.memory import MemorySystem
+
+def fake_run(app_, **kwargs):
+    print("handler", getattr(signal.getsignal(signal.SIGTERM), "__name__", None), flush=True)
+    signal.raise_signal(signal.SIGTERM)
+    print("survived", flush=True)
+
+def logged(name, original):
+    def wrapper(self, *args, **kwargs):
+        print(name, flush=True)
+        return original(self, *args, **kwargs)
+    return wrapper
+
+uvicorn.run = fake_run
+MemoryProxy.close_all = logged("close_all", MemoryProxy.close_all)
+MemorySystem.close = logged("system_close", MemorySystem.close)
+from cuemem.cli import app
+app(sys.argv[1:], prog_name="cuemem")
+"""
+
+
+def _server_env(tmp_path: Path) -> dict[str, str]:
+    """子进程里的 serve / proxy：离线的哈希向量、临时目录里的数据与 TMPDIR；代理指向不通的端口，
+    子进程没有 netguard，漏网的联网请求也只会立刻失败。"""
+    env = dict(os.environ)
+    env.update(
+        CUEMEM_EMBEDDING__BACKEND="hash",
+        CUEMEM_EMBEDDING__DIM="128",
+        CUEMEM_PATHS__MEDIA=str(tmp_path / "media"),
+        DEEPSEEK_API_KEY="sk-test-deepseek",
+        DASHSCOPE_API_KEY="sk-test-dashscope",
+        HTTP_PROXY="http://127.0.0.1:9",
+        HTTPS_PROXY="http://127.0.0.1:9",
+        NO_PROXY="",
+        TMPDIR=str(tmp_path / "tmp"),
+    )
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    return env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 SIGTERM 的处理函数")
+@pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
+def test_sigterm_runs_the_shutdown_sequence(
+    isolated_paths: None, tmp_path: Path, command: list[str]
+) -> None:
+    """uvicorn 排空之后把 SIGTERM 重发给原来的处理函数：以前是默认处理，进程当场结束（退出码
+    -15），serve 与 proxy 的 finally（结束会话、写回、关记忆系统）都不执行（第八轮体检 P2）。
+    现在变成 SystemExit(143)，收尾照常执行。"""
+    done = subprocess.run(
+        [sys.executable, "-c", SIGTERM_AFTER_DRAIN, *command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_server_env(tmp_path),
+    )
+    assert done.returncode == 143, (done.returncode, done.stdout, done.stderr)
+    lines = done.stdout.splitlines()
+    assert "handler _sigterm_to_exit" in lines and "survived" not in lines
+    assert lines.index("close_all") < lines.index("system_close")
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 SIGTERM")
+def test_terminated_server_checkpoints_and_removes_its_temp_dir(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真的启动 cuemem serve（带界面时）再发 SIGTERM（systemd、kill、docker --init 的停法）：退出码
+    143，WAL 已检查点（-wal 文件不在或为空），界面放原图副本的 cuemem-gradio-* 目录已删掉，同一个
+    数据目录随后能照常打开。"""
+    import urllib.request
+
+    pytest.importorskip("gradio")
+    env = _server_env(tmp_path)
+    port = _free_port()
+    command = [str(Path(sys.executable).parent / "cuemem"), "serve", "--scenario", "plain"]
+    server = subprocess.Popen(
+        [*command, "--port", str(port)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        deadline = time.monotonic() + 90
+        while True:
+            assert server.poll() is None, server.communicate()[1]
+            try:
+                opener.open(f"http://127.0.0.1:{port}/api/health", timeout=2).read()
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "serve 没有在 90 秒内启动"
+                time.sleep(0.2)
+        assert list((tmp_path / "tmp").glob("cuemem-gradio-*"))  # 界面的临时目录在用
+        server.terminate()
+        _, stderr = server.communicate(timeout=90)
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.communicate()
+    assert server.returncode == 143, stderr
+    assert not list((tmp_path / "tmp").glob("cuemem-gradio-*"))
+    for path in (Path(os.environ["CUEMEM_PATHS__DB"]), Path(os.environ["CUEMEM_PATHS__LEDGER"])):
+        wal = path.with_name(path.name + "-wal")
+        assert not wal.exists() or wal.stat().st_size == 0, wal
+    from cuemem.sdk import Memory
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope")
+    memory = Memory(background=False)
+    try:
+        assert memory.get_all(user_id="nobody")["results"] == []
+    finally:
+        memory.close()
+
+
+# 替身的 uvicorn.run 与 MCPServer.run：服务"运行"时记一条带调用栈的警告（像抽取失败时那样）
+LOG_ONE_WARNING = """
+import logging, sys
+import uvicorn
+from mcp.server.mcpserver import MCPServer
+
+def warn(*args, **kwargs):
+    try:
+        raise ConnectionError("APIConnectionError: Connection error " * 4)
+    except ConnectionError:
+        logging.getLogger("cuemem.x").warning("a b c " * 30, exc_info=True)
+
+uvicorn.run = warn
+MCPServer.run = warn
+from cuemem.cli import app
+app(sys.argv[1:], prog_name="cuemem")
+"""
+LOG_LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} WARNING cuemem\.x: (a b c ){30}$")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["serve", "--no-ui", "--scenario", "plain"],
+        ["serve", "--no-ui", "--scenario", "plain", "--no-mcp"],
+        ["proxy"],
+        ["mcp"],
+    ],
+)
+def test_server_logs_are_plain_lines(
+    isolated_paths: None, tmp_path: Path, command: list[str]
+) -> None:
+    """serve、proxy 与 mcp 的日志不论装没装 MCP 都是一条一行、带时间、级别与 logger 名字（第八轮
+    体检 P13）。以前装了 MCP 时是 Rich 的框（非终端里按 80 列折行，grep 找不到整句，一次出错几十
+    上百行），--no-mcp 与 proxy 时没有时间、级别与名字（Python 的 lastResort）。"""
+    done = subprocess.run(
+        [sys.executable, "-c", LOG_ONE_WARNING, *command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_server_env(tmp_path),
+    )
+    assert done.returncode == 0, done.stderr
+    lines = done.stderr.splitlines()
+    assert [line for line in lines if LOG_LINE.match(line)] == [lines[0]], done.stderr
+    assert lines[1] == "Traceback (most recent call last):", done.stderr
+    assert lines[-1] == "ConnectionError: " + "APIConnectionError: Connection error " * 4
+    assert not set("╭│╰─") & set(done.stderr) and len(lines) < 15, done.stderr
+
+
+def test_bad_log_level_is_refused(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUEMEM_LOG_LEVEL 不是那五个名字时说明并退出（退出码 2），不启动；大小写不论。"""
+    monkeypatch.setenv("CUEMEM_LOG_LEVEL", "loud")
+    for command in (["serve", "--no-ui", "--scenario", "plain"], ["proxy"], ["mcp"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 2 and served == [], result.output
+        assert "CUEMEM_LOG_LEVEL" in _flat(result.output) and "loud" in result.output
+    # 只认文档里的五个名字：Python 的别名 WARN、FATAL 与 NOTSET 也拒绝
+    for alias in ("warn", "FATAL", "notset"):
+        monkeypatch.setenv("CUEMEM_LOG_LEVEL", alias)
+        result = runner.invoke(app, ["proxy"])
+        assert result.exit_code == 2 and served == [], (alias, result.output)
+    monkeypatch.setenv("CUEMEM_LOG_LEVEL", "info")
+    assert runner.invoke(app, ["proxy"]).exit_code == 0 and len(served) == 1
+
+
+def test_access_log_flags(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """--access-log/--no-access-log：serve 默认不记（与以前相同），proxy 默认记。serve 加了
+    --access-log 时 uvicorn 用 INFO 级别（访问日志是 INFO）。"""
+    options: list[dict[str, Any]] = []
+    monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: options.append(kwargs))
+    serve = ["serve", "--no-ui", "--scenario", "plain"]
+    for command in (serve, [*serve, "--access-log"], ["proxy"], ["proxy", "--no-access-log"]):
+        assert runner.invoke(app, command).exit_code == 0
+    picked = [(o["access_log"], o.get("log_level")) for o in options]
+    assert picked == [(False, "warning"), (True, "info"), (True, None), (False, None)]
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
@@ -1032,6 +1510,31 @@ def test_keys_add_prints_token_once_and_file_is_0600_and_parses(
     assert agent_key is not None and agent_key.allows("agent/bot")
     assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
     assert runner.invoke(app, ["keys", "add", "b", "--file", str(fresh)]).exit_code == 1
+
+
+def test_keys_add_max_spaces_and_the_any_agent_reminder(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """keys add --max-spaces 写进令牌文件（keys list 列出）；只给 --user 不给 --agent、又没给
+    --max-spaces 时在标准错误提醒：任意 agent_id 都是新的空间（第八轮体检 P3）。"""
+    from cuemem.api.auth import Keys
+
+    path = tmp_path / "keys.yaml"
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
+    loose = runner.invoke(app, ["keys", "add", "a", "--user", "alice"])
+    assert loose.exit_code == 0, loose.output
+    assert "任意agent_id" in _flat(loose.stderr) and "--max-spaces" in loose.stderr
+    capped = runner.invoke(app, ["keys", "add", "b", "--user", "bob", "--max-spaces", "2"])
+    assert capped.exit_code == 0 and "任意" not in capped.stderr
+    bound = runner.invoke(app, ["keys", "add", "c", "--user", "carol", "--agent", "shop"])
+    assert bound.exit_code == 0 and "任意" not in bound.stderr
+    keys = Keys.parse(path.read_text(encoding="utf-8"))
+    principal = keys.resolve(capped.stdout.strip())
+    assert principal is not None and principal.max_spaces == 2
+    assert [p.max_spaces for _, p in keys.scoped] == [None, 2, None]
+    listed = runner.invoke(app, ["keys", "list"], terminal_width=200)
+    assert "空间上限" in listed.stdout
+    assert runner.invoke(app, ["keys", "add", "d", "--user", "d", "--max-spaces", "0"]).exit_code
 
 
 def test_keys_add_says_where_the_file_is_and_never_makes_directories(

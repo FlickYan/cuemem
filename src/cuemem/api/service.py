@@ -9,9 +9,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,10 +23,12 @@ from cuemem.agent.shop import SHOP_PERSONA, Catalog, shop_tools
 from cuemem.api.limits import MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import PROJECT_ROOT, Settings
 from cuemem.core.ids import sortable_session_id, stable_id
-from cuemem.core.models import Entity, SessionIn, TurnIn
+from cuemem.core.mentions import Mentions
+from cuemem.core.models import SessionIn, TurnIn
 from cuemem.core.types import RecallMode, Router, Scenario
 from cuemem.errors import CueMemError, SessionLimitError
 from cuemem.evidence import fact_state, recall_listing, resolve_ids
+from cuemem.expiry import expired_entity_ids
 from cuemem.memory import ForgetReport, MemorySystem
 
 SHOP_CATALOG = PROJECT_ROOT / "demo" / "shop" / "catalog.json"  # 只在源码仓库里有，不进 wheel
@@ -341,7 +342,17 @@ class ChatService:
             )
         return rows
 
-    def entities(self, space_id: str) -> list[dict[str, Any]]:
+    def entities(self, space_id: str, *, show_expired: bool = False) -> list[dict[str, Any]]:
+        """实体列表。只出现在已经过期的事实里的实体（连同抽取时写的描述）默认不列出，同事实表、
+        实体图与图库（第八轮体检）；show_expired=True 时也列出，各行的 expired 标着。规则见
+        expiry.expired_entity_ids：没有任何事实提到的实体照旧列出（没有出处可以判断）。没有
+        过期的发言时（绝大多数空间）不读事实。"""
+        entities = self.system.entities(space_id)
+        gone = self.system.expired_ids(space_id, datetime.now())
+        dead: frozenset[str] = frozenset()
+        if gone:
+            facts = self.system.facts(space_id, current_only=False)
+            dead = expired_entity_ids(facts, gone, Mentions(entities).find)
         return [
             {
                 "id": e.id,
@@ -350,15 +361,17 @@ class ChatService:
                 "aliases": e.aliases,
                 "description": e.description,
                 "mentions": e.mentions,
+                "expired": e.id in dead,
             }
-            for e in self.system.entities(space_id)
+            for e in entities
+            if show_expired or e.id not in dead
         ]
 
     def graph(self, space_id: str, *, show_expired: bool = False) -> dict[str, Any]:
         """实体图：实体为点；当前有效的事实把主语和它提到的其他实体连起来（宾语，或陈述里
         出现了名字或别名的实体），边上写谓词。已经过期的事实不算（show_expired=True 时也算）。"""
         entities = {e.id: e for e in self.system.entities(space_id)}
-        mentions = _Mentions(entities.values())
+        mentions = Mentions(entities.values())
         gone = frozenset() if show_expired else self.system.expired_ids(space_id, datetime.now())
         edges = []
         degree: dict[str, int] = {}
@@ -460,39 +473,6 @@ class ChatService:
             if not session.closed:
                 self.agent.end(session)  # 登记巩固任务；进程退出后下次巩固时完成
         self.system.close()
-
-
-class _Mentions:
-    """实体图找陈述里出现了哪些实体的名字或别名（三个字及以上，不分大小写，前后不是单词字符，
-    即正则的 (?<!\\w)别名(?!\\w)）。以前每条事实把每个实体的每个别名都试一遍，实体数 × 事实数：
-    5000 个实体、1 万条事实要 19 秒，界面每次刷新都算。现在把别名放进字典，每条事实只在单词边界
-    之间、不长于最长别名的片段里查，结果与原来的正则逐条相同（包括两头是标点的别名、中文名字在
-    不分词的中文里照旧找不到）。"""
-
-    def __init__(self, entities: Iterable[Entity]) -> None:
-        self.index: dict[str, set[str]] = {}
-        for e in entities:
-            for name in [e.name, *e.aliases]:
-                if len(name) >= 3:
-                    self.index.setdefault(name.lower(), set()).add(e.id)
-        self.longest = max(map(len, self.index), default=0)
-
-    def find(self, text: str) -> set[str]:
-        text = text.lower()
-        if not self.index:
-            return set()
-        word = [c.isalnum() or c == "_" for c in text]  # 与 re 的 Unicode \w 相同
-        n = len(text)
-        ends = [q for q in range(1, n + 1) if q == n or not word[q]]
-        found: set[str] = set()
-        for p in range(n):
-            if p and word[p - 1]:
-                continue
-            for q in ends[bisect_right(ends, p) :]:
-                if q - p > self.longest:
-                    break
-                found |= self.index.get(text[p:q], set())
-        return found
 
 
 def _display(name: str, aliases: list[str]) -> str:

@@ -93,28 +93,33 @@ class ResponseCache:
         self._locks_dir = path.with_name(path.name + ".holds") if path is not None else None
         self._holds: dict[str, _HoldLock] = {}  # 本对象标记着、还没核对的归属
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS llm_cache ("
-                " key TEXT PRIMARY KEY, model TEXT NOT NULL, response TEXT NOT NULL,"
-                " created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, scope TEXT)"
-            )
-            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(llm_cache)")}
-            if "scope" not in columns:  # N3 之前建的缓存库
-                self._conn.execute("ALTER TABLE llm_cache ADD COLUMN scope TEXT")
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_llm_cache_scope ON llm_cache (scope)"
-            )
-            # 遗忘时标记、待核对的条目（见 hold、settle）；owner 是标记它的那次遗忘的锁（_HoldLock）
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS llm_cache_held ("
-                " key TEXT PRIMARY KEY, scope TEXT NOT NULL, owner TEXT)"
-            )
-            held = {row[1] for row in self._conn.execute("PRAGMA table_info(llm_cache_held)")}
-            if "owner" not in held:  # 第二轮复审之前建的缓存库：那时的标记没有 owner
-                self._conn.execute("ALTER TABLE llm_cache_held ADD COLUMN owner TEXT")
-            self._conn.commit()
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA secure_delete=ON")  # 遗忘时删除的条目不留在空闲页里
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS llm_cache ("
+                    " key TEXT PRIMARY KEY, model TEXT NOT NULL, response TEXT NOT NULL,"
+                    " created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, scope TEXT)"
+                )
+                columns = {row[1] for row in self._conn.execute("PRAGMA table_info(llm_cache)")}
+                if "scope" not in columns:  # N3 之前建的缓存库
+                    self._conn.execute("ALTER TABLE llm_cache ADD COLUMN scope TEXT")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_llm_cache_scope ON llm_cache (scope)"
+                )
+                # 遗忘时标记、待核对的条目（见 hold、settle）；owner 是标记它的那次遗忘的锁
+                # （_HoldLock）
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS llm_cache_held ("
+                    " key TEXT PRIMARY KEY, scope TEXT NOT NULL, owner TEXT)"
+                )
+                held = {row[1] for row in self._conn.execute("PRAGMA table_info(llm_cache_held)")}
+                if "owner" not in held:  # 第二轮复审之前建的缓存库：那时的标记没有 owner
+                    self._conn.execute("ALTER TABLE llm_cache_held ADD COLUMN owner TEXT")
+                self._conn.commit()
+            except BaseException:  # 打开时出错（文件损坏、不是 SQLite 数据库）：不留句柄
+                self._conn.close()
+                raise
         self._drop_held()
 
     def get(self, key: str) -> dict[str, Any] | None:

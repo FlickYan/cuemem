@@ -155,6 +155,47 @@ def test_local_vectors_migrate_into_the_server(
         source.close()
 
 
+def test_hidden_ids_are_filtered_by_the_server(server: VectorStore, token: str) -> None:
+    """hidden_ids（过期的记忆，第七轮体检 P5）在服务端上同样在检索里排除：must_not 的
+    HasIdCondition 与 kind、ts 的条件一起由服务端求值，结果等于不过滤的前 k + 4 条去掉它们、
+    再取前 k 条。test_vector_mask.py 只在本地模式上核对过（第八轮体检 P10）。"""
+    space = f"{token}/frank"
+    rng = np.random.default_rng(7)
+    n, k = 10, 4
+    ids = [f"u{i}" for i in range(n)]
+    dense = l2_normalize(rng.random((n, 4)).astype(np.float32))
+    sparse = [
+        SparseVector(indices=[1, 2 + i % 3], values=[1.0 + i / 10, 0.5 + i / 20]) for i in range(n)
+    ]
+    payloads = [{"kind": "round" if i % 3 else "fact", "ts": 100.0 * i} for i in range(n)]
+    server.upsert(space, ids, dense, sparse, payloads)
+    images = l2_normalize(rng.random((3, 2)).astype(np.float32))
+    server.upsert_images(space, ["m0", "m1", "m2"], images, [{"ts": float(i)} for i in range(3)])
+    _wait_indexed(server, space)
+
+    query = l2_normalize(np.array([[1.0, 0.5, 0.2, 0.1]], dtype=np.float32))[0]
+    probe = SparseVector(indices=[1, 3], values=[1.0, 1.0])
+    for kinds, ts_range in ((None, None), (["round"], None), (["round"], (150.0, None))):
+        every = server.search_dense(space, query, k + 4, kinds=kinds, ts_range=ts_range)
+        hidden = {h.unit_id for h in every[:3]} | {"never-stored"}
+        hits = server.search_dense(
+            space, query, k, kinds=kinds, ts_range=ts_range, hidden_ids=hidden
+        )
+        expected = [h.unit_id for h in every if h.unit_id not in hidden][:k]
+        assert [h.unit_id for h in hits] == expected and expected, (kinds, ts_range)
+        words = server.search_sparse(space, probe, k + 4, kinds=kinds, ts_range=ts_range)
+        gone = {h.unit_id for h in words[:3]} | {"never-stored"}
+        found = server.search_sparse(
+            space, probe, k, kinds=kinds, ts_range=ts_range, hidden_ids=gone
+        )
+        left = [h.unit_id for h in words if h.unit_id not in gone][:k]
+        assert [h.unit_id for h in found] == left and left, (kinds, ts_range)
+    pictures = server.search_images(space, images[0], 3)
+    hidden = {pictures[0].unit_id, "never-stored"}
+    shown = server.search_images(space, images[0], 2, hidden_ids=hidden)
+    assert [h.unit_id for h in shown] == [h.unit_id for h in pictures[1:]]
+
+
 @pytest.mark.skipif(not KEY, reason="服务端没设 API Key：设 CUEMEM_TEST_QDRANT_API_KEY")
 def test_a_keyed_server_refuses_a_store_without_the_key(server: VectorStore, token: str) -> None:
     """服务端真的在查 Key（CI 给 Qdrant 设了 QDRANT__SERVICE__API_KEY）：带 Key 的连接照常，不带的
@@ -171,3 +212,14 @@ def test_a_keyed_server_refuses_a_store_without_the_key(server: VectorStore, tok
         assert refused.value.status_code == 401
     finally:
         keyless.close()
+
+
+def test_ping_reaches_the_server(server: VectorStore) -> None:
+    """/api/ready 的探活（第八轮体检 P9）：服务端在时 True（带着 Key）；Key 不对时 False。"""
+    assert server.ping()
+    if KEY:
+        wrong = VectorStore(None, dim=4, url=URL, api_key="not-the-key")
+        try:
+            assert not wrong.ping()
+        finally:
+            wrong.close()

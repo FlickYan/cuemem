@@ -86,6 +86,17 @@ MIRRORED_SPACES = 4
 DIGESTS_KEPT = 100_000  # 记着内容指纹的会话数（见 enqueue），超过时清空重算
 
 
+def consolidation_fingerprint(model: str, config: ConsolidationConfig) -> str:
+    """影响巩固结果的配置指纹（见 Consolidator.fingerprint）：流水线版本、抽取模型与巩固配置，
+    并发数不算。单独成函数，cuemem doctor 不组装 Consolidator 也能按配置判断空间是否过期。"""
+    # 没有补充说明时不计入指纹：加这个字段之前巩固过的空间不会被判为过期
+    exclude = {"workers", "background_workers"}
+    if config.instructions is None:
+        exclude.add("instructions")
+    dumped = json.dumps(config.model_dump(exclude=exclude), sort_keys=True)
+    return stable_id(PIPELINE_VERSION, model, dumped)
+
+
 @dataclass
 class ConsolidationReport:
     space_id: str
@@ -250,6 +261,28 @@ class Consolidator:
             self._digests[key] = (version, started_at, digest)
         return digest
 
+    def changed_sessions(self, space_id: str, jobs: Sequence[Mapping[str, Any]]) -> set[str]:
+        """这些任务里已完成（当前版本）的，会话的内容现在与任务记下的指纹不同的会话（第八轮
+        体检）：巩固之后又用 infer=False 追加了发言，没有登记新任务，regrown_sessions（要有待
+        处理的任务）看不出来，重放时 requeue 却会按现在的内容重新登记、重新抽取。会话或发言
+        已经没了的也算。用 enqueue 的同一个指纹缓存（_digest），只读不改任务。"""
+        done = [j for j in jobs if j["status"] == "done" and j["version"] == PIPELINE_VERSION]
+        sids = list(dict.fromkeys(j["session_id"] for j in done))
+        if not sids:
+            return set()
+        sessions = self.db.sessions_of(space_id, sids)
+        versions = self.db.turns_versions(space_id, [s for s in sids if s in sessions])
+        changed: set[str] = set()
+        for job in done:
+            sid = job["session_id"]
+            started = sessions.get(sid)
+            if (
+                started is None
+                or self._digest(space_id, sid, started, versions[sid]) != job["content_hash"]
+            ):
+                changed.add(sid)
+        return changed
+
     def fingerprint(self) -> str:
         """影响巩固结果的配置指纹：流水线版本、抽取模型、阈值等（并发数不算）。
 
@@ -258,12 +291,7 @@ class Consolidator:
         也要放进 exclude。"""
         role = self.extractor.llm.settings.roles.get(self.extractor.role)
         model = self.extractor.model or (role.model if role else "")
-        # 没有补充说明时不计入指纹：加这个字段之前巩固过的空间不会被判为过期
-        exclude = {"workers", "background_workers"}
-        if self.config.instructions is None:
-            exclude.add("instructions")
-        config = json.dumps(self.config.model_dump(exclude=exclude), sort_keys=True)
-        return stable_id(PIPELINE_VERSION, model, config)
+        return consolidation_fingerprint(model, self.config)
 
     def stale(self, space_id: str) -> bool:
         """派生记忆是否过期：有用旧版本流水线处理过的会话，或巩固配置变了（需要重建）。
@@ -1017,6 +1045,10 @@ class ConsolidationWorker:
                     return False
                 self._cond.wait(remaining)
         return True
+
+    def alive(self) -> bool:
+        """后台线程都还在（/api/ready 用）：_loop 抛出没接住的异常时线程会退出，任务从此不再做。"""
+        return all(thread.is_alive() for thread in self._threads)
 
     def stop(self) -> None:
         """已经排着的空间做完再退出（之后到期的重试不再排），所有线程一共最多等 stop_timeout_s

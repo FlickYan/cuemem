@@ -12,6 +12,8 @@ import inspect
 import io
 import json
 import math
+import os
+import re
 import subprocess
 import sys
 import threading
@@ -20,17 +22,18 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx2
 import pytest
 from fakes import NO_BALANCE, PROJECT_ROOT, RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import BaseModel, TypeAdapter
-from scripted import ScriptedModel
+from scripted import ScriptedModel, _fact
 from test_forget import embed_cache_full_once, no_space_for_trace_rewrites
 from test_sdk import (
     AUG,
@@ -40,6 +43,7 @@ from test_sdk import (
     without_balance_for_extracting,
     without_balance_for_reconciling,
 )
+from test_store import small_open_file_limit
 
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
@@ -62,11 +66,15 @@ from cuemem.errors import (
     IdempotencyConflictError,
     MemoryAPIError,
     SessionLimitError,
+    VectorStoreFullError,
 )
 from cuemem.evidence import MEMORY_NOTE, RAISED_REASON, inject_evidence, recall_evidence
 from cuemem.memory import MemorySystem
+from cuemem.portable import ExportPlan
 from cuemem.sdk import space_for
 from cuemem.store.media import ACCEPTED_FORMATS
+from cuemem.store.sqlite import MemoryDB
+from cuemem.store.vector import reserved_files
 
 Mem = Memory | MemoryClient
 
@@ -235,9 +243,10 @@ ARGUMENTS: dict[str, Any] = {
     "derived": False,
     "idempotency_key": "retry-0001",
     "timeout": 2.0,  # 比 TestClient 的读超时（5 秒）减去 WAIT_MARGIN_S 短，原样发出
+    "format": "mem0",  # load：Mem0 的导出（服务端先换算、查作用域，再交给 Memory.load）
 }
 PER_METHOD: dict[tuple[str, str], Any] = {
-    ("load", "data"): {"version": 2, "space_id": "alice"},
+    ("load", "data"): [{"id": "m1", "memory": "hi", "created_at": "2026-01-01T00:00:00"}],
     ("wait", "timeout"): 0.3,  # /wait 等不到（见 _Recorder 的 worker）：0.3 秒后 504
 }
 RETURNS: dict[str, Any] = {
@@ -247,6 +256,8 @@ RETURNS: dict[str, Any] = {
     "spaces": [],
     "media": b"image",
     "wait": None,
+    # GET /api/v1/export 边读边写（第八轮体检 P7）：调用 Memory._export_plan，再写出这个计划
+    "_export_plan": ExportPlan(cast(MemoryDB, None), "alice", [], {}, {}, set(), None),
 }
 
 
@@ -318,6 +329,8 @@ def test_every_argument_reaches_memory(name: str) -> None:
     called, got = recorder.calls[0]  # open_run 之后，关掉客户端时还会 end_run
     if name == "batch_delete":  # 客户端换成 delete_many 的请求，服务端照样调用 delete_many
         name, args = "delete_many", {"memory_ids": ["m1", "m2"], "dry_run": False}
+    if name == "export":  # 边读边写：服务端调用 Memory._export_plan，参数与 export 相同
+        name = "_export_plan"
     assert called == name
     assert _meaning(name, got) == _meaning(name, args)
 
@@ -407,6 +420,47 @@ def test_add_events_history_and_time_travel(mem: Mem) -> None:
     ]
     assert mem.get("no-such-id") is None and mem.history("no-such-id") == []
     assert "Munich" in mem.profile(user_id="alice")
+
+
+def no_coffee(prompt: str) -> dict[str, Any]:
+    """抽取替身：每句发言抽成一条否定的单值事实（"no longer drinks coffee"）。"""
+    facts = [
+        _fact("The user no longer drinks coffee.", "drinks", "coffee", turns=[int(n)],
+              negated=True)
+        for n, _ in re.findall(r"\[t(\d+)\] User: (.*)", prompt)
+    ]  # fmt: skip
+    return {"summary": "", "facts": facts, "entities": []}
+
+
+def test_fact_items_carry_negated_and_cardinality(mem: Mem, fake_api: FakeAPI) -> None:
+    """第八轮体检 P18：事实条目以前只有主谓宾，没有 negated 与 cardinality：按三元组同步的
+    客户端把"不再喝咖啡"记成"喝咖啡"。本地与经 /api/v1 的 MemoryClient 都给出（远程的响应按
+    OpenAPI 的模型校验，见 documented）。"""
+    fake_api.chat_replies = [ScriptedModel(no_coffee)]
+    added = mem.add("I no longer drink coffee", user_id="u", wait=True)["results"]
+    found = mem.search("coffee", user_id="u", mode="l1")["results"]
+    listed = mem.get_all(user_id="u")["results"]
+    (fact,) = listed
+    items = [*added, *[f for f in found if f["type"] == "fact"], fact, mem.get(fact["id"])]
+    items += mem.history(fact["id"])
+    assert len(items) == 5
+    for item in items:
+        assert item["negated"] is True and item["cardinality"] == "single", item
+        assert (item["subject"], item["predicate"], item["object"]) == ("User", "drinks", "coffee")
+
+
+def test_the_client_takes_fact_items_from_an_older_server() -> None:
+    """MemoryClient 不按模型校验响应：0.8.0 之前的服务端给的事实条目没有 negated 与 cardinality，
+    照样原样交给调用方（调用方用 item.get("negated", False)）。"""
+    old = {"id": "f1", "memory": "The user drinks tea.", "type": "fact", "subject": "User",
+           "predicate": "drinks", "object": "tea"}  # fmt: skip
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"results": [old]})
+
+    http = httpx2.Client(transport=httpx2.MockTransport(handle), base_url="http://old")
+    with MemoryClient("http://old", http_client=http) as client:
+        assert client.get_all(user_id="u")["results"] == [old]
 
 
 def test_valid_at_takes_a_year_month_or_day(mem: Mem) -> None:
@@ -859,10 +913,14 @@ def test_context_leaves_out_expired_memories(mem: Mem) -> None:
     assert "snow" in text and "rain" not in text
 
 
-def test_expired_memories_do_not_take_recall_slots(system: MemorySystem) -> None:
+@pytest.mark.parametrize("mode", ["l1", "l2"])
+def test_expired_memories_do_not_take_recall_slots(
+    system: MemorySystem, mode: Literal["l1", "l2"]
+) -> None:
     """过期的近似说法不再占召回的名额（第七轮体检 P5）：以前它们加进 exclude，各路先取前 30 条、
     再去掉它们，有效的记忆被挤出候选（300 条过期的近似说法时装入的对话片段从 33 条降到 29 条）；
-    现在在检索里就排除，各路的前 30 条都是有效的记忆，召回的不比没有过期记忆的空间少。"""
+    现在在检索里就排除，各路的前 30 条都是有效的记忆，召回的不比没有过期记忆的空间少。
+    L2 的各次 L1 检索也要带上 hidden（第八轮体检 P10：以前只测了 L1）。"""
     mem = Memory.from_system(system)
     question = "what is the daily special at the cafe?"
     yesterday = date.today() - timedelta(days=1)
@@ -876,13 +934,13 @@ def test_expired_memories_do_not_take_recall_slots(system: MemorySystem) -> None
             text = f"what is the daily special at the cafe? it is the soup {i}"
             mem.add(text, user_id=user, infer=False, expiration_date=yesterday)
         mem.consolidate(user_id=user)
-    plain = mem.context(question, user_id="plain", mode="l1")
-    crowded = mem.context(question, user_id="crowded", mode="l1")
+    plain = mem.context(question, user_id="plain", mode=mode)
+    crowded = mem.context(question, user_id="crowded", mode=mode)
     assert crowded["recalled"] >= plain["recalled"]
     assert "pasta" in crowded["context"] and "soup" not in crowded["context"]
-    recall = system.retrieve("crowded", question, mode="l1", hide_expired=True)
+    recall = system.retrieve("crowded", question, mode=mode, hide_expired=True)
     rounds = [h.unit.text for h in recall.view.rounds]
-    plain_rounds = system.retrieve("plain", question, mode="l1", hide_expired=True).view.rounds
+    plain_rounds = system.retrieve("plain", question, mode=mode, hide_expired=True).view.rounds
     assert len(rounds) >= len(plain_rounds) and not any("soup" in t for t in rounds)
     # 改走 L1 的第二次检索用第一次算出的过期记忆，不再算一遍
     assert recall.expired is not None and len(recall.expired) >= 300
@@ -933,6 +991,79 @@ def test_context_respects_the_key_scope(system: MemorySystem) -> None:
         assert eve.context("Where do I live?", user_id="eve")["context"] == ""
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")
+def test_new_spaces_get_503_capacity_near_the_open_file_limit(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只写 user 的令牌可以用任意 agent_id，每个都是新的空间、本地模式下一个一直开着的文件。快到
+    打开文件数的上限时新的空间 503（code capacity，type VectorStoreFullError），什么都没写；已有的
+    空间照常写。以前一直写到文件用光，那时所有用户的请求都出错（第八轮体检 P3）。"""
+    assert not system.vectors.remote
+    token = "alice-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: alice-app\n    token: {token}\n    scopes:\n      - user: alice\n",
+        "admin-token-0123456789",
+    )
+    with TestClient(v1_app(system, keys)) as http:
+        auth = {"Authorization": f"Bearer {token}"}
+
+        def add(agent_id: str) -> httpx2.Response:
+            body = {"messages": "I like tea", "user_id": "alice", "agent_id": agent_id}
+            return http.post("/api/v1/memories", json={**body, "infer": False}, headers=auth)
+
+        assert add("a0").status_code == 200
+        collections = len(system.vectors._client.get_collections().collections)
+        # 软上限只剩 reserved_files 个：最小的、余量正好够已有集合的软上限
+        soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+        small_open_file_limit(monkeypatch, soft)
+        full = add("a1")
+        assert full.status_code == 503, full.text
+        error = full.json()["error"]
+        assert error["code"] == "capacity" and error["type"] == "VectorStoreFullError"
+        assert "ulimit -n" in error["message"]
+        assert str(system.settings.paths.qdrant) not in full.text
+        assert space_for("alice", "a1") not in {row["space_id"] for row in system.db.list_spaces()}
+        assert add("a0").status_code == 200  # 已有的空间照常
+        alice = MemoryClient("http://testserver", api_key=token, http_client=http)
+        with pytest.raises(VectorStoreFullError, match="open-file limit"):
+            alice.add("I like tea", user_id="alice", agent_id="a2", infer=False)
+
+
+def test_mem0_import_respects_the_key_scope(system: MemorySystem) -> None:
+    """POST /api/v1/import 的 format=mem0（第八轮体检）：先换算再查作用域。限定作用域的令牌导入
+    别的用户的 Mem0 记忆 403、什么都不写；几个用户混在一起又没给 user_id 时 400；自己的照常导入，
+    MemoryClient.load(format="mem0") 再导入一次什么都不加。"""
+    eve_token = "eve-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: eve-app\n    token: {eve_token}\n    scopes:\n      - user: eve\n",
+        "admin-token-0123456789",
+    )
+    memories = [
+        {"id": "m1", "memory": "Likes tea", "created_at": "2026-05-01T09:00:00Z", "user_id": "zoe"},
+        {
+            "id": "m2",
+            "memory": "Likes rain",
+            "created_at": "2026-05-02T09:00:00Z",
+            "user_id": "eve",
+        },
+    ]
+    with TestClient(v1_app(system, keys)) as http:
+        auth = {"Authorization": f"Bearer {eve_token}"}
+        body = {"data": {"results": memories[:1]}, "format": "mem0"}
+        denied = http.post("/api/v1/import", json=body, headers=auth)
+        assert denied.status_code == 403, denied.text
+        mixed = http.post("/api/v1/import", json={"data": memories, "format": "mem0"}, headers=auth)
+        assert mixed.status_code == 400 and "mixes several users" in mixed.text
+        assert system.db.list_spaces() == []
+
+        eve = MemoryClient("http://testserver", api_key=eve_token, http_client=http)
+        report = eve.load(memories[1:], format="mem0")
+        assert report["space_id"] == "eve" and report["turns_added"] == 1
+        assert report["skipped"] == 0
+        assert eve.load(memories[1:], format="mem0")["turns_added"] == 0
+        assert [row["space_id"] for row in system.db.list_spaces()] == ["eve"]
+
+
 # 记忆代理与各框架集成的证据块（recall_evidence → inject_evidence）在一个固定的场景里的摘要。
 # 加 context 时不能改变它们：它们是代理发给模型的请求里的文字
 PROXY_NOTE_SHA256 = "cbefc0c3581ab972ce6423eb3dff2a7cb4d898bcf8a10963f7f9d3bf822fef92"
@@ -955,6 +1086,122 @@ def test_the_proxy_evidence_bytes_are_unchanged(system: MemorySystem) -> None:
         notes.append([found.level, found.recalled, inject_evidence(messages, found.block)])
     digest = hashlib.sha256(json.dumps(notes, sort_keys=True).encode()).hexdigest()
     assert digest == PROXY_NOTE_SHA256
+
+
+EXPORTED_AT = "2026-08-01T10:00:00"
+
+
+def _photo(size: tuple[int, int], color: str | None = None) -> str:
+    """一张 PNG 的 data URL；color 不给时是随机的噪点（压不小）。"""
+    image = (
+        Image.new("RGB", size, color)
+        if color
+        else Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3))
+    )
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode()
+
+
+def _with_image(text: str, url: str) -> list[dict[str, Any]]:
+    block = {"type": "image_url", "image_url": {"url": url}}
+    return [{"role": "user", "content": [{"type": "text", "text": text}, block]}]
+
+
+def test_streamed_export_is_byte_identical_to_the_old_response(
+    system: MemorySystem, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /api/v1/export 与 /api/spaces/{space}/export 边读边写（第八轮体检 P7），响应体与以前
+    JSONResponse 渲染 export_space 的结果逐字节相同：图片、metadata、过期时间、只写日志的会话、
+    不是 ASCII 的文字，派生记忆的快照带与不带。不再有 Content-Length（不是一次渲染好的）。没有
+    这个空间时照旧 404（/api/v1 的出错格式与 /api 的 {"detail": …}）。"""
+    from cuemem import portable
+
+    monkeypatch.setattr(portable, "_now", lambda: EXPORTED_AT)
+    local = Memory.from_system(system)
+    local.add("I live in Berlin", user_id="alice", run_id="s1", timestamp=AUG, wait=True)
+    photo = _with_image("same photo", _photo((9, 9), "green"))
+    local.add(photo, user_id="alice", run_id="s2", wait=True)
+    local.add(  # 最后写：之后的 wait=True 会把它一起抽取
+        _with_image("我住在柏林 — café ☕ </memory>", _photo((9, 9), "green")),
+        user_id="alice",
+        run_id="s3",
+        metadata={"source": "相册", "n": 1.5},
+        expiration_date="2030-01-01",
+        infer=False,
+    )
+    assert system.facts("alice") and system.worker is None  # 后台不会再改它
+    service = ChatService(system, Agent(system, router="rule"))
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, mcp=False)
+    with TestClient(app) as http:
+        for derived in (True, False):
+            old = JSONResponse(portable.export_space(system, "alice", derived=derived)).body
+            plan = portable.export_plan(system, "alice", derived=derived)
+            assert b"".join(portable.iter_export_json(plan, EXPORTED_AT)) == old
+            assert b"".join(portable.iter_export_json(plan)) == old  # 不给时是现在（_now）
+            flag = str(derived).lower()
+            for path in (
+                f"/api/v1/export?user_id=alice&derived={flag}",
+                f"/api/spaces/alice/export?derived={flag}",
+            ):
+                response = http.get(path)
+                assert response.status_code == 200 and response.content == old, path
+                assert "content-length" not in response.headers, path
+                assert response.headers["content-type"] == "application/json"
+        assert [s.get("infer") for s in json.loads(old)["sessions"]].count(False) == 1
+        assert "café" in old.decode() and "derived" not in json.loads(old)
+
+        missing = http.get("/api/v1/export?user_id=nobody")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["type"] == "KeyError"
+        assert http.get("/api/spaces/nobody/export").json() == {"detail": "No memory space nobody"}
+    service.close()
+
+
+def test_an_export_holds_one_turn_of_images_at_a_time(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一张约 2 MB 的图写 20 次：媒体库里只有一份，导出里有 20 份。以前整个导出先放进一个
+    dict 再渲染，峰值约是响应体（20 份 base64）的三倍，一个只能写自己空间的令牌就能让并发的几次
+    导出占几 GB；现在边读边写，峰值与写了几次无关，只是一份 base64 的几倍（第八轮体检 P7）。"""
+    import tracemalloc
+
+    from cuemem import portable
+
+    url = _photo((1000, 700))
+    encoded = len(url.split(",", 1)[1])
+    token = "alice-token-0123456789"
+    keys = Keys.parse(
+        f"keys:\n  - name: alice-app\n    token: {token}\n    scopes:\n      - user: alice\n"
+    )
+    local = Memory.from_system(system)
+    for i in range(20):
+        local.add(_with_image(f"pic {i}", url), user_id="alice", infer=False)
+    with TestClient(v1_app(system, keys)) as http:
+        response = http.get(
+            "/api/v1/export?user_id=alice", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200 and "content-length" not in response.headers
+        assert len(response.content) > 20 * encoded
+    del response
+    plan = portable.export_plan(system, "alice")
+    whole = portable.export_space(system, "alice")
+    # 原图的 base64 一段一段地编（第八轮复审）：段小一些，看得出一张图只剩原始字节那么多
+    monkeypatch.setattr(portable, "EXPORT_IMAGE_SLICE", 3 << 12, raising=False)
+    tracemalloc.start()
+    try:
+        total = 0
+        for chunk in portable.iter_export_json(plan):
+            total += len(chunk)
+            del chunk
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert total > 20 * encoded
+    # 以前约 60 倍；第八轮体检之后约 5 倍（整句发言 json.dumps 时原图有约五份 base64 那么多）
+    assert peak < 1.5 * encoded, (peak, encoded)
+    streamed = b"".join(portable.iter_export_json(plan, whole["exported_at"]))
+    assert streamed == JSONResponse(whole).body  # 一段一段编出的 base64 拼起来逐字节照旧
 
 
 def test_runs_scopes_export_and_load(mem: Mem) -> None:
@@ -1439,6 +1686,79 @@ def test_open_runs_per_space_are_capped_on_the_server(system: MemorySystem) -> N
         c = client.open_run(user_id="eve")
         assert system.open_sessions("eve") == {b, c}
         client.close()
+
+
+def test_reopening_an_idle_run_counts_against_the_cap(system: MemorySystem) -> None:
+    """第八轮体检 P8：add 重新打开闲置结束的 run 也受 max_open_runs 限制：到了上限时
+    SessionLimitError（/api/v1 回 429），什么都不写，run 照旧记着是闲置结束的，有名额之后再 add
+    照样重新打开（不登记新的任务）。以前 add 绕过上限，一个空间开着的 run 可以多到
+    IDLE_CLOSED_KEPT 个，调用方自己的 open_run 反而 429。"""
+    server = Memory.from_system(system)
+    server.max_open_runs = 2
+    app = FastAPI()
+    app.include_router(memories_router(server, dependencies=guard(Keys())))
+    install_error_format(app)
+    with TestClient(app) as http:
+        client = MemoryClient("http://testserver", http_client=http)
+        a = client.open_run(user_id="eve")
+        b = client.open_run(user_id="eve")
+        client.add("I live in Lisbon", user_id="eve", run_id=a)
+        client.add("I like tea", user_id="eve", run_id=b)
+        assert server.close_idle_runs(0.0) == 2
+        c = client.open_run(user_id="eve")
+        d = client.open_run(user_id="eve")
+        with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            client.add("I like jazz", user_id="eve", run_id=a)
+        refused = http.post(
+            "/api/v1/memories",
+            json={"messages": "I like jazz", "user_id": "eve", "run_id": b, "infer": False},
+        )
+        assert refused.status_code == 429 and refused.headers["retry-after"] == "60"
+        assert refused.json()["error"]["code"] == "rate_limited"
+        assert system.open_sessions("eve") == {c, d}
+        assert [t.text for t in system.db.get_turns("eve", a)] == ["I live in Lisbon"]
+        assert [t.text for t in system.db.get_turns("eve", b)] == ["I like tea"]
+        jobs = len(system.db.get_jobs("eve"))
+
+        client.end_run(c, user_id="eve")
+        client.add("I like jazz", user_id="eve", run_id=a)  # 有名额了：重新打开
+        assert system.open_sessions("eve") == {a, d}
+        assert len(system.db.get_jobs("eve")) == jobs  # 重新打开，不是普通的会话
+        assert client.add("hello", user_id="eve", run_id="never-opened")  # 普通的会话不受限
+        client.close()
+
+
+def test_resuming_a_left_open_run_counts_against_the_cap(
+    n3_settings: Settings, fake_api: FakeAPI, model: ScriptedModel
+) -> None:
+    """第八轮体检 P8：重启之后 add 接着写之前的进程留下的 run 也受 max_open_runs 限制：到了上限时
+    SessionLimitError，进行中的标记留着，有名额之后再 add 照样接着写。不会重新打开的 run_id
+    （普通的会话）照常写。"""
+    fake_api.chat_replies = [model]
+    _left_open_runs(n3_settings, fake_api, "a", "b")
+    after = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    _adopt_after(after, 60, clock=lambda: 0.0)  # 与 cuemem serve 相同：留给调用方接着写
+    try:
+        server = Memory.from_system(after)
+        server.max_open_runs = 2
+        server.open_run("c", user_id="eve")
+        server.open_run("d", user_id="eve")
+        with pytest.raises(SessionLimitError, match="CUEMEM_MAX_OPEN_SESSIONS"):
+            server.add("I like jazz", user_id="eve", run_id="a")
+        assert after.open_sessions("eve") == {"c", "d"}
+        assert after.can_resume_left_open("eve", "a")
+        assert len(after.db.meta_keys("open-session:")) == 4  # a、b 的标记留着
+        assert [t.text for t in after.db.get_turns("eve", "a")] == ["I like a"]
+        assert server.add("hello", user_id="eve", run_id="never-opened")  # 普通的会话不受限
+        assert after.open_sessions("eve") == {"c", "d"}
+
+        server.end_run("c", user_id="eve")
+        server.add("I like jazz", user_id="eve", run_id="a")
+        assert after.open_sessions("eve") == {"a", "d"}
+        assert not after.can_resume_left_open("eve", "a")
+        assert "a" not in {j["session_id"] for j in after.db.get_jobs("eve")}
+    finally:
+        after.close()
 
 
 @pytest.mark.parametrize("where", ["local", "remote"])
@@ -2006,17 +2326,36 @@ def _xbm_stall(k: int) -> bytes:
     return data + b"A" * (512 - len(data))
 
 
-def test_uncommon_image_formats_are_refused_at_once(system: MemorySystem) -> None:
+def test_uncommon_image_formats_are_refused_at_once(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """不是 JPEG、PNG、WEBP、GIF、BMP、TIFF 的图片（store/media.py 的 ACCEPTED_FORMATS）：400
     ValueError，不交给 Pillow 别的格式的解码器去试，什么都不写、不存原图。以前一个只能写自己空间
     的令牌发 512 字节的 XBM 文件头，Pillow 12 上卡住整个服务十几秒之后回 500；认不出的文件也是
-    500（UnidentifiedImageError 没有算成请求的错）。"""
+    500（UnidentifiedImageError 没有算成请求的错）。
+
+    断言的是"别的格式的识别函数一个都没被调用"（第八轮体检 P12）：锁定的 Pillow 13 上这个文件头
+    不再卡住，以前那个 1 秒的计时什么也守不住，负载重时却会失败。计时留着、放宽到 5 秒：compat
+    任务用 Pillow 12 时卡住要十几秒。"""
     keys = Keys.parse(
         "keys:\n  - name: m-app\n    token: m-token-0123456789\n    scopes:\n"
         "      - user: mallory\n"
     )
     xbm = io.BytesIO()
     Image.new("1", (8, 8)).save(xbm, format="XBM")  # 一张正常的 XBM：以前照样存下
+    Image.init()  # 先注册全部格式，再换掉别的格式的识别函数
+    probed: list[str] = []
+
+    def recording(fmt: str, accept: Callable[[bytes], Any]) -> Callable[[bytes], Any]:
+        def probe(prefix: bytes) -> Any:
+            probed.append(fmt)
+            return accept(prefix)
+
+        return probe
+
+    for fmt, (factory, accept) in list(Image.OPEN.items()):
+        if fmt not in ACCEPTED_FORMATS and accept is not None:
+            monkeypatch.setitem(Image.OPEN, fmt, (factory, recording(fmt, accept)))
     with TestClient(v1_app(system, keys), raise_server_exceptions=False) as http:
         for data in (_xbm_stall(28), xbm.getvalue(), b"hello, not an image"):
             url = "data:image/png;base64," + base64.b64encode(data).decode()
@@ -2029,10 +2368,11 @@ def test_uncommon_image_formats_are_refused_at_once(system: MemorySystem) -> Non
                 json=body,
                 headers={"Authorization": "Bearer m-token-0123456789"},
             )
-            assert time.perf_counter() - started < 1.0
+            assert time.perf_counter() - started < 5.0
             assert response.status_code == 400, response.text
             error = response.json()["error"]
             assert error["type"] == "ValueError" and "Not a valid image" in error["message"]
+    assert probed == []
     assert system.db.list_spaces() == [] and system.db.get_media("mallory") == []
     assert not [p for p in system.settings.paths.media.rglob("*") if p.is_file()]
 

@@ -1,13 +1,13 @@
 [project]
 name = "cuemem"
-version = "0.1.0"
+version = "0.8.0"
 description = "CueMem: cue-driven, self-regulating, multimodal long-term memory for LLM agents"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "src/cuemem/evals/memlens_prompts/LICENSE"]
 requires-python = ">=3.12"
 # 带类型注解（src/cuemem/py.typed）：用户的 mypy / pyright 按 SDK 的签名检查调用。锁文件、Docker
-# 镜像与发表的结果用 3.12；3.14 由 .github/workflows/compat.yml 每周跑一次（不是必需检查）
+# 镜像与发表的结果用 3.12；3.13、3.14 由 .github/workflows/compat.yml 每周跑一次（不是必需检查）
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",

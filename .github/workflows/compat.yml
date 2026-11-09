@@ -2,9 +2,11 @@ name: 兼容性
 
 # 锁文件之外的版本：CI 的 test 任务只跑 uv.lock 与 Python 3.12，package 任务只解核心依赖，而文档
 # 推荐的 pip install "cuemem[...] @ git+..." 拿到的是当天最新的版本。这里每周（以及改到依赖的 PR）
-# 跑三种：全部可选依赖取最新的版本、取 pyproject.toml 写的下限（lowest-direct），以及锁文件在
-# Python 3.14 上。不在规则集的必需检查里：上游发布新版本不需要代码改动就会让它变红，红了说明要
-# 改下限或适配新版本，不该挡住无关的合并
+# 跑四种：全部可选依赖取最新的版本、取 pyproject.toml 写的下限（lowest-direct），以及锁文件在
+# Python 3.13、3.14 上（pyproject.toml 的分类里写着的版本，tests/test_ci_pins.py 核对）。另有一个
+# 任务在镜像里用预设 deepseek 跑真的 fastembed（下载 bge-small，不调用模型）：Dependabot 升级
+# fastembed 或 onnxruntime 时这里先变红。不在规则集的必需检查里：上游发布新版本、Hugging Face
+# 下载失败都不需要代码改动就会让它变红，红了说明要改下限或适配新版本，不该挡住无关的合并
 on:
   workflow_dispatch:
   schedule:
@@ -36,7 +38,10 @@ jobs:
             resolution: highest
           - name: floors-3.12
             resolution: lowest-direct
+          - name: locked-3.13
+            python: "3.13"
           - name: locked-3.14
+            python: "3.14"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,8 +66,45 @@ jobs:
       - name: 单元测试（离线，不需要 API Key）
         if: matrix.resolution
         run: .venv-compat/bin/python -m pytest
-      - name: 锁文件在 Python 3.14 上
+      - name: 锁文件在别的 Python 版本上
         if: ${{ !matrix.resolution }}
+        env:
+          PYTHON: ${{ matrix.python }}
         run: |
-          uv sync --locked --all-extras --python 3.14
-          uv run --python 3.14 pytest
+          uv sync --locked --all-extras --python "$PYTHON"
+          uv run --python "$PYTHON" pytest
+
+  fastembed:
+    # 真的 fastembed（第八轮体检 P20）：别的任务只用哈希向量，单元测试只给 FastEmbedTextEmbedder
+    # 换上假的模型，CI 的 test 任务连 local 都不装。这里在镜像里用预设 deepseek（只有 DeepSeek
+    # 的 Key 时的 Docker 用法）、不覆盖向量后端：写一句（infer=false，不抽取）、用 L1 查回来，
+    # 下载 bge-small（约 130 MB）并跑 ONNX 推理；Key 是假的，不调用模型
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 构建镜像
+        run: docker build -t cuemem:fastembed .
+      - name: 预设 deepseek：本机向量写入、检索
+        run: |
+          api=http://127.0.0.1:7860
+          auth="Authorization: Bearer ci-token-0123456789"
+          docker run -d --name cuemem --stop-timeout 90 -p 127.0.0.1:7860:7860 \
+            -e CUEMEM_API_TOKEN=ci-token-0123456789 -e CUEMEM_PRESET=deepseek \
+            -e DEEPSEEK_API_KEY=dummy-not-used cuemem:fastembed
+          for _ in $(seq 90); do curl -fsS "$api/api/health" && break; sleep 2; done
+          curl -fsS "$api/api/health" || { docker logs cuemem; exit 1; }
+          # 第一次向量化时下载模型：给足时间
+          curl -fsS -m 900 "$api/api/v1/memories" -H "$auth" -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"I have a golden retriever"}],"user_id":"ci",
+            "infer":false}' || { docker logs cuemem; exit 1; }
+          curl -fsS -m 300 "$api/api/v1/memories/search" -H "$auth" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"golden retriever","user_id":"ci","mode":"l1"}' | tee search.json
+          grep -F 'golden retriever' search.json || { docker logs cuemem; exit 1; }
+          docker stop cuemem
+          code=$(docker inspect -f '{{.State.ExitCode}}' cuemem)
+          [ "$code" -eq 143 ] || { docker logs cuemem; exit 1; }
+          if docker logs cuemem 2>&1 | grep -F Traceback; then docker logs cuemem; exit 1; fi

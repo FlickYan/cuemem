@@ -82,6 +82,7 @@ from cuemem.store.sqlite import legacy_idx_key, next_idx_key
 # 记忆系统（向量库、模型客户端）在 Memory() 时才导入：import cuemem.sdk 只要零点几秒
 if TYPE_CHECKING:
     from cuemem.memory import ForgetReport, MemorySystem, Recall
+    from cuemem.portable import ExportPlan
     from cuemem.store.sqlite import MemoryKind
 
 logger = logging.getLogger(__name__)
@@ -465,17 +466,23 @@ class Memory:
                 self._run_seen[(space, rid)] = time.monotonic()
                 self._idle_closed.pop((space, rid), None)
         finally:
-            with self._runs_lock:
-                self._opening[space] -= 1
-                if not self._opening[space]:
-                    del self._opening[space]
+            self._opened(space)
         return rid
 
+    def _opened(self, space: str) -> None:
+        """open_run、_resume 开完（或开失败）一个 run 之后：去掉 _make_room 之后记下的“正在开”。"""
+        with self._runs_lock:
+            self._opening[space] -= 1
+            if not self._opening[space]:
+                del self._opening[space]
+
     def _make_room(self, space: str, run_id: str) -> None:
-        """open_run 的上限（调用方持有 _runs_lock）：max_open_runs 给了、这个空间开着的（加上正在
-        开的）run 已经这么多、run_id 又不是其中之一时 SessionLimitError（/api/v1 回 429）。不替
-        调用方结束别的 run：那会让它们提前抽取。以前 /api/v1 不限，一个令牌可以一直 open_run，
-        每个都占着内存与一个进行中的标记，直到闲置 30 分钟才结束。"""
+        """open_run 与 add 重新打开 run（_resume）的上限（调用方持有 _runs_lock）：max_open_runs
+        给了、这个空间开着的（加上正在开的）run 已经这么多、run_id 又不是其中之一时
+        SessionLimitError（/api/v1 回 429）。不替调用方结束别的 run：那会让它们提前抽取。以前
+        /api/v1 不限，一个令牌可以一直 open_run，每个都占着内存与一个进行中的标记，直到闲置 30
+        分钟才结束。add 重新打开闲置结束的或之前的进程留下的 run 也算开一个新的 run（第八轮体检
+        P8：以前 add 绕过上限，一个空间开着的 run 可以多到 IDLE_CLOSED_KEPT 个）。"""
         limit = self.max_open_runs
         if limit is None or (space, run_id) in self._runs:
             return
@@ -576,23 +583,44 @@ class Memory:
                 return
             idle = key in self._idle_closed
         # 锁的顺序与 close_idle_runs 相同：先会话锁，再 _runs_lock（resume_left_open 拿 _open_lock）
+        # 重新打开也受 max_open_runs 限制（_make_room）：到了上限时 SessionLimitError，什么都不改
         with self.system.session_lock(space, run_id):
             if not idle:
-                if self.system.resume_left_open(space, run_id):
+                reserved = False
+                if self.max_open_runs is not None:
+                    # 在 resume_left_open 改动任何东西之前查：不会重新打开的（普通的会话）照常写，
+                    # 不受上限限制；会重新打开的到了上限时拒绝，标记留着，之后再 add 照样接着写
+                    if not self.system.can_resume_left_open(space, run_id):
+                        return
                     with self._runs_lock:
-                        self._runs.add(key)
-                        self._run_seen[key] = time.monotonic()
+                        self._make_room(space, run_id)
+                        self._opening[space] = self._opening.get(space, 0) + 1
+                        reserved = True
+                try:
+                    if self.system.resume_left_open(space, run_id):
+                        with self._runs_lock:
+                            self._runs.add(key)
+                            self._run_seen[key] = time.monotonic()
+                finally:
+                    if reserved:
+                        self._opened(space)
                 return
             with self._runs_lock:
                 if key not in self._idle_closed:  # 期间别的 add 已经重新打开了
                     if key in self._runs:
                         self._run_seen[key] = time.monotonic()
                     return
+                # 在去掉 _idle_closed 的记录之前：拒绝之后再 add 时照样重新打开，不变成普通的会话
+                self._make_room(space, run_id)
                 del self._idle_closed[key]
-            self.system.open_session(space, run_id)
-            with self._runs_lock:
-                self._runs.add(key)
-                self._run_seen[key] = time.monotonic()
+                self._opening[space] = self._opening.get(space, 0) + 1
+            try:
+                self.system.open_session(space, run_id)
+                with self._runs_lock:
+                    self._runs.add(key)
+                    self._run_seen[key] = time.monotonic()
+            finally:
+                self._opened(space)
 
     def update(
         self,
@@ -1203,20 +1231,44 @@ class Memory:
 
         return export_space(self.system, space_for(user_id, agent_id), derived=derived)
 
+    def _export_plan(
+        self, *, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
+    ) -> ExportPlan:
+        """export 的第一步（portable.export_plan，不读原图）：/api/v1/export 接着用
+        portable.iter_export_json 边读边写，不把整个导出放进内存。没有这个空间时 KeyError。"""
+        from cuemem.portable import export_plan
+
+        return export_plan(self.system, space_for(user_id, agent_id), derived=derived)
+
     def load(
         self,
-        data: Mapping[str, Any],
+        data: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
         wait: bool = False,
+        format: Literal["cuemem", "mem0"] = "cuemem",
     ) -> dict[str, Any]:
         """导入 export 的结果：写回原始日志，派生记忆重新抽取（wait=True 时同步完成）。
-        不给 user_id、agent_id 时导入到文件里原来的空间。"""
-        from cuemem.portable import import_space
+        不给 user_id、agent_id 时导入到文件里原来的空间。
 
+        format="mem0"：data 是 Mem0 get_all 的结果（列表或 {"results": [...]}），一条记忆一个
+        会话，重复导入什么都不加（portable.from_mem0）。不给 user_id、agent_id 时所有记忆要属于
+        同一个用户（与 Agent），否则 ValueError；返回值多一个 skipped（文字为空、跳过的记忆数）。"""
+        from cuemem.portable import from_mem0, import_space
+
+        if format not in ("cuemem", "mem0"):
+            raise ValueError(f"format must be 'cuemem' or 'mem0', not {format!r}")
+        skipped: int | None = None
+        if format == "mem0":
+            data = from_mem0(data, user_id=user_id, agent_id=agent_id)
+            skipped = data["skipped"]
+        elif not isinstance(data, Mapping):
+            raise ValueError("Malformed export: a CueMem export is a JSON object")
         space = space_for(user_id, agent_id) if user_id or agent_id else None
         report = import_space(self.system, data, space_id=space, consolidate=wait)
+        if skipped is not None:
+            report["skipped"] = skipped
         if not wait and self.system.worker is not None:
             self.system.worker.submit(report["space_id"])
         return report
@@ -1898,6 +1950,8 @@ def _fact_item(
         "subject": fact.subject,
         "predicate": fact.predicate,
         "object": fact.object,
+        "negated": fact.negated,  # 否定的事实：主谓宾说的是不成立的事（第八轮体检）
+        "cardinality": fact.cardinality,
         "category": fact.category,
         "importance": fact.importance,
         "status": fact_status(fact, {}),

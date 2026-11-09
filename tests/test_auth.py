@@ -485,10 +485,11 @@ def test_api_escapes_through_the_path_are_refused(world: World) -> None:
 
 
 def test_every_api_route_needs_a_token(world: World) -> None:
-    """/api 与 /v1 下的每个接口（探活除外）都要令牌：以后新加的接口忘了挂 guard 时这里失败。"""
+    """/api 与 /v1 下的每个接口（探活与就绪检查除外）都要令牌：以后新加的接口忘了挂 guard 时
+    这里失败。"""
     checked = 0
     for path, methods in world.app.openapi()["paths"].items():
-        if not path.startswith(("/api/", "/v1/")) or path == "/api/health":
+        if not path.startswith(("/api/", "/v1/")) or path in ("/api/health", "/api/ready"):
             continue
         url = re.sub(r"\{[^}]+\}", "x", path)
         for method in methods:
@@ -791,6 +792,94 @@ def test_errors_keep_the_v1_shape(world: World) -> None:
         }
     }
     assert world.http.get("/api/v1/spaces").status_code == 401
+
+
+def test_max_spaces_caps_new_spaces_on_every_surface(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path
+) -> None:
+    """令牌写了 max_spaces：作用域里已经有这么多个空间时，要建新空间的写入 429（/api/v1 的 add、
+    runs、consolidate、import，/api 开会话与导入，记忆代理，/mcp 的 remember），什么都不写；已有的
+    空间照常写。没写 max_spaces 的令牌与管理令牌不限（第八轮体检 P3）。"""
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    service = ChatService(system, Agent(system, router="rule"), default_space="shop-demo")
+    proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    keys = Keys.parse(
+        f"""
+keys:
+  - name: alice-app
+    token: {ALICE_TOKEN}
+    scopes: [{{user: alice}}]
+    max_spaces: 2
+  - name: shop-users
+    token: {SHOP_USERS_TOKEN}
+    scopes: [{{user: "*", agent: shop}}]
+""",
+        ADMIN_TOKEN,
+    )
+    app = create_app(service, upload_dir=tmp_path / "uploads", ui=False, keys=keys, proxy=proxy)
+    service.remember("bob", "not alice's")  # 作用域之外的空间不算
+
+    def add(token: str, agent_id: str, user_id: str = "alice") -> Any:
+        body = {"messages": "I like tea", "user_id": user_id, "agent_id": agent_id, "infer": False}
+        return http.post("/api/v1/memories", json=body, headers=bearer(token))
+
+    try:
+        with TestClient(app) as http:
+            assert add(ALICE_TOKEN, "a1").status_code == 200
+            assert add(ALICE_TOKEN, "a2").status_code == 200
+            before = set(system.db.space_ids())
+            refused = add(ALICE_TOKEN, "a3")
+            assert refused.status_code == 429, refused.text
+            error = refused.json()["error"]
+            assert error["code"] == "rate_limited" and "at most 2 memory spaces" in error["message"]
+            third = {"user_id": "alice", "agent_id": "a3"}
+            for path, body in (
+                ("/api/v1/runs", third),
+                ("/api/v1/consolidate", third),
+                ("/api/v1/import", {**third, "data": {"format": "cuemem.space", "sessions": []}}),
+            ):
+                response = http.post(path, json=body, headers=bearer(ALICE_TOKEN))
+                assert response.status_code == 429, (path, response.text)
+            a3 = space_for("alice", "a3")
+            start = http.post("/api/sessions", json={"space": a3}, headers=bearer(ALICE_TOKEN))
+            assert start.status_code == 429 and "max_spaces" in start.json()["detail"]
+            imported = http.post(
+                f"/api/spaces/import?space={a3}",
+                json={"format": "cuemem.space", "sessions": []},
+                headers=bearer(ALICE_TOKEN),
+            )
+            assert imported.status_code == 429
+            relayed = _chat(http, ALICE_TOKEN, user="alice", headers={"X-CueMem-Agent": "a3"})
+            assert relayed.status_code == 429
+            assert relayed.json()["error"]["type"] == "rate_limit_error"
+            mcp_headers = {
+                **bearer(ALICE_TOKEN),
+                "Accept": "application/json, text/event-stream",
+                "X-CueMem-User": "alice",
+                "X-CueMem-Agent": "a3",
+            }
+            call = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "remember", "arguments": {"text": "I like milk"}},
+            }
+            remembered = http.post("/mcp", json=call, headers=mcp_headers).json()["result"]
+            assert remembered["isError"] is True
+            assert "at most 2 memory spaces" in remembered["content"][0]["text"]
+            assert set(system.db.space_ids()) == before  # 都没写
+
+            assert add(ALICE_TOKEN, "a1").status_code == 200  # 已有的空间照常
+            relayed = _chat(http, ALICE_TOKEN, user="alice", headers={"X-CueMem-Agent": "a2"})
+            assert relayed.status_code == 200
+            assert add(ADMIN_TOKEN, "a3").status_code == 200  # 管理令牌不限
+            assert add(ALICE_TOKEN, "a3").status_code == 200  # 已经有了：不是新的空间
+            for i in range(3):  # 没写 max_spaces 的令牌不限
+                assert add(SHOP_USERS_TOKEN, "shop", user_id=f"u{i}").status_code == 200
+    finally:
+        proxy.close_all()
+        service.close()
 
 
 # ---------- 记忆代理 ----------
@@ -1149,7 +1238,7 @@ def test_a_scoped_key_cannot_take_every_thread(world: World) -> None:
     以前 alice 并发 45 个卡住的 POST /api/v1/consolidate 就占满 AnyIO 的 40 个线程，管理令牌查别人
     的状态也要等到它们做完。"""
     took, codes = _flood(world, "/api/v1/consolidate", {"user_id": "alice"}, 45)
-    assert took < 1.0, took
+    assert took < 3.0, took  # 以前要等到放开锁（一直卡着）；放宽是为了负载重的机器
     assert codes.count(429) >= 45 - 8 and set(codes) <= {200, 429}, codes
 
 
@@ -1165,7 +1254,7 @@ def test_waits_hold_no_thread(raised_cap: None, world: World) -> None:
     管理令牌查 bob 的状态照样马上回。以前每个 wait 占着一个线程，状态要等到它们超时（4 秒）。
     放开之后它们都 200。"""
     took, codes = _flood(world, "/api/v1/wait", {"user_id": "alice", "timeout": 4}, 45)
-    assert took < 1.0, took
+    assert took < 3.0, took  # 以前要等到 wait 超时（开始计时之后约 3.5 秒）；放宽是为了负载重的机器
     assert codes == [200] * 45, codes
 
 

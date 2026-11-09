@@ -32,7 +32,8 @@
 ValueError、TypeError 或 cuemem.errors 里的类型），MemoryClient 据此抛出同样的异常。请求体不合
 格式（422）、令牌不对（401）在 /api/v1 下也写成这个形状（install_error_format）。模型与向量供应商
 出错时的状态码与 /api 相同（api/failures.py：限流 429 带 Retry-After、余额不足 402、超时 504……），
-code 是出错的类别（rate_limited、no_balance、timeout 等）；向量接口的出错另带 upstream_status
+code 是出错的类别（rate_limited、no_balance、timeout 等；向量库连不上是 503
+vector_store_unavailable，超时是 504 vector_store_timeout）；向量接口的出错另带 upstream_status
 （上游原来的状态码），MemoryClient 抛出的 EmbeddingAPIError 与本地一样带着 status 与 retry_after，
 没有对应的本地异常时抛出的 MemoryAPIError 带着 status、code、type 与 retry_after（Retry-After 头）。
 
@@ -60,22 +61,31 @@ from fastapi.exception_handlers import (
     request_validation_exception_handler,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, WithJsonSchema
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cuemem import __version__
-from cuemem.api.auth import Keys, Principal, authenticated_route, guard, principal_of
+from cuemem.api.auth import (
+    Keys,
+    Principal,
+    authenticated_route,
+    guard,
+    principal_of,
+    space_cap_message,
+    spaces_over_cap,
+)
 from cuemem.api.failures import provider_failure
-from cuemem.core.models import FactCategory, SupersedeReason
+from cuemem.core.models import Cardinality, FactCategory, SupersedeReason
 from cuemem.errors import (
     ConcurrentWriteError,
     CueMemError,
     EmbeddingAPIError,
     IdempotencyConflictError,
     SessionLimitError,
+    VectorStoreFullError,
 )
 from cuemem.read.controller import Router
 from cuemem.sdk import (
@@ -233,10 +243,16 @@ class WaitRequest(BaseModel):
 
 
 class ImportRequest(BaseModel):
-    data: dict[str, Any]
+    data: dict[str, Any] | list[Any] = Field(
+        description="A CueMem export (format cuemem), or Mem0 get_all output: a list of memories "
+        'or {"results": [...]} (format mem0)'
+    )
     user_id: str | None = None
     agent_id: str | None = None
     wait: bool = False
+    format: Literal["cuemem", "mem0"] = Field(
+        "cuemem", description="cuemem: a CueMem export; mem0: Mem0 get_all output"
+    )
 
 
 # ---------- 返回值的形状（只用于 OpenAPI，第三轮体检）----------
@@ -280,6 +296,14 @@ class FactItem(_Out):
     subject: str
     predicate: str
     object: str
+    negated: bool = Field(
+        description='True for a negative fact ("no longer drinks coffee"): subject, predicate '
+        "and object then describe what is NOT true."
+    )
+    cardinality: Cardinality = Field(
+        description='"single": a newer value replaces the old one (where the user lives); '
+        '"multi": values accumulate (what the user likes).'
+    )
     category: FactCategory
     importance: int
     status: str = Field(description='"current", or since when it is no longer true or corrected.')
@@ -560,6 +584,9 @@ class ImportReport(_Out):
     turns_added: int
     images_added: int
     consolidation: ConsolidationReport | None = None
+    skipped: int | None = Field(
+        None, description="format mem0 only: memories skipped because their text was empty"
+    )
 
 
 class SpaceRow(_Out):
@@ -605,8 +632,10 @@ _ERRORS = {
     422: "Malformed request body or parameters (type ValueError).",
     429: "Rate-limited by the model provider; see Retry-After.",
     502: "The model or embedding provider failed.",
-    503: "The model provider is temporarily unavailable; see Retry-After.",
-    504: "The model provider timed out, or POST /wait reached its timeout (type TimeoutError).",
+    503: "The model provider or the vector store is temporarily unavailable (see Retry-After), "
+    "or the local vector store has no room for a new space (code capacity).",
+    504: "The model provider or the vector store timed out, or POST /wait reached its timeout "
+    "(type TimeoutError).",
     500: "Unexpected server error (a bug); the traceback is in the server log.",
 }
 
@@ -631,9 +660,13 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(400, str(exc), error_type=type(exc).__name__) from exc
     except (ConcurrentWriteError, IdempotencyConflictError) as exc:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
-    except SessionLimitError as exc:  # open_run 到了上限：结束一个 run 或等闲置的被结束
+    except SessionLimitError as exc:  # open_run 或 add 重新打开 run 到了上限
         raise V1Error(
             429, str(exc), error_type="SessionLimitError", headers={"Retry-After": "60"}
+        ) from exc
+    except VectorStoreFullError as exc:  # 本地向量库没有余量建新的空间（已有的照常可用）
+        raise V1Error(
+            503, exc.for_client(), error_type="VectorStoreFullError", code="capacity"
         ) from exc
     except Exception as exc:
         failure = provider_failure(exc)
@@ -735,11 +768,24 @@ def memories_router(
         user_id: str | None,
         agent_id: str | None,
         filters: dict[str, Any] | None = None,
+        *,
+        creates: bool = False,
     ) -> None:
         """user_id、agent_id 定下的空间（filters 里的 user_id、agent_id 优先）要在作用域里。与 SDK
-        用同一个函数解析 filters：检查的空间就是 SDK 要读的空间。都没给时报 SDK 的 ValueError。"""
+        用同一个函数解析 filters：检查的空间就是 SDK 要读的空间。都没给时报 SDK 的 ValueError。
+        creates：这个接口会建新的空间（add、runs、consolidate），另查令牌的 max_spaces。"""
         user_id, agent_id, _, _ = _scope(user_id, agent_id, None, filters)
-        _allow(principal_of(http), space_for(user_id, agent_id))
+        space = space_for(user_id, agent_id)
+        _allow(principal_of(http), space)
+        if creates:
+            room(http, space)
+
+    def room(http: Request, space: str | None) -> None:
+        """令牌写了 max_spaces、空间已经这么多个、这次写入又要建新的空间时 429（rate_limited）。"""
+        who = principal_of(http)
+        held = spaces_over_cap(who, space, lambda: memory.system.db.space_ids())
+        if held is not None:
+            raise V1Error(429, space_cap_message(who, held))
 
     def visible(http: Request, memory_id: str) -> bool:
         """按 ID 找的记忆：不存在的，或者在作用域里的。作用域之外的与不存在的一样处理。事实、
@@ -769,7 +815,7 @@ def memories_router(
         ] = None,
     ) -> V1Json:
         with _sdk_errors():
-            allow(http, request.user_id, request.agent_id)
+            allow(http, request.user_id, request.agent_id, creates=True)
             _no_server_files(request.messages)
             return memory.add(
                 request.messages,
@@ -977,7 +1023,7 @@ def memories_router(
     @router.post("/runs", responses=_ok(RunResult))
     def open_run(http: Request, request: RunRequest) -> V1Json:
         with _sdk_errors():
-            allow(http, request.user_id, request.agent_id)
+            allow(http, request.user_id, request.agent_id, creates=True)
             run_id = memory.open_run(
                 request.run_id, user_id=request.user_id, agent_id=request.agent_id
             )
@@ -997,7 +1043,7 @@ def memories_router(
     @router.post("/consolidate", responses=_ok(ConsolidationReport))
     def consolidate(http: Request, request: ConsolidateRequest) -> V1Json:
         with _sdk_errors():
-            allow(http, request.user_id, request.agent_id)
+            allow(http, request.user_id, request.agent_id, creates=True)
             return memory.consolidate(
                 user_id=request.user_id, agent_id=request.agent_id, rebuild=request.rebuild
             )
@@ -1054,25 +1100,45 @@ def memories_router(
     def export(
         http: Request, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
     ) -> V1Json:
+        # 边读边写（第八轮体检 P7）：与 Memory.export 的 JSON 逐字节相同，同一时间只有一句发言的
+        # 原图在内存里。以前整个导出（每张原图的 base64）先放进一个 dict 再渲染，峰值约是响应体的
+        # 三倍。没有这个空间时在开始写之前 404；写出途中出错只能截断（MemoryClient 解析时出错）。
+        # 文档里的形状照旧（ExportDocument，docs/openapi-v1.json 不变）
+        from cuemem.portable import iter_export_json
+
         with _sdk_errors(by_id=True):  # 没有这个空间：KeyError（404），与本地相同
             allow(http, user_id, agent_id)
-            return memory.export(user_id=user_id, agent_id=agent_id, derived=derived)
+            plan = memory._export_plan(user_id=user_id, agent_id=agent_id, derived=derived)
+        stream = StreamingResponse(iter_export_json(plan), media_type="application/json")
+        return cast(V1Json, stream)
 
     @router.post("/import", responses=_ok(ImportReport))
     def load(http: Request, request: ImportRequest) -> V1Json:
         # 写进哪个空间与 Memory.load 的取法相同：给了 user_id、agent_id 时是它们的空间，否则是
-        # 文件里的 space_id
-        if request.user_id or request.agent_id:
-            target: str | None = space_for(request.user_id, request.agent_id)
+        # 文件里的 space_id。Mem0 的导出先换算（from_mem0），按换算出的空间查作用域：混着几个
+        # 用户、又没给 user_id 时 400，作用域之外的空间 403
+        data = request.data
+        if request.format == "mem0":
+            from cuemem.portable import from_mem0
+
+            with _sdk_errors():
+                converted = from_mem0(data, user_id=request.user_id, agent_id=request.agent_id)
+            target: str | None = str(converted["space_id"])
+        elif request.user_id or request.agent_id:
+            target = space_for(request.user_id, request.agent_id)
         else:
-            target = str(request.data["space_id"]) if "space_id" in request.data else None
+            target = (
+                str(data["space_id"]) if isinstance(data, dict) and "space_id" in data else None
+            )
         _allow(principal_of(http), target)
+        room(http, target)
         with _sdk_errors():
             return memory.load(
-                request.data,
+                data,
                 user_id=request.user_id,
                 agent_id=request.agent_id,
                 wait=request.wait,
+                format=request.format,
             )
 
     @router.get("/spaces", responses=_ok(list[SpaceRow]))

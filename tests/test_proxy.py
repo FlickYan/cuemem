@@ -18,20 +18,32 @@ import anyio
 import httpx2
 import numpy as np
 import pytest
-from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI
+from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI, QdrantDown
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
 from PIL import Image, UnidentifiedImageError
 from scripted import ScriptedModel
 from test_sdk import where_i_live
+from test_store import small_open_file_limit
 
 from cuemem import Memory
-from cuemem.api.proxy import MemoryProxy, _chat_to_response, _responses_to_chat, create_proxy_app
+from cuemem.api import proxy as proxy_module
+from cuemem.api.proxy import (
+    MemoryProxy,
+    ProxyError,
+    _chat_to_response,
+    _responses_to_chat,
+    create_proxy_app,
+)
 from cuemem.config import PathsConfig, Settings, load_settings
+from cuemem.core.models import SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
 from cuemem.memory import MemorySystem
+from cuemem.sdk import space_for
+from cuemem.store.vector import reserved_files
+from cuemem.write.consolidate import Consolidator
 from cuemem.write.online import worth_retrying
 
 SYSTEM = {"role": "system", "content": "You are a helpful shopping assistant."}
@@ -518,6 +530,29 @@ def test_upstream_errors_are_returned_and_not_remembered(
     assert system.db.get_turns("alice") == []
 
 
+def test_a_new_user_near_the_open_file_limit_gets_503_before_forwarding(
+    client: TestClient, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """本地向量库快到打开文件数的上限、请求的用户（X-CueMem-Agent 下）又是新的空间：在开会话、
+    转发之前回 OpenAI 格式的 503（server_error，code capacity），话没发给模型、什么都没写；已有的
+    空间照常（第八轮体检 P3）。以前转发、回答之后写回才失败（文件用光时所有请求都出错）。"""
+    assert chat(client, "I live in Berlin", user="alice").status_code == 200
+    collections = len(system.vectors._client.get_collections().collections)
+    # 最小的、余量正好够已有集合的软上限（reserved_files 在软上限小时最多留一半）
+    soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+    small_open_file_limit(monkeypatch, soft)
+    sent = len(upstream.proxied)
+    full = chat(client, "hi", user="alice", headers={"X-CueMem-Agent": "x1"})
+    assert full.status_code == 503, full.text
+    error = full.json()["error"]
+    assert (error["type"], error["code"]) == ("server_error", "capacity")
+    assert full.headers["x-should-retry"] == "false"
+    assert len(upstream.proxied) == sent and space_for("alice", "x1") not in {
+        row["space_id"] for row in system.db.list_spaces()
+    }
+    assert chat(client, "Recommend a coat", user="alice").status_code == 200
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_upstream_rate_limits_and_timeouts_reach_the_caller(
     client: TestClient,
@@ -731,16 +766,17 @@ def test_open_proxy_sessions_per_user_are_capped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """第七轮复审 P14：一个用户同时进行中的代理会话最多 max_open_runs 个
-    （CUEMEM_MAX_OPEN_SESSIONS，默认 64）。再开新的时先结束最久没有请求、没有留着写回的那个
-    （与闲置结束相同）；都留着写回（故障期间）时 429。以前每个会话的写回有上限，会话数却不限：
-    调用方每次换一个 X-CueMem-Session，故障期间每个都能留 32 MiB。"""
+    （CUEMEM_MAX_OPEN_SESSIONS，默认 64）。再开新的时先停放最久没有请求、没有留着写回的那个
+    （第八轮体检 P1：会话照旧进行中，见 test_parked_proxy_sessions_are_not_replayed）；都留着写回
+    （故障期间）时 429。以前每个会话的写回有上限，会话数却不限：调用方每次换一个
+    X-CueMem-Session，故障期间每个都能留 32 MiB。"""
     assert proxy.max_open_runs == 64
     proxy.max_open_runs = 2
     for i, sid in enumerate(("s1", "s2", "s3")):
         clock.now = float(i)
         assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
-    assert sorted(sid for _, sid in proxy._runs) == ["s2", "s3"]  # s1 最久没有请求：结束了
-    assert system.open_sessions("alice") == {"s2", "s3"}
+    assert sorted(sid for _, sid in proxy._runs) == ["s2", "s3"]  # s1 最久没有请求：停放了
+    assert system.open_sessions("alice") == {"s1", "s2", "s3"}  # 照旧进行中
     assert chat(client, "hi", user="bob", headers={"X-CueMem-Session": "s1"}).is_success  # 各算各的
 
     outage = Outage(system, monkeypatch)
@@ -758,15 +794,219 @@ def test_open_proxy_sessions_per_user_are_capped(
     chat(client, "back", user="alice", headers={"X-CueMem-Session": "s2"})  # s2 留着的写进去了
     clock.now = 20.0
     assert chat(client, "one more", user="alice", headers={"X-CueMem-Session": "s4"}).is_success
-    # s2 刚有过请求，却是唯一没有留着写回的：结束它；s3 留着的写回不丢
+    # s2 刚有过请求，却是唯一没有留着写回的：停放它；s3 留着的写回不丢
     assert sorted(sid for space, sid in proxy._runs if space == "alice") == ["s3", "s4"]
-    assert "s2" not in system.open_sessions("alice")
+    assert "s2" in system.open_sessions("alice")
     assert [t.text for t in system.db.get_turns("alice", "s2") if t.role == "user"] == [
         "note 1",
         "later 0",
         "back",
     ]
     assert [u.messages[0]["content"] for u in proxy._runs[("alice", "s3")].unsaved] == ["later 1"]
+
+
+def test_parked_proxy_sessions_are_not_replayed(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第八轮体检 P1：一个用户并行的会话多于上限时，为腾名额停放的会话照旧进行中，不交给抽取。
+    以前直接结束它（交给抽取），调用方回来接着写时会话又打开、长了，下次腾名额时整个空间重放
+    （rebuild(replay=True)）：3 个会话轮流、上限 2 时 4 轮重放 3 次。停放的会话闲置太久时照常
+    交给抽取，每个会话只抽取一次。"""
+    proxy.max_open_runs = 2
+    replays: list[bool] = []
+    rebuild = Consolidator.rebuild
+
+    def spy(self: Consolidator, space_id: str, *, replay: bool = False) -> Any:
+        replays.append(replay)
+        return rebuild(self, space_id, replay=replay)
+
+    monkeypatch.setattr(Consolidator, "rebuild", spy)
+    sessions = ("s1", "s2", "s3")
+    assert system.worker is not None
+    for r in range(4):
+        for i, sid in enumerate(sessions):
+            clock.now = float(r * 3 + i)
+            headers = {"X-CueMem-Session": sid}
+            assert chat(client, f"note {r} {sid}", user="alice", headers=headers).is_success
+        system.worker.wait()
+    assert not any(replays)
+    assert system.open_sessions("alice") == set(sessions)
+    assert system.db.get_jobs("alice") == []  # 进行中：都还没交给抽取
+    assert proxy.open_runs() == 2 and proxy.parked_runs() == 1
+
+    clock.now += proxy.idle_s
+    assert proxy.close_idle() == 3  # 停放的也闲置结束
+    system.worker.wait()
+    assert proxy.open_runs() == 0 and proxy.parked_runs() == 0
+    assert system.open_sessions("alice") == set()
+    jobs = system.db.get_jobs("alice")
+    assert sorted(j["session_id"] for j in jobs) == sorted(sessions)
+    assert all(j["status"] == "done" for j in jobs)
+    assert "note 3 s1" in {f.statement for f in system.facts("alice")}
+    assert not any(replays)
+
+
+def test_parked_proxy_sessions_beyond_the_limit_are_ended(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停放的会话最多 PARKED_KEPT 个（整个进程）：再多时最早停放的那个交给抽取；退出时
+    （close_all）停放的也交出去。"""
+    monkeypatch.setattr(proxy_module, "PARKED_KEPT", 1)
+    proxy.max_open_runs = 1
+    assert system.worker is not None
+    for i, sid in enumerate(("s1", "s2")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    assert proxy.parked_runs() == 1 and system.db.get_jobs("alice") == []
+    clock.now = 2.0
+    assert chat(client, "note 2", user="alice", headers={"X-CueMem-Session": "s3"}).is_success
+    system.worker.wait()
+    assert proxy.parked_runs() == 1  # 停放了 s2，最早停放的 s1 交给抽取
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == ["s1"]
+    assert system.open_sessions("alice") == {"s2", "s3"}
+
+    proxy.close_all()
+    system.worker.wait()
+    assert proxy.parked_runs() == 0 and system.open_sessions("alice") == set()
+    assert sorted(j["session_id"] for j in system.db.get_jobs("alice")) == ["s1", "s2", "s3"]
+
+
+def test_a_parked_implicit_session_keeps_its_id(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """没指定会话头的会话也会被停放：调用方接着这段对话时写进原来的会话；开始新的一段时先把它
+    交给抽取。"""
+    proxy.max_open_runs = 1
+    first = chat(client, "I live in Berlin", user="alice")
+    session = first.headers["x-cuemem-session"]
+    clock.now = 1.0
+    assert chat(client, "hi", user="alice", headers={"X-CueMem-Session": "s1"}).is_success
+    assert proxy.parked_runs() == 1 and session in system.open_sessions("alice")
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    clock.now = 2.0
+    second = chat(client, "Recommend a coat", history, user="alice")
+    assert second.headers["x-cuemem-session"] == session
+    assert system.db.get_jobs("alice") == []
+    clock.now = 3.0
+    assert chat(client, "hi again", user="alice", headers={"X-CueMem-Session": "s1"}).is_success
+    clock.now = 4.0
+    third = chat(client, "A new topic", user="alice")  # 新的一段：停放的那段交给抽取
+    assert third.headers["x-cuemem-session"] != session
+    assert system.worker is not None
+    system.worker.wait()
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == [session]
+
+
+def test_forgetting_beside_a_parked_session_keeps_the_replay(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停放（第八轮体检 P1）与遗忘的快速路径（P4）合在一起：停放的会话还在进行中、没有任务，
+    快速路径不把它当作只记了日志的会话：删掉它照旧重放。删掉别的只记了日志的会话照样走快速
+    路径（重放本来就跳过进行中的会话）。之后停放的会话照常闲置结束、交给抽取。"""
+    proxy.max_open_runs = 1
+    for i, sid in enumerate(("s1", "s2")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    assert proxy.parked_runs() == 1 and system.db.get_jobs("alice") == []
+    turns = [TurnIn(role="user", text="I like opera")]  # 只记日志（SDK 的 infer=False）
+    session = SessionIn(session_id="logged", started_at=datetime(2026, 5, 1), turns=turns)
+    system.append("alice", session, 0, enqueue=False)
+    fast: list[bool] = []
+    inert = MemorySystem._inert_sessions
+
+    def spy(self: MemorySystem, *args: Any, **kwargs: Any) -> bool:
+        fast.append(inert(self, *args, **kwargs))
+        return fast[-1]
+
+    monkeypatch.setattr(MemorySystem, "_inert_sessions", spy)
+    assert system.forget("alice", session_ids=["logged"]).turns_deleted == 1
+    assert system.forget("alice", session_ids=["s1"]).turns_deleted == 2
+    assert fast == [True, False]  # 停放的会话进行中、有进行中的标记：不走快速路径
+    clock.now += proxy.idle_s + 2
+    assert proxy.close_idle() == 2
+    assert system.worker is not None
+    system.worker.wait()
+    assert proxy.parked_runs() == 0 and system.open_sessions("alice") == set()
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == ["s2"]
+
+
+def test_a_session_that_is_writing_back_is_not_ended_to_make_room(
+    client: TestClient, proxy: MemoryProxy, clock: Clock
+) -> None:
+    """第八轮体检 P10：到了 max_open_runs 时不停放正在写回的会话（它的锁被持有），即使它最久
+    没有请求；都在写回时 429。直接调用 _make_room（调用方持有 proxy._lock），只看选了哪个。"""
+    proxy.max_open_runs = 2
+    for i, sid in enumerate(("s1", "s2")):
+        clock.now = float(i)
+        assert chat(client, f"note {i}", user="alice", headers={"X-CueMem-Session": sid}).is_success
+    s1, s2 = proxy._runs[("alice", "s1")], proxy._runs[("alice", "s2")]
+    with s1.lock:  # s1 最久没有请求，但正在写回
+        with proxy._lock:
+            assert proxy._make_room("alice") is None
+        assert list(proxy._parked) == [("alice", "s2")]  # 停放的是 s2（第八轮体检 P1）
+        proxy._parked.clear()
+        proxy._runs[("alice", "s2")] = s2  # 放回去：只看选了哪个
+        with s2.lock, proxy._lock, pytest.raises(ProxyError) as refused:
+            proxy._make_room("alice")
+    assert refused.value.status == 429
+    assert sorted(sid for _, sid in proxy._runs) == ["s1", "s2"]
+
+
+def test_a_parked_session_survives_a_429(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """第八轮复审：回到停放的会话、名额都在写回（429）时，停放的会话照旧停放。以前先从 _parked
+    取走再腾名额，429 时它不在内存里也不在 _parked 里：close_idle、close_all 都看不到，一直进行中、
+    不交给抽取（没指定会话时连会话 ID 也丢了）。调用方开始新的一段时，取走的那段照常交给抽取。"""
+    proxy.max_open_runs = 1
+    first = chat(client, "I live in Berlin", user="alice")
+    implicit = first.headers["x-cuemem-session"]
+    clock.now = 1.0
+    assert chat(client, "hi", user="alice", headers={"X-CueMem-Session": "s1"}).is_success
+    clock.now = 2.0  # 停放了没指定会话的那段；s1 停放 s2，最早停放的仍留着（PARKED_KEPT）
+    assert chat(client, "hello", user="alice", headers={"X-CueMem-Session": "s2"}).is_success
+    assert proxy.parked_runs() == 2
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    with proxy._runs[("alice", "s2")].lock:  # s2 正在写回：腾不出名额
+        clock.now = 3.0
+        refused = chat(client, "again", user="alice", headers={"X-CueMem-Session": "s1"})
+        assert refused.status_code == 429
+        assert chat(client, "Recommend a coat", history, user="alice").status_code == 429
+        assert proxy.parked_runs() == 2
+        assert set(proxy._parked) == {("alice", "s1"), ("alice", None)}
+        assert proxy._parked[("alice", None)][0] == implicit
+        assert chat(client, "A new topic", user="alice").status_code == 429
+    assert system.worker is not None
+    system.worker.wait()  # 新的一段：取走的那段照常交给抽取，s1 照旧停放
+    assert [j["session_id"] for j in system.db.get_jobs("alice")] == [implicit]
+    assert set(proxy._parked) == {("alice", "s1")}
+    proxy.close_all()
+    system.worker.wait()
+    assert system.open_sessions("alice") == set()
+    assert sorted(j["session_id"] for j in system.db.get_jobs("alice")) == sorted(
+        [implicit, "s1", "s2"]
+    )
 
 
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）
@@ -879,6 +1119,22 @@ def test_access_token(proxy: MemoryProxy, upstream: Upstream) -> None:
         assert chat(client, "hi", user="alice").status_code == 401
         ok = chat(client, "hi", user="alice", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200
+
+
+def test_vector_store_outage_keeps_answering_and_fails_readiness(
+    system: MemorySystem, proxy: MemoryProxy, upstream: Upstream
+) -> None:
+    """Qdrant 服务端连不上时（第八轮体检 P9）：对话照常转发、只是不带记忆（召回本来就是
+    fail-open）；/health 照旧 200，/ready 503 说出向量库。"""
+    Memory.from_system(system).add("I like green tea.", user_id="alice", infer=False)
+    with TestClient(create_proxy_app(proxy)) as client:
+        assert client.get("/ready").json() == {"ok": True}
+        with QdrantDown(system.vectors):
+            assert chat(client, "What tea do I like?", user="alice").status_code == 200
+            assert client.get("/health").status_code == 200
+            ready = client.get("/ready")
+            assert ready.status_code == 503 and ready.json()["failing"] == ["vector_store"]
+        assert client.get("/ready").status_code == 200
 
 
 @pytest.mark.parametrize(

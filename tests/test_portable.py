@@ -504,6 +504,156 @@ def test_cli_export_keeps_the_old_backup_when_the_write_fails(
     assert runner.invoke(app, ["export", "--space", "demo", "-o", os.devnull]).exit_code == 0
 
 
+def _mem0_export() -> dict[str, Any]:
+    """Mem0 get_all(show_expired=True) 的结果（mem0ai 2.2.1 的形状）：时间带时区（Mem0 写美西
+    时间），一条带 metadata，一条带过期日期。"""
+    return {
+        "results": [
+            {
+                "id": "6f1c0e3a-sushi",
+                "memory": "Likes sushi",
+                "hash": "h1",
+                "created_at": "2026-05-01T09:00:00.123456-07:00",
+                "updated_at": "2026-06-01T10:00:00-07:00",
+                "user_id": "alice",
+                "metadata": {"source": "chat"},
+            },
+            {
+                "id": "9a7d2b11-berlin",
+                "memory": "Lives in Berlin",
+                "hash": "h2",
+                "created_at": "2026-05-02T09:00:00-07:00",
+                "updated_at": None,
+                "user_id": "alice",
+                "run_id": "trip",
+                "expiration_date": "2030-01-01",
+            },
+        ]
+    }
+
+
+def test_mem0_import_is_idempotent(memory: Memory, fake_api: FakeAPI) -> None:
+    """load(..., format="mem0")（第八轮体检）：一条 Mem0 记忆一个会话，metadata、过期日期与
+    mem0_id 随事实带出，事实引用导入的发言；再导入一次什么都不加、不再调用模型；Mem0 里改过的
+    那条（更新时间不同）作为新会话进来，只加 1 条。带时区的时间换算成本机时间。"""
+    from cuemem.core.timeutil import naive_local
+
+    data = _mem0_export()
+    report = memory.load(data, format="mem0", wait=True)
+    assert report["space_id"] == "alice" and report["turns_added"] == 2
+    assert report["skipped"] == 0
+    turns = {t.text: t for t in memory.system.db.get_turns("alice")}
+    assert turns["Likes sushi"].ts == naive_local(
+        datetime.fromisoformat("2026-06-01T10:00:00-07:00")
+    )
+    assert {t.session_id[:5] for t in turns.values()} == {"mem0-"}
+    facts = {f["memory"]: f for f in memory.get_all(user_id="alice")["results"]}
+    assert facts["Likes sushi"]["metadata"] == {
+        "source": "chat",
+        "mem0_id": "6f1c0e3a-sushi",
+        "mem0_updated_at": "2026-06-01T10:00:00-07:00",
+    }
+    assert facts["Lives in Berlin"]["metadata"] == {
+        "mem0_id": "9a7d2b11-berlin",
+        "mem0_run_id": "trip",
+    }
+    assert facts["Lives in Berlin"]["expiration_date"] == "2030-01-01"
+    assert facts["Likes sushi"]["source_turn_ids"] == [turns["Likes sushi"].id]
+
+    calls = len(fake_api.chat_requests)
+    again = memory.load(data, format="mem0", wait=True)
+    assert again["turns_added"] == 0 and len(fake_api.chat_requests) == calls
+    assert len(memory.system.db.get_turns("alice")) == 2
+
+    edited = _mem0_export()
+    edited["results"][0].update(memory="Loves sushi", updated_at="2026-07-01T10:00:00-07:00")
+    assert memory.load(edited, format="mem0", wait=True)["turns_added"] == 1
+    assert memory.load(edited, format="mem0")["turns_added"] == 0
+
+
+def test_mem0_import_refuses_mixed_users_and_malformed_items(memory: Memory) -> None:
+    """几个用户混在一起又没给 user_id 时 ValueError、什么都不写（给了 user_id 时都进那个空间）；
+    哪一条不合格式（memory 不是文字、metadata 不是对象、时间认不出）都整个拒绝，什么都不写。文字
+    为空的记忆跳过、记数。format 写错时 ValueError。"""
+    mixed = _mem0_export()
+    mixed["results"][1]["user_id"] = "bob"
+    with pytest.raises(ValueError, match="mixes several users"):
+        memory.load(mixed, format="mem0")
+    assert memory.spaces() == []
+    report = memory.load(mixed["results"], format="mem0", user_id="carol")
+    assert report["space_id"] == "carol" and report["turns_added"] == 2
+
+    for field, value in (
+        ("memory", None),
+        ("metadata", [1]),
+        ("created_at", "yesterday"),
+        # 带时区、在日期范围边上：换算成本机时间时 OverflowError，以前原样抛出（第八轮复审）
+        ("created_at", "0001-01-01T00:00:00+05:00"),
+        ("updated_at", "9999-12-31T23:59:59-05:00"),
+        ("expiration_date", "9999-12-31T23:59:59-05:00"),
+        ("expiration_date", "soon"),
+        ("user_id", 42),
+    ):
+        bad = _mem0_export()
+        bad["results"][1][field] = value
+        with pytest.raises(ValueError, match="Malformed Mem0 export"):
+            memory.load(bad, format="mem0")
+    with pytest.raises(ValueError, match="Malformed Mem0 export"):
+        memory.load({"memories": []}, format="mem0", user_id="dave")
+    assert [s["space_id"] for s in memory.spaces()] == ["carol"]
+
+    blank = _mem0_export()
+    blank["results"][0]["memory"] = "  "
+    report = memory.load(blank, format="mem0", user_id="erin")
+    assert report["turns_added"] == 1 and report["skipped"] == 1
+    with pytest.raises(ValueError, match="format"):
+        memory.load(blank, format="letta")  # type: ignore[arg-type]
+    # 不是对象的文件当作 CueMem 导出：与 Memory.load 相同的说明，以前说 AttributeError
+    with pytest.raises(ValueError, match="is a JSON object"):
+        import_space(memory.system, blank["results"])  # type: ignore[arg-type]
+
+
+def test_cli_import_from_mem0(
+    clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cuemem import --from mem0：不给 --user 时按 user_id 分组，每个用户导入到自己的空间，逐个
+    报告；再运行一次什么都不加。--user 时都导入到那个用户。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    data = _mem0_export()
+    data["results"][1]["user_id"] = "bob"
+    path = tmp_path / "mem0.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = runner.invoke(app, ["import", str(path), "--from", "mem0"])
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "记忆空间alice：1个会话，新增1条发言" in flat
+    assert "记忆空间bob：1个会话，新增1条发言" in flat
+    assert "各是一个事务" in flat
+    result = runner.invoke(app, ["import", str(path), "--from", "mem0"])
+    assert result.exit_code == 0 and _flat(result.output).count("新增0条发言") == 2
+    result = runner.invoke(app, ["import", str(path), "--from", "mem0", "--user", "carol"])
+    assert result.exit_code == 0 and "记忆空间carol：2个会话，新增2条发言" in _flat(result.output)
+    spaces = runner.invoke(app, ["spaces"]).output
+    assert all(name in spaces for name in ("alice", "bob", "carol"))
+
+    data["results"][0]["user_id"] = None
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = runner.invoke(app, ["import", str(path), "--from", "mem0"])
+    assert result.exit_code == 1 and "nouser_idoragent_id" in _flat(result.output)
+    result = runner.invoke(app, ["import", str(path), "--from", "letta"])
+    assert result.exit_code == 1 and "--from只能是" in _flat(result.output)
+
+    # 忘了 --from mem0（第八轮复审）：两种 Mem0 的形状都一行提示加上 --from mem0，什么都不写；
+    # 以前列表说 AttributeError，{"results": [...]} 说不是 CueMem 导出
+    for shape in (data["results"], data):
+        path.write_text(json.dumps(shape), encoding="utf-8")
+        result = runner.invoke(app, ["import", str(path)])
+        flat = _flat(result.output)
+        assert result.exit_code == 1 and "--frommem0" in flat and "Error" not in flat, flat
+
+
 @pytest.mark.parametrize("damage", ["truncated", "not-utf8"])
 def test_cli_import_of_a_damaged_file_is_one_line(
     clean_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
