@@ -712,9 +712,7 @@ class MemorySystem:
         queued = 0
         with (
             start_trace("append", self.tracer, space=space_id, **names),
-            self.writer.writing(
-                space_id, import_batches(pieces), meta, first_wins=True
-            ) as report,
+            self.writer.writing(space_id, import_batches(pieces), meta, first_wins=True) as report,
         ):
             if enqueue:
                 queued = self.consolidator.enqueue(space_id, sessions, skip=skip | set(log_only))

@@ -153,11 +153,11 @@ class McpEndpoint:
       全是通配的令牌没有，400；utf-8'' 写错、不是 UTF-8 时也是 400；
     - 空间在令牌的作用域之外时 403，什么都不做；
     - 只认 POST（第九轮体检 P4）：GET、DELETE 与别的方法都是 405、Allow: POST，在上面三项检查
-      之后（令牌不对时仍然是 401）。无状态、JSON 响应时服务端从不主动发消息，也没有会话可结束；以前 GET
-      却得到一个永远不结束的空 text/event-stream：Node 的 MCP 客户端（包括 Claude Code）连上
-      之后都会开一个，每个占着令牌的一个并发名额（max_concurrent，默认 8，占满之后工具调用是
-      429），停止服务时还要等满优雅退出的时限。MCP 的规范允许对这个 GET 回 405，客户端把它当成
-      "没有服务端的流"；
+      之后（令牌不对时仍然是 401）。无状态、JSON 响应时服务端从不主动发消息，也没有会话可结束；
+      以前 GET 却得到一个永远不结束的空 text/event-stream：Node 的 MCP 客户端（包括 Claude
+      Code）连上之后都会开一个，每个占着令牌的一个并发名额（max_concurrent，默认 8，占满之后
+      工具调用是 429），停止服务时还要等满优雅退出的时限。MCP 的规范允许对这个 GET 回 405，
+      客户端把它当成"没有服务端的流"；
     - 空间放进 _SPACE、令牌放进 _WHO，工具读它们（remember 查令牌的 max_spaces）。
 
     Host 与 Origin 由整个应用的 TrustedHostMiddleware 与 SameOriginOnly 检查（与 /api 相同），
