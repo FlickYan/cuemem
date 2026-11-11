@@ -2588,6 +2588,54 @@ def test_a_stopped_responses_stream_keeps_only_the_user_message(
     assert relayed._runs[("alice", None)].busy == 0
 
 
+def test_a_responses_stream_echoes_a_lone_surrogate(system: MemorySystem) -> None:
+    """请求里原样带回、不转发的字段（metadata）有落单的代理项（JSON 的 "\\ud800" 解析得出来，
+    写不成 UTF-8）：以前建事件流的时候抛 UnicodeEncodeError，上游已经开着的流没有人关，连接
+    不还给连接池，这一轮也一直算作进行中（会话停放不了）。现在这样的事件用 \\uXXXX 转义写。"""
+    answer = Answer(["Your PIN is 1234"])
+    relayed = streaming(system, answer)
+    body = {**RESPOND_PIN, "metadata": {"k": "\ud800"}}
+    status, chunks, _ = relayed.respond_stream(body, {})
+    events = events_of(chunks)
+    assert status == 200 and kinds_of(events) == [*STREAMED, "response.completed"]
+    assert {e["response"]["metadata"]["k"] for e in events if "response" in e} == {"\ud800"}
+    assert answer.closed and relayed._runs[("alice", None)].busy == 0
+    assert len(system.db.get_turns("alice")) == 2
+
+
+def test_a_responses_stream_that_cannot_start_closes_the_upstream(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """事件流没建成（不管什么原因）：上游的流关掉，这一轮放开，只写回用户的话。"""
+
+    def broken(self: Any, *args: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(proxy_module._ResponsesRelay, "__init__", broken)
+    answer = Answer(["Your PIN is 1234"])
+    relayed = streaming(system, answer)
+    with pytest.raises(RuntimeError, match="boom"):
+        relayed.respond_stream(RESPOND_PIN, {})
+    assert answer.closed and relayed._runs[("alice", None)].busy == 0
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+
+
+def test_a_responses_stream_relays_a_split_surrogate_pair(system: MemorySystem) -> None:
+    """上游把一个字符的两半（"\\ud83d" 与 "\\ude00"）分在两块里：以前带着半个的那个 delta 写不成
+    UTF-8，事件流中途断掉、没有结束事件。现在这两个 delta 照上游的转义写，拼起来是原来的字。"""
+    answer = Answer(["Hi \ud83d", "\ude00 there"])
+    relayed = streaming(system, answer)
+    _, chunks, _ = relayed.respond_stream(RESPOND_PIN, {})
+    raw = list(chunks)
+    events = events_of(iter(raw))
+    assert kinds_of(events) == [*STREAMED, "response.completed"]
+    assert [e["delta"] for e in events if "delta" in e] == ["Hi \ud83d", "\ude00 there"]
+    assert rb"Hi \ud83d" in raw[4] and rb"\ude00 there" in raw[5]
+    # 拼起来的全文是一对完整的代理项：JSON 解析出来就是那个字
+    assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Hi \U0001f600 there"
+    assert answer.closed and relayed._runs[("alice", None)].busy == 0
+
+
 @pytest.mark.parametrize("reply", [REJECT, RATE_LIMIT, TIMEOUT])
 def test_a_responses_stream_refused_at_the_start_is_a_json_error(
     client: TestClient, system: MemorySystem, upstream: Upstream, reply: str

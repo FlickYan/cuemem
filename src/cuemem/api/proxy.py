@@ -403,7 +403,11 @@ class MemoryProxy:
         status, chunks, extra = self.stream(chat, headers, principal)
         if status != 200 or not isinstance(chunks, _Relay):
             return status, chunks, extra
-        return 200, _ResponsesRelay(chunks, body, extra["X-CueMem-Model"]), extra
+        try:
+            return 200, _ResponsesRelay(chunks, body, extra["X-CueMem-Model"]), extra
+        except BaseException:
+            chunks.close()  # 上游的流已经开着：包装没建成也要关掉它、放开这一轮
+            raise
 
     def embeddings(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         """/v1/embeddings：交给配置里的向量模型（文档向量，不加查询指令）。返回（响应体，响应头）。"""
@@ -1217,7 +1221,13 @@ class _ResponsesRelay(Iterator[bytes]):
     def _event(self, kind: str, **fields: Any) -> bytes:
         payload = {"type": kind, "sequence_number": self._sequence, **fields}
         self._sequence += 1
-        return f"event: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+        try:
+            data = json.dumps(payload, ensure_ascii=False).encode()
+        except UnicodeEncodeError:
+            # 落单的代理项（请求里原样带回的字段，或者上游把一个字符的两半分在两块里）写不成
+            # UTF-8：这个事件改用 \uXXXX 转义，JSON 的内容不变
+            data = json.dumps(payload).encode()
+        return b"event: " + kind.encode() + b"\ndata: " + data + b"\n\n"
 
 
 class _RelayResponse(StreamingResponse):
