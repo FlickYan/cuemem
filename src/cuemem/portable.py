@@ -271,8 +271,8 @@ def import_space(
             target, chunks, meta, log_only = _parse_export(data, space_id, Path(scratch))
         except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError(f"Malformed export: {type(exc).__name__}: {exc}") from exc
-        # 整个文件在一个事务里提交：向量化中途出错时一条都不写，重试从头开始（每段各向量化一次，
-        # 与以前逐段写入时的请求相同）
+        # 整个文件在一个事务里提交：向量化中途出错时一条都不写，重试从头开始。几段合成一批一起
+        # 向量化（每批最多 256 句发言，见 MemorySystem.appending），不是每段一个请求
         if chunks:
             extra = meta if any(m is not None for m in meta.values()) else None
             # 目标空间里已经有任务的会话照常登记（又多了发言时要重新抽取）

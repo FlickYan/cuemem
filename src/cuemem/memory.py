@@ -9,7 +9,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -387,6 +387,27 @@ def vector_gaps(
     return gaps
 
 
+def import_batches(
+    pieces: Iterable[tuple[SessionIn, int]], max_turns: int = 256
+) -> list[list[tuple[SessionIn, int]]]:
+    """把要写入的几段（会话，第一句的序号）按顺序合成几批：一批里的发言加起来不超过 max_turns，
+    一段不拆开（比上限还长的一段自己一批）。OnlineWriter 每批向量化一次、写一次向量库。
+
+    第九轮体检：以前每段一批，导入 50 个各一句的会话就是 50 个向量请求（默认每个请求能带 10 段
+    文本），迁移几千条记忆时是几千个串行的请求。上限让一次写向量库的点数有界：全部合成一批时，
+    5,000 条记忆在 Qdrant 服务端是一个几十 MB 的请求。"""
+    batches: list[list[tuple[SessionIn, int]]] = []
+    size = 0
+    for piece in pieces:
+        turns = len(piece[0].turns)
+        if not batches or size + turns > max_turns:
+            batches.append([])
+            size = 0
+        batches[-1].append(piece)
+        size += turns
+    return batches
+
+
 class MemorySystem:
     def __init__(
         self,
@@ -670,18 +691,21 @@ class MemorySystem:
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
         log_only: Collection[str] = (),
     ) -> Iterator[IngestReport]:
-        """同 append，pieces 是若干段（会话，第一句的序号），每段各向量化一次（导入文件时每段
-        连续的发言一段，与以前逐段追加时的请求相同）。with 块里的写入（Agent 的溯源）与发言、
-        巩固任务在同一个事务里提交，块里出错时一起撤销（块里只做数据库的写入：事务持有数据库
-        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。log_only：只写日志、
-        不登记巩固任务的会话（导入文件里 "infer": false 的会话，同 SDK 的 add(infer=False)）。"""
+        """同 append，pieces 是若干段（会话，第一句的序号；导入文件时每段连续的发言一段）。
+        几段合成一批一起向量化、写向量（import_batches：每批最多 256 句发言），不再每段一个请求；
+        只有一段时（add、append、update、Agent）就是那一批，请求与以前相同。
+
+        with 块里的写入（Agent 的溯源）与发言、巩固任务在同一个事务里提交，块里出错时一起撤销
+        （块里只做数据库的写入：事务持有数据库的锁）。meta：（会话，发言序号）→ 附加信息，见
+        OnlineWriter.writing。log_only：只写日志、不登记巩固任务的会话（导入文件里
+        "infer": false 的会话，同 SDK 的 add(infer=False)）。"""
         sessions = list(dict.fromkeys(s.session_id for s, _ in pieces))
         names = {"session": sessions[0]} if len(sessions) == 1 else {"sessions": sessions}
         skip = self.open_sessions(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
         queued = 0
         with (
             start_trace("append", self.tracer, space=space_id, **names),
-            self.writer.writing(space_id, [[piece] for piece in pieces], meta) as report,
+            self.writer.writing(space_id, import_batches(pieces), meta) as report,
         ):
             if enqueue:
                 queued = self.consolidator.enqueue(space_id, sessions, skip=skip | set(log_only))

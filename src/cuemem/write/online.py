@@ -214,8 +214,8 @@ class OnlineWriter:
         发言，却没有"轮"、也没有巩固任务，调用方重试又把同样的话写一遍。现在出错时数据库里什么
         都没写，已经写进向量库的点尽量删掉，存进媒体库、别处没有用到的原图也删掉（见 _discard）。
 
-        每批向量化一次，与以前逐次写入时的请求相同：导入整段对话是一批，导入文件时每段连续的
-        发言一批。已有的发言不再处理；遗忘删掉的发言也不会被写回来。
+        每批向量化一次：导入整段对话是一批，一次追加是一批，导入文件时若干段合成一批（见
+        MemorySystem.appending）。已有的发言不再处理；遗忘删掉的发言也不会被写回来。
 
         meta：（会话，发言序号）→ 附加信息（SDK 的 metadata、过期时间与更正目标，导入的文件），
         与发言在同一个事务里写，只写给真正写进去的发言；不影响"轮"与向量化。
@@ -245,7 +245,8 @@ class OnlineWriter:
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
     ) -> None:
         """一批会话：建发言与"轮"、存原图，把这批里新的图片与"轮"向量化、写进向量库（不写数据库）。
-        前面几批已经要写的不算新的，与以前逐批提交时相同（导入的文件里序号重复时）。"""
+        前面几批已经要写的、这一批里前面出现过的都不算新的：导入的文件里序号重复时先出现的算，
+        与发言的 INSERT OR IGNORE 一致（以前每段一批，只用管前面几批）。"""
         space_id = staged.space_id
         units: list[MemoryUnit] = []
         media: list[MediaItem] = []
@@ -265,7 +266,11 @@ class OnlineWriter:
         if media:  # 新图片：先写图片向量，再登记图片记录（数据库里有就说明向量已写入）
             known = {m.id for m in self.db.get_media(space_id, ids=[m.id for m in media])}
             known |= {m.id for m in staged.media}
-            new_media = [m for m in media if m.id not in known]
+            new_media = []
+            for m in media:
+                if m.id not in known:
+                    known.add(m.id)
+                    new_media.append(m)
             if new_media and self.image_embedder is not None:
                 with span("embed_images", images=len(new_media)):
                     vectors = self.image_embedder.embed_images([Path(m.path) for m in new_media])
@@ -283,7 +288,11 @@ class OnlineWriter:
 
         missing = set(self.db.missing_unit_ids(space_id, [u.id for u in units]))
         missing -= {u.id for u in staged.units}
-        new_units = [u for u in units if u.id in missing]
+        new_units = []
+        for u in units:
+            if u.id in missing:
+                missing.discard(u.id)
+                new_units.append(u)
         if new_units:
             embedded = self._embed(new_units)
             staged.units.extend(new_units)

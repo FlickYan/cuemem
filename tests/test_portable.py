@@ -25,9 +25,10 @@ from test_cli import _flat, runner
 from cuemem import Memory
 from cuemem.cli import app
 from cuemem.config import PathsConfig, Settings, load_settings, presets
-from cuemem.core.models import Turn
+from cuemem.core.models import SessionIn, Turn, TurnIn
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import EmbeddingAPIError
+from cuemem.memory import import_batches
 from cuemem.portable import FORMAT, import_space
 from cuemem.write.extract import INSTRUCTIONS_HEADER, Extractor
 
@@ -341,6 +342,131 @@ def test_an_import_that_fails_midway_writes_nothing(
     assert memory.load(data, user_id="bob")["turns_added"] == 2
     assert sorted(j["session_id"] for j in system.db.get_jobs("bob")) == ["s1", "s2"]
     assert len(system.db.list_units("bob", kinds=["round"])) == 2
+
+
+def _single_turn_sessions(n: int) -> dict[str, Any]:
+    """n 个各一句发言的会话（从 Mem0 迁移过来的记忆就是这样：一条记忆一个会话）。"""
+    sessions = [
+        {
+            "session_id": f"s{i}",
+            "started_at": DAY.isoformat(),
+            "turns": [
+                {"idx": 0, "role": "user", "text": f"memory number {i}", "ts": DAY.isoformat()}
+            ],
+        }
+        for i in range(n)
+    ]
+    return {"format": FORMAT, "version": 1, "space_id": "x", "sessions": sessions}
+
+
+def test_import_embeds_pieces_in_batches(settings: Settings, fake_api: FakeAPI) -> None:
+    """导入 25 个各一句的会话：向量请求是 3 个（默认每个请求 10 段文本），不是每个会话一个
+    （第九轮体检：以前每段各向量化一次，迁移 5,000 条记忆就是 5,000 个串行的请求）。同样的文本、
+    同样的向量，只是分组不同。"""
+    fake_api.embed_dim = settings.embedding.dim
+    with Memory(settings, http_client=fake_api.client(), background=False) as m:
+        report = m.load(_single_turn_sessions(25), user_id="bob")
+        assert report["turns_added"] == 25
+        assert [len(r["input"]["texts"]) for r in fake_api.embed_requests] == [10, 10, 5]
+        sent = [t for r in fake_api.embed_requests for t in r["input"]["texts"]]
+        assert sent == [f"User: memory number {i}" for i in range(25)]
+        assert len(m.system.db.list_units("bob", kinds=["round"])) == 25
+        assert m.system.vectors.count("bob") == 25
+
+
+def test_a_large_import_is_written_in_capped_batches(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """300 个各一句的会话：每批最多 256 句发言，向量库每次写入不超过这么多点（一次全写进去时，
+    5,000 条记忆在 Qdrant 服务端是一个几十 MB 的请求）。还是一个事务：300 句都在。"""
+    system = memory.system
+    upsert = system.vectors.upsert
+    sizes: list[int] = []
+
+    def spy(space_id: str, unit_ids: Sequence[str], *args: Any, **kwargs: Any) -> None:
+        sizes.append(len(unit_ids))
+        upsert(space_id, unit_ids, *args, **kwargs)
+
+    monkeypatch.setattr(system.vectors, "upsert", spy)
+    assert memory.load(_single_turn_sessions(300), user_id="bob")["turns_added"] == 300
+    assert sizes == [256, 44]
+    assert len(system.db.list_units("bob", kinds=["round"])) == 300
+    assert system.vectors.count("bob", kinds=["round"]) == 300
+    assert len(system.db.get_jobs("bob")) == 300
+
+
+def test_import_batches_never_split_a_piece() -> None:
+    def piece(n: int) -> tuple[SessionIn, int]:
+        turns = [TurnIn(role="user", text="x")] * n
+        return SessionIn(session_id=f"s{n}", started_at=DAY, turns=turns), 0
+
+    one = piece(1)
+    assert import_batches([one]) == [[one]]  # add、append、update：与以前相同的一批
+    sizes = [
+        [len(s.turns) for s, _ in batch] for batch in import_batches(map(piece, [3, 2, 9, 1, 4]), 5)
+    ]
+    assert sizes == [[3, 2], [9], [1, 4]]  # 比上限还长的一段自己一批
+
+
+def test_import_with_repeated_turn_numbers_keeps_the_first(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文件里序号重复（手改过的文件）：先出现的算，发言、"轮"、图片记录与图片向量都只有一份，
+    与以前逐段写入时相同（现在几段在同一批里，批内也要先到先得）。"""
+    day = DAY.isoformat()
+    turns = [
+        {"idx": 0, "role": "user", "text": "hi", "ts": day, "images": []},
+        {"idx": 1, "role": "user", "text": "red <image>", "ts": day, "images": [_image(_png())]},
+        {
+            "idx": 1,
+            "role": "user",
+            "text": "blue <image>",
+            "ts": day,
+            "images": [_image(_png("blue"))],
+        },
+        {"idx": 2, "role": "assistant", "text": "nice", "ts": day, "images": []},
+    ]
+    session = {"session_id": "s1", "started_at": day, "turns": turns}
+    data = {"format": FORMAT, "version": 1, "space_id": "x", "sessions": [session]}
+    system = memory.system
+    texts: list[str] = []
+    images: list[bytes] = []
+    embed = system.embedder.embed
+    assert system.image_embedder is not None
+    embed_images = system.image_embedder.embed_images
+
+    def spy_texts(batch: Sequence[str], kind: EmbedKind) -> Any:
+        texts.extend(batch)
+        return embed(batch, kind)
+
+    def spy_images(paths: Sequence[Path]) -> Any:
+        images.extend(p.read_bytes() for p in paths)
+        return embed_images(paths)
+
+    monkeypatch.setattr(system.embedder, "embed", spy_texts)
+    monkeypatch.setattr(system.image_embedder, "embed_images", spy_images)
+    report = memory.load(data, user_id="bob")
+    # 写进向量库的是先出现的那一份：后一份不向量化，也不覆盖同一个 ID 的点
+    assert texts == ["User: hi", "User: red <image>"]
+    assert images == [_png()]
+    # 下面的 ID 与内容是在改动之前的代码上记下的
+    assert report == {"space_id": "bob", "sessions": 1, "turns_added": 3, "images_added": 1}
+    image = "2af2426833692392"
+    assert [(t.idx, t.text, t.media_ids) for t in system.db.get_turns("bob")] == [
+        (0, "hi", []),
+        (1, "red <image>", [image]),
+        (2, "nice", []),
+    ]
+    units = system.db.list_units("bob", kinds=["round"])
+    assert sorted((u.id, u.text) for u in units) == [
+        ("d131e841a51d5466", "User: red <image>"),
+        ("f46b09a0239dd371", "User: hi"),
+    ]
+    [item] = system.db.get_media("bob")
+    assert (item.id, item.source_turn_id) == (image, "be4adafcb601e8c8")
+    assert Path(item.path).read_bytes() == _png()
+    assert system.vectors.count("bob", kinds=["round"]) == 2
+    assert system.vectors.media_ids("bob") == [image]
 
 
 def test_import_never_writes_outside_its_scratch_dir(memory: Memory, tmp_path: Path) -> None:
