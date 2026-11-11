@@ -257,7 +257,7 @@ RETURNS: dict[str, Any] = {
     "media": b"image",
     "wait": None,
     # GET /api/v1/export 边读边写（第八轮体检 P7）：调用 Memory._export_plan，再写出这个计划
-    "_export_plan": ExportPlan(cast(MemoryDB, None), "alice", [], {}, {}, set(), None),
+    "_export_plan": ExportPlan(cast(MemoryDB, None), "alice", [], {}, set(), None),
 }
 
 
@@ -1202,6 +1202,84 @@ def test_an_export_holds_one_turn_of_images_at_a_time(
     assert peak < 1.5 * encoded, (peak, encoded)
     streamed = b"".join(portable.iter_export_json(plan, whole["exported_at"]))
     assert streamed == JSONResponse(whole).body  # 一段一段编出的 base64 拼起来逐字节照旧
+
+
+def _two_sessions(system: MemorySystem) -> Memory:
+    """s1 的一句话比 EXPORT_CHUNK_BYTES 长：iter_export_json 的第一段在读 s2 之前写出。"""
+    local = Memory.from_system(system)
+    long_text = "I live in Berlin " + "x" * 70000
+    local.add(long_text, user_id="alice", run_id="s1", infer=False, timestamp=AUG)
+    local.add("I like tea", user_id="alice", run_id="s2", infer=False, timestamp="2026-08-02")
+    return local
+
+
+def test_a_turn_added_mid_stream_is_left_out(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """导出是开始那一刻的发言（第九轮体检 P6）。以前会话的发言在写到它时才读，附加信息与图片
+    记录却是开始时读的：下载途中写进来的发言也被导出，但没有图片、metadata 与过期时间（导回去
+    之后永远不过期），文件仍是合法的 JSON。现在它不在这次导出里，响应体与开始时的导出逐字节
+    相同。"""
+    from cuemem import portable
+
+    monkeypatch.setattr(portable, "_now", lambda: EXPORTED_AT)
+    local = _two_sessions(system)
+    before = JSONResponse(portable.export_space(system, "alice")).body
+    stream = portable.iter_export_json(portable.export_plan(system, "alice"))
+    first = next(stream)
+    assert b"I like tea" not in first  # s2 还没读
+    local.add(
+        _with_image("trip photo", _photo((9, 9), "green")),
+        user_id="alice",
+        run_id="s2",
+        metadata={"topic": "travel"},
+        expiration_date="2026-12-31",
+        infer=False,
+    )
+    local.add("a session started later", user_id="alice", run_id="s9", infer=False)
+    body = first + b"".join(stream)
+    assert [(s["session_id"], len(s["turns"])) for s in json.loads(body)["sessions"]] == [
+        ("s1", 1),
+        ("s2", 1),
+    ]
+    assert body == before
+    late = portable.export_space(system, "alice")["sessions"][1]["turns"][1]  # 下一次导出里完整
+    assert (len(late["images"]), late["metadata"], late["expires_at"][:10]) == (
+        1,
+        {"topic": "travel"},
+        "2026-12-31",
+    )
+
+
+def test_a_session_recreated_mid_stream_keeps_its_metadata(system: MemorySystem) -> None:
+    """下载途中整个空间被遗忘、又用同一个 run_id 写：新的发言序号从 0 重来、轮 ID 也相同，在
+    “开始时最大的序号”之内。每个会话的发言与附加信息在同一次持锁里读（MemoryDB.export_rows），
+    写出的发言带着它自己的 metadata 与过期时间；以前它与开始时读的附加信息（没有）拼在一起。"""
+    from cuemem import portable
+
+    local = _two_sessions(system)
+    stream = portable.iter_export_json(portable.export_plan(system, "alice"))
+    first = next(stream)
+    local.delete_all(user_id="alice")
+    local.add(
+        "secret new",
+        user_id="alice",
+        run_id="s2",
+        metadata={"topic": "x"},
+        expiration_date="2026-12-31",
+        infer=False,
+    )
+    streamed = json.loads(first + b"".join(stream))
+    fresh = {
+        (s["session_id"], t["idx"]): t
+        for s in portable.export_space(system, "alice")["sessions"]
+        for t in s["turns"]
+    }
+    assert set(fresh) == {("s2", 0)} and fresh["s2", 0]["metadata"] == {"topic": "x"}
+    seen = {(s["session_id"], t["idx"]): t for s in streamed["sessions"] for t in s["turns"]}
+    assert ("s2", 0) in seen  # 这一句在计划的范围之内
+    for key in seen.keys() & fresh.keys():
+        assert seen[key] == fresh[key], key
 
 
 def test_runs_scopes_export_and_load(mem: Mem) -> None:

@@ -88,14 +88,14 @@ _FORMAT_SUFFIX = {
 
 @dataclass(frozen=True)
 class ExportPlan:
-    """export_plan 的结果：导出一个空间要的、不带原图的那些（会话按开始时间排好，发言与原图在
-    写出时再读）。"""
+    """export_plan 的结果：导出一个空间要的、不带原图的那些（会话按开始时间排好，发言、附加
+    信息与原图在写出时再读）。bounds 是每个会话这时最大的发言序号：之后写进来的发言不在这次导出
+    里（见 iter_export_json）。"""
 
     db: MemoryDB
     space_id: str
     sessions: list[tuple[str, datetime]]
-    media: dict[str, MediaItem]
-    meta: dict[str, TurnMeta]
+    bounds: dict[str, int]
     log_only: set[str]
     derived: dict[str, Any] | None
 
@@ -103,8 +103,8 @@ class ExportPlan:
 def export_plan(
     system: MemorySystem | MemoryDB, space_id: str, *, derived: bool = True
 ) -> ExportPlan:
-    """导出的第一步：会话、图片记录、附加信息与派生记忆的快照，不读原图（便宜）。没有这个空间时
-    KeyError（HTTP 接口据此在开始写响应之前回 404）。"""
+    """导出的第一步：会话、每个会话这时最大的发言序号与派生记忆的快照，不读发言与原图（便宜）。
+    没有这个空间时 KeyError（HTTP 接口据此在开始写响应之前回 404）。"""
     db = system if isinstance(system, MemoryDB) else system.db
     sessions = db.get_sessions(space_id)
     if not sessions:
@@ -123,8 +123,7 @@ def export_plan(
         db=db,
         space_id=space_id,
         sessions=sorted(sessions.items(), key=lambda item: item[1]),
-        media={m.id: m for m in db.get_media(space_id)},
-        meta=db.get_turn_meta(space_id),
+        bounds=db.turn_bounds(space_id),
         log_only=_log_only(system, space_id),
         derived=snapshot,
     )
@@ -136,15 +135,16 @@ def export_space(
     """导出一个记忆空间：原始日志与图片原文件（base64），可选附上派生记忆的快照。
 
     只读数据库与原图，不用向量库：cuemem export 只打开数据库（向量库打不开、或者 serve 正开着
-    它的时候也能导出）。整个导出在内存里；HTTP 接口改用 iter_export_json 边读边写。"""
+    它的时候也能导出）。整个导出在内存里；HTTP 接口改用 iter_export_json 边读边写，两者读发言的
+    方式相同（计划那一刻的发言，见 iter_export_json）。"""
     plan = export_plan(system, space_id, derived=derived)
     out_sessions = []
     for session_id, started_at in plan.sessions:
-        turns = plan.db.get_turns(space_id, session_id)
+        turns, meta, media = _session_rows(plan, session_id)
         out: dict[str, Any] = {
             "session_id": session_id,
             "started_at": started_at.isoformat(),
-            "turns": [_turn_out(t, plan.media, plan.meta.get(t.id)) for t in turns],
+            "turns": [_turn_out(t, media, meta.get(t.id)) for t in turns],
         }
         if turns and session_id in plan.log_only:
             out["infer"] = False
@@ -165,7 +165,15 @@ def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterat
     第八轮体检 P7：以前 /api/v1/export 与 /api/spaces/{space}/export 先把整个空间（每张原图的
     base64）放进一个 dict 再渲染成一个响应体，峰值约是响应体的三倍；同一张图写了 N 次时媒体库里
     只有一份，导出里却有 N 份，一个只能写自己空间的令牌就能让一次导出占几 GB。写出途中出错时响应
-    已经开始，只能截断（调用方解析 JSON 时出错）；写出途中被遗忘删掉的原图照样跳过。"""
+    已经开始，只能截断（调用方解析 JSON 时出错）；写出途中被遗忘删掉的原图照样跳过。
+
+    第九轮体检 P6：导出的是 export_plan 那一刻有的发言。会话的发言在写到它时才读，客户端读得慢
+    时这段时间就是整个下载：以前这期间写进来的发言也被导出，附加信息与图片记录却是开始时读的，
+    于是它没有 metadata、过期时间与图片（导回去之后永远不过期）。现在计划记下每个会话最大的序号
+    （bounds），之后写进来的发言不导出，之后新开的会话本来就不在计划里；每个会话的发言、附加信息
+    与图片记录在同一次持锁里读（MemoryDB.export_rows），写出的发言带的总是它自己的那一份——整个
+    会话被遗忘、又用同一个 run_id 重新写时序号从 0 重来，这样的发言也是完整的。写出途中的遗忘：
+    还没写到的会话里被遗忘的发言不再写出，已经写出的收不回来；derived 与会话的 infer 是开始时的。"""
     stamp = exported_at if exported_at is not None else _now()
     head = _dumps({**_header(plan, stamp), "sessions": []})
     pending = [head[:-2]]  # 去掉 "]}"：后面接各个会话
@@ -173,11 +181,11 @@ def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterat
     for i, (session_id, started_at) in enumerate(plan.sessions):
         opening = {"session_id": session_id, "started_at": started_at.isoformat(), "turns": []}
         pending.append(("," if i else "") + _dumps(opening)[:-2])
-        turns = plan.db.get_turns(plan.space_id, session_id)
+        turns, meta, media = _session_rows(plan, session_id)
         for j, turn in enumerate(turns):
             if j:
                 pending.append(",")
-            for piece in _turn_pieces(turn, plan.media, plan.meta.get(turn.id)):
+            for piece in _turn_pieces(turn, media, meta.get(turn.id)):
                 if len(piece) >= EXPORT_CHUNK_BYTES:  # 一段 base64 或很长的文字：不再拼接
                     if pending:
                         yield "".join(pending).encode("utf-8")
@@ -196,6 +204,14 @@ def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterat
         pending.append("," + _dumps({"derived": plan.derived})[1:-1])
     pending.append("}")
     yield "".join(pending).encode("utf-8")
+
+
+def _session_rows(
+    plan: ExportPlan, session_id: str
+) -> tuple[list[Turn], dict[str, TurnMeta], dict[str, MediaItem]]:
+    """一个会话在计划之内的发言，连同它们的附加信息与图片记录（一次持锁读出）。计划之后才有
+    发言的会话什么都不给。"""
+    return plan.db.export_rows(plan.space_id, session_id, plan.bounds.get(session_id, -1))
 
 
 def _header(plan: ExportPlan, exported_at: str) -> dict[str, Any]:
