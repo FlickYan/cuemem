@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel
 from scripted import ScriptedModel
 from test_sdk import where_i_live
 from test_store import small_open_file_limit
@@ -2252,6 +2253,121 @@ def test_responses_input_becomes_chat_messages() -> None:
     }
 
 
+def respond(sdk: OpenAI, said: Any = "I live in Berlin", **extra: Any) -> Any:
+    """官方 SDK 的 responses.create：instructions 是 SYSTEM（Upstream 由此认出转发来的请求）。"""
+    return sdk.responses.create(
+        model="qwen3.8-flash", instructions=SYSTEM["content"], input=said, user="alice", **extra
+    )
+
+
+def test_responses_hints_are_accepted(client: TestClient, upstream: Upstream) -> None:
+    """只是提示的参数（prompt_cache_retention，truncation 的 auto）以前 501，官方 SDK 的常见
+    写法用不了。现在照收；代理不截断，响应里的 truncation 照实写 disabled。"""
+    sdk = sdk_for(client)
+    assert respond(sdk, prompt_cache_retention="24h").status == "completed"
+    assert respond(sdk, truncation="auto").truncation == "disabled"
+    respond(sdk)
+    assert len(upstream.proxied) == 3  # 都不转发给上游：与没写这两个参数的请求是同样的键
+    assert set(upstream.proxied[0]) == set(upstream.proxied[1]) == set(upstream.proxied[2])
+
+
+def test_responses_reasoning_and_verbosity_are_mapped(
+    client: TestClient, upstream: Upstream
+) -> None:
+    """reasoning.effort 与 text.verbosity（以前 501）换成 Chat Completions 的写法转发。"""
+    sdk = sdk_for(client)
+    assert respond(sdk, reasoning={"effort": "low"}).output_text == "Happy to help, Alice!"
+    assert upstream.proxied[-1]["reasoning_effort"] == "low"
+    assert "reasoning" not in upstream.proxied[-1]
+    answered = respond(sdk, text={"verbosity": "low"})
+    assert upstream.proxied[-1]["verbosity"] == "low" and "text" not in upstream.proxied[-1]
+    assert answered.text is not None and answered.text.verbosity == "low"
+    assert answered.text.format is not None and answered.text.format.type == "text"
+    respond(sdk, reasoning={}, text={"format": {"type": "text"}})  # 等于没给
+    assert not {"reasoning_effort", "verbosity", "response_format"} & set(upstream.proxied[-1])
+
+
+class Home(BaseModel):
+    city: str
+
+
+def test_responses_structured_output_becomes_response_format(
+    client: TestClient, upstream: Upstream
+) -> None:
+    """text.format 的 json_schema / json_object（以前 501）换成 response_format：Responses 里
+    平铺的 name / schema / strict 放进 json_schema 一层；官方 SDK 的 responses.parse 可用。"""
+    sdk = sdk_for(client)
+    upstream.reply = '{"city": "Berlin"}'
+    parsed = sdk.responses.parse(
+        model="qwen3.8-flash",
+        instructions=SYSTEM["content"],
+        input="I live in Berlin",
+        user="alice",
+        text_format=Home,
+    )
+    assert parsed.output_parsed == Home(city="Berlin")
+    sent = upstream.proxied[-1]["response_format"]
+    assert sent["type"] == "json_schema" and set(sent) == {"type", "json_schema"}
+    assert sent["json_schema"]["name"] == "Home" and sent["json_schema"]["strict"] is True
+    assert sent["json_schema"]["schema"]["properties"] == {
+        "city": {"title": "City", "type": "string"}
+    }
+    assert parsed.text is not None and parsed.text.format is not None
+    assert parsed.text.format.type == "json_schema"  # 响应里照抄回去
+
+    respond(sdk, text={"format": {"type": "json_object"}})
+    assert upstream.proxied[-1]["response_format"] == {"type": "json_object"}
+
+
+def test_responses_images_are_forwarded_and_stored_like_chat_images(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """用户消息里的 input_image（以前 501）换成 image_url 块：data URL 的图片转发并写进记忆，
+    网络图片只转发、不存（与 /v1/chat/completions 相同）。"""
+    shown = [
+        {"type": "input_text", "text": "Here is my red jacket"},
+        {"type": "input_image", "image_url": red_png_url(), "detail": "low"},
+        {"type": "input_image", "image_url": "https://example.test/a.png"},
+    ]
+    answered = respond(sdk_for(client), [{"role": "user", "content": shown}])
+    assert answered.output_text == "Happy to help, Alice!"
+    assert upstream.proxied[-1]["messages"][-1]["content"] == [
+        {"type": "text", "text": "Here is my red jacket"},
+        {"type": "image_url", "image_url": {"url": red_png_url(), "detail": "low"}},
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+    ]
+    turns = system.db.get_turns("alice")
+    assert turns[0].text == "Here is my red jacket <image>" and len(turns[0].media_ids) == 1
+    assert len(system.db.get_media("alice")) == 1
+
+
+def test_responses_images_only_in_user_messages() -> None:
+    image = {"type": "input_image", "image_url": red_png_url()}
+    body = {"model": "m", "input": [{"role": "system", "content": [image]}]}
+    with pytest.raises(ProxyError) as refused:
+        _responses_to_chat(body)
+    assert refused.value.status == 501 and "input_image" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"reasoning": "low"},
+        {"reasoning": {"effort": 3}},
+        {"text": "json"},
+        {"text": {"format": 1}},
+        {"text": {"verbosity": 2}},
+    ],
+)
+def test_responses_options_of_the_wrong_type_are_400(
+    client: TestClient, upstream: Upstream, extra: dict[str, Any]
+) -> None:
+    body = {"model": "qwen3.8-flash", "instructions": SYSTEM["content"], "input": "hi", **extra}
+    refused = client.post("/v1/responses", json=body)
+    assert refused.status_code == 400 and refused.json()["error"]["param"] in extra
+    assert upstream.proxied == []
+
+
 def test_a_truncated_answer_is_an_incomplete_response() -> None:
     data = {
         "model": "deepseek-flash",
@@ -2277,8 +2393,16 @@ def test_a_truncated_answer_is_an_incomplete_response() -> None:
         ({"stream": True}, "stream"),
         ({"tools": [{"type": "function", "name": "f", "parameters": {}}]}, "tools"),
         ({"previous_response_id": "resp_1"}, "previous_response_id"),
-        ({"text": {"format": {"type": "json_object"}}}, "text"),
-        ({"input": [{"role": "user", "content": [{"type": "input_image"}]}]}, "input_image"),
+        ({"reasoning": {"summary": "auto"}}, "reasoning.summary"),
+        ({"reasoning": {"effort": "low", "generate_summary": "auto"}}, "generate_summary"),
+        ({"text": {"format": {"type": "grammar"}}}, "text.format of type 'grammar'"),
+        ({"text": {"format": {"type": "json_object", "schema": {}}}}, "text.format.schema"),
+        ({"text": {"logprobs": True}}, "text.logprobs"),
+        (
+            {"input": [{"role": "user", "content": [{"type": "input_image", "file_id": "f"}]}]},
+            "input_image with file_id",
+        ),
+        ({"input": [{"role": "user", "content": [{"type": "input_file"}]}]}, "input_file"),
         ({"input": [{"type": "function_call_output", "call_id": "c"}]}, "function_call_output"),
     ],
 )
@@ -2289,8 +2413,9 @@ def test_responses_outside_the_subset_are_501(
     extra: dict[str, Any],
     named: str,
 ) -> None:
-    """子集以外的（流式、工具、存下来的回答、结构化输出、图片与工具调用的输入）：501，OpenAI 格式
-    的出错写明哪一项，x-should-retry: false 让官方 SDK 不重试；不转发、不碰记忆。"""
+    """子集以外的（流式、工具、存下来的回答、推理的摘要、不认识的输出格式、file_id 的图片与
+    工具调用的输入）：501，OpenAI 格式的出错写明哪一项，x-should-retry: false 让官方 SDK
+    不重试；不转发、不碰记忆。"""
     body = {"model": "qwen3.8-flash", "input": "I live in Berlin", "user": "alice", **extra}
     response = client.post("/v1/responses", json=body)
     assert response.status_code == 501 and response.headers["x-should-retry"] == "false"

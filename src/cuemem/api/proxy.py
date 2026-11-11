@@ -55,10 +55,14 @@ max_completion_tokens 不超过它，并且总按这个模型在目录里的写�
 （enable_thinking、thinking），只有 models 管得住。
 
 另外两个 OpenAI 兼容的接口：
-- /v1/responses：Responses API 的一个子集——非流式、纯文字输入（字符串或 input_text 的消息），
-  instructions、max_output_tokens、temperature、top_p。换成 Chat Completions 走上面同样的想起、
-  注入、转发与写回，回答写成 Responses 的格式。流式、工具、图片与 previous_response_id 等返回
-  501（OpenAI 格式的出错，带 x-should-retry: false），用 /v1/chat/completions；
+- /v1/responses：Responses API 的一个子集——非流式，输入是文字（字符串或 input_text 的消息）
+  与用户消息里的图片（input_image 的 data URL 或网址，与 /v1/chat/completions 一样只存 data
+  URL），instructions、max_output_tokens、temperature、top_p，以及 reasoning.effort、
+  text.verbosity 与 text.format 的 json_object / json_schema（结构化输出，换成 reasoning_effort、
+  verbosity 与 response_format 转发）。换成 Chat Completions 走上面同样的想起、注入、转发与
+  写回，回答写成 Responses 的格式。流式、工具、file_id 的图片、reasoning.summary 与
+  previous_response_id 等返回 501（OpenAI 格式的出错，带 x-should-retry: false），用
+  /v1/chat/completions；
 - /v1/embeddings：交给配置里的向量模型（与记忆共用一个，不碰记忆、不进向量缓存），支持
   encoding_format 的 float 与 base64。
 
@@ -1263,24 +1267,26 @@ def _vector(row: Any, encoding: str) -> list[float] | str:
 
 # ---------- /v1/responses ----------
 
-# 照着转换的参数，与不影响回答、照单全收的参数（store：这里不保存回答，响应里写 store: false）
+# 照着转换的参数（text、reasoning 只收一部分，见 _text_options、_reasoning_options），与不影响
+# 回答、照单全收的参数（store：这里不保存回答，响应里写 store: false；prompt_cache_retention 与
+# prompt_cache_key 一样只是给供应商的缓存提示）
 _RESPONSES_MAPPED = frozenset(
     {"model", "input", "instructions", "max_output_tokens", "temperature", "top_p", "user"}
+    | {"text", "reasoning"}
 )
 _RESPONSES_IGNORED = frozenset(
     {"metadata", "store", "parallel_tool_calls", "service_tier", "prompt_cache_key"}
-    | {"safety_identifier"}
+    | {"safety_identifier", "prompt_cache_retention"}
 )
-# 写成这些值时等于没给的参数；别的值（流式、工具、结构化输出等）不支持
+# 写成这些值时等于没给的参数；别的值（流式、工具等）不支持。truncation 的 auto：代理不截断，
+# 放不下时是上游的 400，响应里照实写 disabled
 _RESPONSES_DEFAULTS: dict[str, tuple[Any, ...]] = {
     "stream": (False,),
     "background": (False,),
     "tools": ([],),
     "tool_choice": ("auto", "none"),
     "include": ([],),
-    "truncation": ("disabled",),
-    "text": ({}, {"format": {"type": "text"}}),
-    "reasoning": ({},),
+    "truncation": ("disabled", "auto"),
 }
 
 
@@ -1288,8 +1294,8 @@ def _unsupported(what: str) -> ProxyError:
     """501：OpenAI 的 SDK 遇到 5xx 会重试，x-should-retry: false 让它不重试。"""
     return ProxyError(
         501,
-        "The CueMem proxy supports a subset of the Responses API (non-streaming text input, "
-        f"no tools, no stored responses). Not supported: {what}. "
+        "The CueMem proxy supports a subset of the Responses API (non-streaming text and image "
+        f"input, no tools, no stored responses). Not supported: {what}. "
         "Use /v1/chat/completions for the rest.",
         code="not_implemented",
         headers={"x-should-retry": "false"},
@@ -1298,7 +1304,10 @@ def _unsupported(what: str) -> ProxyError:
 
 def _responses_to_chat(body: Mapping[str, Any]) -> dict[str, Any]:
     """Responses 的请求 → Chat Completions 的请求：instructions 是第一条系统消息，input 的每条
-    消息照抄（developer 写成 system，内容块只收 input_text / output_text，拼成一段文字）。"""
+    消息照抄（developer 写成 system；内容块收 input_text / output_text，拼成一段文字，用户消息
+    里另收 input_image，见 _input_message）。text.format、text.verbosity 与 reasoning.effort
+    换成 Chat Completions 的 response_format、verbosity 与 reasoning_effort，上游不认识时是
+    它自己的出错（与 /v1/chat/completions 原样转发这些参数时相同）。"""
     unsupported = sorted(
         key
         for key, value in body.items()
@@ -1326,11 +1335,77 @@ def _responses_to_chat(body: Mapping[str, Any]) -> dict[str, Any]:
         "temperature": body.get("temperature"),
         "top_p": body.get("top_p"),
         "user": body.get("user"),  # 与 Chat Completions 一样：记忆属于哪个用户
+        **_reasoning_options(body.get("reasoning")),
+        **_text_options(body.get("text")),
     }
     return {key: value for key, value in chat.items() if value is not None}
 
 
-def _input_message(item: Any) -> dict[str, str]:
+def _reasoning_options(reasoning: Any) -> dict[str, Any]:
+    """reasoning：只收 effort（→ reasoning_effort）；summary 等要的是推理的摘要，这里给不了。"""
+    if reasoning is None:
+        return {}
+    if not isinstance(reasoning, dict):
+        raise ProxyError(400, "reasoning must be an object.", param="reasoning")
+    given = {key: value for key, value in reasoning.items() if value is not None}
+    other = sorted(key for key in given if key != "effort")
+    if other:
+        raise _unsupported(", ".join(f"reasoning.{key}" for key in other))
+    if "effort" in given and not isinstance(given["effort"], str):
+        raise ProxyError(400, "reasoning.effort must be a string.", param="reasoning")
+    return {"reasoning_effort": given["effort"]} if given else {}
+
+
+def _text_options(text: Any) -> dict[str, Any]:
+    """text：verbosity 照抄；format 的 json_object 与 json_schema（Responses 里是平铺的
+    name / schema / strict / description）换成 Chat Completions 的 response_format，text 等于
+    没给；别的类型与别的键 501。"""
+    if text is None:
+        return {}
+    if not isinstance(text, dict):
+        raise ProxyError(400, "text must be an object.", param="text")
+    given = {key: value for key, value in text.items() if value is not None}
+    other = sorted(key for key in given if key not in ("format", "verbosity"))
+    if other:
+        raise _unsupported(", ".join(f"text.{key}" for key in other))
+    out: dict[str, Any] = {}
+    if "verbosity" in given:
+        if not isinstance(given["verbosity"], str):
+            raise ProxyError(400, "text.verbosity must be a string.", param="text")
+        out["verbosity"] = given["verbosity"]
+    if "format" not in given:
+        return out
+    fmt = given["format"]
+    if not isinstance(fmt, dict):
+        raise ProxyError(400, "text.format must be an object.", param="text")
+    kind = fmt.get("type")
+    allowed = _TEXT_FORMATS.get(kind) if isinstance(kind, str) else None
+    if allowed is None:
+        raise _unsupported(f"text.format of type {kind!r}")
+    fields = {key: value for key, value in fmt.items() if key != "type" and value is not None}
+    other = sorted(key for key in fields if key not in allowed)
+    if other:
+        raise _unsupported(", ".join(f"text.format.{key}" for key in other))
+    if kind == "json_object":
+        out["response_format"] = {"type": "json_object"}
+    elif kind == "json_schema":
+        out["response_format"] = {"type": "json_schema", "json_schema": fields}
+    return out
+
+
+# text.format 的类型 → 除 type 以外收的键
+_TEXT_FORMATS: dict[str, tuple[str, ...]] = {
+    "text": (),
+    "json_object": (),
+    "json_schema": ("name", "schema", "strict", "description"),
+}
+
+
+def _input_message(item: Any) -> dict[str, Any]:
+    """input 里的一条消息 → Chat Completions 的消息。只有文字块的消息照旧是用换行连起来的一段
+    文字（转发的请求与以前逐字节相同）；用户消息里有 input_image（image_url 是字符串：data URL
+    或网址）时 content 是内容块的列表，图片写成 image_url 块：与 /v1/chat/completions 的图片
+    一样转发、写回时只存 data URL（_storable）。file_id 的图片存在 OpenAI 那边，这里取不到。"""
     if not isinstance(item, dict):
         raise ProxyError(400, "Each input item must be an object.", param="input")
     kind = item.get("type", "message")
@@ -1341,16 +1416,47 @@ def _input_message(item: Any) -> dict[str, str]:
         raise ProxyError(400, f"Unknown message role {role!r}.", param="input")
     content = item.get("content")
     if isinstance(content, list):
-        parts = []
+        blocks: list[dict[str, Any]] = []
         for part in content:
             part_type = part.get("type") if isinstance(part, dict) else None
-            if part_type not in ("input_text", "output_text"):
-                raise _unsupported(f"{part_type or 'non-text'} content (only input_text)")
-            parts.append(str(part.get("text") or ""))
-        content = "\n".join(parts)
+            if part_type == "input_image" and role == "user":
+                blocks.append(_image_block(part))
+            elif part_type in ("input_text", "output_text"):
+                blocks.append({"type": "text", "text": str(part.get("text") or "")})
+            elif part_type == "input_image":
+                raise _unsupported(f"input_image content in {role} messages")
+            else:
+                raise _unsupported(
+                    f"{part_type or 'non-text'} content (only input_text and input_image)"
+                )
+        if all(block["type"] == "text" for block in blocks):
+            content = "\n".join(block["text"] for block in blocks)
+        else:
+            content = blocks
     elif not isinstance(content, str):
         raise ProxyError(400, "Message content must be a string or a list.", param="input")
     return {"role": "system" if role == "developer" else role, "content": content}
+
+
+def _image_block(part: dict[str, Any]) -> dict[str, Any]:
+    """Responses 的 input_image 块 → Chat Completions 的 image_url 块（detail 给了时照抄）。"""
+    url = part.get("image_url")
+    if part.get("file_id") is not None or not isinstance(url, str):
+        raise _unsupported("input_image with file_id (send the image as a data URL or a URL)")
+    image: dict[str, Any] = {"url": url}
+    if part.get("detail") is not None:
+        image["detail"] = part["detail"]
+    return {"type": "image_url", "image_url": image}
+
+
+def _text_echo(body: Mapping[str, Any]) -> dict[str, Any]:
+    """响应里的 text：请求给的 format（没给时是 text）与 verbosity 照抄回去。"""
+    text = body.get("text")
+    given = text if isinstance(text, dict) else {}
+    out: dict[str, Any] = {"format": given.get("format") or {"type": "text"}}
+    if given.get("verbosity") is not None:
+        out["verbosity"] = given["verbosity"]
+    return out
 
 
 def _chat_to_response(
@@ -1397,7 +1503,7 @@ def _chat_to_response(
         "previous_response_id": None,
         "store": False,
         "temperature": body.get("temperature"),
-        "text": {"format": {"type": "text"}},
+        "text": _text_echo(body),
         "tool_choice": body.get("tool_choice") or "auto",
         "tools": [],
         "top_p": body.get("top_p"),
