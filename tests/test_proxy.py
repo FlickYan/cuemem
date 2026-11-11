@@ -40,6 +40,7 @@ from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.core.models import SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
 from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
+from cuemem.evidence import recall_evidence
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store.vector import reserved_files
@@ -1095,6 +1096,288 @@ def test_tool_follow_ups_only_store_the_answer(
     assert [(t.role, t.text) for t in system.db.get_turns("alice", "t1")] == [
         ("assistant", "Happy to help, Alice!")
     ]
+
+
+# ---------- 工具调用的后续请求：这一轮的证据块再放进去（第九轮体检 P1） ----------
+
+ASK = "Where do I live? Find a coat shop nearby"
+TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "find", "parameters": {"type": "object", "properties": {}}},
+    }
+]
+TOOL_CALL = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "find", "arguments": "{}"}}
+    ],
+}
+TOOL_RESULT = {"role": "tool", "tool_call_id": "c1", "content": "P01"}
+CALLS_FIND = {"content": None, "tool_calls": [{"id": "c1", "name": "find", "arguments": "{}"}]}
+
+
+def berlin_is_remembered(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, clock: Clock
+) -> None:
+    """之前的一个会话里说过住在柏林，会话已经结束、抽取完。"""
+    chat(client, "I live in Berlin", user="alice")
+    clock.now += 31 * 60
+    proxy.close_idle()
+    assert system.worker is not None
+    system.worker.wait()
+
+
+def follow_up(client: TestClient, text: str = ASK, *more: dict[str, Any], **extra: Any) -> Any:
+    """工具调用的后续请求：调用方重发用户的原话（不带证据块）、工具调用与工具的结果。"""
+    headers = extra.pop("headers", {})
+    messages = [SYSTEM, {"role": "user", "content": text}, TOOL_CALL, TOOL_RESULT, *more]
+    body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice", "tools": TOOLS}
+    return client.post("/v1/chat/completions", json={**body, **extra}, headers=headers)
+
+
+def count_retrievals(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """记下之后每一次检索的问题。"""
+    queries: list[str] = []
+    retrieve = system.retrieve
+
+    def counted(space: str, query: str, *args: Any, **kwargs: Any) -> Any:
+        queries.append(query)
+        return retrieve(space, query, *args, **kwargs)
+
+    monkeypatch.setattr(system, "retrieve", counted)
+    return queries
+
+
+def has_memory(message: dict[str, Any]) -> bool:
+    return "<memory>" in json.dumps(message)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_tool_follow_ups_carry_the_memory_block_of_the_turn(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Chat Completions 没有状态：模型要调用工具时，调用方的下一个请求重发用户的原话，不带第一次
+    注入的证据块。以前不以用户消息结尾的请求不想起（X-CueMem-Level none）：最后的回答是没有
+    记忆写出来的，转发的请求从用户消息起就与第一次不同（供应商的前缀缓存用不上）。现在这一轮
+    的证据块原样再放进同一句用户消息，不再检索；一轮里的每个后续请求都一样。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    queries = count_retrievals(system, monkeypatch)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS, stream=stream)
+    assert first.status_code == 200 and first.headers["x-cuemem-level"] == "L1"
+    asked = upstream.proxied[-1]["messages"]
+    assert asked[-1]["content"].startswith("<memory>\n") and "Berlin" in asked[-1]["content"]
+    assert asked[-1]["content"].endswith("</memory>\n\n" + ASK)
+    assert queries == [ASK]
+
+    upstream.reply = "final"
+    for more in ([], [TOOL_CALL, TOOL_RESULT]):  # 第二个后续请求：又调用了一次工具
+        second = follow_up(client, ASK, *more, stream=stream)
+        assert second.status_code == 200
+        sent = upstream.proxied[-1]["messages"]
+        assert sent[:2] == asked  # 到用户消息为止与第一次逐字节相同
+        assert sent[2:] == [TOOL_CALL, TOOL_RESULT, *more]  # 之后的消息原样
+        for name in ("level", "recalled", "reasons", "session"):
+            assert second.headers[f"x-cuemem-{name}"] == first.headers[f"x-cuemem-{name}"]
+    assert queries == [ASK]  # 没有再检索
+    # 写回照旧：用户的话只写一次，后续请求只写回答
+    turns = system.db.get_turns("alice", first.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [
+        ("user", ASK),
+        ("assistant", "final"),
+        ("assistant", "final"),
+    ]
+
+
+def test_requests_ending_in_a_user_message_are_forwarded_as_before(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """以用户消息结尾的请求不变：想起的证据块放在最后一句用户消息前面（文字或内容块），别的
+    消息与参数逐字节原样；上一轮的用户消息里不放证据块，留着的那份（见 Kept）也不用在这里。"""
+    berlin_is_remembered(client, proxy, system, clock)
+
+    def note(query: str, earlier: list[dict[str, Any]], session: str = "") -> str:
+        exclude = proxy._in_context("alice", session, earlier)
+        block = recall_evidence(system, "alice", query, mode="l1", exclude=exclude).block
+        assert "The user lives in Berlin." in block
+        return f"<memory>\n{block}\n</memory>\n\n"
+
+    expected = note("Where do I live?", [])
+    first = chat(client, "Where do I live?", user="alice", tools=TOOLS, temperature=0.2)
+    sent = upstream.proxied[-1]
+    assert sent["messages"] == [SYSTEM, {"role": "user", "content": expected + "Where do I live?"}]
+    assert {k: v for k, v in sent.items() if k != "messages"} == {
+        "model": "qwen3.8-flash",
+        "tools": TOOLS,
+        "temperature": 0.2,
+        "enable_thinking": False,
+    }
+
+    blocks = [{"type": "text", "text": "Which coat shops are near me?"}]
+    history = [{"role": "user", "content": "Where do I live?"}, TOOL_CALL, TOOL_RESULT]
+    history.append({"role": "assistant", "content": "In Berlin."})
+    expected = note("Which coat shops are near me?", history, first.headers["x-cuemem-session"])
+    chat(client, blocks, history, user="alice")
+    assert upstream.proxied[-1]["messages"] == [
+        SYSTEM,
+        *history,  # 之前的消息（含上一轮的用户消息）不动
+        {"role": "user", "content": [{"type": "text", "text": expected}, *blocks]},
+    ]
+
+
+def test_a_tool_follow_up_after_a_forget_recalls_again(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第一个请求与后续请求之间删了注入的那条记忆：留着的证据块不再用（里面有刚删的内容），
+    对那句用户消息重新想起。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS)
+    assert "Berlin" in json.dumps(upstream.proxied[-1]["messages"])
+    [fact] = [f for f in system.facts("alice") if "Berlin" in f.statement]
+    Memory.from_system(system).delete(fact.id)
+    queries = count_retrievals(system, monkeypatch)
+    upstream.reply = "final"
+    second = follow_up(client)
+    assert second.status_code == 200
+    assert second.headers["x-cuemem-session"] == first.headers["x-cuemem-session"]
+    assert queries == [ASK]
+    assert "Berlin" not in json.dumps(upstream.proxied[-1])
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_follow_up_answer_built_on_memory_forgotten_meanwhile_is_not_written_back(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    fake_api: FakeAPI,
+    stream: bool,
+) -> None:
+    """后续请求等上游回答的时候删了再用的那条记忆：回答是照它写的，不写回（与以用户消息结尾的
+    请求相同，见 test_an_answer_built_on_memory_forgotten_meanwhile_is_not_written_back）。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS)
+    [fact] = [f for f in system.facts("alice") if "Berlin" in f.statement]
+    memory = Memory.from_system(system)
+    injected: list[bool] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        if body["messages"][0].get("content") != SYSTEM["content"]:
+            return upstream.model(body)
+        injected.append("lives in Berlin" in json.dumps(body["messages"]))
+        forget = threading.Thread(target=memory.delete, args=(fact.id,))  # 另一个调用方
+        forget.start()
+        forget.join()
+        return "You live in Berlin: shop P01 is nearby."
+
+    fake_api.chat_replies = [reply]
+    second = follow_up(client, stream=stream)
+    assert second.status_code == 200 and "Berlin" in second.text  # 调用方照样拿到回答
+    assert injected == [True]
+    turns = system.db.get_turns("alice", first.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [("user", ASK)]
+
+
+@pytest.mark.parametrize("lost", ["restart", "edited"])
+def test_a_tool_follow_up_without_a_kept_block_recalls_for_the_user_message(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    fake_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    lost: str,
+) -> None:
+    """没有留着的证据块（代理重启过），或者调用方重发的用户消息不是注入的那一句：对请求里最后
+    一句用户消息重新想起一次，这一轮之后的后续请求再用它。已经写进记忆的这句话不会被当成
+    记忆引回来。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    session = {"X-CueMem-Session": "t1"}
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS, headers=session)
+    assert first.headers["x-cuemem-level"] == "L1"
+    upstream.reply = "final"
+    asked = ASK
+    if lost == "restart":  # 新的代理接着用同一个系统：会话还在进行中，内存里什么也没留
+        restarted = MemoryProxy(system, http_client=fake_api.client(), clock=clock, mode="l1")
+        client = TestClient(create_proxy_app(restarted))
+    else:
+        asked = "Where do I live? Find a boot shop nearby"
+    queries = count_retrievals(system, monkeypatch)
+    for _ in range(2):
+        second = follow_up(client, asked, headers=session)
+        assert second.status_code == 200 and second.headers["x-cuemem-level"] == "L1"
+        sent = upstream.proxied[-1]["messages"]
+        assert [has_memory(m) for m in sent] == [False, True, False, False]
+        content = sent[1]["content"]
+        assert "The user lives in Berlin." in content
+        assert content.endswith("</memory>\n\n" + asked) and content.count(asked) == 1
+    assert queries == [asked]
+    texts = [(t.role, t.text) for t in system.db.get_turns("alice", "t1")]
+    assert texts == [("user", ASK), ("assistant", "final"), ("assistant", "final")]
+
+
+def test_memory_goes_into_the_user_message_when_a_system_message_follows_it(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """用户消息之后还有一条系统消息（有的框架每轮在末尾加提醒）：以前这样的请求不想起；现在
+    证据块放进最后一句用户消息，不是最后一条消息。只写回回答（与工具调用的后续请求相同）。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    reminder = {"role": "system", "content": "Answer in one sentence."}
+    messages = [SYSTEM, {"role": "user", "content": "Where do I live?"}, reminder]
+    body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice"}
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200 and response.headers["x-cuemem-level"] == "L1"
+    sent = upstream.proxied[-1]["messages"]
+    assert sent[0] == SYSTEM and sent[2] == reminder
+    assert sent[1]["content"].startswith("<memory>\n") and "Berlin" in sent[1]["content"]
+    assert sent[1]["content"].endswith("</memory>\n\nWhere do I live?")
+    turns = system.db.get_turns("alice", response.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [("assistant", "Happy to help, Alice!")]
+
+
+def test_the_openai_sdk_tool_loop_keeps_its_memory(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """官方 OpenAI SDK 的工具循环：把模型的工具调用与工具的结果接在原来的消息后面再发一次。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    sdk = sdk_for(client)
+    messages: list[Any] = [SYSTEM, {"role": "user", "content": ASK}]
+    tools: Any = TOOLS
+    upstream.reply = CALLS_FIND
+    first = sdk.chat.completions.create(
+        model="qwen3.8-flash", messages=messages, tools=tools, user="alice"
+    )
+    [call] = first.choices[0].message.tool_calls or []
+    asked = upstream.proxied[-1]["messages"]
+    messages.append(first.choices[0].message.model_dump(exclude_none=True))
+    messages.append({"role": "tool", "tool_call_id": call.id, "content": "P01"})
+    upstream.reply = "You live in Berlin: shop P01 is nearby."
+    raw = sdk.chat.completions.with_raw_response.create(
+        model="qwen3.8-flash", messages=messages, tools=tools, user="alice"
+    )
+    assert raw.headers["x-cuemem-level"] == "L1" and int(raw.headers["x-cuemem-recalled"]) >= 1
+    assert raw.parse().choices[0].message.content == "You live in Berlin: shop P01 is nearby."
+    sent = upstream.proxied[-1]["messages"]
+    assert sent[:2] == asked and has_memory(sent[1])
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool"]
 
 
 def test_the_proxy_expires_old_traces_when_it_starts(

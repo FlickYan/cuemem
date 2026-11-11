@@ -7,10 +7,16 @@
 它们每一轮都检索；这里每一轮先过检索控制器（N7）：
 
 1. **想起**：对最后一句用户消息跑控制器，选 L0（不检索，只给画像）/ L1 / L2；当前会话里
-   已经写进记忆、并且原样还在请求里的轮，检索时排除；
+   已经写进记忆、并且原样还在请求里的轮，检索时排除。请求不是以用户消息结尾时（工具调用的
+   后续请求、用户消息之后还有系统消息）不再检索一次：这个会话上一次为同一句用户消息想起的
+   证据块原样再用（见 Kept），响应头照它写；没有留着的（重启、停放过的会话、用户消息改过）
+   或者之后这个空间遗忘过时，对那句用户消息重新想起；
 2. **注入**：取到的画像、带有效期的事实与对话片段排成和 reader 相同的证据块，放在最后一句
    用户消息的前面（与 Mem0 的 proxy 相同的位置）；系统提示与之前的消息不动，
-   供应商的前缀缓存照常命中；
+   供应商的前缀缓存照常命中。Chat Completions 没有状态，工具调用的后续请求里调用方重发的
+   用户消息不带证据块：照上一步再放进同一句用户消息，转发的请求到这句为止与第一次逐字节
+   相同，一轮之内的工具循环前缀缓存接着命中（下一句用户消息的请求里，之前的用户消息照旧
+   不带证据块）；
 3. **转发**：按配置里的模型目录转发给上游（model 是配置里的别名或模型 ID；不认识的模型默认
    改用 agent 角色的模型并记一条警告，proxy.unknown_model: reject 时返回 400；目录里供应商的
    Key 没设置的模型返回 503 model_not_available，GET /v1/models 也不列它们），流式与非流式
@@ -56,6 +62,7 @@ max_completion_tokens 不超过它，并且总按这个模型在目录里的写�
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -156,6 +163,24 @@ class Unsaved:
 
 
 @dataclass
+class Kept:
+    """一个会话最近一次想起的结果，留给这一轮里不以用户消息结尾的请求（工具调用的后续）再用。
+
+    digest：注入的那句用户消息写回时的样子（stored_text(_storable(...))，与 _in_context 的
+    比对相同）的 SHA-256：调用方重发的还是这一句才再用。epoch：想起之前这个空间删过几次发言
+    （MemoryDB.turn_epoch）：之后遗忘过就不再用，重新想起。block 为空的也留着（没有画像的 L0
+    不用再想一遍）。证据块里的相对时间与它一起不变：再放进去的要与第一次逐字节相同。期间后台
+    抽取出的新事实、刚过期的事实不会进来，最多留到会话结束（idle_minutes）。"""
+
+    digest: str
+    block: str
+    level: str
+    reasons: list[str]
+    recalled: int
+    epoch: int
+
+
+@dataclass
 class Run:
     """进行中的会话（一段对话）。
 
@@ -163,7 +188,10 @@ class Run:
     按先后排。之后每次写回这个会话时先写它们，会话结束（空闲、开了新的一段、close_all）之前
     再试一次，还是写不进去才丢掉、记警告。在线写入要么全写、要么不写（R1），以前丢下它们就永远
     丢了：之后的请求只写各自最后一句用户消息。最多留 MAX_UNSAVED 次、MAX_UNSAVED_BYTES
-    （unsaved_bytes 是它们的 size 之和），超出时丢掉最早的、记警告（MemoryProxy._trim）。"""
+    （unsaved_bytes 是它们的 size 之和），超出时丢掉最早的、记警告（MemoryProxy._trim）。
+
+    kept：最近一次想起的结果（见 Kept），一个会话只留一份，随 Run 一起没有（空闲结束、停放、
+    调用方开了新的一段、重启）。"""
 
     space: str
     session_id: str
@@ -173,6 +201,7 @@ class Run:
     agent_id: str | None = None
     unsaved: list[Unsaved] = field(default_factory=list)
     unsaved_bytes: int = 0
+    kept: Kept | None = None
 
     def keep(self, unsaved: Unsaved) -> None:
         self.unsaved.append(unsaved)
@@ -193,6 +222,7 @@ class Turn:
     agent_id: str | None = None
     run: Run | None = None
     write_user: dict[str, Any] | None = None  # 要写回的用户消息（OpenAI 格式）
+    anchor: int | None = None  # 最后一句用户消息在 messages 里的位置：证据块放进这一句
     level: str = "none"
     reasons: list[str] = field(default_factory=list)
     recalled: int = 0  # 注入的记忆条数（画像、事实、对话片段）
@@ -512,8 +542,11 @@ class MemoryProxy:
                 self._identity(body, headers, principal)
             raise
         turn = self._recall(body, headers, principal)
-        if turn.write_user is not None and turn.block:
-            upstream["messages"] = inject_evidence(upstream["messages"], turn.block)
+        if turn.anchor is not None and turn.block:
+            # 放进最后一句用户消息；它之后的消息（工具调用与结果等）原样接在后面。请求以用户
+            # 消息结尾时后面没有东西，与以前逐字节相同
+            messages, cut = upstream["messages"], turn.anchor + 1
+            upstream["messages"] = inject_evidence(messages[:cut], turn.block) + messages[cut:]
         return turn, upstream, url, auth
 
     def _identity(
@@ -574,14 +607,31 @@ class MemoryProxy:
         earlier = [m for m in messages[:-1] if m.get("role") in ("user", "assistant")]
         run = self._run(space, session, fresh=not earlier, user_id=user_id, agent_id=agent_id)
         turn = Turn(space=space, user_id=user_id, agent_id=agent_id, run=run)
-        last = messages[-1]
-        if last.get("role") != "user":  # 工具调用的后续请求：只写回回答
+        users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        if not users:
             return turn
-        turn.write_user = last
-        query = message_text(last.get("content"))
+        turn.anchor = users[-1]
+        asked = messages[turn.anchor]
+        # 不以用户消息结尾：工具调用的后续请求（或用户消息之后还有系统消息），只写回回答
+        follow_up = turn.anchor != len(messages) - 1
+        if not follow_up:
+            turn.write_user = asked
+            run.kept = None  # 新的一轮：上一轮想起的不再用（这次想不起来时也不用）
+        query = message_text(asked.get("content"))
         if not query.strip() or not self.system.db.has_sessions(space):
             return turn
-        turn.epoch = self.system.db.turn_epoch(space)  # 在想起之前记：之后的遗忘都比得出来
+        digest = _digest(asked)
+        epoch = self.system.db.turn_epoch(space)  # 在想起之前记：之后的遗忘都比得出来
+        kept = run.kept
+        if follow_up and kept is not None and kept.digest == digest and kept.epoch == epoch:
+            # 这一轮已经想起过、之后没有遗忘过：原样再用，不再检索
+            turn.level, turn.reasons = kept.level, list(kept.reasons)
+            turn.recalled, turn.block, turn.epoch = kept.recalled, kept.block, kept.epoch
+            record_event(
+                "proxy_recall", space=space, level=turn.level, recalled=turn.recalled, reused=True
+            )
+            return turn
+        turn.epoch = epoch
         try:
             evidence = recall_evidence(
                 self.system,
@@ -596,6 +646,7 @@ class MemoryProxy:
             return turn
         turn.level, turn.reasons = evidence.level, evidence.reasons
         turn.recalled, turn.block = evidence.recalled, evidence.block
+        run.kept = Kept(digest, turn.block, turn.level, list(turn.reasons), turn.recalled, epoch)
         record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
         return turn
 
@@ -717,7 +768,8 @@ class MemoryProxy:
         记忆的回答不写：它是照想起的记忆写的，可能复述了刚删的内容，写回去下次抽取时又长出来。以前
         写回时才记遗忘次数，比不出这段时间里的遗忘（D-068 记下的剩余限制，流式时这段时间更长）。
         用户的话照写：它不是从记忆来的，与这次遗忘无关时丢掉就再也没有了（之后的请求只写各自最后
-        一句用户消息）。没有注入记忆的回答（工具调用的后续、想起失败、空间里还没有记忆）照写。"""
+        一句用户消息）。没有注入记忆的回答（想起失败、空间里还没有记忆）照写。工具调用的后续请求
+        也注入了这一轮的证据块（见 _recall），同样照这条规则：期间遗忘过时它的回答不写。"""
         if turn.space is None or turn.run is None:
             return
         user = [_storable(turn.write_user)] if turn.write_user is not None else []
@@ -921,6 +973,13 @@ def _storable(message: dict[str, Any]) -> dict[str, Any]:
         if block.get("type") != "image_url" or _image_url(block).startswith("data:")
     ]
     return {**message, "content": kept}
+
+
+def _digest(message: dict[str, Any]) -> str:
+    """用户消息写回时的样子的 SHA-256（见 Kept）：与 _in_context 比对时的写法相同。"""
+    return hashlib.sha256(
+        stored_text(_storable(message)).strip().encode("utf-8", "surrogatepass")
+    ).hexdigest()
 
 
 def _image_url(block: dict[str, Any]) -> str:
