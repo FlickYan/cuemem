@@ -72,3 +72,44 @@ def test_ingest_and_ask_end_to_end(offline_settings: Settings, fake_api: FakeAPI
     ask_trace = next(t for t in traces if t["name"] == "ask")
     assert {s["name"] for s in ask_trace["spans"]} >= {"retrieve", "read"}
     assert any(e["kind"] == "llm" for e in ask_trace["events"])
+
+
+def test_ingest_with_a_repeated_session_id_is_unchanged(
+    offline_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """LongMemEval 有 13 个样本同一个会话 ID 出现两次（内容相同、日期不同）。导入整段对话
+    （评测建库的路）不做导入文件那样的"先出现的算"：那一"轮"照旧算两次、写两次向量，向量库里
+    留的是后一次的时间，重建的评测空间与以前的逐项相同。数据库里的"轮"是先写的那个。"""
+
+    def said(session_id: str, day: int, text: str) -> SessionIn:
+        return SessionIn(
+            session_id=session_id,
+            started_at=datetime(2023, 5, day, 9),
+            turns=[TurnIn(role="user", text=text)],
+        )
+
+    sessions = [
+        said("dup", 25, "我养了一只猫"),
+        said("other", 26, "我住在柏林"),
+        said("dup", 28, "我养了一只猫"),
+    ]
+    sent: list[list[str]] = []
+    with MemorySystem.from_settings(offline_settings, http_client=fake_api.client()) as system:
+        embed = system.embedder.embed
+
+        def spy(texts: Any, kind: Any) -> Any:
+            sent.append(list(texts))
+            return embed(texts, kind)
+
+        system.embedder.embed = spy  # type: ignore[method-assign]
+        report = system.ingest(Conversation(space_id="lme", sessions=sessions))
+        assert sent == [["User: 我养了一只猫", "User: 我住在柏林", "User: 我养了一只猫"]]
+        assert (report.turns_added, report.units_added) == (2, 3)
+        assert system.vectors.count("lme") == 2
+        [unit] = [u for u in system.db.list_units("lme", kinds=["round"]) if "猫" in u.text]
+        assert unit.ts == datetime(2023, 5, 25, 9)
+        records, _ = system.vectors._client.scroll(
+            system.vectors.collection_name("lme"), limit=10, with_payload=True
+        )
+        [ts] = [r.payload["ts"] for r in records if r.payload and r.payload["unit_id"] == unit.id]
+        assert ts == datetime(2023, 5, 28, 9).timestamp()

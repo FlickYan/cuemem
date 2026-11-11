@@ -204,6 +204,8 @@ class OnlineWriter:
         space_id: str,
         batches: Sequence[Sequence[tuple[SessionIn, int]]],
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+        *,
+        first_wins: bool = False,
     ) -> Iterator[IngestReport]:
         """写入这些会话的发言，要么全部写进去，要么什么都不留。每项是会话与第一句的序号（导入
         整段对话时从 0 起；Agent 追加新的一问一答时接着往下排）。with 块里调用方的写入（登记巩固
@@ -219,13 +221,18 @@ class OnlineWriter:
 
         meta：（会话，发言序号）→ 附加信息（SDK 的 metadata、过期时间与更正目标，导入的文件），
         与发言在同一个事务里写，只写给真正写进去的发言；不影响"轮"与向量化。
+
+        first_wins：一批里同一句出现不止一次时只写先出现的那个（见 _stage）。追加与导入文件时打开
+        （MemorySystem.appending）；导入整段对话（ingest，评测建库用它）不开，与以前逐字相同：
+        LongMemEval 里有 13 个样本同一个会话出现两次，那一"轮"照旧写两次向量（后一次的时间留在
+        向量库里）、在 units_added 里算两次。
         """
         started = time.perf_counter()
         staged = _Staged(space_id)
         try:
             try:
                 for pieces in batches:
-                    self._stage(staged, pieces, meta)
+                    self._stage(staged, pieces, meta, first_wins=first_wins)
                 with self.db.transaction():
                     report = self._commit(staged, started)
                     yield report
@@ -243,10 +250,12 @@ class OnlineWriter:
         staged: _Staged,
         pieces: Sequence[tuple[SessionIn, int]],
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+        *,
+        first_wins: bool = False,
     ) -> None:
         """一批会话：建发言与"轮"、存原图，把这批里新的图片与"轮"向量化、写进向量库（不写数据库）。
-        前面几批已经要写的、这一批里前面出现过的都不算新的：导入的文件里序号重复时先出现的算，
-        与发言的 INSERT OR IGNORE 一致（以前每段一批，只用管前面几批）。"""
+        前面几批已经要写的不算新的。first_wins：这一批里前面出现过的也不算新的，导入的文件里序号
+        重复时先出现的算，与发言的 INSERT OR IGNORE 一致（以前每段一批，只用管前面几批）。"""
         space_id = staged.space_id
         units: list[MemoryUnit] = []
         media: list[MediaItem] = []
@@ -269,7 +278,8 @@ class OnlineWriter:
             new_media = []
             for m in media:
                 if m.id not in known:
-                    known.add(m.id)
+                    if first_wins:
+                        known.add(m.id)
                     new_media.append(m)
             if new_media and self.image_embedder is not None:
                 with span("embed_images", images=len(new_media)):
@@ -291,7 +301,8 @@ class OnlineWriter:
         new_units = []
         for u in units:
             if u.id in missing:
-                missing.discard(u.id)
+                if first_wins:
+                    missing.discard(u.id)
                 new_units.append(u)
         if new_units:
             embedded = self._embed(new_units)
