@@ -310,6 +310,33 @@ def test_parallel_batches_stop_at_the_first_failure(settings: Settings) -> None:
     assert len(ledger_tokens(ledger)) == sent - 1
 
 
+def test_a_failed_parallel_batch_does_not_shift_the_accounting(settings: Settings) -> None:
+    """同时发的三个请求（10、10、5 段）里第一个失败、另外两个回来了：embedding 事件的 texts 是
+    回来的那两批的段数。以前成功的结果从第一批起对着数，第三批的 5 段记成了 10。"""
+    fake = FakeAPI()
+    fake.embed_dim = settings.embedding.dim
+    lock = threading.Lock()
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        if "text 0" in json.loads(request.content)["input"]["texts"]:
+            time.sleep(0.2)  # 等另外两个回来
+            return httpx2.Response(400, json={"message": "bad request"})
+        with lock:
+            return fake._handle(request)
+
+    embedder = DashScopeTextEmbedder(
+        settings.embedding.model_copy(update={"max_concurrency": 3}),
+        "sk-test",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+        ledger=Ledger(None),
+        sleep=lambda _: None,
+        parallel=True,
+    )
+    with start_trace("embed") as trace, pytest.raises(EmbeddingAPIError, match="400"):
+        embedder.embed([f"text {i}" for i in range(25)], "document")
+    assert [e["texts"] for e in trace.events if e["kind"] == "embedding"] == [10, 5]
+
+
 def test_parallel_batches_keep_trace_events(settings: Settings) -> None:
     """线程里的重试照样记进调用方的 trace（任务带着调用方的上下文），记账的事件按输入的顺序。"""
     api = SlowAPI(FakeAPI())

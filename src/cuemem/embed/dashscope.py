@@ -70,13 +70,12 @@ class DashScopeTextEmbedder:
             results = self._send_all(batches, kind)
         else:  # 一个请求发完、记完账再发下一个
             results = (self._send(batch, kind) for batch in batches)
-        for batch, (vectors, sparse_vectors, used, latency_ms) in zip(
-            batches, results, strict=True
-        ):
+        # 一段文本一行向量（_parse 核对过数量）：同时发的请求有失败的时候，回来的不一定是前几批
+        for vectors, sparse_vectors, used, latency_ms in results:
             dense_parts.append(vectors)
             sparse.extend(sparse_vectors)
             tokens += used
-            self._account(used, latency_ms, len(batch))
+            self._account(used, latency_ms, len(vectors))
         dense = (
             l2_normalize(np.vstack(dense_parts))
             if dense_parts
