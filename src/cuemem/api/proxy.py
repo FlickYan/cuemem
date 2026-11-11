@@ -24,7 +24,8 @@
 4. **写回**：用户的话（含图片）与回答在线写入原始日志（不调用 LLM）；上游出错时不写，流式
    回答中途断开（客户端停下）只写用户的话。写不进去（向量接口暂时不可用等）时留着，这个会话
    下一次写回或结束之前再写（见 Run；一个会话最多留 MAX_UNSAVED 次、MAX_UNSAVED_BYTES，超出的
-   丢掉最早的、记警告）。会话进行中不抽取事实，
+   丢掉最早的、记警告）。n > 1 时几个回答都原样返回，写进记忆的只有第一个（流式与非流式相同）；
+   回答的 content 是内容块的列表时只写其中的文字（见 _answer_text）。会话进行中不抽取事实，
    空闲超过 idle_minutes 后整个会话交给后台抽取（与 Agent 的做法相同，D-045）。
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent；不是 ASCII 的 ID 写成
@@ -303,9 +304,7 @@ class MemoryProxy:
             return status, error, extra
         data = _json(response)
         if response.status_code == 200:
-            choices = data.get("choices") or [{}]
-            message = choices[0].get("message") or {}
-            self._write_back(turn, message.get("content"))
+            self._write_back(turn, _answer_text(_first_message(data).get("content")))
             return 200, data, extra
         return response.status_code, data, {**extra, **_retry_headers(response)}
 
@@ -1012,10 +1011,48 @@ def _sse_json(payload: str) -> dict[str, Any]:
     return chunk if isinstance(chunk, dict) else {}
 
 
+def _answer_text(content: Any) -> str:
+    """回答的 content → 写进记忆的文字。字符串原样；有的上游给的是内容块的列表
+    （[{type: thinking}, {type: text}]）：只取 text 块的文字，直接连起来（流式的每一块是一小段，
+    不能加空格），思考、推理的块不写；别的（None、不认识的形状）是空的。上游的响应不可信：
+    块不是对象、text 不是字符串的跳过。以前列表原样交给写回：非流式 AttributeError（上游已经
+    回答了 200，调用方却拿到 500），流式在收尾时 TypeError，用户的话也没写（第九轮体检 P5）。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part["text"]
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    )
+
+
+def _first_choice(data: Mapping[str, Any]) -> dict[str, Any]:
+    """非流式响应里的第一个回答（choices[0]）；上游的响应形状不对时是空的。"""
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    return choice if isinstance(choice, dict) else {}
+
+
+def _first_message(data: Mapping[str, Any]) -> dict[str, Any]:
+    """第一个回答的 message；形状不对时是空的。"""
+    message = _first_choice(data).get("message")
+    return message if isinstance(message, dict) else {}
+
+
 def _delta_text(chunk: dict[str, Any]) -> str:
-    choices = chunk.get("choices") or []
-    delta = choices[0].get("delta") if choices else None
-    return (delta or {}).get("content") or ""
+    """流式的一块里第一个回答（index 为 0，没写的算 0）新增的文字。n > 1 时每一块只带一个回答、
+    各有各的 index：以前不看 index 取 choices[0]，几个回答的片段交错着拼成一句写进了记忆
+    （"Berlin" 与 "Paris" 成了 "BerParlinis"），非流式却只写第一个（第九轮体检 P5）。"""
+    choices = chunk.get("choices")
+    for choice in choices if isinstance(choices, list) else []:
+        if isinstance(choice, dict) and (choice.get("index") or 0) == 0:
+            delta = choice.get("delta")
+            return _answer_text(delta.get("content")) if isinstance(delta, dict) else ""
+    return ""
 
 
 def _json(response: httpx2.Response) -> dict[str, Any]:
@@ -1169,10 +1206,11 @@ def _chat_to_response(
 ) -> dict[str, Any]:
     """Chat Completions 的回答 → Responses 的响应对象（一条 assistant 消息，一段 output_text）。
     回答被截断（length）或被内容审核拦下时 status 是 incomplete。"""
-    choice = (data.get("choices") or [{}])[0]
-    text = (choice.get("message") or {}).get("content") or ""
+    choice = _first_choice(data)
+    text = _answer_text(_first_message(data).get("content"))
+    finish = choice.get("finish_reason")
     reason = {"length": "max_output_tokens", "content_filter": "content_filter"}.get(
-        choice.get("finish_reason")
+        finish if isinstance(finish, str) else ""
     )
     status = "incomplete" if reason else "completed"
     usage = data.get("usage") or {}

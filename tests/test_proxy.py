@@ -32,6 +32,7 @@ from cuemem.api import proxy as proxy_module
 from cuemem.api.proxy import (
     MemoryProxy,
     ProxyError,
+    _answer_text,
     _chat_to_response,
     _responses_to_chat,
     create_proxy_app,
@@ -446,6 +447,101 @@ def test_a_stopped_stream_keeps_only_the_user_message(system: MemorySystem) -> N
     chunks.close()
     assert answer.closed
     assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+
+
+def _delta(index: int, content: Any) -> bytes:
+    chunk = {"choices": [{"index": index, "delta": {"content": content}}]}
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+def test_a_stream_with_several_choices_stores_the_first(system: MemorySystem) -> None:
+    """第九轮体检 P5：n > 1 的流式回答，每一块只带一个回答、各有各的 index。写进记忆的只有第一个
+    （index 0），与非流式相同；转给调用方的字节不变。以前不看 index，两个回答的片段交错着拼成
+    "BerParlinis" 写进了记忆。"""
+    usage = b'data: {"choices": [], "usage": {"total_tokens": 9}}\n\n'
+    raw = b"".join([_delta(0, "Ber"), _delta(1, "Par"), _delta(0, "lin"), _delta(1, "is"), usage])
+    answer = Answer([], last=raw + b"data: [DONE]\n\n")
+    status, chunks, _ = streaming(system, answer).stream({**ASK_PIN, "n": 2}, {})
+    assert status == 200 and b"".join(chunks) == raw + b"data: [DONE]\n\n"
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Berlin"),
+    ]
+
+
+def test_a_stream_with_content_parts_is_written_back(system: MemorySystem) -> None:
+    """第九轮体检 P5：有的上游流式的 delta.content 是内容块的列表（思考与文字）。只写文字，照
+    原样连起来。以前流读完、收尾时 TypeError：调用方拿到了完整的回答，记忆里连用户的话都没写。"""
+    raw = b"".join(
+        [
+            _delta(0, [{"type": "thinking", "thinking": "The user asks for a PIN."}]),
+            _delta(0, [{"type": "text", "text": "Your PIN"}, "junk", {"type": "text"}]),
+            _delta(0, " is 1234."),
+            _delta(0, None),
+        ]
+    )
+    answer = Answer([], last=raw + b"data: [DONE]\n\n")
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    assert b"".join(chunks) == raw + b"data: [DONE]\n\n"
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Your PIN is 1234."),
+    ]
+
+
+PARTS = [
+    {"type": "thinking", "thinking": [{"type": "text", "text": "France. Its capital."}]},
+    {"type": "text", "text": "Paris"},
+]
+
+
+def answering(system: MemorySystem, body: dict[str, Any]) -> MemoryProxy:
+    """上游的非流式回答就是 body 的代理。"""
+    transport = httpx2.MockTransport(lambda _: httpx2.Response(200, json=body))
+    return MemoryProxy(system, http_client=httpx2.Client(transport=transport))
+
+
+def test_an_answer_made_of_content_parts_is_written_back(system: MemorySystem) -> None:
+    """第九轮体检 P5：非流式回答的 content 是内容块的列表：响应原样返回，写进记忆的是其中的文字
+    （思考的块不写）。以前写回时 AttributeError：上游已经回答了 200，调用方拿到的是 500，用户的
+    话也没写。/v1/responses 走同一条路，output_text 是文字。"""
+    message = {"role": "assistant", "content": PARTS}
+    body = {
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    }
+    proxy = answering(system, body)
+    ask = {**ASK_PIN, "stream": False}
+    status, data, _ = proxy.complete(ask, {"x-cuemem-session": "s1"})
+    assert status == 200 and data == body
+    assert [(t.role, t.text) for t in system.db.get_turns("alice", "s1")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Paris"),
+    ]
+
+    request = {"model": "qwen3.8-flash", "input": "Capital of France?", "user": "alice"}
+    status, data, _ = proxy.respond(request, {"x-cuemem-session": "s2"})
+    assert status == 200
+    assert OpenAIResponse.model_validate(data).output_text == "Paris"
+    assert [t.text for t in system.db.get_turns("alice", "s2")] == ["Capital of France?", "Paris"]
+
+
+@pytest.mark.parametrize("body", [{"choices": ["x"]}, {"choices": [{"message": "x"}]}, {}])
+def test_an_answer_of_an_unknown_shape_keeps_the_user_message(
+    system: MemorySystem, body: dict[str, Any]
+) -> None:
+    """上游的 200 不是 Chat Completions 的形状：原样返回，只写用户的话（以前前两种 500）。"""
+    status, data, _ = answering(system, body).complete({**ASK_PIN, "stream": False}, {})
+    assert status == 200 and data == body
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+
+
+def test_answer_text() -> None:
+    assert _answer_text("Paris ") == "Paris "
+    assert _answer_text(PARTS) == "Paris"
+    parts = [{"type": "text", "text": "a"}, "b", None, {"type": "text", "text": 3}, {"text": "c"}]
+    assert _answer_text([*parts, {"type": "text", "text": "d"}]) == "ad"
+    assert [_answer_text(x) for x in (None, 7, {"type": "text", "text": "a"}, [])] == [""] * 4
 
 
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
