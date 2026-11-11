@@ -293,7 +293,11 @@ def test_get_and_delete_are_refused_after_the_token_check(app: FastAPI) -> None:
                 ended = await http.delete("/mcp", headers=stream)
                 assert ended.status_code == 405 and ended.headers["allow"] == "POST"
                 assert "stateless: POST only" in ended.json()["detail"]
-                for method in ("GET", "DELETE"):  # 令牌、作用域的检查在前
+                for method in ("PUT", "PATCH", "OPTIONS", "HEAD"):  # 以前 Allow 里还有 GET、DELETE
+                    other_method = await http.request(method, "/mcp", headers=stream)
+                    assert other_method.status_code == 405, method
+                    assert other_method.headers["allow"] == "POST", method
+                for method in ("GET", "DELETE", "PUT", "OPTIONS"):  # 令牌、作用域的检查在前
                     anonymous = await http.request(method, "/mcp", headers={"Accept": "*/*"})
                     assert anonymous.status_code == 401, method
                     other = stream | {"X-CueMem-User": "bob"}

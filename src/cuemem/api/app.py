@@ -835,7 +835,9 @@ def _serve_mcp(app: FastAPI, service: ChatService, keys: AnyKeys) -> None:
     from cuemem.api.mcp import McpEndpoint
 
     endpoint = McpEndpoint(service, keys)
-    app.router.routes.append(Route("/mcp", endpoint, methods=["GET", "POST", "DELETE"]))
+    # 不写 methods：每种方法都交给 McpEndpoint（POST 之外都是它的 405、Allow: POST，在令牌的
+    # 检查之后）；写了的话别的方法由 Starlette 在鉴权之前回 405，Allow 里还列着 GET、DELETE
+    app.router.routes.append(Route("/mcp", endpoint))
     outer = app.router.lifespan_context
 
     @asynccontextmanager

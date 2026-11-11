@@ -152,8 +152,8 @@ class McpEndpoint:
       sdk.space_for）；都没给时是令牌作用域里的第一个用户（Principal.home），管理令牌、不鉴权与
       全是通配的令牌没有，400；utf-8'' 写错、不是 UTF-8 时也是 400；
     - 空间在令牌的作用域之外时 403，什么都不做；
-    - 只认 POST（第九轮体检 P4）：GET 与 DELETE 是 405、Allow: POST，在上面三项检查之后（令牌
-      不对时仍然是 401）。无状态、JSON 响应时服务端从不主动发消息，也没有会话可结束；以前 GET
+    - 只认 POST（第九轮体检 P4）：GET、DELETE 与别的方法都是 405、Allow: POST，在上面三项检查
+      之后（令牌不对时仍然是 401）。无状态、JSON 响应时服务端从不主动发消息，也没有会话可结束；以前 GET
       却得到一个永远不结束的空 text/event-stream：Node 的 MCP 客户端（包括 Claude Code）连上
       之后都会开一个，每个占着令牌的一个并发名额（max_concurrent，默认 8，占满之后工具调用是
       429），停止服务时还要等满优雅退出的时限。MCP 的规范允许对这个 GET 回 405，客户端把它当成
