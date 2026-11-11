@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import json
 import logging
@@ -16,9 +17,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import numpy as np
 import pytest
-from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI
+from fakes import NO_BALANCE, TOY_CONVERSATION, FakeAPI, chat_completion_body
 from scripted import (
     TOY_EXTRACTIONS,
     TOY_UPDATE_KEYWORDS,
@@ -42,8 +44,8 @@ from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store import MemoryDB
 from cuemem.write import consolidate as consolidate_module
-from cuemem.write.consolidate import MAX_ATTEMPTS, REBUILD_PENDING
-from cuemem.write.extract import PIPELINE_VERSION, session_content_hash
+from cuemem.write.consolidate import MAX_ATTEMPTS, REBUILD_PENDING, Consolidator
+from cuemem.write.extract import PIPELINE_VERSION, Extractor, session_content_hash
 
 EXTRACT = "You build the long-term memory"  # 抽取请求的系统提示开头
 RECONCILE = "You maintain a long-term memory"  # 对账请求的系统提示开头
@@ -1602,3 +1604,117 @@ def test_facts_reconcile_in_the_order_they_were_said(
         assert facts.keys() == {"Berlin", "Munich"}
         assert facts["Munich"].is_current and not facts["Berlin"].is_current
         assert facts["Berlin"].superseded_by == facts["Munich"].id
+
+
+CUT = 6000  # 模拟的输出上限（字符）：echo_extraction 每条事实约 250 个字符
+
+
+def truncating(fake_api: FakeAPI, calls: list[dict[str, Any]]) -> httpx2.Client:
+    """抽取的回复超过 CUT 个字符时截断、finish_reason 为 length；别的请求照 FakeAPI。calls 记下
+    每个抽取请求的请求体。"""
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content or b"{}")
+        messages = body.get("messages") or [{}]
+        if not str(messages[0].get("content", "")).startswith(EXTRACT):
+            return fake_api._handle(request)
+        calls.append(body)
+        text = json.dumps(echo_extraction(messages[1]["content"]), ensure_ascii=False)
+        reason = "length" if len(text) > CUT else "stop"
+        reply = chat_completion_body(text[:CUT], deepseek=False, finish_reason=reason)
+        return httpx2.Response(200, json=reply)
+
+    return httpx2.Client(transport=httpx2.MockTransport(handle))
+
+
+def notes(n: int) -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": f"Note {i}: my item number {i} is called thing-{i}."}
+        for i in range(n)
+    ]
+
+
+def shown_turns(call: dict[str, Any]) -> int:
+    """一个抽取请求里展示了几句发言。"""
+    return len(re.findall(r"^\[t\d+\]", call["messages"][1]["content"], re.M))
+
+
+HALVES = [60, 30, 15, 15, 30, 15, 15]  # 60 句的一半怎样分到回复完整（先序）
+
+
+def test_truncated_extraction_splits_the_window(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """一次写入 120 句各带一条事实的短发言，抽取的回复在输出上限处被截断（第九轮体检）：把窗口
+    对半分开再抽，直到回复完整，120 条事实都在、出处是各自的发言。以前把截断的 JSON 发回去要求
+    改正，三次都被截断，任务失败；三个回复进了缓存，之后每次重试都重放同样的失败。"""
+    calls: list[dict[str, Any]] = []
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=truncating(fake_api, calls), background=False) as m:
+        with start_trace("add") as trace:
+            result = m.add(notes(120), user_id="alice", timestamp=AUG, wait=True)
+        assert result["status"] == "consolidated"
+        # 每个请求只有原来的两条消息，没有"改正"的反馈
+        assert [shown_turns(c) for c in calls] == [120, *HALVES, *HALVES]
+        assert all(len(c["messages"]) == 2 for c in calls)
+        splits = [e["turns"] for e in trace.events if e["kind"] == "extract_split"]
+        assert splits == [120, 60, 30, 30, 60, 30, 30]
+
+        space = space_for("alice")
+        turns = {t.id: t for t in m.system.db.get_turns(space)}
+        facts = m.system.db.get_facts(space)
+        assert len(facts) == 120
+        for fact in facts:
+            [source] = fact.source_turn_ids
+            assert turns[source].text == fact.statement
+        assert sorted(turns[f.source_turn_ids[0]].idx for f in facts) == list(range(120))
+        assert m.status(user_id="alice")["failed"] == []
+
+
+def test_truncated_extraction_is_retried_as_before_when_not_enabled(
+    n3_settings: Settings, fake_api: FakeAPI
+) -> None:
+    """split_truncated 没开（评测直接构造 MemorySystem；这里把开关关掉）时与以前一样：三个请求，
+    后两个带着截断的回复与校验错误，任务失败。之后打开开关再巩固：缓存里第一个回复带着
+    finish_reason=length，不重发它，直接从对半分开始，这个会话恢复了。"""
+    calls: list[dict[str, Any]] = []
+    fake_api.chat_replies = [ScriptedModel(echo_extraction)]
+    with Memory(n3_settings, http_client=truncating(fake_api, calls), background=False) as m:
+        extractor = m.system.consolidator.extractor
+        assert extractor.split_truncated  # from_settings 打开
+        extractor.split_truncated = False
+        result = m.add(notes(120), user_id="alice", timestamp=AUG, wait=True)
+        assert result["status"] == "queued" and "StructuredOutputError" in result["error"]
+        assert [len(c["messages"]) for c in calls] == [2, 4, 6]
+        first, second, third = (c["messages"] for c in calls)
+        assert second[:2] == first and third[:4] == second
+        assert second[2]["role"] == "assistant" and len(second[2]["content"]) == CUT
+        assert second[3]["content"].startswith("That JSON does not match the schema: ")
+        assert m.get_all(user_id="alice")["results"] == []
+
+        m.consolidate(user_id="alice")  # 重试：三个回复都来自缓存，照样失败
+        assert len(calls) == 3
+        assert len(m.status(user_id="alice")["failed"]) == 1
+
+        extractor.split_truncated = True
+        m.consolidate(user_id="alice")
+        assert [shown_turns(c) for c in calls[3:]] == [*HALVES, *HALVES]
+        assert len(m.system.db.get_facts(space_for("alice"))) == 120
+        assert m.status(user_id="alice")["failed"] == []
+
+
+def test_one_truncated_turn_fails_after_one_call(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """只有一句发言、回复还是被截断：没法再分，任务照旧失败，但只发一次请求（以前三次）。"""
+    calls: list[dict[str, Any]] = []
+    with Memory(n3_settings, http_client=truncating(fake_api, calls), background=False) as m:
+        long = [{"role": "user", "content": "I keep a list: " + "item, " * 1200}]
+        result = m.add(long, user_id="alice", timestamp=AUG, wait=True)
+        assert result["status"] == "queued"
+        assert "(OutputTruncatedError: " in result["error"]
+        assert "item" not in result["error"]
+        assert len(calls) == 1
+        assert len(m.status(user_id="alice")["failed"]) == 1
+
+
+def test_splitting_is_off_unless_from_settings_turns_it_on() -> None:
+    """评测直接构造 MemorySystem、Consolidator、Extractor：开关默认关，请求照旧。"""
+    for cls in (MemorySystem, Consolidator, Extractor):
+        assert inspect.signature(cls.__init__).parameters["split_truncated"].default is False

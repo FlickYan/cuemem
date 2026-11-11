@@ -11,12 +11,17 @@ from zoneinfo import ZoneInfo
 
 import httpx2
 import pytest
-from fakes import FakeAPI, fill_to_capacity
+from fakes import FakeAPI, chat_completion_body, fill_to_capacity
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 
 from cuemem.config import Settings
-from cuemem.errors import CacheMissError, MissingAPIKeyError, StructuredOutputError
+from cuemem.errors import (
+    CacheMissError,
+    MissingAPIKeyError,
+    OutputTruncatedError,
+    StructuredOutputError,
+)
 from cuemem.llm import ChatResult, Ledger, LLMClient, ResponseCache, ToolCall, Usage, chat_cost
 from cuemem.llm import client as llm_client
 from cuemem.llm.cache import request_key
@@ -132,6 +137,63 @@ def test_structured_output_gives_up(settings: Settings, fake_api: FakeAPI) -> No
     with pytest.raises(StructuredOutputError):
         make_client(settings, fake_api).structured("extractor", HELLO, Pet, max_attempts=2)
     assert len(fake_api.chat_requests) == 2
+
+
+CUT_PET = '{"name": "Max", "breed": "golden retr'
+
+
+def truncated_client(settings: Settings, requests: list[dict[str, Any]], reply: str) -> LLMClient:
+    """每次都回 reply、finish_reason 为 length（回复在输出上限处被截断）。"""
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(json.loads(request.content))
+        body = chat_completion_body(reply, deepseek=False, finish_reason="length")
+        return httpx2.Response(200, json=body)
+
+    return LLMClient(
+        settings,
+        cache=ResponseCache(None),
+        ledger=Ledger(None),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+        clock=lambda: PEAK_TIME,
+    )
+
+
+def test_truncated_structured_output_raises_at_once_when_asked(settings: Settings) -> None:
+    """回复在输出上限处被截断、不是合法的 JSON：raise_on_truncation 时一次请求就抛出
+    OutputTruncatedError（第九轮体检；以前把截断的 JSON 发回去要求改正，三次都被截断）。消息里
+    不带模型的输出。"""
+    requests: list[dict[str, Any]] = []
+    client = truncated_client(settings, requests, CUT_PET)
+    with pytest.raises(OutputTruncatedError) as caught:
+        client.structured("extractor", HELLO, Pet, raise_on_truncation=True)
+    assert len(requests) == 1
+    assert isinstance(caught.value, StructuredOutputError)
+    assert "Max" not in str(caught.value) and "\n" not in str(caught.value)
+
+    # 缓存里的回复带着 finish_reason：再来一次不发请求，照样立即抛出
+    with pytest.raises(OutputTruncatedError):
+        client.structured("extractor", HELLO, Pet, raise_on_truncation=True)
+    assert len(requests) == 1
+
+    # 合法的 JSON 即使 finish_reason 是 length 也照常返回
+    whole: list[dict[str, Any]] = []
+    client = truncated_client(settings, whole, '{"name": "Max", "breed": "pug"}')
+    out = client.structured("extractor", HELLO, Pet, raise_on_truncation=True)
+    assert out.value == Pet(name="Max", breed="pug") and len(whole) == 1
+
+
+def test_truncated_structured_output_is_retried_by_default(settings: Settings) -> None:
+    """不传 raise_on_truncation 时照旧：三次请求、每次带上上一次的回复与校验错误，最后是普通的
+    StructuredOutputError（评测与冻结的方法走这条路，请求不能变）。"""
+    requests: list[dict[str, Any]] = []
+    with pytest.raises(StructuredOutputError) as caught:
+        truncated_client(settings, requests, CUT_PET).structured("extractor", HELLO, Pet)
+    assert type(caught.value) is StructuredOutputError
+    assert [len(r["messages"]) for r in requests] == [2, 4, 6]
+    assert requests[2]["messages"][:4] == requests[1]["messages"]
+    assert requests[1]["messages"][2] == {"role": "assistant", "content": CUT_PET}
+    assert requests[1]["messages"][3]["content"].startswith("That JSON does not match the schema: ")
 
 
 def _structured_schemas() -> list[type[BaseModel]]:

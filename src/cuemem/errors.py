@@ -19,6 +19,13 @@ class StructuredOutputError(CueMemError):
     """多次重试后，模型仍未给出符合 Schema 的 JSON。"""
 
 
+class OutputTruncatedError(StructuredOutputError):
+    """模型的回复在输出上限处被截断（finish_reason 为 length），不是合法的 JSON。
+
+    只在调用方要求时抛出（LLMClient.structured 的 raise_on_truncation）：把截断的 JSON 发回去
+    要求改正，多半再被截断一次，调用方该做的是把输入分小。"""
+
+
 class EmbeddingAPIError(CueMemError):
     """向量化接口返回错误或格式异常。
 

@@ -45,6 +45,7 @@ from cuemem.errors import (
     CacheMissError,
     ContentFilteredError,
     MissingAPIKeyError,
+    OutputTruncatedError,
     StructuredOutputError,
 )
 from cuemem.llm.cache import ResponseCache, request_key
@@ -316,6 +317,7 @@ class LLMClient:
         max_attempts: int = 3,
         cache_scope: str | None = None,
         fallback_model: str | None = None,
+        raise_on_truncation: bool = False,
     ) -> Structured[T]:
         """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。
 
@@ -326,6 +328,11 @@ class LLMClient:
         只读缓存（llm_cache_mode=read_only，--cache-only）下主模型未命中缓存时也换备用模型：
         构建时主模型被拒或超时的请求没有缓存，缓存里只有备用模型的回复，以前重放到这里就
         CacheMissError。两个都未命中时抛出 CacheMissError（写明两个模型）。
+
+        raise_on_truncation：回复不是合法的 JSON 且是在输出上限处被截断的（finish_reason 为
+        length）时，不再反馈重试，立即抛出 OutputTruncatedError：把截断的 JSON 发回去要求改正，
+        提示词越来越长，回复多半再被截断，三次都进了缓存，以后每次重试都重放同样的失败。
+        默认 False：请求与流程照旧（评测与冻结的方法都不传）。
         """
         primary = model or (
             self.settings.roles[role].model if role in self.settings.roles else None
@@ -341,6 +348,7 @@ class LLMClient:
                 max_attempts,
                 cache_scope,
                 retry_timeouts=fallback is None,
+                raise_on_truncation=raise_on_truncation,
             )
         except fallback_errors(self.settings) as exc:
             if fallback is None:
@@ -348,7 +356,14 @@ class LLMClient:
             record_event("llm_fallback", role=role, model=fallback, reason=type(exc).__name__)
             with replay_miss(exc, role, primary, fallback):
                 return self._structured(
-                    role, messages, schema, fallback, max_tokens, max_attempts, cache_scope
+                    role,
+                    messages,
+                    schema,
+                    fallback,
+                    max_tokens,
+                    max_attempts,
+                    cache_scope,
+                    raise_on_truncation=raise_on_truncation,
                 )
 
     def _structured[T: BaseModel](
@@ -362,6 +377,7 @@ class LLMClient:
         cache_scope: str | None,
         *,
         retry_timeouts: bool = True,
+        raise_on_truncation: bool = False,
     ) -> Structured[T]:
         msgs = _with_schema_instruction(messages, schema)
         last_error = ""
@@ -404,6 +420,11 @@ class LLMClient:
                     value=schema.model_validate_json(text), result=result, attempts=attempt
                 )
             except ValidationError as exc:
+                if raise_on_truncation and result.finish_reason == "length":
+                    # 消息里不带模型的输出（它是用户对话的转述，会进任务的错误与日志）
+                    raise OutputTruncatedError(
+                        f"模型的回复在输出上限处被截断（{len(text)} 个字符），不是合法的 JSON"
+                    ) from None
                 last_error = str(exc)
                 feedback = (
                     f"That JSON does not match the schema: {_brief_errors(exc)}. "

@@ -400,6 +400,7 @@ class MemorySystem:
         tracer: TraceSink | None = None,
         owns_ledger: bool = True,
         owns_caches: bool = False,
+        split_truncated: bool = False,
         reranker: Reranker | None = None,
         media: MediaStore | None = None,
         image_embedder: ImageEmbedder | None = None,
@@ -430,6 +431,9 @@ class MemorySystem:
             settings.consolidation,
             open_sessions=self._held,
             holding_open=self._holding_held,
+            # 抽取的回复被截断时把窗口分小再抽（Extractor）。只有 from_settings 打开：评测直接
+            # 构造 MemorySystem，请求照旧
+            split_truncated=split_truncated,
         )
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
@@ -478,7 +482,10 @@ class MemorySystem:
 
         账本与两个缓存是 best_effort（第七轮体检）：磁盘满了、只读时少记一笔、少缓存一条，记一条
         警告，检索与回答照样返回（以前每个没见过的问题都抛出 database or disk is full，已经付费的
-        回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。"""
+        回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。
+
+        split_truncated 在这里打开（第九轮体检）：抽取的回复在输出上限处被截断时把窗口对半分开
+        再抽，不再把截断的 JSON 发回去要求改正。评测直接构造 MemorySystem，没有打开。"""
         private_dirs(*storage_dirs(settings))
         paths = settings.paths
         # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
@@ -529,6 +536,7 @@ class MemorySystem:
                 ledger=ledger,
                 tracer=TraceSink(paths.traces),
                 owns_caches=True,
+                split_truncated=True,
                 reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
                 # 写入与遗忘在媒体库里留标记（见 store/media.py）：进程被杀时 recover_media
                 # 收拾原图。评测空间（ephemeral、on_disk）不写：它们的图片记录不在这个数据库里
