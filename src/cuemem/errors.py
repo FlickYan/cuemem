@@ -125,7 +125,13 @@ class MemoryAPIError(CueMemError):
     （sent=False：连不上，写入一定没做，可以重发）；timeout 与 disconnected（sent=True：超时、
     连接中途断开，写入可能已经提交：add 用同一个 idempotency_key 原样重发，服务端只写一次；没给键时
     不要盲目重发，用 export 核对）；transport（sent=True：别的传输出错）。
-    拿到了 HTTP 响应时 sent 是 None。"""
+    拿到了 HTTP 响应时 sent 是 None。
+
+    attempts 是这个调用一共发了几次请求：MemoryClient(max_retries=N) 自动重试时最多 N + 1，
+    默认（不重试）是 1。MemoryClient 抛出的别的异常（KeyError、cuemem.errors 里的类型）上也有
+    这个属性。"""
+
+    attempts: int = 1
 
     def __init__(
         self,
