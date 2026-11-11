@@ -78,8 +78,9 @@ class VectorStoreOpenError(CueMemError):
 class VectorStoreFullError(CueMemError):
     """本地模式的向量库没有余量建新的集合（新的记忆空间）了：集合数加上要建的，会占到打开文件数
     软上限里留给数据库、图片与连接的那部分（store.vector.reserved_files）。没有建，什么都没写；
-    已有的空间照常可用（HTTP 503，错误码 capacity）。collections、limit：集合数与软上限（客户端
-    还原的异常里是 None）。"""
+    已有的空间照常可用（HTTP 503，错误码 capacity）；一个空间的第一张图片也要另建一个集合，
+    记忆代理在转发之前同样先查、回 503。collections、limit：集合数与软上限（客户端还原的异常里
+    是 None）。"""
 
     def __init__(
         self, message: str, *, collections: int | None = None, limit: int | None = None

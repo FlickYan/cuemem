@@ -382,16 +382,20 @@ class VectorStore:
         )
         collection._cuemem_fast_mask = True
 
-    def check_room(self, space_id: str) -> None:
+    def check_room(self, space_id: str, *, images: bool = False) -> None:
         """这个空间的文字集合还没有、又没有余量建时 VectorStoreFullError（见 _room_for）；记忆代理
-        在转发之前查，不让调用方的话先发给模型、之后才写不进去。服务端模式与只在内存里时什么也不
-        做（不多发请求）。"""
+        在转发之前查，不让调用方的话先发给模型、之后才写不进去。images：这一次还要写图片，图片
+        集合还没有时也算上（空间的第一张图片要另建一个集合；新空间的第一句话带图片时要两个）。
+        服务端模式与只在内存里时什么也不做（不多发请求）。"""
         if self._path is None:
             return
         name = self.collection_name(space_id)
         with self._lock:
-            if not self._client.collection_exists(name):
-                self._room_for(1)
+            needed = int(not self._client.collection_exists(name))
+            if images and not self._client.collection_exists(self._image_collection(space_id)):
+                needed += 1
+            if needed:
+                self._room_for(needed)
 
     def _room_for(self, n_new: int) -> None:
         """建 n_new 个集合之前（调用方持有 self._lock）：本地模式（磁盘上）的集合数加上 n_new 超过

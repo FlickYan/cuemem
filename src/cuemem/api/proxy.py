@@ -592,8 +592,10 @@ class MemoryProxy:
                 code="rate_limited",
                 headers={"x-should-retry": "false"},  # 等也没用：要删空间或调高上限
             )
-        try:  # 新的空间、本地向量库又没有余量建它：在开会话、转发之前 503，不让这一轮写不进去
-            self.system.vectors.check_room(space)
+        # 新的空间、本地向量库又没有余量建它：在开会话、转发之前 503，不让这一轮写不进去。空间的
+        # 第一张图片要另建图片集合，同样先查（第九轮体检 P3）：以前转发、回答之后写回才失败
+        try:
+            self.system.vectors.check_room(space, images=self._stores_image(messages[-1]))
         except VectorStoreFullError as exc:
             raise ProxyError(
                 503,
@@ -649,6 +651,21 @@ class MemoryProxy:
         run.kept = Kept(digest, turn.block, turn.level, list(turn.reasons), turn.recalled, epoch)
         record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
         return turn
+
+    def _stores_image(self, message: Any) -> bool:
+        """这句消息写回时会不会存图片（要用图片集合）：配了图片库与图片向量、是用户消息、带着
+        data URL 的图片（与 _storable 相同：网络图片与本地路径不存，不该因此 503）。"""
+        if self.system.media is None or self.system.image_embedder is None:
+            return False
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        content = message.get("content")
+        return isinstance(content, list) and any(
+            isinstance(block, dict)
+            and block.get("type") == "image_url"
+            and _image_url(block).startswith("data:")
+            for block in content
+        )
 
     def _in_context(self, space: str, session_id: str, earlier: list[dict[str, Any]]) -> list[str]:
         """当前会话里已经原样在请求中的轮（检索时排除，名额留给请求里没有的）。之前的每条消息

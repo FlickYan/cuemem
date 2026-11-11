@@ -39,7 +39,12 @@ from cuemem.api.proxy import (
 from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.core.models import SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
-from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    ContentFilteredError,
+    EmbeddingAPIError,
+    VectorStoreFullError,
+)
 from cuemem.evidence import recall_evidence
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
@@ -554,6 +559,82 @@ def test_a_new_user_near_the_open_file_limit_gets_503_before_forwarding(
     assert chat(client, "Recommend a coat", user="alice").status_code == 200
 
 
+def at_the_open_file_limit(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> None:
+    """软上限正好够已有的集合：再建一个就 VectorStoreFullError（reserved_files 在软上限小时最多
+    留一半）。"""
+    collections = len(system.vectors._client.get_collections().collections)
+    soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+    small_open_file_limit(monkeypatch, soft)
+
+
+def photo(text: str) -> list[dict[str, Any]]:
+    return [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": red_png_url()}},
+    ]
+
+
+def test_a_first_photo_near_the_open_file_limit_gets_503_before_forwarding(
+    client: TestClient, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P3：已有的空间的第一张图片要另建一个图片集合。本地向量库没有余量时在转发之前
+    回 503（与新的空间相同），话没发给模型、什么都没写，这个会话之后的文字照常写。以前只查文字
+    集合：照常转发、回答，写回时才失败，并且留着重试，这个会话之后的写回都排在它后面，会话结束
+    时一起丢掉。网络图片不存，不受影响。"""
+    session = {"X-CueMem-Session": "s1"}
+    assert chat(client, "I live in Berlin", user="alice", headers=session).status_code == 200
+    at_the_open_file_limit(system, monkeypatch)
+    sent = len(upstream.proxied)
+    full = chat(client, photo("Look at my cat"), user="alice", headers=session)
+    assert full.status_code == 503, full.text
+    error = full.json()["error"]
+    assert (error["type"], error["code"]) == ("server_error", "capacity")
+    assert full.headers["x-should-retry"] == "false"
+    assert len(upstream.proxied) == sent
+    assert len(system.db.get_turns("alice")) == 2 and system.db.get_media("alice") == []
+
+    remote = [
+        {"type": "text", "text": "And this one"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+    ]
+    assert chat(client, remote, user="alice", headers=session).status_code == 200
+    for i in range(3):
+        assert chat(client, f"note {i}", user="alice", headers=session).status_code == 200
+    users = [t.text for t in system.db.get_turns("alice", "s1") if t.role == "user"]
+    assert users == ["I live in Berlin", "And this one", "note 0", "note 1", "note 2"]
+
+
+def test_a_write_back_without_room_for_its_photo_is_dropped_alone(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """第九轮体检 P3：写回时才发现没有余量建图片集合（转发之前还有，或者没查出来）：只丢这一次
+    写回、警告一次，这个会话之后的照常写。以前 VectorStoreFullError 算作值得重试：它一直排在最
+    前面，每次写回都先重试它（连同图片向量），会话结束时 4 次写回的 8 条消息一起丢掉。"""
+    session = {"X-CueMem-Session": "s1"}
+    assert chat(client, "I live in Berlin", user="alice", headers=session).status_code == 200
+    at_the_open_file_limit(system, monkeypatch)
+    monkeypatch.setattr(system.vectors, "check_room", lambda space, **_: None)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        full = chat(client, photo("Look at my cat"), user="alice", headers=session)
+        assert full.status_code == 200
+        assert proxy._runs[("alice", "s1")].unsaved == []
+        for i in range(3):
+            assert chat(client, f"note {i}", user="alice", headers=session).status_code == 200
+        users = [t.text for t in system.db.get_turns("alice", "s1") if t.role == "user"]
+        assert users == ["I live in Berlin", "note 0", "note 1", "note 2"]
+        proxy.close_all()
+    assert len(system.db.get_turns("alice", "s1")) == 8 and system.db.get_media("alice") == []
+    dropped = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+    assert len(dropped) == 1
+    assert "could not store 2 message(s) of proxy session s1" in dropped[0]
+    assert "VectorStoreFullError" in dropped[0]
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_upstream_rate_limits_and_timeouts_reach_the_caller(
     client: TestClient,
@@ -1025,6 +1106,7 @@ WORTH_RETRYING: list[tuple[BaseException, bool]] = [
     (TypeError("bad message"), False),
     (KeyError("k"), False),
     (OSError("qdrant down"), True),
+    (VectorStoreFullError("full"), False),  # 要运营者处理：留着它后面的写回都排在它后面
 ]
 
 

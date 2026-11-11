@@ -27,7 +27,12 @@ from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import span
 from cuemem.embed.base import EmbeddingBatch, TextEmbedder
 from cuemem.embed.multimodal import ImageEmbedder
-from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    ContentFilteredError,
+    EmbeddingAPIError,
+    VectorStoreFullError,
+)
 from cuemem.store.media import MediaStore, StoredImage
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
@@ -42,11 +47,15 @@ def worth_retrying(exc: BaseException) -> bool:
     数据库出错时有。没有的：向量接口拒绝了请求本身（别的 4xx）、内容审核、发言本身不合法（图片
     读不出来、像素太多等），留着它们，这个会话后面的写入都得排在它们后面；撞号
     （ConcurrentWriteError）时什么都没写（第七轮体检起），但这个会话另有一个写入者（别的进程），
-    自动重试会把发言排到它的发言之后，留给调用方决定。"""
+    自动重试会把发言排到它的发言之后，留给调用方决定；本地向量库没有余量建新的集合
+    （VectorStoreFullError，例如这个空间的第一张图片要建图片集合）：要运营者处理（删空间、调高
+    ulimit、换服务端模式），留着它这个会话后面的写入一直排在它后面，会话结束时一起丢掉
+    （第九轮体检 P3）。"""
     if isinstance(
         exc,
         ConcurrentWriteError
         | ContentFilteredError
+        | VectorStoreFullError
         | UnidentifiedImageError
         | ValueError
         | TypeError
