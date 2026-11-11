@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any
 
@@ -24,6 +26,9 @@ from cuemem.llm.ledger import Ledger, UsageRecord
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+# 一个请求的结果：dense 向量、sparse 向量、用掉的 tokens、耗时（毫秒）
+_Sent = tuple[FloatArray, list[SparseVector], int, float]
+
 
 class DashScopeTextEmbedder:
     def __init__(
@@ -34,6 +39,7 @@ class DashScopeTextEmbedder:
         http_client: httpx2.Client | None = None,
         ledger: Ledger | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        parallel: bool = False,
     ) -> None:
         self.cfg = cfg
         self.name = cfg.model
@@ -47,18 +53,26 @@ class DashScopeTextEmbedder:
         self._sleep = sleep  # 测试时替换为空函数，避免真的等待
         # 评测时多个线程共用同一个向量器：限制在途请求数，避免触发按分钟计的配额限流
         self._slots = threading.BoundedSemaphore(max(1, cfg.max_concurrency))
+        # 一次调用要发几个请求时同时发（最多 max_concurrency 个在途），不再一个等一个。只有
+        # MemorySystem.from_settings 打开（build_embedder 的 parallel）：评测的请求顺序照旧
+        self._parallel = parallel and cfg.max_concurrency > 1
 
     def embed(self, texts: Sequence[str], kind: EmbedKind) -> EmbeddingBatch:
         dense_parts: list[FloatArray] = []
         sparse: list[SparseVector] = []
         tokens = 0
-        for start in range(0, len(texts), self.cfg.batch_size):
-            # 接口拒绝空字符串，用空格占位；过长文本截断
-            batch = [
-                t[: self.cfg.max_chars] or " " for t in texts[start : start + self.cfg.batch_size]
-            ]
-            data, latency_ms = self._post(self._body(batch, kind))
-            vectors, sparse_vectors, used = self._parse(data, expected=len(batch))
+        # 接口拒绝空字符串，用空格占位；过长文本截断
+        batches = [
+            [t[: self.cfg.max_chars] or " " for t in texts[start : start + self.cfg.batch_size]]
+            for start in range(0, len(texts), self.cfg.batch_size)
+        ]
+        if self._parallel and len(batches) > 1:
+            results = self._send_all(batches, kind)
+        else:  # 一个请求发完、记完账再发下一个
+            results = (self._send(batch, kind) for batch in batches)
+        for batch, (vectors, sparse_vectors, used, latency_ms) in zip(
+            batches, results, strict=True
+        ):
             dense_parts.append(vectors)
             sparse.extend(sparse_vectors)
             tokens += used
@@ -71,6 +85,35 @@ class DashScopeTextEmbedder:
         return EmbeddingBatch(
             dense=dense, sparse=sparse if self.cfg.sparse else None, tokens=tokens
         )
+
+    def _send(self, batch: list[str], kind: EmbedKind) -> _Sent:
+        data, latency_ms = self._post(self._body(batch, kind))
+        vectors, sparse_vectors, used = self._parse(data, expected=len(batch))
+        return vectors, sparse_vectors, used, latency_ms
+
+    def _send_all(self, batches: Sequence[list[str]], kind: EmbedKind) -> Iterator[_Sent]:
+        """同时发这几个请求，按输入的顺序给出结果（请求体与逐个发时相同，只是不等上一个回来）。
+
+        线程里只发请求、解析响应；记账与拼结果留在调用的线程上，顺序与逐个发时相同。每个任务带着
+        调用方的上下文：重试时的 embedding_retry 事件照样记进当前的 trace。有一个失败时，还没
+        开始的不再发，已经在途的等它回来，成功的照样记账（已经付费），然后抛出最靠前的那个错误。"""
+        workers = min(self.cfg.max_concurrency, len(batches))
+        futures: list[Future[_Sent]] = []
+        with ThreadPoolExecutor(workers, thread_name_prefix="cuemem-embed") as pool:
+            try:
+                for batch in batches:  # 每个任务一份上下文：同一份不能在两个线程里同时进入
+                    run = contextvars.copy_context().run
+                    futures.append(pool.submit(run, self._send, batch, kind))
+                wait(futures, return_when=FIRST_EXCEPTION)
+            finally:  # 有一个失败（或被打断）：排着队的不再发；在途的取消不了，退出 with 时等它
+                for future in futures:
+                    future.cancel()
+        sent = [f for f in futures if not f.cancelled()]
+        for future in sent:
+            if future.exception() is None:
+                yield future.result()
+        for future in sent:
+            future.result()  # 有失败的：抛出最靠前的那个
 
     def _body(self, batch: list[str], kind: EmbedKind) -> dict[str, Any]:
         params: dict[str, Any] = {

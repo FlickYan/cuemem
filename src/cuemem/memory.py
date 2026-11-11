@@ -506,7 +506,10 @@ class MemorySystem:
         回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。
 
         split_truncated 在这里打开（第九轮体检）：抽取的回复在输出上限处被截断时把窗口对半分开
-        再抽，不再把截断的 JSON 发回去要求改正。评测直接构造 MemorySystem，没有打开。"""
+        再抽，不再把截断的 JSON 发回去要求改正。评测直接构造 MemorySystem，没有打开。
+
+        向量器是 parallel 的（第九轮体检）：一次调用要发几个向量请求时同时发，最多
+        embedding.max_concurrency 个在途。评测自己建向量器（build_embedder 默认不开）。"""
         private_dirs(*storage_dirs(settings))
         paths = settings.paths
         # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
@@ -519,7 +522,11 @@ class MemorySystem:
                 ledger = Ledger(paths.ledger, best_effort=True)
             opened.callback(ledger.close)
             embedder = build_embedder(
-                settings, ledger=ledger, http_client=http_client, cache_best_effort=True
+                settings,
+                ledger=ledger,
+                http_client=http_client,
+                cache_best_effort=True,
+                parallel=True,
             )
             if isinstance(embedder, CachedEmbedder):
                 opened.callback(embedder.cache.close)

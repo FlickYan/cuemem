@@ -367,9 +367,13 @@ def test_import_embeds_pieces_in_batches(settings: Settings, fake_api: FakeAPI) 
     with Memory(settings, http_client=fake_api.client(), background=False) as m:
         report = m.load(_single_turn_sessions(25), user_id="bob")
         assert report["turns_added"] == 25
-        assert [len(r["input"]["texts"]) for r in fake_api.embed_requests] == [10, 10, 5]
-        sent = [t for r in fake_api.embed_requests for t in r["input"]["texts"]]
-        assert sent == [f"User: memory number {i}" for i in range(25)]
+        # 三个请求同时发（from_settings 的向量器是 parallel 的），到的先后不定
+        sent = sorted(
+            fake_api.embed_requests, key=lambda r: int(r["input"]["texts"][0].split()[-1])
+        )
+        assert [len(r["input"]["texts"]) for r in sent] == [10, 10, 5]
+        texts = [t for r in sent for t in r["input"]["texts"]]
+        assert texts == [f"User: memory number {i}" for i in range(25)]
         assert len(m.system.db.list_units("bob", kinds=["round"])) == 25
         assert m.system.vectors.count("bob") == 25
 

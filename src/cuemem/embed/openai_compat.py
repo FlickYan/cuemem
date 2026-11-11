@@ -32,9 +32,12 @@ class OpenAICompatibleEmbedder(DashScopeTextEmbedder):
         http_client: httpx2.Client | None = None,
         ledger: Ledger | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        parallel: bool = False,
     ) -> None:
         cfg = cfg.model_copy(update={"sparse": False})  # 兼容接口只有 dense 向量
-        super().__init__(cfg, api_key, http_client=http_client, ledger=ledger, sleep=sleep)
+        super().__init__(
+            cfg, api_key, http_client=http_client, ledger=ledger, sleep=sleep, parallel=parallel
+        )
         self._url = base_url.rstrip("/") + "/embeddings"
 
     def _body(self, batch: list[str], kind: EmbedKind) -> dict[str, Any]:

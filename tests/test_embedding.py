@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import httpx2
 import numpy as np
 import pytest
 from fakes import FakeAPI
 
 from cuemem.config import MultimodalEmbeddingConfig, Settings
 from cuemem.core.ids import content_hash
+from cuemem.core.trace import start_trace
 from cuemem.embed import (
     CachedEmbedder,
     DashScopeTextEmbedder,
@@ -18,10 +23,12 @@ from cuemem.embed import (
     EmbedKind,
     HashEmbedder,
     SparseVector,
+    build_embedder,
 )
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.errors import EmbeddingAPIError
 from cuemem.llm import Ledger
+from cuemem.memory import MemorySystem
 
 
 def make_embedder(
@@ -204,3 +211,133 @@ def test_default_embedding_is_dense_only(settings: Settings, fake_api: FakeAPI) 
     assert request["model"] == "qwen3.7-text-embedding"
     assert request["parameters"]["output_type"] == "dense"
     assert batch.sparse is None
+
+
+class SlowAPI:
+    """FakeAPI 外面包一层：每个向量请求花 delay 秒，记下同时在途的请求数的峰值。"""
+
+    def __init__(self, fake_api: FakeAPI, delay: float = 0.02) -> None:
+        self.fake_api = fake_api
+        self.delay = delay
+        self.flying = 0
+        self.peak = 0
+        self.lock = threading.Lock()
+
+    def client(self) -> httpx2.Client:
+        return httpx2.Client(transport=httpx2.MockTransport(self._handle))
+
+    def _handle(self, request: httpx2.Request) -> httpx2.Response:
+        with self.lock:
+            self.flying += 1
+            self.peak = max(self.peak, self.flying)
+        try:
+            time.sleep(self.delay)
+            with self.lock:  # FakeAPI 的预设状态码序列不是线程安全的
+                return self.fake_api._handle(request)
+        finally:
+            with self.lock:
+                self.flying -= 1
+
+
+def slow_embedder(
+    settings: Settings, api: SlowAPI, ledger: Ledger, **overrides: object
+) -> DashScopeTextEmbedder:
+    api.fake_api.embed_dim = settings.embedding.dim
+    parallel = bool(overrides.pop("parallel", False))
+    return DashScopeTextEmbedder(
+        settings.embedding.model_copy(update=overrides),
+        "sk-test",
+        http_client=api.client(),
+        ledger=ledger,
+        sleep=lambda _: None,
+        parallel=parallel,
+    )
+
+
+def ledger_tokens(ledger: Ledger) -> list[int]:
+    rows = ledger._conn.execute("SELECT input_tokens FROM usage ORDER BY rowid").fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def test_parallel_batches_overlap_up_to_max_concurrency(settings: Settings) -> None:
+    """parallel 的向量器（MemorySystem.from_settings 建的）：一次调用的几个请求同时发，在途的不
+    超过 max_concurrency；请求体、向量、tokens 与账本里的行（按输入的顺序）都与逐个发时相同。
+    默认（评测）还是一个接一个，请求的顺序就是输入的顺序。"""
+    texts = [f"text number {i} " + "x" * (i % 7) for i in range(65)]  # 7 个请求，最后一个 5 段
+
+    one_by_one, ledger_a = SlowAPI(FakeAPI()), Ledger(None)
+    expected = slow_embedder(settings, one_by_one, ledger_a, max_concurrency=3).embed(
+        texts, "document"
+    )
+    assert one_by_one.peak == 1
+    in_order = one_by_one.fake_api.embed_requests
+    assert [t for r in in_order for t in r["input"]["texts"]] == texts
+
+    together, ledger_b = SlowAPI(FakeAPI()), Ledger(None)
+    embedder = slow_embedder(settings, together, ledger_b, max_concurrency=3, parallel=True)
+    got = embedder.embed(texts, "document")
+    assert 2 <= together.peak <= 3
+    assert np.array_equal(got.dense, expected.dense) and got.tokens == expected.tokens
+
+    def canonical(requests: list[dict[str, object]]) -> list[str]:
+        return sorted(json.dumps(r, sort_keys=True) for r in requests)
+
+    assert canonical(together.fake_api.embed_requests) == canonical(in_order)
+    assert ledger_tokens(ledger_b) == ledger_tokens(ledger_a) == [50] * 6 + [25]
+
+    # 只有一个请求的调用（检索时的问题、一次 add）不建线程池
+    together.peak = 0
+    embedder.embed(texts[:10], "query")
+    assert together.peak == 1
+
+    # max_concurrency 为 1 时 parallel 不起作用
+    single = SlowAPI(FakeAPI())
+    slow_embedder(settings, single, Ledger(None), max_concurrency=1, parallel=True).embed(
+        texts, "document"
+    )
+    assert single.peak == 1
+
+
+def test_parallel_batches_stop_at_the_first_failure(settings: Settings) -> None:
+    """同时发的请求里有一个失败：排着队的不再发，已经回来的照样记账（已经付费），抛出那个错误。"""
+    api, ledger = SlowAPI(FakeAPI()), Ledger(None)
+    api.fake_api.embed_status = [400]  # 第一个到的请求失败
+    embedder = slow_embedder(settings, api, ledger, max_concurrency=2, parallel=True)
+    with pytest.raises(EmbeddingAPIError, match="400"):
+        embedder.embed([f"text {i}" for i in range(200)], "document")  # 20 个请求
+    sent = len(api.fake_api.embed_requests)
+    assert 2 <= sent < 20
+    assert len(ledger_tokens(ledger)) == sent - 1
+
+
+def test_parallel_batches_keep_trace_events(settings: Settings) -> None:
+    """线程里的重试照样记进调用方的 trace（任务带着调用方的上下文），记账的事件按输入的顺序。"""
+    api = SlowAPI(FakeAPI())
+    api.fake_api.embed_status = [429, 200]
+    embedder = slow_embedder(settings, api, Ledger(None), max_concurrency=2, parallel=True)
+    with start_trace("embed") as trace:
+        embedder.embed([f"text {i}" for i in range(25)], "document")
+    kinds = [e["kind"] for e in trace.events]
+    assert kinds.count("embedding_retry") == 1
+    assert [e["texts"] for e in trace.events if e["kind"] == "embedding"] == [10, 10, 5]
+
+
+def test_only_from_settings_builds_a_parallel_embedder(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    def parallel(embedder: object) -> bool:
+        assert isinstance(embedder, CachedEmbedder)
+        assert isinstance(embedder.inner, DashScopeTextEmbedder)
+        return embedder.inner._parallel
+
+    embedder = build_embedder(settings, http_client=fake_api.client())  # 评测与脚本
+    assert isinstance(embedder, CachedEmbedder)
+    try:
+        assert not parallel(embedder)
+    finally:
+        embedder.cache.close()
+    system = MemorySystem.from_settings(settings, http_client=fake_api.client())
+    try:
+        assert parallel(system.embedder)
+    finally:
+        system.close()
