@@ -9,16 +9,17 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import httpx2
 import numpy as np
 import pytest
-from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI, QdrantDown
+from fakes import RATE_LIMIT, REJECT, SERVER_ERROR, TIMEOUT, FakeAPI, QdrantDown
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
@@ -552,7 +553,8 @@ def test_client_disconnect_closes_the_relay_at_once(
     Starlette 不关同步迭代器，要等垃圾回收才收尾（写回排到下一轮之后，还可能在同一线程上
     等自己持有的会话锁）。2.4 起服务器在 send 时报 OSError，更早的版本由 receive 告知断开。"""
     answer = Answer(["Your PIN is"], endless=True)
-    app_ = create_proxy_app(streaming(system, answer))
+    relayed = streaming(system, answer)
+    app_ = create_proxy_app(relayed)
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": spec_version},
@@ -597,6 +599,7 @@ def test_client_disconnect_closes_the_relay_at_once(
     assert bodies >= 3
     assert answer.closed  # 不等垃圾回收
     assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+    assert relayed._runs[("alice", None)].busy == 0  # 这次请求算答完了（第九轮体检 P8）
 
 
 def test_model_mapping_and_agent_scope(
@@ -1185,6 +1188,244 @@ def test_a_parked_session_survives_a_429(
     assert sorted(j["session_id"] for j in system.db.get_jobs("alice")) == sorted(
         [implicit, "s1", "s2"]
     )
+
+
+def ask(text: str, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    messages = [SYSTEM, *(history or []), {"role": "user", "content": text}]
+    return {"model": "qwen3.8-flash", "user": "alice", "messages": messages}
+
+
+def while_waiting(
+    upstream: Upstream, monkeypatch: pytest.MonkeyPatch, meanwhile: Callable[[], None]
+) -> None:
+    """代理转发来的第一个请求在等上游回答的时候做 meanwhile（一次）。"""
+    answer, done = Upstream.__call__, False
+
+    def reply(self: Upstream, body: dict[str, Any]) -> str | dict[str, Any]:
+        nonlocal done
+        out = answer(self, body)
+        if body["messages"][0].get("content") == SYSTEM["content"] and not done:
+            done = True
+            meanwhile()
+        return out
+
+    monkeypatch.setattr(Upstream, "__call__", reply)
+
+
+S1, S2, S3 = ({"x-cuemem-session": sid} for sid in ("s1", "s2", "s3"))
+
+
+def test_a_session_waiting_for_its_answer_is_not_parked(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第九轮体检 P8：到了 max_open_runs 时不停放还有请求在等上游回答的会话，即使它最久没有请求
+    （会话的锁只在写回时持有，以前等回答的时候看起来是空闲的）。以前 s1 被停放，它的写回之后写
+    不进去（向量接口故障）时留在一个谁也找不到的 Run 上：故障过后 s1 只有后一轮，前一轮不声不响
+    地丢了。"""
+    proxy.max_open_runs = 2
+    outage = Outage(system, monkeypatch)
+    outage.status = None
+    seen: list[int] = []
+
+    def meanwhile() -> None:
+        seen.append(proxy._runs[("alice", "s1")].busy)
+        clock.now = 1.0
+        assert proxy.complete(ask("another thread"), S2)[0] == 200
+        clock.now = 2.0
+        assert proxy.complete(ask("a third thread"), S3)[0] == 200
+        outage.status = 503  # s1 的回答回来之前向量接口开始出错
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    assert seen == [1]
+    assert list(proxy._parked) == [("alice", "s2")]  # 停放的是答完了的 s2，不是在等回答的 s1
+    run = proxy._runs[("alice", "s1")]
+    assert run.busy == 0 and len(run.unsaved) == 1  # 写回留在找得到的 Run 上
+    assert system.db.get_turns("alice", "s1") == []
+
+    outage.status = None
+    clock.now = 3.0
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    assert proxy.complete(ask("next", history), S1)[0] == 200
+    proxy.close_all()
+    assert [t.text for t in system.db.get_turns("alice", "s1")] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+        "next",
+        "Happy to help, Alice!",
+    ]
+
+
+def test_sessions_all_waiting_for_answers_refuse_a_new_one(
+    proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P8：名额里的会话都有请求还没答完时，新的会话 429（原有的那个），不停放它们。
+    以前 s2 照常开了、s1 被停放。"""
+    proxy.max_open_runs = 1
+    refused: list[ProxyError] = []
+
+    def meanwhile() -> None:
+        with pytest.raises(ProxyError) as caught:
+            proxy.complete(ask("another thread"), S2)
+        refused.append(caught.value)
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    assert [e.status for e in refused] == [429] and refused[0].headers == {"Retry-After": "60"}
+    assert list(proxy._runs) == [("alice", "s1")] and not proxy._parked
+    assert len(upstream.proxied) == 1  # s2 没有转发
+    assert [t.text for t in system.db.get_turns("alice", "s1")] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+    ]
+    assert proxy.complete(ask("another thread"), S2)[0] == 200  # s1 答完了：可以停放
+    assert list(proxy._parked) == [("alice", "s1")]
+
+
+def test_requests_in_flight_are_counted_down(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第九轮体检 P8：会话的 busy 在请求进行中是 1，每一种结束方式之后回到 0（漏减的会话到了上限
+    再也停放不了，这个用户只剩 429）：回答、上游出错、连不上，流读完、流里出错、流中途断开、
+    中途关掉、还没读就关掉、上游一开始就出错，想起与注入时抛了异常。"""
+    seen: list[int] = []
+    while_waiting(upstream, monkeypatch, lambda: seen.append(proxy._runs[("alice", "s1")].busy))
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    run = proxy._runs[("alice", "s1")]
+    assert seen == [1] and run.busy == 0
+
+    for reply, status in ((SERVER_ERROR, 500), (TIMEOUT, 504)):
+        upstream.reply = reply
+        assert proxy.complete(ask("hi"), S1)[0] == status
+        assert run.busy == 0
+        code, chunks, _ = proxy.stream({**ask("hi"), "stream": True}, S1)
+        assert code == status and run.busy == 0
+        list(chunks)
+        assert run.busy == 0
+    upstream.reply = "Happy to help, Alice!"
+
+    code, chunks, _ = proxy.stream({**ask("I like jazz"), "stream": True}, S1)
+    assert code == 200 and run.busy == 1  # 流还没读完
+    list(chunks)
+    assert run.busy == 0
+    assert isinstance(chunks, proxy_module._Relay)
+    chunks.close()  # 结束之后再关：不再减
+    assert run.busy == 0
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("database is locked")
+
+    with monkeypatch.context() as patch:  # 开了会话之后、转发之前抛异常
+        patch.setattr(system.db, "has_sessions", broken)
+        with pytest.raises(RuntimeError):
+            proxy.complete(ask("hi"), S1)
+        assert run.busy == 0
+        with pytest.raises(RuntimeError):
+            proxy.stream({**ask("hi"), "stream": True}, S1)
+        assert run.busy == 0
+    with monkeypatch.context() as patch:
+        found = SimpleNamespace(level="L1", reasons=[], recalled=1, block="<memory>x</memory>")
+        patch.setattr(proxy_module, "recall_evidence", lambda *args, **kwargs: found)
+        patch.setattr(proxy_module, "inject_evidence", broken)
+        with pytest.raises(RuntimeError):
+            proxy.complete(ask("Where do I live?"), S1)
+        assert run.busy == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(proxy_module, "_headers", broken)
+        with pytest.raises(RuntimeError):
+            proxy.stream({**ask("hi"), "stream": True}, S1)
+        assert run.busy == 0
+
+    error = {"error": {"message": "overloaded", "type": "server_error"}}
+    endings = [  # 上游的回答，与调用方读几块（None：读到完）
+        (Answer(["Your PIN is"], last=f"data: {json.dumps(error)}\n\n".encode()), None),
+        (Answer(["Your PIN is"], error=httpx2.ReadError("reset")), None),
+        (Answer(["Your PIN is"], endless=True), 3),
+        (Answer(["Your PIN is"], endless=True), 0),  # 还没读就关掉
+    ]
+    for answer, read in endings:
+        relayed = streaming(system, answer)
+        code, chunks, _ = relayed.stream(ASK_PIN, {})
+        [waiting] = relayed._runs.values()
+        assert code == 200 and waiting.busy == 1 and isinstance(chunks, proxy_module._Relay)
+        with contextlib.suppress(httpx2.ReadError):
+            for _ in chunks if read is None else range(read):
+                next(chunks, None)
+        if read is not None:
+            assert waiting.busy == 1
+            chunks.close()
+        assert waiting.busy == 0 and answer.closed
+        relayed.close_all()
+
+
+def test_a_session_is_idle_from_the_end_of_its_answer(
+    proxy: MemoryProxy, upstream: Upstream, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P8：会话最后一次请求的时间在回答结束时再记一次：空闲从回答结束算起。以前
+    只在请求开始时记：刚答完一个长回答的会话是“最久没有请求的”，最先被停放、最先因闲置结束。"""
+
+    def meanwhile() -> None:
+        clock.now = 50.0
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    assert proxy._runs[("alice", "s1")].last_seen == 50.0
+
+    code, chunks, _ = proxy.stream({**ask("I like jazz"), "stream": True}, S2)
+    clock.now = 70.0
+    list(chunks)
+    assert code == 200 and proxy._runs[("alice", "s2")].last_seen == 70.0
+
+
+def test_a_write_back_after_its_session_ended_is_not_dropped_silently(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """第九轮体检 P8：会话在等上游的时候结束了（没带会话头的调用方并行开始了新的一段；闲置、
+    close_all 同样），它的写回之后才到：照常写一次，写不进去时不再留着（已经没有人会再写这个
+    Run），丢掉并警告、记 proxy_write_failed kept=False。以前留在结束了的 Run 上：没有警告，
+    这一轮不声不响地丢了。写得进去时照常写。"""
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
+    )
+    outage = Outage(system, monkeypatch)
+    outage.status = None
+
+    def meanwhile() -> None:
+        assert proxy.complete(ask("another conversation"), {})[0] == 200  # 新的一段：结束上一段
+        outage.status = 503
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        status, _, headers = proxy.complete(ask("I live in Berlin"), {})
+    session = headers["X-CueMem-Session"]
+    assert status == 200 and proxy._runs[("alice", None)].session_id != session
+    assert system.db.get_turns("alice", session) == []
+    failed = [data for kind, data in events if kind == "proxy_write_failed"]
+    assert [(d["space"], d["kept"]) for d in failed] == [("alice", False)]
+    warned = [r.getMessage() for r in caplog.records]
+    assert len(warned) == 1
+    assert f"could not store 2 message(s) of proxy session {session} and dropped" in warned[0]
+
+    outage.status = None  # 写得进去时：结束之后才到的写回照常写
+    while_waiting(upstream, monkeypatch, proxy.close_all)
+    status, _, headers = proxy.complete(ask("I like tea"), {})
+    late = system.db.get_turns("alice", headers["X-CueMem-Session"])
+    assert status == 200 and [t.text for t in late] == ["I like tea", "Happy to help, Alice!"]
 
 
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）

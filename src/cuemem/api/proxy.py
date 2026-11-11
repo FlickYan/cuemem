@@ -34,8 +34,8 @@ utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id�
 或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
 一个用户（记忆空间）内存里同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时
 先停放最久没有请求的那个（会话照旧进行中、不抽取，调用方回来时接着写，闲置太久时照常交给抽取；
-整个进程最多停放 PARKED_KEPT 个，再多时最早停放的交给抽取）；都留着没写进去的写回时 429
-（见 _make_room）。
+整个进程最多停放 PARKED_KEPT 个，再多时最早停放的交给抽取）；有请求还没答完（在等上游、流还
+没读完）或者留着没写进去的写回的会话不停放，都是这样时 429（见 _make_room）。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
@@ -192,7 +192,11 @@ class Run:
     （unsaved_bytes 是它们的 size 之和），超出时丢掉最早的、记警告（MemoryProxy._trim）。
 
     kept：最近一次想起的结果（见 Kept），一个会话只留一份，随 Run 一起没有（空闲结束、停放、
-    调用方开了新的一段、重启）。"""
+    调用方开了新的一段、重启）。
+
+    busy：这个会话还没答完的请求数（从 _run 到 MemoryProxy._release：在等上游的回答、流还没
+    读完），由 MemoryProxy._lock 保护；不是 0 的会话不停放（_make_room）。ended：已经交给
+    _finish（由 lock 保护）：之后才到的写回只写一次，写不进去就丢掉、记警告（见 _write_back）。"""
 
     space: str
     session_id: str
@@ -203,6 +207,8 @@ class Run:
     unsaved: list[Unsaved] = field(default_factory=list)
     unsaved_bytes: int = 0
     kept: Kept | None = None
+    busy: int = 0
+    ended: bool = False
 
     def keep(self, unsaved: Unsaved) -> None:
         self.unsaved.append(unsaved)
@@ -229,6 +235,7 @@ class Turn:
     recalled: int = 0  # 注入的记忆条数（画像、事实、对话片段）
     block: str = ""  # 注入的证据块
     epoch: int | None = None  # 想起之前这个空间删过几次发言（MemoryDB.turn_epoch，见 _write_back）
+    released: bool = False  # 这次请求已经从 run.busy 里减掉（MemoryProxy._release）
 
 
 class MemoryProxy:
@@ -296,17 +303,20 @@ class MemoryProxy:
         Retry-After）、不写记忆；连不上或超时时回 OpenAI 格式的 502 / 504。
         principal：请求的令牌，用户在它的作用域之外时 ProxyError（403）；None 不限制。"""
         turn, upstream, url, auth = self._prepare(body, headers, principal)
-        extra = _headers(turn, upstream["model"])
-        try:
-            response = self._http.post(url, json=upstream, headers=auth)
-        except httpx2.TransportError as exc:
-            status, error = _unreachable(exc)
-            return status, error, extra
-        data = _json(response)
-        if response.status_code == 200:
-            self._write_back(turn, _answer_text(_first_message(data).get("content")))
-            return 200, data, extra
-        return response.status_code, data, {**extra, **_retry_headers(response)}
+        try:  # 这次请求怎么结束都算答完了（见 _release）
+            extra = _headers(turn, upstream["model"])
+            try:
+                response = self._http.post(url, json=upstream, headers=auth)
+            except httpx2.TransportError as exc:
+                status, error = _unreachable(exc)
+                return status, error, extra
+            data = _json(response)
+            if response.status_code == 200:
+                self._write_back(turn, _answer_text(_first_message(data).get("content")))
+                return 200, data, extra
+            return response.status_code, data, {**extra, **_retry_headers(response)}
+        finally:
+            self._release(turn)
 
     def stream(
         self,
@@ -320,18 +330,27 @@ class MemoryProxy:
         中途不要的（客户端断开、用户停下）只写回用户的话；上游中途出错时什么也不写。
         上游一开始就出错时与非流式相同。"""
         turn, upstream, url, auth = self._prepare(body, headers, principal)
-        request = self._http.build_request("POST", url, json=upstream, headers=auth)
-        extra = _headers(turn, upstream["model"])
+        # 返回 _Relay 时请求还没答完（它结束时 _release）；别的出口在这里就答完了
         try:
-            response = self._http.send(request, stream=True)
-        except httpx2.TransportError as exc:
-            status, error = _unreachable(exc)
-            return status, iter([json.dumps(error).encode()]), extra
-        if response.status_code != 200:
-            content = response.read()
-            response.close()
-            return response.status_code, iter([content]), {**extra, **_retry_headers(response)}
-        return 200, _Relay(self, turn, response), extra
+            request = self._http.build_request("POST", url, json=upstream, headers=auth)
+            extra = _headers(turn, upstream["model"])
+            try:
+                response = self._http.send(request, stream=True)
+            except httpx2.TransportError as exc:
+                status, error = _unreachable(exc)
+                self._release(turn)
+                return status, iter([json.dumps(error).encode()]), extra
+            if response.status_code != 200:
+                try:
+                    content = response.read()
+                finally:
+                    response.close()
+                self._release(turn)
+                return response.status_code, iter([content]), {**extra, **_retry_headers(response)}
+            return 200, _Relay(self, turn, response), extra
+        except BaseException:
+            self._release(turn)
+            raise
 
     def respond(
         self,
@@ -419,13 +438,15 @@ class MemoryProxy:
 
     def _unpark(self, key: tuple[str, str | None]) -> Run:
         """取走一个停放的会话（调用方持有 self._lock），还原成 Run 交给 _finish：它没有留着的
-        写回（停放时就没有），_finish 只是把它交给抽取。"""
+        写回，也没有还没答完的请求（这样的会话不停放，见 _make_room），_finish 只是把它交给
+        抽取。"""
         sid, seen = self._parked.pop(key)
         return Run(key[0], sid, seen)
 
     def _finish(self, run: Run) -> None:
         """会话结束：没写进去的写回最后再写一次（见 Run），再交给后台抽取。"""
         with run.lock:
+            run.ended = True  # 之后才到的写回（这个会话还有请求没答完）不再留着，见 _write_back
             self._save(run, final=True)
         self.system.close_session(run.space, run.session_id)
 
@@ -446,6 +467,7 @@ class MemoryProxy:
         self._adopt(space, explicit)
         key = (space, explicit)
         ended: list[Run] = []
+        counted: Run | None = None
         try:
             with self._lock:
                 run = self._runs.get(key)
@@ -480,19 +502,47 @@ class MemoryProxy:
                     # 进行中：每轮照常写入，但不抽取（停放过的会话还开着，open_session 什么也不做）
                     self.system.open_session(space, sid)
                 run.last_seen = now
+                # 这次请求答完之前（_release）这个会话不停放。与登记在同一次持锁里：否则别的
+                # 线程可以在两者之间把它停放
+                run.busy += 1
+                counted = run
         finally:  # 已经取走、要结束的会话 429 时也交给抽取
-            for done in ended:
-                self._finish(done)
+            try:
+                for done in ended:
+                    self._finish(done)
+            except BaseException:
+                if counted is not None:  # 这次请求到此为止：没有 Turn 来 _release
+                    with self._lock:
+                        counted.busy -= 1
+                raise
         return run
+
+    def _release(self, turn: Turn) -> None:
+        """这次请求答完了（回答写回了、上游出错、流读完或被关掉、中途抛了异常）：每个请求在每个
+        出口正好调用一次，重复调用什么也不做。会话的 busy 减一，last_seen 记成现在：空闲从回答
+        结束算起，不是从请求开始——刚答完一个长回答的会话不会马上被当成最久没有请求的那个
+        停放，也不会马上因为闲置被结束。第九轮体检 P8。"""
+        run = turn.run
+        if run is None or turn.released:
+            return
+        turn.released = True
+        with self._lock:
+            run.busy -= 1
+            run.last_seen = self._clock()
 
     def _make_room(self, space: str) -> Run | None:
         """_run 开新会话之前（调用方持有 self._lock）：这个空间内存里进行中的会话没到 max_open_runs
-        个时 None；到了时把其中最久没有请求、没有留着重试的写回、也没在写回的那个停放，没有这样的
-        会话时 ProxyError 429。以前不限：调用方每换一个 X-CueMem-Session 就多一个会话，故障期间每个
-        会话还能留 MAX_UNSAVED_BYTES 的写回，内存跟着会话数一直长。
+        个时 None；到了时把其中最久没有请求、没有留着重试的写回、没在写回、也没有请求还没答完
+        （busy）的那个停放，没有这样的会话时 ProxyError 429。以前不限：调用方每换一个
+        X-CueMem-Session 就多一个会话，故障期间每个会话还能留 MAX_UNSAVED_BYTES 的写回，内存跟着
+        会话数一直长。
 
-        停放只丢掉内存里的 Run（它没有留着的写回，丢掉不丢东西），只记下会话 ID 与最后一次请求的
-        时间（_parked）；会话照旧进行中：不交给抽取，数据库里的进行中标记与 MemorySystem 的登记
+        停放只丢掉内存里的 Run，只记下会话 ID 与最后一次请求的时间（_parked）。它没有留着的
+        写回，也没有请求还没答完，丢掉才不丢东西。第九轮体检 P8：以前不看有没有请求在等上游的
+        回答（会话的锁只在写回时持有）：等着长回答或流式回答的会话也会被停放，它的写回之后写不
+        进去时留在一个谁也找不到的 Run 上，下一次请求、close_idle、close_all 新建的 Run 里没有
+        它，这一轮不声不响地丢了；同一个会话还有了两个 Run、两把锁，写回不再按顺序。
+        停放的会话照旧进行中：不交给抽取，数据库里的进行中标记与 MemorySystem 的登记
         都留着（巩固照旧跳过它，崩溃后照旧由 adopt_open 接手）。调用方再用这个会话时接着写，
         闲置太久时由 close_idle 交给抽取，退出时由 close_all。第八轮体检 P1：以前这里直接结束它
         （交给抽取），调用方回来接着写时会话又打开、长了，下次结束时整个空间重放
@@ -501,7 +551,13 @@ class MemoryProxy:
         mine = [k for k, r in self._runs.items() if r.space == space]
         if len(mine) < self.max_open_runs:
             return None
-        idle = [k for k in mine if not self._runs[k].unsaved and not self._runs[k].lock.locked()]
+        idle = [
+            k
+            for k in mine
+            if not self._runs[k].unsaved
+            and not self._runs[k].lock.locked()
+            and self._runs[k].busy == 0
+        ]
         if not idle:
             raise ProxyError(
                 429,
@@ -545,7 +601,11 @@ class MemoryProxy:
             # 放进最后一句用户消息；它之后的消息（工具调用与结果等）原样接在后面。请求以用户
             # 消息结尾时后面没有东西，与以前逐字节相同
             messages, cut = upstream["messages"], turn.anchor + 1
-            upstream["messages"] = inject_evidence(messages[:cut], turn.block) + messages[cut:]
+            try:
+                upstream["messages"] = inject_evidence(messages[:cut], turn.block) + messages[cut:]
+            except BaseException:
+                self._release(turn)
+                raise
         return turn, upstream, url, auth
 
     def _identity(
@@ -608,9 +668,21 @@ class MemoryProxy:
         earlier = [m for m in messages[:-1] if m.get("role") in ("user", "assistant")]
         run = self._run(space, session, fresh=not earlier, user_id=user_id, agent_id=agent_id)
         turn = Turn(space=space, user_id=user_id, agent_id=agent_id, run=run)
+        try:
+            self._evidence(turn, run, messages, earlier)
+        except BaseException:  # 会话已经记了这次请求（run.busy）：到此为止
+            self._release(turn)
+            raise
+        return turn
+
+    def _evidence(
+        self, turn: Turn, run: Run, messages: list[Any], earlier: list[dict[str, Any]]
+    ) -> None:
+        """_recall 的后一半：给这次请求（turn）想起证据块，或者再用这一轮留着的。"""
+        space = run.space
         users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
         if not users:
-            return turn
+            return
         turn.anchor = users[-1]
         asked = messages[turn.anchor]
         # 不以用户消息结尾：工具调用的后续请求（或用户消息之后还有系统消息），只写回回答
@@ -620,7 +692,7 @@ class MemoryProxy:
             run.kept = None  # 新的一轮：上一轮想起的不再用（这次想不起来时也不用）
         query = message_text(asked.get("content"))
         if not query.strip() or not self.system.db.has_sessions(space):
-            return turn
+            return
         digest = _digest(asked)
         epoch = self.system.db.turn_epoch(space)  # 在想起之前记：之后的遗忘都比得出来
         kept = run.kept
@@ -631,7 +703,7 @@ class MemoryProxy:
             record_event(
                 "proxy_recall", space=space, level=turn.level, recalled=turn.recalled, reused=True
             )
-            return turn
+            return
         turn.epoch = epoch
         try:
             evidence = recall_evidence(
@@ -644,12 +716,11 @@ class MemoryProxy:
         except Exception as exc:  # 想不起来不该让这一轮失败：不注入记忆，照常转发
             record_event("proxy_recall_failed", space=space, error=f"{type(exc).__name__}: {exc}")
             turn.level = "error"
-            return turn
+            return
         turn.level, turn.reasons = evidence.level, evidence.reasons
         turn.recalled, turn.block = evidence.recalled, evidence.block
         run.kept = Kept(digest, turn.block, turn.level, list(turn.reasons), turn.recalled, epoch)
         record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
-        return turn
 
     def _stores_image(self, message: Any) -> bool:
         """这句消息写回时会不会存图片（要用图片集合）：配了图片库与图片向量、是用户消息、带着
@@ -785,7 +856,11 @@ class MemoryProxy:
         写回时才记遗忘次数，比不出这段时间里的遗忘（D-068 记下的剩余限制，流式时这段时间更长）。
         用户的话照写：它不是从记忆来的，与这次遗忘无关时丢掉就再也没有了（之后的请求只写各自最后
         一句用户消息）。没有注入记忆的回答（想起失败、空间里还没有记忆）照写。工具调用的后续请求
-        也注入了这一轮的证据块（见 _recall），同样照这条规则：期间遗忘过时它的回答不写。"""
+        也注入了这一轮的证据块（见 _recall），同样照这条规则：期间遗忘过时它的回答不写。
+
+        这个会话在等上游的时候已经结束了（run.ended：调用方没带会话头又开始了新的一段、闲置太久、
+        close_all）：照常写一次，写不进去时不留着——这个 Run 已经没有人会再写它——丢掉、记警告
+        （第九轮体检 P8；以前留在它上面，不声不响地丢了）。"""
         if turn.space is None or turn.run is None:
             return
         user = [_storable(turn.write_user)] if turn.write_user is not None else []
@@ -805,7 +880,7 @@ class MemoryProxy:
             if not messages:
                 return
             run.keep(Unsaved(messages, datetime.now(), epoch, payload_size(messages)))
-            self._save(run)
+            self._save(run, final=run.ended)
             self._trim(run)  # 写得进去时先写：只限写完之后还留着的
 
     @staticmethod
@@ -913,16 +988,19 @@ class _Relay(Iterator[bytes]):
         if self._ended is not None:
             return
         self._ended = ended
-        self._response.close()
-        answer = "".join(self._pieces)
-        if ended == "done":
-            self._proxy._write_back(self._turn, answer)
-            return
-        record_event(
-            "proxy_stream_incomplete", space=self._turn.space, ended=ended, chars=len(answer)
-        )
-        if ended == "stopped":
-            self._proxy._write_back(self._turn, None)
+        try:
+            self._response.close()
+            answer = "".join(self._pieces)
+            if ended == "done":
+                self._proxy._write_back(self._turn, answer)
+                return
+            record_event(
+                "proxy_stream_incomplete", space=self._turn.space, ended=ended, chars=len(answer)
+            )
+            if ended == "stopped":
+                self._proxy._write_back(self._turn, None)
+        finally:  # 流怎么结束都算这次请求答完了（还没开始读就 close() 的也是）
+            self._proxy._release(self._turn)
 
 
 class _RelayResponse(StreamingResponse):
