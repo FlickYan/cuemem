@@ -32,10 +32,12 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
+from cuemem import __version__
 from cuemem.api.auth import (
     UNAUTHORIZED,
     AnyKeys,
@@ -54,6 +56,37 @@ from cuemem.sdk import space_for
 INSTRUCTIONS = """CueMem is a long-term memory of past conversations with this user.
 Call recall before answering anything that may depend on the user's past (preferences, plans, people, things they own or did). Call remember when the user shares something worth keeping. Cite memory ids when you rely on them, and use forget when the user asks you to delete something."""  # noqa: E501
 
+# 工具说明：单行，与各框架集成（integrations/langgraph.py、openai_agents.py）的常量一字不差。
+# 这里不从集成导入（它们是可选的依赖）；测试比较两边。以前用函数的 docstring，说明里带着源码的
+# 换行与缩进
+REMEMBER_DESCRIPTION = (
+    "Save something worth remembering about the user (a preference, a fact, a plan). It can be "
+    "recalled right away and is turned into structured facts in the background."
+)
+RECALL_DESCRIPTION = (
+    "Recall memories relevant to the query. The memory controller decides whether a fast "
+    "search is enough or a deeper one is needed; deep=true forces the deep search. Returns the "
+    "user's profile, facts with validity, and conversation excerpts, each with an id and a date."
+)
+FORGET_DESCRIPTION = (
+    "Forget memories by the ids that recall returned (fact ids or excerpt ids). Deletes the "
+    "conversation they came from and rebuilds everything derived from it."
+)
+PROFILE_DESCRIPTION = "The user's profile: the most important facts that are currently true."
+
+# 工具的提示（MCP 的 ToolAnnotations，客户端用来决定要不要先问用户；只是提示）。四个工具都只动
+# CueMem 自己的记忆（openWorldHint=False）；forget 删了就找不回来，对已经不在的 ID 再调用一次
+# 什么都不变（resolve_ids 忽略不认识的 ID）
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+ADDITIVE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+DESTRUCTIVE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False
+)
+STATELESS = (
+    "MCP at /mcp is stateless: POST only. There is no server-to-client stream (GET) and no "
+    "session to end (DELETE)."
+)
+
 # /mcp 上这次请求的记忆空间（McpEndpoint 设置）。同步的工具在线程池里执行，anyio 把上下文带过去
 _SPACE: ContextVar[str] = ContextVar("cuemem_mcp_space")
 # 与 _SPACE 一起设置：这次请求的令牌（remember 查它的 max_spaces）；stdio 与不鉴权时 None
@@ -63,15 +96,20 @@ _WHO: ContextVar[Principal | None] = ContextVar("cuemem_mcp_principal", default=
 def build_server(service: ChatService, space_id: str | None = None) -> MCPServer[Any]:
     """space_id：stdio 的那一个空间；None 时每次调用的空间由 McpEndpoint 按请求设置（_SPACE）。"""
     # 日志只要警告以上（stdout 是协议通道，日志走 stderr，但每个 HTTP 请求一行太吵）
-    server: MCPServer[Any] = MCPServer("cuemem", instructions=INSTRUCTIONS, log_level="WARNING")
+    server: MCPServer[Any] = MCPServer(
+        "cuemem",
+        title="CueMem",
+        version=__version__,  # 以前 serverInfo.version 是空的
+        instructions=INSTRUCTIONS,
+        log_level="WARNING",
+    )
 
     def space() -> str:
         return space_id if space_id is not None else _SPACE.get()
 
-    @server.tool()
+    @server.tool(title="Remember", description=REMEMBER_DESCRIPTION, annotations=ADDITIVE)
     def remember(text: str) -> str:
-        """Save something worth remembering about the user (a preference, a fact, a plan).
-        It can be recalled right away and is turned into structured facts in the background."""
+        """记一条笔记（REMEMBER_DESCRIPTION）。"""
         who = _WHO.get() if space_id is None else None
         held = spaces_over_cap(who, space(), service.system.db.space_ids)
         if who is not None and held is not None:  # 令牌的 max_spaces（api/auth.py）
@@ -80,27 +118,23 @@ def build_server(service: ChatService, space_id: str | None = None) -> MCPServer
             saved = service.remember(space(), text)
         return f"Saved as {saved['turn_id']}."
 
-    @server.tool()
+    @server.tool(title="Recall memories", description=RECALL_DESCRIPTION, annotations=READ_ONLY)
     def recall(query: str, deep: bool = False) -> str:
-        """Recall memories relevant to the query. The memory controller decides whether a fast
-        search is enough or a deeper one is needed; deep=true forces the deep search. Returns the
-        user's profile, facts with validity, and conversation excerpts, each with an id and a
-        date."""
+        """召回（RECALL_DESCRIPTION）。"""
         with _provider_errors():
             found = service.recall(space(), query, mode="l2" if deep else "auto", at_least_l1=True)
         return format_recall(found)
 
-    @server.tool()
+    @server.tool(title="Forget memories", description=FORGET_DESCRIPTION, annotations=DESTRUCTIVE)
     def forget(ids: list[str]) -> str:
-        """Forget memories by the ids that recall returned (fact ids or excerpt ids). Deletes
-        the conversation they came from and rebuilds everything derived from it."""
+        """按编号遗忘（FORGET_DESCRIPTION）。"""
         with _provider_errors():  # 删除之后重建出错时不算出错，见 forget_summary
             report = service.forget_ids(space(), ids)
         return forget_summary(report)
 
-    @server.tool()
+    @server.tool(title="User profile", description=PROFILE_DESCRIPTION, annotations=READ_ONLY)
     def profile() -> str:
-        """The user's profile: the most important facts that are currently true."""
+        """用户画像（PROFILE_DESCRIPTION）。"""
         text = service.profile(space())  # 与 recall 的清单一样逐行引用（format_profile）
         return format_profile(text) if text else "Nothing is known about the user yet."
 
@@ -118,6 +152,12 @@ class McpEndpoint:
       sdk.space_for）；都没给时是令牌作用域里的第一个用户（Principal.home），管理令牌、不鉴权与
       全是通配的令牌没有，400；utf-8'' 写错、不是 UTF-8 时也是 400；
     - 空间在令牌的作用域之外时 403，什么都不做；
+    - 只认 POST（第九轮体检 P4）：GET 与 DELETE 是 405、Allow: POST，在上面三项检查之后（令牌
+      不对时仍然是 401）。无状态、JSON 响应时服务端从不主动发消息，也没有会话可结束；以前 GET
+      却得到一个永远不结束的空 text/event-stream：Node 的 MCP 客户端（包括 Claude Code）连上
+      之后都会开一个，每个占着令牌的一个并发名额（max_concurrent，默认 8，占满之后工具调用是
+      429），停止服务时还要等满优雅退出的时限。MCP 的规范允许对这个 GET 回 405，客户端把它当成
+      "没有服务端的流"；
     - 空间放进 _SPACE、令牌放进 _WHO，工具读它们（remember 查令牌的 max_spaces）。
 
     Host 与 Origin 由整个应用的 TrustedHostMiddleware 与 SameOriginOnly 检查（与 /api 相同），
@@ -153,6 +193,9 @@ class McpEndpoint:
             await found(scope, receive, send)
             return
         space, principal = found
+        if scope["method"] != "POST":
+            await JSONResponse({"detail": STATELESS}, 405, {"Allow": "POST"})(scope, receive, send)
+            return
         if self._manager is None:  # 应用的 lifespan 没有运行（uvicorn 总会运行它）
             refused = {"detail": "MCP is not running: the app's lifespan has not started."}
             await JSONResponse(refused, 503)(scope, receive, send)

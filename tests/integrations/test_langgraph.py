@@ -127,7 +127,7 @@ def lives_in_berlin(memory: Memory) -> Memory:
 def test_tools_match_the_mcp_server(memory: Memory) -> None:
     server = build_server(None, "x")  # type: ignore[arg-type]
     listed = asyncio.run(server.list_tools())
-    mcp = {t.name: " ".join((t.description or "").split()) for t in listed}
+    mcp = {t.name: t.description for t in listed}  # 逐字相同（MCP 的说明以前带着换行）
     tools = memory_tools(memory, user_id="alice")
     assert [t.name for t in tools] == ["recall", "remember", "forget"]
     for t in tools:  # 同名工具、同样的说明（profile 不单独做工具：recall 的结果里带着画像）

@@ -21,7 +21,7 @@ from scripted import Reply, ScriptedModel, _fact, echo_extraction
 from starlette.datastructures import Headers
 from test_store import small_open_file_limit
 
-from cuemem import Memory
+from cuemem import Memory, __version__
 from cuemem.agent import Agent
 from cuemem.api.app import LOOPBACK_HOSTS, create_app
 from cuemem.api.auth import ADMIN, Keys
@@ -262,6 +262,96 @@ def test_the_tools_are_the_same_as_over_stdio(app: FastAPI, service: ChatService
         assert empty == "Nothing is known about the user yet."
         result = asyncio.run(stdio.call_tool("profile", {}))
         assert "".join(getattr(c, "text", "") for c in result.content) == empty
+
+
+def test_get_and_delete_are_refused_after_the_token_check(app: FastAPI) -> None:
+    """第九轮体检 P4：/mcp 无状态、JSON 响应，服务端从不主动发消息，GET 以前却得到一个永远不结束
+    的空 text/event-stream（Node 的 MCP 客户端连上之后都会开一个）：每个占着令牌的一个并发名额
+    （默认 8），占满之后工具调用是 429，停止服务时还要等满优雅退出的时限。现在 GET 与 DELETE 是
+    405、Allow: POST，在令牌与作用域的检查之后；九个 GET 之后工具调用照常。"""
+    stream = {"Accept": "text/event-stream", "Authorization": f"Bearer {ALICE_TOKEN}"}
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url=URL) as http:
+                gets = [asyncio.ensure_future(http.get("/mcp", headers=stream)) for _ in range(9)]
+                # 以前这些请求不结束：等不到就算失败（不让整个测试挂住）
+                done, pending = await asyncio.wait(gets, timeout=5)
+                for task in pending:
+                    task.cancel()
+                assert not pending, f"{len(pending)} GET /mcp 没有结束"
+                for task in done:
+                    refused = task.result()
+                    assert refused.status_code == 405, refused.text
+                    assert refused.headers["allow"] == "POST"
+                    assert "stateless: POST only" in refused.json()["detail"]
+                profile = await http.post(
+                    "/mcp", json=call("profile"), headers=headers(ALICE_TOKEN)
+                )
+                assert said(profile) == "Nothing is known about the user yet."
+                ended = await http.delete("/mcp", headers=stream)
+                assert ended.status_code == 405 and ended.headers["allow"] == "POST"
+                assert "stateless: POST only" in ended.json()["detail"]
+                for method in ("GET", "DELETE"):  # 令牌、作用域的检查在前
+                    anonymous = await http.request(method, "/mcp", headers={"Accept": "*/*"})
+                    assert anonymous.status_code == 401, method
+                    other = stream | {"X-CueMem-User": "bob"}
+                    assert (await http.request(method, "/mcp", headers=other)).status_code == 403
+
+    asyncio.run(asyncio.wait_for(run(), 60))
+
+
+def test_the_server_reports_its_version_and_tool_hints(app: FastAPI) -> None:
+    """第九轮体检 P4：initialize 的 serverInfo 带包的版本与标题（以前 version 是空的）；tools/list
+    里每个工具有标题与提示（recall、profile 只读，forget 有破坏性），说明是一行（以前带着源码的
+    换行与缩进）。"""
+    alice = headers(ALICE_TOKEN)
+    with TestClient(app, base_url=URL) as http:
+        started = http.post("/mcp", json=INITIALIZE, headers=alice).json()["result"]
+        assert started["serverInfo"] == {
+            "name": "cuemem",
+            "title": "CueMem",
+            "version": __version__,
+        }
+        listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        tools = {
+            t["name"]: t
+            for t in http.post("/mcp", json=listing, headers=alice).json()["result"]["tools"]
+        }
+    assert {name: (t["title"], t["annotations"]) for name, t in tools.items()} == {
+        "remember": (
+            "Remember",
+            {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        ),
+        "recall": ("Recall memories", {"readOnlyHint": True, "openWorldHint": False}),
+        "forget": (
+            "Forget memories",
+            {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        ),
+        "profile": ("User profile", {"readOnlyHint": True, "openWorldHint": False}),
+    }
+    for tool in tools.values():
+        assert "\n" not in tool["description"] and "  " not in tool["description"]
+
+
+def test_forgetting_the_same_ids_again_changes_nothing(app: FastAPI, service: ChatService) -> None:
+    """forget 的 idempotentHint：已经遗忘的编号再遗忘一次不是出错，什么都不再删。"""
+    Memory.from_system(service.system).add("I like tea", user_id="alice", wait=True)
+    ids = [f.id for f in service.system.facts("alice")]
+    assert ids
+    with TestClient(app, base_url=URL) as http:
+        alice = headers(ALICE_TOKEN)
+        first = http.post("/mcp", json=call("forget", ids=ids), headers=alice)
+        assert said(first).startswith("Deleted 1 conversation turn(s)")
+        again = http.post("/mcp", json=call("forget", ids=ids), headers=alice)
+        assert again.json()["result"].get("isError", False) is False
+        assert said(again).startswith("Deleted 0 conversation turn(s)")
 
 
 FORGED = (
