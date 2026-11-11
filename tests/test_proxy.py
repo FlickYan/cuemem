@@ -558,9 +558,10 @@ def test_answer_text() -> None:
     assert [_answer_text(x) for x in (None, 7, {"type": "text", "text": "a"}, [])] == [""] * 4
 
 
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 def test_client_disconnect_closes_the_relay_at_once(
-    system: MemorySystem, spec_version: str
+    system: MemorySystem, spec_version: str, path: str
 ) -> None:
     """客户端中途断开：路由立即关掉转发，上游的连接马上释放，用户的话按顺序写回。以前
     Starlette 不关同步迭代器，要等垃圾回收才收尾（写回排到下一轮之后，还可能在同一线程上
@@ -574,8 +575,8 @@ def test_client_disconnect_closes_the_relay_at_once(
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/v1/chat/completions",
-        "raw_path": b"/v1/chat/completions",
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
         "headers": [(b"content-type", b"application/json")],
@@ -583,6 +584,8 @@ def test_client_disconnect_closes_the_relay_at_once(
         "server": ("127.0.0.1", 8787),
     }
     bodies = 0
+    asked = {**ASK_PIN, "input": "What is my PIN?"}  # /v1/responses 的流式（第九轮体检 P12）
+    del asked["messages" if path == "/v1/responses" else "input"]
 
     async def main() -> None:
         gone = anyio.Event()
@@ -592,7 +595,7 @@ def test_client_disconnect_closes_the_relay_at_once(
             nonlocal received
             if not received:
                 received = True
-                return {"type": "http.request", "body": json.dumps(ASK_PIN).encode()}
+                return {"type": "http.request", "body": json.dumps(asked).encode()}
             await gone.wait()
             return {"type": "http.disconnect"}
 
@@ -600,7 +603,7 @@ def test_client_disconnect_closes_the_relay_at_once(
             nonlocal bodies
             if message["type"] == "http.response.body":
                 bodies += 1
-                if bodies >= 3:
+                if bodies >= 6:  # /v1/responses 开头的四个事件之后才是回答
                     gone.set()
                     if spec_version == "2.4":
                         raise OSError("client went away")
@@ -609,7 +612,7 @@ def test_client_disconnect_closes_the_relay_at_once(
             await app_(scope, receive, send)
 
     anyio.run(main)
-    assert bodies >= 3
+    assert bodies >= 6
     assert answer.closed  # 不等垃圾回收
     assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
     assert relayed._runs[("alice", None)].busy == 0  # 这次请求算答完了（第九轮体检 P8）
@@ -2390,8 +2393,11 @@ def test_a_truncated_answer_is_an_incomplete_response() -> None:
 @pytest.mark.parametrize(
     ("extra", "named"),
     [
-        ({"stream": True}, "stream"),
+        ({"stream": "yes"}, "stream"),
+        ({"stream": True, "background": True}, "background"),
+        ({"stream": True, "stream_options": {"include_obfuscation": False}}, "stream_options"),
         ({"tools": [{"type": "function", "name": "f", "parameters": {}}]}, "tools"),
+        ({"stream": True, "tools": [{"type": "web_search"}]}, "tools"),
         ({"previous_response_id": "resp_1"}, "previous_response_id"),
         ({"reasoning": {"summary": "auto"}}, "reasoning.summary"),
         ({"reasoning": {"effort": "low", "generate_summary": "auto"}}, "generate_summary"),
@@ -2413,14 +2419,187 @@ def test_responses_outside_the_subset_are_501(
     extra: dict[str, Any],
     named: str,
 ) -> None:
-    """子集以外的（流式、工具、存下来的回答、推理的摘要、不认识的输出格式、file_id 的图片与
-    工具调用的输入）：501，OpenAI 格式的出错写明哪一项，x-should-retry: false 让官方 SDK
-    不重试；不转发、不碰记忆。"""
+    """子集以外的（工具、后台运行、存下来的回答、推理的摘要、不认识的输出格式、file_id 的图片
+    与工具调用的输入；流式的也一样）：501，OpenAI 格式的出错写明哪一项，x-should-retry: false
+    让官方 SDK 不重试；不转发、不碰记忆。"""
     body = {"model": "qwen3.8-flash", "input": "I live in Berlin", "user": "alice", **extra}
     response = client.post("/v1/responses", json=body)
     assert response.status_code == 501 and response.headers["x-should-retry"] == "false"
     assert named in response.json()["error"]["message"]
     assert upstream.proxied == [] and system.db.list_spaces() == []
+
+
+# ---------- /v1/responses 的流式（第九轮体检 P12） ----------
+
+RESPOND_PIN = {
+    "model": "qwen3.8-flash",
+    "stream": True,
+    "user": "alice",
+    "input": "What is my PIN?",
+}
+STREAMED = [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+]
+
+
+def _last(*chunks: dict[str, Any]) -> bytes:
+    """上游的流收尾的几块，再加 [DONE]。"""
+    return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode() + b"data: [DONE]\n\n"
+
+
+def events_of(chunks: Iterator[bytes]) -> list[dict[str, Any]]:
+    """Responses 的事件流 → 各个事件的 data；顺带检查每个事件的写法与递增的序号。"""
+    events = []
+    for raw in chunks:
+        head, data = raw.decode().removesuffix("\n\n").split("\n", 1)
+        event = json.loads(data.removeprefix("data: "))
+        assert head == f"event: {event['type']}" and event["sequence_number"] == len(events)
+        events.append(event)
+    return events
+
+
+def kinds_of(events: list[Any]) -> list[str]:
+    """事件的类型，连着的 delta 算一个。"""
+    kinds = [e["type"] if isinstance(e, dict) else e.type for e in events]
+    return [kind for i, kind in enumerate(kinds) if i == 0 or kind != kinds[i - 1]]
+
+
+def test_responses_stream_with_the_openai_sdk(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """/v1/responses 的 stream: true 以前 501。现在换成流式的 Chat Completions，上游的块换成
+    Responses 的事件：官方 SDK 的 responses.stream() 与 create(stream=True) 照常可用，回答与
+    用户的话各写回一次，用量照上游最后一块记。"""
+    sdk = sdk_for(client)
+    upstream.reply = "Berlin has great coffee"
+    with sdk.responses.stream(
+        model="qwen3.8-flash",
+        instructions=SYSTEM["content"],
+        input="I live in Berlin",
+        user="alice",
+        max_output_tokens=200,
+    ) as stream:
+        events = list(stream)
+        final = stream.get_final_response()
+    assert kinds_of(events) == [*STREAMED, "response.completed"]
+    assert final.output_text == "Berlin has great coffee" and final.status == "completed"
+    assert final.usage is not None and final.usage.total_tokens == 13
+    assert (final.usage.input_tokens, final.usage.output_tokens) == (10, 3)
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "I live in Berlin"),
+        ("assistant", "Berlin has great coffee"),
+    ]
+    sent = upstream.proxied[-1]
+    assert sent["messages"] == [SYSTEM, {"role": "user", "content": "I live in Berlin"}]
+    assert sent["stream"] is True and sent["max_tokens"] == 200
+    # 只有这条路替调用方要用量（对话接口的见 test_streams_that_report_usage_are_metered）
+    assert sent["stream_options"] == {"include_usage": True}
+    (row,) = metered(system)
+    assert (row["role"], row["input_tokens"], row["output_tokens"]) == ("proxy", 10, 3)
+
+    raw = list(respond(sdk, "What do you know about my city?", stream=True))
+    assert raw[-1].type == "response.completed"
+    assert raw[-1].response.output_text == "Berlin has great coffee"
+    assert len(system.db.get_turns("alice")) == 4
+
+
+def test_responses_stream_events(client: TestClient, upstream: Upstream) -> None:
+    """事件流的样子：text/event-stream，X-CueMem-* 响应头，序号从 0 递增，响应与消息的 ID 每个
+    事件里相同（官方 SDK 见到 ID 变了会报错），没有 [DONE]。"""
+    upstream.reply = "你好 Alice"
+    body = {**RESPOND_PIN, "instructions": SYSTEM["content"], "metadata": {"app": "shop"}}
+    with client.stream("POST", "/v1/responses", json=body) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["x-cuemem-level"] == "none"  # 还没有记忆
+        assert response.headers["x-cuemem-model"] == "qwen3.8-flash"
+        assert response.headers["x-cuemem-session"]
+        text = response.read().decode()
+    assert "[DONE]" not in text and "你好" in text
+    events = events_of(f"{block}\n\n".encode() for block in text.split("\n\n") if block)
+    assert kinds_of(events) == [*STREAMED, "response.completed"]
+    created, completed = events[0]["response"], events[-1]["response"]
+    assert created["status"] == "in_progress" and created["output"] == []
+    assert created["usage"] is None and created["metadata"] == {"app": "shop"}
+    assert {e["response"]["id"] for e in events if "response" in e} == {created["id"]}
+    item = completed["output"][0]
+    assert {e["item_id"] for e in events if "item_id" in e} == {item["id"]}
+    assert [e["item"]["id"] for e in events if "item" in e] == [item["id"]] * 2
+    assert "".join(e["delta"] for e in events if "delta" in e) == "你好 Alice"
+    assert item["content"][0]["text"] == "你好 Alice" and item["status"] == "completed"
+    assert OpenAIResponse.model_validate(completed).output_text == "你好 Alice"
+    assert completed["created_at"] == created["created_at"]
+
+
+def test_a_truncated_responses_stream_is_incomplete(system: MemorySystem) -> None:
+    """finish_reason 为 length：结束事件是 response.incomplete；回答照常写回（与对话接口相同）。"""
+    cut = {"model": "qwen-x", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+    answer = Answer(["Your PIN is"], last=_last(cut))
+    _, chunks, _ = streaming(system, answer).respond_stream(RESPOND_PIN, {})
+    events = events_of(chunks)
+    assert kinds_of(events) == [*STREAMED, "response.incomplete"]
+    final = OpenAIResponse.model_validate(events[-1]["response"])
+    assert final.status == "incomplete" and final.incomplete_details is not None
+    assert final.incomplete_details.reason == "max_output_tokens"
+    assert final.model == "qwen-x" and final.usage is None  # 上游没报用量：不编一个
+    assert final.output[0].status == "incomplete" and final.output_text == "Your PIN is"
+    assert [t.text for t in system.db.get_turns("alice")] == ["What is my PIN?", "Your PIN is"]
+
+
+@pytest.mark.parametrize("how", ["in-stream", "reset"])
+def test_a_failed_responses_stream_is_not_remembered(system: MemorySystem, how: str) -> None:
+    """上游中途出错（流里的 {"error": ...}，或者连接断了）：发 response.failed 就结束，什么也
+    不写（与对话接口的流式相同）。"""
+    if how == "reset":
+        answer = Answer(["Your PIN is"], error=httpx2.ReadError("connection reset by peer"))
+    else:
+        error = {"error": {"message": "overloaded", "type": "server_error"}}
+        answer = Answer(["Your PIN is"], last=_last(error, json.loads(_sse(" 1234")[5:])))
+    with TestClient(create_proxy_app(streaming(system, answer))) as client:
+        events = list(sdk_for(client).responses.create(**RESPOND_PIN))
+    assert [e.type for e in events][4:] == ["response.output_text.delta", "response.failed"]
+    failed = events[-1].response
+    assert failed.status == "failed" and failed.error is not None and failed.output == []
+    assert failed.error.code == "server_error"
+    assert ("overloaded" if how == "in-stream" else "ReadError") in failed.error.message
+    assert answer.closed and system.db.get_turns("alice") == []
+
+
+@pytest.mark.parametrize("read", [0, 6])
+def test_a_stopped_responses_stream_keeps_only_the_user_message(
+    system: MemorySystem, read: int
+) -> None:
+    """调用方中途不要了（还没开始读的也是）：关掉上游，只写回用户的话。"""
+    answer = Answer(["Your PIN is"], endless=True)
+    relayed = streaming(system, answer)
+    _, chunks, _ = relayed.respond_stream(RESPOND_PIN, {})
+    for _ in range(read):
+        next(chunks)
+    chunks.close()
+    assert answer.closed and list(chunks) == []
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+    assert relayed._runs[("alice", None)].busy == 0
+
+
+@pytest.mark.parametrize("reply", [REJECT, RATE_LIMIT, TIMEOUT])
+def test_a_responses_stream_refused_at_the_start_is_a_json_error(
+    client: TestClient, system: MemorySystem, upstream: Upstream, reply: str
+) -> None:
+    """上游一开始就出错（或连不上）：与非流式相同的 JSON 出错，不是事件流。"""
+    upstream.reply = reply
+    body = {**RESPOND_PIN, "instructions": SYSTEM["content"]}
+    refused = client.post("/v1/responses", json=body)
+    assert refused.status_code == {REJECT: 400, RATE_LIMIT: 429, TIMEOUT: 504}[reply]
+    assert refused.headers["content-type"] == "application/json"
+    assert refused.json()["error"]["message"]
+    assert system.db.get_turns("alice") == [] and metered(system) == []
 
 
 def test_responses_errors(client: TestClient, system: MemorySystem, upstream: Upstream) -> None:

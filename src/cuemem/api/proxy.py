@@ -45,9 +45,10 @@ utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id�
 供应商、模型别名、上游报的 token 数与照目录标价算的成本，没有用户、令牌与文字；算法与内部
 调用相同（LLMClient.account）。非流式照响应体里的 usage 记；流式只有上游发了带 usage 的块才
 记得了（调用方写了 stream_options: {"include_usage": true}），代理不替调用方加这个参数（转发的
-请求逐字节不变），没有 usage 的流记成 proxy-unmetered 角色的一行（token 数是 0，看得出有多少
-次没计量）。上游出错的请求不记；账本写不进去时只记警告，回答照样返回。按令牌的每日预算
-还没有。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求逐字节不变）：
+请求逐字节不变；只有 /v1/responses 的流式由代理加），没有 usage 的流记成 proxy-unmetered
+角色的一行（token 数是 0，看得出有多少次没计量）。上游出错的请求不记；账本写不进去时只记
+警告，回答照样返回。按令牌的每日预算还没有。限定作用域的令牌可以另外写（第四轮体检，见
+api/auth.py；不写时转发的请求逐字节不变）：
 models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的；列出的别名只放行它自己，
 不放行同一个模型 ID 的别的别名，见 _upstream）与 max_output_tokens（max_tokens、
 max_completion_tokens 不超过它，并且总按这个模型在目录里的写法 max_tokens_param 写上一份；n 只能
@@ -55,14 +56,15 @@ max_completion_tokens 不超过它，并且总按这个模型在目录里的写�
 （enable_thinking、thinking），只有 models 管得住。
 
 另外两个 OpenAI 兼容的接口：
-- /v1/responses：Responses API 的一个子集——非流式，输入是文字（字符串或 input_text 的消息）
-  与用户消息里的图片（input_image 的 data URL 或网址，与 /v1/chat/completions 一样只存 data
-  URL），instructions、max_output_tokens、temperature、top_p，以及 reasoning.effort、
-  text.verbosity 与 text.format 的 json_object / json_schema（结构化输出，换成 reasoning_effort、
-  verbosity 与 response_format 转发）。换成 Chat Completions 走上面同样的想起、注入、转发与
-  写回，回答写成 Responses 的格式。流式、工具、file_id 的图片、reasoning.summary 与
-  previous_response_id 等返回 501（OpenAI 格式的出错，带 x-should-retry: false），用
-  /v1/chat/completions；
+- /v1/responses：Responses API 的一个子集——输入是文字（字符串或 input_text 的消息）与用户
+  消息里的图片（input_image 的 data URL 或网址，与 /v1/chat/completions 一样只存 data URL），
+  instructions、max_output_tokens、temperature、top_p，以及 reasoning.effort、text.verbosity
+  与 text.format 的 json_object / json_schema（结构化输出，换成 reasoning_effort、verbosity 与
+  response_format 转发）。换成 Chat Completions 走上面同样的想起、注入、转发与写回，回答写成
+  Responses 的格式；stream: true 时是 Responses 的事件流（只有文字，见 _ResponsesRelay；这条
+  路替调用方向上游要 stream_options.include_usage）。工具、file_id 的图片、reasoning.summary、
+  background 与 previous_response_id 等返回 501（OpenAI 格式的出错，带 x-should-retry:
+  false），用 /v1/chat/completions；
 - /v1/embeddings：交给配置里的向量模型（与记忆共用一个，不碰记忆、不进向量缓存），支持
   encoding_format 的 float 与 base64。
 
@@ -80,7 +82,7 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -381,6 +383,26 @@ class MemoryProxy:
         if status != 200:  # 上游的出错原样返回（OpenAI 两种接口的出错格式相同）
             return status, data, extra
         return status, _chat_to_response(body, data, extra["X-CueMem-Model"]), extra
+
+    def respond_stream(
+        self,
+        body: dict[str, Any],
+        headers: Mapping[str, str],
+        principal: Principal | None = None,
+    ) -> tuple[int, Iterator[bytes], dict[str, str]]:
+        """/v1/responses 的流式（stream: true）：换成流式的 Chat Completions 走 stream 同样的想起、
+        注入、转发与写回，上游的每一块换成 Responses 的事件（见 _ResponsesRelay）。返回值与
+        stream 相同：状态码不是 200 时是上游（或连不上时）的 JSON 出错，原样返回。
+
+        只有这条路替调用方写 stream_options.include_usage：Responses 的结束事件里要有用量，
+        用量账本也由此记得了；/v1/chat/completions 的请求照旧逐字节不变。"""
+        chat = _responses_to_chat({key: value for key, value in body.items() if key != "stream"})
+        chat["stream"] = True
+        chat["stream_options"] = {"include_usage": True}
+        status, chunks, extra = self.stream(chat, headers, principal)
+        if status != 200 or not isinstance(chunks, _Relay):
+            return status, chunks, extra
+        return 200, _ResponsesRelay(chunks, body, extra["X-CueMem-Model"]), extra
 
     def embeddings(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         """/v1/embeddings：交给配置里的向量模型（文档向量，不加查询指令）。返回（响应体，响应头）。"""
@@ -1034,6 +1056,10 @@ class _Relay(Iterator[bytes]):
     def close(self) -> None:
         self._end("stopped")
 
+    def fail(self) -> None:
+        """不再读下去，按上游中途出错收尾（_ResponsesRelay 见到流里的出错就停）。"""
+        self._end("failed")
+
     def _end(self, ended: str) -> None:
         if self._ended is not None:
             return
@@ -1054,6 +1080,143 @@ class _Relay(Iterator[bytes]):
                 self._proxy._write_back(self._turn, None)
         finally:  # 流怎么结束都算这次请求答完了（还没开始读就 close() 的也是）
             self._proxy._release(self._turn)
+
+
+class _ResponsesRelay(Iterator[bytes]):
+    """把 _Relay 转发的 Chat Completions 流换成 Responses API 的事件流（只有一条 assistant
+    消息、一段 output_text）：
+
+        response.created、response.in_progress、response.output_item.added、
+        response.content_part.added、response.output_text.delta（每段文字一个）、
+        response.output_text.done、response.content_part.done、response.output_item.done、
+        response.completed（回答被截断或被内容审核拦下时是 response.incomplete）
+
+    每个事件是 "event: <type>\ndata: <json>\n\n"，sequence_number 从 0 递增；没有
+    "data: [DONE]"（Responses API 没有）。响应与消息的 ID 只生成一次、每个事件里相同：官方 SDK
+    的 responses.stream() 见到 ID 变了会报错。结束事件里的 usage 取上游最后一个带 usage 的块，
+    上游不报时是 null。推理的内容（reasoning_content）与 n > 1 时别的回答不转。
+
+    流里的 {"error": ...} 或者上游中途断开：发 response.failed 就结束，内层的 _Relay 照上游
+    中途出错收尾（什么也不写）。写回与用量都由内层的 _Relay 做，规则与 /v1/chat/completions
+    的流式相同；close()（客户端断开、用户停下）一定关掉内层，还没开始读的也是。"""
+
+    def __init__(self, relay: _Relay, body: Mapping[str, Any], model: str) -> None:
+        self._relay = relay
+        self._body = body
+        self._id = f"resp_{uuid.uuid4().hex}"
+        self._item_id = f"msg_{uuid.uuid4().hex}"
+        self._seen: dict[str, Any] = {"created": int(time.time()), "model": model}
+        self._finish: str | None = None
+        self._pieces: list[str] = []
+        self._sequence = 0
+        self._ended = False
+        self._part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
+        self._events: deque[bytes] = deque(
+            [
+                self._event("response.created", response=self._response("in_progress")),
+                self._event("response.in_progress", response=self._response("in_progress")),
+                self._event(
+                    "response.output_item.added",
+                    output_index=0,
+                    item={
+                        "type": "message",
+                        "id": self._item_id,
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                ),
+                self._at("response.content_part.added", part=self._part),
+            ]
+        )
+
+    def __next__(self) -> bytes:
+        while not self._events:
+            if self._ended:
+                raise StopIteration
+            self._read()
+        return self._events.popleft()
+
+    def close(self) -> None:
+        self._ended = True
+        self._events.clear()
+        self._relay.close()
+
+    def _read(self) -> None:
+        """读上游的一行，把它换成的事件（多半没有或一个）放进 _events。"""
+        try:
+            line = next(self._relay).decode()
+        except StopIteration:
+            self._finished()
+            return
+        except httpx2.HTTPError as exc:  # 内层已经照出错收尾了
+            self._failed(f"The upstream model provider closed the stream ({type(exc).__name__}).")
+            return
+        payload = line[5:].strip() if line.startswith("data:") else ""
+        if not payload or payload == "[DONE]":
+            return
+        chunk = _sse_json(payload)
+        error = chunk.get("error")
+        if error:
+            self._relay.fail()
+            message = error.get("message") if isinstance(error, dict) else None
+            self._failed(
+                message if isinstance(message, str) else "The upstream model provider failed."
+            )
+            return
+        for key in ("usage", "model"):
+            if chunk.get(key):
+                self._seen[key] = chunk[key]
+        choices = chunk.get("choices")
+        for choice in choices if isinstance(choices, list) else []:
+            if isinstance(choice, dict) and (choice.get("index") or 0) == 0:
+                finish = choice.get("finish_reason")
+                self._finish = finish if isinstance(finish, str) else self._finish
+        text = _delta_text(chunk)
+        if text:
+            self._pieces.append(text)
+            self._events.append(self._at("response.output_text.delta", delta=text, logprobs=[]))
+
+    def _finished(self) -> None:
+        self._ended = True
+        text = "".join(self._pieces)
+        final = self._response("completed", text)
+        kind = "response.completed" if final["status"] == "completed" else "response.incomplete"
+        self._events += [
+            self._at("response.output_text.done", text=text, logprobs=[]),
+            self._at("response.content_part.done", part={**self._part, "text": text}),
+            self._event("response.output_item.done", output_index=0, item=final["output"][0]),
+            self._event(kind, response=final),
+        ]
+
+    def _failed(self, message: str) -> None:
+        self._ended = True
+        failed = self._response("failed")
+        failed["error"] = {"code": "server_error", "message": message}
+        self._events.append(self._event("response.failed", response=failed))
+
+    def _response(self, status: str, text: str | None = None) -> dict[str, Any]:
+        """这一刻的响应对象。text 为 None：还没有回答的样子（进行中、出错），output 是空的；
+        否则是读完之后的（status 由 finish_reason 定，见 _chat_to_response）。"""
+        choice = {"message": {"content": text or ""}, "finish_reason": self._finish}
+        out = _chat_to_response(self._body, {**self._seen, "choices": [choice]}, "")
+        out["id"] = self._id
+        if text is None:
+            out.update(status=status, output=[], completed_at=None, incomplete_details=None)
+        else:
+            out["output"][0]["id"] = self._item_id
+        if text is None or "usage" not in self._seen:
+            out["usage"] = None
+        return out
+
+    def _at(self, kind: str, **fields: Any) -> bytes:
+        """这条消息的这段文字上的事件。"""
+        return self._event(kind, item_id=self._item_id, output_index=0, content_index=0, **fields)
+
+    def _event(self, kind: str, **fields: Any) -> bytes:
+        payload = {"type": kind, "sequence_number": self._sequence, **fields}
+        self._sequence += 1
+        return f"event: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
 class _RelayResponse(StreamingResponse):
@@ -1278,8 +1441,8 @@ _RESPONSES_IGNORED = frozenset(
     {"metadata", "store", "parallel_tool_calls", "service_tier", "prompt_cache_key"}
     | {"safety_identifier", "prompt_cache_retention"}
 )
-# 写成这些值时等于没给的参数；别的值（流式、工具等）不支持。truncation 的 auto：代理不截断，
-# 放不下时是上游的 400，响应里照实写 disabled
+# 写成这些值时等于没给的参数；别的值（工具等）不支持。stream 为 true 时路由走 respond_stream，
+# 不到这里。truncation 的 auto：代理不截断，放不下时是上游的 400，响应里照实写 disabled
 _RESPONSES_DEFAULTS: dict[str, tuple[Any, ...]] = {
     "stream": (False,),
     "background": (False,),
@@ -1294,8 +1457,8 @@ def _unsupported(what: str) -> ProxyError:
     """501：OpenAI 的 SDK 遇到 5xx 会重试，x-should-retry: false 让它不重试。"""
     return ProxyError(
         501,
-        "The CueMem proxy supports a subset of the Responses API (non-streaming text and image "
-        f"input, no tools, no stored responses). Not supported: {what}. "
+        "The CueMem proxy supports a subset of the Responses API (text and image input, "
+        f"text output, no tools, no stored responses). Not supported: {what}. "
         "Use /v1/chat/completions for the rest.",
         code="not_implemented",
         headers={"x-should-retry": "false"},
@@ -1566,8 +1729,14 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
     @router.post("/v1/responses")
     def responses(body: Annotated[dict[str, Any], Depends(_body)], request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
+        who = principal_of(request)
         try:
-            status, data, extra = proxy.respond(body, headers, principal_of(request))
+            if body.get("stream") is True:
+                status, chunks, extra = proxy.respond_stream(body, headers, who)
+                if status != 200:
+                    return Response(b"".join(chunks), status, extra, media_type="application/json")
+                return _RelayResponse(chunks, headers=extra, media_type="text/event-stream")
+            status, data, extra = proxy.respond(body, headers, who)
         except ProxyError as exc:
             return exc.response()
         return JSONResponse(data, status, extra)
