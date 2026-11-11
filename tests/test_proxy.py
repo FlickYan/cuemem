@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -19,7 +20,15 @@ import anyio
 import httpx2
 import numpy as np
 import pytest
-from fakes import RATE_LIMIT, REJECT, SERVER_ERROR, TIMEOUT, FakeAPI, QdrantDown
+from fakes import (
+    RATE_LIMIT,
+    REJECT,
+    SERVER_ERROR,
+    TIMEOUT,
+    FakeAPI,
+    QdrantDown,
+    chat_completion_body,
+)
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
@@ -36,6 +45,7 @@ from cuemem.api.proxy import (
     _answer_text,
     _chat_to_response,
     _responses_to_chat,
+    _usage,
     create_proxy_app,
 )
 from cuemem.config import PathsConfig, Settings, load_settings
@@ -48,6 +58,8 @@ from cuemem.errors import (
     VectorStoreFullError,
 )
 from cuemem.evidence import recall_evidence
+from cuemem.llm.ledger import chat_cost
+from cuemem.llm.types import Usage
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store.vector import reserved_files
@@ -2083,10 +2095,10 @@ def test_unknown_models_rejected_list_only_available_ones(
 def test_requests_with_keys_keep_their_auth_header(proxy: MemoryProxy) -> None:
     """默认配置、Key 都设了：鉴权头与以前相同；不需要 Key 的本地供应商照旧用占位 Key。"""
     body = {"model": "qwen3.8-flash", "messages": [SYSTEM]}
-    _, url, auth = proxy._upstream(body)
+    _, url, auth, _, _ = proxy._upstream(body)
     assert auth == {"Authorization": "Bearer sk-test-dashscope"}
     assert url == "https://maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
-    _, _, auth = proxy._upstream({**body, "model": "deepseek-flash"})
+    _, _, auth, _, _ = proxy._upstream({**body, "model": "deepseek-flash"})
     assert auth == {"Authorization": "Bearer sk-test-deepseek"}
     listed = {m["id"] for m in proxy.models()["data"]}
     assert set(proxy.system.settings.models) <= listed
@@ -2296,3 +2308,179 @@ def test_responses_errors(client: TestClient, system: MemorySystem, upstream: Up
     assert rejected.status_code == 400
     assert rejected.json()["error"]["code"] == "data_inspection_failed"
     assert system.db.get_turns("alice") == []
+
+
+# ---------- 转发的补全记进用量账本（第九轮体检 P10） ----------
+
+
+def metered(system: MemorySystem) -> list[dict[str, Any]]:
+    """账本里代理转发的补全（角色 proxy、proxy-unmetered），按 Ledger.summary 汇总。"""
+    assert system.ledger is not None
+    return [r for r in system.ledger.summary() if str(r["role"]).startswith("proxy")]
+
+
+def test_forwarded_completions_are_metered(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """转发出去的补全以前不进账本：cuemem usage 只有抽取与向量的行，看不出代理花了多少。现在
+    每次记一行，角色 proxy，token 数照上游的 usage，成本照目录的标价；没有用户的请求也记。"""
+    assert chat(client, "I live in Berlin", user="alice").status_code == 200
+    spec = system.settings.models["qwen3.8-flash"]
+    nominal = chat_cost(spec.price, Usage(input_tokens=120, output_tokens=30))[0]
+    (row,) = metered(system)
+    assert (row["kind"], row["role"], row["provider"]) == ("chat", "proxy", spec.provider)
+    assert (row["model"], row["calls"], row["cache_hits"]) == ("qwen3.8-flash", 1, 0)
+    assert (row["input_tokens"], row["output_tokens"]) == (120, 30)
+    assert row["nominal_cost"] == pytest.approx(nominal) and nominal > 0
+
+    assert chat(client, "What is the capital of France?").status_code == 200  # 不碰记忆的
+    (row,) = metered(system)
+    assert (row["calls"], row["input_tokens"]) == (2, 240)
+
+
+def test_a_forwarded_model_id_is_metered_under_its_alias(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """请求里写的是模型 ID 或不认识的模型：账本里记目录的别名，与内部调用的行同一个写法。"""
+    spec = system.settings.models["qwen3.8-flash"]
+    for model in (spec.model_id, "gpt-unknown"):
+        assert chat(client, "hi", model=model).status_code == 200
+    (row,) = metered(system)
+    assert system.settings.models[row["model"]] == spec and row["calls"] == 2
+
+
+def test_streams_that_report_usage_are_metered(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream
+) -> None:
+    """流式：上游发了带 usage 的块（调用方写了 stream_options.include_usage）时照它记。转发的
+    请求不变：代理不替调用方加 stream_options。"""
+    body = {
+        "model": "qwen3.8-flash",
+        "stream": True,
+        "messages": [SYSTEM, ask("hi")["messages"][0]],
+    }
+    with client.stream("POST", "/v1/chat/completions", json=body) as response:
+        assert response.status_code == 200
+        assert any("usage" in line for line in response.iter_lines())  # 原样转给调用方
+    (row,) = metered(system)
+    assert (row["role"], row["calls"]) == ("proxy", 1)
+    assert (row["input_tokens"], row["output_tokens"]) == (10, 3)
+    sent = upstream.proxied[-1]
+    assert "stream_options" not in sent
+    assert sent == proxy._upstream(body)[0]  # 只有目录里的模型 ID 与供应商的开关，与以前相同
+
+
+def test_streams_without_usage_are_counted_as_unmetered(system: MemorySystem) -> None:
+    """多数流式请求不带 include_usage，上游不报用量：记成 proxy-unmetered 的一行（0 个 token），
+    账本里看得出有多少次没计量；回答照常写回。中途停下的也算一次。"""
+    relayed = streaming(system, Answer(["Your PIN is", " 1234"]))
+    _, chunks, _ = relayed.stream(ASK_PIN, {})
+    list(chunks)
+    (row,) = metered(system)
+    assert (row["kind"], row["role"], row["model"]) == ("chat", "proxy-unmetered", "qwen3.8-flash")
+    assert (row["calls"], row["input_tokens"], row["output_tokens"]) == (1, 0, 0)
+    assert row["nominal_cost"] == 0 and row["spent"] == 0
+    assert [t.text for t in system.db.get_turns("alice")] == ["What is my PIN?", "Your PIN is 1234"]
+
+    _, chunks, _ = streaming(system, Answer(["Your PIN is"], endless=True)).stream(ASK_PIN, {})
+    next(chunks)
+    chunks.close()
+    assert metered(system)[0]["calls"] == 2
+
+
+def test_a_broken_stream_is_metered_only_with_usage(system: MemorySystem) -> None:
+    """上游中途出错的流：没见到 usage 的不记（多半没算钱），见到了的照它记。"""
+    reset = httpx2.ReadError("connection reset by peer")
+    _, chunks, _ = streaming(system, Answer(["Your PIN is"], error=reset)).stream(ASK_PIN, {})
+    with pytest.raises(httpx2.ReadError):
+        list(chunks)
+    assert metered(system) == []
+
+    usage = {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2}}
+    error = {"error": {"message": "overloaded", "type": "server_error"}}
+    last = f"data: {json.dumps(usage)}\n\ndata: {json.dumps(error)}\n\n".encode()
+    _, chunks, _ = streaming(system, Answer(["Your PIN is"], last=last)).stream(ASK_PIN, {})
+    list(chunks)
+    (row,) = metered(system)
+    assert (row["role"], row["input_tokens"], row["output_tokens"]) == ("proxy", 7, 2)
+    assert system.db.get_turns("alice") == []
+
+
+def test_the_responses_api_is_metered(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    answered = client.post(
+        "/v1/responses",
+        json={"model": "qwen3.8-flash", "instructions": SYSTEM["content"], "input": "hi"},
+    )
+    assert answered.status_code == 200 and answered.json()["usage"]["input_tokens"] == 120
+    (row,) = metered(system)
+    assert (row["role"], row["calls"], row["input_tokens"]) == ("proxy", 1, 120)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reply", [RATE_LIMIT, SERVER_ERROR, TIMEOUT])
+def test_upstream_errors_are_not_metered(
+    client: TestClient, system: MemorySystem, upstream: Upstream, reply: str, stream: bool
+) -> None:
+    upstream.reply = reply
+    assert chat(client, "I live in Berlin", user="alice", stream=stream).status_code >= 400
+    assert metered(system) == []
+
+
+def test_a_ledger_failure_does_not_fail_the_answer(
+    client: TestClient,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """账本被别的进程锁着（best_effort 也照样抛出）：回答已经付过钱，照样返回、照样写回，只记
+    一条警告。"""
+    assert system.ledger is not None
+    recorded = system.ledger.record
+
+    def record(rec: Any) -> None:
+        if rec.role == "proxy":
+            raise sqlite3.OperationalError("database is locked")
+        recorded(rec)
+
+    monkeypatch.setattr(system.ledger, "record", record)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        response = chat(client, "I live in Berlin", user="alice")
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Happy to help, Alice!"
+    assert [t.text for t in system.db.get_turns("alice")] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+    ]
+    assert metered(system) == []
+    assert sum("database is locked" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_deepseek_cache_hits_are_metered(system: MemorySystem) -> None:
+    """DeepSeek 把前缀缓存命中写在 prompt_cache_hit_tokens：记进 cached_input_tokens，花费照
+    命中的价格算。"""
+    body = chat_completion_body("Paris", deepseek=True, cached_tokens=100)
+    request = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
+    status, _, _ = answering(system, body).complete(request, {})
+    assert status == 200
+    (row,) = metered(system)
+    assert (row["provider"], row["model"], row["role"]) == ("deepseek", "deepseek-flash", "proxy")
+    assert (row["input_tokens"], row["cached_input_tokens"]) == (120, 100)
+    assert 0 < row["spent"] < row["nominal_cost"]
+
+
+def test_usage_of_an_unknown_shape() -> None:
+    assert _usage({}) is None and _usage({"usage": None}) is None and _usage({"usage": []}) is None
+    odd = {"prompt_tokens": "12", "completion_tokens": True, "prompt_tokens_details": "x"}
+    assert _usage({"usage": odd}) == Usage()
+    reported = {
+        "prompt_tokens": 9,
+        "completion_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 5},
+        "completion_tokens_details": {"reasoning_tokens": 3},
+    }
+    assert _usage({"usage": reported}) == Usage(
+        input_tokens=9, output_tokens=4, cached_input_tokens=5, reasoning_tokens=3
+    )

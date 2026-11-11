@@ -516,11 +516,31 @@ class LLMClient:
             self._sleep(min(remaining, 60.0))
 
     def _account(self, role: str, alias: str, spec: ModelSpec, result: ChatResult) -> None:
-        nominal, discounted = chat_cost(spec.price, result.usage)
+        self.account(
+            role,
+            alias,
+            spec,
+            result.usage,
+            latency_ms=result.latency_ms,
+            from_cache=result.from_cache,
+        )
+
+    def account(
+        self,
+        role: str,
+        alias: str,
+        spec: ModelSpec,
+        usage: Usage,
+        *,
+        latency_ms: float = 0.0,
+        from_cache: bool = False,
+    ) -> None:
+        """记一次聊天补全的用量：账本一行、trace 一条 llm 事件。chat / chat_stream 记自己的；
+        不经过这个客户端的调用（记忆代理转发的请求，api/proxy.py）也用它记，算法相同。"""
+        nominal, discounted = chat_cost(spec.price, usage)
         peak = self.settings.providers[spec.provider].peak_hours
-        if peak is not None and not result.from_cache and not in_peak(peak, self._now()):
+        if peak is not None and not from_cache and not in_peak(peak, self._now()):
             discounted *= peak.off_peak_factor  # 非高峰时段的实际价格（标价按高峰计）
-        usage = result.usage
         if self.ledger is not None:
             self.ledger.record(
                 UsageRecord(
@@ -536,21 +556,21 @@ class LLMClient:
                     cost=nominal,
                     cost_cached=discounted,
                     currency=spec.currency,
-                    from_cache=result.from_cache,
-                    latency_ms=result.latency_ms,
+                    from_cache=from_cache,
+                    latency_ms=latency_ms,
                 )
             )
         record_event(
             "llm",
             role=role,
             model=alias,
-            from_cache=result.from_cache,
+            from_cache=from_cache,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cached_input_tokens=usage.cached_input_tokens,
             cost=round(nominal, 6),
-            spent=0.0 if result.from_cache else round(discounted, 6),
-            latency_ms=round(result.latency_ms, 1),
+            spent=0.0 if from_cache else round(discounted, 6),
+            latency_ms=round(latency_ms, 1),
         )
 
 

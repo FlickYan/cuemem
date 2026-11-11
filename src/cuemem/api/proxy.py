@@ -41,7 +41,13 @@ utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id�
 之前。
 
 作用域不是花费的上限：请求里的 model、n、max_tokens 与供应商的开关（enable_thinking 等）原样
-转发。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求逐字节不变）：
+转发。转发出去的每一次补全在用量账本里记一行（第九轮体检 P10；cuemem usage 的 proxy 角色）：
+供应商、模型别名、上游报的 token 数与照目录标价算的成本，没有用户、令牌与文字；算法与内部
+调用相同（LLMClient.account）。非流式照响应体里的 usage 记；流式只有上游发了带 usage 的块才
+记得了（调用方写了 stream_options: {"include_usage": true}），代理不替调用方加这个参数（转发的
+请求逐字节不变），没有 usage 的流记成 proxy-unmetered 角色的一行（token 数是 0，看得出有多少
+次没计量）。上游出错的请求不记；账本写不进去时只记警告，回答照样返回。按令牌的每日预算
+还没有。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求逐字节不变）：
 models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的；列出的别名只放行它自己，
 不放行同一个模型 ID 的别的别名，见 _upstream）与 max_output_tokens（max_tokens、
 max_completion_tokens 不超过它，并且总按这个模型在目录里的写法 max_tokens_param 写上一份；n 只能
@@ -111,6 +117,7 @@ from cuemem.evidence import (
     recall_evidence,
     stored_text,
 )
+from cuemem.llm.types import Usage
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.sdk import Memory, space_for
 from cuemem.write.online import worth_retrying
@@ -236,6 +243,8 @@ class Turn:
     block: str = ""  # 注入的证据块
     epoch: int | None = None  # 想起之前这个空间删过几次发言（MemoryDB.turn_epoch，见 _write_back）
     released: bool = False  # 这次请求已经从 run.busy 里减掉（MemoryProxy._release）
+    spec: ModelSpec | None = None  # 转发用的模型（目录里的一项）与它在账本里的别名（_meter）
+    alias: str = ""
 
 
 class MemoryProxy:
@@ -305,6 +314,7 @@ class MemoryProxy:
         turn, upstream, url, auth = self._prepare(body, headers, principal)
         try:  # 这次请求怎么结束都算答完了（见 _release）
             extra = _headers(turn, upstream["model"])
+            started = time.perf_counter()
             try:
                 response = self._http.post(url, json=upstream, headers=auth)
             except httpx2.TransportError as exc:
@@ -312,6 +322,8 @@ class MemoryProxy:
                 return status, error, extra
             data = _json(response)
             if response.status_code == 200:
+                # 没有用户、不碰记忆的请求也记：花的同样是服务端的 Key
+                self._meter(turn, _usage(data), (time.perf_counter() - started) * 1000)
                 self._write_back(turn, _answer_text(_first_message(data).get("content")))
                 return 200, data, extra
             return response.status_code, data, {**extra, **_retry_headers(response)}
@@ -334,6 +346,7 @@ class MemoryProxy:
         try:
             request = self._http.build_request("POST", url, json=upstream, headers=auth)
             extra = _headers(turn, upstream["model"])
+            started = time.perf_counter()
             try:
                 response = self._http.send(request, stream=True)
             except httpx2.TransportError as exc:
@@ -347,7 +360,7 @@ class MemoryProxy:
                     response.close()
                 self._release(turn)
                 return response.status_code, iter([content]), {**extra, **_retry_headers(response)}
-            return 200, _Relay(self, turn, response), extra
+            return 200, _Relay(self, turn, response, started), extra
         except BaseException:
             self._release(turn)
             raise
@@ -591,12 +604,13 @@ class MemoryProxy:
     ) -> tuple[Turn, dict[str, Any], str, dict[str, str]]:
         # 先认模型与令牌的用量限制：被拒绝的请求不开会话、不检索
         try:
-            upstream, url, auth = self._upstream(body, principal)
+            upstream, url, auth, spec, alias = self._upstream(body, principal)
         except ProxyError as exc:
             if exc.status == 503:  # 缺 Key 排在令牌的作用域之后：越权的请求照旧先 403
                 self._identity(body, headers, principal)
             raise
         turn = self._recall(body, headers, principal)
+        turn.spec, turn.alias = spec, alias
         if turn.anchor is not None and turn.block:
             # 放进最后一句用户消息；它之后的消息（工具调用与结果等）原样接在后面。请求以用户
             # 消息结尾时后面没有东西，与以前逐字节相同
@@ -745,9 +759,10 @@ class MemoryProxy:
 
     def _upstream(
         self, body: dict[str, Any], principal: Principal | None = None
-    ) -> tuple[dict[str, Any], str, dict[str, str]]:
-        """请求体 → 上游的请求体、地址与鉴权头。principal 写了 models、max_output_tokens 时按它们
-        查、改（见模块说明）；没写时与以前逐字节相同。"""
+    ) -> tuple[dict[str, Any], str, dict[str, str], ModelSpec, str]:
+        """请求体 → 上游的请求体、地址与鉴权头，加上转发用的模型（目录里的一项）与记账用的别名
+        （请求里写的就是别名时用它，否则是目录里第一个指向这一项的别名）。principal 写了 models、
+        max_output_tokens 时按它们查、改（见模块说明）；没写时请求体与以前逐字节相同。"""
         settings = self.system.settings
         spec = self._model(body.get("model"))  # 改用默认模型之后的
         models = principal.models if principal is not None else None
@@ -796,7 +811,12 @@ class MemoryProxy:
         if cap is not None:
             _cap_output(upstream, spec, cap)
         auth = {"Authorization": f"Bearer {key}"} if key else {}
-        return upstream, provider.base_url.rstrip("/") + "/chat/completions", auth
+        requested = body.get("model")
+        if isinstance(requested, str) and settings.models.get(requested) == spec:
+            alias = requested
+        else:
+            alias = next(alias for alias, s in settings.models.items() if s == spec)
+        return upstream, provider.base_url.rstrip("/") + "/chat/completions", auth, spec, alias
 
     def _model(self, requested: Any) -> ModelSpec:
         """请求的 model → 模型目录里的一项：配置里的别名或模型 ID；没给时是 role 的模型；
@@ -847,6 +867,23 @@ class MemoryProxy:
                 name,
                 used,
             )
+
+    def _meter(self, turn: Turn, usage: Usage | None, latency_ms: float) -> None:
+        """转发出去的一次补全记进用量账本（见模块说明）：角色 proxy；上游没报用量（usage 是
+        None）时记 proxy-unmetered 的一行，token 数与成本都是 0。记不进去（账本被别的进程锁着
+        等）只记一条警告：回答已经付过钱，照样返回、照样写回。"""
+        if turn.spec is None:
+            return
+        try:
+            self.system.llm.account(
+                "proxy" if usage is not None else "proxy-unmetered",
+                turn.alias,
+                turn.spec,
+                usage or Usage(),
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:
+            logger.warning("代理转发的一次补全没有记进用量账本：%s: %s", type(exc).__name__, exc)
 
     def _write_back(self, turn: Turn, answer: str | None) -> None:
         """把这一轮写进记忆：用户的话与回答。
@@ -952,12 +989,20 @@ class _Relay(Iterator[bytes]):
       回答（调用方下一次请求的历史里有它）；用户的话却要写：之后的请求只写各自最后一句
       用户消息，这句不写就永远丢了。
 
+    用量（MemoryProxy._meter）：流里最后一个带 usage 的块是这次补全的用量。读完与中途停下的
+    都记（停下之前的输出也算钱），没见到 usage 的记成没计量的；上游中途出错的只有见到 usage
+    才记。
+
     写成类而不是生成器：还没开始读就 close() 的生成器不执行收尾，上游的连接一直占着。"""
 
-    def __init__(self, proxy: MemoryProxy, turn: Turn, response: httpx2.Response) -> None:
+    def __init__(
+        self, proxy: MemoryProxy, turn: Turn, response: httpx2.Response, started: float
+    ) -> None:
         self._proxy = proxy
         self._turn = turn
         self._response = response
+        self._started = started  # 请求发给上游的时刻（time.perf_counter）
+        self._usage: Usage | None = None
         self._lines = response.iter_lines()
         self._pieces: list[str] = []
         self._error = False
@@ -979,6 +1024,7 @@ class _Relay(Iterator[bytes]):
             chunk = _sse_json(payload)
             self._error = self._error or bool(chunk.get("error"))
             self._pieces.append(_delta_text(chunk))
+            self._usage = _usage(chunk) or self._usage
         return (line + "\n").encode()
 
     def close(self) -> None:
@@ -990,6 +1036,9 @@ class _Relay(Iterator[bytes]):
         self._ended = ended
         try:
             self._response.close()
+            if ended != "failed" or self._usage is not None:
+                latency_ms = (time.perf_counter() - self._started) * 1000
+                self._proxy._meter(self._turn, self._usage, latency_ms)
             answer = "".join(self._pieces)
             if ended == "done":
                 self._proxy._write_back(self._turn, answer)
@@ -1131,6 +1180,31 @@ def _delta_text(chunk: dict[str, Any]) -> str:
             delta = choice.get("delta")
             return _answer_text(delta.get("content")) if isinstance(delta, dict) else ""
     return ""
+
+
+def _count(value: Any) -> int:
+    """用量里的一个数：不是非负整数的（缺了、字符串、布尔）算 0。"""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _usage(data: Mapping[str, Any]) -> Usage | None:
+    """响应体（或流里的一块）里的 usage → Usage；没有、不是对象时 None。前缀缓存命中的 token：
+    OpenAI、通义写在 prompt_tokens_details.cached_tokens，DeepSeek 写 prompt_cache_hit_tokens。"""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_details = usage.get("prompt_tokens_details")
+    cached = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
+    if cached is None:
+        cached = usage.get("prompt_cache_hit_tokens")
+    details = usage.get("completion_tokens_details")
+    reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    return Usage(
+        input_tokens=_count(usage.get("prompt_tokens")),
+        output_tokens=_count(usage.get("completion_tokens")),
+        cached_input_tokens=_count(cached),
+        reasoning_tokens=_count(reasoning),
+    )
 
 
 def _json(response: httpx2.Response) -> dict[str, Any]:
@@ -1291,12 +1365,9 @@ def _chat_to_response(
         finish if isinstance(finish, str) else ""
     )
     status = "incomplete" if reason else "completed"
-    usage = data.get("usage") or {}
-    prompt = int(usage.get("prompt_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or 0)
-    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
-    cached = cached if cached is not None else usage.get("prompt_cache_hit_tokens")  # DeepSeek
-    reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    usage = _usage(data) or Usage()
+    reported = data.get("usage")
+    total = _count(reported.get("total_tokens")) if isinstance(reported, dict) else 0
     now = int(time.time())
     return {
         "id": f"resp_{uuid.uuid4().hex}",
@@ -1332,11 +1403,14 @@ def _chat_to_response(
         "top_p": body.get("top_p"),
         "truncation": "disabled",
         "usage": {
-            "input_tokens": prompt,
-            "input_tokens_details": {"cached_tokens": int(cached or 0), "cache_write_tokens": 0},
-            "output_tokens": completion,
-            "output_tokens_details": {"reasoning_tokens": int(reasoning or 0)},
-            "total_tokens": int(usage.get("total_tokens") or prompt + completion),
+            "input_tokens": usage.input_tokens,
+            "input_tokens_details": {
+                "cached_tokens": usage.cached_input_tokens,
+                "cache_write_tokens": 0,
+            },
+            "output_tokens": usage.output_tokens,
+            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
+            "total_tokens": total or usage.input_tokens + usage.output_tokens,
         },
         "user": body.get("user"),
     }
