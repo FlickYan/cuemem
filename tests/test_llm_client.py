@@ -183,6 +183,38 @@ def test_truncated_structured_output_raises_at_once_when_asked(settings: Setting
     assert out.value == Pet(name="Max", breed="pug") and len(whole) == 1
 
 
+def test_a_truncated_fallback_reply_raises_at_once_too(settings: Settings) -> None:
+    """主模型被内容审核拦下、换到备用模型，备用模型的回复也在输出上限处被截断：
+    raise_on_truncation 同样管着备用模型的调用，一次请求就抛出 OutputTruncatedError（抽取据此
+    把窗口对半分开），不把截断的 JSON 发回去改三次。"""
+    from fakes import REJECT
+
+    rejecting = FakeAPI()
+    rejecting.chat_replies = [REJECT]
+    requests: list[str] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        model = json.loads(request.content)["model"]
+        requests.append(model)
+        if model == "qwen3.8-flash":
+            return rejecting._handle(request)
+        body = chat_completion_body(CUT_PET, deepseek=True, finish_reason="length")
+        return httpx2.Response(200, json=body)
+
+    client = LLMClient(
+        settings,
+        cache=ResponseCache(None),
+        ledger=Ledger(None),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+        clock=lambda: PEAK_TIME,
+    )
+    with pytest.raises(OutputTruncatedError):
+        client.structured(
+            "extractor", HELLO, Pet, fallback_model="deepseek-flash", raise_on_truncation=True
+        )
+    assert requests[-1] == "deepseek-flash" and requests.count("deepseek-flash") == 1
+
+
 def test_truncated_structured_output_is_retried_by_default(settings: Settings) -> None:
     """不传 raise_on_truncation 时照旧：三次请求、每次带上上一次的回复与校验错误，最后是普通的
     StructuredOutputError（评测与冻结的方法走这条路，请求不能变）。"""

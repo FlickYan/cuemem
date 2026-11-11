@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 
-from fakes import FakeAPI
+import httpx2
+from fakes import FakeAPI, chat_completion_body
 
 from cuemem.config import Settings
 from cuemem.core.models import SessionIn, TurnIn
@@ -137,6 +139,39 @@ def test_deleted_gaps_are_marked_only_where_messages_were_deleted(
     assert not any("[deleted]" in p for p in prompts[:first])
     marked = [p for p in prompts[first:] if "[deleted]" in p]
     assert len(marked) == 1 and "[deleted]\n[t5]" in marked[0]
+
+
+def test_split_windows_keep_the_numbering_of_deleted_gaps(settings: Settings) -> None:
+    """回复被截断、窗口对半分开时（第九轮体检 P13），遗忘留下的空缺照相邻的窗口那样标：后一半
+    第一句应有的编号接着前一半，[deleted] 只出现在真的缺了发言的地方。被截断的调用也算进
+    attempts。"""
+    turns = session(*[("user", f"Note {i}.") for i in range(8)])
+    kept = [t for t in turns if t.idx != 2]  # 第 2 句被遗忘了
+    prompts: list[str] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        prompt = json.loads(request.content)["messages"][1]["content"]
+        prompts.append(prompt)
+        if prompt.count("] User: ") > 2:  # 多于两句：回复在输出上限处被截断
+            cut = '{"summary": "s", "fac'
+            body = chat_completion_body(cut, deepseek=False, finish_reason="length")
+        else:
+            whole = '{"summary": "s", "facts": [], "entities": []}'
+            body = chat_completion_body(whole, deepseek=False)
+        return httpx2.Response(200, json=body)
+
+    client = LLMClient(settings, http_client=httpx2.Client(transport=httpx2.MockTransport(handle)))
+    result = Extractor(client, split_truncated=True).extract("s1", kept, WHEN)
+    shown = ["".join(re.findall(r"^\[t(\d+)\]", p, re.M)) for p in prompts]
+    assert shown == ["0134567", "013", "0", "13", "4567", "45", "67"]
+    assert result.attempts == 7  # 被截断的三次也算
+    gap = "\n[deleted]\n"  # 正文里的空缺（说明里也有 [deleted] 这个词）
+    assert [gap in p for p in prompts] == [True, True, False, True, False, False, False]
+    # 后一半与接在前一半后面的窗口渲染得一样：第一句应有的编号是前一半最后一句的下一个
+    assert prompts[3] == render_session(kept[1:3], WHEN, assistant_chars=600, deleted_from=1)
+    assert "[t1] User: Note 1.\n[deleted]\n[t3]" in prompts[3]
+    assert prompts[3].count(gap) == 1
+    assert prompts[4] == render_session(kept[3:], WHEN, assistant_chars=600, deleted_from=4)
 
 
 def test_turns_said_on_another_day_get_a_date_line() -> None:
