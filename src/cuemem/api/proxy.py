@@ -108,6 +108,7 @@ from cuemem.api.auth import (
     space_cap_message,
     spaces_over_cap,
 )
+from cuemem.api.docs import add_docs
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import MAX_BODY_BYTES, MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import ModelSpec, UnknownModel
@@ -1821,7 +1822,11 @@ def create_proxy_app(
         version=__version__,
         description="OpenAI-compatible chat completions with long-term memory.",
         lifespan=lifespan,
+        docs_url=None,  # /docs 是 api/docs.py 的页面（固定版本、带完整性校验），没有 /redoc
+        redoc_url=None,
+        swagger_ui_oauth2_redirect_url=None,
     )
+    add_docs(app)
 
     @app.get("/health")  # async：不排在默认线程池后面（open_runs 只拿一下锁）
     async def health() -> dict[str, Any]:

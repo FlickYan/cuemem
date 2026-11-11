@@ -67,6 +67,7 @@ from cuemem.api.auth import (
     spaces_over_cap,
     ui_login,
 )
+from cuemem.api.docs import add_docs
 from cuemem.api.failures import provider_failure
 from cuemem.api.limits import (
     MAX_BODY_BYTES,
@@ -530,7 +531,12 @@ def create_app(
         version=__version__,
         description="Long-term multimodal memory for LLM agents: chat, browse, forget, recall.",
         lifespan=lifespan,
+        # FastAPI 自带的 /docs、/redoc 加载不固定版本的第三方脚本：/docs 换成 api/docs.py 的页面
+        docs_url=None,
+        redoc_url=None,
+        swagger_ui_oauth2_redirect_url=None,
     )
+    add_docs(app)
     keys = keys if keys is not None else Keys.from_token(token)
     guarded = guard(keys)  # 认出令牌（principal_of）；没有配令牌时不鉴权
     checked = authenticated_route(keys)  # 令牌不对时在读请求体之前就 401
