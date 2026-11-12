@@ -6,8 +6,8 @@ CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 
 | 方式 | 适合 | 谁决定要不要想起 | 见 |
 |---|---|---|---|
-| OpenAI 兼容的记忆代理 | 任何用 OpenAI SDK 的应用，代码不动：Chat Completions、embeddings 与非流式的纯文字 Responses 调用 | 控制器（每轮） | `cuemem proxy`，README |
-| MCP Server | Claude Code、Claude Desktop 等 MCP 客户端 | 模型调用 `recall`（控制器只决定深浅） | `cuemem mcp`（stdio），或 `cuemem serve` 的 `/mcp`（HTTP，令牌同上） |
+| OpenAI 兼容的记忆代理 | 任何用 OpenAI SDK 的应用，代码不动：Chat Completions、embeddings 与 Responses API 的一个子集（文字与图片输入、文字输出，流式与非流式；没有工具） | 控制器（每轮） | `cuemem proxy`，README |
+| MCP Server | Claude Code、Claude Desktop 等 MCP 客户端 | 模型调用 `recall`（控制器只决定深浅） | `cuemem mcp`（stdio），或 `cuemem serve` 的 `/mcp`（HTTP，令牌同上；D-076 起只认 POST，工具带标题与只读、破坏性的提示） |
 | 框架集成（本页） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool | 控制器（每次调用模型之前），模型还可以用工具补查 | `cuemem.integrations.*` |
 | Python SDK | 自己写的 Agent 循环 | 调用方 | `from cuemem import Memory` |
 | HTTP 记忆接口 | 别的语言写的应用，或几个进程共用一个服务 | 调用方 | `cuemem serve` 的 `/api/v1/memories`；`from cuemem import MemoryClient` |
@@ -70,8 +70,8 @@ close_sessions(memory)  # 退出前、memory.close() 之前
 - 遗忘：`pop_item`、`clear_session` 撤回的消息在长期记忆里一并遗忘；forget 工具删掉的发言，下次读历史时也从内层会话里去掉。
 - 供应商那边的副本：Agents SDK 不设 `ModelSettings.store`，Responses API 保存每个响应（它的 instructions 与输入，两种位置的证据都在里面）至少 30 天，除非传 `ModelSettings(store=False)` 或组织开了零数据保留；这份副本在 `forget` 与 `delete_all` 之外。历史由客户端保存时（`CueMemSession`、`result.to_input_list()`）用 `RunConfig(model_settings=ModelSettings(store=False), call_model_input_filter=..., trace_include_sensitive_data=False)`，如上。服务端保存对话状态（`previous_response_id`、`conversation_id`）要靠存下的响应，这份副本避免不了，遗忘也管不到。（按 openai-agents 0.24 与 openai 3.40 核对；保留的期限以 OpenAI 的文档为准。）
 - 输入护栏拦下的、模型没有回应过的用户消息不写进长期记忆。
-- 写不进去的留着重试：一批写不进去时（向量接口或 Qdrant 故障），`CueMemSession` 留着它，下一批或 `end()` 时先按原来的时间写它。重试没有用的（大部分 4xx、内容审核拒绝、输入不合法，例如像素超过 Pillow 上限的图片，这一批单独丢掉），或这个空间之后遗忘过发言的，丢掉（trace 事件 `agents_mirror_dropped`），不把遗忘之前的消息写回去。留着的只在进程内存里：每个会话最多 100 批或 32 MiB（按文字与图片 data URL 的字符数算）；故障持续很久时丢掉更早的，记警告与 `agents_mirror_dropped` trace 事件（`reason=backlog`）。
-- 改走记忆代理：Agents SDK 缺省的模型类调用 Responses API，通常带工具或流式，记忆代理对这些回 501。用这里的集成，或者把 `OpenAIChatCompletionsModel` 指向记忆代理。
+- 写不进去的留着重试：一批写不进去时（向量接口或 Qdrant 故障），`CueMemSession` 留着它，下一批或 `end()` 时先按原来的时间写它。重试没有用的（大部分 4xx、内容审核拒绝、输入不合法，例如像素超过 Pillow 上限的图片，这一批单独丢掉；D-076 起还有本地向量库没有余量建新集合的 `VectorStoreFullError`），或这个空间之后遗忘过发言的，丢掉（trace 事件 `agents_mirror_dropped`），不把遗忘之前的消息写回去。留着的只在进程内存里：每个会话最多 100 批或 32 MiB（按文字与图片 data URL 的字符数算）；故障持续很久时丢掉更早的，记警告与 `agents_mirror_dropped` trace 事件（`reason=backlog`）。
+- 改走记忆代理：Agents SDK 缺省的模型类调用 Responses API，通常带工具，记忆代理对带工具的 Responses 调用回 501（D-076 起只有文字的 Responses 调用能用，流式与非流式都行）。用这里的集成，或者把 `OpenAIChatCompletionsModel` 指向记忆代理：这时经记忆代理的工具循环里，每次调用模型都带着这一轮的记忆（0.9.0 之前只有一轮的第一次调用带，后续请求不带），与这里的集成和 LangGraph 相同。
 
 ## LangGraph / LangChain
 
@@ -149,7 +149,7 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删（mem
 ## 局限
 
 - 一个数据库一个进程：一个数据库同一时间只能由一个进程打开。第二个打开同一个数据库的进程（stdio 的 `cuemem mcp`、`cuemem proxy`、`cuemem reindex`、SDK 的 `Memory()`）得到 `StorageLockedError`，写明拿着锁的进程的 pid 与命令，向量在 Qdrant 服务端时也一样。通过 `MemoryClient` 或 HTTP（`/api/v1`、`/mcp`）连到运行中的进程；或者设 `CUEMEM_ALLOW_SHARED_DB=1` 不加锁，风险自负（互相接手进行中的 run、`reindex` 删掉另一个进程刚写的向量、发言序号相撞）。锁是数据库旁边的文件 `<数据库>.lock`（例如 `data/cuemem.sqlite.lock`），用的是 `flock`，NFS 上可能不起作用。两个数据目录指向同一个 Qdrant 服务端与同一个空间时仍共用集合，锁管不到。
-- 模型回答期间的遗忘：注入的记忆在模型还在回答时被遗忘了，记忆代理照样返回回答，但不存下（用户的话照样存下）。三个集成同样是"召回 → 模型 → 写回"，没有这项检查，这样的回答在那里仍可能写回（没有复现过）。
+- 模型回答期间的遗忘：注入的记忆在模型还在回答时被遗忘了，记忆代理照样返回回答，但不存下（用户的话照样存下）；D-076 起工具调用后续请求的回答也是这样。三个集成同样是"召回 → 模型 → 写回"，没有这项检查，这样的回答在那里仍可能写回（没有复现过）。
 - 三个集成都只注入文字证据；控制器想看原图（`see`）时，原图不会附进模型调用（与记忆代理相同）。
 - 都是同步的 CueMem 在线程里跑：异步框架里用 `AsyncMemory` 或各集成的 async 版本。
 - 供应商出错与过期：各集成自己的记忆工具不像 MCP 那样把供应商的出错（限流、余额不足、超时）换成说明，出来的是供应商客户端的异常。`expiration_date` 已过的记忆不出现在各集成的召回、自动召回与画像里，也不出现在 Claude memory tool 生成的 `profile.md`、`facts.md` 与 `history/` 里（D-072；以前只有 SDK 的 `search`、`get_all` 与画像排除它们）。过期按现在的时间算；后来又说过一次、没给过期时间的记忆照样留着。

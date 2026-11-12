@@ -39,12 +39,12 @@
 
 ## 3. 能力对照
 
-"未见"指在核对的源码与文档里没有找到，不代表一定没有。CueMem 一列按第八轮体检（D-075）之后的代码更新。
+"未见"指在核对的源码与文档里没有找到，不代表一定没有。CueMem 一列按第九轮体检（D-076）之后的代码更新。
 
 | 能力 | CueMem（N12 与几轮体检） | Mem0 | Letta | Graphiti / Zep | Cognee | Supermemory |
 |---|---|---|---|---|---|---|
 | Python SDK | `Memory` / `AsyncMemory`，方法名与调用方式照 Mem0（含 `update(text=)`、`reset`、`metadata`、filters 的运算与 `show_expired`），另有 `status()`；远程的 `MemoryClient` 连自己部署的 `cuemem serve`；带类型（`py.typed`） | `Memory` / `AsyncMemory`；`MemoryClient` 连托管平台 | 弃用（主力是 TS） | 全异步的 `Graphiti` | `remember` / `recall` 等 | `supermemory` 客户端 |
-| 零代码接入 | OpenAI 兼容的 HTTP 代理（`/v1/chat/completions`，流式；`/v1/embeddings`；`/v1/responses` 的非流式纯文字子集） | 客户端包装（`Mem0().chat.completions.create`） | — | — | — | Memory Router（改 base URL；文档已重定向，现状未核实） |
+| 零代码接入 | OpenAI 兼容的 HTTP 代理（`/v1/chat/completions`，流式；`/v1/embeddings`；`/v1/responses` 的一个子集：文字与图片输入、文字输出、流式，没有工具） | 客户端包装（`Mem0().chat.completions.create`） | — | — | — | Memory Router（改 base URL；文档已重定向，现状未核实） |
 | 每轮都检索吗 | 否：控制器先判断，L0 不检索（SDK 的 `search` 缺省不低于 L1） | 包装里每轮检索 | LLM 决定 | 应用决定 | 规则路由 | 每轮 |
 | 知识更新 | 失效而不删除，版本链 `history()`；`update()` 在日志里记一句更正，取代原来那条 | v3 只增不改；`update()` 就地改写；`history()` | LLM 改写 | 失效而不删除 | 矛盾检测（默认关） | `isLatest` 版本链 |
 | 两条时间轴 | 事件时间与记录时间分开回放：`valid_at`（那时现实中成立的）、`known_at`（系统那时相信的）；过期时间 `expiration_date`（召回、回答、记忆代理、MCP、画像、对话 Agent、各集成、浏览的接口与 `cuemem ask` 都排除，要了才给；`cuemem inspect` 标出来，`get`、`history` 与导出仍给出；可选：过期 N 天之后真的删掉） | 记录时间；过期时间 `expiration_date` | 未见 | 有：边上记 `valid_at` / `invalid_at` 与 `created_at` / `expired_at` | 未见 | 未见 |
@@ -155,7 +155,7 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 | `update()` 与 `reset()` | Mem0 | Mem0 的 `update()` 就地改写；CueMem 在日志里记一句 "Correction: …"，对账按 `edit_of` 取代原来那条（不问 LLM），经得起重建与遗忘；`reset()` 删除数据目录里的每个空间 | `sdk.py`、`write/reconcile.py` | D-069 |
 | HTTP 记忆接口与远程客户端 | Mem0 的 REST 接口与 `MemoryClient` | `cuemem serve` 的 `/api/v1` 与 SDK 一一对应，出错是 `{"error": {code, type, message}}`；`MemoryClient` 的签名与 `Memory` 逐一相同、抛出同样的异常，代码在本地与共用的服务之间只换一行 | `api/memories.py`、`client.py` | D-069 |
 | 按用户鉴权 | Mem0 的空间划分（user_id、agent_id） | 限定作用域的令牌：每个令牌列出能访问的用户与 Agent；点名作用域之外的空间回 403，按 ID 找的记忆在作用域之外时与不存在的一样（404）；`/api`、`/api/v1`、界面与记忆代理都检查（第三轮之后还有 `/mcp`） | `api/auth.py` | D-069 |
-| 记忆代理的覆盖面 | OpenAI 的 Embeddings 与 Responses API | `/v1/embeddings`；`/v1/responses` 的非流式纯文字子集，其余回 501；每个响应写明实际转发的模型（`X-CueMem-Model`），不认识的模型可以拒绝（`unknown_model: reject`） | `api/proxy.py` | D-069 |
+| 记忆代理的覆盖面 | OpenAI 的 Embeddings 与 Responses API | `/v1/embeddings`；`/v1/responses` 的一个子集（文字与图片输入、`reasoning.effort`、`text.verbosity`、JSON 的输出格式，D-076 起有文字的流式），其余回 501（工具、存下的响应）；每个响应写明实际转发的模型（`X-CueMem-Model`），不认识的模型可以拒绝（`unknown_model: reject`） | `api/proxy.py` | D-069、D-076 |
 
 第三轮体检补上了用过这些项目的人最先会碰到的缺口（D-070）：
 
@@ -188,6 +188,8 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 |---|---|---|---|---|
 | 导入 Mem0 的导出 | Cognee 从 Mem0 / Zep / Letta 的导入 | `cuemem import FILE --from mem0`、`load(data, format="mem0")` 与带 `"format": "mem0"` 的 `POST /api/v1/import` 读 Mem0 `get_all` 的结果：一条记忆一个会话，ID 由 Mem0 的 ID 与更新时间算出，每个空间一个事务，所以重复导入什么都不加，改过的记忆取代旧的事实。事实由 CueMem 重新抽取（每条记忆一次调用）；Mem0 的历史版本不导入 | `portable.py`、`cli.py`、`sdk.py`、`api/memories.py` | D-075 |
 
+第九轮体检（D-076）没有加新的接口，把已有的补宽了：经记忆代理的工具调用后续请求带着这一轮的记忆，转发的补全记进用量账本（`cuemem usage` 的 `proxy` 角色）；`/v1/responses` 收图片、`reasoning.effort`、`text.verbosity` 与 JSON 的输出格式，文字可以流式；`/mcp` 报出版本号、工具的标题与只读、破坏性的提示；`MemoryClient` 可以自己重试（`max_retries`，`add` 带生成的幂等键）；导出是开始那一刻的空间；导入时按最多 256 句发言一批向量化；抽取的回复在供应商的输出上限处被截断时对半分开再抽，不再一直失败。
+
 ## 6. 刻意没有照搬的
 
 - **让 LLM 自己决定检索、自己改记忆作为默认**（Letta、LangMem 的工具式记忆）：这正是 CueMem 研究的对照组（B3 ReAct）。N9 的结论是它在文本上强、在图片上弱（MemLens 46.7%），成本也更高（LoCoMo 每千题 $3.15，L1 是 $1.44）。保留为 `mode="agent"` 与 Agent 的 `memory_search` 逃生通道，不作默认。
@@ -205,4 +207,4 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；第五轮体检起（D-072）过期也在 `answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、对话 Agent 与各集成里生效，第七轮（D-074）起浏览的接口与 `cuemem ask` 也不给（`cuemem inspect` 标出来）；在这些召回的地方过期的记忆不再占召回的名额（SDK 的 `search` 仍在检索之后过滤），`CUEMEM_EXPIRED_RETENTION_DAYS` 可以把它们真的删掉。第八轮（D-075）起实体列表不再给出只有过期的事实提到的实体；Supermemory 那样自动认出临时事实、让它过期的还没有。
 6. **面向开发者的英文文字**：命令行的提示、核心模块抛出的大部分异常（包括 `/api` 的报错）与 SDK 的大部分文档字符串是中文，这一点有意不改；另写了一份英文的接口参考（[docs/en/api.md](en/api.md)，中文版 [docs/api.md](api.md)，D-069）。SDK 自己的报错、`/api/v1`、记忆代理、MCP 工具与界面是英文（N12 之后的体检，D-068）。
-7. **正式发布**：CueMem 还没有发布到 PyPI，从 GitHub 安装（`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"`）；PyPI 上名叫 cuemem 的包不是这个项目（D-071）。第八轮体检起每合入一轮升一次版本号（0.8.0），合并之后在 GitHub 上打 `vX.Y.Z` 标签，安装时可以固定在审过的版本上；这一轮的决策记录就是发布说明（D-075）。
+7. **正式发布**：CueMem 还没有发布到 PyPI，从 GitHub 安装（`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"`）；PyPI 上名叫 cuemem 的包不是这个项目（D-071）。第八轮体检起每合入一轮升一次版本号（那一轮是 0.8.0，第九轮之后是 0.9.0，D-076），合并之后在 GitHub 上打 `vX.Y.Z` 标签，安装时可以固定在审过的版本上；这一轮的决策记录就是发布说明（D-075）。
