@@ -19,6 +19,7 @@ from dotenv import dotenv_values
 from fakes import TOY_CONVERSATION
 from typer.testing import CliRunner
 
+from cuemem import __version__
 from cuemem.cli import app
 from cuemem.config import load_settings
 
@@ -564,6 +565,67 @@ def test_missing_key_gives_friendly_error(isolated_paths: None) -> None:
     result = runner.invoke(app, ["ingest", str(TOY_CONVERSATION)])
     assert result.exit_code == 1
     assert "DASHSCOPE_API_KEY" in result.output
+
+
+def test_failed_extraction_says_why_and_exits_1(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """有会话抽取失败时写出原因、退出码 1（第十轮体检 Q9）。以前没配 Key 的第一次运行只列出
+    会话 ID、说"下次运行会重试"，stderr 是空的，退出码 0。"""
+    from cuemem import cli
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setattr(cli.console, "width", 300)
+    for command in (
+        ["ingest", str(TOY_CONVERSATION), "--consolidate"],
+        ["consolidate", "--space", "demo"],
+    ):
+        result = runner.invoke(app, command)
+        flat = _flat(result.output)
+        assert result.exit_code == 1, result.output
+        assert "5个会话抽取失败（MissingAPIKeyError" in flat, result.output
+        assert "cuememconsolidate--spacedemo" in flat and "cuememdoctor" in flat
+        assert "下次运行会重试" not in flat
+
+
+def test_import_consolidate_reports_failed_extraction(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """cuemem import --consolidate 同样：抽取失败时写出原因、退出码 1（以前什么都不说）。"""
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    assert runner.invoke(app, ["ingest", str(TOY_CONVERSATION)]).exit_code == 0
+    exported = tmp_path / "demo.json"
+    result = runner.invoke(app, ["export", "--space", "demo", "--out", str(exported)])
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(app, ["import", str(exported), "--space", "copy", "--consolidate"])
+    assert result.exit_code == 1, result.output
+    assert "个会话抽取失败（MissingAPIKeyError" in _flat(result.output)
+    assert runner.invoke(app, ["import", str(exported), "--space", "plain"]).exit_code == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (b"hello", "不是有效的对话文件"),
+        (b'{"messages": [{"role": "user", "content": "SECRET-TEXT"}]}', "space_id"),
+        (b'{"space_id": 7, "sessions": "SECRET-TEXT"}', "sessions"),
+        (b"\xff\xfe", "不是 UTF-8 文本"),
+    ],
+)
+def test_bad_ingest_file_is_a_few_lines(
+    isolated_paths: None, tmp_path: Path, content: bytes, expected: str
+) -> None:
+    """cuemem ingest 的文件不是对话格式：几行说明、退出码 1（第十轮体检 Q9；以前是三十多行带
+    源码的调用栈）。不回显文件里的值。"""
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(content)
+    result = runner.invoke(app, ["ingest", str(bad)])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.output
+    assert "Traceback" not in result.output and "SECRET-TEXT" not in result.output
+    assert expected in result.output and "错误：" in result.output
+    assert len(result.output.strip().splitlines()) <= 6, result.output
 
 
 def test_configure_writes_keys(env_path: Path) -> None:
@@ -1221,15 +1283,45 @@ def test_bad_log_level_is_refused(served: list[Any], monkeypatch: pytest.MonkeyP
 
 
 def test_access_log_flags(served: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    """--access-log/--no-access-log：serve 默认不记（与以前相同），proxy 默认记。serve 加了
-    --access-log 时 uvicorn 用 INFO 级别（访问日志是 INFO）。"""
+    """--access-log/--no-access-log：serve 默认不记（与以前相同），proxy 默认记。要访问日志时
+    uvicorn 用 INFO 级别（访问日志是 INFO）。
+
+    第十轮体检 Q9：两个命令都给 log_config=None，uvicorn 不装自己的处理器，启动信息与访问日志
+    走 root 的那一个（stderr，带时间、级别与名字；以前是 uvicorn 自己的格式，访问日志在 stdout）。
+    proxy 因此也要给级别：root 默认 WARNING，不给时默认开着的访问日志就没了。"""
     options: list[dict[str, Any]] = []
     monkeypatch.setattr("uvicorn.run", lambda app_, **kwargs: options.append(kwargs))
     serve = ["serve", "--no-ui", "--scenario", "plain"]
     for command in (serve, [*serve, "--access-log"], ["proxy"], ["proxy", "--no-access-log"]):
         assert runner.invoke(app, command).exit_code == 0
     picked = [(o["access_log"], o.get("log_level")) for o in options]
-    assert picked == [(False, "warning"), (True, "info"), (True, None), (False, None)]
+    assert picked == [(False, "warning"), (True, "info"), (True, "info"), (False, "warning")]
+    assert [o.get("log_config", "default") for o in options] == [None] * 4
+
+
+def test_uvicorn_logs_go_through_the_root_logger() -> None:
+    """log_config=None 加上 log_level="info"：uvicorn 的访问日志没有自己的处理器、传到 root，
+    root 是 WARNING 时 INFO 也出得来（cuemem serve --access-log 与 cuemem proxy 给的参数）。"""
+    import logging
+
+    import uvicorn
+
+    loggers = [logging.getLogger(name) for name in ("uvicorn", "uvicorn.error", "uvicorn.access")]
+    before = [(log.level, log.propagate, list(log.handlers)) for log in loggers]
+    try:
+        for log in loggers:  # 别的测试起过 uvicorn 时留下的设置
+            log.handlers.clear()
+            log.propagate = True
+            log.setLevel(logging.NOTSET)
+        uvicorn.Config(lambda *_: None, log_config=None, access_log=True, log_level="info")
+        access = logging.getLogger("uvicorn.access")
+        assert access.isEnabledFor(logging.INFO) and access.propagate and not access.handlers
+        assert logging.getLogger("uvicorn.error").isEnabledFor(logging.INFO)
+    finally:
+        for log, (level, propagate, handlers) in zip(loggers, before, strict=True):
+            log.setLevel(level)
+            log.propagate = propagate
+            log.handlers[:] = handlers
 
 
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
@@ -1787,6 +1879,23 @@ def test_serve_offers_mcp_over_http(served: list[Any]) -> None:
     with_mcp, without = (TestClient(a, base_url="http://127.0.0.1:7860") for a in served)
     assert with_mcp.post("/mcp", json={}).status_code == 400
     assert without.post("/mcp", json={}).status_code == 404
+    # 没有界面时根路径是一页入口（第十轮体检 Q9，以前 404）；别的网站发来的请求照旧 403
+    index = with_mcp.get("/")
+    assert index.status_code == 200 and index.json() == {
+        "name": "cuemem",
+        "version": __version__,
+        "ui": False,
+        "ui_hint": "The browser UI is off: the server was started with --no-ui.",
+        "docs": "/docs",
+        "health": "/api/health",
+        "ready": "/api/ready",
+        "memory_api": "/api/v1",
+        "openai_proxy": "/v1",
+        "mcp": "/mcp",
+    }
+    assert "mcp" not in without.get("/").json()
+    assert with_mcp.get("/", headers={"Origin": "https://evil.example"}).status_code == 403
+    assert "/" not in with_mcp.get("/openapi.json").json()["paths"]
 
 
 def test_serve_falls_back_to_the_plain_assistant_outside_a_checkout(
@@ -1825,7 +1934,10 @@ def test_serve_without_the_ui_extra_serves_the_api(
     client = TestClient(app_, headers={"Host": "127.0.0.1:7860"})
     assert client.get("/api/health").status_code == 200
     assert client.get("/v1/models").status_code == 200
-    assert client.get("/").status_code == 404  # 根路径上没有界面
+    index = client.get("/")  # 根路径上没有界面：说明怎么装（第十轮体检 Q9，以前 404）
+    assert index.status_code == 200 and index.json()["ui"] is False
+    assert "uv sync --extra ui" in index.json()["ui_hint"]
+    assert index.json()["version"] == __version__ and "build" not in index.json()
 
 
 def test_eval_commands_say_which_extra_to_install(

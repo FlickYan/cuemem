@@ -73,6 +73,8 @@ from cuemem.errors import (
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
 # 不加载 matplotlib、评测与用不到的模块（以前每个命令启动都要 3 秒多）
 if TYPE_CHECKING:
+    from pydantic import ValidationError
+
     from cuemem.agent import Reply
     from cuemem.api.auth import AnyKeys, KeyRing, Keys
     from cuemem.api.service import ChatService
@@ -93,6 +95,7 @@ LOW_DISK = 200 * 2**20  # doctor 在数据目录剩余空间低于它时标黄
 CACHE_WARN = 2**30  # doctor：缓存与 trace 合计超过它、又没设 trace 保留天数时标黄
 TRACE_WARN = 100 * 2**20  # doctor：只是 trace 就超过它、又没设 trace 保留天数时也标黄
 JOB_LINES = 20  # doctor 最多列出这么多条巩固任务的提醒，其余只说还有几条
+BAD_FILE_LINES = 3  # ingest 的文件格式不对时最多列出这么多处
 
 
 def _show_version(value: bool) -> None:
@@ -383,10 +386,24 @@ def ingest(
         bool, typer.Option("--consolidate", help="导入后立即巩固（抽取事实、实体与摘要）")
     ] = False,
 ) -> None:
-    """导入一段多会话对话（可重复执行，不会产生重复数据）。"""
+    """导入一段多会话对话（可重复执行，不会产生重复数据）。
+
+    文件不是 UTF-8、不是这种格式时几行说明、退出码 1（以前是整屏调用栈）；加了 --consolidate 而
+    有会话抽取失败时写出原因、退出码 1（以前不写原因、退出码 0，第十轮体检 Q9）。"""
+    from pydantic import ValidationError
+
     from cuemem.core.models import Conversation
 
-    conversation = Conversation.model_validate_json(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        Console(stderr=True).print(f"[red]错误：{escape(str(path))} 不是 UTF-8 文本[/red]")
+        raise typer.Exit(1) from exc
+    try:
+        conversation = Conversation.model_validate_json(text)
+    except ValidationError as exc:
+        _print_bad_conversation(path, exc)
+        raise typer.Exit(1) from exc
     if space:
         conversation = conversation.model_copy(update={"space_id": space})
     with _open_system() as system:
@@ -396,11 +413,14 @@ def ingest(
             f"新增 {report.turns_added} 条轮次、{report.units_added} 个记忆单元，"
             f"耗时 {report.elapsed_ms:.0f} ms"
         )
+        failed = False
         if consolidate:
-            _print_consolidation(system.consolidate(report.space_id))
+            failed = _print_consolidation(system.consolidate(report.space_id), system.db)
         else:
             console.print("[dim]提示：运行 cuemem consolidate 抽取事实与实体（需要 LLM）。[/dim]")
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+        if failed:
+            raise typer.Exit(1)
 
 
 @app.command("export")
@@ -510,6 +530,7 @@ def import_cmd(
         raise typer.Exit(1) from exc
     with _open_system() as system:
         reports = []
+        failed = False
         for doc in docs:
             try:
                 report = import_space(system, doc, space_id=space, consolidate=consolidate)
@@ -521,6 +542,11 @@ def import_cmd(
                 f"记忆空间 [bold]{escape(report['space_id'])}[/bold]：{report['sessions']} 个会话，"
                 f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
             )
+            done = report.get("consolidation")
+            if done is not None:  # --consolidate：抽取失败的会话同样写出原因，最后退出码 1
+                failed |= _print_extraction_problems(
+                    system.db, report["space_id"], done["failed"], done["skipped"]
+                )
         if source == "mem0":
             if len(reports) > 1:
                 console.print(
@@ -535,6 +561,8 @@ def import_cmd(
             console.print(
                 "[dim]提示：运行 cuemem consolidate 重新抽取事实与实体（需要 LLM）。[/dim]"
             )
+        if failed:
+            raise typer.Exit(1)
 
 
 @app.command("consolidate")
@@ -544,10 +572,14 @@ def consolidate_cmd(
         bool, typer.Option("--rebuild", help="清空派生记忆后从原始日志全部重放（命中缓存）")
     ] = False,
 ) -> None:
-    """巩固：把原始对话整理成带有效期的事实、实体、会话摘要与核心记忆（幂等，可重复执行）。"""
+    """巩固：把原始对话整理成带有效期的事实、实体、会话摘要与核心记忆（幂等，可重复执行）。
+
+    有会话抽取失败时写出原因，退出码 1（第十轮体检 Q9）。"""
     with _open_system() as system:
-        _print_consolidation(system.consolidate(space, rebuild=rebuild))
+        failed = _print_consolidation(system.consolidate(space, rebuild=rebuild), system.db)
         _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+        if failed:
+            raise typer.Exit(1)
 
 
 @app.command()
@@ -1141,7 +1173,11 @@ def _configure_logging() -> None:
     有处理器时那次调用什么也不做。以前装了 MCP（serve 默认）时日志是 Rich 的框，非终端里按 80 列
     折行（grep 找不到整句），一次出错几百行；--no-mcp 时 root 没有处理器，警告走 Python 的
     lastResort，没有时间、级别与 logger 名字。不用 force=True：不拆掉别人（pytest 的 caplog、
-    嵌入 CueMem 的应用）已经装上的处理器；SDK 与库的导入路径不碰日志设置。"""
+    嵌入 CueMem 的应用）已经装上的处理器；SDK 与库的导入路径不碰日志设置。
+
+    uvicorn 的启动信息与访问日志也走这里（第十轮体检 Q9）：两处 uvicorn.run 都给
+    log_config=None，它就不装自己的处理器，记录传到 root。以前访问日志是 uvicorn 自己的格式、
+    写在 stdout，没有时间。"""
     raw = os.environ.get(LOG_LEVEL_ENV, "").strip()
     level = logging.WARNING
     if raw:
@@ -1296,6 +1332,7 @@ def serve(
                     port=port,
                     # 访问日志是 INFO：要它时 uvicorn 的启动信息也一起出来
                     log_level="info" if access_log else "warning",
+                    log_config=None,  # 不装 uvicorn 自己的处理器，见 _configure_logging
                     access_log=access_log,
                     timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
                 )
@@ -1395,6 +1432,9 @@ def proxy(
                 app_,
                 host=host,
                 port=port,
+                # root 默认是 WARNING：不给级别时访问日志（INFO）出不来
+                log_level="info" if access_log else "warning",
+                log_config=None,  # 不装 uvicorn 自己的处理器，见 _configure_logging
                 access_log=access_log,
                 timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
             )
@@ -3018,21 +3058,66 @@ def _print_forget_plan(plan: dict[str, Any]) -> None:
     console.print("[dim]重建后还会再查一遍有没有从别处长出来的同样信息，预演里没有这一步。[/dim]")
 
 
-def _print_consolidation(report: ConsolidationReport) -> None:
-    if report.sessions == 0 and not report.failed:
+def _print_bad_conversation(path: Path, exc: ValidationError) -> None:
+    """cuemem ingest 的文件不是对话格式：几行说明写到 stderr（第十轮体检 Q9；以前是三十多行
+    调用栈）。只写字段的位置与校验信息，不回显文件里的值。"""
+    err = Console(stderr=True)
+    err.print(f"[red]错误：{escape(str(path))} 不是有效的对话文件（{exc.error_count()} 处）[/red]")
+    errors = exc.errors(include_url=False, include_input=False, include_context=False)
+    for error in errors[:BAD_FILE_LINES]:
+        where = ".".join(map(str, error["loc"])) or "(根)"
+        err.print(escape(f"  {where}: {error['msg']}"))
+    err.print(
+        "格式见 examples/toy_conversation.en.json；Mem0 的导出用 cuemem import --from mem0，"
+        "CueMem 的导出用 cuemem import"
+    )
+
+
+def _print_extraction_problems(
+    db: MemoryDB, space_id: str, failed: list[str], skipped: list[str]
+) -> bool:
+    """巩固里抽取失败与被内容审核跳过的会话；有失败的返回 True（调用方以退出码 1 结束）。
+
+    失败的原因取任务表里记下的那条（cuemem doctor 也列它）：只要第一行、最多 200 个字符，后面的
+    行可能引用模型输出里的用户原文。以前只列会话 ID、说"下次运行会重试"，没配 Key 时重跑多少遍
+    都一样失败，退出码还是 0（第十轮体检 Q9）。"""
+    if skipped:
+        console.print(
+            f"[yellow]{len(skipped)} 个会话被内容审核拒绝，已跳过：[/yellow]"
+            f"{escape(', '.join(skipped[:5]))}"
+        )
+    if not failed:
+        return False
+    wanted = set(failed)
+    errors = (
+        str(job["error"] or "")
+        for job in db.get_jobs(space_id, status="failed")
+        if job["session_id"] in wanted
+    )
+    first = (next(errors, "").splitlines() or [""])[0][:200]
+    reason = f"（{escape(first)}）" if first else ""
+    console.print(
+        f"[yellow]{len(failed)} 个会话抽取失败[/yellow]{reason}：{escape(', '.join(failed[:5]))}"
+    )
+    console.print(
+        f"查明原因后重新运行 {escape(cli_command(f'consolidate --space {space_id}'))}；"
+        f"{escape(cli_command('doctor'))} 列出每个空间的失败原因"
+    )
+    return True
+
+
+def _print_consolidation(report: ConsolidationReport, db: MemoryDB) -> bool:
+    """写出巩固的结果；有会话抽取失败时返回 True。"""
+    if report.sessions == 0 and not report.failed and not report.skipped:
         console.print("没有待巩固的会话（任务都已完成）。")
-        return
+        return False
     console.print(
         f"巩固 {report.sessions} 个会话：抽取事实 {report.facts_extracted} 条 → "
         f"新增 {report.added} · 取代 {report.superseded} · 合并 {report.merged} · "
         f"重放 {report.noop}；新建实体 {report.entities_created} 个；"
         f"LLM 调用 {report.llm_calls} 次；耗时 {report.elapsed_ms / 1000:.1f} 秒"
     )
-    if report.failed:
-        console.print(
-            f"[yellow]{len(report.failed)} 个会话抽取失败，下次运行会重试：[/yellow]"
-            f"{', '.join(report.failed[:5])}"
-        )
+    return _print_extraction_problems(db, report.space_id, report.failed, report.skipped)
 
 
 def _span_text(start: str | None, end: str | None) -> str:

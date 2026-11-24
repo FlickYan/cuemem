@@ -784,10 +784,41 @@ def create_app(
         app.include_router(proxy_router(proxy, dependencies=guarded))
     if mcp:  # 在界面之前：界面挂在根路径上
         _serve_mcp(app, service, keys)
-    if ui and importlib.util.find_spec("gradio") is None:
+    no_gradio = importlib.util.find_spec("gradio") is None
+    if ui and no_gradio:
         # 界面是可选依赖 cuemem[ui]：没装时照常提供接口与记忆代理
         logger.warning("演示界面要用可选依赖 ui（Gradio），没有安装：%s", extra_remedy("ui"))
         ui = False
+    if not ui:
+        # cuemem serve 发现没装 Gradio 时自己就传 ui=False：按装没装来说明，不按参数
+        ui_hint = (
+            f"The browser UI is an optional extra: {extra_remedy('ui')}"
+            if no_gradio
+            else "The browser UI is off: the server was started with --no-ui."
+        )
+
+        # 没有界面时根路径以前是 404：照 README 用 pip 装（没有 ui 这个可选依赖）、打开首页的人
+        # 只看到 {"detail":"Not Found"}（第十轮体检 Q9）。不鉴权，同 /api/health：只有版本号与
+        # 挂了哪些入口，没有构建号
+        @app.get("/", include_in_schema=False)
+        async def index(request: Request) -> dict[str, Any]:
+            root = str(request.scope.get("root_path", "")).rstrip("/")  # 同 /docs
+            body = {
+                "name": "cuemem",
+                "version": __version__,
+                "ui": False,
+                "ui_hint": ui_hint,
+                "docs": root + "/docs",
+                "health": root + "/api/health",
+                "ready": root + "/api/ready",
+                "memory_api": root + "/api/v1",
+            }
+            if proxy is not None:
+                body["openai_proxy"] = root + "/v1"
+            if mcp:
+                body["mcp"] = root + "/mcp"
+            return body
+
     if ui:
         import gradio as gr
 

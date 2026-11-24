@@ -39,7 +39,7 @@ from scripted import ScriptedModel
 from test_sdk import where_i_live
 from test_store import small_open_file_limit
 
-from cuemem import Memory
+from cuemem import Memory, __version__
 from cuemem.api import proxy as proxy_module
 from cuemem.api.proxy import (
     _SESSION_ID,
@@ -2229,6 +2229,20 @@ def test_the_proxy_expires_old_traces_when_it_starts(
 def test_access_token(proxy: MemoryProxy, upstream: Upstream) -> None:
     with TestClient(create_proxy_app(proxy, token="secret")) as client:
         assert client.get("/health").status_code == 200  # 探活不鉴权
+        # 根路径是一页入口，同样不鉴权（第十轮体检 Q9：以前 404，启动时写出的 …/v1 也是 404）
+        index = client.get("/")
+        assert index.status_code == 200 and index.json() == {
+            "name": "cuemem memory proxy",
+            "version": __version__,
+            "base_url": "/v1",
+            "models": "/v1/models",
+            "docs": "/docs",
+            "health": "/health",
+            "ready": "/ready",
+        }
+        assert client.get("/", headers={"Origin": "https://evil.example"}).status_code == 403
+        assert client.get("/v1/models").status_code == 401
+        assert "/" not in client.get("/openapi.json").json()["paths"]
         assert chat(client, "hi", user="alice").status_code == 401
         ok = chat(client, "hi", user="alice", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200

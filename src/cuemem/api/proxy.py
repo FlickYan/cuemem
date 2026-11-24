@@ -2187,6 +2187,21 @@ def create_proxy_app(
     )
     add_docs(app)
 
+    # 根路径以前是 404，而启动时写出的地址（…/v1）也是 404：打开它的人看不出服务在不在（第十轮
+    # 体检 Q9）。不鉴权，同 /health
+    @app.get("/", include_in_schema=False)
+    async def index(request: Request) -> dict[str, Any]:
+        root = str(request.scope.get("root_path", "")).rstrip("/")
+        return {
+            "name": "cuemem memory proxy",
+            "version": __version__,
+            "base_url": root + "/v1",
+            "models": root + "/v1/models",
+            "docs": root + "/docs",
+            "health": root + "/health",
+            "ready": root + "/ready",
+        }
+
     @app.get("/health")  # async：不排在默认线程池后面（open_runs 只拿一下锁）
     async def health() -> dict[str, Any]:
         waiting, dropped = proxy.write_backs()

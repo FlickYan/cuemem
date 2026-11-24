@@ -1735,6 +1735,8 @@ def test_ui_contacts_no_third_party_by_default(
         assert config["analytics_enabled"] is False
         assert [s for s in config["stylesheets"] if s.startswith(("http://", "https://"))] == []
         assert "fonts.googleapis.com" not in page and "fonts.gstatic.com" not in page
+        # 有界面时根路径还是 Gradio 的页面，不是没有界面时的那页 JSON（第十轮体检 Q9）
+        assert page.lstrip().lower().startswith("<!doctype html") and '"ui_hint"' not in page
 
         monkeypatch.setenv("GRADIO_ANALYTICS_ENABLED", "True")  # 运营者自己打开
         assert build_ui(service).analytics_enabled is True
