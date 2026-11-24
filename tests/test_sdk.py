@@ -2902,14 +2902,17 @@ def test_a_raised_search_writes_one_trace_line(memory: Memory) -> None:
     assert memory.search(hello, user_id="u")["reasons"] == [RAISED_REASON]
     assert context_evidence(system, "u", hello).reasons == [RAISED_REASON]
     assert recall_listing(system, "u", hello, at_least_l1=True)["level"] == "L1"
+    # context 的 max_chars、exclude_run_id（Q14）走的是同一段：也只写一行
+    fitted = context_evidence(system, "u", hello, max_chars=1000, exclude_run_id="no-such-run")
+    assert fitted.reasons == [RAISED_REASON]
     raised = new(seen)
     assert [line["attrs"] for line in raised] == [
         {"space": "u", "question": hello, "mode": "auto"}
-    ] * 3
+    ] * 4
     for line in raised:
         assert [e["level"] for e in line["events"] if e["kind"] == "raised"] == ["l1"]
 
-    seen += 3  # 没有改走的检索：照旧一行，mode 是调用方给的
+    seen += 4  # 没有改走的检索：照旧一行，mode 是调用方给的
     assert memory.search(hello, user_id="u", min_level="l0")["level"] == "L0"
     assert memory.search("What do I like?", user_id="u", mode="l1")["level"] == "L1"
     plain = new(seen)

@@ -195,6 +195,27 @@ def test_capture_never_prints(served: tuple[Memory, _Wire]) -> None:
     assert wire.sent[-1] == ("POST", "/runs/end")
 
 
+def test_a_very_long_session_id_still_fits_the_run_id_limit(served: tuple[Memory, _Wire]) -> None:
+    """run_id 最多 sdk.MAX_ID_CHARS 个字符（第十轮体检 Q7）：钩子自己拼的 "cc-" + session_id 超过
+    时换成散列，不然这个会话的每一句都被服务端拒绝、钩子又不出声。不超过的原样。"""
+    from cuemem.sdk import MAX_ID_CHARS
+
+    memory, _ = served
+    assert hooks.MAX_RUN_CHARS == MAX_ID_CHARS
+    fits = "s" * (MAX_ID_CHARS - len(hooks.RUN_PREFIX))
+    assert hooks._run_id(fits) == hooks.RUN_PREFIX + fits
+    long_id = "s" * (MAX_ID_CHARS + 44)
+    run_id = hooks._run_id(long_id)
+    assert run_id.startswith(hooks.RUN_PREFIX) and len(run_id) <= MAX_ID_CHARS
+    assert run_id != hooks._run_id(long_id + "x")
+    stop = {**STOP, "session_id": long_id}
+    assert hook("capture", event=stop).stdout == ""
+    assert turns(memory, run_id) == [("assistant", STOP["last_assistant_message"])]
+    assert ("dev", run_id) in memory._runs
+    assert hook("capture", "--end", event={**SESSION_END, "session_id": long_id}).stdout == ""
+    assert ("dev", run_id) not in memory._runs
+
+
 def test_capture_options(served: tuple[Memory, _Wire]) -> None:
     """--no-assistant 不写回答（回答里可能有仓库里的代码与密钥）；--max-turn-chars 截断；空的
     回答、PreCompact 等别的事件什么都不做（压缩之后对话还在继续，run 不能结束）。"""

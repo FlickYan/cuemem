@@ -22,10 +22,10 @@ last_assistant_message），经 MemoryClient 调用正在运行的 cuemem serve�
   的上限，超出的只给模型一个文件路径与开头 2,000 个字符）；
 - --debug 时出错在标准错误写一行（退出码 0 时 Claude Code 不把它给模型），令牌与地址里的
   密码不写出来；
-- 一个 Claude Code 会话是一个 run（"cc-" + session_id）：写入之前 open_run（已经开着时什么
-  都不做），不然每次 add 都把整段对话重新抽取一遍；SessionEnd 时 end_run，没等到的由服务端
-  闲置 30 分钟之后交给抽取。想起时排除这个 run 的对话片段（context 的 exclude_run_id）：它们
-  本来就在模型的上下文里；
+- 一个 Claude Code 会话是一个 run（"cc-" + session_id，太长时见 _run_id）：写入之前 open_run
+  （已经开着时什么都不做），不然每次 add 都把整段对话重新抽取一遍；SessionEnd 时 end_run，
+  没等到的由服务端闲置 30 分钟之后交给抽取。想起时排除这个 run 的对话片段（context 的
+  exclude_run_id）：它们本来就在模型的上下文里；
 - 整个钩子最多用 --timeout 秒（默认 8 秒，比例子里钩子自己的 timeout: 10 短）：超时的钩子
   Claude Code 会取消并丢掉输出。
 
@@ -59,6 +59,8 @@ MIN_RECALL_CHARS = 1000  # context 的 max_chars 的下限（sdk.MaxChars）
 TURN_CHARS = 8000  # 写进记忆的一句话最多这么多字符（--max-turn-chars 的默认值）
 QUERY_CHARS = 2000  # 拿去检索的只是用户这句话的开头这么多字符（贴进来的长文不整段向量化）
 RUN_PREFIX = "cc-"
+# 与 sdk.MAX_ID_CHARS 相同（tests/test_hooks.py 核对）：add、open_run 不收更长的 run_id
+MAX_RUN_CHARS = 256
 # 与 evidence.MEMORY_NOTE、evidence.quote_memory 相同（tests/test_hooks.py 核对）。在这里再写一份：
 # cuemem.evidence 要导入整个记忆系统，钩子每句话运行一次，只导入 cuemem.client
 MEMORY_NOTE = (
@@ -112,7 +114,7 @@ class _Session:
             raise _Skip("事件里没有 session_id")
         self.event = event
         self.session_id = session_id
-        self.run_id = RUN_PREFIX + session_id
+        self.run_id = _run_id(session_id)
         self.scope: dict[str, Any] = {"user_id": options.user, "agent_id": options.agent or None}
         self._deadline = time.monotonic() + max(options.timeout, 0.1)
         self._http = http_client(max(options.timeout, 0.1))
@@ -156,6 +158,13 @@ class _Session:
 
     def close(self) -> None:
         self._http.close()
+
+
+def _run_id(session_id: str) -> str:
+    """这个 Claude Code 会话的 run："cc-" + session_id。长得服务端不收的（超过 MAX_RUN_CHARS
+    个字符；平常是一个 UUID）换成它的 SHA-256，不然这个会话的每一句都写不进去、钩子又不出声。"""
+    run_id = RUN_PREFIX + session_id
+    return run_id if len(run_id) <= MAX_RUN_CHARS else RUN_PREFIX + _digest(session_id)
 
 
 def _digest(text: str) -> str:
