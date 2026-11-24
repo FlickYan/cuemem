@@ -385,6 +385,9 @@ class MemoryProxy:
         # 丢的地方拿着 run.lock，不能再去拿 self._lock（顺序是先 self._lock、后 run.lock）
         self._dropped = 0
         self._dropped_lock = threading.Lock()
+        # 每挡回一个请求（429）通知一次，参数是原因（open_sessions、spaces、budget）。默认 None；
+        # 开了 /metrics 的应用把它设成 Metrics.throttled（api/metrics.py）
+        self.on_throttle: Callable[[str], None] | None = None
         system.start_worker()  # 会话结束后的抽取在后台完成
 
     # ---------- 请求 ----------
@@ -724,6 +727,10 @@ class MemoryProxy:
         if trace is not None:
             trace.add_event(kind, **data)
 
+    def _throttled(self, reason: str) -> None:
+        if self.on_throttle is not None:
+            self.on_throttle(reason)
+
     def _make_room(self, space: str) -> Run | None:
         """_run 开新会话之前（调用方持有 self._lock）：这个空间内存里进行中的会话没到 max_open_runs
         个时 None；到了时把其中最久没有请求、没有留着重试的写回、没在写回、也没有请求还没答完
@@ -757,6 +764,7 @@ class MemoryProxy:
             and self._runs[k].busy == 0
         ]
         if not idle:
+            self._throttled("open_sessions")
             raise ProxyError(
                 429,
                 f"This user already has {len(mine)} open memory sessions (the limit is "
@@ -860,6 +868,7 @@ class MemoryProxy:
         anchor, follow_up = _last_user(messages)
         held = spaces_over_cap(principal, space, self.system.db.space_ids)
         if held is not None and principal is not None:  # 令牌的 max_spaces（api/auth.py）
+            self._throttled("spaces")
             raise ProxyError(
                 429,
                 space_cap_message(principal, held),
@@ -1139,6 +1148,7 @@ class MemoryProxy:
         if used < budget:
             return budget
         midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+        self._throttled("budget")
         raise ProxyError(
             429,
             f"This API key has used its daily token budget ({used} of {budget} tokens today). "
@@ -2137,6 +2147,7 @@ def create_proxy_app(
     origin_hosts: Sequence[str] = (),
     allow_ip_hosts: bool = False,
     max_body_bytes: int = MAX_BODY_BYTES,
+    metrics: bool = False,
 ) -> FastAPI:
     """单独运行的记忆代理（cuemem proxy）。token 非空时要求 Authorization: Bearer <token>：
     OpenAI SDK 的 api_key 填这个令牌即可（上游的 Key 由 CueMem 的配置提供）。keys：另有限定作用域
@@ -2145,7 +2156,10 @@ def create_proxy_app(
     不接受别的网站发来的浏览器请求；allowed_hosts、origin_hosts、allow_ip_hosts 同
     api.app.create_app。
     max_body_bytes：请求体的上限（字节，超过时 413，见 api/limits.py），cuemem proxy 从环境变量
-    CUEMEM_MAX_BODY_BYTES 读。"""
+    CUEMEM_MAX_BODY_BYTES 读。
+    metrics：提供 GET /metrics（Prometheus 文本格式，只给管理令牌；默认不提供，见
+    api/metrics.py）。cuemem proxy --metrics 或 CUEMEM_METRICS=1。"""
+    from cuemem.api import metrics as metrics_
     from cuemem.api.app import (
         SWEEP_INTERVAL_S,
         _adopt_after,
@@ -2156,6 +2170,9 @@ def create_proxy_app(
     )
 
     stop = threading.Event()
+    registry = metrics_.for_system(proxy.system) if metrics else None
+    if registry is not None:
+        proxy.on_throttle = registry.throttled
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -2164,6 +2181,8 @@ def create_proxy_app(
         # 过期的 trace、过期的记忆
         adopt = _adopt_after(proxy.system, proxy.idle_s)
         jobs = _sweep_jobs(proxy.system, proxy.close_idle, adopt)
+        if registry is not None:  # 排在最后：数据库的锁被占着时不耽误前面的
+            jobs.append(metrics_.refresh_stats(proxy.system, registry))
         threading.Thread(
             target=_sweep,
             args=(stop, SWEEP_INTERVAL_S, *jobs),
@@ -2221,6 +2240,18 @@ def create_proxy_app(
 
     keys = keys if keys is not None else Keys.from_token(token)
     app.include_router(proxy_router(proxy, dependencies=guard(keys)))
+    if registry is not None:
+
+        def live() -> dict[str, float]:  # /metrics 里当场从内存读的几项
+            waiting, dropped = proxy.write_backs()
+            return {
+                "cuemem_open_runs": proxy.open_runs(),
+                "cuemem_write_backs_waiting": waiting,
+                "cuemem_write_backs_dropped_total": dropped,
+                **metrics_.worker_alive(proxy.system),
+            }
+
+        metrics_.add_route(app, registry, keys, live)
     _guard(
         app,
         allowed_hosts,
@@ -2228,5 +2259,8 @@ def create_proxy_app(
         max_body_bytes=max_body_bytes,
         keys=keys,
         allow_ip_hosts=allow_ip_hosts,
+        on_throttle=registry.throttled if registry is not None else None,
     )
+    if registry is not None:  # 最后装：在最外层
+        metrics_.install(app, registry)
     return app

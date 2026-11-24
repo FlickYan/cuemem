@@ -85,7 +85,9 @@ class BodyLimit:
     之前就 401（auth.authenticated_route）。
     max_concurrent：一个限定作用域的令牌在 RATE_PATHS 同时在处理的请求数的上限（令牌自己写了
     max_concurrent 时用它的），见模块说明。
-    clock：次数上限用的时钟（秒，测试里换掉）。"""
+    clock：次数上限用的时钟（秒，测试里换掉）。
+    on_throttle：每挡回一个请求调用一次，参数是原因（rate、concurrency、body_too_large、
+    body_bytes）；开了 /metrics 时是 Metrics.throttled（api/metrics.py），否则 None。"""
 
     def __init__(
         self,
@@ -96,8 +98,10 @@ class BodyLimit:
         keys: AnyKeys | None = None,
         max_concurrent: int = MAX_CONCURRENT,
         clock: Callable[[], float] = time.monotonic,
+        on_throttle: Callable[[str], None] | None = None,
     ) -> None:
         self.app = app
+        self.on_throttle = on_throttle
         self.max_body_bytes = max_body_bytes
         self.max_import_bytes = max_import_bytes
         self.keys = keys
@@ -125,6 +129,10 @@ class BodyLimit:
             return None
         principal = bearer_principal(self.keys, Headers(scope=scope).get("authorization"))
         return None if principal is None or principal.admin else principal
+
+    def _refused(self, reason: str) -> None:
+        if self.on_throttle is not None:
+            self.on_throttle(reason)
 
     def _wait(self, principal: Principal) -> float:
         """令牌桶（容量 rate_per_minute，每秒补 rate_per_minute / 60 个）：这个请求能不能过。能过
@@ -157,6 +165,7 @@ class BodyLimit:
         ):
             wait = self._wait(principal)
             if wait:
+                self._refused("rate")
                 message = _too_often(path, principal.rate_per_minute, wait)
                 retry = {"Retry-After": str(max(1, math.ceil(wait - 1e-6)))}
                 response = (
@@ -171,6 +180,7 @@ class BodyLimit:
             assert principal is not None
             most = principal.max_concurrent or self.max_concurrent
             if self.requests_in_flight.get(principal.name, 0) >= most:
+                self._refused("concurrency")
                 message = _too_busy(path, most)
                 response = (
                     _error(429, message, None, RETRY)
@@ -201,6 +211,7 @@ class BodyLimit:
         length = Headers(scope=scope).get("content-length", "")
         declared = int(length) if length.isascii() and length.isdigit() else 0
         if declared > cap:
+            self._refused("body_too_large")
             message = _too_large(path, cap, env, tenant)
             response = (
                 _error(413, message, None) if _v1(path) else JSONResponse({"detail": message}, 413)
@@ -208,6 +219,7 @@ class BodyLimit:
             await response(scope, receive, send)
             return
         if tenant is not None and self.in_flight.get(tenant, 0) + declared > self.max_body_bytes:
+            self._refused("body_bytes")
             message = _too_many(path, self.max_body_bytes)
             response = (
                 _error(429, message, None, RETRY)
@@ -223,6 +235,7 @@ class BodyLimit:
             nonlocal held
             if tenant is not None and size > held:
                 if self.in_flight.get(tenant, 0) + size - held > self.max_body_bytes:
+                    self._refused("body_bytes")
                     raise HTTPException(429, _too_many(path, self.max_body_bytes), RETRY)
                 self.in_flight[tenant] = self.in_flight.get(tenant, 0) + size - held
                 held = size
@@ -233,6 +246,7 @@ class BodyLimit:
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > cap:
+                    self._refused("body_too_large")
                     raise HTTPException(413, _too_large(path, cap, env, tenant))
                 hold(received)  # 分块传输，或者比声明的长
             return message

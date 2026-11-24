@@ -1552,6 +1552,15 @@ class MemoryDB:
             ).fetchall()
         return {r[0]: int(r[1]) for r in rows}
 
+    def job_totals(self) -> dict[str, int]:
+        """全部空间的巩固任务按状态的个数（/metrics 的 cuemem_consolidation_jobs，清理线程每分钟
+        读一次）。只数个数：job_summary 还要扫一遍出错的文字；job_counts 是一个空间的。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM jobs GROUP BY status"
+            ).fetchall()
+        return {str(status): int(count) for status, count in rows}
+
     def job_summary(self, version: str) -> list[dict[str, Any]]:
         """全部空间的任务概况（cuemem doctor，第八轮体检）：每个有任务的空间一项，按空间 ID 排序，
         有 space_id、counts（状态 → 个数）、other_version（按别的流水线版本登记的任务数）、

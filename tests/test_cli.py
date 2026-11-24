@@ -1324,6 +1324,35 @@ def test_uvicorn_logs_go_through_the_root_logger() -> None:
             log.handlers[:] = handlers
 
 
+@pytest.mark.parametrize(
+    ("command", "port"), [(["serve", "--no-ui", "--scenario", "plain"], 7860), (["proxy"], 8787)]
+)
+def test_metrics_flag_and_environment(
+    served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str], port: int
+) -> None:
+    """GET /metrics 默认没有（第十轮体检 Q18）：--metrics 或 CUEMEM_METRICS=1 才提供，启动时写出
+    地址；CUEMEM_METRICS 写错时说明并退出（退出码 1），不启动。"""
+    from fastapi.testclient import TestClient
+
+    def scrape() -> int:
+        client = TestClient(served.pop(), base_url=f"http://127.0.0.1:{port}")
+        return client.get("/metrics").status_code
+
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0 and "/metrics" not in result.output and scrape() == 404
+    result = runner.invoke(app, [*command, "--metrics"])
+    assert result.exit_code == 0, result.output
+    assert f"http://127.0.0.1:{port}/metrics" in _flat(result.output) and scrape() == 200
+    monkeypatch.setenv("CUEMEM_METRICS", "true")
+    assert runner.invoke(app, command).exit_code == 0 and scrape() == 200
+    monkeypatch.setenv("CUEMEM_METRICS", "0")
+    assert runner.invoke(app, command).exit_code == 0 and scrape() == 404
+    monkeypatch.setenv("CUEMEM_METRICS", "maybe")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1 and served == [], result.output
+    assert "CUEMEM_METRICS" in _flat(result.output) and "maybe" in result.output
+
+
 @pytest.mark.parametrize("command", [["serve", "--no-ui", "--scenario", "plain"], ["proxy"]])
 def test_non_loopback_bind_needs_a_token(
     served: list[Any], monkeypatch: pytest.MonkeyPatch, command: list[str]

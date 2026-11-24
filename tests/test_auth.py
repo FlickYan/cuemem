@@ -1309,9 +1309,12 @@ def test_a_daily_token_budget_refuses_once_it_is_used(
 
     # 重启：这个进程自己记的没有了，账本里的还在
     again = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    reasons: list[str] = []
+    again.on_throttle = reasons.append  # 开了 /metrics 时是 Metrics.throttled（第十轮体检 Q18）
     with pytest.raises(ProxyError) as caught:
         again.complete({"messages": [{"role": "user", "content": "hi"}]}, {}, _metered())
     assert caught.value.status == 429 and caught.value.body["error"]["code"] == "budget_exceeded"
+    assert reasons == ["budget"]
 
     monkeypatch.setattr(proxy_module, "_now", lambda: noon + timedelta(days=1))
     assert _chat(http, BUDGET_TOKEN, user="alice", headers=one).status_code == 200  # 第二天

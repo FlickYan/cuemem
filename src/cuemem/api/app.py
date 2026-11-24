@@ -77,6 +77,10 @@ from cuemem.api.limits import (
     concurrency_limit,
 )
 from cuemem.api.memories import _error, install_error_format, memories_router
+from cuemem.api.metrics import add_route as add_metrics_route
+from cuemem.api.metrics import for_system as metrics_for
+from cuemem.api.metrics import install as install_metrics
+from cuemem.api.metrics import refresh_stats, worker_alive
 from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError, SessionLimitError, VectorStoreFullError
@@ -239,19 +243,21 @@ def _guard(
     max_import_bytes: int = MAX_IMPORT_BYTES,
     keys: AnyKeys | None = None,
     allow_ip_hosts: bool = False,
+    on_throttle: Callable[[str], None] | None = None,
 ) -> None:
     """浏览器侧的防护与请求体的上限（create_app 与 create_proxy_app 共用）；Host 检查在最外层，
     先于 Origin，再是请求体的上限（api/limits.py；keys：限定作用域的令牌导入也用 max_body_bytes，
     同时在处理的请求体加起来有上限）。这三项都不读请求体。allow_ip_hosts：allowed_hosts 之外
     另外接受任何 IP 地址作为 Host（TrustedHosts 的 ip_literals）。一个限定作用域的令牌同时在
     处理的请求数的上限这时从环境变量 CUEMEM_MAX_CONCURRENT_PER_KEY 读（limits.concurrency_limit，
-    写错时 CueMemError）。"""
+    写错时 CueMemError）。on_throttle：开了 /metrics 时，BodyLimit 每挡回一个请求通知一次。"""
     app.add_middleware(
         BodyLimit,
         max_body_bytes=max_body_bytes,
         max_import_bytes=max_import_bytes,
         keys=keys,
         max_concurrent=concurrency_limit(),
+        on_throttle=on_throttle,
     )
     app.add_middleware(SameOriginOnly, hosts=origin_hosts)
     if allowed_hosts is not None:
@@ -468,6 +474,7 @@ def create_app(
     max_body_bytes: int = MAX_BODY_BYTES,
     max_import_bytes: int = MAX_IMPORT_BYTES,
     mcp: bool = True,
+    metrics: bool = False,
 ) -> FastAPI:
     """token 非空时启用访问令牌：接口要带 Bearer 令牌，界面要先登录。keys：管理令牌之外还有限定
     作用域的令牌（Keys.from_env，见 api/auth.py；给了时不看 token）：每个令牌只能访问自己作用域
@@ -500,8 +507,14 @@ def create_app(
     的会话交给抽取（一次，见 _adopt_after）。设了 traces_retention_days、expired_retention_days 时
     这个线程还删过期的 trace、过期的记忆（启动时与之后每天一次，见 _sweep_jobs），idle_minutes 为
     None 时也起。
+
+    metrics：提供 GET /metrics（Prometheus 文本格式，只给管理令牌；第十轮体检 Q18，见
+    api/metrics.py）。默认不提供：没有这个路由与它的中间件，什么都不多做。打开时清理线程总是
+    起（每分钟刷新任务数、空间数与向量库的状态）。cuemem serve --metrics 或 CUEMEM_METRICS=1。
     """
     _clear_uploads(upload_dir)
+    registry = metrics_for(service.system) if metrics else None
+    throttled = registry.throttled if registry is not None else None
     v1 = Memory.from_system(service.system)  # /api/v1 的 run 由清理线程结束闲置的
     v1.max_open_runs = service.max_open_sessions  # 一个空间开着的 run 与对话会话同一个上限
 
@@ -521,6 +534,8 @@ def create_app(
             # 之前的进程留下、过了一个闲置期还没人接着写的会话交给抽取（从启动时算起）
             idle.append(_adopt_after(service.system, idle_s))
         jobs = _sweep_jobs(service.system, *idle)  # 只设了保留天数时也要起线程
+        if registry is not None:  # 排在最后：数据库的锁被占着时不耽误前面的
+            jobs.append(refresh_stats(service.system, registry))
         if not jobs:
             yield
             return
@@ -582,6 +597,21 @@ def create_app(
     async def ready() -> JSONResponse:
         return await _readiness(service.system, ready_limiter)
 
+    if registry is not None:
+
+        def live() -> dict[str, float]:  # /metrics 里当场从内存读的几项
+            values = {"cuemem_open_sessions": len(service.sessions), **worker_alive(service.system)}
+            if proxy is not None:
+                waiting, dropped = proxy.write_backs()
+                values["cuemem_open_runs"] = proxy.open_runs()
+                values["cuemem_write_backs_waiting"] = waiting
+                values["cuemem_write_backs_dropped_total"] = dropped
+            return values
+
+        add_metrics_route(app, registry, keys, live)
+        if proxy is not None:
+            proxy.on_throttle = throttled
+
     @api.get("/api/spaces")
     def spaces(http: Request) -> list[dict[str, Any]]:
         who = principal_of(http)
@@ -592,6 +622,8 @@ def create_app(
         who = principal_of(http)
         held = spaces_over_cap(who, space, service.system.db.space_ids)
         if held is not None:
+            if throttled is not None:
+                throttled("spaces")
             raise HTTPException(
                 429,
                 f"这个访问令牌最多有 {who.max_spaces} 个记忆空间，已经有 {held} 个：已有的空间照常"
@@ -605,6 +637,8 @@ def create_app(
         try:
             session = service.start(request.space, at=request.at)
         except SessionLimitError as exc:  # 结束一个会话或等闲置的会话被清理（每分钟一次）
+            if throttled is not None:
+                throttled("open_sessions")
             raise HTTPException(429, str(exc), headers={"Retry-After": "60"}) from exc
         return SessionOut(
             session_id=session.session_id, space=session.space_id, started_at=session.started_at
@@ -777,7 +811,7 @@ def create_app(
     app.include_router(api)
     # Mem0 形状的记忆接口（/api/v1）：与界面、记忆代理共用同一个记忆系统，鉴权与作用域相同
     app.include_router(memories_router(v1, dependencies=guarded, route_class=checked))
-    install_error_format(app)
+    install_error_format(app, throttled)
     if proxy is not None:
         from cuemem.api.proxy import proxy_router
 
@@ -856,7 +890,10 @@ def create_app(
         max_import_bytes=max_import_bytes,
         keys=keys,
         allow_ip_hosts=allow_ip_hosts,
+        on_throttle=throttled,
     )
+    if registry is not None:  # 最后装：在最外层，被上面三项挡回去的请求也算
+        install_metrics(app, registry, ui=ui)
     return app
 
 

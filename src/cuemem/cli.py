@@ -1158,6 +1158,11 @@ def _gradio_temp_dir(ui: bool) -> Iterator[None]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+METRICS_HELP = (
+    "提供 GET /metrics（Prometheus 文本格式的运行指标，只给管理令牌）；也可以设环境变量 "
+    "CUEMEM_METRICS=1"
+)
+METRICS_NOTE = "指标：{url}（Prometheus 文本格式；配了访问令牌时只给管理令牌）"
 LOG_LEVEL_ENV = "CUEMEM_LOG_LEVEL"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -1243,6 +1248,7 @@ def serve(
     access_log: Annotated[
         bool, typer.Option("--access-log/--no-access-log", help="每个请求记一行访问日志")
     ] = False,
+    metrics: Annotated[bool, typer.Option("--metrics", help=METRICS_HELP)] = False,
 ) -> None:
     """启动 HTTP 接口（/api，文档在 /docs）、记忆代理（/v1）、MCP（/mcp）与演示界面（Gradio，
     根路径）。
@@ -1257,6 +1263,7 @@ def serve(
     from cuemem.api.app import create_app
     from cuemem.api.auth import KeyRing, Keys
     from cuemem.api.limits import MAX_BODY_BYTES, MAX_IMPORT_BYTES, body_limits, concurrency_limit
+    from cuemem.api.metrics import metrics_enabled
     from cuemem.api.proxy import MemoryProxy
     from cuemem.api.service import open_session_limit
 
@@ -1275,7 +1282,8 @@ def serve(
     limits = MAX_BODY_BYTES, MAX_IMPORT_BYTES
 
     def check() -> None:  # 加载配置时已读入 .env；建服务之前检查，被拒绝时不接着做上次的抽取
-        nonlocal keys, limits
+        nonlocal keys, limits, metrics
+        metrics = metrics_enabled(metrics)  # CUEMEM_METRICS；写错时退出码 1
         keys = _access_keys(not _weak_refused(host, insecure_no_auth, insecure_weak_token))
         limits = body_limits()  # CUEMEM_MAX_BODY_BYTES、CUEMEM_MAX_IMPORT_BYTES；写错时退出码 1
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
@@ -1301,6 +1309,7 @@ def serve(
                 max_body_bytes=limits[0],
                 max_import_bytes=limits[1],
                 mcp=not no_mcp,
+                metrics=metrics,
             )
             where = f"界面：[bold]http://{host}:{port}/[/bold] · " if ui else ""
             console.print(
@@ -1313,6 +1322,8 @@ def serve(
                     "（请求头 X-CueMem-User 选用户，不是 ASCII 的写成 utf-8''<百分号编码>；"
                     "令牌同 /api；--no-mcp 关掉）"
                 )
+            if metrics:
+                console.print(METRICS_NOTE.format(url=f"http://{host}:{port}/metrics"))
             if keys.enabled:
                 console.print(
                     f"已启用访问令牌：{_keys_note(keys)}。接口要带 Bearer 令牌，界面要先登录"
@@ -1363,12 +1374,14 @@ def proxy(
     access_log: Annotated[
         bool, typer.Option("--access-log/--no-access-log", help="每个请求记一行访问日志")
     ] = True,
+    metrics: Annotated[bool, typer.Option("--metrics", help=METRICS_HELP)] = False,
 ) -> None:
     """OpenAI 兼容的记忆代理（N12）：把应用的 base_url 换成 http://HOST:PORT/v1 就有了长期记忆。"""
     _configure_logging()
     import uvicorn
 
     from cuemem.api.limits import body_limits, concurrency_limit, open_session_limit
+    from cuemem.api.metrics import metrics_enabled
     from cuemem.api.proxy import MemoryProxy, create_proxy_app
     from cuemem.memory import MemorySystem
 
@@ -1383,6 +1396,7 @@ def proxy(
         max_body_bytes, _ = body_limits()  # CUEMEM_MAX_BODY_BYTES（代理没有导入接口）
         concurrency_limit()  # CUEMEM_MAX_CONCURRENT_PER_KEY（建应用时再读一次）
         open_session_limit()  # CUEMEM_MAX_OPEN_SESSIONS（建代理时再读一次）
+        metrics = metrics_enabled(metrics)  # CUEMEM_METRICS
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
@@ -1417,6 +1431,8 @@ def proxy(
         elif not _is_loopback(host) or _exposed_names():  # 加了 --insecure-no-auth
             _no_auth_warning(host, "用你的上游 Key、读写记忆")
             _no_auth_hosts_note(hosts)
+        if metrics:
+            console.print(METRICS_NOTE.format(url=f"http://{host}:{port}/metrics"))
         for line in _loose_modes():
             console.print(line)
         app_ = create_proxy_app(
@@ -1426,6 +1442,7 @@ def proxy(
             origin_hosts=hosts.origins,
             allow_ip_hosts=hosts.ip_literals,
             max_body_bytes=max_body_bytes,
+            metrics=metrics,
         )
         with _sigterm_runs_cleanup():
             uvicorn.run(

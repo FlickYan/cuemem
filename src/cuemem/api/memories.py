@@ -128,7 +128,9 @@ class V1Error(HTTPException):
     """/api/v1 的出错：状态码、错误码与 SDK 的异常类型（MemoryClient 据此抛出同样的异常）。
     code 不给时按状态码取（_CODES）；headers：例如限流时上游的 Retry-After。upstream_status：
     向量接口的出错（EmbeddingAPIError）原来的状态码，写进出错的 upstream_status，MemoryClient
-    据此还原异常的 status（回给调用方的状态码可能不同：上游的 500 是 502）。"""
+    据此还原异常的 status（回给调用方的状态码可能不同：上游的 500 是 502）。throttle：被 CueMem
+    自己的哪个上限挡回去的（open_sessions、spaces），只给 /metrics 计数用（install_error_format
+    的 on_throttle），不写进响应。"""
 
     def __init__(
         self,
@@ -139,11 +141,13 @@ class V1Error(HTTPException):
         code: str | None = None,
         headers: Mapping[str, str] | None = None,
         upstream_status: int | None = None,
+        throttle: str | None = None,
     ) -> None:
         super().__init__(status, message, headers=dict(headers) if headers else None)
         self.error_type = error_type
         self.code = code
         self.upstream_status = upstream_status
+        self.throttle = throttle
 
 
 class AddRequest(BaseModel):
@@ -664,7 +668,11 @@ def _sdk_errors(*, by_id: bool = False) -> Iterator[None]:
         raise V1Error(409, str(exc), error_type=type(exc).__name__) from exc
     except SessionLimitError as exc:  # open_run 或 add 重新打开 run 到了上限
         raise V1Error(
-            429, str(exc), error_type="SessionLimitError", headers={"Retry-After": "60"}
+            429,
+            str(exc),
+            error_type="SessionLimitError",
+            headers={"Retry-After": "60"},
+            throttle="open_sessions",
         ) from exc
     except VectorStoreFullError as exc:  # 本地向量库没有余量建新的空间（已有的照常可用）
         raise V1Error(
@@ -794,7 +802,7 @@ def memories_router(
         who = principal_of(http)
         held = spaces_over_cap(who, space, lambda: memory.system.db.space_ids())
         if held is not None:
-            raise V1Error(429, space_cap_message(who, held))
+            raise V1Error(429, space_cap_message(who, held), throttle="spaces")
 
     def visible(http: Request, memory_id: str) -> bool:
         """按 ID 找的记忆：不存在的，或者在作用域里的。作用域之外的与不存在的一样处理。事实、
@@ -1169,13 +1177,17 @@ def memories_router(
     return router
 
 
-def install_error_format(app: FastAPI) -> None:
+def install_error_format(app: FastAPI, on_throttle: Callable[[str], None] | None = None) -> None:
     """/api/v1 下的出错（包括 401、422、找不到接口、没有处理的异常的 500）都写成
     {"error": {"code", "type", "message"}}；别的路径照 FastAPI 的默认（{"detail": …}，500 是
-    text/plain）。"""
+    text/plain）。on_throttle：开了 /metrics 时，被上限挡回去的 V1Error（throttle 写了原因的）
+    每个通知一次。"""
 
     async def http_error(request: Request, exc: Exception) -> Response:
         assert isinstance(exc, StarletteHTTPException)
+        reason = getattr(exc, "throttle", None)
+        if on_throttle is not None and reason:
+            on_throttle(reason)
         if not _v1(request):
             return await http_exception_handler(request, exc)
         return _error(

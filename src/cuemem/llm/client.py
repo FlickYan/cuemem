@@ -104,6 +104,9 @@ class LLMClient:
         self._notified: set[tuple[str, datetime]] = set()
         self._inflight: dict[str, threading.Event] = {}  # 正在请求中的缓存键（相同请求合并）
         self._bad_json: set[str] = set()  # 上次拿到解析不了的 JSON 的缓存键（见 retry_bad_json）
+        # account 记完一次用量之后通知它（角色、模型别名、模型、用量、是否命中缓存）。默认 None；
+        # 只有开了 /metrics 的服务设它（api/metrics.py），评测与 SDK 不设
+        self.observer: Callable[[str, str, ModelSpec, Usage, bool], None] | None = None
 
     def chat(
         self,
@@ -615,6 +618,11 @@ class LLMClient:
             spent=0.0 if from_cache else round(discounted, 6),
             latency_ms=round(latency_ms, 1),
         )
+        if self.observer is not None:
+            try:
+                self.observer(role, alias, spec, usage, from_cache)
+            except Exception:  # 指标出错不能让已经完成的调用失败
+                logger.warning("LLMClient.observer 出错", exc_info=True)
 
 
 def _json_mode(params: dict[str, Any]) -> bool:
