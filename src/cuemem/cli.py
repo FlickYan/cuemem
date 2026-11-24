@@ -39,8 +39,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args
@@ -360,6 +360,7 @@ def doctor(
     if repair_vectors:
         _repair_vectors(settings)
     _print_config(settings)
+    _print_config_files(settings)
     _print_local_store(settings)
     _print_disk(settings)
     _print_media_journal(settings)
@@ -2597,6 +2598,60 @@ def _peak_status(settings: Settings) -> list[str]:
     return lines
 
 
+def _fallback_line(settings: Settings) -> str:
+    """doctor 里兜底模型（consolidation.fallback_model）的那一行。
+
+    used_providers() 不算它的供应商：供应商表里写着（未使用）、configure 也不问它的 Key，可是
+    一次超时或内容审核误拒就会换到它，所以缺 Key 时在这里标黄。"""
+    alias = settings.consolidation.fallback_model
+    if alias is None:
+        return "兜底模型：无"
+    spec = settings.models.get(alias)
+    if spec is None:
+        return f"[yellow]兜底模型：{escape(alias)}（不在 models 里）[/yellow]"
+    line = f"兜底模型：{escape(alias)}（{escape(spec.provider)}）"
+    provider = settings.providers[spec.provider]
+    if provider.api_key_env is not None and not provider.api_key():
+        return (
+            f"[yellow]{line}，未设置 {escape(provider.api_key_env)}；"
+            "不用兜底时设 consolidation.fallback_model: null[/yellow]"
+        )
+    return line
+
+
+def _print_config_files(settings: Settings) -> None:
+    """自己写的配置文件（CUEMEM_CONFIG 与预设的路径）里配置模型不认识的键：每个一行提醒。
+
+    YAML 文件里写错的键被悄悄丢掉（加载保持宽松），用的仍是默认值；这里只提醒，不改退出码。
+    随包发布的默认配置与预设不查。读不出、解析不了的文件 load_settings 已经报过错。"""
+    import yaml
+
+    from cuemem.config import DEFAULT_CONFIG, PRESETS_DIR, preset_path, unknown_keys
+
+    files: list[Path] = []
+    if config := os.environ.get("CUEMEM_CONFIG"):
+        files.append(Path(config).resolve())
+    if preset := os.environ.get("CUEMEM_PRESET"):
+        with suppress(ValueError):
+            files.append(preset_path(preset))
+    for path in dict.fromkeys(files):
+        if path == DEFAULT_CONFIG or path.parent == PRESETS_DIR:
+            continue
+        try:
+            data = yaml.safe_load(path.read_text("utf-8")) or {}
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            continue
+        if not isinstance(data, Mapping):
+            continue
+        for dotted, near in unknown_keys(data):
+            hint = f"（是不是 {escape(near)}？）" if near else ""
+            console.print(
+                f"[yellow]配置文件 {escape(str(path))} 里有不认识的键 {escape(dotted)}{hint}，"
+                "已忽略[/yellow]",
+                highlight=False,
+            )
+
+
 def _print_config(settings: Settings) -> None:
     providers = Table(title="供应商")
     for column in ("名称", "Base URL", "Key 环境变量", "状态"):
@@ -2630,6 +2685,16 @@ def _print_config(settings: Settings) -> None:
         f"sparse={'开' if emb.sparse and emb.backend == 'dashscope' else '关'}"
     )
     console.print(f"向量：{detail}")
+    # 图片向量、重排与兜底模型不在上面两张表里：自己写的预设没关掉它们时，用的仍是默认供应商
+    image = settings.multimodal_embedding
+    image_detail = {"none": "关", "hash": "离线哈希向量"}.get(
+        image.backend, f"{image.model}（{image.provider}）"
+    )
+    console.print(f"图片向量：{escape(image_detail)}", highlight=False)
+    rerank = settings.rerank
+    rerank_detail = "关" if rerank.provider is None else f"{rerank.model}（{rerank.provider}）"
+    console.print(f"重排：{escape(rerank_detail)}", highlight=False)
+    console.print(_fallback_line(settings), highlight=False)
     vector_store = f"本地模式 {settings.paths.qdrant}"
     if settings.vector_store.url:
         has_key = settings.vector_store.api_key is not None

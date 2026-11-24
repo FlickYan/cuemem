@@ -21,7 +21,7 @@ from typer.testing import CliRunner
 
 from cuemem import __version__
 from cuemem.cli import app
-from cuemem.config import load_settings
+from cuemem.config import DEFAULT_CONFIG, load_settings
 
 runner = CliRunner()
 
@@ -2436,3 +2436,102 @@ def test_mcp_expires_old_traces_when_it_starts(
     assert ran == ["stdio"] and not old.exists()
     assert result.stdout == ""  # stdout 是 MCP 的通道
     assert not any(t.name == "cuemem-mcp-sweep" and t.is_alive() for t in threading.enumerate())
+
+
+GATEWAY_ROLES = """\
+providers:
+  gateway: {base_url: https://llm.example.com/v1, api_key_env: GATEWAY_API_KEY, max_concurrency: 4}
+models:
+  my-chat:
+    provider: gateway
+    model_id: vendor/chat-model
+    context_window: 128000
+    price: {input: 0.5, output: 1.5}
+roles:
+  extractor: {model: my-chat}
+  planner: {model: my-chat}
+  reader: {model: my-chat}
+  vlm: {model: my-chat}
+  captioner: {model: my-chat}
+  judge: {model: my-chat}
+  agent: {model: my-chat, max_tokens: 1200}
+"""
+
+
+def _doctor(preset: str | Path | None) -> Any:
+    """cuemem [--preset P] doctor。--preset 把 CUEMEM_PRESET 写进进程的环境变量：这里经 env 交给
+    CliRunner 记下原值，调用结束时还原，不留给后面的测试。"""
+    args = ["--preset", str(preset), "doctor"] if preset else ["doctor"]
+    return runner.invoke(app, args, env={"CUEMEM_PRESET": str(preset) if preset else None})
+
+
+def test_doctor_warns_about_unknown_preset_keys(isolated_paths: None, tmp_path: Path) -> None:
+    """自己写的预设里写错的键（max_concurency、embeding）加载时被悄悄丢掉，用的仍是默认值；
+    doctor 逐个指出来、给出最像的键，退出码不变（第十轮体检 Q15）。CUEMEM_CONFIG 的文件同样查。"""
+    preset = tmp_path / "typo.yaml"
+    preset.write_text(
+        "providers:\n"
+        "  gateway: {base_url: https://llm.example.com/v1, api_key_env: GATEWAY_API_KEY,"
+        " max_concurency: 4}\n"
+        "embeding: {backend: hash}\n",
+        "utf-8",
+    )
+    result = _doctor(preset)
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "里有不认识的键providers.gateway.max_concurency" in flat
+    assert "（是不是providers.gateway.max_concurrency？），已忽略" in flat
+    assert "里有不认识的键embeding（是不是embedding？），已忽略" in flat
+
+    config = tmp_path / "config.yaml"
+    config.write_text(DEFAULT_CONFIG.read_text("utf-8") + "zzzzzz: 1\n", "utf-8")  # 它替换默认配置
+    result = runner.invoke(app, ["doctor"], env={"CUEMEM_CONFIG": str(config)})
+    assert result.exit_code == 0, result.output
+    assert "里有不认识的键zzzzzz，已忽略" in _flat(result.output)  # 没有相近的键时不带括号
+
+
+@pytest.mark.parametrize("preset", [None, "openai", "ollama", "deepseek", "qwen"])
+def test_doctor_is_quiet_for_packaged_presets(isolated_paths: None, preset: str | None) -> None:
+    """随包发布的默认配置与四个预设没有不认识的键：doctor 不提醒。"""
+    result = _doctor(preset)
+    assert result.exit_code == 0, result.output
+    assert "不认识的键" not in result.output
+
+
+def test_doctor_shows_rerank_multimodal_and_fallback(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """doctor 写出图片向量、重排与兜底模型（第十轮体检 Q15）：预设只换了七个角色时这三处仍是默认
+    供应商，以前 doctor 不显示它们；兜底模型的供应商还被标成（未使用），缺 Key 也没人提醒。"""
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+    partial = tmp_path / "partial.yaml"
+    partial.write_text(GATEWAY_ROLES, "utf-8")
+    result = _doctor(partial)
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "图片向量：tongyi-embedding-vision-plus（qwen）" in flat
+    assert "重排：qwen3-rerank（qwen）" in flat
+    assert (
+        "兜底模型：deepseek-flash（deepseek），未设置DEEPSEEK_API_KEY；"
+        "不用兜底时设consolidation.fallback_model:null"
+    ) in flat
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")  # 有 Key 时只写是哪个模型
+    flat = _flat(_doctor(partial).output)
+    assert "兜底模型：deepseek-flash（deepseek）" in flat
+    assert "未设置DEEPSEEK_API_KEY" not in flat
+
+    full = tmp_path / "full.yaml"
+    full.write_text(
+        GATEWAY_ROLES + "multimodal_embedding: {backend: none}\n"
+        "rerank: {provider: null}\n"
+        "consolidation: {fallback_model: null}\n",
+        "utf-8",
+    )
+    result = _doctor(full)
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "图片向量：关" in flat
+    assert "重排：关" in flat
+    assert "兜底模型：无" in flat
