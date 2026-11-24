@@ -90,7 +90,8 @@ _FORMAT_SUFFIX = {
 class ExportPlan:
     """export_plan 的结果：导出一个空间要的、不带原图的那些（会话按开始时间排好，发言、附加
     信息与原图在写出时再读）。bounds 是每个会话这时最大的发言序号：之后写进来的发言不在这次导出
-    里（见 iter_export_json）。"""
+    里（见 iter_export_json）。epoch 是这时这个空间的 MemoryDB.turn_epoch：写出 derived 时它
+    变了（期间经本进程删过发言）就不用这里的 derived，重新读一份（_derived_now）。"""
 
     db: MemoryDB
     space_id: str
@@ -98,6 +99,7 @@ class ExportPlan:
     bounds: dict[str, int]
     log_only: set[str]
     derived: dict[str, Any] | None
+    epoch: int = 0
 
 
 def export_plan(
@@ -106,27 +108,44 @@ def export_plan(
     """导出的第一步：会话、每个会话这时最大的发言序号与派生记忆的快照，不读发言与原图（便宜）。
     没有这个空间时 KeyError（HTTP 接口据此在开始写响应之前回 404）。"""
     db = system if isinstance(system, MemoryDB) else system.db
+    epoch = db.turn_epoch(space_id)  # 先于派生记忆的快照：之后的遗忘都比得出来
     sessions = db.get_sessions(space_id)
     if not sessions:
         raise KeyError(f"No memory space {space_id}")
-    snapshot: dict[str, Any] | None = None
-    if derived:
-        core = db.get_core_memory(space_id)
-        snapshot = {
-            "facts": [
-                f.model_dump(mode="json", exclude={"space_id", "entity_ids"})
-                for f in db.get_facts(space_id)
-            ],
-            "profile": core.text if core is not None else "",
-        }
     return ExportPlan(
         db=db,
         space_id=space_id,
         sessions=sorted(sessions.items(), key=lambda item: item[1]),
         bounds=db.turn_bounds(space_id),
         log_only=_log_only(system, space_id),
-        derived=snapshot,
+        derived=_derived_snapshot(db, space_id) if derived else None,
+        epoch=epoch,
     )
+
+
+def _derived_snapshot(db: MemoryDB, space_id: str) -> dict[str, Any]:
+    """派生记忆这时的样子：全部事实与画像的文字。"""
+    core = db.get_core_memory(space_id)
+    return {
+        "facts": [
+            f.model_dump(mode="json", exclude={"space_id", "entity_ids"})
+            for f in db.get_facts(space_id)
+        ],
+        "profile": core.text if core is not None else "",
+    }
+
+
+def _derived_now(plan: ExportPlan) -> dict[str, Any] | None:
+    """导出里写的 derived：计划那一刻的快照；计划之后这个空间经本进程删过发言（遗忘、删除空间）
+    时重新读一份。
+
+    第十轮体检 Q3：derived 写在最后。以前它总是开始时的那份，下载期间做完的遗忘在会话那一部分
+    已经照办（第九轮体检 P6），这里却还写着被遗忘的事实与照它写的画像。遗忘在同一个事务里清掉
+    派生记忆、删掉发言、记下 turn_epoch，所以重新读到的要么是清空的、要么是重放了一部分或者
+    全部的，不会有被遗忘的内容。没有遗忘时用的还是那份快照，写出的字节不变。"""
+    if plan.derived is None or plan.db.turn_epoch(plan.space_id) == plan.epoch:
+        return plan.derived
+    return _derived_snapshot(plan.db, plan.space_id)
 
 
 def export_space(
@@ -151,8 +170,9 @@ def export_space(
         out_sessions.append(out)
     data = _header(plan, _now())
     data["sessions"] = out_sessions
-    if plan.derived is not None:
-        data["derived"] = plan.derived
+    snapshot = _derived_now(plan)
+    if snapshot is not None:
+        data["derived"] = snapshot
     return data
 
 
@@ -173,7 +193,12 @@ def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterat
     （bounds），之后写进来的发言不导出，之后新开的会话本来就不在计划里；每个会话的发言、附加信息
     与图片记录在同一次持锁里读（MemoryDB.export_rows），写出的发言带的总是它自己的那一份——整个
     会话被遗忘、又用同一个 run_id 重新写时序号从 0 重来，这样的发言也是完整的。写出途中的遗忘：
-    还没写到的会话里被遗忘的发言不再写出，已经写出的收不回来；derived 与会话的 infer 是开始时的。"""
+    还没写到的会话里被遗忘的发言不再写出，已经写出的收不回来；会话的 infer 是开始时的。
+
+    第十轮体检 Q3：derived 也是开始时的，除非导出期间这个空间经本进程删过发言：那时在最后重新
+    读一份（_derived_now），里面没有被遗忘的事实与画像。重新读的这份可能带着开始之后写进来的
+    发言得出的事实（这些发言不在这次导出里），遗忘的重放还没做完时可能不全；导入不看 derived。
+    别的进程做的遗忘（serve 开着时另起的 cuemem forget）这里比不出来。"""
     stamp = exported_at if exported_at is not None else _now()
     head = _dumps({**_header(plan, stamp), "sessions": []})
     pending = [head[:-2]]  # 去掉 "]}"：后面接各个会话
@@ -200,8 +225,9 @@ def iter_export_json(plan: ExportPlan, exported_at: str | None = None) -> Iterat
         tail = "," + _dumps({"infer": False})[1:-1] if turns and session_id in plan.log_only else ""
         pending.append("]" + tail + "}")
     pending.append("]")
-    if plan.derived is not None:
-        pending.append("," + _dumps({"derived": plan.derived})[1:-1])
+    snapshot = _derived_now(plan)
+    if snapshot is not None:
+        pending.append("," + _dumps({"derived": snapshot})[1:-1])
     pending.append("}")
     yield "".join(pending).encode("utf-8")
 

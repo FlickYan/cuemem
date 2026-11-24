@@ -22,7 +22,7 @@ from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 from test_cli import _flat, runner
 
-from cuemem import Memory
+from cuemem import Memory, portable
 from cuemem.cli import app
 from cuemem.config import PathsConfig, Settings, load_settings, presets
 from cuemem.core.models import SessionIn, Turn, TurnIn
@@ -289,6 +289,55 @@ def test_updates_survive_export_to_the_same_space(
         ]
         fresh.load(data, user_id="bob", wait=True)
         assert len(fresh.get_all(user_id="bob")["results"]) == 2
+
+
+def _two_sessions(memory: Memory) -> str:
+    """alice 的两个巩固过的会话；返回 s1 那条事实（住在柏林）的 ID。"""
+    memory.add("The user lives in Berlin.", user_id="alice", run_id="s1", wait=True)
+    memory.add("I like tea", user_id="alice", run_id="s2", wait=True)
+    facts = {f["memory"]: f["id"] for f in memory.get_all(user_id="alice")["results"]}
+    assert set(facts) == {"The user lives in Berlin.", "I like tea"}
+    return str(facts["The user lives in Berlin."])
+
+
+def test_export_derived_drops_what_was_forgotten_during_the_download(memory: Memory) -> None:
+    """第十轮体检 Q3：计划之后、写出之前做完的遗忘（HTTP 接口上就是整个下载期间）。会话那一部分
+    从第九轮起不再写被遗忘的发言，derived 却还是开始时的那份：被遗忘的事实与照它写的画像。"""
+    berlin = _two_sessions(memory)
+    plan = portable.export_plan(memory.system, "alice")
+    assert "Berlin" in json.dumps(plan.derived)
+    assert memory.delete(berlin)["turns_deleted"] == 1
+    out = b"".join(portable.iter_export_json(plan))
+    assert b"Berlin" not in out
+    data = json.loads(out)
+    assert [[t["text"] for t in s["turns"]] for s in data["sessions"]] == [[], ["I like tea"]]
+    assert [f["statement"] for f in data["derived"]["facts"]] == ["I like tea"]
+    assert data["derived"]["profile"] == "- I like tea"
+    # 没有遗忘时用的是计划里的那份快照
+    quiet = portable.export_plan(memory.system, "alice")
+    assert portable._derived_now(quiet) is quiet.derived
+    bare = portable.export_plan(memory.system, "alice", derived=False)
+    assert portable._derived_now(bare) is None
+
+
+def test_export_space_derived_drops_what_was_forgotten_meanwhile(
+    memory: Memory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同上，整个在内存里的 export_space：遗忘落在计划与读第一个会话之间。"""
+    berlin = _two_sessions(memory)
+    read = portable._session_rows
+    pending = [berlin]
+
+    def forgetting(plan: portable.ExportPlan, session_id: str) -> Any:
+        while pending:
+            memory.delete(pending.pop())
+        return read(plan, session_id)
+
+    monkeypatch.setattr(portable, "_session_rows", forgetting)
+    data = memory.export(user_id="alice")
+    assert not pending and "Berlin" not in json.dumps(data)
+    assert [f["statement"] for f in data["derived"]["facts"]] == ["I like tea"]
+    assert data["derived"]["profile"] == "- I like tea"
 
 
 def _png(color: str = "red") -> bytes:
