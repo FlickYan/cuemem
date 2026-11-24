@@ -1169,7 +1169,9 @@ def test_server_logs_are_plain_lines(
         env=_server_env(tmp_path),
     )
     assert done.returncode == 0, done.stderr
-    lines = done.stderr.splitlines()
+    # onnxruntime 的 C++ 部分在有些机器上（GitHub 的 runner）往 stderr 直接写一行设备探测的警告，
+    # 不经过 logging，不是这里要查的
+    lines = [line for line in done.stderr.splitlines() if "[W:onnxruntime:" not in line]
     assert [line for line in lines if LOG_LINE.match(line)] == [lines[0]], done.stderr
     assert lines[1] == "Traceback (most recent call last):", done.stderr
     assert lines[-1] == "ConnectionError: " + "APIConnectionError: Connection error " * 4
