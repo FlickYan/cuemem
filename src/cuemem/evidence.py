@@ -192,7 +192,11 @@ def message_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+        # 形状不对的块（不是对象、text 不是字符串）跳过：记忆代理收到的请求由上游判断对不对
+        texts = (
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+        return " ".join(t for t in texts if isinstance(t, str))
     return ""
 
 
@@ -210,7 +214,10 @@ def payload_size(messages: Sequence[Mapping[str, Any]]) -> int:
                 continue
             image = block.get("image_url")
             url = image.get("url") if isinstance(image, Mapping) else image
-            total += len(block.get("text") or "") + (len(url) if isinstance(url, str) else 0)
+            text = block.get("text")
+            total += (len(text) if isinstance(text, str) else 0) + (
+                len(url) if isinstance(url, str) else 0
+            )
     return total
 
 
@@ -228,8 +235,11 @@ def stored_text(message: Mapping[str, Any]) -> str:
         return content if isinstance(content, str) else ""
     parts: list[str] = []
     for block in content:
+        if not isinstance(block, Mapping):  # 形状不对的块跳过（见 message_text）
+            continue
         if block.get("type") == "text":
-            parts.append(block.get("text") or "")
+            text = block.get("text")
+            parts.append(text if isinstance(text, str) else "")
         elif block.get("type") == "image_url":
             parts.append("<image>")
     return " ".join(p for p in parts if p)

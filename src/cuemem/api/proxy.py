@@ -175,13 +175,11 @@ MODEL_NAME_SHOWN = 200
 MODEL_NAMES_WARNED = 1000  # 记过警告的模型名最多这么多个，之后的新名字不再警告
 
 
-def _short(value: Any) -> str:
-    """请求里的模型名写进日志、出错与 _warned 之前：超过 MODEL_NAME_SHOWN 个字符的只留开头，
-    加 "…"。名字是调用方写的，最长能到请求体的上限（第十轮体检 Q6）。"""
-    if isinstance(value, str):  # 先截再写：不为一个 64 MiB 的名字再复制一份
-        return value if len(value) <= MODEL_NAME_SHOWN else value[:MODEL_NAME_SHOWN] + "…"
-    text = str(value)
-    return text if len(text) <= MODEL_NAME_SHOWN else text[:MODEL_NAME_SHOWN] + "…"
+def _short(value: Any, shown: int = MODEL_NAME_SHOWN) -> str:
+    """请求里的模型名写进日志、出错与 _warned 之前：超过 shown 个字符的只留开头，加 "…"。
+    名字是调用方写的，最长能到请求体的上限（第十轮体检 Q6）。403 里的用户与 Agent 也这样写。"""
+    text = value if isinstance(value, str) else str(value)
+    return text if len(text) <= shown else text[:shown] + "…"
 
 
 class ProxyError(Exception):
@@ -707,38 +705,48 @@ class MemoryProxy:
 
     def _identity(
         self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
-    ) -> tuple[Any, str | None]:
-        """请求的用户与 Agent；用户不在令牌的作用域里时 ProxyError（403）。"""
+    ) -> tuple[str | None, str | None, str | None]:
+        """请求的用户、Agent 与它们的记忆空间（没有用户时都是 None：不碰记忆）。ID 不是字符串、
+        超过 sdk.MAX_ID_CHARS 个字符时 ProxyError（400），用户不在令牌的作用域里时 403，都在开
+        会话、检索与转发之前。第十轮体检 Q7：以前不限长度（1 MiB 的 user 每个请求让数据库长
+        16 到 30 MB），管理令牌与不鉴权时不是字符串的 user 是 500。"""
         try:  # 不是 ASCII 的 ID：原样的 UTF-8 或 utf-8''<百分号编码>（auth.header_id）
             header_user, agent_id = identity_headers(headers)
         except ValueError as exc:
             raise ProxyError(400, str(exc), param="user") from None
         user_id = header_user or body.get("user") or self.default_user
-        if (  # 在开会话、检索之前；管理令牌不限制
-            user_id is not None
-            and principal is not None
-            and not principal.admin
-            and (not isinstance(user_id, str) or not principal.allows(space_for(user_id, agent_id)))
-        ):
+        if user_id is None:
+            return None, agent_id, None
+        scoped = principal is not None and not principal.admin  # 管理令牌不限制
+        space: str | None = None
+        if isinstance(user_id, str) or not scoped:  # 限定作用域的令牌下不是字符串的照旧 403
+            try:
+                space = space_for(user_id, agent_id)
+            except ValueError as exc:  # 出错里只有长度，没有 ID 本身
+                raise ProxyError(400, str(exc), param="user") from None
+        if principal is not None and scoped and (space is None or not principal.allows(space)):
             raise ProxyError(
                 403,
-                f"This API key cannot access the memories of user {user_id!r}"
-                + (f" with agent {agent_id!r}" if agent_id else "")
+                f"This API key cannot access the memories of user {_short(repr(user_id), 80)}"
+                + (f" with agent {_short(repr(agent_id), 80)}" if agent_id else "")
                 + ": use a user in its scope (the user field or the X-CueMem-User header).",
                 kind="permission_error",
                 param="user",
                 code="forbidden",
             )
-        return user_id, agent_id
+        return user_id, agent_id, space
 
     def _recall(
         self, body: dict[str, Any], headers: Mapping[str, str], principal: Principal | None
     ) -> Turn:
-        user_id, agent_id = self._identity(body, headers, principal)
+        user_id, agent_id, space = self._identity(body, headers, principal)
         messages = body.get("messages") or []
-        if user_id is None or not messages:
+        if user_id is None or space is None or not messages:
             return Turn(space=None)
-        space = space_for(user_id, agent_id)
+        # 带着用户的请求要读这些消息：形状不对的在这里 400（以前 500）。没有用户的照旧原样转发，
+        # 由上游判断；内容块形状不对的也交给上游（message_text 等跳过它们）
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            raise ProxyError(400, "messages must be a list of message objects.", param="messages")
         anchor, follow_up = _last_user(messages)
         held = spaces_over_cap(principal, space, self.system.db.space_ids)
         if held is not None and principal is not None:  # 令牌的 max_spaces（api/auth.py）
@@ -1394,7 +1402,9 @@ def _storable(message: dict[str, Any]) -> dict[str, Any]:
     kept = [
         block
         for block in content
-        if block.get("type") != "image_url" or _image_url(block).startswith("data:")
+        # 不是对象的块不存（转发时原样在，由上游判断）：留着的话这一次写回每次都写不进去
+        if isinstance(block, dict)
+        and (block.get("type") != "image_url" or _image_url(block).startswith("data:"))
     ]
     return {**message, "content": kept}
 

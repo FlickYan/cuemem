@@ -216,7 +216,10 @@ class McpEndpoint:
             user_id, agent_id = identity_headers(headers)
         except ValueError as exc:
             return JSONResponse({"detail": str(exc)}, 400)
-        space = space_for(user_id, agent_id) if user_id or agent_id else principal.home()
+        try:  # 超过 sdk.MAX_ID_CHARS 个字符的 ID：400（第十轮体检 Q7；以前照收，之后是 500）
+            space = space_for(user_id, agent_id) if user_id or agent_id else principal.home()
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, 400)
         if space is None:
             message = (
                 "Send the X-CueMem-User header (and optionally X-CueMem-Agent) to choose whose "

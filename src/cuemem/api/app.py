@@ -81,9 +81,9 @@ from cuemem.api.service import ChatService
 from cuemem.config import extra_remedy
 from cuemem.errors import CueMemError, SessionLimitError, VectorStoreFullError
 from cuemem.memory import MemorySystem, RecallMode
-from cuemem.portable import export_plan, import_space, iter_export_json
+from cuemem.portable import export_plan, import_space, iter_export_json, longest_session_id
 from cuemem.read.controller import Router
-from cuemem.sdk import Memory
+from cuemem.sdk import MAX_ID_CHARS, Memory, ids_too_long
 
 if TYPE_CHECKING:
     from cuemem.api.proxy import MemoryProxy
@@ -328,10 +328,21 @@ def _router(value: str | None) -> Router | None:
 
 
 def _check_space(who: Principal, space: str) -> str:
-    """令牌的作用域之外的空间：403（空间是请求自己点名的，不涉及别人有没有数据）。"""
+    """令牌的作用域之外的空间：403（空间是请求自己点名的，不涉及别人有没有数据）。用户或 Agent
+    的 ID 超过 sdk.MAX_ID_CHARS 个字符的空间 400：限定作用域的令牌用不了（第十轮体检 Q7），
+    管理令牌照常按空间 ID 访问已有的这种空间。"""
     if not who.allows(space):
+        _refuse_long_ids(space)
         raise HTTPException(403, f"这个访问令牌不能访问记忆空间 {space}")
     return space
+
+
+def _refuse_long_ids(space: str | None) -> None:
+    if space and ids_too_long(space):
+        raise HTTPException(
+            400,
+            f"用户与 Agent 的 ID 最多 {MAX_ID_CHARS} 个字符：这个访问令牌不能用 ID 更长的记忆空间",
+        )
 
 
 def _import_target(data: Mapping[str, Any], space: str | None) -> str | None:
@@ -733,8 +744,15 @@ def create_app(
         """导入 export 的结果（N12）：写回原始日志，派生记忆在后台重新抽取。写进作用域之外的
         空间（参数，或文件里的 space_id）时 403，什么都不写。"""
         target = _import_target(data, space)
-        if not principal_of(http).allows(target):
+        who = principal_of(http)
+        if not who.allows(target):
+            _refuse_long_ids(target)
             raise HTTPException(403, f"这个访问令牌不能导入到记忆空间 {target}")
+        if not who.admin and (longest := longest_session_id(data)) > MAX_ID_CHARS:
+            # 会话 ID 写在它的每句发言上。管理令牌与命令行照常能导入（恢复有上限之前的导出）
+            raise HTTPException(
+                400, f"会话 ID 最多 {MAX_ID_CHARS} 个字符（文件里最长的有 {longest} 个）"
+            )
         room(http, target)
         with _errors():
             report = import_space(service.system, data, space_id=space)

@@ -33,7 +33,15 @@ from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, store
 from cuemem.memory import _open_mark
 from cuemem.read.l1 import L1Config
 from cuemem.read.l2 import L2Config
-from cuemem.sdk import _key_hash, _matches, parse_messages, space_for
+from cuemem.sdk import (
+    MAX_ID_CHARS,
+    _key_hash,
+    _matches,
+    ids_too_long,
+    parse_messages,
+    space_for,
+    space_owner,
+)
 from cuemem.store.vector import VectorStore
 
 AUG = datetime(2026, 8, 1, 10, 0)
@@ -2781,3 +2789,38 @@ def test_full_llm_cache_still_answers_and_accounts(
         assert rows() - before == 2
     warned = [r.getMessage() for r in caplog.records if "LLM 缓存写不进" in r.getMessage()]
     assert len(warned) == 1
+
+
+def test_ids_have_a_length_limit(memory: Memory) -> None:
+    """第十轮体检 Q7：user_id、agent_id 与写入时的 run_id 最多 MAX_ID_CHARS（256）个字符，更长
+    的 ValueError（出错里只有长度）。以前不限：ID 写在每句发言、每条事实、每个向量上。已有的
+    更长的空间解不回用户（space_owner 是 None：限定作用域的令牌用不了，管理令牌按空间 ID
+    照常访问）。"""
+    assert MAX_ID_CHARS == 256
+    long, fits = "u" * 257, "u" * 256
+    for args in ((long,), ("a", long), (None, long), (long, long)):
+        with pytest.raises(ValueError, match=r"at most 256 characters \(got 257\)") as caught:
+            space_for(*args)
+        assert long not in str(caught.value)
+    assert space_for(fits) == fits and space_for(fits, fits) == f"{fits}/{fits}"
+    assert space_for("/" * 256) == "%2F" * 256  # 按 ID 的字符数算，不按转义之后的
+    assert space_owner(fits) == (fits, None) and space_owner("u" * 300) is None
+    assert space_owner(f"bot/{long}") is None and space_owner(f"agent/{long}") is None
+    assert ids_too_long("u" * 300) and ids_too_long(f"bot/{long}") and ids_too_long(f"{long}/u")
+    assert not ids_too_long(fits) and not ids_too_long(f"{fits}/{fits}")
+    for call in (
+        lambda: memory.add("hi", user_id=long),
+        lambda: memory.search("hi", user_id=long),
+        lambda: memory.get_all(user_id="alice", agent_id=long),
+        lambda: memory.delete_all(user_id=long),
+        lambda: memory.add("hi", user_id="alice", run_id="r" * 257),
+        lambda: memory.open_run("r" * 257, user_id="alice"),
+    ):
+        with pytest.raises(ValueError, match="at most 256 characters"):
+            call()
+    assert memory.system.db.space_ids() == []
+    added = memory.add("I live in Berlin", user_id=fits, run_id="r" * 256, infer=False)
+    assert added["session_id"] == "r" * 256
+    # 只在写入时查 run_id：更长的照常能查、能结束、能删（什么都没有）
+    assert memory.get_all(user_id=fits, run_id="r" * 300)["results"] == []
+    assert memory.delete_all(user_id=fits, run_id="r" * 300)["message"].startswith("No such run")

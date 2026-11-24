@@ -572,6 +572,99 @@ def test_api_sessions_and_import_stay_in_scope(world: World) -> None:
     assert len(world.system.db.get_turns("alice")) == before["alice"] + 1
 
 
+def test_ids_over_the_limit_are_400_for_scoped_keys(world: World) -> None:
+    """第十轮体检 Q7：用户与 Agent 的 ID 最多 256 个字符。user 是 "*" 的令牌（给后端用的写法）
+    点名更长的 ID 时每个接口都是 400（不是 403，也不照收），不建空间、不转发；Agent 不限的令牌
+    （user: alice）给更长的 X-CueMem-Agent 也一样。限定作用域的令牌也不能导入会话 ID 更长的
+    文件（会话 ID 写在它的每句发言上），管理令牌照常（恢复以前的导出）。"""
+    http, system = world.http, world.system
+    long = "u" * 257
+    spaces, before = system.db.space_ids(), world.turns()
+    shop, alice, admin = bearer(SHOP_USERS_TOKEN), bearer(ALICE_TOKEN), bearer(ADMIN_TOKEN)
+
+    for response in (
+        _chat(http, SHOP_USERS_TOKEN, user=long, headers={"X-CueMem-Agent": "shop"}),
+        _chat(http, ALICE_TOKEN, user="alice", headers={"X-CueMem-Agent": long}),
+        _chat(http, ADMIN_TOKEN, user=long),
+    ):
+        assert response.status_code == 400, response.text
+        error = response.json()["error"]
+        assert error["param"] == "user" and "at most 256 characters" in error["message"]
+    assert world.forwarded() == 0 and world.proxy.open_runs() == 0
+
+    v1 = [
+        http.post("/api/v1/memories", json={"messages": "hi", "user_id": long}, headers=admin),
+        http.post(
+            "/api/v1/memories",
+            json={"messages": "hi", "user_id": long, "agent_id": "shop"},
+            headers=shop,
+        ),
+        http.post(
+            "/api/v1/memories",
+            json={"messages": "hi", "user_id": "alice", "agent_id": long},
+            headers=alice,
+        ),
+        http.post(
+            "/api/v1/memories",
+            json={"messages": "hi", "user_id": "alice", "run_id": "r" * 257},
+            headers=alice,
+        ),
+        http.post("/api/v1/runs", json={"user_id": "alice", "run_id": "r" * 257}, headers=alice),
+        http.get("/api/v1/memories", params={"user_id": long}, headers=admin),
+        http.post("/api/v1/wait", json={"user_id": long}, headers=admin),
+    ]
+    dump = http.get("/api/spaces/alice/export", headers=admin).json()
+    v1.append(  # 以前这个接口上 space_for 的 ValueError 没人接：500
+        http.post("/api/v1/import", json={"data": dump, "user_id": long}, headers=admin)
+    )
+    for response in v1:
+        assert response.status_code == 400, response.text
+        error = response.json()["error"]
+        assert error["type"] == "ValueError" and "at most 256 characters" in error["message"]
+
+    # /api 按空间 ID：ID 更长的空间限定作用域的令牌用不了（400），管理令牌照常
+    for space in (f"shop/{long}", f"shop%2F{long}"):
+        refused = http.get(f"/api/spaces/{space}/profile", headers=shop)
+        assert refused.status_code == 400 and "256" in refused.json()["detail"], refused.text
+    started = http.post("/api/sessions", json={"space": f"shop/{long}"}, headers=shop)
+    assert started.status_code == 400 and "256" in started.json()["detail"]
+    assert http.get(f"/api/spaces/{long}/profile", headers=admin).status_code == 200
+    assert http.get("/api/spaces/shop/nobody/profile", headers=alice).status_code == 403
+
+    renamed = {**dump, "sessions": [{**dump["sessions"][0], "session_id": "s" * 257}]}
+    params = {"space": f"shop/{long}"}
+    refused = http.post("/api/spaces/import", json=dump, params=params, headers=shop)
+    assert refused.status_code == 400 and "256" in refused.json()["detail"]
+    refused = http.post(
+        "/api/spaces/import", json=renamed, params={"space": "alice"}, headers=alice
+    )
+    assert refused.status_code == 400 and "257" in refused.json()["detail"]
+    moved = {"data": {**dump, "space_id": f"shop/{long}"}}  # 文件里的空间：也是 400，不是 403
+    refused = http.post("/api/v1/import", json=moved, headers=shop)
+    assert refused.status_code == 400 and "256" in refused.json()["error"]["message"]
+    refused = http.post("/api/v1/import", json={"data": renamed, "user_id": "alice"}, headers=alice)
+    assert refused.status_code == 400, refused.text
+    assert "session_id must be at most 256 characters" in refused.json()["error"]["message"]
+    assert system.db.space_ids() == spaces and world.turns() == before
+    restored = http.post(
+        "/api/spaces/import", json=renamed, params={"space": "alice"}, headers=admin
+    )
+    assert restored.status_code == 200, restored.text
+    assert len(system.db.get_turns("alice", "s" * 257)) == 1
+
+
+def test_key_files_with_ids_over_the_limit_are_refused() -> None:
+    """令牌文件里写死的 ID（或前缀）超过 256 个字符：启动时就报错。这样的 ID 哪个接口都不收，
+    留着的话 Principal.home 在请求时才 ValueError。"""
+    for scope in (f"user: {'u' * 257}", f'user: "{"u" * 257}*"', f"agent: {'a' * 257}"):
+        text = f"keys:\n  - name: k\n    token: {ALICE_TOKEN}\n    scopes:\n      - {{{scope}}}\n"
+        with pytest.raises(AccessKeysError, match="最多 256 个字符"):
+            Keys.parse(text)
+    fits = f"keys:\n  - name: k\n    token: {ALICE_TOKEN}\n    scopes:\n      - user: {'u' * 256}\n"
+    key = Keys.parse(fits).resolve(ALICE_TOKEN)
+    assert key is not None and key.home() == "u" * 256
+
+
 def _forbidden(call: Callable[[], Any]) -> None:
     with pytest.raises(MemoryAPIError) as caught:
         call()

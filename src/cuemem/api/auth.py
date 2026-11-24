@@ -95,7 +95,7 @@ from fastapi.security.utils import get_authorization_scheme_param
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cuemem.errors import AccessKeysError
-from cuemem.sdk import space_for, space_owner
+from cuemem.sdk import MAX_ID_CHARS, space_for, space_owner
 
 logger = logging.getLogger(__name__)
 
@@ -585,6 +585,11 @@ def _patterns(value: str | list[str] | None, where: str) -> tuple[str, ...] | No
         if not pattern or "*" in pattern[:-1]:
             raise AccessKeysError(
                 f'{where}: {pattern!r} 不行：写一个 ID，"*"（任何 ID），或以 "*" 结尾的前缀'
+            )
+        if len(pattern.removesuffix("*")) > MAX_ID_CHARS:  # 这样的 ID 哪个接口都不收
+            raise AccessKeysError(
+                f"{where}: 用户与 Agent 的 ID 最多 {MAX_ID_CHARS} 个字符"
+                f"（这一个有 {len(pattern)} 个）"
             )
     return tuple(patterns)
 

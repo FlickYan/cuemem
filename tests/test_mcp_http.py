@@ -133,6 +133,22 @@ def test_tokens_and_scopes_are_checked_before_mcp(app: FastAPI, service: ChatSer
         for token in (SHOP_TOKEN, ADMIN_TOKEN):
             response = http.post("/mcp", json=call("profile"), headers=headers(token))
             assert response.status_code == 400 and "X-CueMem-User" in response.json()["detail"]
+        # 第十轮体检 Q7：超过 256 个字符的 ID 是 400（以前管理令牌下照收，之后 space_for 的
+        # ValueError 没人接时是 500），什么都不写
+        before = turns(service)
+        for token, scope in (
+            (ADMIN_TOKEN, {"X-CueMem-User": "u" * 257}),
+            (SHOP_TOKEN, {"X-CueMem-User": "u" * 257, "X-CueMem-Agent": "shop"}),
+            (ALICE_TOKEN, {"X-CueMem-User": "alice", "X-CueMem-Agent": "a" * 257}),
+        ):
+            response = http.post(
+                "/mcp", json=call("remember", text="PIN 0000"), headers=headers(token, **scope)
+            )
+            assert response.status_code == 400, response.text
+            assert "at most 256 characters (got 257)" in response.json()["detail"]
+        assert turns(service) == before
+        fits = headers(ADMIN_TOKEN, **{"X-CueMem-User": "u" * 256})
+        assert http.post("/mcp", json=call("profile"), headers=fits).status_code == 200
         shop = headers(SHOP_TOKEN, **{"X-CueMem-User": "carol", "X-CueMem-Agent": "shop"})
         said(http.post("/mcp", json=call("remember", text="I like coffee"), headers=shop))
         admin = headers(ADMIN_TOKEN, **{"X-CueMem-User": "dave"})

@@ -317,6 +317,15 @@ def import_space(
     return out
 
 
+def longest_session_id(data: Any) -> int:
+    """导出文件里最长的会话 ID 的字符数（没有会话、形状不对时 0）。HTTP 的导入接口据此拒绝限定
+    作用域的令牌导入会话 ID 超过 sdk.MAX_ID_CHARS 的文件（第十轮体检 Q7）：ID 写在它的每句发言
+    上，文件里只写一次。"""
+    sessions = data.get("sessions") if isinstance(data, Mapping) else None
+    ids = (s.get("session_id") for s in sessions or () if isinstance(s, Mapping))
+    return max((len(i) for i in ids if isinstance(i, str)), default=0)
+
+
 def _parse_export(
     data: Mapping[str, Any], space_id: str | None, scratch: Path
 ) -> tuple[str, list[tuple[SessionIn, int]], dict[tuple[str, int], TurnMeta | None], set[str]]:

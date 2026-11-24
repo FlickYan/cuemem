@@ -63,7 +63,7 @@ from cuemem.evidence import recall_evidence
 from cuemem.llm.ledger import chat_cost
 from cuemem.llm.types import Usage
 from cuemem.memory import MemorySystem
-from cuemem.sdk import space_for
+from cuemem.sdk import MAX_ID_CHARS, space_for
 from cuemem.store.vector import reserved_files
 from cuemem.write.consolidate import Consolidator
 from cuemem.write.online import worth_retrying
@@ -675,6 +675,84 @@ def test_without_a_user_requests_pass_through(
     assert response.headers["x-cuemem-level"] == "none"
     assert "x-cuemem-session" not in response.headers
     assert system.db.list_spaces() == []
+
+
+def test_ids_longer_than_the_limit_are_refused(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream
+) -> None:
+    """第十轮体检 Q7：用户与 Agent 的 ID 最多 MAX_ID_CHARS（256）个字符，请求体的 user 与两个
+    请求头都一样：更长的 400，不建空间、不开会话、不转发。以前不限：ID 写在每句发言、每个向量
+    上，一个 1 MiB 的 user 每个请求让数据库长 16 到 30 MB，proxy._adopted 里也留一份。"""
+    long = "u" * (MAX_ID_CHARS + 1)
+    refused = [
+        chat(client, "hello there", user=long),
+        chat(client, "hello there", headers={"X-CueMem-User": long}),
+        chat(client, "hello there", user="alice", headers={"X-CueMem-Agent": long}),
+        chat(client, "hello there", user=long, stream=True),
+        client.post("/v1/responses", json={"model": "qwen3.8-flash", "input": "hi", "user": long}),
+    ]
+    for response in refused:
+        assert response.status_code == 400, response.text
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error" and error["param"] == "user"
+        assert "at most 256 characters (got 257)" in error["message"]
+        assert long not in error["message"]
+    assert system.db.space_ids() == [] and proxy._adopted == set()
+    assert upstream.proxied == [] and proxy.open_runs() == 0
+
+    fits = "u" * MAX_ID_CHARS
+    ok = chat(client, "hello there", user=fits, headers={"X-CueMem-Agent": "a" * MAX_ID_CHARS})
+    assert ok.status_code == 200
+    assert system.db.space_ids() == [space_for(fits, "a" * MAX_ID_CHARS)]
+
+
+@pytest.mark.parametrize("user", [42, {"id": "alice"}, ["alice"], 1.5])
+def test_a_user_that_is_not_a_string_is_a_400(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, user: Any
+) -> None:
+    """不鉴权（或管理令牌）时 user 不是字符串：400。以前 space_for 的 ValueError 没人接，500。"""
+    refused = chat(client, "hello there", user=user)
+    assert refused.status_code == 400, refused.text
+    error = refused.json()["error"]
+    assert error["param"] == "user" and "must be a string" in error["message"]
+    assert upstream.proxied == [] and system.db.space_ids() == []
+
+
+@pytest.mark.parametrize("messages", [["hi"], "hi", {"role": "user"}, [SYSTEM, None]])
+def test_messages_of_the_wrong_shape_are_a_400(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, messages: Any
+) -> None:
+    """带着用户的请求里 messages 不是消息对象的列表：400（以前 AttributeError，500）。没有用户
+    的请求照旧原样转发，由上游判断。"""
+    body = {"model": "qwen3.8-flash", "messages": messages}
+    refused = client.post("/v1/chat/completions", json={**body, "user": "alice"})
+    assert refused.status_code == 400, refused.text
+    error = refused.json()["error"]
+    assert (error["type"], error["param"]) == ("invalid_request_error", "messages")
+    assert upstream.proxied == [] and system.db.space_ids() == [] and proxy.open_runs() == 0
+    # 没有用户：原样转发（这里的假上游照常回答）
+    if isinstance(messages, list) and isinstance(messages[0], dict):
+        assert client.post("/v1/chat/completions", json=body).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "content",
+    [["x"], [{"type": "text", "text": 5}], [None, {"type": "text", "text": "I live in Berlin"}]],
+)
+def test_content_parts_of_the_wrong_shape_are_left_to_the_upstream(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, content: Any
+) -> None:
+    """内容块形状不对（不是对象、text 不是字符串）的请求照常转发、由上游判断：以前在读它的文字
+    时 AttributeError / TypeError，500。这一轮写不进记忆时只丢这一次写回。"""
+    sent = chat(client, content, user="alice")
+    assert sent.status_code == 200, sent.text
+    assert upstream.proxied[-1]["messages"][-1]["content"] == content  # 原样转发
+    again = chat(client, "and now?", [{"role": "user", "content": content}], user="alice")
+    assert again.status_code == 200, again.text
+    (run,) = proxy._runs.values()
+    assert run.busy == 0 and run.unsaved == []
+    said = [t.text for t in system.db.get_turns("alice") if t.role == "user"]
+    assert said[-1] == "and now?" and len(said) <= 2  # 形状对的那一块（如果有）照常写进去
 
 
 def test_upstream_errors_are_returned_and_not_remembered(

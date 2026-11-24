@@ -104,15 +104,26 @@ _IMAGE_SUFFIX = {
 }
 
 
+# user_id、agent_id 与 run_id 最多这么多个字符（第十轮体检 Q7）。ID 写在每句发言、每条事实、每个
+# 向量的附加信息与 trace 里：以前不限，一个 1 MiB 的 user 每个请求让数据库长 16 到 30 MB。邮箱
+# （最长 254）与 UUID 都放得下；按字符算，UTF-8 下最多约 1 KiB
+MAX_ID_CHARS = 256
+
+
 def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
     """user_id、agent_id → 记忆空间 ID。两者都给时是这个 Agent 对这个用户的记忆。
 
     "/" 是分隔符，所以 ID 里的 "/" 与 "%" 先转义（URL 的百分号编码）：否则 user_id="agent/x"
-    与 agent_id="x" 会落进同一个空间。不含这两个字符的 ID 原样保留（"alice" 还是 "alice"）。"""
+    与 agent_id="x" 会落进同一个空间。不含这两个字符的 ID 原样保留（"alice" 还是 "alice"）。
+    超过 MAX_ID_CHARS 个字符的 ID 报 ValueError（各个接口上是 400），出错里不写 ID 本身。"""
     # 别的类型（user_id=42）以前在 _part 里 AttributeError；/api/v1 的请求校验报 ValueError
     for name, value in (("user_id", user_id), ("agent_id", agent_id)):
         if value is not None and not isinstance(value, str):
             raise ValueError(f"{name} must be a string")
+        if value is not None and len(value) > MAX_ID_CHARS:
+            raise ValueError(
+                f"{name} must be at most {MAX_ID_CHARS} characters (got {len(value)})."
+            )
     if user_id and agent_id:
         return f"{_part(agent_id)}/{_part(user_id)}"
     if user_id:
@@ -129,19 +140,36 @@ def space_owner(space: str) -> tuple[str | None, str | None] | None:
     （space_for("x", "agent")）也落在这里，但不能因此算作用户 x 的，否则只能访问用户 x 的令牌
     借 agent_id="agent" 就读到了 Agent x 的记忆。不是由 space_for 得来的空间（评测、手工起的名字
     里有两个以上的 "/"，或者 "%" 的写法与 space_for 不同）返回 None。解出来的 ID 再过一遍
-    space_for，逐字相同才算。"""
-    left, slash, right = space.partition("/")
-    owner: tuple[str | None, str | None]
-    if not slash:
-        owner = (_unpart(space), None)
-    elif left == "agent":
-        owner = (None, _unpart(right))
-    else:
-        owner = (_unpart(right), _unpart(left))
+    space_for，逐字相同才算。ID 超过 MAX_ID_CHARS 个字符的空间（有这个上限之前建的）也返回
+    None：限定作用域的令牌用不了它，管理令牌按空间 ID 照常能读、导出与遗忘。"""
+    owner = _owner(space)
     try:
         return owner if space_for(*owner) == space else None
-    except ValueError:  # 空的 ID
+    except ValueError:  # 空的 ID、超过 MAX_ID_CHARS 个字符的 ID
         return None
+
+
+def ids_too_long(space: str) -> bool:
+    """这个空间解回的 user_id 或 agent_id 超过 MAX_ID_CHARS 个字符（space_owner 因此是 None）：
+    接口据此回 400 而不是 403。"""
+    return any(part is not None and len(part) > MAX_ID_CHARS for part in _owner(space))
+
+
+def check_run_id(run_id: str | None) -> None:
+    """add、open_run 的 run_id 最多 MAX_ID_CHARS 个字符（ValueError，与 user_id 相同）：它写在
+    这个会话的每句发言上。只在写入时查：已有的更长的会话照常能检索、结束与遗忘。"""
+    if isinstance(run_id, str) and len(run_id) > MAX_ID_CHARS:
+        raise ValueError(f"run_id must be at most {MAX_ID_CHARS} characters (got {len(run_id)}).")
+
+
+def _owner(space: str) -> tuple[str | None, str | None]:
+    """空间 ID 照 space_for 的写法拆回的（user_id，agent_id），不检查（见 space_owner）。"""
+    left, slash, right = space.partition("/")
+    if not slash:
+        return (_unpart(space), None)
+    if left == "agent":
+        return (None, _unpart(right))
+    return (_unpart(right), _unpart(left))
 
 
 def _part(value: str) -> str:
@@ -298,6 +326,7 @@ class Memory:
         同一个键只有一个写进去，别的回滚、按 duplicate 返回。
         """
         space = space_for(user_id, agent_id)
+        check_run_id(run_id)
         keyed: tuple[str, str] | None = None
         if idempotency_key is not None:  # 不给键时与以前完全相同，不多一次查询
             keyed = (
@@ -454,6 +483,7 @@ class Memory:
         30 分钟没有 add）的 run 先交给抽取，之后再 add 时重新打开（close_idle_runs）；本进程接手过
         的 run 同样（MemorySystem.resume_left_open）。"""
         space = space_for(user_id, agent_id)
+        check_run_id(run_id)
         rid = run_id or sortable_session_id("run", datetime.now())
         with self._runs_lock:
             self._make_room(space, rid)

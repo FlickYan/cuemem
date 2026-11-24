@@ -89,6 +89,7 @@ from cuemem.errors import (
 )
 from cuemem.read.controller import Router
 from cuemem.sdk import (
+    MAX_ID_CHARS,
     AnswerMode,
     Lam,
     Memory,
@@ -96,6 +97,7 @@ from cuemem.sdk import (
     SearchMode,
     _moment,
     _scope,
+    ids_too_long,
     space_for,
 )
 from cuemem.store.media import ACCEPTED_FORMATS
@@ -731,8 +733,15 @@ def _filters(raw: str | None) -> dict[str, Any] | None:
 
 
 def _allow(who: Principal, space: str | None) -> None:
-    """请求点名的空间在令牌的作用域之外：403。"""
+    """请求点名的空间在令牌的作用域之外：403。导入的文件里的空间，用户或 Agent 的 ID 超过
+    MAX_ID_CHARS 个字符时 400（别的接口上 space_for 已经报了 ValueError）。"""
     if not who.allows(space):
+        if space and ids_too_long(space):
+            raise V1Error(
+                400,
+                f"user_id and agent_id must be at most {MAX_ID_CHARS} characters.",
+                error_type="ValueError",
+            )
         raise V1Error(403, f"This API key cannot access the memory space {space!r}.")
 
 
@@ -1067,7 +1076,7 @@ def memories_router(
         if user_id is not None or agent_id is not None:
             with _sdk_errors():
                 allow(http, user_id, agent_id)
-            spaces = space_for(user_id, agent_id).__eq__
+                spaces = space_for(user_id, agent_id).__eq__
         else:
             spaces = None if who.admin else who.allows
         worker = memory.system.worker
@@ -1117,20 +1126,31 @@ def memories_router(
         # 写进哪个空间与 Memory.load 的取法相同：给了 user_id、agent_id 时是它们的空间，否则是
         # 文件里的 space_id。Mem0 的导出先换算（from_mem0），按换算出的空间查作用域：混着几个
         # 用户、又没给 user_id 时 400，作用域之外的空间 403
-        data = request.data
+        from cuemem.portable import longest_session_id
+
+        data = source = request.data
         if request.format == "mem0":
             from cuemem.portable import from_mem0
 
             with _sdk_errors():
-                converted = from_mem0(data, user_id=request.user_id, agent_id=request.agent_id)
-            target: str | None = str(converted["space_id"])
+                source = from_mem0(data, user_id=request.user_id, agent_id=request.agent_id)
+            target: str | None = str(source["space_id"])
         elif request.user_id or request.agent_id:
-            target = space_for(request.user_id, request.agent_id)
+            with _sdk_errors():  # 太长的 ID：400（第十轮体检 Q7；以前在这里是 500）
+                target = space_for(request.user_id, request.agent_id)
         else:
             target = (
                 str(data["space_id"]) if isinstance(data, dict) and "space_id" in data else None
             )
-        _allow(principal_of(http), target)
+        who = principal_of(http)
+        _allow(who, target)
+        if not who.admin and (longest := longest_session_id(source)) > MAX_ID_CHARS:
+            # 会话 ID 写在它的每句发言上。管理令牌与命令行照常能导入（恢复有上限之前的导出）
+            raise V1Error(
+                400,
+                f"session_id must be at most {MAX_ID_CHARS} characters (got {longest}).",
+                error_type="ValueError",
+            )
         room(http, target)
         with _sdk_errors():
             return memory.load(
