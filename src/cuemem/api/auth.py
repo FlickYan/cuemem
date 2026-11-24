@@ -36,9 +36,12 @@
         max_concurrent: 4            # /api、/api/v1、/v1、/mcp 同时在处理的请求最多这么多个
                                      # （429；不写时是 CUEMEM_MAX_CONCURRENT_PER_KEY，默认 8）
         max_spaces: 20               # 最多这么多个记忆空间（第八轮体检）：要建新空间的写入 429
+        max_daily_tokens: 2000000    # 记忆代理一天转发的补全最多用这么多 token（第十轮体检
+                                     # Q19，输入加输出，服务器本地的一天）：用完之后 429
 
-  models、max_output_tokens 只管记忆代理（/v1/chat/completions、/v1/responses）；别的接口用配置里
-  的角色与模型。
+  models、max_output_tokens、max_daily_tokens 只管记忆代理（/v1/chat/completions、
+  /v1/responses）；别的接口用配置里的角色与模型。max_daily_tokens 的算法与它管不到的在
+  api/proxy.py 的模块说明里。
   models 里的别名只放行这个别名（连同目录里它的 extra_body）：写 deepseek-flash 的令牌不能用
   同一个模型 ID 打开思考的 deepseek-flash-thinking。只写 max_output_tokens 管不住调用方的开关
   （enable_thinking、thinking 原样转发），要固定它们得写 models。
@@ -141,9 +144,9 @@ class Scope:
 class Principal:
     """一个令牌是谁、能访问什么。admin：不受作用域限制（管理令牌；没配令牌时的本机演示）。
 
-    rate_per_minute、models、max_output_tokens、max_spaces：限定作用域的令牌可选的用量限制（见模块
-    说明），None 是不限。max_concurrent：同时在处理的请求数的上限（api/limits.py），None 时用
-    CUEMEM_MAX_CONCURRENT_PER_KEY（默认 8）；管理令牌不限。"""
+    rate_per_minute、models、max_output_tokens、max_spaces、max_daily_tokens：限定作用域的令牌
+    可选的用量限制（见模块说明），None 是不限。max_concurrent：同时在处理的请求数的上限
+    （api/limits.py），None 时用 CUEMEM_MAX_CONCURRENT_PER_KEY（默认 8）；管理令牌不限。"""
 
     name: str
     admin: bool = False
@@ -153,6 +156,7 @@ class Principal:
     max_output_tokens: int | None = None
     max_concurrent: int | None = None
     max_spaces: int | None = None
+    max_daily_tokens: int | None = None
 
     def allows(self, space: str | None) -> bool:
         """能不能访问这个记忆空间：空间解回的（user_id，agent_id）要在作用域里。"""
@@ -534,6 +538,7 @@ class _KeyIn(BaseModel):
     max_output_tokens: _PositiveInt | None = None
     max_concurrent: _PositiveInt | None = None
     max_spaces: _PositiveInt | None = None
+    max_daily_tokens: _PositiveInt | None = None
 
 
 class _KeysIn(BaseModel):
@@ -566,6 +571,7 @@ def _key(entry: _KeyIn, where: str) -> tuple[bytes, Principal]:
         max_output_tokens=entry.max_output_tokens,
         max_concurrent=entry.max_concurrent,
         max_spaces=entry.max_spaces,
+        max_daily_tokens=entry.max_daily_tokens,
     )
 
 
@@ -630,6 +636,7 @@ def key_entry(
     max_output_tokens: int | None = None,
     max_concurrent: int | None = None,
     max_spaces: int | None = None,
+    max_daily_tokens: int | None = None,
     indent: str = "  ",
 ) -> str:
     """一个限定作用域的令牌的 YAML（块状写法，列表项缩进 indent，以换行结尾）：一项作用域，
@@ -654,6 +661,8 @@ def key_entry(
         lines.append(f"{pad}max_concurrent: {max_concurrent}")
     if max_spaces is not None:
         lines.append(f"{pad}max_spaces: {max_spaces}")
+    if max_daily_tokens is not None:
+        lines.append(f"{pad}max_daily_tokens: {max_daily_tokens}")
     return "\n".join(lines) + "\n"
 
 

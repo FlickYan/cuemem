@@ -52,13 +52,25 @@ _make_room）。
 记得了（调用方写了 stream_options: {"include_usage": true}），代理不替调用方加这个参数（转发的
 请求逐字节不变；只有 /v1/responses 的流式由代理加），没有 usage 的流记成 proxy-unmetered
 角色的一行（token 数是 0，看得出有多少次没计量）。上游出错的请求不记；账本写不进去时只记
-警告，回答照样返回。按令牌的每日预算还没有。限定作用域的令牌可以另外写（第四轮体检，见
-api/auth.py；不写时转发的请求逐字节不变）：
+警告，回答照样返回。限定作用域的令牌可以另外写（第四轮体检，见 api/auth.py；不写时转发的请求
+逐字节不变）：
 models（只能用这些模型，之外 403；目录里的 extra_body 盖过调用方给的；列出的别名只放行它自己，
 不放行同一个模型 ID 的别的别名，见 _upstream）与 max_output_tokens（max_tokens、
 max_completion_tokens 不超过它，并且总按这个模型在目录里的写法 max_tokens_param 写上一份；n 只能
 是 1，否则 400）。都在检索、开会话与转发之前查。max_output_tokens 管不住调用方的开关
 （enable_thinking、thinking），只有 models 管得住。
+
+按令牌的每日预算（第十轮体检 Q19）：令牌写了 max_daily_tokens 时，它经 /v1/chat/completions 与
+/v1/responses 转发的补全，上游报的输入加输出的 token 数按（令牌的名字，服务器本地的日期）累计
+（账本里的 key_usage 表，与 cuemem usage --today 同一个“今天”；不写这一项的令牌不记、账本里
+没有这张表），到了预算之后的请求 429（rate_limit_error，code 是 budget_exceeded，Retry-After 是
+到本地零点的秒数），在检索、开会话与转发之前。数的是 token 不是钱：目录里的标价币种不一、有
+错峰系数。请求开始之前查，已经在路上的请求（最多 max_concurrent 个）还会用掉一些，可能超出。
+每次查都读账本：重启之后、与同一个数据目录上的另一个进程（cuemem serve 与 cuemem proxy）合计；
+账本写不进去时只按这个进程自己记的数算。这种令牌的流式请求由代理加上 stream_options:
+{"include_usage": true}（不然数不了），上游多发的那个只有用量的块不转给没要它的调用方；不认
+stream_options 的上游会因此回 400。管不到的：/v1/embeddings、/api、/api/v1、/mcp，与这个令牌
+写进去的内容之后抽取、向量化的花费；上游没报用量的 200 只数次数（unmetered）。
 
 另外两个 OpenAI 兼容的接口：
 - /v1/responses：Responses API 的一个子集——输入是文字（字符串或 input_text 的消息）与用户
@@ -83,6 +95,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -91,7 +104,7 @@ from collections import Counter, OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Any
 
 import anyio
@@ -180,6 +193,11 @@ def _short(value: Any, shown: int = MODEL_NAME_SHOWN) -> str:
     名字是调用方写的，最长能到请求体的上限（第十轮体检 Q6）。403 里的用户与 Agent 也这样写。"""
     text = value if isinstance(value, str) else str(value)
     return text if len(text) <= shown else text[:shown] + "…"
+
+
+def _now() -> datetime:
+    """现在（服务器本地时间）：每日预算的“今天”与到零点还有多久。单独写出来，测试里换掉。"""
+    return datetime.now()
 
 
 class ProxyError(Exception):
@@ -295,6 +313,9 @@ class Turn:
     released: bool = False  # 这次请求已经从 run.busy 里减掉（MemoryProxy._release）
     spec: ModelSpec | None = None  # 转发用的模型（目录里的一项）与它在账本里的别名（_meter）
     alias: str = ""
+    # 令牌写了 max_daily_tokens 时它的名字与预算（_meter 按名字累计，见模块说明）；否则 None
+    key: str | None = None
+    budget: int | None = None
 
 
 class MemoryProxy:
@@ -333,6 +354,8 @@ class MemoryProxy:
         self._parked: OrderedDict[tuple[str, str | None], tuple[str, float]] = OrderedDict()
         self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间
         self._warned: set[str] = set()  # 已经警告过的不认识的模型名
+        # （令牌的名字，日期）-> 这个进程替它转发的 token 数（只有写了 max_daily_tokens 的令牌）
+        self._spent: dict[tuple[str, str], int] = {}
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的抽取在后台完成
 
@@ -394,6 +417,15 @@ class MemoryProxy:
         turn, upstream, url, auth = self._prepare(body, headers, principal)
         # 返回 _Relay 时请求还没答完（它结束时 _release）；别的出口在这里就答完了
         try:
+            # 有每日预算的令牌：流里要有用量才数得了。调用方没要时代理替它要，多出来的那个只有
+            # 用量的块不转给它（_Relay）；没有预算的令牌照旧逐字节不变
+            options = upstream.get("stream_options")
+            asked = turn.budget is not None and not (
+                isinstance(options, dict) and options.get("include_usage") is True
+            )
+            if asked:
+                kept = options if isinstance(options, dict) else {}
+                upstream["stream_options"] = {**kept, "include_usage": True}
             request = self._http.build_request("POST", url, json=upstream, headers=auth)
             extra = _headers(turn, upstream["model"])
             started = time.perf_counter()
@@ -410,7 +442,7 @@ class MemoryProxy:
                     response.close()
                 self._release(turn)
                 return response.status_code, iter([content]), {**extra, **_retry_headers(response)}
-            return 200, _Relay(self, turn, response, started), extra
+            return 200, _Relay(self, turn, response, started, drop_usage_chunk=asked), extra
         except BaseException:
             self._release(turn)
             raise
@@ -690,8 +722,11 @@ class MemoryProxy:
             if exc.status == 503:  # 缺 Key 排在令牌的作用域之后：越权的请求照旧先 403
                 self._identity(body, headers, principal)
             raise
+        budget = self._check_budget(principal)
         turn = self._recall(body, headers, principal)
         turn.spec, turn.alias = spec, alias
+        if principal is not None and budget is not None:
+            turn.key, turn.budget = principal.name, budget
         if turn.anchor is not None and turn.block:
             # 放进最后一句用户消息；它之后的消息（工具调用与结果等）原样接在后面。请求以用户
             # 消息结尾时后面没有东西，与以前逐字节相同
@@ -986,12 +1021,60 @@ class MemoryProxy:
                 MODEL_NAMES_WARNED,
             )
 
+    def _check_budget(self, principal: Principal | None) -> int | None:
+        """令牌的每日预算（max_daily_tokens；没写、管理令牌、不鉴权时 None）。今天已经用到了时
+        ProxyError（429，见模块说明）。用掉的取这个进程自己记的与账本里的较大者：账本里有重启
+        之前的与别的进程的，账本写不进去时自己记的还在。"""
+        if principal is None or principal.admin or principal.max_daily_tokens is None:
+            return None
+        budget, now = principal.max_daily_tokens, _now()
+        day = now.date().isoformat()
+        with self._lock:
+            used = self._spent.get((principal.name, day), 0)
+        try:
+            used = max(used, self.system.ledger.key_tokens(principal.name, day))
+        except Exception as exc:  # 账本读不了（已经关了等）：按自己记的算
+            logger.warning(
+                "读不出令牌今天的用量，按这个进程记的算：%s: %s", type(exc).__name__, exc
+            )
+        if used < budget:
+            return budget
+        midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+        raise ProxyError(
+            429,
+            f"This API key has used its daily token budget ({used} of {budget} tokens today). "
+            "It resets at midnight, server time.",
+            kind="rate_limit_error",
+            code="budget_exceeded",
+            headers={
+                "Retry-After": str(max(1, math.ceil((midnight - now).total_seconds()))),
+                "x-should-retry": "false",  # 马上重试也一样：等到第二天，或者请运营者调高预算
+            },
+        )
+
     def _meter(self, turn: Turn, usage: Usage | None, latency_ms: float) -> None:
         """转发出去的一次补全记进用量账本（见模块说明）：角色 proxy；上游没报用量（usage 是
         None）时记 proxy-unmetered 的一行，token 数与成本都是 0。记不进去（账本被别的进程锁着
-        等）只记一条警告：回答已经付过钱，照样返回、照样写回。"""
+        等）只记一条警告：回答已经付过钱，照样返回、照样写回。令牌有每日预算（turn.key）时另外
+        按令牌累计输入加输出的 token 数：先记在这个进程里，再记进账本的 key_usage。"""
         if turn.spec is None:
             return
+        if turn.key is not None:
+            tokens = usage.input_tokens + usage.output_tokens if usage is not None else 0
+            day = _now().date().isoformat()
+            with self._lock:
+                for stale in [k for k in self._spent if k[1] != day]:  # 昨天的不用留
+                    del self._spent[stale]
+                self._spent[(turn.key, day)] = self._spent.get((turn.key, day), 0) + tokens
+            try:
+                self.system.ledger.add_key_usage(turn.key, day, tokens, unmetered=usage is None)
+            except Exception as exc:
+                logger.warning(
+                    "令牌 %s 的这一次用量没有记进账本（这个进程里照常数着）：%s: %s",
+                    turn.key,
+                    type(exc).__name__,
+                    exc,
+                )
         try:
             self.system.llm.account(
                 "proxy" if usage is not None else "proxy-unmetered",
@@ -1113,13 +1196,22 @@ class _Relay(Iterator[bytes]):
 
     用量（MemoryProxy._meter）：流里最后一个带 usage 的块是这次补全的用量。读完与中途停下的
     都记（停下之前的输出也算钱），没见到 usage 的记成没计量的；上游中途出错的只有见到 usage
-    才记。
+    才记。drop_usage_chunk：include_usage 是代理替有每日预算的令牌加的（MemoryProxy.stream），
+    调用方没要：只有用量的那个块（choices 是空的）照常记，但不转给它，后面的空行也不转。
 
     写成类而不是生成器：还没开始读就 close() 的生成器不执行收尾，上游的连接一直占着。"""
 
     def __init__(
-        self, proxy: MemoryProxy, turn: Turn, response: httpx2.Response, started: float
+        self,
+        proxy: MemoryProxy,
+        turn: Turn,
+        response: httpx2.Response,
+        started: float,
+        *,
+        drop_usage_chunk: bool = False,
     ) -> None:
+        self._drop_usage = drop_usage_chunk
+        self._dropped = False  # 刚丢掉只有用量的块：它后面的空行也不转
         self._proxy = proxy
         self._turn = turn
         self._response = response
@@ -1141,12 +1233,18 @@ class _Relay(Iterator[bytes]):
         except BaseException:
             self._end("failed")
             raise
+        dropped, self._dropped = self._dropped, False
+        if dropped and not line:
+            return self.__next__()
         payload = line[5:].strip() if line.startswith("data:") else ""
         if payload and payload != "[DONE]":
             chunk = _sse_json(payload)
             self._error = self._error or bool(chunk.get("error"))
             self._pieces.append(_delta_text(chunk))
             self._usage = _usage(chunk) or self._usage
+            if self._drop_usage and chunk.get("choices") == [] and "usage" in chunk:
+                self._dropped = True
+                return self.__next__()
         return (line + "\n").encode()
 
     def close(self) -> None:

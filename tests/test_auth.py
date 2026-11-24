@@ -10,14 +10,16 @@ import functools
 import hashlib
 import io
 import json
+import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +34,10 @@ from scripted import ScriptedModel, echo_extraction
 from cuemem import MemoryClient
 from cuemem.agent import Agent
 from cuemem.api import auth
+from cuemem.api import proxy as proxy_module
 from cuemem.api.app import create_app
 from cuemem.api.auth import ADMIN, Keys, Principal, Scope
-from cuemem.api.proxy import MemoryProxy, create_proxy_app
+from cuemem.api.proxy import MemoryProxy, ProxyError, create_proxy_app
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
 from cuemem.core.models import SessionIn, TurnIn
@@ -1236,6 +1239,175 @@ def test_scoped_keys_without_limits_forward_the_same_bytes(
     assert sent[0] == sent[1]
 
 
+BUDGET_TOKEN = "budget-token-0123456789"
+BUDGETS = f"""
+keys:
+  - name: metered
+    token: {BUDGET_TOKEN}
+    scopes: [{{user: alice}}]
+    max_daily_tokens: 200
+  - name: plain
+    token: {PLAIN_TOKEN}
+    scopes: [{{user: alice}}]
+"""
+Budgeted = tuple[TestClient, MemoryProxy, FakeAPI, MemorySystem]
+
+
+@pytest.fixture
+def budgeted(n3_settings: Settings, fake_api: FakeAPI) -> Iterator[Budgeted]:
+    fake_api.chat_replies = ["Your PIN is 1234"]
+    system = MemorySystem.from_settings(n3_settings, http_client=fake_api.client())
+    proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    app = create_proxy_app(proxy, keys=Keys.parse(BUDGETS, ADMIN_TOKEN))
+    try:
+        with TestClient(app) as http:
+            yield http, proxy, fake_api, system
+    finally:
+        proxy.close_all()
+        system.close()
+
+
+def _tables(system: MemorySystem) -> set[str]:
+    """账本文件里的表。"""
+    conn = sqlite3.connect(system.settings.paths.ledger)
+    try:
+        return {name for (name,) in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+
+
+def test_a_daily_token_budget_refuses_once_it_is_used(
+    budgeted: Budgeted, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第十轮体检 Q19：令牌写了 max_daily_tokens（这里 200）时，记忆代理转发的补全按上游报的
+    输入加输出的 token 数累计（假上游每次 120 + 30），到了预算之后 429（budget_exceeded，带
+    Retry-After），在检索、开会话与转发之前；/v1/responses 与流式一样。别的令牌不受影响。第二天
+    重新算；重启（新的 MemoryProxy，同一个账本）之后照旧拒绝。"""
+    http, proxy, fake_api, system = budgeted
+    noon = datetime(2026, 11, 24, 12, 0, 0)
+    monkeypatch.setattr(proxy_module, "_now", lambda: noon)
+    one = {"X-CueMem-Session": "s1"}  # 同一个会话：期间没有后台抽取的请求
+    for _ in range(2):  # 第二次开始之前用了 150，还没到 200：放行（请求开始之前查）
+        assert _chat(http, BUDGET_TOKEN, user="alice", headers=one).status_code == 200
+    assert system.ledger.key_tokens("metered", "2026-11-24") == 300
+    sent, turns = len(fake_api.chat_requests), len(system.db.get_turns("alice"))
+    for extra in ({"user": "alice"}, {}, {"stream": True}, {"path": "/v1/responses"}):
+        refused = _chat(http, BUDGET_TOKEN, **extra)
+        assert refused.status_code == 429, refused.text
+        error = refused.json()["error"]
+        assert (error["type"], error["code"]) == ("rate_limit_error", "budget_exceeded")
+        assert "300 of 200 tokens" in error["message"]
+        assert refused.headers["retry-after"] == str(12 * 3600)  # 到本地零点
+        assert refused.headers["x-should-retry"] == "false"
+    assert len(fake_api.chat_requests) == sent  # 没转发
+    assert len(system.db.get_turns("alice")) == turns
+    for token in (PLAIN_TOKEN, ADMIN_TOKEN):
+        assert _chat(http, token, user="alice", headers=one).status_code == 200
+    assert system.ledger.key_usage("2026-11-24") == [
+        {"key": "metered", "tokens": 300, "calls": 2, "unmetered": 0}
+    ]
+
+    # 重启：这个进程自己记的没有了，账本里的还在
+    again = MemoryProxy(system, http_client=fake_api.client(), mode="l1")
+    with pytest.raises(ProxyError) as caught:
+        again.complete({"messages": [{"role": "user", "content": "hi"}]}, {}, _metered())
+    assert caught.value.status == 429 and caught.value.body["error"]["code"] == "budget_exceeded"
+
+    monkeypatch.setattr(proxy_module, "_now", lambda: noon + timedelta(days=1))
+    assert _chat(http, BUDGET_TOKEN, user="alice", headers=one).status_code == 200  # 第二天
+    assert system.ledger.key_tokens("metered", "2026-11-25") == 150
+    assert list(proxy._spent) == [("metered", "2026-11-25")]  # 昨天的不留
+
+
+def _metered() -> Principal:
+    principal = Keys.parse(BUDGETS).resolve(BUDGET_TOKEN)
+    assert principal is not None and principal.max_daily_tokens == 200
+    return principal
+
+
+def test_a_daily_budget_counts_on_when_the_ledger_cannot_be_written(
+    budgeted: Budgeted, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """账本写不进去（被别的进程锁着）：回答照样返回，只记警告；这个进程自己记的数照常算，预算
+    照样拦得住（重启之后才丢）。"""
+    http, _, _, system = budgeted
+
+    def locked(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(system.ledger, "add_key_usage", locked)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        for _ in range(2):
+            assert _chat(http, BUDGET_TOKEN).status_code == 200
+    assert sum("metered" in r.getMessage() for r in caplog.records) == 2
+    assert system.ledger.key_tokens("metered", datetime.now().date().isoformat()) == 0
+    assert _chat(http, BUDGET_TOKEN).status_code == 429
+
+
+def test_a_budgeted_stream_is_counted_without_showing_the_usage_chunk(
+    budgeted: Budgeted,
+) -> None:
+    """有每日预算的令牌的流式请求：调用方没写 stream_options.include_usage 时代理替它写（不然
+    流里没有用量，数不了），上游多发的那个只有用量的块（choices 是空的）不转给调用方，别的行
+    原样。调用方自己要了用量时原样转给它。/v1/responses 的流照旧在结束事件里带用量。"""
+    http, _, fake_api, system = budgeted
+    today = datetime.now().date().isoformat()
+    plain = _chat(http, PLAIN_TOKEN, stream=True)
+    assert "stream_options" not in fake_api.chat_requests[-1]
+    assert '"choices": []' in plain.text  # 假上游总发用量的块：没有预算的令牌原样转发
+
+    streamed = _chat(http, BUDGET_TOKEN, stream=True)
+    assert streamed.status_code == 200
+    assert fake_api.chat_requests[-1]["stream_options"] == {"include_usage": True}
+    kept = [line for line in plain.text.split("\n\n") if '"choices": []' not in line]
+    assert streamed.text == "\n\n".join(kept)
+    assert '"usage"' not in streamed.text and streamed.text.endswith("data: [DONE]\n\n")
+    assert system.ledger.key_tokens("metered", today) == 13  # 假上游的流报 10 + 3
+
+    options = {"include_usage": True, "x": 1}
+    asked = _chat(http, BUDGET_TOKEN, stream=True, stream_options=options)
+    assert fake_api.chat_requests[-1]["stream_options"] == options
+    assert asked.text == plain.text  # 调用方要了：用量的块照常转给它
+    declined = {"include_usage": False, "x": 1}
+    _chat(http, BUDGET_TOKEN, stream=True, stream_options=declined)
+    assert fake_api.chat_requests[-1]["stream_options"] == options  # 别的选项留着
+    assert system.ledger.key_tokens("metered", today) == 39
+
+    events = _chat(http, BUDGET_TOKEN, path="/v1/responses", stream=True)
+    assert events.status_code == 200
+    last = json.loads(events.text.strip().split("\n\n")[-1].split("data: ", 1)[1])
+    assert last["type"] == "response.completed"
+    assert last["response"]["usage"]["total_tokens"] == 13
+    assert system.ledger.key_usage(today) == [
+        {"key": "metered", "tokens": 52, "calls": 4, "unmetered": 0}
+    ]
+
+
+def test_keys_without_a_daily_budget_forward_the_same_bytes_and_keep_no_table(
+    budgeted: Budgeted,
+) -> None:
+    """没写 max_daily_tokens 的令牌、管理令牌：转发的请求与以前逐字节相同（流式不加
+    stream_options），账本里没有 key_usage 这张表；有预算的令牌的非流式请求体也不变。"""
+    http, proxy, fake_api, system = budgeted
+    body = {**EXPENSIVE, "temperature": 0.3, "tools": [{"type": "function", "function": {}}]}
+    for extra in ({}, {"stream": True}):
+        sent = []
+        for token in (ADMIN_TOKEN, PLAIN_TOKEN):
+            assert _chat(http, token, **body, **extra).status_code == 200
+            sent.append(json.dumps(fake_api.chat_requests[-1], sort_keys=True))
+        assert sent[0] == sent[1] and "stream_options" not in sent[0]
+    assert system.ledger.key_tokens("plain", datetime.now().date().isoformat()) == 0
+    assert system.ledger.key_usage(datetime.now().date().isoformat()) == []
+    assert _tables(system) >= {"usage"} and "key_usage" not in _tables(system)
+    assert proxy._spent == {}
+
+    assert _chat(http, BUDGET_TOKEN, **body).status_code == 200
+    assert json.dumps(fake_api.chat_requests[-1], sort_keys=True) == sent[0].replace(
+        ', "stream": true', ""
+    )
+    assert "key_usage" in _tables(system)  # 第一次记有预算的令牌时才建
+
+
 def test_key_limits_are_validated() -> None:
     """rate_per_minute、max_output_tokens 是正整数；models 不能是空列表，也不能有空的名字。"""
     for entry, problem in (
@@ -1247,6 +1419,8 @@ def test_key_limits_are_validated() -> None:
         ("models: qwen3.8-flash", "models"),
         ("max_concurrent: 0", "max_concurrent"),
         ("max_concurrent: '4'", "max_concurrent"),
+        ("max_daily_tokens: 0", "max_daily_tokens"),
+        ("max_daily_tokens: '5'", "max_daily_tokens"),
     ):
         with pytest.raises(AccessKeysError) as caught:
             Keys.parse(_keys(f"name: a, token: t, scopes: [{{user: a}}], {entry}"))

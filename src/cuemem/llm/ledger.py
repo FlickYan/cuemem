@@ -5,6 +5,10 @@
 - cost_cached：按供应商报告的缓存命中 token 打折后的估算，非高峰时段的调用再乘上错峰系数
   （LLMClient.account 记账前已经乘好），更接近真实账单。
 命中本地响应缓存的调用（from_cache=True）实际没有花钱，汇总时单独统计。
+
+另有一张 key_usage 表（第十轮体检 Q19）：记忆代理给写了 max_daily_tokens 的令牌按（令牌的名字，
+服务器本地的日期）累计转发的 token 数，每日预算据此算。只在第一次记这样的用量时建
+（add_key_usage）：评测与没有这种令牌的部署的账本文件里没有它，usage 表与它的写法不变。
 """
 
 from __future__ import annotations
@@ -118,6 +122,65 @@ class Ledger:
                 self.failing = True
             else:
                 self.failing = False
+
+    def add_key_usage(self, key: str, day: str, tokens: int, *, unmetered: bool = False) -> None:
+        """记忆代理替令牌 key 在 day（服务器本地的日期，ISO 写法）转发的一次补全：tokens（输入加
+        输出）加进这一天的合计，calls 加一；unmetered：上游没报用量的一次（tokens 是 0）。表在
+        第一次调用时才建。磁盘写不进去时与 record 相同（best_effort 时记警告、不抛出）。"""
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS key_usage ("
+                    " key TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL,"
+                    " calls INTEGER NOT NULL, unmetered INTEGER NOT NULL,"
+                    " PRIMARY KEY (key, day))"
+                )
+                self._conn.execute(
+                    "INSERT INTO key_usage (key, day, tokens, calls, unmetered)"
+                    " VALUES (?, ?, ?, 1, ?)"
+                    " ON CONFLICT (key, day) DO UPDATE SET tokens = tokens + excluded.tokens,"
+                    " calls = calls + 1, unmetered = unmetered + excluded.unmetered",
+                    (key, day, tokens, int(unmetered)),
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                spare_write(
+                    self._conn,
+                    exc,
+                    best_effort=self.best_effort,
+                    failing=self.failing,
+                    what="用量账本",
+                    path=self._path,
+                )
+                self.failing = True
+            else:
+                self.failing = False
+
+    def key_tokens(self, key: str, day: str) -> int:
+        """令牌 key 在 day 已经记下的 token 数；没有这张表、没有这一行或读不出来时 0（不建表）。"""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT tokens FROM key_usage WHERE key = ? AND day = ?", (key, day)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return 0
+        return int(row[0]) if row else 0
+
+    def key_usage(self, day: str) -> list[dict[str, Any]]:
+        """day 这一天各个令牌的用量（key、tokens、calls、unmetered），按名字排；没有这张表时空
+        （不建表）。cuemem usage --by-key 用。"""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT key, tokens, calls, unmetered FROM key_usage WHERE day = ?"
+                    " ORDER BY key",
+                    (day,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        names = ("key", "tokens", "calls", "unmetered")
+        return [dict(zip(names, row, strict=True)) for row in rows]
 
     def summary(
         self, *, run_id: str | None = None, since: datetime | None = None

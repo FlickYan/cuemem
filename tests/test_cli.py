@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -1537,6 +1538,46 @@ def test_keys_add_max_spaces_and_the_any_agent_reminder(
     listed = runner.invoke(app, ["keys", "list"], terminal_width=200)
     assert "空间上限" in listed.stdout
     assert runner.invoke(app, ["keys", "add", "d", "--user", "d", "--max-spaces", "0"]).exit_code
+
+
+def test_keys_add_max_daily_tokens_and_usage_by_key(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """keys add --max-daily-tokens 写进令牌文件（keys list 列出）；cuemem usage --by-key 列出今天
+    记忆代理按令牌记的 token 数，没有记录时说明、不在账本里建表（第十轮体检 Q19）。"""
+    from cuemem.api.auth import Keys
+    from cuemem.llm.ledger import Ledger
+
+    path = tmp_path / "keys.yaml"
+    monkeypatch.setenv("CUEMEM_API_KEYS_FILE", str(path))
+    added = runner.invoke(
+        app, ["keys", "add", "metered", "--user", "*", "--max-daily-tokens", "2000000"]
+    )
+    assert added.exit_code == 0, added.output
+    plain = runner.invoke(app, ["keys", "add", "plain", "--user", "bob", "--agent", "shop"])
+    assert plain.exit_code == 0, plain.output
+    keys = Keys.parse(path.read_text(encoding="utf-8"))
+    assert [p.max_daily_tokens for _, p in keys.scoped] == [2000000, None]
+    assert "max_daily_tokens: 2000000" in path.read_text(encoding="utf-8")
+    listed = runner.invoke(app, ["keys", "list"])
+    assert "每日" in listed.stdout and "2000000" in listed.stdout  # 窄的终端里表头折成两行
+    refused = runner.invoke(app, ["keys", "add", "x", "--user", "x", "--max-daily-tokens", "0"])
+    assert refused.exit_code != 0
+
+    empty = runner.invoke(app, ["usage", "--by-key"])
+    assert empty.exit_code == 0 and "没有按令牌记的用量" in _flat(empty.stdout)
+    ledger_path = tmp_path / "ledger"
+    conn = sqlite3.connect(ledger_path)
+    assert "key_usage" not in {n for (n,) in conn.execute("SELECT name FROM sqlite_master")}
+    conn.close()
+    ledger = Ledger(ledger_path)
+    ledger.add_key_usage("metered", datetime.now().date().isoformat(), 163)
+    ledger.add_key_usage("metered", datetime.now().date().isoformat(), 0, unmetered=True)
+    ledger.add_key_usage("old", "2020-01-01", 5)
+    ledger.close()
+    shown = runner.invoke(app, ["usage", "--by-key"])
+    assert shown.exit_code == 0, shown.output
+    assert "metered" in shown.stdout and "163" in shown.stdout and "old" not in shown.stdout
 
 
 def test_keys_add_says_where_the_file_is_and_never_makes_directories(

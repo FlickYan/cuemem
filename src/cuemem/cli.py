@@ -795,6 +795,13 @@ def spaces() -> None:
 def usage(
     today: Annotated[bool, typer.Option("--today", help="只统计今天")] = False,
     run: Annotated[str | None, typer.Option(help="只统计某次运行（run_id）")] = None,
+    by_key: Annotated[
+        bool,
+        typer.Option(
+            "--by-key",
+            help="写了 max_daily_tokens 的令牌今天经记忆代理用的 token 数（每日预算按它算）",
+        ),
+    ] = False,
 ) -> None:
     """汇总模型调用量与成本。"""
     from cuemem.llm.ledger import Ledger
@@ -807,6 +814,22 @@ def usage(
     except DatabaseOpenError as exc:
         console.print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
+    if by_key:
+        day = datetime.now().date()
+        spent = ledger.key_usage(day.isoformat())
+        ledger.close()
+        if not spent:
+            console.print(f"今天（{day}）没有按令牌记的用量（只记写了 max_daily_tokens 的令牌）。")
+            return
+        table = Table(title=f"{day}：记忆代理按令牌的用量")
+        for column in ("令牌", "token（输入加输出）", "补全次数", "其中没计量"):
+            table.add_column(column)
+        for row in spent:
+            table.add_row(
+                escape(row["key"]), str(row["tokens"]), str(row["calls"]), str(row["unmetered"])
+            )
+        console.print(table)
+        return
     since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) if today else None
     rows = ledger.summary(run_id=run, since=since)
     ledger.close()
@@ -1482,6 +1505,14 @@ def keys_add(
             help="最多这么多个记忆空间：要建新空间的写入 429，已有的照常；不给时不限",
         ),
     ] = None,
+    max_daily_tokens: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="记忆代理一天（服务器本地的一天）转发的补全最多用这么多 token（输入加输出），"
+            "用完之后 429；不给时不限",
+        ),
+    ] = None,
     file: Annotated[Path | None, typer.Option("--file", help=KEYS_FILE_HELP)] = None,
 ) -> None:
     """生成一个限定作用域的令牌，把它的 sha256 加进令牌文件（注释与写法留着，文件改成 0600）。
@@ -1527,6 +1558,7 @@ def keys_add(
             max_output_tokens=max_output_tokens,
             max_concurrent=max_concurrent,
             max_spaces=max_spaces,
+            max_daily_tokens=max_daily_tokens,
             indent=indent,
         )
 
@@ -1605,7 +1637,9 @@ def keys_list(
         return
     table = Table(title=f"{escape(where)}：{len(keys.names)} 个令牌")
     columns = ("名字", "作用域", "每分钟写", "同时处理", "空间上限", "模型", "max_output_tokens")
-    for column in columns:
+    # 每日 token（max_daily_tokens）这一列只在有令牌写了它时才有：窄的终端里别的列不被挤短
+    budgets = any(p.max_daily_tokens is not None for _, p in keys.scoped)
+    for column in (*columns, "每日 token") if budgets else columns:
         table.add_column(column)
     for _, p in keys.scoped:
         table.add_row(
@@ -1616,6 +1650,7 @@ def keys_list(
             str(p.max_spaces or "—"),
             escape(", ".join(p.models)) if p.models is not None else "—",
             str(p.max_output_tokens or "—"),
+            *([str(p.max_daily_tokens or "—")] if budgets else []),
         )
     console.print(table)
 
