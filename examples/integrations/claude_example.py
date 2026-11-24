@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 import anthropic
@@ -40,7 +41,7 @@ from anthropic.types.beta import BetaMessageParam
 from cuemem import Memory
 from cuemem.integrations.claude import CueMemMemoryTool, delete_all, with_recall
 
-MODEL = os.environ["ANTHROPIC_MODEL"]
+MODEL = os.environ.get("ANTHROPIC_MODEL", "")
 USER = "claude-demo"
 SYSTEM = "You are a friendly personal assistant. Keep answers short."
 
@@ -90,6 +91,11 @@ class Conversation:
 
 
 def main() -> None:
+    if not MODEL:  # 不内置默认的模型；没设时一行说明，不是 KeyError 的调用栈
+        sys.exit(
+            "Set ANTHROPIC_MODEL to a Claude model id that supports the memory tool "
+            "(memory_20250818), for example: export ANTHROPIC_MODEL=<model id>"
+        )
     # 不设 CUEMEM_PRESET 时是默认配置：抽取、向量与检索用通义千问；回答模型是 DeepSeek，这里用不到
     memory = Memory()
     delete_all(memory, user_id=USER)  # 演示用户从空白开始：记忆与 Claude 的文件一起删

@@ -7,6 +7,7 @@ import ast
 import asyncio
 import json
 import re
+import runpy
 import sqlite3
 import threading
 import time
@@ -1295,3 +1296,18 @@ def test_the_example_sends_the_whole_history() -> None:
     assert len(calls) == 1
     thread = {k.arg: k.value for k in calls[0].keywords}.get("thread")
     assert isinstance(thread, ast.Constant) and thread.value is False
+
+
+def test_the_example_names_the_missing_model_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """第十轮体检 Q16：没设 ANTHROPIC_MODEL 时示例一行说明要设什么（退出），以前是模块顶层的
+    KeyError 调用栈；examples/README.md 的那一行也没有写这个变量。退出发生在打开 Memory 与
+    建客户端之前，不碰数据目录、不联网。"""
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    example = PROJECT_ROOT / "examples" / "integrations" / "claude_example.py"
+    with pytest.raises(SystemExit, match="ANTHROPIC_MODEL"):
+        runpy.run_path(str(example), run_name="__main__")
+    readme = (PROJECT_ROOT / "examples" / "README.md").read_text("utf-8")
+    rows = [line for line in readme.splitlines() if "claude_example.py" in line]
+    assert len(rows) == 1
+    assert "`ANTHROPIC_MODEL`" in rows[0]
+    assert rows[0].count("ANTHROPIC_MODEL=<model id>") == 2  # 默认配置与 deepseek 预设两条命令

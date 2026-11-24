@@ -7,7 +7,7 @@ CueMem 接进现成 Agent 框架的五种方式，从改动最少到最深：
 | 方式 | 适合 | 谁决定要不要想起 | 见 |
 |---|---|---|---|
 | OpenAI 兼容的记忆代理 | 任何用 OpenAI SDK 的应用，代码不动：Chat Completions、embeddings 与 Responses API 的一个子集（文字与图片输入、文字输出，流式与非流式；没有工具） | 控制器（每轮） | `cuemem proxy`，README |
-| MCP Server | Claude Code、Claude Desktop 等 MCP 客户端 | 模型调用 `recall`（控制器只决定深浅） | `cuemem mcp`（stdio），或 `cuemem serve` 的 `/mcp`（HTTP，令牌同上；D-076 起只认 POST，工具带标题与只读、破坏性的提示） |
+| MCP Server | Claude Code、Claude Desktop 等 MCP 客户端 | 模型调用 `recall`（控制器只决定深浅） | `cuemem mcp`（stdio），或 `cuemem serve` 的 `/mcp`（HTTP，令牌同上；D-076 起只认 POST，工具带标题与只读、破坏性的提示）；[客户端的配置文件](#mcp-客户端的配置文件) |
 | 框架集成（本页） | OpenAI Agents SDK、LangGraph / LangChain、Claude 的 memory tool | 控制器（每次调用模型之前），模型还可以用工具补查 | `cuemem.integrations.*` |
 | Python SDK | 自己写的 Agent 循环 | 调用方 | `from cuemem import Memory` |
 | HTTP 记忆接口 | 别的语言写的应用，或几个进程共用一个服务 | 调用方 | `cuemem serve` 的 `/api/v1/memories`；`from cuemem import MemoryClient` |
@@ -145,6 +145,128 @@ delete_all(memory, user_id="alice")  # 记忆与 Claude 的文件一起删（mem
 - 笔记记下之后供应商出错：改动已经作为笔记写进日志、抽取却出错时（例如余额不足），文件的改动照样成功，笔记只记一次，下次巩固时补上抽取。删除之后重建出错时，删除也照样成功，并说明重建要等下次。
 - Claude 的文件不在 `Memory.export` 里（导出只有原始日志里的笔记）。
 - anthropic 2.3 起，`tool_runner` 默认把对话放在服务端保存的会话（thread）里：一轮里第一次之后的请求只发新消息（之前发过的消息，包括证据块，按发出去的样子留着）。上面的写法每一轮照样从完整的 `history` 开始。用了服务端的会话时，供应商在服务端存着这段对话，证据块也在内；这一份在 CueMem 的遗忘与 `delete_all` 之外。上面的写法与 `examples/integrations/claude_example.py` 都传 `thread=False`（要 anthropic 2.3 或更新；CueMem 的下限 `anthropic>=1.14` 仍接受的 1.x 没有这个参数，用 1.x 时去掉它：1.x 本来就每次发完整历史）。这样每一步都重发完整历史，发出去的都在 CueMem 的遗忘与 `delete_all` 管得到的地方。去掉它是拿遗忘的覆盖换更小的请求：默认的服务端会话把证据块留在供应商那边。供应商把会话或请求留多久，见 Anthropic 的文档。示例运行时要把 `ANTHROPIC_MODEL` 设成支持 memory tool 的 Claude 模型。
+
+## MCP 客户端的配置文件
+
+MCP Server（stdio 的 `cuemem mcp`，或 `cuemem serve` 的 `/mcp`；工具、请求头与错误见[接口参考](api.md#mcp-server)）可以用 `claude mcp add` 这样的命令登记，也可以写进客户端的配置文件。下面的文件在 2026-11 对照各客户端自己的文档核对过；格式是客户端定的、会跟着它们变，某一项不被接受时以链接里的文档为准。`tests/test_docs_mcp_snippets.py` 保证这些代码块里 `cuemem` 的参数一直有效。
+
+### stdio：Claude Code、Cursor、Claude Desktop
+
+客户端自己启动 `cuemem mcp`，一项对应一个记忆空间。同样的一项可以写进三个文件：
+
+- Claude Code：项目根目录的 `.mcp.json`（[文档](https://code.claude.com/docs/en/mcp)）。
+- Cursor：项目里的 `.cursor/mcp.json`，或 `~/.cursor/mcp.json`（[文档](https://cursor.com/docs/context/mcp)）。
+- Claude Desktop：`claude_desktop_config.json`（Settings → Developer → Edit Config；macOS 在 `~/Library/Application Support/Claude/`，Windows 在 `%APPDATA%\Claude\`；[文档](https://modelcontextprotocol.io/docs/develop/connect-local-servers)）。这个文件只收本机的 stdio Server；远程的 Server 在应用里作为 connector 添加。
+
+在源码仓库里：
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "command": "uv",
+      "args": ["--directory", "/abs/path/to/cuemem", "run", "cuemem", "mcp", "--space", "me"]
+    }
+  }
+}
+```
+
+pip 安装之后（`cuemem` 在 PATH 里）：
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "command": "cuemem",
+      "args": ["mcp", "--space", "me"]
+    }
+  }
+}
+```
+
+### HTTP：Claude Code 与 Cursor
+
+连到正在运行的 `cuemem serve`。Claude Code 要写 `"type": "http"`（有 `url` 而没有 `type` 的一项会被当成 stdio Server），变量写成 `${VAR}`：
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "type": "http",
+      "url": "http://127.0.0.1:7860/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CUEMEM_MCP_KEY}",
+        "X-CueMem-User": "alice"
+      }
+    }
+  }
+}
+```
+
+Cursor 不写 `type`，变量写成 `${env:NAME}`：
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "url": "http://127.0.0.1:7860/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:CUEMEM_MCP_KEY}",
+        "X-CueMem-User": "alice"
+      }
+    }
+  }
+}
+```
+
+### VS Code
+
+`.vscode/mcp.json`（[文档](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration)）最外层的键是 `servers`，每一项都有 `type`：
+
+```json
+{
+  "servers": {
+    "cuemem": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["--directory", "/abs/path/to/cuemem", "run", "cuemem", "mcp", "--space", "me"]
+    }
+  }
+}
+```
+
+HTTP 的写法，令牌由 VS Code 问一次并替你保管，不写在文件里：
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "cuemem-key",
+      "description": "CueMem key",
+      "password": true
+    }
+  ],
+  "servers": {
+    "cuemem": {
+      "type": "http",
+      "url": "http://127.0.0.1:7860/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:cuemem-key}",
+        "X-CueMem-User": "alice"
+      }
+    }
+  }
+}
+```
+
+### 各客户端都要注意的
+
+- **模型供应商的 Key（stdio）。** 默认配置下 `cuemem mcp` 需要供应商的 Key。它从数据目录的 `.env` 里读（`cuemem configure` 负责写）：用 `uv --directory` 时是仓库根目录，pip 安装后是 `~/.cuemem/.env`。也可以写在这一项的 `env` 里，`CUEMEM_HOME`、`CUEMEM_PRESET` 也写在那里。没有 Key 时 Server 以退出码 1 结束，错误在 stderr 上，客户端的 MCP 日志里看得到。
+- **绝对路径。** 图形界面的客户端启动 Server 时 PATH 很短。找不到 `uv` 或 `cuemem` 时，`command` 写它的绝对路径（`which uv`、`which cuemem`）。
+- **令牌。** `.mcp.json` 通常会提交进仓库，令牌放在环境变量里（上面的 `${CUEMEM_MCP_KEY}`，在启动客户端的 shell 里设）。优先用 `cuemem keys add <name> --user alice` 建的、只限一个用户的令牌，不用管理员令牌。
+- **`X-CueMem-User`**：用管理员令牌、不设认证、令牌只有通配符作用域时必须带（否则 400）；写明了用户的令牌缺省用它的第一个用户。`X-CueMem-Agent` 可选。不是 ASCII 的 ID 写成 `utf-8''<百分号编码的 UTF-8>`，例如张三是 `utf-8''%E5%BC%A0%E4%B8%89`。
+- **一个数据库一个进程。** stdio 的 Server 自己打开数据目录，不能与正在运行的 `cuemem serve` 共用（`StorageLockedError`）：这时用 HTTP 的写法。
 
 ## 局限
 

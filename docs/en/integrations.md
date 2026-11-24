@@ -7,7 +7,7 @@ There are five ways to plug CueMem into an existing agent stack, from least to m
 | Way in | Good for | Who decides whether to recall | Where |
 |---|---|---|---|
 | OpenAI-compatible memory proxy | Any app on the OpenAI SDK, with no code changes: Chat Completions, embeddings, and a subset of the Responses API (text and image input, text output, streamed or not; no tools) | The controller, every turn | `cuemem proxy`, README |
-| MCP server | Claude Code, Claude Desktop and other MCP clients | The model calls `recall`; the controller only picks the depth | `cuemem mcp` (stdio), or `/mcp` of `cuemem serve` (HTTP, behind the same tokens; POST only, with tool titles and read-only / destructive hints since D-076) |
+| MCP server | Claude Code, Claude Desktop and other MCP clients | The model calls `recall`; the controller only picks the depth | `cuemem mcp` (stdio), or `/mcp` of `cuemem serve` (HTTP, behind the same tokens; POST only, with tool titles and read-only / destructive hints since D-076); [client configuration files](#mcp-client-configuration-files) |
 | Framework integrations (this page) | OpenAI Agents SDK, LangGraph / LangChain, Claude's memory tool | The controller, before every model call; the model can also search with tools | `cuemem.integrations.*` |
 | Python SDK | Your own agent loop | You | `from cuemem import Memory` |
 | Memory API over HTTP | Apps in other languages, or several processes sharing one server | You | `/api/v1/memories` of `cuemem serve`; `from cuemem import MemoryClient` |
@@ -169,6 +169,128 @@ delete_all(memory, user_id="alice")  # memories and Claude's files; memory.delet
 - **Provider failures after the note is logged:** if extraction fails once a change has been written as a note (say, the provider is out of balance), the file change still succeeds and the note is logged once; extraction finishes on the next consolidation. A delete whose rebuild fails after the deletion also succeeds, and says that the rebuild finishes later.
 - **Export:** Claude's files are not in `Memory.export`, which only has the notes in the raw log.
 - **anthropic 2.3 and later:** `tool_runner` keeps the conversation in a thread the server holds by default, so the requests within one turn after the first send only the new messages (the earlier ones, evidence block included, stay as sent). The pattern above still starts each turn from the full `history`. With a thread, the provider stores the conversation server-side, evidence blocks included; that copy is outside CueMem's forget and `delete_all`. The snippet above and `examples/integrations/claude_example.py` pass `thread=False` (it needs anthropic 2.3 or later; on 1.x, which CueMem's `anthropic>=1.14` floor still accepts, remove the argument, since 1.x already sends the whole history). Each step then re-sends the whole history, so everything sent stays within CueMem's forget and `delete_all`. Removing it trades forget coverage for smaller requests, because the default server-held thread keeps the evidence blocks on the provider's side. For how long the provider keeps threads or requests, see Anthropic's documentation. The example needs `ANTHROPIC_MODEL` set to a Claude model that supports the memory tool.
+
+## MCP client configuration files
+
+The MCP server (`cuemem mcp` over stdio, or `/mcp` of `cuemem serve` over HTTP; tools, headers and errors are in the [API reference](api.md#mcp-server)) can be registered with a command such as `claude mcp add`, or through the client's configuration file. The files below were checked against each client's own page in 2026-11; the formats are the clients' and change with them, so follow the link when an entry is not accepted. `tests/test_docs_mcp_snippets.py` keeps the `cuemem` arguments in these blocks valid.
+
+### stdio: Claude Code, Cursor, Claude Desktop
+
+The client starts `cuemem mcp` itself, one memory space per entry. The same entry works in three files:
+
+- Claude Code: `.mcp.json` at the project root ([docs](https://code.claude.com/docs/en/mcp)).
+- Cursor: `.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` ([docs](https://cursor.com/docs/context/mcp)).
+- Claude Desktop: `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS `~/Library/Application Support/Claude/`, on Windows `%APPDATA%\Claude\`; [docs](https://modelcontextprotocol.io/docs/develop/connect-local-servers)). This file takes local stdio servers only; a remote server is added in the app as a connector.
+
+From a source checkout:
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "command": "uv",
+      "args": ["--directory", "/abs/path/to/cuemem", "run", "cuemem", "mcp", "--space", "me"]
+    }
+  }
+}
+```
+
+After a pip install (`cuemem` on the PATH):
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "command": "cuemem",
+      "args": ["mcp", "--space", "me"]
+    }
+  }
+}
+```
+
+### HTTP: Claude Code and Cursor
+
+Against a running `cuemem serve`. Claude Code needs `"type": "http"` (an entry with a `url` and no `type` is read as a stdio server) and expands `${VAR}`:
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "type": "http",
+      "url": "http://127.0.0.1:7860/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CUEMEM_MCP_KEY}",
+        "X-CueMem-User": "alice"
+      }
+    }
+  }
+}
+```
+
+Cursor takes the entry without `type` and writes variables as `${env:NAME}`:
+
+```json
+{
+  "mcpServers": {
+    "cuemem": {
+      "url": "http://127.0.0.1:7860/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:CUEMEM_MCP_KEY}",
+        "X-CueMem-User": "alice"
+      }
+    }
+  }
+}
+```
+
+### VS Code
+
+`.vscode/mcp.json` ([docs](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration)) has a top-level `servers` key and a `type` on every entry:
+
+```json
+{
+  "servers": {
+    "cuemem": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["--directory", "/abs/path/to/cuemem", "run", "cuemem", "mcp", "--space", "me"]
+    }
+  }
+}
+```
+
+Over HTTP, with the token asked for once and kept by VS Code instead of written in the file:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "cuemem-key",
+      "description": "CueMem key",
+      "password": true
+    }
+  ],
+  "servers": {
+    "cuemem": {
+      "type": "http",
+      "url": "http://127.0.0.1:7860/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:cuemem-key}",
+        "X-CueMem-User": "alice"
+      }
+    }
+  }
+}
+```
+
+### Notes for every client
+
+- **Provider keys (stdio).** Under the default configuration `cuemem mcp` needs the provider keys. It reads them from the `.env` file of the data directory (`cuemem configure` writes it): the checkout root with `uv --directory`, `~/.cuemem/.env` after a pip install. An `env` block in the entry works too, and is also where `CUEMEM_HOME` or `CUEMEM_PRESET` go. Without the keys the server exits with code 1 and the error on stderr, which the client shows in its MCP log.
+- **Absolute paths.** GUI clients start servers with a minimal PATH. If `uv` or `cuemem` is not found, give its absolute path as `command` (`which uv`, `which cuemem`).
+- **Tokens.** `.mcp.json` is usually committed, so keep the token in an environment variable (`${CUEMEM_MCP_KEY}` above; set it in the shell that starts the client). Prefer a scoped key for one user, made with `cuemem keys add <name> --user alice`, over the admin token.
+- **`X-CueMem-User`** is required with the admin token, without authentication and with wildcard-only keys (400 otherwise); a scoped key that names a user defaults to its first user. `X-CueMem-Agent` is optional. A non-ASCII id is written `utf-8''<percent-encoded UTF-8>`, for example `utf-8''%E5%BC%A0%E4%B8%89` for 张三.
+- **One process per database.** The stdio server opens the data directory itself and cannot share it with a running `cuemem serve` (`StorageLockedError`): use the HTTP entry then.
 
 ## Limitations
 
