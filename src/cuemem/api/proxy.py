@@ -38,8 +38,9 @@ _session_name；实际用的 ID 在响应头里），不给时自动切分：请
 否则会混进同一个会话。
 一个用户（记忆空间）内存里同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时
 先停放最久没有请求的那个（会话照旧进行中、不抽取，调用方回来时接着写，闲置太久时照常交给抽取；
-整个进程最多停放 PARKED_KEPT 个，再多时最早停放的交给抽取）；有请求还没答完（在等上游、流还
-没读完）或者留着没写进去的写回的会话不停放，都是这样时 429（见 _make_room）。
+整个进程最多停放 PARKED_KEPT 个，再多时停放得最多的那个用户最早停放的交给抽取）；有请求还没
+答完（在等上游、流还没读完）或者留着没写进去的写回的会话不停放，都是这样时 429（见
+_make_room）。
 都没有用户、又没配默认用户时，请求原样转发、不碰记忆。限定作用域的令牌（api/auth.py）只能用
 作用域里的用户与 Agent（包括配置的默认用户）：之外的 403（OpenAI 格式），在检索、开会话与转发
 之前。
@@ -86,7 +87,7 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -164,10 +165,23 @@ MAX_EMBED_INPUTS = 2048  # 与 OpenAI 的上限相同
 MAX_UNSAVED = 100
 MAX_UNSAVED_BYTES = 32 * 1024 * 1024
 # 为腾出名额而停放的会话（见 MemoryProxy._make_room）最多记这么多个（每个空间各自的
-# CUEMEM_MAX_OPEN_SESSIONS 之外，整个进程合计）：再多时最早停放的那个照闲置结束交给抽取。
+# CUEMEM_MAX_OPEN_SESSIONS 之外，整个进程合计）：再多时停放得最多的那个空间最早停放的那个照闲置
+# 结束交给抽取。
 # 停放的会话照旧进行中（数据库里的进行中标记与 MemorySystem 的登记都留着），每个只占一个键与
 # 一个时间
 PARKED_KEPT = 4096
+# 不认识的模型名在警告、400 的出错与 MemoryProxy._warned 里最多写这么多个字符（见 _short）
+MODEL_NAME_SHOWN = 200
+MODEL_NAMES_WARNED = 1000  # 记过警告的模型名最多这么多个，之后的新名字不再警告
+
+
+def _short(value: Any) -> str:
+    """请求里的模型名写进日志、出错与 _warned 之前：超过 MODEL_NAME_SHOWN 个字符的只留开头，
+    加 "…"。名字是调用方写的，最长能到请求体的上限（第十轮体检 Q6）。"""
+    if isinstance(value, str):  # 先截再写：不为一个 64 MiB 的名字再复制一份
+        return value if len(value) <= MODEL_NAME_SHOWN else value[:MODEL_NAME_SHOWN] + "…"
+    text = str(value)
+    return text if len(text) <= MODEL_NAME_SHOWN else text[:MODEL_NAME_SHOWN] + "…"
 
 
 class ProxyError(Exception):
@@ -622,7 +636,11 @@ class MemoryProxy:
         闲置太久时由 close_idle 交给抽取，退出时由 close_all。第八轮体检 P1：以前这里直接结束它
         （交给抽取），调用方回来接着写时会话又打开、长了，下次结束时整个空间重放
         （Consolidator._replay_regrown）：一个用户的并行会话多于上限时每次腾名额都重放一遍。
-        停放的会话超过 PARKED_KEPT 个时返回最早停放的那个（调用方结束它，交给抽取）。"""
+        停放的会话超过 PARKED_KEPT 个时返回停放得最多的那个空间最早停放的那个（调用方结束它，
+        交给抽取；一样多时先算这个空间）。第十轮体检 Q6：以前是整个进程最早停放的那个，不管是谁
+        的——一个令牌不停地换会话名就能把别的用户停放的会话一个个挤出去，各自提前结束（回来接着
+        写时整个空间重放）。只结束自己最早的也不行：先停满 PARKED_KEPT 个的令牌让别人每停放一个
+        就结束一个。"""
         mine = [k for k, r in self._runs.items() if r.space == space]
         if len(mine) < self.max_open_runs:
             return None
@@ -647,7 +665,10 @@ class MemoryProxy:
         run = self._runs.pop(oldest)
         self._parked[oldest] = (run.session_id, run.last_seen)
         if len(self._parked) > PARKED_KEPT:
-            return self._unpark(next(iter(self._parked)))
+            held = Counter(k[0] for k in self._parked)
+            top = max(held.values())
+            owner = space if held[space] == top else next(s for s, n in held.items() if n == top)
+            return self._unpark(next(k for k in self._parked if k[0] == owner))
         return None
 
     def _adopt(self, space: str, explicit: str | None) -> None:
@@ -919,28 +940,42 @@ class MemoryProxy:
     def _check_model(self, requested: Any, known: Collection[str], used: str) -> None:
         """请求的 model 不在 known 里时：unknown_model 是 reject 时报 400（OpenAI 的
         model_not_found，列出转发得了的别名），否则照旧改用 used，每个模型名记一次警告（响应头
-        X-CueMem-Model 写着实际用的模型）。没给 model 的请求不算：没有要求哪个模型。"""
+        X-CueMem-Model 写着实际用的模型）。没给 model 的请求不算：没有要求哪个模型。
+
+        模型名是调用方写的：警告、出错与 _warned 里只写它的前 MODEL_NAME_SHOWN 个字符（_short；
+        开头相同的两个长名字算一个），_warned 记满 1000 个之后的新名字不再警告。第十轮体检 Q6：
+        以前照原样存、照原样写日志（一个名字最长是请求体的上限），记满之后每个请求都再警告
+        一次。"""
         if requested is None or (isinstance(requested, str) and requested in known):
             return
         if self.unknown_model == "reject":
             raise ProxyError(
                 400,
-                f"The model {requested!r} is not served by this proxy. Use one of: "
+                f"The model {_short(requested)!r} is not served by this proxy. Use one of: "
                 f"{', '.join(self._available_aliases())} (see GET /v1/models).",
                 param="model",
                 code="model_not_found",
             )
-        name = str(requested)
+        name = _short(requested)
+        full = False
         with self._lock:
-            first = name not in self._warned
-            if first and len(self._warned) < 1000:  # 调用方乱写的模型名不能让它无限长大
+            # 调用方乱写的模型名不能让它无限长大：记满之后的新名字不记、也不警告
+            first = name not in self._warned and len(self._warned) < MODEL_NAMES_WARNED
+            if first:
                 self._warned.add(name)
+                full = len(self._warned) == MODEL_NAMES_WARNED
         if first:
             logger.warning(
                 "Model %r is not in the CueMem model catalog: using %s instead (see the "
                 "X-CueMem-Model response header; set proxy.unknown_model to 'reject' to refuse).",
                 name,
                 used,
+            )
+        if full:
+            logger.warning(
+                "%d different unknown model names seen: further ones are not logged (see the "
+                "X-CueMem-Model response header).",
+                MODEL_NAMES_WARNED,
             )
 
     def _meter(self, turn: Turn, usage: Usage | None, latency_ms: float) -> None:

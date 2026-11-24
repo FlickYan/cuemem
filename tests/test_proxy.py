@@ -1114,6 +1114,86 @@ def test_parked_proxy_sessions_beyond_the_limit_are_ended(
     assert sorted(j["session_id"] for j in system.db.get_jobs("alice")) == ["s1", "s2", "s3"]
 
 
+def ended_by(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """记下交给抽取的会话（空间，会话 ID），按先后。"""
+    ended: list[tuple[str, str]] = []
+    close = system.close_session
+
+    def spy(space_id: str, session_id: str) -> Any:
+        ended.append((space_id, session_id))
+        return close(space_id, session_id)
+
+    monkeypatch.setattr(system, "close_session", spy)
+    return ended
+
+
+def test_parked_sessions_of_another_user_are_not_ended(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第十轮体检 Q6：停放的会话超过 PARKED_KEPT 个时结束的是停放得最多的那个用户最早停放的。
+    以前是整个进程最早停放的：mallory 不停地换会话名，victim 停放的会话就一个个被结束、交给
+    抽取（她回来接着写时整个空间重放）。"""
+    monkeypatch.setattr(proxy_module, "PARKED_KEPT", 8)
+    proxy.max_open_runs = 2
+    ended = ended_by(system, monkeypatch)
+    for i in range(4):
+        clock.now = float(i)
+        headers = {"X-CueMem-Session": f"v{i + 1}"}
+        assert chat(client, f"note {i}", user="victim", headers=headers).is_success
+    assert list(proxy._parked) == [("victim", "v1"), ("victim", "v2")]
+    for i in range(12):
+        clock.now = 10.0 + i
+        headers = {"X-CueMem-Session": f"m{i}"}
+        assert chat(client, f"spam {i}", user="mallory", headers=headers).is_success
+    assert ("victim", "v1") in proxy._parked and ("victim", "v2") in proxy._parked
+    assert system.db.get_jobs("victim") == []
+    assert ended == [("mallory", m) for m in ("m0", "m1", "m2", "m3")]
+    assert proxy.parked_runs() == 8
+    assert system.open_sessions("victim") == {"v1", "v2", "v3", "v4"}
+
+
+def test_a_full_parked_set_does_not_end_a_small_users_sessions(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mallory 先把停放的名额占满，之后 victim 停放一个会话：结束的是 mallory 最早的那个，不是
+    victim 刚停放的（“只结束自己最早的”那种改法在这里不行）；victim 停放得最多之后才轮到她。"""
+    monkeypatch.setattr(proxy_module, "PARKED_KEPT", 8)
+    proxy.max_open_runs = 2
+    ended = ended_by(system, monkeypatch)
+    for i in range(10):
+        clock.now = float(i)
+        headers = {"X-CueMem-Session": f"m{i}"}
+        assert chat(client, f"spam {i}", user="mallory", headers=headers).is_success
+    assert proxy.parked_runs() == 8 and ended == []
+    for i in range(3):
+        clock.now = 20.0 + i
+        headers = {"X-CueMem-Session": f"v{i + 1}"}
+        assert chat(client, f"note {i}", user="victim", headers=headers).is_success
+    assert ("victim", "v1") in proxy._parked and ended == [("mallory", "m0")]
+    assert system.db.get_jobs("victim") == []
+
+    for i in range(3, 12):
+        clock.now = 30.0 + i
+        headers = {"X-CueMem-Session": f"v{i + 1}"}
+        assert chat(client, f"note {i}", user="victim", headers=headers).is_success
+    # victim 再停放 9 个：先结束 mallory 的；victim 停放得比她多之后结束的是 victim 自己最早的
+    assert ended == [("mallory", f"m{i}") for i in range(4)] + [
+        ("victim", f"v{i}") for i in range(1, 7)
+    ]
+    held = [space for space, _ in proxy._parked]
+    assert (held.count("victim"), held.count("mallory")) == (4, 4)
+
+
 def test_a_parked_implicit_session_keeps_its_id(
     client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
 ) -> None:
@@ -2222,6 +2302,56 @@ def test_the_model_actually_used_is_named_and_unknown_ones_warned(
     assert known.headers["x-cuemem-model"] == "deepseek-flash"
     warned = [r.getMessage() for r in caplog.records if r.name == "cuemem.api.proxy"]
     assert len(warned) == 1 and "'gpt-4o'" in warned[0] and "qwen3.8-flash" in warned[0]
+
+
+def test_a_long_unknown_model_name_is_cut(
+    client: TestClient, proxy: MemoryProxy, upstream: Upstream, caplog: pytest.LogCaptureFixture
+) -> None:
+    """第十轮体检 Q6：不认识的模型名是调用方写的（最长是请求体的上限），以前照原样记在
+    proxy._warned 里、照原样写进警告：1 MiB 的名字每个占 1 MiB 的内存与日志。现在只留前 200
+    个字符。"""
+    long = "m" * (1024 * 1024)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        embedded = client.post("/v1/embeddings", json={"model": long, "input": "x"})
+        assert embedded.status_code == 200
+        assert chat(client, "hi", model="x" + long).status_code == 200
+        assert chat(client, "hi", model=["y" * 5000]).status_code == 200  # 不是字符串的也一样
+    assert len(proxy._warned) == 3 and all(len(name) <= 201 for name in proxy._warned)
+    warned = [r.getMessage() for r in caplog.records if r.name == "cuemem.api.proxy"]
+    assert len(warned) == 3 and all(len(line) < 1000 for line in warned)
+    assert "m" * 200 + "…" in warned[0]
+    assert upstream.proxied[-1]["model"] == "qwen3.8-flash"
+
+
+def test_unknown_model_warnings_stop_at_the_cap(
+    client: TestClient, proxy: MemoryProxy, caplog: pytest.LogCaptureFixture
+) -> None:
+    """记过警告的模型名最多 1000 个。以前记满之后每个新名字的每个请求都再警告一次（“每个模型
+    名一次”不再成立，日志跟着请求数长）；现在记满时说一声，之后的新名字不再警告。"""
+    proxy._warned.update(f"model-{i}" for i in range(999))
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        assert client.post("/v1/embeddings", json={"model": "last", "input": "x"}).is_success
+        warned = [r.getMessage() for r in caplog.records if r.name == "cuemem.api.proxy"]
+        assert len(warned) == 2 and "'last'" in warned[0]
+        assert "1000 different unknown model names" in warned[1]
+        assert "further ones are not logged" in warned[1]
+        caplog.clear()
+        for _ in range(2):
+            assert client.post("/v1/embeddings", json={"model": "more", "input": "x"}).is_success
+        assert client.post("/v1/embeddings", json={"model": "last", "input": "x"}).is_success
+    assert [r for r in caplog.records if r.name == "cuemem.api.proxy"] == []
+    assert len(proxy._warned) == 1000 and "more" not in proxy._warned
+
+
+def test_rejected_model_name_is_cut(system: MemorySystem, fake_api: FakeAPI) -> None:
+    """unknown_model="reject" 的 400 里也只写模型名的前 200 个字符（以前把整个名字写回去）。"""
+    proxy = MemoryProxy(system, http_client=fake_api.client(), mode="l1", unknown_model="reject")
+    with TestClient(create_proxy_app(proxy)) as client:
+        refused = chat(client, "hi", model="m" * (1024 * 1024), user="alice")
+    assert refused.status_code == 400
+    error = refused.json()["error"]
+    assert error["code"] == "model_not_found" and len(error["message"]) < 1000
+    assert "m" * 200 + "…" in error["message"]
 
 
 def test_unknown_models_can_be_rejected(
