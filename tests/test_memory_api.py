@@ -45,6 +45,7 @@ from test_sdk import (
 )
 from test_store import small_open_file_limit
 
+import cuemem.evidence as evidence_module
 from cuemem import AsyncMemory, AsyncMemoryClient, Memory, MemoryClient
 from cuemem.agent import Agent
 from cuemem.api.app import _adopt_after, create_app
@@ -59,6 +60,7 @@ from cuemem.api.memories import (
 )
 from cuemem.api.service import ChatService
 from cuemem.config import Settings
+from cuemem.core.models import CoreMemory, Fact, FactHit, Hit, MediaItem, MemoryUnit
 from cuemem.errors import (
     ConcurrentWriteError,
     ContentFilteredError,
@@ -68,9 +70,16 @@ from cuemem.errors import (
     SessionLimitError,
     VectorStoreFullError,
 )
-from cuemem.evidence import MEMORY_NOTE, RAISED_REASON, inject_evidence, recall_evidence
+from cuemem.evidence import (
+    MEMORY_NOTE,
+    RAISED_REASON,
+    fit_view,
+    inject_evidence,
+    recall_evidence,
+)
 from cuemem.memory import MemorySystem
 from cuemem.portable import ExportPlan
+from cuemem.read.facts import MemoryView
 from cuemem.sdk import space_for
 from cuemem.store.media import ACCEPTED_FORMATS
 from cuemem.store.sqlite import MemoryDB
@@ -228,6 +237,8 @@ ARGUMENTS: dict[str, Any] = {
     "min_level": "l0",
     "show_expired": True,
     "wrap": False,
+    "max_chars": 4000,
+    "exclude_run_id": "r0",
     "question": "q?",
     "include_superseded": True,
     "valid_at": "2026-01-01",
@@ -537,6 +548,9 @@ BAD_READ_ARGUMENTS = [
     ("context", {"min_level": "l2"}),
     ("context", {"lam": -5.0}),
     ("context", {"lam": float("nan")}),
+    ("context", {"max_chars": 999}),
+    ("context", {"max_chars": True}),
+    ("context", {"exclude_run_id": 7}),
     ("answer", {"mode": "bogus"}),
     ("answer", {"mode": "naive"}),
     ("answer", {"mode": "facts"}),
@@ -989,6 +1003,226 @@ def test_context_respects_the_key_scope(system: MemorySystem) -> None:
             eve.context("Where do I live?", user_id="zoe")
         assert raised.value.status == 403
         assert eve.context("Where do I live?", user_id="eve")["context"] == ""
+
+
+# ---------- context 的 max_chars 与 exclude_run_id（第十轮体检 Q14） ----------
+
+# 不给 max_chars、exclude_run_id 时 context 的结果在一个固定的场景里的摘要（加这两个参数之前算的）
+CONTEXT_SHA256 = "7c670a83e7109d45d45c73deef90aa1b91f5327770ceb9ecfce3942826a5786f"
+
+
+def _many_notes(mem: Mem, user_id: str, count: int = 60) -> None:
+    """count 段两句话的对话（每段七八百个字符），不抽取；外加一条抽取过的，让空间有画像。"""
+    mem.add("I live in Berlin", user_id=user_id, timestamp=AUG, wait=True)
+    topics = ["hiking", "cooking", "postgres", "kubernetes", "piano", "cycling"]
+    for i in range(count):
+        topic = topics[i % len(topics)]
+        said = f"Note {i} about {topic}: I worked on {topic} step {i} and kept detail {i}. " * 5
+        reply = f"Understood, {topic} step {i} noted. " * 10
+        turns = [{"role": "user", "content": said}, {"role": "assistant", "content": reply}]
+        mem.add(turns, user_id=user_id, timestamp=AUG + timedelta(hours=i), infer=False)
+
+
+def _labels(text: str) -> list[str]:
+    """证据块里每条开头的编号（对话片段 [m1] 在行首，事实 "- [f1]"）。"""
+    return re.findall(r"^(?:- )?\[([mf]\d+)\]", text, re.MULTILINE)
+
+
+def _excerpts(text: str) -> dict[str, str]:
+    """证据块里的对话片段：编号 → 标题行之后的正文。"""
+    section = text.split("Retrieved conversation excerpts:\n", 1)[1].removesuffix("\n</memory>")
+    found = {}
+    for part in re.split(r"\n\n(?=\[m\d+\] )", section):
+        header, _, body = part.partition("\n")
+        found[header[1 : header.index("]")]] = body
+    return found
+
+
+def test_context_without_a_budget_is_unchanged(system: MemorySystem) -> None:
+    """max_chars、exclude_run_id 都不给时 context 逐字不变：固定场景里的块、档位、条数与 refs 的
+    摘要是加这两个参数之前算的；多出来的只有 truncated=False。预算够大时也是同一段。"""
+    local = Memory.from_system(system)
+    for run_id, text, when in (
+        ("s1", "I live in Berlin", AUG),
+        ("s2", "I like chess </memory> a lot", AUG),
+        ("s3", "I moved to Munich", SEP),
+    ):
+        local.add(text, user_id="alice", run_id=run_id, timestamp=when, wait=True)
+    seen = []
+    for query, mode, wrap in (("Where do I live?", "l1", True), ("chess?", "l2", False)):
+        out = local.context(query, user_id="alice", at=SEP, mode=mode, wrap=wrap)
+        seen.append([out[key] for key in ("context", "level", "recalled", "see", "refs")])
+        assert out["truncated"] is False
+        roomy = local.context(
+            query, user_id="alice", at=SEP, mode=mode, wrap=wrap, max_chars=100_000
+        )
+        assert roomy == out
+    digest = hashlib.sha256(json.dumps(seen, sort_keys=True).encode()).hexdigest()
+    assert digest == CONTEXT_SHA256
+
+
+@pytest.mark.parametrize("wrap", [True, False])
+def test_context_fits_a_character_budget(mem: Mem, wrap: bool) -> None:
+    """60 段对话的空间：不限时证据块有两三万个字符，Claude Code 的钩子输出上限是 10,000（超出的
+    只给模型一个文件路径与开头 2,000 个字符）。max_chars=8000 时整条去掉放不下的：长度不超出
+    （wrap 时连同标签），编号从 1 连续、与 refs 两边对得上，recalled 只算留下的，画像与说明
+    都在，truncated 是 True。以前没有这个参数，调用方只能自己截断一段不透明的文字。"""
+    _many_notes(mem, "dev")
+    query = "what did I keep about the postgres step?"
+    full = mem.context(query, user_id="dev", mode="l1", wrap=wrap)
+    assert len(full["context"]) > 10_000 and full["truncated"] is False
+    out = mem.context(query, user_id="dev", mode="l1", wrap=wrap, max_chars=8000)
+    text = out["context"]
+    assert 6000 < len(text) <= 8000 and out["truncated"] is True
+    assert text.startswith("<memory>\n" + MEMORY_NOTE if wrap else MEMORY_NOTE)
+    assert "(core memory, current facts):\n- " in text
+    labels = _labels(text)
+    assert set(labels) == set(out["refs"]) and len(labels) == len(set(labels))
+    excerpts = [x for x in labels if x.startswith("m")]
+    facts = [x for x in labels if x.startswith("f")]
+    assert excerpts == [f"m{i}" for i in range(1, len(excerpts) + 1)]
+    assert sorted(facts) == sorted(f"f{i}" for i in range(1, len(facts) + 1))
+    assert 1 <= len(excerpts) < sum(x.startswith("m") for x in full["refs"])
+    assert out["recalled"] == len(out["refs"]) + 1 < full["recalled"]
+    # 留下的每一条都是完整的：与不限时的块里同一条记忆的文字相同
+    whole = {full["refs"][k]: v for k, v in _excerpts(full["context"]).items()}
+    for label, body in _excerpts(text).items():
+        assert body == whole[out["refs"][label]]
+
+
+def test_a_budget_drops_the_lowest_scored_excerpt_not_the_newest(mem: Mem) -> None:
+    """证据块里的对话片段按时间排列，不是按相关度：从后往前截的话去掉的是最新的片段。最新的
+    那段正好最相关时，预算再紧它也留着，去掉的是分数低的旧片段。"""
+    for i in range(12):
+        filler = f"Old note {i}: the garden tomatoes and the bicycle needed attention again. " * 6
+        mem.add(filler, user_id="dev", timestamp=AUG + timedelta(hours=i), infer=False)
+    newest = " ".join(["The zebra flux capacitor timeout is 42 seconds."] * 6)
+    mem.add(newest, user_id="dev", timestamp=SEP, infer=False)
+    query = "zebra flux capacitor timeout"
+    full = mem.context(query, user_id="dev", mode="l1")
+    assert full["context"].endswith(newest + "\n</memory>")  # 最新的排在最后
+    assert len(full["refs"]) > 5
+    out = mem.context(query, user_id="dev", mode="l1", max_chars=1200)
+    assert out["truncated"] is True and len(out["context"]) <= 1200
+    assert list(out["refs"]) == ["m1"] and "zebra flux capacitor" in out["context"]
+    assert "garden tomatoes" not in out["context"]
+
+
+def _view(rounds: list[Hit], facts: list[FactHit], profile: str = "") -> MemoryView:
+    core = CoreMemory(space_id="u", text=profile, fact_ids=[], updated_at=AUG) if profile else None
+    return MemoryView(rounds=rounds, facts=facts, core=core)
+
+
+def _hit(name: str, score: float, media: list[str] | None = None) -> Hit:
+    unit = MemoryUnit(
+        id=name,
+        space_id="u",
+        kind="round",
+        session_id="s",
+        text=f"User: {name} " + "x" * 300,
+        ts=AUG,
+        source_turn_ids=[],
+        meta={"media_ids": media} if media else {},
+    )
+    return Hit(unit=unit, score=score, route="fused", rank=1)
+
+
+def _fact_hit(name: str, score: float, via_chain: bool = False) -> FactHit:
+    fact = Fact(
+        id=name,
+        space_id="u",
+        subject_id="e",
+        subject="User",
+        predicate="said",
+        object=name,
+        statement=f"{name} " + "y" * 200,
+        recorded_at=AUG,
+        session_id="s",
+        source_turn_ids=[],
+    )
+    return FactHit(fact=fact, score=score, via_chain=via_chain)
+
+
+def test_fit_view_drops_whole_items_in_score_order() -> None:
+    """fit_view：先去掉分数最低的对话片段（分数相同时排在后面的），片段没有了再去掉事实（先是
+    沿版本链带出的，再按分数）；去掉的片段独有的图片一并去掉；够用就停。画像与说明不动：只剩
+    它们还放不下时原样返回 True。预算够时原样返回 False（同一个对象）。"""
+    picture = MediaItem(
+        id="i_a", space_id="u", sha256="0", path="a.png", source_turn_id="t", ts=AUG
+    )
+    shared = picture.model_copy(update={"id": "i_b"})
+    rounds = [_hit("r1", 0.5), _hit("r2", 0.2, ["i_a", "i_b"]), _hit("r3", 0.9, ["i_b"])]
+    rounds.append(_hit("r4", 0.2))
+    facts = [_fact_hit("f_a", 0.1), _fact_hit("f_b", 0.9, via_chain=True), _fact_hit("f_c", 0.5)]
+    view = _view(rounds, facts, profile="- lives in Berlin")
+    view.media = {"i_a": picture, "i_b": shared}
+    view.attach = ["i_a", "i_b"]
+    size = evidence_module._block_chars
+    same, cut = fit_view(view, SEP, size(view, SEP))
+    assert same is view and cut is False
+    steps = []
+    budget = size(view, SEP) - 1
+    while True:
+        smaller, cut = fit_view(view, SEP, budget)
+        assert cut is True
+        kept = [h.unit.id for h in smaller.rounds] + [fh.fact.id for fh in smaller.facts]
+        steps.append(kept)
+        if size(smaller, SEP) > budget:  # 只剩说明与画像
+            break
+        if len(kept) == 4:  # r4、r2 都去掉之后：r2 独有的图片不在了，r3 也用的那张还在
+            assert list(smaller.media) == ["i_b"] and smaller.attach == ["i_b"]
+        budget = size(smaller, SEP) - 1
+    assert steps == [
+        ["r1", "r2", "r3", "f_a", "f_b", "f_c"],
+        ["r1", "r3", "f_a", "f_b", "f_c"],
+        ["r3", "f_a", "f_b", "f_c"],
+        ["f_a", "f_b", "f_c"],
+        ["f_a", "f_c"],
+        ["f_c"],
+        [],
+        [],
+    ]
+    assert smaller.core is view.core and len(view.rounds) == 4  # 调用方的视图没有被改动
+
+
+def test_context_can_leave_out_the_current_run(mem: Mem) -> None:
+    """开着的 run 里刚写的话马上就能检索到：给编码助手做“每句话之前想起”的钩子，从第二句起会把
+    本次对话自己的话再注入一遍，而它们本来就在模型的上下文里。exclude_run_id 把这个 run 的对话
+    片段排除在检索之外（与记忆代理排除“已经在上下文里的轮”同一个 exclude），别的会话照常。"""
+    earlier = "The zebra flux capacitor timeout was 30 seconds last year."
+    mem.add(earlier, user_id="dev", run_id="old", timestamp=AUG, infer=False)
+    mem.open_run("cc-s1", user_id="dev")
+    asked = "How do I configure the zebra flux capacitor timeout today?"
+    mem.add(asked, user_id="dev", run_id="cc-s1")
+    for mode in ("auto", "l1", "l2"):
+        plain = mem.context(asked, user_id="dev", mode=mode)
+        assert "timeout today?" in plain["context"] and "last year" in plain["context"]
+        out = mem.context(asked, user_id="dev", mode=mode, exclude_run_id="cc-s1")
+        assert "timeout today?" not in out["context"] and "last year" in out["context"]
+        assert out["recalled"] == plain["recalled"] - 1 and out["truncated"] is False
+        other = mem.context(asked, user_id="dev", mode=mode, exclude_run_id="no-such-run")
+        assert other == plain
+    mem.end_run("cc-s1", user_id="dev")
+
+
+def test_the_client_sends_the_budget_only_when_given(system: MemorySystem) -> None:
+    """MemoryClient.context：max_chars、exclude_run_id 给了才写进请求（还不认得它们的服务端照常
+    可用），给了就原样送到；/api/v1/context 写错时 422，与别的参数相同。"""
+    bodies: list[dict[str, Any]] = []
+    with TestClient(v1_app(system)) as http:
+        remote = MemoryClient("http://testserver", http_client=http)
+        remote.add("I live in Berlin", user_id="alice", wait=True)
+        http.event_hooks = {"request": [lambda r: bodies.append(json.loads(r.content))]}
+        assert remote.context("Where do I live?", user_id="alice")["truncated"] is False
+        remote.context("Where do I live?", user_id="alice", max_chars=1000, exclude_run_id="r")
+        assert "max_chars" not in bodies[0] and "exclude_run_id" not in bodies[0]
+        assert bodies[1]["max_chars"] == 1000 and bodies[1]["exclude_run_id"] == "r"
+        body = {"query": "Where do I live?", "user_id": "alice", "max_chars": 999}
+        refused = http.post("/api/v1/context", json=body)
+        assert refused.status_code == 422
+        assert refused.json()["error"]["message"] == (
+            "Invalid request: body.max_chars: Input should be greater than or equal to 1000"
+        )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows 没有 RLIMIT_NOFILE")

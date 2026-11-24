@@ -4799,6 +4799,31 @@
             "title": "Wrap",
             "description": "Wrap the block in <memory>...</memory>",
             "default": true
+          },
+          "max_chars": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1000.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Chars",
+            "description": "Upper bound on the length of context (the <memory> tags count when wrap is true). Whole items are left out, lowest score first; the note and the profile stay"
+          },
+          "exclude_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Run Id",
+            "description": "Leave out conversation excerpts of this run (the caller already has them)"
           }
         },
         "type": "object",
@@ -4846,6 +4871,11 @@
             "type": "object",
             "title": "Refs",
             "description": "Label in the block -> memory id (see GET)"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated",
+            "description": "True when max_chars left items out (or the note and profile alone exceed it)"
           }
         },
         "additionalProperties": true,
@@ -4856,7 +4886,8 @@
           "reasons",
           "recalled",
           "see",
-          "refs"
+          "refs",
+          "truncated"
         ],
         "title": "ContextResult",
         "description": "POST /context: the evidence block the memory proxy injects, ready for a prompt."

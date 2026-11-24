@@ -27,6 +27,7 @@ from cuemem.core.timeutil import naive_local
 from cuemem.core.trace import record_event
 from cuemem.memory import ForgetReport, MemorySystem, Recall, RecallMode
 from cuemem.read.controller import Router, english_reason
+from cuemem.read.facts import MemoryView
 from cuemem.read.reader import memory_blocks
 
 MEMORY_NOTE = (
@@ -65,6 +66,8 @@ class Evidence:
     recall: Recall | None = None
     # 证据块里的编号 → 记忆 ID（事实或对话片段，Memory.get 认得）；不影响 block 的文字
     refs: dict[str, str] = field(default_factory=dict)
+    # 给了 max_chars、去掉了一些条目才放得下（或者只剩说明与画像也放不下）时 True
+    truncated: bool = False
 
 
 def recall_evidence(
@@ -104,6 +107,9 @@ def context_evidence(
     router: Router = "learned",
     lam: float | None = None,
     min_level: str = "l1",
+    max_chars: int | None = None,
+    wrap: bool = True,
+    exclude_run_id: str | None = None,
 ) -> Evidence:
     """Memory.context 与 POST /api/v1/context 用的证据块（第六轮体检 P17）：与记忆代理注入的
     同一段文字（evidence_from），只是控制器选了 L0、而 mode="auto" 且 min_level="l1" 时改走
@@ -111,10 +117,21 @@ def context_evidence(
     打包探针打过分的候选（同一个问题时间），两次检索在同一次 reading 里（遗忘不能插在中间）。
     min_level="l0" 时照控制器的决定，与 recall_evidence（记忆代理）逐字相同。过期的记忆不给。
 
+    第十轮体检 Q14 加的两个可选项，都不给时与以前逐字相同：
+    - max_chars：证据块最多这么多字符（wrap 时连同 <memory> 标签一起算），放不下时按分数从低
+      到高整条去掉（fit_view），Evidence.truncated 写明；
+    - exclude_run_id：这个 run（会话）里的对话片段与图片不参与检索，与记忆代理排除“已经在
+      上下文里的轮”同一个 exclude。调用方的模型本来就看得到当前这段对话，名额留给别的记忆。
+      只排除原话：这个 run 结束之后从它抽取的事实照常给出。
+
     不改 recall_evidence 与 inject_evidence：记忆代理与各框架集成的请求逐字不变。"""
     now = naive_local(at) if at is not None else datetime.now()
     # 两次检索只写一条 retrieve trace（MemorySystem.retrieval_trace）
     with system.reading(space), system.retrieval_trace(space, query, mode):
+        exclude: list[str] = []
+        if exclude_run_id is not None:
+            for unit in system.db.list_units(space, kinds=["round"], session_ids=[exclude_run_id]):
+                exclude += [unit.id, *unit.meta.get("media_ids", [])]
         recall = system.retrieve(
             space,
             query,
@@ -122,6 +139,7 @@ def context_evidence(
             mode=mode,
             router=router,
             lam=lam,
+            exclude=exclude,
             hide_expired=True,
         )
         raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
@@ -133,13 +151,71 @@ def context_evidence(
                 question_time=now,
                 mode="l1",
                 candidates=recall.candidates,
+                exclude=exclude,  # 候选是同一个 exclude 下的探针结果
                 hide_expired=True,
                 expired=recall.expired,  # 第一次检索算过的，不再算一遍
             )
+        truncated = False
+        if max_chars is not None:
+            view = recall.view
+            if recall.level == "l0":  # 与 evidence_from 相同：L0 只给画像
+                view = replace(view, rounds=[], facts=[], attach=[])
+            view, truncated = fit_view(view, now, max_chars - (WRAP_CHARS if wrap else 0))
+            recall = replace(recall, view=view)
         evidence = evidence_from(recall, query, now)
+    evidence.truncated = truncated
     if raised:
         evidence.reasons = [RAISED_REASON]
     return evidence
+
+
+# "<memory>\n" 与 "\n</memory>"：Memory.context(wrap=True) 包在证据块外面的字符数
+WRAP_CHARS = len("<memory>\n\n</memory>")
+
+
+def _block_chars(view: MemoryView, now: datetime) -> int:
+    """evidence_from 会把这个视图排成多少个字符（同样的 memory_blocks 与 quote_memory）。"""
+    blocks, _, _ = memory_blocks(view, now, relative_time=True)
+    if not view.rounds:
+        blocks = blocks[:-1]
+    return len("\n\n".join([MEMORY_NOTE, *map(quote_memory, blocks)])) if blocks else 0
+
+
+def fit_view(view: MemoryView, now: datetime, budget: int) -> tuple[MemoryView, bool]:
+    """把视图减到证据块不超过 budget 个字符，返回（视图，是否去掉了东西或仍然放不下）。只在
+    给了 max_chars 时用（第十轮体检 Q14：Claude Code 的钩子输出上限 10,000 字符，60 段对话的
+    空间一次 context 就有两三万）。
+
+    每次去掉一整条再重排一遍，从不截断一条的中间：先是分数最低的对话片段，片段没有了再是
+    事实（先去掉沿版本链带出的，再按分数从低到高）。不按块里的顺序去：片段按时间、事实按主语
+    排列，从后往前截掉的是最新的片段，不是最不相关的。重排之后编号仍然从 1 连续，refs 与文字
+    对得上。去掉的片段里的图片（没有别的片段用到时）一并从 media 与 attach 里去掉。
+
+    画像与开头的说明不动：只剩它们还放不下时原样返回、标记为 True，由调用方决定。"""
+    removed = False
+    while _block_chars(view, now) > budget:
+        if view.rounds:
+            # 分数相同的去掉排在后面的
+            drop = min(range(len(view.rounds)), key=lambda i: (view.rounds[i].score, -i))
+            rounds = [hit for i, hit in enumerate(view.rounds) if i != drop]
+            kept = {m for hit in rounds for m in hit.unit.meta.get("media_ids", [])}
+            gone = set(view.rounds[drop].unit.meta.get("media_ids", [])) - kept
+            view = replace(
+                view,
+                rounds=rounds,
+                media={k: v for k, v in view.media.items() if k not in gone},
+                attach=[m for m in view.attach if m not in gone],
+            )
+        elif view.facts:
+            drop = min(
+                range(len(view.facts)),
+                key=lambda i: (not view.facts[i].via_chain, view.facts[i].score, -i),
+            )
+            view = replace(view, facts=[fh for i, fh in enumerate(view.facts) if i != drop])
+        else:
+            return view, True
+        removed = True
+    return view, removed
 
 
 def evidence_from(recall: Recall, query: str, now: datetime) -> Evidence:

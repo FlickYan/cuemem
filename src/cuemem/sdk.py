@@ -91,6 +91,9 @@ logger = logging.getLogger(__name__)
 IDLE_CLOSED_KEPT = 10_000  # 记着多少个闲置结束的 run（见 close_idle_runs），之后再 add 时重新打开
 SearchMode = Literal["auto", "l0", "l1", "l2"]
 AnswerMode = Literal["auto", "l0", "l1", "l2", "agent", "hatch"]
+# context 的 max_chars：不小于 1000 的整数（MEMORY_NOTE 有 411 个字符，画像还可能很长，再小连
+# 一条记忆都放不下）；不认 True、"8000"、8000.0。/api/v1 的请求模型用同一个类型
+MaxChars = Annotated[int | None, Field(ge=1000, strict=True)]
 MinLevel = Literal["l0", "l1"]  # search 的 min_level（签名里照写 Literal：客户端不导入这里）
 # 控制器的 λ（按需付费的权重）：不小于 0 的有限数。/api/v1 的请求模型用同一个类型
 Lam = Annotated[float | None, Field(ge=0, allow_inf_nan=False)]
@@ -922,16 +925,27 @@ class Memory:
         lam: float | None = None,
         min_level: Literal["l0", "l1"] = "l1",
         wrap: bool = True,
+        max_chars: int | None = None,
+        exclude_run_id: str | None = None,
     ) -> dict[str, Any]:
         """放进提示词的记忆（第六轮体检 P17）：记忆代理注入的同一段证据块（evidence.py 的
         evidence_from），不调用模型。带日期与有效状态的事实、按时间排列的对话片段、画像，记忆里的
         <memory、</memory 已经转义，开头的 MEMORY_NOTE 声明这些是资料、不是指令。自己拿 search
         的结果拼提示词时这些都没有。
 
-        返回 {context, level, reasons, recalled, see, refs}。wrap=True 时 context 包在
+        返回 {context, level, reasons, recalled, see, refs, truncated}。wrap=True 时 context 包在
         "<memory>\\n…\\n</memory>" 里（记忆代理放在最后一句用户消息开头的那段，去掉末尾的空行），
         wrap=False 时只有块本身；没有要给的内容时是空字符串。recalled 是条数（画像算一条），
         refs 是块里的编号 → 记忆 ID（Memory.get 认得）。
+
+        max_chars（第十轮体检 Q14）：context 最多这么多字符（wrap 时连同标签），给有固定预算的
+        调用方（Claude Code 的钩子输出上限是 10,000 字符）。放不下时整条去掉，从不截断一条的
+        中间：先是分数最低的对话片段，再是事实；编号仍然连续，recalled 与 refs 只算留下的，
+        truncated 是 True。开头的说明与画像不动，只剩它们还超出时原样给出（truncated 也是
+        True）。不小于 1000 的整数，否则 ValueError。不给时块与以前逐字相同、truncated 是 False。
+
+        exclude_run_id：这个 run（add 的 run_id）里的对话片段不参与检索：调用方的模型本来就
+        看得到当前这段对话，不必再给一遍。只排除原话，从它抽取的事实照常给出。
 
         与 search 相同，min_level="l1"（缺省）时控制器选了 L0 也改走 L1，reasons 写明；
         min_level="l0" 时照控制器的决定，与记忆代理逐字相同。过期的记忆不给，画像里也去掉。
@@ -940,6 +954,8 @@ class Memory:
         _valid("router", Router, router)
         _valid("min_level", MinLevel, min_level)
         lam = _valid("lam", Lam, lam)
+        _valid("max_chars", MaxChars, max_chars)
+        _valid("exclude_run_id", str | None, exclude_run_id)
         space = space_for(user_id, agent_id)
         moment = _moment("at", at)
         if not self.system.db.has_sessions(space):
@@ -950,6 +966,7 @@ class Memory:
                 "recalled": 0,
                 "see": False,
                 "refs": {},
+                "truncated": False,
             }
         from cuemem.evidence import context_evidence
 
@@ -962,6 +979,9 @@ class Memory:
             router=router,
             lam=lam,
             min_level=min_level,
+            max_chars=max_chars,
+            wrap=wrap,
+            exclude_run_id=exclude_run_id,
         )
         block = evidence.block
         return {
@@ -971,6 +991,7 @@ class Memory:
             "recalled": evidence.recalled,
             "see": evidence.see,
             "refs": evidence.refs,
+            "truncated": evidence.truncated,
         }
 
     def answer(

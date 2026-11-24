@@ -189,6 +189,8 @@ class AsyncMethods:
         lam: float | None = None,
         min_level: Literal["l0", "l1"] = "l1",
         wrap: bool = True,
+        max_chars: int | None = None,
+        exclude_run_id: str | None = None,
     ) -> dict[str, Any]:
         """见 Memory.context。"""
         return await asyncio.to_thread(
@@ -202,6 +204,8 @@ class AsyncMethods:
             lam=lam,
             min_level=min_level,
             wrap=wrap,
+            max_chars=max_chars,
+            exclude_run_id=exclude_run_id,
         )
 
     async def answer(

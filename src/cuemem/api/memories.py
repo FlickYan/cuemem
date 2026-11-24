@@ -92,6 +92,7 @@ from cuemem.sdk import (
     MAX_ID_CHARS,
     AnswerMode,
     Lam,
+    MaxChars,
     Memory,
     MinLevel,
     SearchMode,
@@ -197,6 +198,15 @@ class ContextRequest(BaseModel):
     lam: Lam = None
     min_level: MinLevel = "l1"
     wrap: bool = Field(True, description="Wrap the block in <memory>...</memory>")
+    max_chars: MaxChars = Field(
+        None,
+        description="Upper bound on the length of context (the <memory> tags count when wrap "
+        "is true). Whole items are left out, lowest score first; the note and the profile stay",
+    )
+    exclude_run_id: str | None = Field(
+        None,
+        description="Leave out conversation excerpts of this run (the caller already has them)",
+    )
 
 
 class AnswerRequest(BaseModel):
@@ -420,6 +430,9 @@ class ContextResult(_Out):
     recalled: int = Field(description="Items in the block; the profile counts as one")
     see: bool
     refs: dict[str, str] = Field(description="Label in the block -> memory id (see GET)")
+    truncated: bool = Field(
+        description="True when max_chars left items out (or the note and profile alone exceed it)"
+    )
 
 
 class GetAllResult(_Out):
@@ -881,6 +894,8 @@ def memories_router(
                 lam=request.lam,
                 min_level=request.min_level,
                 wrap=request.wrap,
+                max_chars=request.max_chars,
+                exclude_run_id=request.exclude_run_id,
             )
 
     @router.get("/memories", responses=_ok(GetAllResult))

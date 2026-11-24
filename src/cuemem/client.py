@@ -311,9 +311,12 @@ class MemoryClient:
         lam: float | None = None,
         min_level: Literal["l0", "l1"] = "l1",
         wrap: bool = True,
+        max_chars: int | None = None,
+        exclude_run_id: str | None = None,
     ) -> dict[str, Any]:
-        """放进提示词的记忆（见 Memory.context）。"""
-        body = {
+        """放进提示词的记忆（见 Memory.context）。max_chars、exclude_run_id 不给时不写进请求：
+        还不认得它们的服务端（第十轮体检之前的）照常可用。"""
+        body: dict[str, Any] = {
             "query": query,
             "user_id": user_id,
             "agent_id": agent_id,
@@ -324,6 +327,10 @@ class MemoryClient:
             "min_level": min_level,
             "wrap": wrap,
         }
+        if max_chars is not None:
+            body["max_chars"] = max_chars
+        if exclude_run_id is not None:
+            body["exclude_run_id"] = exclude_run_id
         return self._call("POST", "/context", body=body, retry_sent=True)
 
     def answer(
