@@ -1784,3 +1784,20 @@ def test_trace_renders_cited_profile_lines(service: ChatService, model: Scripted
     reply = service.chat(later.session_id, "Remind me what you know.", mode="l0")
     assert [i.kind for i in reply.trace.recalled] == ["profile"]
     assert "profile" in render_trace(reply, service)
+
+
+def test_health_reports_the_mounted_proxy(service: ChatService, tmp_path: Path) -> None:
+    """第十轮体检 Q12：serve 同时提供记忆代理时，/api/health 多一项 proxy：它进行中的会话、留着
+    等重试的写回与丢掉的写回（与 cuemem proxy 的 /health 相同）。没有代理时响应不变。"""
+    plain = TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False))
+    assert set(plain.get("/api/health").json()) == {"ok", "version", "open_sessions"}
+    proxy = MemoryProxy(service.system)
+    served = TestClient(create_app(service, upload_dir=tmp_path / "up", ui=False, proxy=proxy))
+    body = served.get("/api/health").json()
+    assert body["ok"] is True and body["proxy"] == {
+        "open_runs": 0,
+        "write_backs_waiting": 0,
+        "write_backs_dropped": 0,
+    }
+    proxy._count_dropped(2)
+    assert served.get("/api/health").json()["proxy"]["write_backs_dropped"] == 2

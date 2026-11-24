@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email.utils
 import json
+import logging
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -16,6 +17,7 @@ from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from pydantic import BaseModel
 
 from cuemem.config import Settings
+from cuemem.core.trace import start_trace
 from cuemem.errors import (
     CacheMissError,
     MissingAPIKeyError,
@@ -437,20 +439,43 @@ def test_read_only_replays_a_cached_fallback(
 
 
 def test_rate_limits_and_server_errors_are_retried_like_the_sdk(
-    settings: Settings, fake_api: FakeAPI
+    settings: Settings, fake_api: FakeAPI, caplog: pytest.LogCaptureFixture
 ) -> None:
     """OpenAI SDK 自己不再重试（它连超时也重试）：429、5xx、连不上由 LLM 客户端照 SDK 的规则重试，
     评测与网关在线上的重试行为不变——上游的 retry-after-ms 照等，没有时 0.5 秒起翻倍、随机减掉最多
-    25%；余额不足（402）不重试；重试满 max_retries 次仍然限流时抛出 RateLimitError。"""
+    25%；余额不足（402）不重试；重试满 max_retries 次仍然限流时抛出 RateLimitError。
+
+    第十轮体检 Q12：每次重试记一个 llm_retry 事件与一条 INFO 日志（供应商、第几次、状态码、
+    出错的类型、等多久；没有出错的文字）。以前重试不留痕迹：供应商限流时抽取与回答慢上几秒到
+    几分钟，trace 与日志里都看不出原因（向量接口一直记 embedding_retry）。"""
     from fakes import NO_BALANCE, RATE_LIMIT, SERVER_ERROR
     from openai import APIStatusError, RateLimitError
 
     waits: list[float] = []
     client = LLMClient(settings, http_client=fake_api.client(), sleep=waits.append)
     fake_api.chat_replies = [RATE_LIMIT, SERVER_ERROR, "OK"]
-    assert client.chat("reader", HELLO).content == "OK"
+    with (
+        caplog.at_level(logging.INFO, logger="cuemem.llm.client"),
+        start_trace("t") as trace,
+    ):
+        assert client.chat("reader", HELLO).content == "OK"
     assert len(fake_api.chat_requests) == 3
     assert waits[0] == 0.001 and 0.75 <= waits[1] <= 1.0  # retry-after-ms: 1；第二次重试的退避
+    assert [e["kind"] for e in trace.events] == ["llm_retry", "llm_retry", "llm"]
+    first, second = trace.events[:2]
+    provider = settings.models[settings.roles["reader"].model].provider
+    assert {k: v for k, v in first.items() if k != "t_ms"} == {
+        "kind": "llm_retry",
+        "provider": provider,
+        "attempt": 1,
+        "status": 429,
+        "error": "RateLimitError",
+        "wait_s": 0.0,
+    }
+    assert (second["attempt"], second["status"], second["error"]) == (2, 500, "InternalServerError")
+    assert second["wait_s"] == round(waits[1], 2)
+    logged = [r.getMessage() for r in caplog.records]
+    assert len(logged) == 2 and "status 429); retry 1 in" in logged[0], logged
 
     for reply, error, sent in ((NO_BALANCE, APIStatusError, 1), (RATE_LIMIT, RateLimitError, 4)):
         fake_api.chat_requests.clear()

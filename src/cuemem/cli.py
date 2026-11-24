@@ -1894,9 +1894,28 @@ def mcp_cmd(
     except CueMemError as exc:
         Console(stderr=True).print(f"[red]错误：[/red]{escape(str(exc))}")
         raise typer.Exit(1) from exc
+    # 与 serve、proxy 同一个清理线程（第十轮体检 Q12）：stdio 的 MCP 独占数据目录，旁边不会有
+    # serve 替它做；以前设了 CUEMEM_TRACES_RETENTION_DAYS / CUEMEM_EXPIRED_RETENTION_DAYS 也
+    # 一直不删。在线程里做，不耽误 MCP 的 initialize；日志在 stderr
+    from cuemem.api.app import SWEEP_INTERVAL_S, _sweep, _sweep_jobs
+
+    jobs = _sweep_jobs(service.system)
+    stop = threading.Event()
+    sweeper: threading.Thread | None = None
+    if jobs:
+        sweeper = threading.Thread(
+            target=_sweep,
+            args=(stop, SWEEP_INTERVAL_S, *jobs),
+            name="cuemem-mcp-sweep",
+            daemon=True,
+        )
+        sweeper.start()
     try:
         build_server(service, space).run("stdio")
     finally:
+        stop.set()
+        if sweeper is not None:
+            sweeper.join(timeout=5)
         service.close()
 
 

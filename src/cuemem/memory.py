@@ -41,6 +41,7 @@ from cuemem.core.trace import (
     current_trace,
     note,
     record_event,
+    span,
     start_trace,
     trace_queries,
     write_trace,
@@ -1759,43 +1760,65 @@ class MemorySystem:
         report_rebuild_errors：删除做完之后重建或检查转述出错时不抛出，写在报告的 rebuild_error
         里（见 forget），不再往下追转述（与抛出时相同）。删除之前出错（找转述时）照常抛出：什么都
         没删。
+
+        trace：一次调用写一行 forget（找转述是 restated 阶段，每次兜底检查一个 regrown 阶段，
+        每一轮删除一个 forget 阶段），耗时从等巩固锁之前算起；preview_forget 不写 trace。
         """
-        turns, restated, statements = self._forget_plan(space_id, turn_ids, fact_ids, media_ids)
-        try:
-            report = self.forget(
-                space_id,
-                session_ids=list(session_ids),
-                turn_ids=list(dict.fromkeys(turns)),
-                restated_turn_ids=restated,
-                report_rebuild_errors=report_rebuild_errors,
-            )
-            report = replace(report, restated=len(restated))
-            for _ in range(REGROW_ROUNDS if statements and not report.rebuild_error else 0):
-                try:
-                    regrown = self.regrown_facts(space_id, statements)
-                except Exception as exc:
-                    if not report_rebuild_errors:
-                        raise
-                    report = replace(report, rebuild_error=_error_text(exc))
-                    break
-                if not regrown:
-                    break
-                more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
-                again = self.forget(
-                    space_id, restated_turn_ids=more, report_rebuild_errors=report_rebuild_errors
+        # 一次调用一条 forget 的 trace（第十轮体检 Q12）：找转述与兜底检查的模型调用以前在 trace
+        # 之外（只有账本记着），每一轮 forget 又各写一行。里面的 forget 成了它的一个阶段，属性
+        # 最后照合并的报告写（不然后一轮盖掉前一轮的 sessions）
+        with start_trace("forget", self.tracer, space=space_id) as trace:
+            with span("restated"):
+                turns, restated, statements = self._forget_plan(
+                    space_id, turn_ids, fact_ids, media_ids
                 )
-                report = report.merged(replace(again, regrown=len(regrown)))
-                if report.rebuild_error:
-                    break
-        finally:
-            # 找转述与兜底时为被删的陈述算过查询与文档两种向量，兜底那次还在 forget 清理之后：
-            # 一并删掉（中途失败时也删）。兜底的请求里有被删的陈述，最后一次没有 forget 跟在后面
-            # 替它清理，它的缓存条目（归属 forget）也在这里删
-            purged = llm_purged = 0
-            if statements and isinstance(self.embedder, CachedEmbedder):
-                purged = self.embedder.purge(statements, "query") + self.embedder.purge(statements)
-            if statements and self.llm.cache is not None:
-                llm_purged = self.llm.cache.delete_scope(scope(space_id, "forget"))
+            try:
+                report = self.forget(
+                    space_id,
+                    session_ids=list(session_ids),
+                    turn_ids=list(dict.fromkeys(turns)),
+                    restated_turn_ids=restated,
+                    report_rebuild_errors=report_rebuild_errors,
+                )
+                report = replace(report, restated=len(restated))
+                for _ in range(REGROW_ROUNDS if statements and not report.rebuild_error else 0):
+                    try:
+                        with span("regrown"):
+                            regrown = self.regrown_facts(space_id, statements)
+                    except Exception as exc:
+                        if not report_rebuild_errors:
+                            raise
+                        report = replace(report, rebuild_error=_error_text(exc))
+                        break
+                    if not regrown:
+                        break
+                    more = [t for f in regrown for t in f.source_turn_ids]  # 同样只删出处那条发言
+                    again = self.forget(
+                        space_id,
+                        restated_turn_ids=more,
+                        report_rebuild_errors=report_rebuild_errors,
+                    )
+                    report = report.merged(replace(again, regrown=len(regrown)))
+                    if report.rebuild_error:
+                        break
+            finally:
+                # 找转述与兜底时为被删的陈述算过查询与文档两种向量，兜底那次还在 forget 清理之后：
+                # 一并删掉（中途失败时也删）。兜底的请求里有被删的陈述，最后一次没有 forget 跟在后面
+                # 替它清理，它的缓存条目（归属 forget）也在这里删
+                purged = llm_purged = 0
+                if statements and isinstance(self.embedder, CachedEmbedder):
+                    purged = self.embedder.purge(statements, "query") + self.embedder.purge(
+                        statements
+                    )
+                if statements and self.llm.cache is not None:
+                    llm_purged = self.llm.cache.delete_scope(scope(space_id, "forget"))
+            trace.attrs.update(
+                turns_deleted=report.turns_deleted,
+                sessions=report.sessions_affected,
+                cascaded=report.cascaded,
+                restated=report.restated,
+                regrown=report.regrown,
+            )
         return replace(
             report,
             embed_cache_purged=report.embed_cache_purged + purged,

@@ -15,6 +15,7 @@ from __future__ import annotations
 import email.utils
 import functools
 import json
+import logging
 import math
 import random
 import re
@@ -52,6 +53,8 @@ from cuemem.llm.cache import ResponseCache, request_key
 from cuemem.llm.ledger import Ledger, UsageRecord, chat_cost
 from cuemem.llm.peak import in_peak, peak_end
 from cuemem.llm.types import ChatResult, ToolCall, Usage
+
+logger = logging.getLogger(__name__)
 
 Message = dict[str, Any]
 
@@ -303,6 +306,25 @@ class LLMClient:
                 delay = _retry_delay(exc, attempt, retry_timeouts=retry_timeouts)
                 if attempt >= retries or delay is None:
                     raise
+                # 重试以前不留痕迹（向量接口记 embedding_retry）：供应商限流时抽取与回答慢上几秒到
+                # 几分钟，trace 与日志里都看不出原因。只记类型与状态码，不记出错的文字
+                status = getattr(exc, "status_code", None)
+                record_event(
+                    "llm_retry",
+                    provider=provider,
+                    attempt=attempt + 1,
+                    status=status,
+                    error=type(exc).__name__,
+                    wait_s=round(delay, 2),
+                )
+                logger.info(
+                    "LLM request to %s failed (%s, status %s); retry %d in %.2fs",
+                    provider,
+                    type(exc).__name__,
+                    status,
+                    attempt + 1,
+                    delay,
+                )
             self._sleep(delay)
             attempt += 1
 

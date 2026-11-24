@@ -3584,3 +3584,43 @@ def test_write_backs_dropped_when_a_session_ends_are_traced(
     assert "bob" not in raw_traces(system) and "Berlin" not in json.dumps(trace_lines(system))
     proxy.close_all()
     assert len(trace_lines(system, "proxy_close")) == 1
+
+
+# ---------- 探活里的写回（第十轮体检 Q12） ----------
+
+
+def test_health_reports_waiting_and_dropped_write_backs(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """向量接口故障时请求照常 200，写回留在内存里等重试，进程退出时还写不进去就丢了：以前
+    /health 只有 open_runs，两个探活都看不出来。现在多两个数：留着的写回与这个进程丢掉的写回。"""
+
+    def health() -> dict[str, Any]:
+        body = client.get("/health").json()
+        assert body["ok"] is True and body["open_runs"] == proxy.open_runs()
+        return {k: body[k] for k in ("write_backs_waiting", "write_backs_dropped")}
+
+    assert health() == {"write_backs_waiting": 0, "write_backs_dropped": 0}
+    outage = Outage(system, monkeypatch)
+    session = {"X-CueMem-Session": "s1"}
+    chat(client, "I live in Berlin", user="alice", headers=session)
+    assert health() == {"write_backs_waiting": 1, "write_backs_dropped": 0}
+    outage.status = None
+    chat(client, "I like jazz", user="alice", headers=session)
+    assert health() == {"write_backs_waiting": 0, "write_backs_dropped": 0}
+    assert len(system.db.get_turns("alice", "s1")) == 4
+
+    outage.status = 503  # 积压超过上限：丢掉最早的
+    monkeypatch.setattr("cuemem.api.proxy.MAX_UNSAVED", 2)
+    for i in range(3):
+        chat(client, f"note {i}", user="alice", headers=session)
+    assert health() == {"write_backs_waiting": 2, "write_backs_dropped": 1}
+    proxy.close_all()  # 退出时再试一次，还写不进去：丢掉
+    assert health() == {"write_backs_waiting": 0, "write_backs_dropped": 3}
+    outage.status = 400  # 重试也没用的出错：当场丢掉
+    chat(client, "note 3", user="alice", headers=session)
+    assert health() == {"write_backs_waiting": 0, "write_backs_dropped": 4}

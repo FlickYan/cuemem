@@ -448,7 +448,10 @@ def test_forget_memories_regrow_rounds_reuse_cache_and_leave_no_check_behind(
 ) -> None:
     """按事实遗忘、兜底时又追了一轮（D-051）：每一轮的重放都不再重新请求输入没变的对账与消歧
     （以前每轮都整个再付一遍）。找转述与兜底检查的请求里写着被删的事实，最后一次兜底检查之后没有
-    forget 替它清理，以前它的缓存条目一直留着。"""
+    forget 替它清理，以前它的缓存条目一直留着。
+
+    第十轮体检 Q12：这一次调用只写一行 forget 的 trace，找转述与两次兜底检查的模型调用都在
+    里面（以前它们在 trace 之外，每一轮删除又各写一行、后一轮的属性里没有前一轮的会话）。"""
     system, model = _secret_system(n3_settings, fake_api, regrown=_flag_once("Geneva"))
     with system:
         [secret] = [f for f in system.facts("alice") if "Zurich" in f.statement]
@@ -468,6 +471,25 @@ def test_forget_memories_regrow_rounds_reuse_cache_and_leave_no_check_behind(
         assert not any("Geneva" in f.statement for f in system.facts("alice"))
         _assert_no_cache_entry_with(system, requests_by_key, SECRET_WORDS)
         _assert_no_cache_entry_with(system, requests_by_key, ["Geneva", "Globex", "Bluejay"])
+
+        [line] = trace_lines(system.settings.paths.traces, "forget")
+        attrs = line["attrs"]
+        assert (attrs["space"], attrs["sessions"]) == ("alice", ["s-b", "s-c"])
+        assert (attrs["turns_deleted"], attrs["restated"], attrs["regrown"]) == (
+            report.turns_deleted,
+            0,
+            1,
+        )
+        stages = [s["name"] for s in line["spans"]]
+        assert [stages.count(name) for name in ("restated", "regrown", "forget")] == [1, 2, 2]
+        checks = [
+            e
+            for e in line["events"]
+            if e["kind"] == "llm" and e["role"] == "extractor" and not e["from_cache"]
+        ]
+        assert len(checks) >= 3  # 找转述 + 两次兜底（重放自己的抽取都命中缓存）
+        for word in (*SECRET_WORDS, "Geneva"):
+            assert word not in json.dumps(line)
 
 
 def _traces(system: MemorySystem) -> str:

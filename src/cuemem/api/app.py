@@ -401,7 +401,7 @@ def _sweep_jobs(system: MemorySystem, *idle: Callable[[], object]) -> list[Calla
     （启动时与之后每小时一次，见 MemorySystem.recover_media），设了 traces_retention_days 时再
     加上删过期的 trace（启动时与之后每天一次，见 MemorySystem.expire_traces），设了
     expired_retention_days 时再加上删过期的记忆（同样每天一次，见 MemorySystem.expire_memories）。
-    cuemem serve 与 cuemem proxy 共用。"""
+    cuemem serve、cuemem proxy 与 cuemem mcp（stdio，没有要结束的闲置会话）共用。"""
     jobs = list(idle)
     if system.media is not None and system.media.owner is not None:  # 写标记的媒体库
         jobs.append(_every(RECOVER_MEDIA_INTERVAL_S, system.recover_media))
@@ -568,7 +568,15 @@ def create_app(
     # 探活跟着等，Docker 的 HEALTHCHECK 5 秒就超时）
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
-        return {"ok": True, "version": __version__, "open_sessions": len(service.sessions)}
+        body = {"ok": True, "version": __version__, "open_sessions": len(service.sessions)}
+        if proxy is not None:  # 同时提供记忆代理时：它进行中的会话与留着、丢掉的写回
+            waiting, dropped = proxy.write_backs()
+            body["proxy"] = {
+                "open_runs": proxy.open_runs(),
+                "write_backs_waiting": waiting,
+                "write_backs_dropped": dropped,
+            }
+        return body
 
     @app.get("/api/ready")  # 不鉴权：向量库与后台巩固能不能用（见 _readiness）
     async def ready() -> JSONResponse:

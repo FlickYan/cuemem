@@ -2238,3 +2238,35 @@ def test_eval_errors_are_listed_once_per_message(
     assert "另有1种报错" in out and "fixed" not in out
     _print_errors(tmp_path)
     assert "B4×1：RuntimeError:[boom]" in _flat(capsys.readouterr().out)
+
+
+def test_mcp_expires_old_traces_when_it_starts(
+    isolated_paths: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """第十轮体检 Q12：stdio 的 cuemem mcp 独占数据目录、旁边不会有 serve，以前却不起清理线程：
+    设了 CUEMEM_TRACES_RETENTION_DAYS（或 CUEMEM_EXPIRED_RETENTION_DAYS）也一直不删。现在与
+    serve、proxy 一样启动时删一遍（在线程里，不耽误 MCP 的 initialize），退出时线程停下。"""
+    import threading
+
+    monkeypatch.setenv("CUEMEM_EMBEDDING__BACKEND", "hash")
+    monkeypatch.setenv("CUEMEM_EMBEDDING__DIM", "128")
+    monkeypatch.setenv("CUEMEM_TRACES_RETENTION_DAYS", "1")
+    traces = tmp_path / "traces"
+    traces.mkdir()
+    old = traces / "20200101.jsonl"
+    old.write_text('{"name": "retrieve", "attrs": {"space": "s", "question": "hi"}}\n', "utf-8")
+    ran: list[str] = []
+
+    class Server:
+        def run(self, transport: str) -> None:
+            deadline = time.monotonic() + 5
+            while old.exists() and time.monotonic() < deadline:  # 等清理线程的第一遍
+                time.sleep(0.01)
+            ran.append(transport)
+
+    monkeypatch.setattr("cuemem.api.mcp.build_server", lambda service, space: Server())
+    result = runner.invoke(app, ["mcp"])
+    assert result.exit_code == 0, result.output
+    assert ran == ["stdio"] and not old.exists()
+    assert result.stdout == ""  # stdout 是 MCP 的通道
+    assert not any(t.name == "cuemem-mcp-sweep" and t.is_alive() for t in threading.enumerate())

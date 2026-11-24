@@ -381,6 +381,10 @@ class MemoryProxy:
         # 已经记过警告的想起失败（空间，出错的类型）：同一种只记一次，想起成功之后再记（_evidence）
         self._recall_warned: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
+        # 这个进程丢掉的写回数（write_backs，/health 的 write_backs_dropped）。自己的一把小锁：
+        # 丢的地方拿着 run.lock，不能再去拿 self._lock（顺序是先 self._lock、后 run.lock）
+        self._dropped = 0
+        self._dropped_lock = threading.Lock()
         system.start_worker()  # 会话结束后的抽取在后台完成
 
     # ---------- 请求 ----------
@@ -567,6 +571,21 @@ class MemoryProxy:
         """内存里进行中的会话数（不含停放的，见 parked_runs）。"""
         with self._lock:
             return len(self._runs)
+
+    def write_backs(self) -> tuple[int, int]:
+        """（留着等重试的写回数，这个进程启动以来丢掉的写回数），/health 用（第十轮体检 Q12）：
+        向量接口故障时请求照常 200，写回留在内存里（每个会话最多 MAX_UNSAVED 次），进程退出时
+        再试一次、还写不进去就丢了；以前两个探活都看不出来。只拿 self._lock，不拿会话的锁
+        （它在写回的网络调用期间一直被持有，/health 在事件循环上）。停放的会话没有留着的写回
+        （见 _make_room）。"""
+        with self._lock:
+            waiting = sum(len(run.unsaved) for run in self._runs.values())
+        with self._dropped_lock:
+            return waiting, self._dropped
+
+    def _count_dropped(self, count: int = 1) -> None:
+        with self._dropped_lock:
+            self._dropped += count
 
     def parked_runs(self) -> int:
         """停放的会话数（见 _make_room）。"""
@@ -1195,6 +1214,7 @@ class MemoryProxy:
             messages = list(user)
             if answered and turn.block and turn.epoch is not None and turn.epoch != epoch:
                 self._note(turn.trace, "proxy_write_dropped", reason="forgotten", part="answer")
+                self._count_dropped()
                 logger.info(
                     "CueMem did not store the answer of a request of proxy session %s: memories "
                     "of its user were forgotten while it was in flight.",
@@ -1217,6 +1237,7 @@ class MemoryProxy:
         ):
             dropped.append(run.unsaved[0])
             run.drop()
+            self._count_dropped()
             self._note(trace, "proxy_write_dropped", reason="backlog")
         if dropped:
             logger.warning(
@@ -1246,6 +1267,7 @@ class MemoryProxy:
                     run.session_id,
                 )
                 run.drop()
+                self._count_dropped()
                 continue
             try:
                 self.memory.add(
@@ -1278,6 +1300,7 @@ class MemoryProxy:
                     run.session_id,
                     error,
                 )
+                self._count_dropped(len(lost))
                 run.drop(len(lost))
                 continue
             run.drop()
@@ -2166,7 +2189,14 @@ def create_proxy_app(
 
     @app.get("/health")  # async：不排在默认线程池后面（open_runs 只拿一下锁）
     async def health() -> dict[str, Any]:
-        return {"ok": True, "version": __version__, "open_runs": proxy.open_runs()}
+        waiting, dropped = proxy.write_backs()
+        return {
+            "ok": True,
+            "version": __version__,
+            "open_runs": proxy.open_runs(),
+            "write_backs_waiting": waiting,
+            "write_backs_dropped": dropped,
+        }
 
     ready_limiter = anyio.CapacityLimiter(2)
 
