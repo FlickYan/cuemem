@@ -33,7 +33,7 @@ from test_sdk import AUG, SEP, moved, where_i_live
 
 from cuemem import Memory
 from cuemem import sdk as sdk_module
-from cuemem.config import PathsConfig, Settings
+from cuemem.config import ConsolidationConfig, PathsConfig, Settings
 from cuemem.core.ids import stable_id
 from cuemem.core.models import Conversation, Entity, Fact, SessionIn, Turn, TurnIn
 from cuemem.core.trace import start_trace
@@ -1591,6 +1591,26 @@ def test_fingerprint_function_matches_the_method(settings: Settings, fake_api: F
         with MemorySystem.from_settings(current, http_client=fake_api.client()) as system:
             assert consolidation_fingerprint(model, config) == system.consolidator.fingerprint()
     assert consolidation_fingerprint(model, settings.consolidation) == "2f0adc7890b6a52e"
+    # consolidation.language 同样：没设时不计入指纹，设了就变（已巩固的空间会重建）
+    seen = set()
+    for language in (None, "auto", "Japanese"):
+        config = settings.consolidation.model_copy(update={"language": language})
+        current = settings.model_copy(update={"consolidation": config})
+        with MemorySystem.from_settings(current, http_client=fake_api.client()) as system:
+            assert consolidation_fingerprint(model, config) == system.consolidator.fingerprint()
+            assert system.consolidator.extractor.language == language
+        seen.add(consolidation_fingerprint(model, config))
+        assert (consolidation_fingerprint(model, config) == "2f0adc7890b6a52e") == (not language)
+    assert len(seen) == 3
+    # 只有空白的值（空的环境变量）当作没设；空白压成一个空格，换行断不开会话抬头
+    blank = ConsolidationConfig(language="  \n")
+    assert blank.language is None
+    assert consolidation_fingerprint(model, blank) == consolidation_fingerprint(
+        model, ConsolidationConfig()
+    )
+    assert ConsolidationConfig(language=" Brazilian\n Portuguese ").language == (
+        "Brazilian Portuguese"
+    )
 
 
 def test_reused_state_notices_writes_from_another_connection(

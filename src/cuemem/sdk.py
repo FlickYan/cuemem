@@ -59,7 +59,7 @@ import httpx2
 from pydantic import Field, TypeAdapter, ValidationError
 
 from cuemem._async import AsyncMethods
-from cuemem.config import Settings, load_settings, presets, unknown_keys
+from cuemem.config import ConsolidationConfig, Settings, load_settings, presets, unknown_keys
 from cuemem.core.ids import sortable_session_id, stable_id
 from cuemem.core.models import (
     Answer,
@@ -198,6 +198,8 @@ class Memory:
     {"roles": {"reader": {"model": "qwen3.8-flash"}}}；有不认识的键（写错的、Mem0 格式的配置）时
     报 ValueError，不悄悄用默认的模型供应商（见 _check_config）；home：数据目录（默认 CUEMEM_HOME，
     源码仓库里是仓库根目录，否则 ~/.cuemem）；instructions：给抽取的补充说明（记什么、不记什么）；
+    language：记忆用什么语言写（consolidation.language）："auto" 跟用户的语言，或语言名，如
+    "Japanese"；不传时按内置规则写成中文或英文；
     background：后台线程抽取事实（默认开）。
 
     peak_policy：DeepSeek 分时价格的高峰时段里需要真实调用时怎么办（默认配置的回答模型就是
@@ -215,6 +217,7 @@ class Memory:
         preset: str | None = None,
         home: str | Path | None = None,
         instructions: str | None = None,
+        language: str | None = None,
         background: bool = True,
         peak_policy: PeakPolicy | None = None,
         http_client: httpx2.Client | None = None,
@@ -233,6 +236,11 @@ class Memory:
             settings = load_settings(preset=preset, home=home, **overrides)
         if instructions is not None:  # 抽取的补充说明（Mem0 叫 custom_instructions）
             consolidation = settings.consolidation.model_copy(update={"instructions": instructions})
+            settings = settings.model_copy(update={"consolidation": consolidation})
+        if language is not None:  # 记忆用什么语言写；过一遍校验（压空白，空的当作没设）
+            consolidation = ConsolidationConfig.model_validate(
+                {**settings.consolidation.model_dump(), "language": language}
+            )
             settings = settings.model_copy(update={"consolidation": consolidation})
         self.settings = settings
         from cuemem.memory import MemorySystem
@@ -1480,6 +1488,7 @@ class AsyncMemory(AsyncMethods):
         preset: str | None = None,
         home: str | Path | None = None,
         instructions: str | None = None,
+        language: str | None = None,
         background: bool = True,
         peak_policy: PeakPolicy | None = None,
         http_client: httpx2.Client | None = None,
@@ -1489,6 +1498,7 @@ class AsyncMemory(AsyncMethods):
             preset=preset,
             home=home,
             instructions=instructions,
+            language=language,
             background=background,
             peak_policy=peak_policy,
             http_client=http_client,

@@ -2373,6 +2373,7 @@ MEM0_CONFIG = {
     ("config", "said"),
     [
         ({"consolidation": {"instruction": "x"}}, "consolidation.instructions"),
+        ({"consolidation": {"langauge": "x"}}, "consolidation.language"),
         ({"retreival": {}}, "did you mean retrieval?"),
         ({"retrieval": {"controler": "v1.json"}}, "retrieval.controller"),
         (MEM0_CONFIG, 'Memory(preset="openai")'),
@@ -2401,6 +2402,57 @@ def test_unknown_config_keys_are_refused(
 
 
 HASH = {"embedding": {"backend": "hash", "dim": 64}}
+
+
+def test_language_keyword_config_key_and_environment_variable(
+    clean_env: None, fake_api: FakeAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """记忆用什么语言写：Memory(language=...)、配置字典里的 consolidation.language 与环境变量
+    CUEMEM_CONSOLIDATION__LANGUAGE 都行，AsyncMemory 照传；不设时是 None（内置规则）。关键字
+    参数过一遍校验：只有空白的当作没设。"""
+
+    def language(config: Any = HASH, **kwargs: Any) -> str | None:
+        memory = Memory(
+            config,
+            home=tmp_path / "home",
+            http_client=fake_api.client(),
+            background=False,
+            **kwargs,
+        )
+        try:
+            assert memory.system.consolidator.extractor.language == (
+                memory.settings.consolidation.language
+            )
+            return memory.settings.consolidation.language
+        finally:
+            memory.close()
+
+    assert language() is None
+    assert language(language="Japanese") == "Japanese"
+    assert language(language=" auto\n") == "auto"
+    assert language(language="  ") is None
+    assert language({**HASH, "consolidation": {"language": "Korean"}}) == "Korean"
+    assert language({**HASH, "consolidation": {"language": "Korean"}}, language="auto") == "auto"
+    settings = Memory(HASH, home=tmp_path / "home", http_client=fake_api.client(), background=False)
+    settings.close()
+    assert language(settings.settings, language="Spanish") == "Spanish"  # Settings 对象也行
+    monkeypatch.setenv("CUEMEM_CONSOLIDATION__LANGUAGE", "Russian")
+    assert language() == "Russian"
+    monkeypatch.setenv("CUEMEM_CONSOLIDATION__LANGUAGE", "")
+    assert language() is None
+    monkeypatch.delenv("CUEMEM_CONSOLIDATION__LANGUAGE")
+
+    async def forwarded() -> str | None:
+        async with AsyncMemory(
+            HASH,
+            home=tmp_path / "home",
+            http_client=fake_api.client(),
+            background=False,
+            language="Japanese",
+        ) as memory:
+            return memory.sync.settings.consolidation.language
+
+    assert asyncio.run(forwarded()) == "Japanese"
 
 
 def test_config_dict_takes_the_vector_store_api_key(

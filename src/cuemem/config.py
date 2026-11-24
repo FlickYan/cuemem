@@ -251,8 +251,19 @@ class ConsolidationConfig(BaseModel):
     # custom_extraction_instructions）：例如"导购场景：记下尺码、预算、品牌偏好，不记寒暄"。
     # 改了会触发重建派生记忆（巩固配置的指纹变了）
     instructions: str | None = None
+    # 记忆（陈述、描述、摘要）用什么语言写。None：内置规则，按用户发言里汉字的比例写成
+    # Chinese 或 English（日文按汉字多少被当成中文或英文，韩文、西班牙文、俄文都是英文）；
+    # "auto"：让抽取模型跟用户的语言；别的值原样当作语言名（"Japanese"）。主语 "User" 与谓词
+    # 仍是英文。不设时抽取请求与巩固配置的指纹逐字不变；设了或改了会触发重建派生记忆
+    language: str | None = None
     caption_images: bool = True  # 巩固时为图片生成描述（上下文感知与孤立两种，N6）
     caption_max_side: int = 768  # 送去描述的图片最长边（像素）
+
+    @field_validator("language")
+    @classmethod
+    def _language(cls, value: str | None) -> str | None:
+        """空白压成一个空格（换行不能把会话抬头断开）；只有空白的值（空的环境变量）当作没设。"""
+        return " ".join(value.split()) or None if value is not None else None
 
 
 class Settings(BaseSettings):

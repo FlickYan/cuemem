@@ -55,6 +55,12 @@ For each fact:
 Also list the named entities that appear in the facts (people, pets, places, organizations, products, events) with their type, other names used for them in this conversation, and a short description; and summarize the conversation in one or two sentences. Write the descriptions and the summary in the same language as the statements.
 Return empty lists if nothing is worth remembering."""  # noqa: E501
 
+# 设了 consolidation.language 时接在会话抬头的语言后面：主语 "User"（认出用户实体靠它）与
+# 谓词（登记表是英文的）仍用英文，用户不列进实体（USER_NAMES 只认英文与简体中文的写法）
+LANGUAGE_SCOPE = (
+    ' (statements, descriptions and the summary; keep the subject "User" and the predicates '
+    "in English, and do not list the user as an entity)"
+)
 # 应用给抽取的补充说明（consolidation.instructions，N12）放在系统提示的最后
 INSTRUCTIONS_HEADER = (
     "Additional instructions from the application (they take precedence over the defaults "
@@ -207,6 +213,7 @@ def render_session(
     assistant_chars: int | None,
     image_notes: Mapping[str, Sequence[str]] | None = None,
     deleted_from: int | None = None,
+    language: str | None = None,
 ) -> str:
     """把会话渲染成带轮次编号的文本。
 
@@ -222,13 +229,16 @@ def render_session(
 
     发言的日期与会话日期（或上一句标出的日期）不同时，在它前面标出新的日期并加一行说明
     （DATED_NOTE）。所有发言都在会话开始的那天时渲染结果不变。
+
+    language（consolidation.language）：抬头里 Language 一行写什么，见 header_language。
+    为 None 时渲染结果不变。
     """
     names = participants(turns)
     who = ", ".join(names) if names != ["User", "Assistant"] else "User, Assistant (AI)"
     lines = [
         f"Conversation date: {started_at:%Y-%m-%d (%A)}",
         f"Participants: {who}",
-        f"Language: {conversation_language(turns)}",
+        f"Language: {header_language(turns, language)}",
     ]
     notes = image_notes or {}
     if any(notes.get(t.id) for t in turns):
@@ -276,6 +286,15 @@ def conversation_language(turns: Sequence[Turn]) -> str:
     return "Chinese" if letters and cjk / len(letters) >= 0.2 else "English"
 
 
+def header_language(turns: Sequence[Turn], language: str | None) -> str:
+    """会话抬头里 Language 一行的内容。None：按汉字比例的内置规则，与原来逐字相同；"auto"：
+    让模型跟用户的语言；别的值原样当作语言名。后两种附上 LANGUAGE_SCOPE。"""
+    if language is None:
+        return conversation_language(turns)
+    name = "the language the user writes in" if language.casefold() == "auto" else language
+    return name + LANGUAGE_SCOPE
+
+
 class Extractor:
     def __init__(
         self,
@@ -287,6 +306,7 @@ class Extractor:
         max_chars: int = 24_000,
         fallback_model: str | None = None,
         instructions: str | None = None,
+        language: str | None = None,
         split_truncated: bool = False,
     ) -> None:
         # split_truncated：回复在输出上限处被截断时把窗口对半分开再抽（见 _extract_window）。
@@ -298,6 +318,8 @@ class Extractor:
         self.max_chars = max_chars
         self.fallback_model = fallback_model
         self.instructions = instructions.strip() if instructions else None
+        # 没设（或只有空白）时会话抬头逐字不变，已有的抽取缓存照常命中
+        self.language = (" ".join(language.split()) or None) if language else None
         self.split_truncated = split_truncated
 
     def extract(
@@ -421,6 +443,7 @@ class Extractor:
             assistant_chars=self.assistant_chars,
             image_notes=image_notes,
             deleted_from=deleted_from,
+            language=self.language,
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": text}]
 

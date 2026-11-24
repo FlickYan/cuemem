@@ -15,7 +15,14 @@ from cuemem.core.timeutil import normalize_partial_date
 from cuemem.llm import LLMClient
 from cuemem.write import build_turns
 from cuemem.write.entities import normalize_name
-from cuemem.write.extract import DATED_NOTE, ExtractionOutput, Extractor, render_session
+from cuemem.write.extract import (
+    DATED_NOTE,
+    LANGUAGE_SCOPE,
+    ExtractionOutput,
+    Extractor,
+    conversation_language,
+    render_session,
+)
 from cuemem.write.predicates import (
     legacy_value_key,
     normalize_predicate,
@@ -205,6 +212,67 @@ def test_turns_said_on_another_day_get_a_date_line() -> None:
         "[Date: 2023-05-28 (Sunday)]\n"
         "[t2] User: I moved yesterday."
     )
+
+
+def test_built_in_language_rule_only_knows_chinese_and_english() -> None:
+    """内置规则按汉字比例二选一（consolidation.language 存在的原因）：日文按汉字多少被当成中文
+    或英文，韩文、西班牙文、俄文都是英文。缺省路径上的这条规则不改（改了抽取请求就变了）。"""
+    labels = {
+        "私は東京に住んでいます。猫を二匹飼っています。": "Chinese",
+        "東京タワーに行きたい": "Chinese",
+        "ありがとうございます、とても助かりました": "English",
+        "저는 서울에 살고 있어요.": "English",
+        "Vivo en Madrid con mi perro.": "English",
+        "Я живу в Москве.": "English",
+        "我住在北京。": "Chinese",
+        "我住在臺北。": "Chinese",
+        "I live in Paris.": "English",
+    }
+    for text, label in labels.items():
+        assert conversation_language(session(("user", text))) == label, text
+
+
+def test_language_setting_changes_only_the_header_line(
+    settings: Settings, fake_api: FakeAPI
+) -> None:
+    """consolidation.language：None（缺省）时会话抬头与系统提示逐字不变；"auto" 让模型跟用户
+    的语言，别的值原样当作语言名，都附上“主语与谓词仍用英文、用户不列进实体”。"""
+    turns = session(("user", "私は東京に住んでいます。"), ("assistant", "いいですね。"))
+    default = render_session(turns, WHEN, assistant_chars=None)
+    assert default == (
+        "Conversation date: 2023-05-20 (Saturday)\n"
+        "Participants: User, Assistant (AI)\n"
+        "Language: Chinese\n"
+        "\n"
+        "[t0] User: 私は東京に住んでいます。\n"
+        "[t1] Assistant: いいですね。"
+    )
+    assert render_session(turns, WHEN, assistant_chars=None, language=None) == default
+    scope = (
+        ' (statements, descriptions and the summary; keep the subject "User" and the '
+        "predicates in English, and do not list the user as an entity)"
+    )
+    assert scope == LANGUAGE_SCOPE
+    for language, line in (
+        ("Japanese", "Language: Japanese" + scope),
+        ("Brazilian Portuguese", "Language: Brazilian Portuguese" + scope),
+        ("auto", "Language: the language the user writes in" + scope),
+        ("AUTO", "Language: the language the user writes in" + scope),
+    ):
+        text = render_session(turns, WHEN, assistant_chars=None, language=language)
+        assert text.split("\n") == [*default.split("\n")[:2], line, *default.split("\n")[3:]]
+
+    reply = json.dumps({"summary": "", "facts": [], "entities": []})
+    fake_api.chat_replies = [reply]
+    client = LLMClient(settings, http_client=fake_api.client())
+    Extractor(client).extract("s1", turns, WHEN)
+    Extractor(client, language="  Japanese\n").extract("s1", turns, WHEN)
+    Extractor(client, language=" \n").extract("s1", turns, WHEN)  # 只有空白：当作没设
+    plain, japanese, blank = (r["messages"] for r in fake_api.chat_requests)
+    assert blank == plain
+    assert plain[1]["content"] == render_session(turns, WHEN, assistant_chars=600)
+    assert japanese[1]["content"].split("\n")[2] == "Language: Japanese" + scope
+    assert japanese[0] == plain[0]  # 系统提示不变
 
 
 def test_predicate_normalization() -> None:

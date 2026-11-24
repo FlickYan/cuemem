@@ -93,6 +93,8 @@ def consolidation_fingerprint(model: str, config: ConsolidationConfig) -> str:
     exclude = {"workers", "background_workers"}
     if config.instructions is None:
         exclude.add("instructions")
+    if config.language is None:  # 同上
+        exclude.add("language")
     dumped = json.dumps(config.model_dump(exclude=exclude), sort_keys=True)
     return stable_id(PIPELINE_VERSION, model, dumped)
 
@@ -178,6 +180,7 @@ class Consolidator:
             max_chars=config.max_session_chars,
             fallback_model=config.fallback_model,
             instructions=config.instructions,
+            language=config.language,
             # 不是 ConsolidationConfig 的字段：那会进巩固指纹与冻结的配置
             split_truncated=split_truncated,
         )
