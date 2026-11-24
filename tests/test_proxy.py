@@ -2634,6 +2634,85 @@ def test_a_responses_stream_relays_a_split_surrogate_pair(system: MemorySystem) 
     # 拼起来的全文是一对完整的代理项：JSON 解析出来就是那个字
     assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Hi \U0001f600 there"
     assert answer.closed and relayed._runs[("alice", None)].busy == 0
+    # 第十轮体检 Q2：写进记忆的也是那个字。以前两半各自落单、存不进去，连用户的话一起丢了
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Hi \U0001f600 there"),
+    ]
+
+
+def test_a_chat_stream_with_a_split_surrogate_pair_is_written_back(system: MemorySystem) -> None:
+    """第十轮体检 Q2：/v1/chat/completions 的流式照上游的字节转给调用方（一直如此），写回时两半
+    合成原来的字。以前拼起来的回答带着两个落单的代理项，Memory.add 出 UnicodeEncodeError，这一轮
+    （用户的话与回答）只留下一条警告。"""
+    answer = Answer(["Hi \ud83d", "\ude00 there"])
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    raw = b"".join(chunks)
+    assert raw == b"".join(answer)
+    assert rb"Hi \ud83d" in raw and rb"\ude00 there" in raw
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Hi \U0001f600 there"),
+    ]
+
+
+def test_an_answer_with_a_lone_surrogate_is_returned_and_stored(system: MemorySystem) -> None:
+    """第十轮体检 Q2：非流式的回答截在半个字符上（"\\ud83d"，finish_reason 是 length）。以前
+    写回时这一轮被丢掉，响应体又写不成 UTF-8：上游答了 200、账也记了，调用方拿到的是 500。现在
+    响应体用 \\uXXXX 转义写出（JSON 的内容与上游的相同），记忆里那半个字是 U+FFFD。"""
+    message = {"role": "assistant", "content": "Sure \ud83d"}
+    body = {
+        "choices": [{"index": 0, "message": message, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+    }
+    sent = json.dumps(body).encode()
+    transport = httpx2.MockTransport(lambda _: httpx2.Response(200, content=sent))
+    proxy = MemoryProxy(system, http_client=httpx2.Client(transport=transport))
+    with TestClient(create_proxy_app(proxy)) as client:
+        chat = client.post("/v1/chat/completions", json={**ASK_PIN, "stream": False})
+        assert chat.status_code == 200 and chat.json() == body
+        assert rb"Sure \ud83d" in chat.content
+        assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+            ("user", "What is my PIN?"),
+            ("assistant", "Sure \ufffd"),
+        ]
+        # /v1/responses：回答与原样带回的 metadata 里都有落单的代理项（D-076 留下的那个 500）
+        ask = {**RESPOND_PIN, "stream": False, "user": "bob", "metadata": {"k": "\ud800"}}
+        answered = client.post(
+            "/v1/responses",
+            content=json.dumps(ask).encode(),
+            headers={"content-type": "application/json"},
+        )
+        assert answered.status_code == 200
+        assert answered.json()["metadata"]["k"] == "\ud800"
+        assert answered.json()["output"][0]["content"][0]["text"] == "Sure \ud83d"
+        assert [(t.role, t.text) for t in system.db.get_turns("bob")] == [
+            ("user", "What is my PIN?"),
+            ("assistant", "Sure \ufffd"),
+        ]
+
+
+def test_an_error_body_with_a_lone_surrogate_is_still_json() -> None:
+    """出错的响应体带着调用方给的字符串时同样不该变成 500。"""
+    error = ProxyError(400, "Unknown thing '\ud800'")
+    assert json.loads(error.response().body) == error.body
+
+
+@pytest.mark.parametrize(
+    ("text", "stored"),
+    [
+        ("Hi \ud83d\ude00 there", "Hi \U0001f600 there"),  # 分在两块里的一对：合成原来的字
+        ("Sure \ud83d", "Sure \ufffd"),  # 截在半个字符上
+        ("\ude00 x", "\ufffd x"),
+        ("x\ude00\ud83dy", "x\ufffd\ufffdy"),  # 顺序反了的两半不是一对
+        ("plain 中文 \U0001f600", "plain 中文 \U0001f600"),
+        ("ascii", "ascii"),
+        ("", ""),
+    ],
+)
+def test_well_formed_text(text: str, stored: str) -> None:
+    assert proxy_module._well_formed(text) == stored
+    stored.encode("utf-8")
 
 
 @pytest.mark.parametrize("reply", [REJECT, RATE_LIMIT, TIMEOUT])

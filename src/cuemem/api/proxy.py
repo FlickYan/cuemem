@@ -163,7 +163,7 @@ class ProxyError(Exception):
         self.headers = dict(headers or {})
 
     def response(self) -> JSONResponse:
-        return JSONResponse(self.body, self.status, self.headers)
+        return _JSON(self.body, self.status, self.headers)
 
 
 @dataclass
@@ -931,6 +931,10 @@ class MemoryProxy:
         （第九轮体检 P8；以前留在它上面，不声不响地丢了）。"""
         if turn.space is None or turn.run is None:
             return
+        if answer:
+            # 上游把一个字符的两半分在两块里、或者截在半个字符上：照原样存不进去，这一轮连同
+            # 用户的话一起丢掉（第十轮体检 Q2）。用户的话不动：_digest 与 _in_context 按原文比对
+            answer = _well_formed(answer)
         user = [_storable(turn.write_user)] if turn.write_user is not None else []
         answered = bool(answer and answer.strip())
         if not user and not answered:
@@ -1278,6 +1282,26 @@ def _cap_output(upstream: dict[str, Any], spec: ModelSpec, cap: int) -> None:
             upstream[key] = cap
     if spec.max_tokens_param not in upstream:
         upstream[spec.max_tokens_param] = min((upstream[key] for key in given), default=cap)
+
+
+def _well_formed(text: str) -> str:
+    """写得成 UTF-8 的文字：分在两块里的一对代理项（"\\ud83d" + "\\ude00"）合成原来的那个字，
+    真正落单的半个换成 U+FFFD；其余原样。"""
+    if text.isascii():
+        return text
+    return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+class _JSON(JSONResponse):
+    """JSONResponse，响应体里有落单的代理项（上游的回答截在半个字符上、请求里原样带回的字段）
+    时改用 \\uXXXX 转义（与 _ResponsesRelay._event 相同，JSON 的内容不变）：以前写不成 UTF-8，
+    调用方收到 500，而这次调用已经记了账。写得成 UTF-8 的响应体与 JSONResponse 逐字节相同。"""
+
+    def render(self, content: Any) -> bytes:
+        try:
+            return super().render(content)
+        except UnicodeEncodeError:
+            return json.dumps(content, allow_nan=False, separators=(",", ":")).encode()
 
 
 def _storable(message: dict[str, Any]) -> dict[str, Any]:
@@ -1735,7 +1759,7 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
             status, data, extra = proxy.complete(body, headers, who)
         except ProxyError as exc:
             return exc.response()
-        return JSONResponse(data, status, extra)
+        return _JSON(data, status, extra)
 
     @router.post("/v1/responses")
     def responses(body: Annotated[dict[str, Any], Depends(_body)], request: Request) -> Response:
@@ -1750,7 +1774,7 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
             status, data, extra = proxy.respond(body, headers, who)
         except ProxyError as exc:
             return exc.response()
-        return JSONResponse(data, status, extra)
+        return _JSON(data, status, extra)
 
     @router.post("/v1/embeddings")
     def embeddings(body: Annotated[dict[str, Any], Depends(_body)]) -> Response:
@@ -1758,7 +1782,7 @@ def proxy_router(proxy: MemoryProxy, *, dependencies: list[Any] | None = None) -
             data, extra = proxy.embeddings(body)
         except ProxyError as exc:
             return exc.response()
-        return JSONResponse(data, 200, extra)
+        return _JSON(data, 200, extra)
 
     return router
 
