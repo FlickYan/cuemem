@@ -102,7 +102,7 @@ from agents.run_config import (  # type: ignore[import-not-found, unused-ignore]
 )
 
 from cuemem.core.ids import sortable_session_id
-from cuemem.core.trace import record_event
+from cuemem.core.trace import error_fields
 from cuemem.evidence import (
     forget_summary,
     format_listing,
@@ -259,7 +259,7 @@ def _hand_over(system: MemorySystem, space: str, sid: str) -> None:
         system.close_session(space, sid)
     except Exception as exc:
         logger.warning("CueMem could not hand session %s to extraction (%s).", sid, _err(exc))
-        record_event("agents_close_failed", space=space, error=_err(exc))
+        system.note_event(space, "agents_close_failed", **error_fields(exc))
 
 
 def _adopt(system: MemorySystem, space: str) -> None:
@@ -447,13 +447,14 @@ class MemoryInputFilter:
             # 按写进记忆后的样子比对（_mirrorable 之后：只有 data URL 的图片记作 <image>）
             pending = [p for p in map(_mirrorable, items) if p is not None]
             present = {stored_text(p.message).strip() for p in pending}
+            since = system.forget_epoch(space)
             try:
                 evidence = await asyncio.to_thread(self._recall, space, query, present)
             except Exception as exc:  # 记忆出错不挡住对话：这一次不带记忆
                 logger.warning(
                     "CueMem recall failed (%s); calling the model without memories.", _err(exc)
                 )
-                record_event("agents_recall_failed", space=space, error=_err(exc))
+                system.note_event(space, "agents_recall_failed", since=since, **error_fields(exc))
                 return model_data
             self._put(self._cache, key, evidence)
         self._put(self._recent, _run_key(space, data.context), evidence)
@@ -504,7 +505,6 @@ class MemoryInputFilter:
             lam=self.lam,
             exclude=in_context_rounds(system, space, sorted(system.open_sessions(space)), present),
         )
-        record_event("agents_recall", space=space, level=found.level, recalled=found.recalled)
         return Evidence(query, found.level, found.reasons, found.recalled, found.block)
 
     def _get(self, cache: OrderedDict[Any, tuple[float, Evidence]], key: Any) -> Evidence | None:
@@ -692,11 +692,12 @@ class CueMemSession:
             await self._prune()
         except Exception as exc:  # 同步不了遗忘也照常读历史
             logger.warning("CueMem could not prune session %s (%s).", self.session_id, _err(exc))
-            record_event("agents_prune_failed", space=self.space, error=_err(exc))
+            self._note("agents_prune_failed", **error_fields(exc))
         return await self.inner.get_items(limit)
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         await self.inner.add_items(items)
+        since = self.memory.system.forget_epoch(self.space)
         try:
             lead = await self._lead(items)
             await asyncio.to_thread(self._take, items, lead)
@@ -708,7 +709,7 @@ class CueMemSession:
                 _err(exc),
                 kept,
             )
-            record_event("agents_mirror_failed", space=self.space, error=_err(exc))
+            self._note("agents_mirror_failed", since=since, **error_fields(exc))
 
     async def pop_item(self) -> TResponseInputItem | None:
         last = await self.inner.get_items(1)
@@ -717,7 +718,7 @@ class CueMemSession:
             try:
                 await asyncio.to_thread(self._forget_item, key)
             except Exception as exc:
-                record_event("agents_forget_failed", space=self.space, error=_err(exc))
+                self._note("agents_forget_failed", **error_fields(exc))
                 raise
         return await self.inner.pop_item()
 
@@ -725,9 +726,14 @@ class CueMemSession:
         try:
             await asyncio.to_thread(self._forget_all)
         except Exception as exc:
-            record_event("agents_forget_failed", space=self.space, error=_err(exc))
+            self._note("agents_forget_failed", **error_fields(exc))
             raise
         await self.inner.clear_session()
+
+    def _note(self, kind: str, *, since: int | None = None, **data: Any) -> None:
+        """记一个 trace 事件（MemorySystem.note_event：不在 trace 里时单独写一行，只有空间、
+        事件名与这里给的计数、出错类型；这个空间正在遗忘时不写，不等）。"""
+        self.memory.system.note_event(self.space, kind, since=since, **data)
 
     # ---------- 会话边界 ----------
 
@@ -818,7 +824,7 @@ class CueMemSession:
             len(held),
             self.session_id,
         )
-        record_event("agents_unanswered_dropped", space=self.space, messages=len(held))
+        self._note("agents_unanswered_dropped", messages=len(held))
         return []
 
     def _write(self, batch: list[_Pending], *, merge: bool = False) -> None:
@@ -829,6 +835,7 @@ class CueMemSession:
         记警告，接着写后面的；之后这个空间遗忘过发言（例如别处删了这个用户的记忆）时也丢掉：
         它们是遗忘之前说的。留着的超过 MAX_UNSAVED 批或 MAX_UNSAVED_BYTES 时丢掉最早的（_trim）。"""
         system = self.memory.system
+        epoch0 = system.forget_epoch(self.space)
         if batch:
             epoch = system.db.turn_epoch(self.space)
             self._unsaved.append(_Unsaved(batch, merge, datetime.now(), epoch))
@@ -836,7 +843,7 @@ class CueMemSession:
             while self._unsaved:
                 head = self._unsaved[0]
                 if head.epoch != system.db.turn_epoch(self.space):
-                    record_event("agents_mirror_dropped", space=self.space, reason="forgotten")
+                    self._note("agents_mirror_dropped", reason="forgotten")
                     del self._unsaved[0]
                     continue
                 try:
@@ -850,7 +857,7 @@ class CueMemSession:
                     )
                 except Exception as exc:
                     if worth_retrying(exc):
-                        self._trim()  # 只限写不进去、还留着的
+                        self._trim(epoch0)  # 只限写不进去、还留着的
                         raise
                     logger.warning(
                         "CueMem could not store %d message(s) of session %s and dropped them (%s).",
@@ -858,7 +865,7 @@ class CueMemSession:
                         self.session_id,
                         _err(exc),
                     )
-                    record_event("agents_mirror_dropped", space=self.space, error=_err(exc))
+                    self._note("agents_mirror_dropped", since=epoch0, **error_fields(exc))
                     del self._unsaved[0]
                     continue
                 del self._unsaved[0]
@@ -870,7 +877,7 @@ class CueMemSession:
                 if head.merge and ids:  # 发言已经写进去了：并不进这一轮也不再重写
                     _merge_round(system, self.space, segment, ids[0])
 
-    def _trim(self) -> None:
+    def _trim(self, since: int | None = None) -> None:
         """留着重试的超过 MAX_UNSAVED 批或 MAX_UNSAVED_BYTES 时丢掉最早的，最新的一批总留着
         （调用方持有 self._lock）。批里的消息会被 _forget_item 删掉，大小每次现算。"""
         sizes = [payload_size([p.message for p in u.batch]) for u in self._unsaved]
@@ -881,7 +888,7 @@ class CueMemSession:
             dropped += len(self._unsaved[0].batch)
             total -= sizes.pop(0)
             del self._unsaved[0]
-            record_event("agents_mirror_dropped", space=self.space, reason="backlog")
+            self._note("agents_mirror_dropped", since=since, reason="backlog")
         if dropped:
             logger.warning(
                 "CueMem could not store %d message(s) of session %s for a long time and dropped "

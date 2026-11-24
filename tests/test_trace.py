@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import threading
 from datetime import date
@@ -12,7 +13,15 @@ from typing import Any
 
 import pytest
 
-from cuemem.core.trace import Trace, TraceSink, trace_queries
+from cuemem.core.trace import (
+    Trace,
+    TraceSink,
+    error_fields,
+    note,
+    start_trace,
+    trace_queries,
+)
+from cuemem.errors import EmbeddingAPIError
 
 
 def _line(space: str, question: str, trace_id: str = "t") -> str:
@@ -281,3 +290,52 @@ def test_remove_deletes_a_file_it_cannot_rewrite(
         "20260104.jsonl",
     ]
     assert "stuck" in (directory / "20260102.jsonl").read_text("utf-8")
+
+
+# ---------- 不在请求的 trace 里的事件（第十轮体检 Q13） ----------
+
+
+def test_note_writes_a_one_event_line_outside_a_trace(tmp_path: Path) -> None:
+    """记忆代理与各集成的失败、丢弃以前用 record_event 记：不在 trace 里时什么也不做，这些事件
+    哪里也没写。note 在 trace 里记到它上面，不在时单独写一行只有这一个事件的 trace。"""
+    sink = TraceSink(tmp_path)
+    note(sink, "agents_recall_failed", space="alice", error="RuntimeError", status=None)
+    [path] = tmp_path.glob("*.jsonl")
+    [record] = [json.loads(line) for line in path.read_text("utf-8").splitlines()]
+    assert record["name"] == "agents_recall_failed" and record["attrs"] == {"space": "alice"}
+    [event] = record["events"]
+    assert {k: v for k, v in event.items() if k != "t_ms"} == {
+        "kind": "agents_recall_failed",
+        "error": "RuntimeError",
+        "status": None,
+    }
+
+    with start_trace("ask", sink, space="alice") as trace:
+        note(sink, "agents_recall_failed", space="alice", error="RuntimeError")
+    assert [e["kind"] for e in trace.events] == ["agents_recall_failed"]
+    assert len(path.read_text("utf-8").splitlines()) == 2  # 只多了 ask 那一行
+    note(None, "agents_recall_failed", space="alice")  # 没有 sink：什么也不做
+
+
+def test_error_fields_keep_the_type_and_status_only() -> None:
+    """事件里的出错只有类型名与状态码：出错的文字可能引着请求里的原话，遗忘找不到事件里的它。"""
+
+    class Refused(Exception):
+        status_code = 429  # openai SDK 的写法
+
+    failed = EmbeddingAPIError("HTTP 503: could not embed 'my PIN is 1234'", status=503)
+    assert error_fields(failed) == {"error": "EmbeddingAPIError", "status": 503}
+    assert error_fields(Refused("quota")) == {"error": "Refused", "status": 429}
+    assert error_fields(ValueError("bad")) == {"error": "ValueError", "status": None}
+
+
+def test_a_failing_sink_warns_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """write_trace（start_trace 与 note 共用）：写不进去时不抛出，接连失败只记一次警告。"""
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory", "utf-8")
+    sink = TraceSink(blocked)
+    with caplog.at_level(logging.WARNING, logger="cuemem.core.trace"):
+        note(sink, "a", space="alice")
+        with start_trace("b", sink):
+            pass
+    assert len(caplog.records) == 1 and sink.failing

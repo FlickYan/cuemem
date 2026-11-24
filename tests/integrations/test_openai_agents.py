@@ -9,6 +9,7 @@ import asyncio
 import base64
 import io
 import itertools
+import json
 import logging
 from collections.abc import Iterator
 from datetime import datetime
@@ -32,7 +33,7 @@ from agents import (
 )
 from agents.testing import ModelCall, assistant_message, function_call
 from agents.testing import ScriptedModel as AgentScript
-from fakes import FakeAPI
+from fakes import FakeAPI, trace_lines
 from PIL import Image
 from scripted import ScriptedModel, echo_extraction
 from test_evidence import PLANTED, wrapped_once
@@ -390,6 +391,15 @@ def test_recall_errors_do_not_block_the_run(
     )
     assert result.final_output == "ok"
     assert last_user_text(script.calls[0]) == "Where do I live?"
+    # 第十轮体检 Q13：agents_recall_failed 以前记在没有打开的 trace 上（哪里也没写）。现在单独
+    # 一行：只有空间、出错的类型与状态码，没有提问与出错的原文；删除空间时一起删掉
+    traces = memory.system.settings.paths.traces
+    [line] = trace_lines(traces, "agents_recall_failed")
+    assert line["attrs"] == {"space": "alice"}
+    assert [(e["error"], e["status"]) for e in line["events"]] == [("RuntimeError", None)]
+    assert "Where do I live" not in json.dumps(line) and "service down" not in json.dumps(line)
+    memory.delete_all(user_id="alice")
+    assert trace_lines(traces, "agents_recall_failed") == []
 
 
 # ---------- 会话：写入 ----------
@@ -661,8 +671,6 @@ def test_messages_kept_during_an_outage_are_capped(
     留着，长时间故障而对话一直在进行时内存一直长。"""
     from cuemem.integrations import openai_agents
 
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(openai_agents, "record_event", lambda kind, **d: events.append((kind, d)))
     monkeypatch.setattr(openai_agents, "MAX_UNSAVED", 3)
     embed = memory.system.embedder.embed
     down = {"on": True}
@@ -680,8 +688,11 @@ def test_messages_kept_during_an_outage_are_capped(
             run(agent, f"note {i}", session=session)
     kept = [u.batch[0].message["content"] for u in session._unsaved]
     assert kept == ["note 2", "note 3", "note 4"]
-    assert [d for kind, d in events if kind == "agents_mirror_dropped"] == [
-        {"space": "alice", "reason": "backlog"}
+    # 第十轮体检 Q13：事件真的写进了 trace（各一行，只有空间与原因；以前哪里也没写）。空间里
+    # 还什么都没写进去，这期间也没遗忘过：照写
+    dropped = trace_lines(memory.system.settings.paths.traces, "agents_mirror_dropped")
+    assert [(t["attrs"], t["events"][0]["reason"]) for t in dropped] == [
+        ({"space": "alice"}, "backlog")
     ] * 2
     assert sum("for a long time" in r.getMessage() for r in caplog.records) == 2
 

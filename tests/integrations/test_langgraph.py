@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
+import logging
 import tempfile
 import warnings
 from collections.abc import Iterator
@@ -22,7 +24,7 @@ import pytest
 pytest.importorskip("langgraph")
 pytest.importorskip("langchain.agents")
 
-from fakes import FakeAPI
+from fakes import FakeAPI, trace_lines
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain.agents.structured_output import ToolStrategy
@@ -495,7 +497,7 @@ def down(*args: Any, **kwargs: Any) -> Any:
 
 
 def test_memory_tool_errors_go_back_to_the_model(
-    lives_in_berlin: Memory, monkeypatch: pytest.MonkeyPatch
+    lives_in_berlin: Memory, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     memory = lives_in_berlin
     model = Recorder(
@@ -514,8 +516,18 @@ def test_memory_tool_errors_go_back_to_the_model(
 
     monkeypatch.setattr(memory.system, "retrieve", down)
     recall, _, _ = memory_tools(memory, user_id="alice")
-    found = recall.invoke(tool_call("recall", query="Where do I live?"))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cuemem.integrations.langgraph"):
+        found = recall.invoke(tool_call("recall", query="Where do I live?"))
     assert found.status == "error" and "embedding service is down" in str(found.content)
+    # 第十轮体检 Q13：工具出错以前没有日志，langgraph_tool_failed 也没写进任何 trace
+    assert [r.getMessage() for r in caplog.records] == [
+        "Memory tool recall failed: ConnectionError"
+    ]
+    [line] = trace_lines(memory.system.settings.paths.traces, "langgraph_tool_failed")
+    assert line["attrs"] == {"space": "alice"}
+    assert [(e["tool"], e["error"]) for e in line["events"]] == [("recall", "ConnectionError")]
+    assert "Where do I live" not in json.dumps(line) and "is down" not in json.dumps(line)
 
 
 def test_recall_and_write_failures_do_not_break_the_turn(
@@ -537,6 +549,18 @@ def test_recall_and_write_failures_do_not_break_the_turn(
     with pytest.warns(RuntimeWarning, match="could not save"):
         out = agent.invoke(ask("Where do I live?"), thread("t2"))
     assert out["messages"][-1].content == "Still no idea."
+    # 第十轮体检 Q13：两个失败各有一行 trace（以前哪里也没写）：只有空间、出错的类型与状态码；
+    # 删除空间时一起删掉
+    traces = memory.system.settings.paths.traces
+    kinds = ("langgraph_recall_failed", "langgraph_write_failed")
+    lines = trace_lines(traces, *kinds)
+    assert [(line["name"], line["attrs"]) for line in lines] == [
+        (k, {"space": "alice"}) for k in kinds
+    ]
+    assert [line["events"][0]["error"] for line in lines] == ["ConnectionError"] * 2
+    assert "Where do I live" not in json.dumps(lines) and "is down" not in json.dumps(lines)
+    memory.delete_all(user_id="alice")
+    assert trace_lines(traces, *kinds) == []
 
 
 # ---------- 身份、图片与遗忘 ----------

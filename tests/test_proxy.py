@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import anyio
+import fakes
 import httpx2
 import numpy as np
 import pytest
@@ -132,6 +133,21 @@ def chat(
     messages = [SYSTEM, *(history or []), {"role": "user", "content": text}]
     body = {"model": "qwen3.8-flash", "messages": messages}
     return client.post("/v1/chat/completions", json={**body, **extra}, headers=headers)
+
+
+def trace_lines(system: MemorySystem, *names: str) -> list[dict[str, Any]]:
+    """trace 文件里这些名字的行（默认是记忆代理自己的 proxy 与 proxy_close），按写入的先后。"""
+    return fakes.trace_lines(system.settings.paths.traces, *(names or ("proxy", "proxy_close")))
+
+
+def proxy_events(system: MemorySystem, kind: str) -> list[dict[str, Any]]:
+    """记忆代理写进 trace 的 kind 事件（去掉时间），按先后。"""
+    return [
+        {k: v for k, v in event.items() if k not in ("kind", "t_ms")}
+        for record in trace_lines(system)
+        for event in record["events"]
+        if event["kind"] == kind
+    ]
 
 
 def test_remembers_across_sessions(
@@ -325,16 +341,16 @@ def test_an_answer_built_on_memory_forgotten_meanwhile_is_not_written_back(
     clock: Clock,
     fake_api: FakeAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     stream: bool,
 ) -> None:
     """等上游回答的时候别的调用方删了注入的那条记忆（DELETE /api/v1/memories/{id}）：回答是照
     被删的记忆写的，以前照样写回日志，下次抽取时被删的事实又长了回来（D-068 记下的剩余限制；
     以前写回时才记遗忘次数）。现在想起之前记下，写回时变了就不写回答、记一个 proxy_write_dropped
-    事件；用户的话照写（它不是从记忆来的）。流式与非流式一样。"""
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
-    )
+    事件；用户的话照写（它不是从记忆来的）。流式与非流式一样。
+
+    第十轮体检 Q13：这个事件真的写进了 trace（名字 proxy 的一行，属性里有空间与会话；以前记在
+    没有打开的 trace 上，哪里也没有），日志里另有一条 INFO；行里没有提问与回答的原文。"""
     chat(client, "I live in Berlin", user="alice")
     clock.now += 31 * 60
     proxy.close_idle()
@@ -354,13 +370,26 @@ def test_an_answer_built_on_memory_forgotten_meanwhile_is_not_written_back(
         return "You live in Berlin, so a warm coat."
 
     fake_api.chat_replies = [reply]
-    response = chat(client, "What coat do I need?", user="alice", stream=stream)
+    with caplog.at_level(logging.INFO, logger="cuemem.api.proxy"):
+        response = chat(client, "What coat do I need?", user="alice", stream=stream)
     assert response.status_code == 200 and "Berlin" in response.text  # 调用方照样拿到回答
     assert injected == [True]
     turns = system.db.get_turns("alice")
     assert [(t.role, t.text) for t in turns] == [("user", "What coat do I need?")]
-    dropped = [data for kind, data in events if kind == "proxy_write_dropped"]
-    assert dropped == [{"space": "alice", "reason": "forgotten", "part": "answer"}]
+    assert proxy_events(system, "proxy_write_dropped") == [
+        {"reason": "forgotten", "part": "answer"}
+    ]
+    [line] = trace_lines(system)
+    assert line["name"] == "proxy" and line["attrs"] == {
+        "space": "alice",
+        "session": response.headers["x-cuemem-session"],
+        "stream": stream,
+        "level": "L1",
+        "recalled": int(response.headers["x-cuemem-recalled"]),
+        "model": "qwen3.8-flash",
+    }
+    assert "coat" not in json.dumps(line) and "Berlin" not in json.dumps(line)
+    assert sum("did not store the answer" in r.getMessage() for r in caplog.records) == 1
 
     fake_api.chat_replies = [upstream]  # 之后没有遗忘：回答照常写回
     history = [{"role": "user", "content": "What coat do I need?"}]
@@ -1006,10 +1035,6 @@ def test_write_backs_kept_during_an_outage_are_capped(
     """第七轮体检 P14：故障期间一个会话留着重试的写回最多 MAX_UNSAVED 次：超出时丢掉最早的，
     记 proxy_write_dropped（reason=backlog）与一条警告。以前一直留着，长时间故障而调用方一直
     在说话时内存一直长（每次请求可以有 64 MiB 的图片），最后服务被杀、留着的全丢。"""
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
-    )
     monkeypatch.setattr("cuemem.api.proxy.MAX_UNSAVED", 3)
     outage = Outage(system, monkeypatch)
     session = {"X-CueMem-Session": "s1"}
@@ -1019,8 +1044,8 @@ def test_write_backs_kept_during_an_outage_are_capped(
     [run] = proxy._runs.values()
     assert [u.messages[0]["content"] for u in run.unsaved] == ["note 2", "note 3", "note 4"]
     assert run.unsaved_bytes == sum(u.size for u in run.unsaved) > 0
-    backlog = [d for kind, d in events if kind == "proxy_write_dropped"]
-    assert backlog == [{"space": "alice", "reason": "backlog"}] * 2
+    assert proxy_events(system, "proxy_write_dropped") == [{"reason": "backlog"}] * 2
+    assert {line["attrs"]["space"] for line in trace_lines(system)} == {"alice"}
     warned = [r.getMessage() for r in caplog.records if "for a long time" in r.getMessage()]
     assert len(warned) == 2 and "store 2 message(s) of proxy session s1" in warned[0]
 
@@ -1608,10 +1633,6 @@ def test_a_write_back_after_its_session_ended_is_not_dropped_silently(
     close_all 同样），它的写回之后才到：照常写一次，写不进去时不再留着（已经没有人会再写这个
     Run），丢掉并警告、记 proxy_write_failed kept=False。以前留在结束了的 Run 上：没有警告，
     这一轮不声不响地丢了。写得进去时照常写。"""
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
-    )
     outage = Outage(system, monkeypatch)
     outage.status = None
 
@@ -1625,8 +1646,10 @@ def test_a_write_back_after_its_session_ended_is_not_dropped_silently(
     session = headers["X-CueMem-Session"]
     assert status == 200 and proxy._runs[("alice", None)].session_id != session
     assert system.db.get_turns("alice", session) == []
-    failed = [data for kind, data in events if kind == "proxy_write_failed"]
-    assert [(d["space"], d["kept"]) for d in failed] == [("alice", False)]
+    assert proxy_events(system, "proxy_write_failed") == [
+        {"error": "EmbeddingAPIError", "status": 503, "kept": False}
+    ]
+    assert [line["attrs"]["session"] for line in trace_lines(system)] == [session]
     warned = [r.getMessage() for r in caplog.records]
     assert len(warned) == 1
     assert f"could not store 2 message(s) of proxy session {session} and dropped" in warned[0]
@@ -3337,3 +3360,227 @@ def test_usage_of_an_unknown_shape() -> None:
     assert _usage({"usage": reported}) == Usage(
         input_tokens=9, output_tokens=4, cached_input_tokens=5, reasoning_tokens=3
     )
+
+
+# ---------- trace 与日志（第十轮体检 Q13） ----------
+
+
+def raw_traces(system: MemorySystem) -> str:
+    """traces 目录里全部文件的原文。"""
+    paths = sorted(system.settings.paths.traces.glob("*"))
+    return "".join(p.read_bytes().decode("utf-8", "surrogateescape") for p in paths)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_recall_failure_is_logged_once_and_traced(
+    client: TestClient,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stream: bool,
+) -> None:
+    """想起失败以前只有响应头 X-CueMem-Level: error：proxy_recall_failed 记在没有打开的 trace 上
+    （哪里也没写），也没有日志。现在写一行名字是 proxy 的 trace（只有出错的类型与状态码：供应商
+    的出错可能引着提问的原话），记一条警告——同一个用户同一种出错只记一次，想起成功之后再失败
+    时再记。照常想起、照常写回的请求不多写这一行；删除空间时这些行一起删掉。"""
+    chat(client, "I live in Berlin", user="alice")
+    chat(client, "I like jazz", user="alice")  # 想起了上一段：照常的请求
+    assert trace_lines(system) == []
+    retrieve = system.retrieve
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise EmbeddingAPIError("HTTP 503 for 'Where does my sister Ana live?'", status=503)
+
+    def warnings() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "could not recall" in r.getMessage()]
+
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        monkeypatch.setattr(system, "retrieve", broken)
+        for _ in range(2):
+            failed = chat(client, "Where does my sister Ana live?", user="alice", stream=stream)
+            assert failed.status_code == 200 and failed.headers["x-cuemem-level"] == "error"
+        assert len(warnings()) == 1
+        assert "(EmbeddingAPIError, status 503)" in warnings()[0] and "Ana" not in warnings()[0]
+        monkeypatch.setattr(system, "retrieve", retrieve)
+        assert chat(client, "Hello again", user="alice").headers["x-cuemem-level"] == "L1"
+        monkeypatch.setattr(system, "retrieve", broken)
+        chat(client, "Where does my sister Ana live?", user="alice", stream=stream)
+        assert len(warnings()) == 2
+    lines = trace_lines(system)
+    assert [line["name"] for line in lines] == ["proxy"] * 3
+    assert [line["attrs"]["stream"] for line in lines] == [stream] * 3
+    assert {(line["attrs"]["space"], line["attrs"]["level"]) for line in lines} == {
+        ("alice", "error")
+    }
+    failures = proxy_events(system, "proxy_recall_failed")
+    assert failures == [{"error": "EmbeddingAPIError", "status": 503}] * 3
+    assert "Ana" not in json.dumps(lines)
+
+    Memory.from_system(system).delete_all(user_id="alice")
+    assert trace_lines(system) == [] and "alice" not in raw_traces(system)
+
+
+def test_a_kept_write_back_is_logged_once_and_traced(
+    client: TestClient,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """写回没写进去、留着重试：以前要到丢掉时才有日志，proxy_write_failed 也没写进任何 trace。
+    现在记一条警告（这个会话留着的都写进去之前只记一次）与 trace 里的一个事件（kept 为真），
+    里面没有消息的原文。"""
+    outage = Outage(system, monkeypatch)
+    session = {"X-CueMem-Session": "s1"}
+
+    def kept() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "will retry" in r.getMessage()]
+
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        chat(client, "I live in Berlin", user="alice", headers=session)
+        chat(client, "I like jazz", user="alice", headers=session)
+        assert len(kept()) == 1 and "kept 1 write-back(s) of proxy session s1" in kept()[0]
+        expected = {"error": "EmbeddingAPIError", "status": 503, "kept": True}
+        assert proxy_events(system, "proxy_write_failed") == [expected] * 2
+        lines = trace_lines(system)
+        assert [line["attrs"]["session"] for line in lines] == ["s1", "s1"]
+        assert "Berlin" not in json.dumps(lines) and "jazz" not in json.dumps(lines)
+
+        outage.status = None
+        chat(client, "I like tea", user="alice", headers=session)  # 留着的都写进去了
+        assert len(system.db.get_turns("alice", "s1")) == 6 and len(trace_lines(system)) == 2
+        outage.status = 503
+        chat(client, "I like rain", user="alice", headers=session)
+        assert len(kept()) == 2
+
+
+def test_a_stopped_stream_is_traced(system: MemorySystem) -> None:
+    """流没读完（调用方停下）：proxy_stream_incomplete 写进了 trace，只有怎么结束的与读到的字数。"""
+    answer = Answer(["Your PIN is"], endless=True)
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    for _ in range(4):
+        next(chunks)
+    chunks.close()
+    [line] = trace_lines(system)
+    assert line["attrs"]["space"] == "alice" and line["attrs"]["stream"] is True
+    [event] = proxy_events(system, "proxy_stream_incomplete")
+    assert event["ended"] == "stopped" and event["chars"] > 0
+    assert "PIN" not in json.dumps(line)
+
+
+def test_a_reused_recall_is_traced(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """工具调用的后续请求再用留着的证据块、不检索：没有 retrieve 的 trace，写一行 proxy 的
+    （proxy_recall 带 reused）。第一次想起的请求有自己的 retrieve，不多写。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS)
+    assert trace_lines(system) == []
+    upstream.reply = "final"
+    follow_up(client)
+    recalled = int(first.headers["x-cuemem-recalled"])
+    assert proxy_events(system, "proxy_recall") == [
+        {"level": "L1", "recalled": recalled, "reused": True}
+    ]
+    [line] = trace_lines(system)
+    assert ASK not in json.dumps(line) and "Berlin" not in json.dumps(line)
+
+
+def test_a_space_deleted_during_a_request_gets_no_trace_line(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    fake_api: FakeAPI,
+) -> None:
+    """后续请求等上游回答的时候整个空间被删了（delete_all 清掉这个空间的全部 trace）：回答不
+    写回，这个请求的 trace 也不写——不然删除之后又留下一行写着这个用户的记录。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    upstream.reply = CALLS_FIND
+    chat(client, ASK, user="alice", tools=TOOLS)
+    memory = Memory.from_system(system)
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        if body["messages"][0].get("content") != SYSTEM["content"]:
+            return upstream.model(body)
+        delete = threading.Thread(target=memory.delete_all, kwargs={"user_id": "alice"})
+        delete.start()
+        delete.join()
+        return "You live in Berlin: shop P01 is nearby."
+
+    fake_api.chat_replies = [reply]
+    assert follow_up(client).status_code == 200
+    assert system.db.get_turns("alice") == []
+    assert "alice" not in raw_traces(system)
+
+
+def test_no_trace_holds_forgotten_text(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """遗忘之后 traces 目录里一个字节也不剩被删的原话：代理自己的 trace 行（想起失败、写回留着、
+    再用证据块）里本来就没有提问、回答与出错的原文，遗忘不用找它们，它们也照旧留着。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    secret = "My sister Ana was born on October 3 in Lisbon"
+    retrieve = system.retrieve
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise EmbeddingAPIError(f"HTTP 400: rejected input {secret!r}", status=400)
+
+    monkeypatch.setattr(system, "retrieve", broken)
+    session = {"X-CueMem-Session": "s1"}
+    chat(client, secret, user="alice", headers=session)  # 想起失败，出错里引着原话
+    monkeypatch.setattr(system, "retrieve", retrieve)
+    outage = Outage(system, monkeypatch)
+    upstream.reply = f"Noted: {secret}."
+    history = [{"role": "user", "content": secret}]
+    chat(client, f"Repeat it: {secret}", history, user="alice", headers=session)  # 写回留着
+    outage.status = None
+    upstream.reply = CALLS_FIND
+    chat(client, ASK, history, user="alice", headers=session, tools=TOOLS)
+    upstream.reply = f"As I said: {secret}."
+    messages = [SYSTEM, *history, {"role": "user", "content": ASK}, TOOL_CALL, TOOL_RESULT]
+    body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice", "tools": TOOLS}
+    assert client.post("/v1/chat/completions", json=body, headers=session).status_code == 200
+    kinds = {e["kind"] for line in trace_lines(system) for e in line["events"]}
+    assert kinds == {"proxy_recall_failed", "proxy_write_failed", "proxy_recall"}
+    assert "Ana" in raw_traces(system)  # 检索与写入的 trace 里有原话
+
+    doomed = [t.id for t in system.db.get_turns("alice", "s1") if "Ana" in t.text]
+    assert len(doomed) == 4
+    system.forget("alice", turn_ids=doomed)
+    left = raw_traces(system)
+    for word in ("Ana", "October", "Lisbon"):
+        assert word not in left
+    assert len(trace_lines(system)) == 3  # 代理自己的几行里没有原话，照旧留着
+
+
+def test_write_backs_dropped_when_a_session_ends_are_traced(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """会话收尾（闲置、退出）时最后再写一次还是写不进去的写回：没有请求，记在名字是 proxy_close
+    的一行里（kept 为假）。没有事件的收尾不写这一行。"""
+    Outage(system, monkeypatch)
+    chat(client, "I live in Berlin", user="alice", headers={"X-CueMem-Session": "s1"})
+    chat(client, "I like jazz", user="bob", headers={"X-CueMem-Session": "s2"})
+    Memory.from_system(system).delete_all(user_id="bob")  # 之后的收尾不留下写着 bob 的行
+    proxy.close_all()
+    [line] = trace_lines(system, "proxy_close")
+    assert line["attrs"] == {"space": "alice", "session": "s1"}
+    assert [{k: v for k, v in e.items() if k != "t_ms"} for e in line["events"]] == [
+        {"kind": "proxy_write_failed", "error": "EmbeddingAPIError", "status": 503, "kept": False}
+    ]
+    assert "bob" not in raw_traces(system) and "Berlin" not in json.dumps(trace_lines(system))
+    proxy.close_all()
+    assert len(trace_lines(system, "proxy_close")) == 1

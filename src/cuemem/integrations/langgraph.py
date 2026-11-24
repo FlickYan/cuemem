@@ -57,6 +57,7 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -91,7 +92,7 @@ from langgraph.types import Command  # type: ignore[import-not-found, unused-ign
 from pydantic import BaseModel
 
 from cuemem.core.ids import sortable_session_id
-from cuemem.core.trace import record_event
+from cuemem.core.trace import error_fields
 from cuemem.evidence import (
     forget_summary,
     format_listing,
@@ -103,6 +104,8 @@ from cuemem.evidence import (
 )
 from cuemem.memory import MemorySystem, RecallMode
 from cuemem.sdk import AsyncMemory, Memory, space_for
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CueMemMiddleware",
@@ -277,12 +280,14 @@ class ThreadMemory:
         space = space_for(user, agent)
         thread = _thread_id(config)
         evidence = Evidence(_key_of(message), "none")
+        system = self.memory.system
+        since = system.forget_epoch(space)
         try:
             self._adopt(space, thread)
             self.close_idle()
             self._retrieve(evidence, space, message, earlier, thread)
         except Exception as exc:
-            record_event("langgraph_recall_failed", space=space, error=_err(exc))
+            system.note_event(space, "langgraph_recall_failed", since=since, **error_fields(exc))
             warnings.warn(
                 f"CueMem could not recall memories; answering without them: {_err(exc)}",
                 RuntimeWarning,
@@ -369,6 +374,7 @@ class ThreadMemory:
         sid = session_for(thread) if thread else None
         shared = self._shared
         keys = [f"{space}\0{sid or ''}\0{m.id}" if m.id else None for m in picked]
+        since = self.memory.system.forget_epoch(space)
         try:
             self._adopt(space, thread)
             self.close_idle()
@@ -391,7 +397,9 @@ class ThreadMemory:
                         if k is not None:
                             _remember(shared.saved, k, None)
         except Exception as exc:
-            record_event("langgraph_write_failed", space=space, error=_err(exc))
+            self.memory.system.note_event(
+                space, "langgraph_write_failed", since=since, **error_fields(exc)
+            )
             warnings.warn(
                 f"CueMem could not save the turn: {_err(exc)}", RuntimeWarning, stacklevel=2
             )
@@ -463,9 +471,6 @@ class ThreadMemory:
         found = recall_evidence(system, space, query, mode=self.mode, exclude=exclude)
         evidence.level, evidence.reasons = found.level, found.reasons
         evidence.recalled, evidence.block = found.recalled, found.block
-        record_event(
-            "langgraph_recall", space=space, level=evidence.level, recalled=evidence.recalled
-        )
 
     def _slot(
         self, message: BaseMessage, config: RunnableConfig | None, context: Any
@@ -511,7 +516,7 @@ class ThreadMemory:
             try:
                 self.memory.system.close_session(space, sid)
             except Exception as exc:
-                record_event("langgraph_close_failed", space=space, error=_err(exc))
+                self.memory.system.note_event(space, "langgraph_close_failed", **error_fields(exc))
                 warnings.warn(
                     f"CueMem could not hand thread {sid} to extraction: {_err(exc)}",
                     RuntimeWarning,
@@ -567,7 +572,7 @@ def memory_tools(
         def run() -> str:
             return format_listing(_recall(sync.system, space_for(*who(config)), query, deep))
 
-        return _tool("recall", run)
+        return _tool("recall", run, sync.system, lambda: space_for(*who(config)))
 
     def remember(text: str, config: RunnableConfig) -> str:
         def run() -> str:
@@ -578,7 +583,7 @@ def memory_tools(
             out = sync.add(text, user_id=user, agent_id=agent, run_id=note, timestamp=when)
             return f"Saved as {out['turn_ids'][0]}." if out["turn_ids"] else "Nothing to save."
 
-        return _tool("remember", run)
+        return _tool("remember", run, sync.system, lambda: space_for(*who(config)))
 
     def forget(ids: list[str], config: RunnableConfig) -> str:
         def run() -> str:
@@ -593,7 +598,7 @@ def memory_tools(
                 threads._forgot(space)
             return forget_summary(report)
 
-        return _tool("forget", run)
+        return _tool("forget", run, sync.system, lambda: space_for(*who(config)))
 
     return [
         StructuredTool.from_function(
@@ -610,13 +615,20 @@ def memory_tools(
     ]
 
 
-def _tool(name: str, run: Callable[[], str]) -> str:
+def _tool(name: str, run: Callable[[], str], system: MemorySystem, space: Callable[[], str]) -> str:
     """工具出错时抛 ToolException：LangChain 把它变成给模型的错误结果，不中断整个 Agent
-    （与 MCP Server 把错误作为工具结果返回相同）。"""
+    （与 MCP Server 把错误作为工具结果返回相同）。记一条警告与一个 trace 事件
+    langgraph_tool_failed（space：这次调用的记忆空间；没有身份、算不出空间时只有警告）。"""
     try:
         return run()
     except Exception as exc:
-        record_event("langgraph_tool_failed", tool=name, error=_err(exc))
+        logger.warning("Memory tool %s failed: %s", name, type(exc).__name__)
+        try:
+            where = space()
+        except ValueError:
+            where = None
+        if where is not None:
+            system.note_event(where, "langgraph_tool_failed", tool=name, **error_fields(exc))
         raise ToolException(f"Memory {name} failed: {exc}") from exc
 
 

@@ -21,7 +21,7 @@ anthropic = pytest.importorskip("anthropic")
 
 import httpx2  # noqa: E402
 from anthropic.lib.tools import ToolError  # noqa: E402
-from fakes import PROJECT_ROOT, FakeAPI  # noqa: E402
+from fakes import PROJECT_ROOT, FakeAPI, trace_lines  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from scripted import ScriptedModel  # noqa: E402
@@ -1134,6 +1134,20 @@ def test_with_recall_survives_a_memory_outage(
     assert out == question
     assert evidence.level == "error"
     assert evidence.reasons == ["RuntimeError: embedding service down"]
+    # 第十轮体检 Q13：claude_recall_failed 以前记在没有打开的 trace 上（哪里也没写）。现在单独
+    # 一行：只有空间、出错的类型与状态码，没有提问与出错的原文；删除空间时一起删掉
+    traces = memory.system.settings.paths.traces
+    [line] = trace_lines(traces, "claude_recall_failed")
+    assert line["attrs"] == {"space": "alice"}
+    [event] = line["events"]
+    assert (event["kind"], event["error"], event["status"]) == (
+        "claude_recall_failed",
+        "RuntimeError",
+        None,
+    )
+    assert "Where do I live" not in json.dumps(line) and "service down" not in json.dumps(line)
+    memory.delete_all(user_id="alice")
+    assert trace_lines(traces, "claude_recall_failed") == []
 
 
 def test_awith_recall_does_not_block_the_event_loop(

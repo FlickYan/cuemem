@@ -98,7 +98,7 @@ from anyio import to_thread
 
 from cuemem.core.models import Fact, Turn
 from cuemem.core.timeutil import day
-from cuemem.core.trace import record_event
+from cuemem.core.trace import error_fields
 from cuemem.evidence import inject_evidence, recall_evidence
 from cuemem.integrations._claude_store import STORE_NAME, _Conflict, _FileStore, _Note
 from cuemem.memory import RecallMode
@@ -442,7 +442,7 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
         if recorded is not None and recorded != _core_epoch(db, self.space):
             removed = self.store.purge(self.space)
             logger.info("Removed %d memory file(s) of a deleted memory space", removed)
-            record_event("claude_memory_purged", space=self.space, files=removed)
+            self.memory.system.note_event(self.space, "claude_memory_purged", files=removed)
         files = self.store.files(self.space)
         notes = self.store.notes(self.space)
         ids = [n.turn_id for n in notes]
@@ -458,7 +458,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
                 logger.info(
                     "Removed %d memory file(s) whose notes were forgotten elsewhere", len(tainted)
                 )
-                record_event("claude_memory_pruned", space=self.space, files=len(tainted))
+                self.memory.system.note_event(
+                    self.space, "claude_memory_pruned", files=len(tainted)
+                )
             files = {p: c for p, c in files.items() if p not in tainted}
             notes = [
                 n._replace(live=n.live and n.path not in tainted)
@@ -603,7 +605,9 @@ class CueMemMemoryTool(BetaAbstractMemoryTool):
             )
         except Exception as exc:
             logger.error("Could not undo memory note %s of %s: %s", note.turn_id, note.path, exc)
-            record_event("claude_memory_rollback_failed", space=self.space, turn=note.turn_id)
+            self.memory.system.note_event(
+                self.space, "claude_memory_rollback_failed", **error_fields(exc)
+            )
 
     def _ensure_epoch(self) -> None:
         if self.store.epoch(self.space) is None:
@@ -783,12 +787,13 @@ def with_recall(
     at = _newest_user(out)
     if at is None:
         return cast("list[BetaMessageParam]", out), Evidence("none", [], 0, "")
+    since = local.system.forget_epoch(space)
     try:
         evidence = _recall(out[at], local, space, mode)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         logger.debug("Recall failed", exc_info=True)
-        record_event("claude_recall_failed", space=space, error=error)
+        local.system.note_event(space, "claude_recall_failed", since=since, **error_fields(exc))
         warnings.warn(
             f"CueMem could not recall memories; continuing without them: {error}",
             RuntimeWarning,
@@ -844,8 +849,6 @@ def _recall(message: Mapping[str, Any], memory: Memory, space: str, mode: Recall
     if not query.strip() or not system.db.has_sessions(space):
         return none
     found = recall_evidence(system, space, query, mode=mode)
-    if found.block:
-        record_event("claude_recall", space=space, level=found.level, recalled=found.recalled)
     return Evidence(found.level, found.reasons, found.recalled, found.block)
 
 

@@ -319,19 +319,53 @@ def start_trace(name: str, sink: TraceSink | None = None, **attrs: Any) -> Itera
         trace.finish()
         _current.reset(token)
         if sink is not None:
-            try:
-                sink.write(trace)
-            except Exception as exc:
-                if not sink.failing:
-                    logger.warning(
-                        "trace 写不进 %s，这次（%s）与之后的 trace 不记，直到写入恢复：%s",
-                        sink.directory,
-                        name,
-                        exc,
-                    )
-                sink.failing = True
-            else:
-                sink.failing = False
+            write_trace(sink, trace)
+
+
+def write_trace(sink: TraceSink, trace: Trace) -> None:
+    """把一条做完的 trace 写进 sink；写不进去时记一条警告、不抛出，接连失败只记一次（见
+    start_trace）。"""
+    try:
+        sink.write(trace)
+    except Exception as exc:
+        if not sink.failing:
+            logger.warning(
+                "trace 写不进 %s，这次（%s）与之后的 trace 不记，直到写入恢复：%s",
+                sink.directory,
+                trace.name,
+                exc,
+            )
+        sink.failing = True
+    else:
+        sink.failing = False
+
+
+def note(sink: TraceSink | None, kind: str, *, space: str, **data: Any) -> None:
+    """记一个不在请求的 trace 里发生的事件（记忆代理与各集成的失败、丢弃，第十轮体检 Q13）：
+    在某个 trace 里时记到它上面（与 record_event 相同，带上 space）；不在时单独写一行只有这一个
+    事件的 trace，名字是 kind，属性里只有 space——删除空间时按它删掉（MemorySystem.
+    purge_space_traces）。data 里不能有提问、回答、记忆 ID 与出错的原文（见 error_fields）：
+    按内容遗忘时只在属性里找原话，事件里的找不到。要不要写由调用方把关（MemorySystem.
+    note_event：刚删掉的空间不留下写着它的行）。"""
+    current = _current.get()
+    if current is not None:
+        current.add_event(kind, space=space, **data)
+        return
+    if sink is None:
+        return
+    trace = Trace(kind, space=space)
+    trace.add_event(kind, **data)
+    trace.finish()
+    write_trace(sink, trace)
+
+
+def error_fields(exc: BaseException) -> dict[str, Any]:
+    """出错在 trace 事件里的样子：只有类型名与状态码。不记出错的文字：供应商的出错可能引着
+    请求里的原话，遗忘找不到事件里的它（完整的出错在日志里）。"""
+    status = getattr(exc, "status", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "status_code", None)
+    return {"error": type(exc).__name__, "status": status if isinstance(status, int) else None}
 
 
 def current_trace() -> Trace | None:

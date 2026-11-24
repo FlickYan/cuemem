@@ -365,3 +365,14 @@ class QdrantDown:
     def __exit__(self, *exc: object) -> None:
         store = self.store
         store._client, store._remote, store._probe, store.remote, store._path = self.saved
+
+
+def trace_lines(traces: Path, *names: str) -> list[dict[str, Any]]:
+    """traces 目录里的 trace（names：只要这些名字的），按写入的先后。"""
+    lines = [
+        json.loads(line)
+        for path in sorted(traces.glob("*.jsonl"))
+        for line in path.read_text("utf-8").split("\n")
+        if line
+    ]
+    return [record for record in lines if not names or record["name"] in names]

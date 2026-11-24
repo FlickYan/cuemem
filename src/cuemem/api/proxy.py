@@ -85,6 +85,19 @@ stream_options 的上游会因此回 400。管不到的：/v1/embeddings、/api�
 - /v1/embeddings：交给配置里的向量模型（与记忆共用一个，不碰记忆、不进向量缓存），支持
   encoding_format 的 float 与 base64。
 
+trace 与日志（第十轮体检 Q13；以前这里的事件都记在没有打开的 trace 上，哪里也没写）：
+检索与写入照旧各写各的 retrieve、append。请求里有别的事——想起失败（proxy_recall_failed）、再用了
+留着的证据块（proxy_recall 带 reused）、写回没写进去（proxy_write_failed，kept 说留没留着重试）、
+写回丢掉了（proxy_write_dropped，reason 是 forgotten / backlog）、流没读完
+（proxy_stream_incomplete）——时在请求答完时另写一行名字是 proxy 的 trace（_write_trace），
+属性只有 space、session、stream、level、recalled 与 model，事件里只有计数、档位、出错的类型名
+与状态码：没有提问、回答、记忆 ID 与出错的原文，所以按内容遗忘不用找它，删除空间按 space 删掉
+它，过期按日期。照常想起、照常写回的请求不多写这一行。会话收尾（闲置、开了新的一段、退出）时
+丢掉或写不进去的记在名字是 proxy_close 的一行里。空间在请求期间被删掉、之后还是空的时不写。
+另外记日志（cuemem.api.proxy）：想起失败一条警告（同一个用户同一种出错只记一次，想起成功之后
+再记）；写回留着重试时一条警告（一个会话留着的都写进去之前只记一次）；因为遗忘丢掉的写回记
+INFO。
+
 请求体必须是 Content-Type: application/json，别的网站发来的浏览器请求（Origin 与 Host 不同）一律
 403（api.app.SameOriginOnly）：否则任何网页都能借访问者的浏览器往本机的代理写记忆、花上游的额度。
 """
@@ -132,7 +145,7 @@ from cuemem.api.failures import provider_failure
 from cuemem.api.limits import MAX_BODY_BYTES, MAX_OPEN_SESSIONS_ENV, open_session_limit
 from cuemem.config import ModelSpec, UnknownModel
 from cuemem.core.ids import sortable_session_id
-from cuemem.core.trace import record_event
+from cuemem.core.trace import Trace, error_fields
 from cuemem.embed import CachedEmbedder, TextEmbedder
 from cuemem.errors import EmbeddingAPIError, VectorStoreFullError
 from cuemem.evidence import (
@@ -186,6 +199,7 @@ PARKED_KEPT = 4096
 # 不认识的模型名在警告、400 的出错与 MemoryProxy._warned 里最多写这么多个字符（见 _short）
 MODEL_NAME_SHOWN = 200
 MODEL_NAMES_WARNED = 1000  # 记过警告的模型名最多这么多个，之后的新名字不再警告
+RECALL_WARNED = 1000  # 记着"想起失败已经警告过"的（空间，出错类型）最多这么多个（_warn_recall）
 
 
 def _short(value: Any, shown: int = MODEL_NAME_SHOWN) -> str:
@@ -283,6 +297,8 @@ class Run:
     kept: Kept | None = None
     busy: int = 0
     ended: bool = False
+    warned: bool = False  # 留着重试的写回已经记过警告（MemoryProxy._save），都写进去之后再记
+    forget0: int = 0  # 开始时这个空间的 forget_epoch（收尾的 trace 要不要写，见 _finish）
 
     def keep(self, unsaved: Unsaved) -> None:
         self.unsaved.append(unsaved)
@@ -292,6 +308,8 @@ class Run:
         """丢掉最早的 count 次写回。"""
         self.unsaved_bytes -= sum(u.size for u in self.unsaved[:count])
         del self.unsaved[:count]
+        if not self.unsaved:
+            self.warned = False
 
 
 @dataclass
@@ -316,6 +334,10 @@ class Turn:
     # 令牌写了 max_daily_tokens 时它的名字与预算（_meter 按名字累计，见模块说明）；否则 None
     key: str | None = None
     budget: int | None = None
+    # 这次请求的 trace（见模块说明的"trace 与日志"）：不放进 start_trace 的上下文变量（检索与
+    # 写入照旧各写各的 retrieve、append），由 _release 写；forget0 是开始时的 forget_epoch
+    trace: Trace | None = None
+    forget0: int = 0
 
 
 class MemoryProxy:
@@ -356,6 +378,8 @@ class MemoryProxy:
         self._warned: set[str] = set()  # 已经警告过的不认识的模型名
         # （令牌的名字，日期）-> 这个进程替它转发的 token 数（只有写了 max_daily_tokens 的令牌）
         self._spent: dict[tuple[str, str], int] = {}
+        # 已经记过警告的想起失败（空间，出错的类型）：同一种只记一次，想起成功之后再记（_evidence）
+        self._recall_warned: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
         system.start_worker()  # 会话结束后的抽取在后台完成
 
@@ -417,6 +441,8 @@ class MemoryProxy:
         turn, upstream, url, auth = self._prepare(body, headers, principal)
         # 返回 _Relay 时请求还没答完（它结束时 _release）；别的出口在这里就答完了
         try:
+            if turn.trace is not None:
+                turn.trace.attrs["stream"] = True
             # 有每日预算的令牌：流里要有用量才数得了。调用方没要时代理替它要，多出来的那个只有
             # 用量的块不转给它（_Relay）；没有预算的令牌照旧逐字节不变
             options = upstream.get("stream_options")
@@ -564,9 +590,13 @@ class MemoryProxy:
 
     def _finish(self, run: Run) -> None:
         """会话结束：没写进去的写回最后再写一次（见 Run），再交给后台抽取。"""
+        # 没有请求的收尾：这里丢掉的、写不进去的记在 proxy_close 的 trace 里，有事件才写
+        trace = Trace("proxy_close", space=run.space, session=run.session_id)
         with run.lock:
             run.ended = True  # 之后才到的写回（这个会话还有请求没答完）不再留着，见 _write_back
-            self._save(run, final=True)
+            self._save(run, final=True, trace=trace)
+        if trace.events:
+            self.system.write_note(trace, since=run.forget0, wait=True)
         self.system.close_session(run.space, run.session_id)
 
     def _run(
@@ -617,6 +647,7 @@ class MemoryProxy:
                         else explicit or sortable_session_id("proxy", when)
                     )
                     run = Run(space, sid, now, user_id=user_id, agent_id=agent_id)
+                    run.forget0 = self.system.forget_epoch(space)
                     self._runs[key] = run
                     # 进行中：每轮照常写入，但不抽取（停放过的会话还开着，open_session 什么也不做）
                     self.system.open_session(space, sid)
@@ -648,6 +679,31 @@ class MemoryProxy:
         with self._lock:
             run.busy -= 1
             run.last_seen = self._clock()
+        self._write_trace(turn)
+
+    def _write_trace(self, turn: Turn) -> None:
+        """请求答完时写它的 trace（一行，名字 proxy）。只是照常想起（没有再用留着的证据块）的
+        请求不写：那次检索自己的 retrieve trace 里都有，不为每个请求多写一行。空间在请求期间被
+        删掉、现在还是空的也不写（MemorySystem.write_note）；这个空间正在遗忘时等它做完（写回
+        本来也要等）。不抛出。"""
+        trace = turn.trace
+        if trace is None:
+            return
+        try:
+            plain = [e for e in trace.events if e["kind"] == "proxy_recall" and not e.get("reused")]
+            if len(plain) == len(trace.events):
+                return
+            trace.attrs.update(level=turn.level, recalled=turn.recalled, model=turn.alias)
+            self.system.write_note(trace, since=turn.forget0, wait=True)
+        except Exception:
+            logger.debug("The trace of a proxy request was not written", exc_info=True)
+
+    @staticmethod
+    def _note(trace: Trace | None, kind: str, **data: Any) -> None:
+        """往请求的 trace 记一个事件（没有 trace 时什么也不做）。data 里只有计数、档位与出错的
+        类型：不放提问、回答、记忆 ID 与出错的原文（遗忘按内容找不到事件里的它们）。"""
+        if trace is not None:
+            trace.add_event(kind, **data)
 
     def _make_room(self, space: str) -> Run | None:
         """_run 开新会话之前（调用方持有 self._lock）：这个空间内存里进行中的会话没到 max_open_runs
@@ -814,6 +870,8 @@ class MemoryProxy:
         earlier = [m for m in before if m.get("role") in ("user", "assistant")]
         run = self._run(space, session, fresh=not earlier, user_id=user_id, agent_id=agent_id)
         turn = Turn(space=space, user_id=user_id, agent_id=agent_id, run=run)
+        turn.trace = Trace("proxy", space=space, session=run.session_id, stream=False)
+        turn.forget0 = self.system.forget_epoch(space)
         try:
             self._evidence(turn, run, messages, earlier)
         except BaseException:  # 会话已经记了这次请求（run.busy）：到此为止
@@ -851,8 +909,8 @@ class MemoryProxy:
             # 这一轮已经想起过、之后没有遗忘过：原样再用，不再检索
             turn.level, turn.reasons = kept.level, list(kept.reasons)
             turn.recalled, turn.block, turn.epoch = kept.recalled, kept.block, kept.epoch
-            record_event(
-                "proxy_recall", space=space, level=turn.level, recalled=turn.recalled, reused=True
+            self._note(
+                turn.trace, "proxy_recall", level=turn.level, recalled=turn.recalled, reused=True
             )
             return
         turn.epoch = epoch
@@ -865,15 +923,37 @@ class MemoryProxy:
                 exclude=self._in_context(space, run.session_id, earlier),
             )
         except Exception as exc:  # 想不起来不该让这一轮失败：不注入记忆，照常转发
-            record_event("proxy_recall_failed", space=space, error=f"{type(exc).__name__}: {exc}")
+            self._note(turn.trace, "proxy_recall_failed", **error_fields(exc))
+            self._warn_recall(space, exc)
             turn.level = "error"
             return
+        with self._lock:  # 想起来了：之后再失败时再记警告
+            self._recall_warned = {k for k in self._recall_warned if k[0] != space}
         turn.level, turn.reasons = evidence.level, evidence.reasons
         turn.recalled, turn.block = evidence.recalled, evidence.block
         run.kept = Kept(
             digest, turn.block, turn.level, list(turn.reasons), turn.recalled, epoch, anchor
         )
-        record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
+        self._note(turn.trace, "proxy_recall", level=turn.level, recalled=turn.recalled)
+
+    def _warn_recall(self, space: str, exc: Exception) -> None:
+        """想起失败记一条警告：同一个空间同一种出错只记一次，想起成功之后再失败时再记（与
+        ConsolidationWorker._fail 相同）；以前只有响应头 X-CueMem-Level: error。警告里只有出错的
+        类型与状态码，完整的出错在 DEBUG。"""
+        fields = error_fields(exc)
+        what = fields["error"] + (f", status {fields['status']}" if fields["status"] else "")
+        with self._lock:
+            if len(self._recall_warned) >= RECALL_WARNED:  # 不让它一直长：清空，各自再记一次
+                self._recall_warned.clear()
+            first = (space, fields["error"]) not in self._recall_warned
+            self._recall_warned.add((space, fields["error"]))
+        if first:
+            logger.warning(
+                "CueMem could not recall memories for a proxy request (%s); forwarding without "
+                "them.",
+                what,
+            )
+        logger.debug("Proxy recall failed", exc_info=exc)
 
     def _stores_image(self, message: Any) -> bool:
         """这句消息写回时会不会存图片（要用图片集合）：配了图片库与图片向量、是用户消息、带着
@@ -1114,19 +1194,21 @@ class MemoryProxy:
             epoch = self.system.db.turn_epoch(run.space)
             messages = list(user)
             if answered and turn.block and turn.epoch is not None and turn.epoch != epoch:
-                record_event(
-                    "proxy_write_dropped", space=run.space, reason="forgotten", part="answer"
+                self._note(turn.trace, "proxy_write_dropped", reason="forgotten", part="answer")
+                logger.info(
+                    "CueMem did not store the answer of a request of proxy session %s: memories "
+                    "of its user were forgotten while it was in flight.",
+                    run.session_id,
                 )
             elif answered:
                 messages.append({"role": "assistant", "content": answer})
             if not messages:
                 return
             run.keep(Unsaved(messages, datetime.now(), epoch, payload_size(messages)))
-            self._save(run, final=run.ended)
-            self._trim(run)  # 写得进去时先写：只限写完之后还留着的
+            self._save(run, final=run.ended, trace=turn.trace)
+            self._trim(run, turn.trace)  # 写得进去时先写：只限写完之后还留着的
 
-    @staticmethod
-    def _trim(run: Run) -> None:
+    def _trim(self, run: Run, trace: Trace | None = None) -> None:
         """留着重试的写回超过 MAX_UNSAVED 次或 MAX_UNSAVED_BYTES 时丢掉最早的（调用方持有
         run.lock）。最新的这一次总留着：单个请求已经由 MAX_BODY_BYTES 限住。"""
         dropped: list[Unsaved] = []
@@ -1135,7 +1217,7 @@ class MemoryProxy:
         ):
             dropped.append(run.unsaved[0])
             run.drop()
-            record_event("proxy_write_dropped", space=run.space, reason="backlog")
+            self._note(trace, "proxy_write_dropped", reason="backlog")
         if dropped:
             logger.warning(
                 "CueMem could not store %d message(s) of proxy session %s for a long time and "
@@ -1146,15 +1228,23 @@ class MemoryProxy:
                 MAX_UNSAVED_BYTES,
             )
 
-    def _save(self, run: Run, *, final: bool = False) -> None:
+    def _save(self, run: Run, *, final: bool = False, trace: Trace | None = None) -> None:
         """把这个会话还没写进去的写回按先后写进记忆，各用各自的时间（调用方持有 run.lock）。
         写回失败不影响已经返回给调用方的回答：重试有用的（worth_retrying）这一次与之后的都留着
-        （见 Run），final（会话要结束了）时丢掉；重试也没用的只丢这一次，接着写后面的。"""
+        （见 Run），final（会话要结束了）时丢掉；重试也没用的只丢这一次，接着写后面的。
+        留下来重试时记一条警告（一个会话留着的都写进去之前只记一次；以前要到丢掉时才有日志）。
+        trace：事件记在哪条 trace 上（请求的，或会话收尾的 proxy_close）。"""
         while run.unsaved:
             head = run.unsaved[0]
             if head.epoch != self.system.db.turn_epoch(run.space):
                 # 之后这个空间遗忘过发言（例如调用方删了这个用户的记忆）：这是遗忘之前说的话
-                record_event("proxy_write_dropped", space=run.space, reason="forgotten")
+                self._note(trace, "proxy_write_dropped", reason="forgotten")
+                logger.info(
+                    "CueMem did not store %d message(s) of proxy session %s: memories of its "
+                    "user were forgotten after they were said.",
+                    len(head.messages),
+                    run.session_id,
+                )
                 run.drop()
                 continue
             try:
@@ -1168,8 +1258,17 @@ class MemoryProxy:
             except Exception as exc:
                 keep = worth_retrying(exc) and not final
                 error = f"{type(exc).__name__}: {exc}"
-                record_event("proxy_write_failed", space=run.space, error=error, kept=keep)
+                self._note(trace, "proxy_write_failed", **error_fields(exc), kept=keep)
                 if keep:
+                    if not run.warned:
+                        run.warned = True
+                        logger.warning(
+                            "CueMem kept %d write-back(s) of proxy session %s and will retry "
+                            "them with the next request of the session (%s).",
+                            len(run.unsaved),
+                            run.session_id,
+                            error,
+                        )
                     return
                 lost = run.unsaved if worth_retrying(exc) else [head]
                 logger.warning(
@@ -1267,8 +1366,8 @@ class _Relay(Iterator[bytes]):
             if ended == "done":
                 self._proxy._write_back(self._turn, answer)
                 return
-            record_event(
-                "proxy_stream_incomplete", space=self._turn.space, ended=ended, chars=len(answer)
+            self._proxy._note(
+                self._turn.trace, "proxy_stream_incomplete", ended=ended, chars=len(answer)
             )
             if ended == "stopped":
                 self._proxy._write_back(self._turn, None)

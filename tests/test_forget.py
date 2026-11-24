@@ -19,7 +19,7 @@ from typing import Any
 import httpx2
 import openai
 import pytest
-from fakes import NO_BALANCE, REJECT, TOY_CONVERSATION, FakeAPI
+from fakes import NO_BALANCE, REJECT, TOY_CONVERSATION, FakeAPI, trace_lines
 from PIL import Image
 from scripted import (
     EMPTY_EXTRACTION,
@@ -37,7 +37,7 @@ from cuemem import Memory
 from cuemem.config import Settings
 from cuemem.core.ids import content_hash
 from cuemem.core.models import Conversation, MediaItem, MemoryUnit, SessionIn, Turn, TurnIn
-from cuemem.core.trace import Trace
+from cuemem.core.trace import Trace, start_trace
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.multimodal import DashScopeMultimodalEmbedder
 from cuemem.errors import EmbeddingAPIError
@@ -1643,3 +1643,54 @@ def test_forget_removes_traces_of_answers_built_from_the_profile(system: MemoryS
     report = system.forget("demo", turn_ids=fact.source_turn_ids)
     assert report.traces_removed >= 1
     assert "zzqq" not in _traces(system)
+
+
+def test_note_event_respects_forgetting(system: MemorySystem) -> None:
+    """第十轮体检 Q13：各集成的失败、丢弃事件单独写一行 trace（MemorySystem.note_event）。这个
+    空间正在遗忘时不等、不写（集成在事件循环里、拿着自己的锁时调用）；刚删掉、还是空的空间不
+    留下写着它的行；删除空间时这些行一起删掉。在某个 trace 里时记到那个 trace 上。"""
+
+    def noted() -> list[dict[str, Any]]:
+        return trace_lines(system.settings.paths.traces, "x_failed")
+
+    entered, release = threading.Event(), threading.Event()
+
+    def forgetting() -> None:
+        with system._exclusive("demo"):
+            entered.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=forgetting)
+    thread.start()
+    assert entered.wait(10)
+    started = time.perf_counter()
+    system.note_event("demo", "x_failed", error="RuntimeError")  # 不等遗忘做完
+    assert time.perf_counter() - started < 5 and noted() == []
+    release.set()
+    thread.join()
+
+    system.note_event("demo", "x_failed", error="RuntimeError", status=503)
+    [line] = noted()
+    assert line["attrs"] == {"space": "demo"}
+    assert [(e["kind"], e["error"], e["status"]) for e in line["events"]] == [
+        ("x_failed", "RuntimeError", 503)
+    ]
+    with system.reading("demo"):  # 读取里照常写（重入）
+        system.note_event("demo", "x_failed")
+    assert len(noted()) == 2
+
+    before = system.forget_epoch("demo")
+    system.delete_space("demo")
+    assert noted() == []
+    system.note_event("demo", "x_failed")  # 空间删掉了、还是空的：不写
+    system.note_event("demo", "x_failed", since=before)  # 开始之后删的：也不写
+    assert noted() == [] and "demo" not in _traces(system)
+    system.note_event("demo", "x_failed", since=system.forget_epoch("demo"))  # 之后没删过：写
+    assert len(noted()) == 1
+
+    with start_trace("ask", system.tracer, space="demo") as trace:
+        system.note_event("demo", "x_failed", tool="recall")
+    assert [(e["kind"], e["space"], e["tool"]) for e in trace.events] == [
+        ("x_failed", "demo", "recall")
+    ]
+    assert len(noted()) == 1

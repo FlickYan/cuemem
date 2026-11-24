@@ -36,11 +36,14 @@ from cuemem.core.models import (
 )
 from cuemem.core.timeutil import expiry_instant, naive_local, valid_period
 from cuemem.core.trace import (
+    Trace,
     TraceSink,
     current_trace,
+    note,
     record_event,
     start_trace,
     trace_queries,
+    write_trace,
 )
 from cuemem.core.types import AskMode, RecallMode
 from cuemem.embed import CachedEmbedder, build_embedder, build_image_embedder
@@ -307,6 +310,33 @@ class _ReadGate:
         finally:
             self._local.depth = depth
             if depth == 0:
+                with self._cond:
+                    self._readers -= 1
+                    self._cond.notify_all()
+
+    @contextmanager
+    def shared_now(self) -> Iterator[bool]:
+        """不等的 shared：别的线程正独占或等着独占（遗忘、删除空间进行中）时给 False，没拿到读；
+        否则与 shared 相同，给 True。"""
+        mine = self._writer == threading.get_ident() or getattr(self._local, "depth", 0) > 0
+        if not mine:
+            with self._cond:
+                if self._writer is not None or self._waiting:
+                    free = False
+                else:
+                    # 先占一个读：下面的 shared 重入时不用再等，期间遗忘进不来
+                    self._readers += 1
+                    free = True
+            if not free:
+                yield False
+                return
+            self._local.depth = 1
+        try:
+            with self.shared():  # 重入（或遗忘自己的读）
+                yield True
+        finally:
+            if not mine:
+                self._local.depth = 0
                 with self._cond:
                     self._readers -= 1
                     self._cond.notify_all()
@@ -821,6 +851,49 @@ class MemorySystem:
         """在独占（_exclusive）里调用：提交与加一之间没有读取能开始。"""
         with self._gates_guard:
             self._forget_epochs[space_id] = self._forget_epochs.get(space_id, 0) + 1
+
+    def write_note(self, trace: Trace, *, since: int | None = None, wait: bool = False) -> bool:
+        """写一条不经 start_trace、由调用方自己拿着的 trace（记忆代理的 proxy、proxy_close 与
+        note_event 的单事件行，第十轮体检 Q13），属性里要有 space。返回写了没有。
+
+        在这个空间的读取（reading）里判断与写：与遗忘、删除空间错开。空间刚删掉、现在还是空的时候
+        不写（since 是调用方开始时的 forget_epoch：之后没遗忘过，或者空间里现在有会话才写；
+        None 时只看有没有会话）：不然删除空间清掉全部 trace 之后，一个晚到的事件又留下一行写着
+        这个空间的记录。删过之后用户的话又把空间建起来了的照写（那句话自己的 append trace 也在）。
+
+        wait=False：这个空间正在遗忘时不等、不写（各集成在事件循环里、拿着自己的锁时调用，
+        不能等一次重放）；True：等它做完（记忆代理在请求线程的末尾调用，不拿着别的锁）。本线程
+        已经拿着这个空间的读或独占时照常写（读可以重入，遗忘自己的读直接通过）。
+        不抛出：trace 只是排查用的记录。"""
+        space = trace.attrs.get("space")
+        if self.tracer is None or not isinstance(space, str):
+            return False
+        try:
+            gate = self._gate(space)
+            with gate.shared() if wait else gate.shared_now() as free:
+                if free is False:
+                    return False
+                if since != self.forget_epoch(space) and not self.db.has_sessions(space):
+                    return False
+                trace.finish()
+                write_trace(self.tracer, trace)
+                return True
+        except Exception:
+            logger.debug("trace %s 没写成", trace.name, exc_info=True)
+            return False
+
+    def note_event(
+        self, space_id: str, kind: str, *, since: int | None = None, **data: Any
+    ) -> None:
+        """记一个事件（各集成的失败与丢弃）：在某个 trace 里时记到它上面，否则单独写一行只有这一个
+        事件的 trace（core.trace.note），照 write_note 的规则（since 见那里；这个空间正在遗忘时
+        不写）。data 里不能有提问、回答、记忆 ID 与出错的原文（用 core.trace.error_fields）。"""
+        if current_trace() is not None or self.tracer is None:
+            note(self.tracer, kind, space=space_id, **data)
+            return
+        trace = Trace(kind, space=space_id)
+        trace.add_event(kind, **data)
+        self.write_note(trace, since=since)
 
     def adopt_open(self, space_id: str, keep: Collection[str] = (), *, start: bool = True) -> int:
         """接手之前的进程留下的进行中的会话：进程崩溃（没来得及 close_session）时，它们没有
