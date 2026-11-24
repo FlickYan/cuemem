@@ -70,6 +70,7 @@ from cuemem.errors import (
     CueMemError,
     DatabaseOpenError,
     DatasetChecksumError,
+    StorageLockedError,
 )
 
 # 记忆系统、评测、Agent 与服务在用到它们的命令里才导入：cuemem --help、cuemem mcp 这些命令
@@ -80,6 +81,7 @@ if TYPE_CHECKING:
     from cuemem.agent import Reply
     from cuemem.api.auth import AnyKeys, KeyRing, Keys
     from cuemem.api.service import ChatService
+    from cuemem.client import MemoryClient
     from cuemem.core.models import Answer, Fact
     from cuemem.evals.datasets import EvalSet
     from cuemem.evals.runner import RunSummary
@@ -228,10 +230,11 @@ def _config_problem(exc: Exception) -> str:
 
 
 @contextmanager
-def _open_system() -> Iterator[MemorySystem]:
+def _open_system(locked_hint: str = "") -> Iterator[MemorySystem]:
     """组装 MemorySystem；把 CueMem 的已知错误转成友好的提示。
 
     交互式命令只发少量请求：分时价格的高峰时段照常调用（记录提醒），不像评测那样暂停。
+    locked_hint：数据库正被另一个进程使用时接在说明后面的话（cuemem import 有 --url）。
     """
     from cuemem.memory import MemorySystem
 
@@ -248,6 +251,9 @@ def _open_system() -> Iterator[MemorySystem]:
             console.print(_unopenable(settings, exc))
             raise typer.Exit(1) from exc
         yield system
+    except StorageLockedError as exc:
+        console.print(f"[red]错误：[/red]{exc}{locked_hint}")
+        raise typer.Exit(1) from exc
     except CueMemError as exc:
         console.print(f"[red]错误：[/red]{exc}")
         raise typer.Exit(1) from exc
@@ -464,10 +470,35 @@ def export_cmd(
     console.print(f"已导出 {len(data['sessions'])} 个会话、{turns} 条发言到 [bold]{out}[/bold]")
 
 
+IMPORT_SOURCES = ("cuemem", "mem0", "chatgpt", "claude")
+CHAT_SOURCES = {"chatgpt": "ChatGPT", "claude": "Claude"}  # 聊天记录的数据导出（--from）
+IMPORT_BATCH = 200  # mem0 与聊天记录默认每批这么多个会话（--batch）
+# --url 时每个请求里各会话的 JSON 最多这么多字节：限定作用域的令牌的请求体上限是 64 MiB
+IMPORT_PIECE_BYTES = 48 << 20
+EDITED_LINES = 20  # 改写过的对话最多列出这么多个
+LOCKED_IMPORT_HINT = "；或者加 --url http://127.0.0.1:7860 通过正在运行的服务导入"
+SourceIds = dict[str, dict[int, str | None]]
+
+
+class _ImportTarget(NamedTuple):
+    """导入写到哪里：本地的记忆系统，或者 --url 的服务。"""
+
+    load: Callable[[dict[str, Any]], Mapping[str, Any]]  # 写一份导入文件，返回报告
+    stored: Callable[[], SourceIds]  # 目标空间里已有发言的 source_message_id（聊天记录）
+    forget: Callable[[list[str]], None]  # 遗忘这几个会话（--replace-edited）
+    failures: tuple[type[Exception], ...]  # 这几种出错是一行说明
+    max_bytes: int | None  # 一份最多这么多字节
+
+
 @app.command("import")
 def import_cmd(
     path: Annotated[
-        Path, typer.Argument(exists=True, dir_okay=False, help="cuemem export 或 Mem0 导出的文件")
+        Path,
+        typer.Argument(
+            exists=True,
+            help="cuemem export 的文件、Mem0 的导出，或者 ChatGPT / Claude 的数据导出"
+            "（zip、解压出的目录或 conversations.json）",
+        ),
     ],
     space: Annotated[str | None, typer.Option(help="导入到这个空间（默认用文件里的）")] = None,
     consolidate: Annotated[
@@ -476,24 +507,219 @@ def import_cmd(
     source: Annotated[
         str,
         typer.Option(
-            "--from", help="文件的格式：cuemem（cuemem export）或 mem0（Mem0 get_all 的 JSON）"
+            "--from",
+            help="文件的格式：cuemem（cuemem export）、mem0（Mem0 get_all 的 JSON）、"
+            "chatgpt 或 claude（它们的数据导出，要给 --user 或 --agent）",
         ),
     ] = "cuemem",
     user: Annotated[str | None, typer.Option("--user", help="导入到这个用户的空间")] = None,
     agent: Annotated[str | None, typer.Option("--agent", help="导入到这个 Agent 的空间")] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            "--url",
+            envvar="CUEMEM_URL",
+            help="经正在运行的 cuemem serve 导入（例如 http://127.0.0.1:7860），不打开本地的"
+            "数据库；令牌取环境变量 CUEMEM_API_TOKEN",
+        ),
+    ] = None,
+    batch: Annotated[
+        int | None,
+        typer.Option(
+            "--batch",
+            min=0,
+            help="每批最多几个会话，各批各是一个事务：中途出错时前面的已经写入，再运行一次只"
+            "补上没写的。0 是不分批。默认 cuemem 不分批，mem0、chatgpt、claude 每批 200",
+        ),
+    ] = None,
+    since: Annotated[
+        datetime | None,
+        typer.Option(
+            "--since",
+            formats=DATETIME_FORMATS,
+            help="chatgpt、claude：只要这个时间之后更新过的对话",
+        ),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="chatgpt、claude：只导入前 N 个对话（先试一小部分）"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="chatgpt、claude：只读文件、报告会导入什么，什么都不写"),
+    ] = False,
+    replace_edited: Annotated[
+        bool,
+        typer.Option(
+            "--replace-edited",
+            help="chatgpt、claude：上次导入之后改写过的对话先遗忘、再重新导入（默认只报告、不动）",
+        ),
+    ] = False,
+    max_file_gb: Annotated[
+        float,
+        typer.Option(
+            "--max-file-gb", min=0.0, help="chatgpt、claude：导出里一个对话文件解压后最多几 GiB"
+        ),
+    ] = 2.0,
 ) -> None:
     """导入 cuemem export 的文件（N12）：写回原始日志，派生记忆由巩固重新生成；可重复执行。
 
     --from mem0 导入 Mem0 的导出（get_all 的结果）：一条记忆一个会话，重复导入什么都不加。不给
-    --user、--agent 时按文件里的 user_id、agent_id 分组，每组导入到各自的空间（各是一个事务）。"""
-    from cuemem.portable import from_mem0, import_space, mem0_groups
-    from cuemem.sdk import space_for
+    --user、--agent 时按文件里的 user_id、agent_id 分组，每组导入到各自的空间。
 
-    if source not in ("cuemem", "mem0"):
-        console.print("[red]--from 只能是 cuemem、mem0[/red]")
+    --from chatgpt、--from claude 导入它们的数据导出：一个对话一个会话，只要用户与助手说的
+    文字（图片、附件、工具调用与思考过程不导入，各有多少会报告）。重复导入什么都不加，对话
+    多了几句时只加新的；改写过的对话见 --replace-edited。先用 --dry-run、--limit 看看规模：
+    每个会话的抽取都要调用 LLM。
+
+    --url 经正在运行的服务导入（cuemem serve 开着时本地的数据库只能由它打开）。"""
+    from cuemem.portable import diverged_sessions, import_space, source_ids, stored_source_ids
+    from cuemem.sdk import space_for, space_owner
+
+    if source not in IMPORT_SOURCES:
+        console.print("[red]--from 只能是 cuemem、mem0、chatgpt、claude[/red]")
+        raise typer.Exit(1)
+    chat = source in CHAT_SOURCES
+    if not chat and (since is not None or limit is not None or dry_run or replace_edited):
+        console.print(
+            "[red]--since、--limit、--dry-run、--replace-edited 只用于 --from chatgpt、claude[/red]"
+        )
         raise typer.Exit(1)
     if space and (user or agent):
         console.print("[red]--space 与 --user、--agent 只给一种[/red]")
+        raise typer.Exit(1)
+    if chat and not (user or agent):
+        console.print(f"[red]--from {source} 用 --user 或 --agent 指定导入到谁的空间[/red]")
+        raise typer.Exit(1)
+    if path.is_dir() and not chat:
+        console.print(
+            f"[red]{escape(str(path))} 是目录：只有 --from chatgpt、claude 认解压出的目录[/red]"
+        )
+        raise typer.Exit(1)
+    try:
+        if user or agent:
+            space = space_for(user, agent)
+        if chat:
+            cap = int(max_file_gb * 2**30)
+            docs = [_chat_document(path, source, user, agent, since, limit, cap)]
+        else:
+            docs = _import_documents(path, source, space, user, agent)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    size = batch if batch is not None else 0 if source == "cuemem" else IMPORT_BATCH
+    if chat:
+        _print_chat_document(docs[0], source)
+
+    if url:
+        try:
+            client = _memory_client(url)
+        except ValueError as exc:
+            console.print(f"[red]--url：{escape(str(exc))}[/red]")
+            raise typer.Exit(1) from exc
+        with client:
+            remote = _ImportTarget(
+                load=lambda piece: client.load(piece, wait=False),
+                stored=lambda: _remote_source_ids(client, user, agent),
+                forget=lambda ids: _remote_forget(client, user, agent, ids),
+                # 服务端的 ValueError、KeyError、TypeError 由客户端原样抛出；等不到回应是
+                # MemoryAPIError（CueMemError）
+                failures=(CueMemError, ValueError, KeyError, TypeError, TimeoutError),
+                max_bytes=IMPORT_PIECE_BYTES,
+            )
+            if dry_run:
+                _print_edited(docs[0], _edited(docs[0], remote), dry_run=True)
+                return
+            console.print(f"[dim]经 {escape(client.base_url)} 导入。[/dim]")
+            if space:  # 服务端按文件里的 space_id 写：MemoryClient.load 没有 space 这个参数
+                docs = [
+                    {**doc, "space_id": space} if isinstance(doc, dict) else doc for doc in docs
+                ]
+            reports = _import_into(remote, docs, size, chat, replace_edited)
+            _print_mem0_notes(source, docs, reports)
+            if not reports:
+                console.print("文件里没有记忆。")
+            elif consolidate:
+                for target in dict.fromkeys(str(r["space_id"]) for r in reports):
+                    owner = (user, agent) if user or agent else space_owner(target)
+                    _remote_wait(client, target, owner)
+            else:
+                console.print(
+                    "[dim]提示：服务端的后台线程会抽取这些会话（需要 LLM）；加 --consolidate "
+                    "等它做完，进度见 GET /api/v1/status。[/dim]"
+                )
+        return
+
+    if dry_run:  # 只读数据库、不拿写的锁：cuemem serve 开着时也能看
+        doc = docs[0]
+        had = _local_source_ids(str(doc["space_id"]), list(source_ids(doc["sessions"])))
+        _print_edited(doc, diverged_sessions(doc, had), dry_run=True)
+        return
+    with _open_system(locked_hint=LOCKED_IMPORT_HINT) as system:
+        target_space = str(docs[0]["space_id"]) if chat else ""
+        local = _ImportTarget(
+            load=lambda piece: import_space(system, piece, space_id=space),
+            stored=lambda: stored_source_ids(
+                system.db, target_space, list(source_ids(docs[0]["sessions"]))
+            ),
+            forget=lambda ids: _local_forget(system, target_space, ids),
+            failures=(CueMemError, ValueError),
+            max_bytes=None,
+        )
+        reports = _import_into(local, docs, size, chat, replace_edited)
+        _print_mem0_notes(source, docs, reports)
+        if not reports:
+            console.print("文件里没有记忆。")
+        elif consolidate:  # 抽取失败的会话同样写出原因，最后退出码 1（第十轮体检 Q9）
+            failed = False
+            for target in dict.fromkeys(str(r["space_id"]) for r in reports):
+                failed |= _print_consolidation(system.consolidate(target), system.db)
+            _print_usage_rows(system.ledger.summary(run_id=system.ledger.run_id))
+            if failed:
+                raise typer.Exit(1)
+        else:
+            console.print(
+                "[dim]提示：运行 cuemem consolidate 重新抽取事实与实体（需要 LLM）。[/dim]"
+            )
+
+
+def _print_mem0_notes(
+    source: str, docs: list[dict[str, Any]], reports: list[dict[str, Any]]
+) -> None:
+    if source != "mem0":
+        return
+    if len(reports) > 1:
+        console.print(
+            f"[dim]{len(reports)} 个空间各自导入（各是一个事务）：中途出错时前面的"
+            "已经写入，再运行一次只补上没写的。[/dim]"
+        )
+    skipped = sum(int(doc["skipped"]) for doc in docs)
+    if skipped:
+        console.print(f"[dim]跳过 {skipped} 条文字为空的记忆。[/dim]")
+
+
+def _memory_client(url: str) -> MemoryClient:
+    """cuemem import --url 用的客户端（测试里换成接在应用上的）；令牌取 CUEMEM_API_TOKEN。"""
+    from cuemem.client import MemoryClient
+
+    return MemoryClient(url)
+
+
+def _import_documents(
+    path: Path, source: str, space: str | None, user: str | None, agent: str | None
+) -> list[dict[str, Any]]:
+    """cuemem、mem0 两种格式要导入的文件：cuemem 是文件本身；mem0 先全部换算、检查完（哪条
+    不合格式都什么都不写），不给 --user、--agent 时每个（user_id，agent_id）一份。认不出的
+    文件一行说明、以 1 退出；换算时的 ValueError 由调用方打印。"""
+    import zipfile
+
+    from cuemem.portable import from_mem0, mem0_groups
+
+    if zipfile.is_zipfile(path):  # 以前说"不是有效的 CueMem 导出文件（被截断了？）"
+        console.print(
+            f"[red]{escape(str(path))} 是 zip：ChatGPT、Claude 的数据导出加上 --from chatgpt 或 "
+            "--from claude（再给 --user U）[/red]"
+        )
         raise typer.Exit(1)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -501,6 +727,22 @@ def import_cmd(
         what = "Mem0 导出" if source == "mem0" else "CueMem 导出"
         console.print(f"[red]不是有效的 {what}文件（被截断了？）：{escape(str(exc))}[/red]")
         raise typer.Exit(1) from exc
+    first = data[0] if isinstance(data, list) and data else None
+    guess = (
+        None
+        if not isinstance(first, dict)
+        else "chatgpt"
+        if "mapping" in first and "current_node" in first
+        else "claude"
+        if "chat_messages" in first
+        else None
+    )
+    if guess:  # 聊天记录也是列表：先于下面的 Mem0 提示
+        console.print(
+            f"[red]{escape(str(path))} 像是 {CHAT_SOURCES[guess]} 的数据导出：加上 "
+            f"--from {guess} --user U（先用 --dry-run 看看会导入什么）[/red]"
+        )
+        raise typer.Exit(1)
     if source == "cuemem" and (
         isinstance(data, list)
         or (isinstance(data, dict) and "results" in data and "format" not in data)
@@ -510,62 +752,249 @@ def import_cmd(
             "文件：加上 --from mem0（可以再给 --user U）[/red]"
         )
         raise typer.Exit(1)
-    # 要导入的文件：cuemem 是文件本身；mem0 先全部换算、检查完（哪条不合格式都什么都不写），
-    # 不给 --user、--agent 时每个（user_id，agent_id）一份
-    skipped = 0
+    if source == "cuemem":
+        return [data]
+    if user or agent:
+        return [from_mem0(data, user_id=user, agent_id=agent)]
+    if space:
+        console.print("[red]--from mem0 用 --user 或 --agent 指定空间[/red]")
+        raise typer.Exit(1)
+    groups = sorted(mem0_groups(data).items(), key=lambda group: str(group[0]))
+    return [from_mem0(items, user_id=u, agent_id=a) for (u, a), items in groups]
+
+
+def _chat_document(
+    path: Path,
+    source: str,
+    user: str | None,
+    agent: str | None,
+    since: datetime | None,
+    limit: int | None,
+    cap: int,
+) -> dict[str, Any]:
+    """ChatGPT、Claude 的数据导出 → 一份要导入的文件（全部读完、检查完才返回）。"""
+    from cuemem import portable
+
+    if source == "chatgpt":
+        found = portable.chatgpt_conversations(path, max_file_bytes=cap)
+        return portable.from_chatgpt(found, user_id=user, agent_id=agent, since=since, limit=limit)
+    found = portable.claude_conversations(path, max_file_bytes=cap)
+    return portable.from_claude(found, user_id=user, agent_id=agent, since=since, limit=limit)
+
+
+def _print_chat_document(doc: Mapping[str, Any], source: str) -> None:
+    """聊天记录换算之后：多少个对话、多少句、跳过了什么，以及抽取要调用 LLM 的提醒。"""
+    sessions = doc["sessions"]
+    turns = [turn for session in sessions for turn in session["turns"]]
+    console.print(
+        f"{CHAT_SOURCES[source]} 导出：{len(sessions)} 个对话、{len(turns)} 条发言、"
+        f"{sum(len(t['text']) for t in turns)} 个字符 → 记忆空间 "
+        f"[bold]{escape(str(doc['space_id']))}[/bold]"
+    )
+    skipped = doc.get("skipped") or {}
+    if skipped:
+        listed = "、".join(f"{escape(reason)} {count}" for reason, count in skipped.items())
+        console.print(f"[dim]跳过：{listed}（图片、附件、工具调用与思考过程不导入）[/dim]")
+    if sessions:
+        console.print(
+            f"[dim]这 {len(sessions)} 个会话的抽取各要调用 LLM（至少一次），{len(turns)} 条发言"
+            "要向量化；重复导入时已有的不再算。[/dim]"
+        )
+
+
+def _edited(doc: Mapping[str, Any], target: _ImportTarget) -> list[str]:
+    """聊天记录里上次导入之后改写过的对话（会话 ID）；读不到已有的发言时一行说明、以 1 退出。"""
+    from cuemem.portable import diverged_sessions
+
+    if not doc["sessions"]:
+        return []
     try:
-        if user or agent:
-            space = space_for(user, agent)
-        if source == "cuemem":
-            docs = [data]
-        elif user or agent:
-            docs = [from_mem0(data, user_id=user, agent_id=agent)]
-        else:
-            if space:
-                console.print("[red]--from mem0 用 --user 或 --agent 指定空间[/red]")
-                raise typer.Exit(1)
-            groups = sorted(mem0_groups(data).items(), key=lambda group: str(group[0]))
-            docs = [from_mem0(items, user_id=u, agent_id=a) for (u, a), items in groups]
-        if source == "mem0":
-            skipped = sum(int(doc["skipped"]) for doc in docs)
-    except ValueError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
-        raise typer.Exit(1) from exc
-    with _open_system() as system:
-        reports = []
-        failed = False
-        for doc in docs:
-            try:
-                report = import_space(system, doc, space_id=space, consolidate=consolidate)
-            except ValueError as exc:
-                console.print(f"[red]{escape(str(exc))}[/red]")
-                raise typer.Exit(1) from exc
-            reports.append(report)
-            console.print(
-                f"记忆空间 [bold]{escape(report['space_id'])}[/bold]：{report['sessions']} 个会话，"
-                f"新增 {report['turns_added']} 条发言、{report['images_added']} 张图片"
-            )
-            done = report.get("consolidation")
-            if done is not None:  # --consolidate：抽取失败的会话同样写出原因，最后退出码 1
-                failed |= _print_extraction_problems(
-                    system.db, report["space_id"], done["failed"], done["skipped"]
-                )
-        if source == "mem0":
-            if len(reports) > 1:
+        return diverged_sessions(doc, target.stored())
+    except target.failures as exc:
+        _import_failed(exc, 1, 1, 0)
+
+
+def _print_edited(doc: Mapping[str, Any], edited: list[str], *, dry_run: bool = False) -> None:
+    if edited:
+        titles = {
+            s["session_id"]: s["turns"][0]["metadata"].get("source_title", "")
+            for s in doc["sessions"]
+        }
+        console.print(
+            f"[yellow]{len(edited)} 个对话在上次导入之后改写过（当前这一支与存下的不同）：[/yellow]"
+        )
+        for session_id in edited[:EDITED_LINES]:
+            console.print(f"  {session_id}  {escape(titles.get(session_id, ''))}")
+        if len(edited) > EDITED_LINES:
+            console.print(f"  …还有 {len(edited) - EDITED_LINES} 个")
+    if dry_run:
+        console.print("[dim]--dry-run：什么都没有写。[/dim]")
+
+
+def _import_into(
+    target: _ImportTarget,
+    docs: list[dict[str, Any]],
+    size: int,
+    chat: bool,
+    replace_edited: bool,
+) -> list[dict[str, Any]]:
+    """把各份文件写进 target，每份一行报告；返回各份的报告（空间、会话数、新增的发言与图片）。
+    size 大于 0 或 target 有字节上限时先按会话切成几批（portable.split_document），各批各写
+    一次；哪一批出错都是一行说明（写明前面几批已经写入）、以 1 退出。"""
+    from cuemem.portable import split_document
+
+    reports: list[dict[str, Any]] = []
+    written = 0  # 已经写入的批数（各份文件合计）
+    for doc in docs:
+        if chat:
+            edited = _edited(doc, target)
+            _print_edited(doc, edited)
+            if edited and replace_edited:
+                try:
+                    target.forget(edited)
+                except target.failures as exc:
+                    _import_failed(exc, 1, 1, written)
                 console.print(
-                    f"[dim]{len(reports)} 个空间各自导入（各是一个事务）：中途出错时前面的"
-                    "已经写入，再运行一次只补上没写的。[/dim]"
+                    f"[dim]已遗忘这 {len(edited)} 个会话、用剩下的日志重建了派生记忆（要调用 "
+                    "LLM，多数命中缓存），下面重新导入。[/dim]"
                 )
-            if skipped:
-                console.print(f"[dim]跳过 {skipped} 条文字为空的记忆。[/dim]")
-        if not reports:
-            console.print("文件里没有记忆。")
-        elif "consolidation" not in reports[-1]:
-            console.print(
-                "[dim]提示：运行 cuemem consolidate 重新抽取事实与实体（需要 LLM）。[/dim]"
-            )
-        if failed:
-            raise typer.Exit(1)
+            elif edited:
+                gone = set(edited)
+                doc = {
+                    **doc,
+                    "sessions": [s for s in doc["sessions"] if s["session_id"] not in gone],
+                }
+                console.print(
+                    "[yellow]这次不导入它们，存下的不动；加 --replace-edited 先遗忘再重新导入"
+                    "。[/yellow]"
+                )
+        pieces: list[dict[str, Any]] = [doc]
+        if size or target.max_bytes is not None:
+            try:
+                pieces = list(
+                    split_document(
+                        doc,
+                        max_sessions=size or None,
+                        max_bytes=target.max_bytes,
+                        oversize_alone=True,
+                    )
+                )
+            except ValueError as exc:
+                _import_failed(exc, 1, 1, written)
+        total: dict[str, Any] = {"sessions": 0, "turns_added": 0, "images_added": 0}
+        total["space_id"] = doc.get("space_id") if isinstance(doc, dict) else None
+        for n, piece in enumerate(pieces, 1):
+            try:
+                report = target.load(piece)
+            except target.failures as exc:
+                _import_failed(exc, n, len(pieces), written)
+            written += 1
+            total["space_id"] = report.get("space_id")
+            for key in ("sessions", "turns_added", "images_added"):
+                total[key] += int(report.get(key) or 0)
+        batches = f"（分 {len(pieces)} 批）" if len(pieces) > 1 else ""
+        console.print(
+            f"记忆空间 [bold]{escape(str(total['space_id']))}[/bold]：{total['sessions']} 个会话，"
+            f"新增 {total['turns_added']} 条发言、{total['images_added']} 张图片{batches}"
+        )
+        reports.append(total)
+    return reports
+
+
+def _import_failed(exc: Exception, n: int, total: int, written: int) -> NoReturn:
+    """导入的一批出错：一行说明（第几批、前面写了几批），以 1 退出。"""
+    text = str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
+    where = f"第 {n} 批（共 {total} 批）导入失败：" if total > 1 else ""
+    kept = (
+        f"。前面 {written} 批已经写入：修好之后再运行一次同样的命令，只补上没写的"
+        if written
+        else ""
+    )
+    head = "" if isinstance(exc, ValueError) else "错误："
+    console.print(f"[red]{head}{where}{escape(text)}{kept}[/red]")
+    raise typer.Exit(1) from exc
+
+
+def _local_source_ids(space: str, session_ids: list[str]) -> SourceIds:
+    """--dry-run：本地数据库里这些会话已有的发言（只读；还没有数据库时是空的，也不新建）。"""
+    from cuemem.portable import stored_source_ids
+
+    if not _settings().paths.db.is_file():
+        return {}
+    with _open_db_only() as db:
+        return stored_source_ids(db, space, session_ids)
+
+
+def _local_forget(system: MemorySystem, space: str, session_ids: list[str]) -> None:
+    system.forget_memories(space, session_ids=session_ids)
+
+
+def _remote_source_ids(client: MemoryClient, user: str | None, agent: str | None) -> SourceIds:
+    """--url：下载目标空间的日志（不带派生记忆的导出），取已有发言的 source_message_id；还没有
+    这个空间时是空的。"""
+    from cuemem.portable import source_ids
+
+    try:
+        exported = client.export(user_id=user, agent_id=agent, derived=False)
+    except KeyError:
+        return {}
+    return source_ids(exported.get("sessions") if isinstance(exported, dict) else None)
+
+
+def _remote_forget(
+    client: MemoryClient, user: str | None, agent: str | None, session_ids: list[str]
+) -> None:
+    for session_id in session_ids:  # 每个各重建一次这个空间的派生记忆
+        client.delete_all(user_id=user, agent_id=agent, run_id=session_id)
+
+
+def _remote_wait(
+    client: MemoryClient, space: str, owner: tuple[str | None, str | None] | None
+) -> None:
+    """--url --consolidate：等服务端的后台线程把这个空间登记的抽取做完。每个请求最多等到客户端
+    的读超时之前（MemoryClient.wait），没做完就看一眼进度再等；两次之间没有进展时不再等。"""
+    if owner is None:  # 空间不是 user_id、agent_id 得来的：/api/v1/wait 指不到它
+        console.print(
+            f"[dim]{escape(space)}：服务端的后台线程在抽取，进度见 GET /api/v1/status。[/dim]"
+        )
+        return
+    user, agent = owner
+    console.print(
+        f"[dim]等服务端抽取 {escape(space)}（Ctrl-C 只是不再等，抽取在服务端继续）…[/dim]"
+    )
+    left: int | None = None
+    try:
+        while True:
+            try:
+                client.wait(user_id=user, agent_id=agent)
+                break
+            except TimeoutError:
+                pending = int(client.status(user_id=user, agent_id=agent).get("pending") or 0)
+                if left is not None and pending >= left:
+                    console.print(
+                        f"[yellow]{escape(space)}：还有 {pending} 个会话没抽取完、这段时间没有"
+                        "进展，不再等；进度见 GET /api/v1/status。[/yellow]"
+                    )
+                    return
+                left = pending
+                console.print(f"[dim]还有 {pending} 个会话…[/dim]")
+        status = client.status(user_id=user, agent_id=agent)
+    except (CueMemError, ValueError, KeyError, TypeError) as exc:
+        console.print(f"[red]错误：等抽取时出错（发言已经写入）：{escape(str(exc))}[/red]")
+        raise typer.Exit(1) from exc
+    failed, pending = status.get("failed") or [], int(status.get("pending") or 0)
+    if failed:
+        console.print(
+            f"[yellow]{escape(space)}：{len(failed)} 个会话抽取失败（原因见 GET /api/v1/status）"
+            "。[/yellow]"
+        )
+    elif pending and not status.get("background"):
+        console.print(
+            f"[yellow]{escape(space)}：服务端没有后台线程，{pending} 个会话还没抽取；调用 "
+            "POST /api/v1/consolidate。[/yellow]"
+        )
+    else:
+        console.print(f"{escape(space)}：抽取完成。")
 
 
 @app.command("consolidate")

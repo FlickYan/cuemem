@@ -39,6 +39,10 @@ Mem0 的导出（第八轮体检）：from_mem0 把 Mem0 get_all 的结果（列
 接口分页的 {"count", "next", "results"}）换成上面的格式，交给同一个 import_space：一条记忆是一个
 会话（session_id 由 Mem0 的 id 与更新时间派生），重复导入什么都不加，Mem0 里改过的记忆作为新会话
 进来、由对账取代旧的事实。见 from_mem0。
+
+分批导入（第十轮体检）：split_document 把一份导入文件按会话切成几份同样格式的文件，每份各自
+交给 import_space（各是一个事务）。导入是幂等的，中途出错时前面几份已经写入，再来一次只补上
+没写的。cuemem import --batch 与 --url（经正在运行的服务导入，请求体有大小上限）用它。
 """
 
 from __future__ import annotations
@@ -48,10 +52,15 @@ import hashlib
 import io
 import json
 import mimetypes
+import re
+import sys
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+import zipfile
+import zlib
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from itertools import groupby
 from pathlib import Path
 from typing import Any
@@ -68,6 +77,13 @@ FORMAT = "cuemem.space"
 MEM0_PREFIX = "mem0-"  # Mem0 导入的会话 ID 的前缀（from_mem0）
 # Mem0 记忆的这几个顶层键是字符串或者没有（mem0/memory/main.py 的 promoted_payload_keys）
 _MEM0_STR_KEYS = ("user_id", "agent_id", "run_id", "actor_id", "role", "attributed_to")
+# ChatGPT 与 Claude 的数据导出（from_chatgpt、from_claude）：装着对话的文件的名字，一个文件
+# 解压后最多这么大，对话标题最多留这么多个字符
+_CHAT_FILE = re.compile(r"conversations(?:-(\d+))?\.json")
+CHAT_FILE_CAP = 2 << 30
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+_CHAT_LABELS = {"chatgpt": "ChatGPT", "claude": "Claude"}
+_TITLE_CHARS = 200
 VERSION = 2  # 2：发言带附加信息（metadata、过期时间、更正目标）；1 照样能导入
 # iter_export_json 攒到这么多个字符就写出一段（只有文字的空间不必每句发言一段）
 EXPORT_CHUNK_BYTES = 1 << 16
@@ -324,6 +340,54 @@ def longest_session_id(data: Any) -> int:
     sessions = data.get("sessions") if isinstance(data, Mapping) else None
     ids = (s.get("session_id") for s in sessions or () if isinstance(s, Mapping))
     return max((len(i) for i in ids if isinstance(i, str)), default=0)
+
+
+def split_document(
+    doc: Mapping[str, Any],
+    *,
+    max_sessions: int | None = None,
+    max_bytes: int | None = None,
+    oversize_alone: bool = False,
+) -> Iterator[dict[str, Any]]:
+    """把一份导入文件切成几份（第十轮体检）：每份的开头相同（format、version、space_id，有
+    exported_at 时也带），sessions 是原来的一段，顺序不变。只在会话之间切，一个会话从不拆开；
+    derived（导入时本来就不用）与别的键不带。没有会话时给出一份空的。
+
+    max_sessions：每份最多这么多个会话；max_bytes：每份里各会话的 JSON（与导出相同的紧凑写法，
+    UTF-8）加起来最多这么多字节，留给 HTTP 请求体的上限用。一个会话自己就超过 max_bytes 时
+    ValueError（限定作用域的令牌的请求体上限装不下它，要用管理令牌导入）；oversize_alone=True
+    时不报错，这个会话单独成一份（cuemem import --url：管理令牌的上限大得多，收不收由服务端
+    决定）。sessions 不是列表、里面有不是对象的项时 ValueError("Malformed export: …")。
+
+    各份逐个交给 import_space，写下的日志与整份导入相同；区别只在事务：整份是一个，这里每份
+    一个，中途出错时前面的已经写入（再导入一次只补上没写的）。"""
+    if max_sessions is not None and max_sessions < 1:
+        raise ValueError("max_sessions must be at least 1")
+    if not isinstance(doc, Mapping):
+        raise ValueError("Malformed export: a CueMem export is a JSON object")
+    sessions = doc.get("sessions", [])
+    if not isinstance(sessions, list) or not all(isinstance(s, Mapping) for s in sessions):
+        raise ValueError("Malformed export: sessions must be a list of JSON objects")
+    head = {key: doc[key] for key in ("format", "version", "exported_at", "space_id") if key in doc}
+    piece: list[Any] = []
+    size = 0
+    for session in sessions:
+        weight = 0
+        if max_bytes is not None:
+            weight = len(_dumps(session).encode("utf-8"))
+            if weight > max_bytes and not oversize_alone:
+                raise ValueError(
+                    f"Session {session.get('session_id')!r} is larger than the server's body "
+                    "limit: import it with the admin token"
+                )
+        full = max_sessions is not None and len(piece) >= max_sessions
+        if piece and (full or (max_bytes is not None and size + weight > max_bytes)):
+            yield {**head, "sessions": piece}
+            piece, size = [], 0
+        piece.append(session)
+        size += weight
+    if piece or not sessions:
+        yield {**head, "sessions": piece}
 
 
 def _parse_export(
@@ -603,3 +667,483 @@ def _mem0_session(item: Mapping[str, Any], n: int) -> dict[str, Any] | None:
         turn["expires_at"] = expires
     digest = hashlib.sha256(f"{memory_id}\0{version}".encode()).hexdigest()[:16]
     return {"session_id": f"{MEM0_PREFIX}{digest}", "started_at": ts, "turns": [turn]}
+
+
+# ---------- ChatGPT 与 Claude 的数据导出（第十轮体检）----------
+
+
+def chatgpt_conversations(
+    source: Path, *, max_file_bytes: int = CHAT_FILE_CAP
+) -> Iterator[Mapping[str, Any]]:
+    """ChatGPT 数据导出里的对话，一次给出一个。source 是导出的 zip、解压出的目录，或者单独的
+    conversations.json / conversations-N.json。对话在 zip（或目录）的根上或往下一层的目录里：
+    conversations.json（早先的导出）与 conversations-0.json、conversations-1.json……（大的导出
+    分成几个文件），按编号一个一个地读，同一时间只有一个文件在内存里。
+
+    zip 只按这几个名字读成员，从不解压到磁盘；一个成员（或文件）解压后超过 max_file_bytes
+    （默认 2 GiB）时拒绝。文件不是 JSON 数组、zip 打不开、里面没有这些文件时
+    ValueError("Malformed ChatGPT export: …")。对话本身由 from_chatgpt 检查。"""
+    return _chat_conversations(Path(source), "ChatGPT", max_file_bytes)
+
+
+def claude_conversations(
+    source: Path, *, max_file_bytes: int = CHAT_FILE_CAP
+) -> Iterator[Mapping[str, Any]]:
+    """Claude（claude.ai）数据导出里的对话，一次给出一个：zip、解压出的目录或单独的
+    conversations.json。读法与限制同 chatgpt_conversations；出错时
+    ValueError("Malformed Claude export: …")。对话本身由 from_claude 检查。"""
+    return _chat_conversations(Path(source), "Claude", max_file_bytes)
+
+
+def from_chatgpt(
+    conversations: Iterable[object],
+    *,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    since: datetime | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """ChatGPT 导出的对话 → 一份 cuemem.space（version 2）文件，交给 import_space。
+
+    - 目标空间是 space_for(user_id, agent_id)，两个都不给时 ValueError（导出里没有可用的用户名）；
+    - 一个对话一个会话：session_id 是 "chatgpt-" 加上 sha256(conversation_id，没有时用 id) 的
+      前 16 位，开始时间是对话的 create_time（没有时用第一句的时间）。同一个对话再导入时发言
+      已在、跳过；对话后来又多了几句，只加新的几句；
+    - 对话在导出里是一棵树（改写一句话、重新生成回答都会分叉），只导入当前这一支：从
+      current_node 沿 parent 走到根；
+    - 留下的发言：role 是 user 或 assistant、content_type 是 text 或 multimodal_text（只取其中
+      的文字）、没有标记 is_visually_hidden_from_conversation、recipient 是 all（或没有）、文字
+      不为空。别的都跳过，按原因记在返回值的 "skipped" 里：别的 role（system、tool）、别的
+      content_type（code、thoughts、reasoning_recap、user_editable_context、tether_quote……）、
+      hidden、tool_call（发给工具的那句）、empty；图片与附件不导入，数目记在 attachments；
+    - 发言的序号是它在留下的发言里的位置。留哪些、跳过哪些因此是会话内容的一部分：这条规则
+      改了，序号就错开，以前导入过的对话都会被当成改写过的（见 diverged_sessions）；
+    - 时间：发言的 create_time，没有时用上一句留下的发言的，第一句没有时用对话的；换算成本机
+      时间；
+    - 每句的 metadata 是 {"source": "chatgpt", "source_message_id": 消息的 id,
+      "source_title": 对话的标题}（没有标题时不带）。
+
+    since：最后更新（update_time，没有时 create_time）早于它的对话跳过（before_since）；
+    limit：只换算前这么多个有内容的对话，之后的不读也不检查（试导入用）。没有一句可留的对话
+    记在 empty_conversations，重复出现的对话只算第一次（duplicate_conversations）。
+
+    先检查完所有对话再返回：哪一个不合格式都 ValueError("Malformed ChatGPT export: …")，什么
+    都不写。导出的格式没有官方文档，这里只认上面写的这些，认不出的结构报错而不是猜。"""
+    return _from_chat(conversations, _chatgpt_session, "chatgpt", user_id, agent_id, since, limit)
+
+
+def from_claude(
+    conversations: Iterable[object],
+    *,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    since: datetime | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Claude（claude.ai）导出的对话 → 一份 cuemem.space（version 2）文件，规则同 from_chatgpt：
+
+    - 一个对话一个会话："claude-" 加上 sha256(uuid) 的前 16 位，开始时间是 created_at；
+    - chat_messages 按顺序：sender 是 human 的作为 user，assistant 的作为 assistant，别的跳过
+      （按 sender 记数）；
+    - 文字是 content 里各个 text 块接起来（空行隔开）；thinking、tool_use、tool_result 与别的块
+      跳过、按类型记数。没有 content（早先的导出）时用消息的 text。没有文字的消息记在 empty；
+      attachments 与 files 不导入，数目记在 attachments；
+    - 时间：消息的 created_at（没有时用上一句的，第一句没有时用对话的），换算成本机时间；
+    - metadata 是 {"source": "claude", "source_message_id": 消息的 uuid, "source_title": name}；
+      消息没有 uuid 时用 "<对话的 uuid>:<它在 chat_messages 里的位置>"。
+
+    since 看 updated_at（没有时 created_at）。不合格式时
+    ValueError("Malformed Claude export: …")。"""
+    return _from_chat(conversations, _claude_session, "claude", user_id, agent_id, since, limit)
+
+
+def source_ids(sessions: object) -> dict[str, dict[int, str | None]]:
+    """一份导入（或导出）文件的会话里，每句发言的 metadata.source_message_id：会话 → 序号 → id
+    （没有时 None）。文件可能来自服务端的导出：形状不对的项跳过。"""
+    out: dict[str, dict[int, str | None]] = {}
+    for session in sessions if isinstance(sessions, list) else []:
+        if not isinstance(session, Mapping) or not isinstance(session.get("session_id"), str):
+            continue
+        turns = session.get("turns")
+        ids = out.setdefault(session["session_id"], {})
+        for turn in turns if isinstance(turns, list) else []:
+            if not isinstance(turn, Mapping) or not isinstance(turn.get("idx"), int):
+                continue
+            meta = turn.get("metadata")
+            found = meta.get("source_message_id") if isinstance(meta, Mapping) else None
+            ids.setdefault(turn["idx"], found if isinstance(found, str) else None)
+    return out
+
+
+def stored_source_ids(
+    db: MemoryDB, space_id: str, session_ids: Iterable[str]
+) -> dict[str, dict[int, str | None]]:
+    """数据库里这些会话已有的发言的 source_message_id（形状同 source_ids）；没有发言的会话不在
+    结果里。只读。"""
+    out: dict[str, dict[int, str | None]] = {}
+    for session_id in session_ids:
+        turns, meta, _ = db.export_rows(space_id, session_id, sys.maxsize)
+        if not turns:
+            continue
+        ids = out[session_id] = {}
+        for turn in turns:
+            extra = meta.get(turn.id)
+            found = extra.metadata.get("source_message_id") if extra is not None else None
+            ids[turn.idx] = found if isinstance(found, str) else None
+    return out
+
+
+def diverged_sessions(
+    doc: Mapping[str, Any], stored: Mapping[str, Mapping[int, str | None]]
+) -> list[str]:
+    """要导入的聊天记录里，与已经存下的对不上的会话：某个序号上已有一句发言，它的
+    source_message_id 与这次的不同——对话在上次导入之后被改写过（改了一句话、重新生成了回答，
+    当前这一支换了）。导入时相同序号的发言先写的算，这样的会话照常导入的话新的那一支被悄悄
+    丢掉、后面多出来的几句接在旧的那一支后面，所以调用方不写它、报告出来，或者先遗忘这个会话
+    再导入（cuemem import --replace-edited）。只是多了几句的对话不算。"""
+    incoming = source_ids(doc.get("sessions"))
+    return [
+        session_id
+        for session_id, ids in incoming.items()
+        if any(idx in ids and ids[idx] != had for idx, had in stored.get(session_id, {}).items())
+    ]
+
+
+def _chat_conversations(source: Path, label: str, cap: int) -> Iterator[Mapping[str, Any]]:
+    for name, payload in _chat_files(source, label, cap):
+        try:
+            items = json.loads(payload)
+        except (ValueError, RecursionError) as exc:  # JSONDecodeError、UnicodeDecodeError 都是
+            raise ValueError(f"Malformed {label} export: {name} is not valid JSON: {exc}") from exc
+        del payload
+        if not isinstance(items, list):
+            raise ValueError(f"Malformed {label} export: {name} is not a JSON array")
+        yield from items
+
+
+def _chat_files(source: Path, label: str, cap: int) -> Iterator[tuple[str, bytes]]:
+    """导出里装着对话的文件（名字，内容），按编号一个一个给出。"""
+    try:
+        if source.is_dir():
+            found = {
+                p.relative_to(source).as_posix(): p
+                for pattern in ("*.json", "*/*.json")
+                for p in source.glob(pattern)
+                if p.is_file()
+            }
+            for name in _chat_members(found, label, source.name):
+                if found[name].stat().st_size > cap:
+                    raise ValueError(_too_big(label, name, cap))
+                yield name, found[name].read_bytes()
+        elif _is_zip(source):
+            with zipfile.ZipFile(source) as archive:
+                members = {i.filename: i for i in archive.infolist() if not i.is_dir()}
+                for name in _chat_members(members, label, source.name):
+                    if members[name].file_size > cap:
+                        raise ValueError(_too_big(label, name, cap))
+                    with archive.open(members[name]) as handle:
+                        payload = handle.read(cap + 1)  # 头里写的大小不可信：按实际读到的算
+                    if len(payload) > cap:
+                        raise ValueError(_too_big(label, name, cap))
+                    yield name, payload
+        else:
+            if source.stat().st_size > cap:
+                raise ValueError(_too_big(label, source.name, cap))
+            yield source.name, source.read_bytes()
+    except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as exc:
+        # RuntimeError：加了密码的 zip；NotImplementedError：不认识的压缩方法
+        raise ValueError(f"Malformed {label} export: cannot read {source.name}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"Malformed {label} export: cannot read {source.name}: {exc}") from exc
+
+
+def _is_zip(source: Path) -> bool:
+    """是不是 zip：先看开头的标记（zipfile.is_zipfile 只找末尾的目录，JSON 文件的末尾碰巧有那
+    几个字节时也算）。"""
+    with source.open("rb") as handle:
+        return handle.read(4) in (b"PK\x03\x04", b"PK\x05\x06") and zipfile.is_zipfile(source)
+
+
+def _chat_members(names: Iterable[str], label: str, where: str) -> list[str]:
+    """names 里装着对话的那几个：根上的 conversations.json 与 conversations-N.json；根上没有时
+    是往下一层的某一个目录里的（zip 里多包了一层目录）。几个目录里都有时 ValueError：不猜。"""
+    by_dir: dict[str, list[tuple[int, str]]] = {}
+    for name in names:
+        folder, _, base = name.rpartition("/")
+        match = _CHAT_FILE.fullmatch(base)
+        if match is not None and "/" not in folder:
+            by_dir.setdefault(folder, []).append((int(match[1]) if match[1] else -1, name))
+    if not by_dir:
+        raise ValueError(
+            f"Malformed {label} export: {where} has no conversations.json or conversations-N.json"
+        )
+    if "" not in by_dir and len(by_dir) > 1:
+        raise ValueError(
+            f"Malformed {label} export: {where} has conversations in several folders "
+            f"({', '.join(sorted(by_dir))}): point at one of them"
+        )
+    chosen = by_dir[""] if "" in by_dir else next(iter(by_dir.values()))
+    return [name for _, name in sorted(chosen)]
+
+
+def _too_big(label: str, name: str, cap: int) -> str:
+    return (
+        f"Malformed {label} export: {name} is larger than {cap} bytes uncompressed "
+        "(raise max_file_bytes, or --max-file-gb on the command line)"
+    )
+
+
+@dataclass(frozen=True)
+class _ChatSession:
+    """一个换算好的对话：导入文件里的会话，与它最后更新的时间（since 用）。"""
+
+    session: dict[str, Any]
+    updated: datetime
+
+
+def _from_chat(
+    conversations: Iterable[object],
+    convert: Callable[[Mapping[str, Any], int, Counter[str]], _ChatSession | None],
+    source: str,
+    user_id: str | None,
+    agent_id: str | None,
+    since: datetime | None,
+    limit: int | None,
+) -> dict[str, Any]:
+    from cuemem.sdk import space_for
+
+    label = _CHAT_LABELS[source]
+    if not user_id and not agent_id:
+        raise ValueError(f"A {label} export names no user: pass user_id or agent_id to import it.")
+    target = space_for(user_id, agent_id)
+    cutoff = naive_local(since) if since is not None else None
+    skipped: Counter[str] = Counter()
+    sessions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for n, item in enumerate(conversations):
+        if limit is not None and len(sessions) >= limit:
+            break
+        if not isinstance(item, Mapping):
+            raise ValueError(f"Malformed {label} export: conversation {n} is not a JSON object")
+        tally: Counter[str] = Counter()
+        found = convert(item, n, tally)
+        if found is None:  # 一句可留的都没有
+            skipped["empty_conversations"] += 1
+            skipped.update(tally)
+        elif found.session["session_id"] in seen:
+            skipped["duplicate_conversations"] += 1
+        elif cutoff is not None and found.updated < cutoff:
+            skipped["before_since"] += 1
+        else:
+            seen.add(found.session["session_id"])
+            sessions.append(found.session)
+            skipped.update(tally)
+    return {
+        "format": FORMAT,
+        "version": VERSION,
+        "space_id": target,
+        "sessions": sessions,
+        "skipped": dict(sorted(skipped.items())),
+    }
+
+
+def _chat_session(
+    source: str,
+    conversation_id: str,
+    title: object,
+    started: datetime | None,
+    updated: datetime | None,
+    kept: Sequence[tuple[str, str, str, datetime | None]],
+    what: str,
+) -> _ChatSession | None:
+    """留下的发言（role，文字，消息 id，时间）→ 会话；一句都没有时 None。没有时间的发言用
+    上一句的，第一句用对话的；都没有时 ValueError。"""
+    if not kept:
+        return None
+    turns = []
+    clock = first = started
+    for idx, (role, text, message_id, ts) in enumerate(kept):
+        clock = ts or clock
+        if clock is None:
+            raise ValueError(f"Malformed {_CHAT_LABELS[source]} export: {what} has no usable time")
+        first = first or clock
+        extra = {"source": source, "source_message_id": _whole(message_id)}
+        if isinstance(title, str) and title.strip():
+            extra["source_title"] = _whole(title.strip()[:_TITLE_CHARS])
+        turns.append(
+            {
+                "idx": idx,
+                "role": role,
+                "text": _whole(text),
+                "ts": clock.isoformat(),
+                "speaker": None,
+                "images": [],
+                "metadata": extra,
+            }
+        )
+    assert first is not None and clock is not None  # kept 不为空
+    digest = hashlib.sha256(conversation_id.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    session = {"session_id": f"{source}-{digest}", "started_at": first.isoformat(), "turns": turns}
+    return _ChatSession(session, updated or clock)
+
+
+def _whole(text: str) -> str:
+    """落单的代理项（导出里截断的表情符号，JSON 的 \\ud83d 之类）换成 U+FFFD：它们写不成
+    UTF-8，数据库与请求体都收不了。"""
+    return _LONE_SURROGATE.sub("\ufffd", text)
+
+
+def _reason(value: object) -> str:
+    """跳过的原因（skipped 的键）：导出里的 role、content_type 等是文件给的字符串，只留 ASCII
+    的字母、数字与 _.:-，最多 40 个字符。"""
+    text = value if isinstance(value, str) and value else "unknown"
+    return re.sub(r"[^A-Za-z0-9_.:-]", "?", text)[:40]
+
+
+def _chatgpt_session(conv: Mapping[str, Any], n: int, skipped: Counter[str]) -> _ChatSession | None:
+    conversation_id = conv.get("conversation_id") or conv.get("id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        hint = (
+            " (it looks like a Claude export: use --from claude)" if "chat_messages" in conv else ""
+        )
+        raise ValueError(f"Malformed ChatGPT export: conversation {n} has no id{hint}")
+    what = f"conversation {conversation_id!r}"
+    mapping, node_id = conv.get("mapping"), conv.get("current_node")
+    if not isinstance(mapping, Mapping):
+        raise ValueError(f"Malformed ChatGPT export: {what} has no mapping")
+    if not isinstance(node_id, str) or node_id not in mapping:
+        raise ValueError(f"Malformed ChatGPT export: {what} has no current_node in its mapping")
+    # 当前这一支：从 current_node 沿 parent 走到根
+    path: list[tuple[str, Mapping[str, Any]]] = []
+    walked: set[str] = set()
+    while node_id is not None:
+        node = mapping.get(node_id) if isinstance(node_id, str) else None
+        if not isinstance(node, Mapping):
+            raise ValueError(f"Malformed ChatGPT export: {what} points at a missing node")
+        if node_id in walked:
+            raise ValueError(f"Malformed ChatGPT export: {what} has a cycle in its mapping")
+        walked.add(node_id)
+        path.append((node_id, node))
+        node_id = node.get("parent")
+    kept: list[tuple[str, str, str, datetime | None]] = []
+    for node_id, node in reversed(path):
+        message = node.get("message")
+        if message is None:  # 根
+            continue
+        if not isinstance(message, Mapping):
+            raise ValueError(f"Malformed ChatGPT export: {what} has a message that is no object")
+        author, content = message.get("author"), message.get("content")
+        if not isinstance(author, Mapping) or not isinstance(content, Mapping):
+            raise ValueError(
+                f"Malformed ChatGPT export: {what} has a message without author or content"
+            )
+        role, kind = author.get("role"), content.get("content_type")
+        if role not in ("user", "assistant"):
+            skipped[_reason(role)] += 1
+            continue
+        if kind not in ("text", "multimodal_text"):
+            skipped[_reason(kind)] += 1
+            continue
+        extra = message.get("metadata")
+        if isinstance(extra, Mapping) and extra.get("is_visually_hidden_from_conversation"):
+            skipped["hidden"] += 1
+            continue
+        if message.get("recipient") not in (None, "all"):
+            skipped["tool_call"] += 1
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            raise ValueError(f"Malformed ChatGPT export: {what} has a message without parts")
+        attached = sum(1 for part in parts if not isinstance(part, str))
+        if isinstance(extra, Mapping) and isinstance(extra.get("attachments"), list):
+            attached = max(attached, len(extra["attachments"]))
+        if attached:
+            skipped["attachments"] += attached
+        text = "\n".join(p for p in parts if isinstance(p, str) and p.strip())
+        if not text:
+            skipped["empty"] += 1
+            continue
+        message_id = message.get("id")
+        ts = _epoch(message.get("create_time"), what)
+        kept.append((role, text, message_id if isinstance(message_id, str) else node_id, ts))
+    started = _epoch(conv.get("create_time"), what)
+    updated = _epoch(conv.get("update_time"), what) or started
+    return _chat_session(
+        "chatgpt", conversation_id, conv.get("title"), started, updated, kept, what
+    )
+
+
+def _claude_session(conv: Mapping[str, Any], n: int, skipped: Counter[str]) -> _ChatSession | None:
+    conversation_id = conv.get("uuid")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        hint = " (it looks like a ChatGPT export: use --from chatgpt)" if "mapping" in conv else ""
+        raise ValueError(f"Malformed Claude export: conversation {n} has no uuid{hint}")
+    what = f"conversation {conversation_id!r}"
+    messages = conv.get("chat_messages")
+    if not isinstance(messages, list):
+        raise ValueError(f"Malformed Claude export: {what} has no chat_messages")
+    kept: list[tuple[str, str, str, datetime | None]] = []
+    for position, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise ValueError(f"Malformed Claude export: {what} has a message that is no object")
+        sender = message.get("sender")
+        if sender not in ("human", "assistant"):
+            skipped[_reason(sender)] += 1
+            continue
+        for key in ("attachments", "files"):
+            if isinstance(message.get(key), list) and message[key]:
+                skipped["attachments"] += len(message[key])
+        blocks = message.get("content")
+        if isinstance(blocks, list) and blocks:
+            texts = []
+            for block in blocks:
+                if not isinstance(block, Mapping):
+                    raise ValueError(
+                        f"Malformed Claude export: {what} has a content block that is no object"
+                    )
+                if block.get("type") != "text":
+                    skipped[_reason(block.get("type"))] += 1
+                elif isinstance(block.get("text"), str) and block["text"].strip():
+                    texts.append(block["text"])
+            text = "\n\n".join(texts)
+        else:  # 早先的导出只有消息级的 text
+            text = message["text"] if isinstance(message.get("text"), str) else ""
+        if not text.strip():
+            skipped["empty"] += 1
+            continue
+        message_id = message.get("uuid")
+        if not isinstance(message_id, str) or not message_id:
+            message_id = f"{conversation_id}:{position}"
+        role = "user" if sender == "human" else "assistant"
+        kept.append((role, text, message_id, _stamp(message.get("created_at"), what)))
+    started = _stamp(conv.get("created_at"), what)
+    updated = _stamp(conv.get("updated_at"), what) or started
+    return _chat_session("claude", conversation_id, conv.get("name"), started, updated, kept, what)
+
+
+def _epoch(value: object, what: str) -> datetime | None:
+    """ChatGPT 的时间（Unix 秒，小数）→ 本机时间；None 原样。别的 ValueError。"""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("not a number")
+        return naive_local(datetime.fromtimestamp(value, tz=UTC))
+    except (ValueError, OverflowError, OSError) as exc:
+        raise ValueError(
+            f"Malformed ChatGPT export: {what} has a bad time {value!r}: {exc}"
+        ) from exc
+
+
+def _stamp(value: object, what: str) -> datetime | None:
+    """Claude 的时间（ISO 8601，带时区）→ 本机时间；None 原样。别的 ValueError。"""
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, str):
+            raise ValueError("not a string")
+        return naive_local(datetime.fromisoformat(value))
+    except (ValueError, OverflowError, OSError) as exc:
+        raise ValueError(
+            f"Malformed Claude export: {what} has a bad time {value!r}: {exc}"
+        ) from exc
