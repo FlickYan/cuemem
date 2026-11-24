@@ -73,6 +73,7 @@ from cuemem.core.models import (
     TurnMeta,
 )
 from cuemem.core.timeutil import naive_local, normalize_expiry
+from cuemem.core.trace import record_event
 from cuemem.core.types import PeakPolicy, Router
 from cuemem.errors import ConcurrentWriteError, IdempotencyConflictError, SessionLimitError
 from cuemem.expiry import Sources as _Sources
@@ -876,13 +877,15 @@ class Memory:
         # 两次检索用同一个问题时间：改走 L1 时打包的是探针在这个时间打过分的候选
         when = moment if moment is not None else datetime.now()
         # 从检索到读出各句的 metadata 与画像一直持有读：改走 L1 时打包的是探针取到的记忆，两次检索
-        # 之间插进来的遗忘会让结果里留着已经删掉的事实与对话片段（见 MemorySystem.retrieve）
-        with self.system.reading(space):
+        # 之间插进来的遗忘会让结果里留着已经删掉的事实与对话片段（见 MemorySystem.retrieve）。
+        # 两次检索只写一条 retrieve trace（MemorySystem.retrieval_trace；以前各写一行）
+        with self.system.reading(space), self.system.retrieval_trace(space, query, mode):
             recall = self.system.retrieve(
                 space, query, question_time=when, mode=mode, router=router, lam=lam
             )
             raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
             if raised:  # 与 evidence.recall_listing 的 at_least_l1 相同：不把探针的检索再做一遍
+                record_event("raised", level="l1")  # 这条 trace 里有两次检索
                 recall = self.system.retrieve(
                     space,
                     query,

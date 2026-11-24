@@ -2260,6 +2260,20 @@ class MemorySystem:
             trace.attrs.update(answer=answer.answer, citations=answer.citations)
         return answer
 
+    def retrieval_trace(
+        self, space_id: str, question: str, mode: str
+    ) -> AbstractContextManager[object]:
+        """retrieve 自己的那条 trace（见 retrieve）：已经在某个 trace 里时什么也不做，否则开一条
+        retrieve（属性是空间、提问的原文与 mode：遗忘按它们找到这条 trace 与提问的查询向量）。
+
+        把 L0 改走 L1 的调用方（SDK 的 search、context_evidence、recall_listing）在 reading 里
+        用它包住两次 retrieve，一共只写一行（第十轮体检 Q22；以前两次各写一行，提问的原文存了
+        两遍，第二行的 mode 是 l1）。不要在调用方直接 start_trace：在别的 trace 里那样会多出一个
+        带着提问原文的 retrieve 阶段。"""
+        if current_trace() is not None:
+            return nullcontext()
+        return start_trace("retrieve", self.tracer, space=space_id, question=question, mode=mode)
+
     def retrieve(
         self,
         space_id: str,
@@ -2292,9 +2306,11 @@ class MemorySystem:
         不用 candidates、重新检索（R5 之前的做法，结果相同，只是多检索一遍）。
 
         不在 trace 里时（SDK 的 search、记忆代理、各框架集成与 MCP 的 recall）自己记一条
-        retrieve trace：提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
-        _remove_traces）。ask、Agent 与评测在自己的 trace 里调用，不另记，trace 与用量统计不变。
-        遗忘等进行中的检索写完 trace（reading）。
+        retrieve trace（retrieval_trace；把 L0 改走 L1 的调用方用它包住两次检索，只写一行）：
+        提问常常就是用户的原话，遗忘时按检索记录找到它、清掉它的查询向量（见
+        _remove_traces）。trace 里是提问的全文，没设 traces_retention_days 时一直留着。ask、Agent
+        与评测在自己的 trace 里调用，不另记，trace 与用量统计不变。遗忘等进行中的检索写完 trace
+        （reading）。
 
         hide_expired：不给出已经过期的记忆（SDK 的 expiration_date，见 expiry.py）。过期的事实、
         对话片段与图片作为 hidden 交给探针与各路检索，在检索里就排除，名额留给别的记忆（第七轮
@@ -2306,11 +2322,7 @@ class MemorySystem:
         画像原样不动，请求逐字节不变。返回的 Recall.expired 是这次算出的过期记忆；同一次 reading
         里带着 candidates 再检索一次时把它作为 expired 传回来，不再算一遍。
         """
-        tracing: AbstractContextManager[object] = (
-            nullcontext()
-            if current_trace() is not None
-            else start_trace("retrieve", self.tracer, space=space_id, question=question, mode=mode)
-        )
+        tracing = self.retrieval_trace(space_id, question, mode)
         if candidates is not None and not self._gate(space_id).held():
             candidates = None  # 在下面的 reading 里查就晚了：那时总是持有读
         with self.reading(space_id), tracing:

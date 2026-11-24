@@ -91,6 +91,7 @@ app = typer.Typer(
 console = Console()
 LOW_DISK = 200 * 2**20  # doctor 在数据目录剩余空间低于它时标黄
 CACHE_WARN = 2**30  # doctor：缓存与 trace 合计超过它、又没设 trace 保留天数时标黄
+TRACE_WARN = 100 * 2**20  # doctor：只是 trace 就超过它、又没设 trace 保留天数时也标黄
 JOB_LINES = 20  # doctor 最多列出这么多条巩固任务的提醒，其余只说还有几条
 
 
@@ -2818,24 +2819,41 @@ def _print_jobs(settings: Settings) -> None:
 
 
 def _print_cache_sizes(settings: Settings) -> None:
-    """LLM 缓存、向量缓存（各连同 -wal）与 trace 目录占了多少空间（第八轮体检）。trace 每个不同
-    的提问约 6-7 KB、一直留着：没设 CUEMEM_TRACES_RETENTION_DAYS 且合计超过 CACHE_WARN 时标黄。"""
+    """LLM 缓存、向量缓存（各连同 -wal）与 trace 目录占了多少空间，trace 最早是哪一天的
+    （第八轮体检；第十轮体检 Q22）。缓存里每个不同的提问约 6-7 KB；trace 每次不在别的 trace 里的
+    检索写一行、里面是提问的全文（记忆代理后面，trace 目录大约跟着用户消息的总量长），一直留着：
+    没设 CUEMEM_TRACES_RETENTION_DAYS，且合计超过 CACHE_WARN 或只是 trace 就超过 TRACE_WARN 时
+    标黄。"""
     paths = settings.paths
     files = [paths.llm_cache, paths.embed_cache]
     files += [path.with_name(path.name + "-wal") for path in files]
     caches = sum(_file_size(path) for path in files)
     traces = _tree_size(paths.traces)
+    oldest = _oldest_trace_day(paths.traces)
+    since = f"，最早 {oldest}" if oldest else ""
     line = (
         f"缓存 {caches / 2**20:,.0f} MB（{escape(str(paths.llm_cache.parent))}），"
-        f"trace {traces / 2**20:,.0f} MB（{escape(str(paths.traces))}）"
+        f"trace {traces / 2**20:,.0f} MB（{escape(str(paths.traces))}{since}）"
     )
-    if settings.traces_retention_days is None and caches + traces > CACHE_WARN:
+    large = caches + traces > CACHE_WARN or traces > TRACE_WARN
+    if settings.traces_retention_days is None and large:
         console.print(
             f"[yellow]{line}[/yellow]：trace 一直留着，设环境变量 "
             "[bold]CUEMEM_TRACES_RETENTION_DAYS[/bold]（天数）定期清掉旧的"
         )
     else:
         console.print(line)
+
+
+def _oldest_trace_day(root: Path) -> str | None:
+    """trace 目录里最早一天的文件的日期（文件名是 YYYYMMDD.jsonl），写成 YYYY-MM-DD；没有时
+    None。"""
+    try:
+        stems = [path.stem for path in root.glob("*.jsonl")]
+    except OSError:
+        return None
+    days = sorted(stem for stem in stems if len(stem) == 8 and stem.isdigit())
+    return f"{days[0][:4]}-{days[0][4:6]}-{days[0][6:]}" if days else None
 
 
 def _file_size(path: Path) -> int:

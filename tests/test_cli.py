@@ -498,6 +498,31 @@ def test_doctor_reports_cache_sizes(
     assert "缓存2MB" in flat and "CUEMEM_TRACES_RETENTION_DAYS" not in flat
 
 
+def test_doctor_flags_large_traces_and_shows_the_oldest_day(
+    isolated_paths: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第十轮体检 Q22：trace 里每次检索一行、是提问的全文，默认一直留着，以前 doctor 要缓存与
+    trace 合计超过 1 GiB 才提醒。现在总是写出最早一天的 trace 的日期，没设保留天数、只是 trace
+    就超过 100 MB 时也标黄。空目录不写日期、不出错。"""
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "trace0MB" in flat and "最早" not in flat
+    assert "CUEMEM_TRACES_RETENTION_DAYS" not in flat
+
+    traces = tmp_path / "traces"
+    traces.mkdir(exist_ok=True)
+    (traces / "20260102.jsonl").write_text("{}\n", "utf-8")
+    (traces / "notes.jsonl").write_text("{}\n", "utf-8")  # 不是按天的文件：不算日期
+    with (traces / "20251230.jsonl").open("wb") as sparse:  # 稀疏文件：不真的占 101 MB
+        sparse.truncate(101 * 2**20)
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "trace101MB" in flat and "最早2025-12-30" in flat
+    assert "CUEMEM_TRACES_RETENTION_DAYS" in flat
+
+    monkeypatch.setenv("CUEMEM_TRACES_RETENTION_DAYS", "30")
+    flat = _flat(runner.invoke(app, ["doctor"]).output)
+    assert "最早2025-12-30" in flat and "CUEMEM_TRACES_RETENTION_DAYS" not in flat
+
+
 @pytest.mark.filterwarnings(
     "ignore:Api key is used with an insecure connection", "ignore:Failed to obtain server version"
 )

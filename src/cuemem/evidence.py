@@ -24,6 +24,7 @@ from typing import Any
 
 from cuemem.core.models import Fact
 from cuemem.core.timeutil import naive_local
+from cuemem.core.trace import record_event
 from cuemem.memory import ForgetReport, MemorySystem, Recall, RecallMode
 from cuemem.read.controller import Router, english_reason
 from cuemem.read.reader import memory_blocks
@@ -112,7 +113,8 @@ def context_evidence(
 
     不改 recall_evidence 与 inject_evidence：记忆代理与各框架集成的请求逐字不变。"""
     now = naive_local(at) if at is not None else datetime.now()
-    with system.reading(space):
+    # 两次检索只写一条 retrieve trace（MemorySystem.retrieval_trace）
+    with system.reading(space), system.retrieval_trace(space, query, mode):
         recall = system.retrieve(
             space,
             query,
@@ -124,6 +126,7 @@ def context_evidence(
         )
         raised = mode == "auto" and min_level == "l1" and recall.level == "l0"
         if raised:
+            record_event("raised", level="l1")  # 这条 trace 里有两次检索：探针与改走的 L1
             recall = system.retrieve(
                 space,
                 query,
@@ -288,7 +291,8 @@ def recall_listing(
     已经删掉的记忆（见 MemorySystem.retrieve）。过期的记忆不给，画像里也去掉（hide_expired）。
     """
     when = naive_local(at) if at is not None else datetime.now()
-    with system.reading(space):
+    # 两次检索只写一条 retrieve trace（MemorySystem.retrieval_trace）
+    with system.reading(space), system.retrieval_trace(space, query, mode):
         recall = system.retrieve(
             space,
             query,
@@ -300,6 +304,7 @@ def recall_listing(
         )
         raised = at_least_l1 and recall.level == "l0"
         if raised:
+            record_event("raised", level="l1")  # 这条 trace 里有两次检索：探针与改走的 L1
             recall = system.retrieve(
                 space,
                 query,

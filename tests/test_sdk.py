@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
-from fakes import NO_BALANCE, FakeAPI
+from fakes import NO_BALANCE, FakeAPI, trace_lines
 from PIL import Image
 from scripted import ScriptedModel
 
@@ -29,7 +29,13 @@ from cuemem.config import PathsConfig, Settings
 from cuemem.embed import CachedEmbedder
 from cuemem.embed.base import EmbedKind
 from cuemem.errors import ConcurrentWriteError, EmbeddingAPIError, IdempotencyConflictError
-from cuemem.evidence import RAISED_REASON, format_profile, recall_listing, stored_text
+from cuemem.evidence import (
+    RAISED_REASON,
+    context_evidence,
+    format_profile,
+    recall_listing,
+    stored_text,
+)
 from cuemem.memory import _open_mark
 from cuemem.read.l1 import L1Config
 from cuemem.read.l2 import L2Config
@@ -2824,3 +2830,65 @@ def test_ids_have_a_length_limit(memory: Memory) -> None:
     # 只在写入时查 run_id：更长的照常能查、能结束、能删（什么都没有）
     assert memory.get_all(user_id=fits, run_id="r" * 300)["results"] == []
     assert memory.delete_all(user_id=fits, run_id="r" * 300)["message"].startswith("No such run")
+
+
+def test_a_raised_search_writes_one_trace_line(memory: Memory) -> None:
+    """第十轮体检 Q22：控制器选了 L0、调用方改走 L1 时检索两次（探针，再打包它的候选），以前
+    两次各写一条 retrieve trace：提问的全文存了两遍（第二行的 mode 是 l1）。现在 SDK 的
+    search、context 与 recall_listing（MCP 与各集成的 recall）都只写一行，属性照旧是空间、提问
+    的原文与调用方的 mode，所以遗忘照旧找得到它与提问的查询向量。"""
+    memory.add("I like green tea", user_id="u", wait=True)
+    memory.add("I like chess", user_id="u", wait=True)
+    system = memory.system
+    traces = system.settings.paths.traces
+    hello = "Hi there"
+
+    def new(after: int) -> list[dict[str, Any]]:
+        return trace_lines(traces, "retrieve")[after:]
+
+    seen = len(new(0))
+    assert memory.search(hello, user_id="u")["reasons"] == [RAISED_REASON]
+    assert context_evidence(system, "u", hello).reasons == [RAISED_REASON]
+    assert recall_listing(system, "u", hello, at_least_l1=True)["level"] == "L1"
+    raised = new(seen)
+    assert [line["attrs"] for line in raised] == [
+        {"space": "u", "question": hello, "mode": "auto"}
+    ] * 3
+    for line in raised:
+        assert [e["level"] for e in line["events"] if e["kind"] == "raised"] == ["l1"]
+
+    seen += 3  # 没有改走的检索：照旧一行，mode 是调用方给的
+    assert memory.search(hello, user_id="u", min_level="l0")["level"] == "L0"
+    assert memory.search("What do I like?", user_id="u", mode="l1")["level"] == "L1"
+    plain = new(seen)
+    assert [(line["attrs"]["question"], line["attrs"]["mode"]) for line in plain] == [
+        (hello, "auto"),
+        ("What do I like?", "l1"),
+    ]
+    assert not any(e["kind"] == "raised" for line in plain for e in line["events"])
+
+    # 遗忘照旧找得到：删除空间时这些行与提问的查询向量一起删掉
+    embedder = system.embedder
+    assert isinstance(embedder, CachedEmbedder) and embedder.cached([hello], "query")
+    memory.delete_all(user_id="u")
+    assert trace_lines(traces, "retrieve") == [] and not embedder.cached([hello], "query")
+
+
+def test_forget_removes_the_trace_of_a_raised_search(memory: Memory) -> None:
+    """改走 L1 的检索只写的那一行里照旧有它给出去的记忆的 ID 与提问的原文：遗忘那句话时这一行
+    与提问的查询向量一起删掉（第十轮体检 Q22）。"""
+    memory.add("Hello there, good morning to you!", user_id="u", wait=True)
+    memory.add("I like chess", user_id="u", wait=True)
+    system = memory.system
+    traces = system.settings.paths.traces
+    question = "Hello there, good morning to you!"  # 用户的原话又拿去检索（代理与 Agent 都这样）
+    found = memory.search(question, user_id="u")
+    assert found["results"] and found["reasons"] == [RAISED_REASON]
+    [line] = [t for t in trace_lines(traces, "retrieve") if t["attrs"]["question"] == question]
+    assert line["attrs"]["mode"] == "auto"
+    embedder = system.embedder
+    assert isinstance(embedder, CachedEmbedder) and embedder.cached([question], "query")
+    [turn] = [t for t in system.db.get_turns("u") if "good morning" in t.text]
+    system.forget("u", turn_ids=[turn.id])
+    left = "".join(p.read_text("utf-8") for p in traces.glob("*.jsonl"))
+    assert "good morning" not in left and not embedder.cached([question], "query")
