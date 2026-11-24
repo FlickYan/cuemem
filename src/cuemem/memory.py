@@ -9,7 +9,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -387,6 +387,27 @@ def vector_gaps(
     return gaps
 
 
+def import_batches(
+    pieces: Iterable[tuple[SessionIn, int]], max_turns: int = 256
+) -> list[list[tuple[SessionIn, int]]]:
+    """把要写入的几段（会话，第一句的序号）按顺序合成几批：一批里的发言加起来不超过 max_turns，
+    一段不拆开（比上限还长的一段自己一批）。OnlineWriter 每批向量化一次、写一次向量库。
+
+    第九轮体检：以前每段一批，导入 50 个各一句的会话就是 50 个向量请求（默认每个请求能带 10 段
+    文本），迁移几千条记忆时是几千个串行的请求。上限让一次写向量库的点数有界：全部合成一批时，
+    5,000 条记忆在 Qdrant 服务端是一个几十 MB 的请求。"""
+    batches: list[list[tuple[SessionIn, int]]] = []
+    size = 0
+    for piece in pieces:
+        turns = len(piece[0].turns)
+        if not batches or size + turns > max_turns:
+            batches.append([])
+            size = 0
+        batches[-1].append(piece)
+        size += turns
+    return batches
+
+
 class MemorySystem:
     def __init__(
         self,
@@ -400,6 +421,7 @@ class MemorySystem:
         tracer: TraceSink | None = None,
         owns_ledger: bool = True,
         owns_caches: bool = False,
+        split_truncated: bool = False,
         reranker: Reranker | None = None,
         media: MediaStore | None = None,
         image_embedder: ImageEmbedder | None = None,
@@ -430,6 +452,9 @@ class MemorySystem:
             settings.consolidation,
             open_sessions=self._held,
             holding_open=self._holding_held,
+            # 抽取的回复被截断时把窗口分小再抽（Extractor）。只有 from_settings 打开：评测直接
+            # 构造 MemorySystem，请求照旧
+            split_truncated=split_truncated,
         )
         self.retriever = NaiveRetriever(db, vectors, embedder)
         self.fact_retriever = FactAugmentedRetriever(db, vectors, embedder)
@@ -478,7 +503,13 @@ class MemorySystem:
 
         账本与两个缓存是 best_effort（第七轮体检）：磁盘满了、只读时少记一笔、少缓存一条，记一条
         警告，检索与回答照样返回（以前每个没见过的问题都抛出 database or disk is full，已经付费的
-        回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。"""
+        回复也丢了）。评测与脚本自己建缓存，默认严格：写不进去照样出错。
+
+        split_truncated 在这里打开（第九轮体检）：抽取的回复在输出上限处被截断时把窗口对半分开
+        再抽，不再把截断的 JSON 发回去要求改正。评测直接构造 MemorySystem，没有打开。
+
+        向量器是 parallel 的（第九轮体检）：一次调用要发几个向量请求时同时发，最多
+        embedding.max_concurrency 个在途。评测自己建向量器（build_embedder 默认不开）。"""
         private_dirs(*storage_dirs(settings))
         paths = settings.paths
         # 数据库、账本与两个缓存打不开时 DatabaseOpenError（一行说明哪个文件，见 opening），并且
@@ -491,7 +522,11 @@ class MemorySystem:
                 ledger = Ledger(paths.ledger, best_effort=True)
             opened.callback(ledger.close)
             embedder = build_embedder(
-                settings, ledger=ledger, http_client=http_client, cache_best_effort=True
+                settings,
+                ledger=ledger,
+                http_client=http_client,
+                cache_best_effort=True,
+                parallel=True,
             )
             if isinstance(embedder, CachedEmbedder):
                 opened.callback(embedder.cache.close)
@@ -529,6 +564,7 @@ class MemorySystem:
                 ledger=ledger,
                 tracer=TraceSink(paths.traces),
                 owns_caches=True,
+                split_truncated=True,
                 reranker=build_reranker(settings, llm=llm, ledger=ledger, http_client=http_client),
                 # 写入与遗忘在媒体库里留标记（见 store/media.py）：进程被杀时 recover_media
                 # 收拾原图。评测空间（ephemeral、on_disk）不写：它们的图片记录不在这个数据库里
@@ -662,18 +698,21 @@ class MemorySystem:
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
         log_only: Collection[str] = (),
     ) -> Iterator[IngestReport]:
-        """同 append，pieces 是若干段（会话，第一句的序号），每段各向量化一次（导入文件时每段
-        连续的发言一段，与以前逐段追加时的请求相同）。with 块里的写入（Agent 的溯源）与发言、
-        巩固任务在同一个事务里提交，块里出错时一起撤销（块里只做数据库的写入：事务持有数据库
-        的锁）。meta：（会话，发言序号）→ 附加信息，见 OnlineWriter.writing。log_only：只写日志、
-        不登记巩固任务的会话（导入文件里 "infer": false 的会话，同 SDK 的 add(infer=False)）。"""
+        """同 append，pieces 是若干段（会话，第一句的序号；导入文件时每段连续的发言一段）。
+        几段合成一批一起向量化、写向量（import_batches：每批最多 256 句发言），不再每段一个请求；
+        只有一段时（add、append、update、Agent）就是那一批，请求与以前相同。
+
+        with 块里的写入（Agent 的溯源）与发言、巩固任务在同一个事务里提交，块里出错时一起撤销
+        （块里只做数据库的写入：事务持有数据库的锁）。meta：（会话，发言序号）→ 附加信息，见
+        OnlineWriter.writing。log_only：只写日志、不登记巩固任务的会话（导入文件里
+        "infer": false 的会话，同 SDK 的 add(infer=False)）。"""
         sessions = list(dict.fromkeys(s.session_id for s, _ in pieces))
         names = {"session": sessions[0]} if len(sessions) == 1 else {"sessions": sessions}
         skip = self.open_sessions(space_id)  # 在事务之外取：open_session 持有它的锁时写数据库
         queued = 0
         with (
             start_trace("append", self.tracer, space=space_id, **names),
-            self.writer.writing(space_id, [[piece] for piece in pieces], meta) as report,
+            self.writer.writing(space_id, import_batches(pieces), meta, first_wins=True) as report,
         ):
             if enqueue:
                 queued = self.consolidator.enqueue(space_id, sessions, skip=skip | set(log_only))

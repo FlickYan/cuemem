@@ -7,22 +7,33 @@ import contextlib
 import io
 import json
 import logging
+import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import httpx2
 import numpy as np
 import pytest
-from fakes import RATE_LIMIT, REJECT, TIMEOUT, FakeAPI, QdrantDown
+from fakes import (
+    RATE_LIMIT,
+    REJECT,
+    SERVER_ERROR,
+    TIMEOUT,
+    FakeAPI,
+    QdrantDown,
+    chat_completion_body,
+)
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.responses import Response as OpenAIResponse
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel
 from scripted import ScriptedModel
 from test_sdk import where_i_live
 from test_store import small_open_file_limit
@@ -32,14 +43,24 @@ from cuemem.api import proxy as proxy_module
 from cuemem.api.proxy import (
     MemoryProxy,
     ProxyError,
+    _answer_text,
     _chat_to_response,
     _responses_to_chat,
+    _usage,
     create_proxy_app,
 )
 from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.core.models import SessionIn, TurnIn
 from cuemem.embed import CachedEmbedder
-from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    ContentFilteredError,
+    EmbeddingAPIError,
+    VectorStoreFullError,
+)
+from cuemem.evidence import recall_evidence
+from cuemem.llm.ledger import chat_cost
+from cuemem.llm.types import Usage
 from cuemem.memory import MemorySystem
 from cuemem.sdk import space_for
 from cuemem.store.vector import reserved_files
@@ -442,23 +463,120 @@ def test_a_stopped_stream_keeps_only_the_user_message(system: MemorySystem) -> N
     assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
 
 
+def _delta(index: int, content: Any) -> bytes:
+    chunk = {"choices": [{"index": index, "delta": {"content": content}}]}
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+def test_a_stream_with_several_choices_stores_the_first(system: MemorySystem) -> None:
+    """第九轮体检 P5：n > 1 的流式回答，每一块只带一个回答、各有各的 index。写进记忆的只有第一个
+    （index 0），与非流式相同；转给调用方的字节不变。以前不看 index，两个回答的片段交错着拼成
+    "BerParlinis" 写进了记忆。"""
+    usage = b'data: {"choices": [], "usage": {"total_tokens": 9}}\n\n'
+    raw = b"".join([_delta(0, "Ber"), _delta(1, "Par"), _delta(0, "lin"), _delta(1, "is"), usage])
+    answer = Answer([], last=raw + b"data: [DONE]\n\n")
+    status, chunks, _ = streaming(system, answer).stream({**ASK_PIN, "n": 2}, {})
+    assert status == 200 and b"".join(chunks) == raw + b"data: [DONE]\n\n"
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Berlin"),
+    ]
+
+
+def test_a_stream_with_content_parts_is_written_back(system: MemorySystem) -> None:
+    """第九轮体检 P5：有的上游流式的 delta.content 是内容块的列表（思考与文字）。只写文字，照
+    原样连起来。以前流读完、收尾时 TypeError：调用方拿到了完整的回答，记忆里连用户的话都没写。"""
+    raw = b"".join(
+        [
+            _delta(0, [{"type": "thinking", "thinking": "The user asks for a PIN."}]),
+            _delta(0, [{"type": "text", "text": "Your PIN"}, "junk", {"type": "text"}]),
+            _delta(0, " is 1234."),
+            _delta(0, None),
+        ]
+    )
+    answer = Answer([], last=raw + b"data: [DONE]\n\n")
+    _, chunks, _ = streaming(system, answer).stream(ASK_PIN, {})
+    assert b"".join(chunks) == raw + b"data: [DONE]\n\n"
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Your PIN is 1234."),
+    ]
+
+
+PARTS = [
+    {"type": "thinking", "thinking": [{"type": "text", "text": "France. Its capital."}]},
+    {"type": "text", "text": "Paris"},
+]
+
+
+def answering(system: MemorySystem, body: dict[str, Any]) -> MemoryProxy:
+    """上游的非流式回答就是 body 的代理。"""
+    transport = httpx2.MockTransport(lambda _: httpx2.Response(200, json=body))
+    return MemoryProxy(system, http_client=httpx2.Client(transport=transport))
+
+
+def test_an_answer_made_of_content_parts_is_written_back(system: MemorySystem) -> None:
+    """第九轮体检 P5：非流式回答的 content 是内容块的列表：响应原样返回，写进记忆的是其中的文字
+    （思考的块不写）。以前写回时 AttributeError：上游已经回答了 200，调用方拿到的是 500，用户的
+    话也没写。/v1/responses 走同一条路，output_text 是文字。"""
+    message = {"role": "assistant", "content": PARTS}
+    body = {
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    }
+    proxy = answering(system, body)
+    ask = {**ASK_PIN, "stream": False}
+    status, data, _ = proxy.complete(ask, {"x-cuemem-session": "s1"})
+    assert status == 200 and data == body
+    assert [(t.role, t.text) for t in system.db.get_turns("alice", "s1")] == [
+        ("user", "What is my PIN?"),
+        ("assistant", "Paris"),
+    ]
+
+    request = {"model": "qwen3.8-flash", "input": "Capital of France?", "user": "alice"}
+    status, data, _ = proxy.respond(request, {"x-cuemem-session": "s2"})
+    assert status == 200
+    assert OpenAIResponse.model_validate(data).output_text == "Paris"
+    assert [t.text for t in system.db.get_turns("alice", "s2")] == ["Capital of France?", "Paris"]
+
+
+@pytest.mark.parametrize("body", [{"choices": ["x"]}, {"choices": [{"message": "x"}]}, {}])
+def test_an_answer_of_an_unknown_shape_keeps_the_user_message(
+    system: MemorySystem, body: dict[str, Any]
+) -> None:
+    """上游的 200 不是 Chat Completions 的形状：原样返回，只写用户的话（以前前两种 500）。"""
+    status, data, _ = answering(system, body).complete({**ASK_PIN, "stream": False}, {})
+    assert status == 200 and data == body
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+
+
+def test_answer_text() -> None:
+    assert _answer_text("Paris ") == "Paris "
+    assert _answer_text(PARTS) == "Paris"
+    parts = [{"type": "text", "text": "a"}, "b", None, {"type": "text", "text": 3}, {"text": "c"}]
+    assert _answer_text([*parts, {"type": "text", "text": "d"}]) == "ad"
+    assert [_answer_text(x) for x in (None, 7, {"type": "text", "text": "a"}, [])] == [""] * 4
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 def test_client_disconnect_closes_the_relay_at_once(
-    system: MemorySystem, spec_version: str
+    system: MemorySystem, spec_version: str, path: str
 ) -> None:
     """客户端中途断开：路由立即关掉转发，上游的连接马上释放，用户的话按顺序写回。以前
     Starlette 不关同步迭代器，要等垃圾回收才收尾（写回排到下一轮之后，还可能在同一线程上
     等自己持有的会话锁）。2.4 起服务器在 send 时报 OSError，更早的版本由 receive 告知断开。"""
     answer = Answer(["Your PIN is"], endless=True)
-    app_ = create_proxy_app(streaming(system, answer))
+    relayed = streaming(system, answer)
+    app_ = create_proxy_app(relayed)
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": spec_version},
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/v1/chat/completions",
-        "raw_path": b"/v1/chat/completions",
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
         "headers": [(b"content-type", b"application/json")],
@@ -466,6 +584,8 @@ def test_client_disconnect_closes_the_relay_at_once(
         "server": ("127.0.0.1", 8787),
     }
     bodies = 0
+    asked = {**ASK_PIN, "input": "What is my PIN?"}  # /v1/responses 的流式（第九轮体检 P12）
+    del asked["messages" if path == "/v1/responses" else "input"]
 
     async def main() -> None:
         gone = anyio.Event()
@@ -475,7 +595,7 @@ def test_client_disconnect_closes_the_relay_at_once(
             nonlocal received
             if not received:
                 received = True
-                return {"type": "http.request", "body": json.dumps(ASK_PIN).encode()}
+                return {"type": "http.request", "body": json.dumps(asked).encode()}
             await gone.wait()
             return {"type": "http.disconnect"}
 
@@ -483,7 +603,7 @@ def test_client_disconnect_closes_the_relay_at_once(
             nonlocal bodies
             if message["type"] == "http.response.body":
                 bodies += 1
-                if bodies >= 3:
+                if bodies >= 6:  # /v1/responses 开头的四个事件之后才是回答
                     gone.set()
                     if spec_version == "2.4":
                         raise OSError("client went away")
@@ -492,9 +612,10 @@ def test_client_disconnect_closes_the_relay_at_once(
             await app_(scope, receive, send)
 
     anyio.run(main)
-    assert bodies >= 3
+    assert bodies >= 6
     assert answer.closed  # 不等垃圾回收
     assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+    assert relayed._runs[("alice", None)].busy == 0  # 这次请求算答完了（第九轮体检 P8）
 
 
 def test_model_mapping_and_agent_scope(
@@ -551,6 +672,82 @@ def test_a_new_user_near_the_open_file_limit_gets_503_before_forwarding(
         row["space_id"] for row in system.db.list_spaces()
     }
     assert chat(client, "Recommend a coat", user="alice").status_code == 200
+
+
+def at_the_open_file_limit(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> None:
+    """软上限正好够已有的集合：再建一个就 VectorStoreFullError（reserved_files 在软上限小时最多
+    留一半）。"""
+    collections = len(system.vectors._client.get_collections().collections)
+    soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections)
+    small_open_file_limit(monkeypatch, soft)
+
+
+def photo(text: str) -> list[dict[str, Any]]:
+    return [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": red_png_url()}},
+    ]
+
+
+def test_a_first_photo_near_the_open_file_limit_gets_503_before_forwarding(
+    client: TestClient, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P3：已有的空间的第一张图片要另建一个图片集合。本地向量库没有余量时在转发之前
+    回 503（与新的空间相同），话没发给模型、什么都没写，这个会话之后的文字照常写。以前只查文字
+    集合：照常转发、回答，写回时才失败，并且留着重试，这个会话之后的写回都排在它后面，会话结束
+    时一起丢掉。网络图片不存，不受影响。"""
+    session = {"X-CueMem-Session": "s1"}
+    assert chat(client, "I live in Berlin", user="alice", headers=session).status_code == 200
+    at_the_open_file_limit(system, monkeypatch)
+    sent = len(upstream.proxied)
+    full = chat(client, photo("Look at my cat"), user="alice", headers=session)
+    assert full.status_code == 503, full.text
+    error = full.json()["error"]
+    assert (error["type"], error["code"]) == ("server_error", "capacity")
+    assert full.headers["x-should-retry"] == "false"
+    assert len(upstream.proxied) == sent
+    assert len(system.db.get_turns("alice")) == 2 and system.db.get_media("alice") == []
+
+    remote = [
+        {"type": "text", "text": "And this one"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+    ]
+    assert chat(client, remote, user="alice", headers=session).status_code == 200
+    for i in range(3):
+        assert chat(client, f"note {i}", user="alice", headers=session).status_code == 200
+    users = [t.text for t in system.db.get_turns("alice", "s1") if t.role == "user"]
+    assert users == ["I live in Berlin", "And this one", "note 0", "note 1", "note 2"]
+
+
+def test_a_write_back_without_room_for_its_photo_is_dropped_alone(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """第九轮体检 P3：写回时才发现没有余量建图片集合（转发之前还有，或者没查出来）：只丢这一次
+    写回、警告一次，这个会话之后的照常写。以前 VectorStoreFullError 算作值得重试：它一直排在最
+    前面，每次写回都先重试它（连同图片向量），会话结束时 4 次写回的 8 条消息一起丢掉。"""
+    session = {"X-CueMem-Session": "s1"}
+    assert chat(client, "I live in Berlin", user="alice", headers=session).status_code == 200
+    at_the_open_file_limit(system, monkeypatch)
+    monkeypatch.setattr(system.vectors, "check_room", lambda space, **_: None)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        full = chat(client, photo("Look at my cat"), user="alice", headers=session)
+        assert full.status_code == 200
+        assert proxy._runs[("alice", "s1")].unsaved == []
+        for i in range(3):
+            assert chat(client, f"note {i}", user="alice", headers=session).status_code == 200
+        users = [t.text for t in system.db.get_turns("alice", "s1") if t.role == "user"]
+        assert users == ["I live in Berlin", "note 0", "note 1", "note 2"]
+        proxy.close_all()
+    assert len(system.db.get_turns("alice", "s1")) == 8 and system.db.get_media("alice") == []
+    dropped = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+    assert len(dropped) == 1
+    assert "could not store 2 message(s) of proxy session s1" in dropped[0]
+    assert "VectorStoreFullError" in dropped[0]
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -1009,6 +1206,244 @@ def test_a_parked_session_survives_a_429(
     )
 
 
+def ask(text: str, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    messages = [SYSTEM, *(history or []), {"role": "user", "content": text}]
+    return {"model": "qwen3.8-flash", "user": "alice", "messages": messages}
+
+
+def while_waiting(
+    upstream: Upstream, monkeypatch: pytest.MonkeyPatch, meanwhile: Callable[[], None]
+) -> None:
+    """代理转发来的第一个请求在等上游回答的时候做 meanwhile（一次）。"""
+    answer, done = Upstream.__call__, False
+
+    def reply(self: Upstream, body: dict[str, Any]) -> str | dict[str, Any]:
+        nonlocal done
+        out = answer(self, body)
+        if body["messages"][0].get("content") == SYSTEM["content"] and not done:
+            done = True
+            meanwhile()
+        return out
+
+    monkeypatch.setattr(Upstream, "__call__", reply)
+
+
+S1, S2, S3 = ({"x-cuemem-session": sid} for sid in ("s1", "s2", "s3"))
+
+
+def test_a_session_waiting_for_its_answer_is_not_parked(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第九轮体检 P8：到了 max_open_runs 时不停放还有请求在等上游回答的会话，即使它最久没有请求
+    （会话的锁只在写回时持有，以前等回答的时候看起来是空闲的）。以前 s1 被停放，它的写回之后写
+    不进去（向量接口故障）时留在一个谁也找不到的 Run 上：故障过后 s1 只有后一轮，前一轮不声不响
+    地丢了。"""
+    proxy.max_open_runs = 2
+    outage = Outage(system, monkeypatch)
+    outage.status = None
+    seen: list[int] = []
+
+    def meanwhile() -> None:
+        seen.append(proxy._runs[("alice", "s1")].busy)
+        clock.now = 1.0
+        assert proxy.complete(ask("another thread"), S2)[0] == 200
+        clock.now = 2.0
+        assert proxy.complete(ask("a third thread"), S3)[0] == 200
+        outage.status = 503  # s1 的回答回来之前向量接口开始出错
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    assert seen == [1]
+    assert list(proxy._parked) == [("alice", "s2")]  # 停放的是答完了的 s2，不是在等回答的 s1
+    run = proxy._runs[("alice", "s1")]
+    assert run.busy == 0 and len(run.unsaved) == 1  # 写回留在找得到的 Run 上
+    assert system.db.get_turns("alice", "s1") == []
+
+    outage.status = None
+    clock.now = 3.0
+    history = [
+        {"role": "user", "content": "I live in Berlin"},
+        {"role": "assistant", "content": "Happy to help, Alice!"},
+    ]
+    assert proxy.complete(ask("next", history), S1)[0] == 200
+    proxy.close_all()
+    assert [t.text for t in system.db.get_turns("alice", "s1")] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+        "next",
+        "Happy to help, Alice!",
+    ]
+
+
+def test_sessions_all_waiting_for_answers_refuse_a_new_one(
+    proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P8：名额里的会话都有请求还没答完时，新的会话 429（原有的那个），不停放它们。
+    以前 s2 照常开了、s1 被停放。"""
+    proxy.max_open_runs = 1
+    refused: list[ProxyError] = []
+
+    def meanwhile() -> None:
+        with pytest.raises(ProxyError) as caught:
+            proxy.complete(ask("another thread"), S2)
+        refused.append(caught.value)
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    assert [e.status for e in refused] == [429] and refused[0].headers == {"Retry-After": "60"}
+    assert list(proxy._runs) == [("alice", "s1")] and not proxy._parked
+    assert len(upstream.proxied) == 1  # s2 没有转发
+    assert [t.text for t in system.db.get_turns("alice", "s1")] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+    ]
+    assert proxy.complete(ask("another thread"), S2)[0] == 200  # s1 答完了：可以停放
+    assert list(proxy._parked) == [("alice", "s1")]
+
+
+def test_requests_in_flight_are_counted_down(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第九轮体检 P8：会话的 busy 在请求进行中是 1，每一种结束方式之后回到 0（漏减的会话到了上限
+    再也停放不了，这个用户只剩 429）：回答、上游出错、连不上，流读完、流里出错、流中途断开、
+    中途关掉、还没读就关掉、上游一开始就出错，想起与注入时抛了异常。"""
+    seen: list[int] = []
+    while_waiting(upstream, monkeypatch, lambda: seen.append(proxy._runs[("alice", "s1")].busy))
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    run = proxy._runs[("alice", "s1")]
+    assert seen == [1] and run.busy == 0
+
+    for reply, status in ((SERVER_ERROR, 500), (TIMEOUT, 504)):
+        upstream.reply = reply
+        assert proxy.complete(ask("hi"), S1)[0] == status
+        assert run.busy == 0
+        code, chunks, _ = proxy.stream({**ask("hi"), "stream": True}, S1)
+        assert code == status and run.busy == 0
+        list(chunks)
+        assert run.busy == 0
+    upstream.reply = "Happy to help, Alice!"
+
+    code, chunks, _ = proxy.stream({**ask("I like jazz"), "stream": True}, S1)
+    assert code == 200 and run.busy == 1  # 流还没读完
+    list(chunks)
+    assert run.busy == 0
+    assert isinstance(chunks, proxy_module._Relay)
+    chunks.close()  # 结束之后再关：不再减
+    assert run.busy == 0
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("database is locked")
+
+    with monkeypatch.context() as patch:  # 开了会话之后、转发之前抛异常
+        patch.setattr(system.db, "has_sessions", broken)
+        with pytest.raises(RuntimeError):
+            proxy.complete(ask("hi"), S1)
+        assert run.busy == 0
+        with pytest.raises(RuntimeError):
+            proxy.stream({**ask("hi"), "stream": True}, S1)
+        assert run.busy == 0
+    with monkeypatch.context() as patch:
+        found = SimpleNamespace(level="L1", reasons=[], recalled=1, block="<memory>x</memory>")
+        patch.setattr(proxy_module, "recall_evidence", lambda *args, **kwargs: found)
+        patch.setattr(proxy_module, "inject_evidence", broken)
+        with pytest.raises(RuntimeError):
+            proxy.complete(ask("Where do I live?"), S1)
+        assert run.busy == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(proxy_module, "_headers", broken)
+        with pytest.raises(RuntimeError):
+            proxy.stream({**ask("hi"), "stream": True}, S1)
+        assert run.busy == 0
+
+    error = {"error": {"message": "overloaded", "type": "server_error"}}
+    endings = [  # 上游的回答，与调用方读几块（None：读到完）
+        (Answer(["Your PIN is"], last=f"data: {json.dumps(error)}\n\n".encode()), None),
+        (Answer(["Your PIN is"], error=httpx2.ReadError("reset")), None),
+        (Answer(["Your PIN is"], endless=True), 3),
+        (Answer(["Your PIN is"], endless=True), 0),  # 还没读就关掉
+    ]
+    for answer, read in endings:
+        relayed = streaming(system, answer)
+        code, chunks, _ = relayed.stream(ASK_PIN, {})
+        [waiting] = relayed._runs.values()
+        assert code == 200 and waiting.busy == 1 and isinstance(chunks, proxy_module._Relay)
+        with contextlib.suppress(httpx2.ReadError):
+            for _ in chunks if read is None else range(read):
+                next(chunks, None)
+        if read is not None:
+            assert waiting.busy == 1
+            chunks.close()
+        assert waiting.busy == 0 and answer.closed
+        relayed.close_all()
+
+
+def test_a_session_is_idle_from_the_end_of_its_answer(
+    proxy: MemoryProxy, upstream: Upstream, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P8：会话最后一次请求的时间在回答结束时再记一次：空闲从回答结束算起。以前
+    只在请求开始时记：刚答完一个长回答的会话是“最久没有请求的”，最先被停放、最先因闲置结束。"""
+
+    def meanwhile() -> None:
+        clock.now = 50.0
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    assert proxy.complete(ask("I live in Berlin"), S1)[0] == 200
+    assert proxy._runs[("alice", "s1")].last_seen == 50.0
+
+    code, chunks, _ = proxy.stream({**ask("I like jazz"), "stream": True}, S2)
+    clock.now = 70.0
+    list(chunks)
+    assert code == 200 and proxy._runs[("alice", "s2")].last_seen == 70.0
+
+
+def test_a_write_back_after_its_session_ended_is_not_dropped_silently(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """第九轮体检 P8：会话在等上游的时候结束了（没带会话头的调用方并行开始了新的一段；闲置、
+    close_all 同样），它的写回之后才到：照常写一次，写不进去时不再留着（已经没有人会再写这个
+    Run），丢掉并警告、记 proxy_write_failed kept=False。以前留在结束了的 Run 上：没有警告，
+    这一轮不声不响地丢了。写得进去时照常写。"""
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "cuemem.api.proxy.record_event", lambda kind, **data: events.append((kind, data))
+    )
+    outage = Outage(system, monkeypatch)
+    outage.status = None
+
+    def meanwhile() -> None:
+        assert proxy.complete(ask("another conversation"), {})[0] == 200  # 新的一段：结束上一段
+        outage.status = 503
+
+    while_waiting(upstream, monkeypatch, meanwhile)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        status, _, headers = proxy.complete(ask("I live in Berlin"), {})
+    session = headers["X-CueMem-Session"]
+    assert status == 200 and proxy._runs[("alice", None)].session_id != session
+    assert system.db.get_turns("alice", session) == []
+    failed = [data for kind, data in events if kind == "proxy_write_failed"]
+    assert [(d["space"], d["kept"]) for d in failed] == [("alice", False)]
+    warned = [r.getMessage() for r in caplog.records]
+    assert len(warned) == 1
+    assert f"could not store 2 message(s) of proxy session {session} and dropped" in warned[0]
+
+    outage.status = None  # 写得进去时：结束之后才到的写回照常写
+    while_waiting(upstream, monkeypatch, proxy.close_all)
+    status, _, headers = proxy.complete(ask("I like tea"), {})
+    late = system.db.get_turns("alice", headers["X-CueMem-Session"])
+    assert status == 200 and [t.text for t in late] == ["I like tea", "Happy to help, Alice!"]
+
+
 # 在线写入出错之后：过一会儿原样再写一次有没有可能写进去（记忆代理与 Agents 的会话据此留着或丢掉）
 WORTH_RETRYING: list[tuple[BaseException, bool]] = [
     (EmbeddingAPIError("no balance", status=402), True),
@@ -1024,6 +1459,7 @@ WORTH_RETRYING: list[tuple[BaseException, bool]] = [
     (TypeError("bad message"), False),
     (KeyError("k"), False),
     (OSError("qdrant down"), True),
+    (VectorStoreFullError("full"), False),  # 要运营者处理：留着它后面的写回都排在它后面
 ]
 
 
@@ -1095,6 +1531,288 @@ def test_tool_follow_ups_only_store_the_answer(
     assert [(t.role, t.text) for t in system.db.get_turns("alice", "t1")] == [
         ("assistant", "Happy to help, Alice!")
     ]
+
+
+# ---------- 工具调用的后续请求：这一轮的证据块再放进去（第九轮体检 P1） ----------
+
+ASK = "Where do I live? Find a coat shop nearby"
+TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "find", "parameters": {"type": "object", "properties": {}}},
+    }
+]
+TOOL_CALL = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "find", "arguments": "{}"}}
+    ],
+}
+TOOL_RESULT = {"role": "tool", "tool_call_id": "c1", "content": "P01"}
+CALLS_FIND = {"content": None, "tool_calls": [{"id": "c1", "name": "find", "arguments": "{}"}]}
+
+
+def berlin_is_remembered(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, clock: Clock
+) -> None:
+    """之前的一个会话里说过住在柏林，会话已经结束、抽取完。"""
+    chat(client, "I live in Berlin", user="alice")
+    clock.now += 31 * 60
+    proxy.close_idle()
+    assert system.worker is not None
+    system.worker.wait()
+
+
+def follow_up(client: TestClient, text: str = ASK, *more: dict[str, Any], **extra: Any) -> Any:
+    """工具调用的后续请求：调用方重发用户的原话（不带证据块）、工具调用与工具的结果。"""
+    headers = extra.pop("headers", {})
+    messages = [SYSTEM, {"role": "user", "content": text}, TOOL_CALL, TOOL_RESULT, *more]
+    body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice", "tools": TOOLS}
+    return client.post("/v1/chat/completions", json={**body, **extra}, headers=headers)
+
+
+def count_retrievals(system: MemorySystem, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """记下之后每一次检索的问题。"""
+    queries: list[str] = []
+    retrieve = system.retrieve
+
+    def counted(space: str, query: str, *args: Any, **kwargs: Any) -> Any:
+        queries.append(query)
+        return retrieve(space, query, *args, **kwargs)
+
+    monkeypatch.setattr(system, "retrieve", counted)
+    return queries
+
+
+def has_memory(message: dict[str, Any]) -> bool:
+    return "<memory>" in json.dumps(message)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_tool_follow_ups_carry_the_memory_block_of_the_turn(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Chat Completions 没有状态：模型要调用工具时，调用方的下一个请求重发用户的原话，不带第一次
+    注入的证据块。以前不以用户消息结尾的请求不想起（X-CueMem-Level none）：最后的回答是没有
+    记忆写出来的，转发的请求从用户消息起就与第一次不同（供应商的前缀缓存用不上）。现在这一轮
+    的证据块原样再放进同一句用户消息，不再检索；一轮里的每个后续请求都一样。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    queries = count_retrievals(system, monkeypatch)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS, stream=stream)
+    assert first.status_code == 200 and first.headers["x-cuemem-level"] == "L1"
+    asked = upstream.proxied[-1]["messages"]
+    assert asked[-1]["content"].startswith("<memory>\n") and "Berlin" in asked[-1]["content"]
+    assert asked[-1]["content"].endswith("</memory>\n\n" + ASK)
+    assert queries == [ASK]
+
+    upstream.reply = "final"
+    for more in ([], [TOOL_CALL, TOOL_RESULT]):  # 第二个后续请求：又调用了一次工具
+        second = follow_up(client, ASK, *more, stream=stream)
+        assert second.status_code == 200
+        sent = upstream.proxied[-1]["messages"]
+        assert sent[:2] == asked  # 到用户消息为止与第一次逐字节相同
+        assert sent[2:] == [TOOL_CALL, TOOL_RESULT, *more]  # 之后的消息原样
+        for name in ("level", "recalled", "reasons", "session"):
+            assert second.headers[f"x-cuemem-{name}"] == first.headers[f"x-cuemem-{name}"]
+    assert queries == [ASK]  # 没有再检索
+    # 写回照旧：用户的话只写一次，后续请求只写回答
+    turns = system.db.get_turns("alice", first.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [
+        ("user", ASK),
+        ("assistant", "final"),
+        ("assistant", "final"),
+    ]
+
+
+def test_requests_ending_in_a_user_message_are_forwarded_as_before(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """以用户消息结尾的请求不变：想起的证据块放在最后一句用户消息前面（文字或内容块），别的
+    消息与参数逐字节原样；上一轮的用户消息里不放证据块，留着的那份（见 Kept）也不用在这里。"""
+    berlin_is_remembered(client, proxy, system, clock)
+
+    def note(query: str, earlier: list[dict[str, Any]], session: str = "") -> str:
+        exclude = proxy._in_context("alice", session, earlier)
+        block = recall_evidence(system, "alice", query, mode="l1", exclude=exclude).block
+        assert "The user lives in Berlin." in block
+        return f"<memory>\n{block}\n</memory>\n\n"
+
+    expected = note("Where do I live?", [])
+    first = chat(client, "Where do I live?", user="alice", tools=TOOLS, temperature=0.2)
+    sent = upstream.proxied[-1]
+    assert sent["messages"] == [SYSTEM, {"role": "user", "content": expected + "Where do I live?"}]
+    assert {k: v for k, v in sent.items() if k != "messages"} == {
+        "model": "qwen3.8-flash",
+        "tools": TOOLS,
+        "temperature": 0.2,
+        "enable_thinking": False,
+    }
+
+    blocks = [{"type": "text", "text": "Which coat shops are near me?"}]
+    history = [{"role": "user", "content": "Where do I live?"}, TOOL_CALL, TOOL_RESULT]
+    history.append({"role": "assistant", "content": "In Berlin."})
+    expected = note("Which coat shops are near me?", history, first.headers["x-cuemem-session"])
+    chat(client, blocks, history, user="alice")
+    assert upstream.proxied[-1]["messages"] == [
+        SYSTEM,
+        *history,  # 之前的消息（含上一轮的用户消息）不动
+        {"role": "user", "content": [{"type": "text", "text": expected}, *blocks]},
+    ]
+
+
+def test_a_tool_follow_up_after_a_forget_recalls_again(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第一个请求与后续请求之间删了注入的那条记忆：留着的证据块不再用（里面有刚删的内容），
+    对那句用户消息重新想起。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS)
+    assert "Berlin" in json.dumps(upstream.proxied[-1]["messages"])
+    [fact] = [f for f in system.facts("alice") if "Berlin" in f.statement]
+    Memory.from_system(system).delete(fact.id)
+    queries = count_retrievals(system, monkeypatch)
+    upstream.reply = "final"
+    second = follow_up(client)
+    assert second.status_code == 200
+    assert second.headers["x-cuemem-session"] == first.headers["x-cuemem-session"]
+    assert queries == [ASK]
+    assert "Berlin" not in json.dumps(upstream.proxied[-1])
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_follow_up_answer_built_on_memory_forgotten_meanwhile_is_not_written_back(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    fake_api: FakeAPI,
+    stream: bool,
+) -> None:
+    """后续请求等上游回答的时候删了再用的那条记忆：回答是照它写的，不写回（与以用户消息结尾的
+    请求相同，见 test_an_answer_built_on_memory_forgotten_meanwhile_is_not_written_back）。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS)
+    [fact] = [f for f in system.facts("alice") if "Berlin" in f.statement]
+    memory = Memory.from_system(system)
+    injected: list[bool] = []
+
+    def reply(body: dict[str, Any]) -> str | dict[str, Any]:
+        if body["messages"][0].get("content") != SYSTEM["content"]:
+            return upstream.model(body)
+        injected.append("lives in Berlin" in json.dumps(body["messages"]))
+        forget = threading.Thread(target=memory.delete, args=(fact.id,))  # 另一个调用方
+        forget.start()
+        forget.join()
+        return "You live in Berlin: shop P01 is nearby."
+
+    fake_api.chat_replies = [reply]
+    second = follow_up(client, stream=stream)
+    assert second.status_code == 200 and "Berlin" in second.text  # 调用方照样拿到回答
+    assert injected == [True]
+    turns = system.db.get_turns("alice", first.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [("user", ASK)]
+
+
+@pytest.mark.parametrize("lost", ["restart", "edited"])
+def test_a_tool_follow_up_without_a_kept_block_recalls_for_the_user_message(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    fake_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    lost: str,
+) -> None:
+    """没有留着的证据块（代理重启过），或者调用方重发的用户消息不是注入的那一句：对请求里最后
+    一句用户消息重新想起一次，这一轮之后的后续请求再用它。已经写进记忆的这句话不会被当成
+    记忆引回来。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    session = {"X-CueMem-Session": "t1"}
+    upstream.reply = CALLS_FIND
+    first = chat(client, ASK, user="alice", tools=TOOLS, headers=session)
+    assert first.headers["x-cuemem-level"] == "L1"
+    upstream.reply = "final"
+    asked = ASK
+    if lost == "restart":  # 新的代理接着用同一个系统：会话还在进行中，内存里什么也没留
+        restarted = MemoryProxy(system, http_client=fake_api.client(), clock=clock, mode="l1")
+        client = TestClient(create_proxy_app(restarted))
+    else:
+        asked = "Where do I live? Find a boot shop nearby"
+    queries = count_retrievals(system, monkeypatch)
+    for _ in range(2):
+        second = follow_up(client, asked, headers=session)
+        assert second.status_code == 200 and second.headers["x-cuemem-level"] == "L1"
+        sent = upstream.proxied[-1]["messages"]
+        assert [has_memory(m) for m in sent] == [False, True, False, False]
+        content = sent[1]["content"]
+        assert "The user lives in Berlin." in content
+        assert content.endswith("</memory>\n\n" + asked) and content.count(asked) == 1
+    assert queries == [asked]
+    texts = [(t.role, t.text) for t in system.db.get_turns("alice", "t1")]
+    assert texts == [("user", ASK), ("assistant", "final"), ("assistant", "final")]
+
+
+def test_memory_goes_into_the_user_message_when_a_system_message_follows_it(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """用户消息之后还有一条系统消息（有的框架每轮在末尾加提醒）：以前这样的请求不想起；现在
+    证据块放进最后一句用户消息，不是最后一条消息。只写回回答（与工具调用的后续请求相同）。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    reminder = {"role": "system", "content": "Answer in one sentence."}
+    messages = [SYSTEM, {"role": "user", "content": "Where do I live?"}, reminder]
+    body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice"}
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200 and response.headers["x-cuemem-level"] == "L1"
+    sent = upstream.proxied[-1]["messages"]
+    assert sent[0] == SYSTEM and sent[2] == reminder
+    assert sent[1]["content"].startswith("<memory>\n") and "Berlin" in sent[1]["content"]
+    assert sent[1]["content"].endswith("</memory>\n\nWhere do I live?")
+    turns = system.db.get_turns("alice", response.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [("assistant", "Happy to help, Alice!")]
+
+
+def test_the_openai_sdk_tool_loop_keeps_its_memory(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
+) -> None:
+    """官方 OpenAI SDK 的工具循环：把模型的工具调用与工具的结果接在原来的消息后面再发一次。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    sdk = sdk_for(client)
+    messages: list[Any] = [SYSTEM, {"role": "user", "content": ASK}]
+    tools: Any = TOOLS
+    upstream.reply = CALLS_FIND
+    first = sdk.chat.completions.create(
+        model="qwen3.8-flash", messages=messages, tools=tools, user="alice"
+    )
+    [call] = first.choices[0].message.tool_calls or []
+    asked = upstream.proxied[-1]["messages"]
+    messages.append(first.choices[0].message.model_dump(exclude_none=True))
+    messages.append({"role": "tool", "tool_call_id": call.id, "content": "P01"})
+    upstream.reply = "You live in Berlin: shop P01 is nearby."
+    raw = sdk.chat.completions.with_raw_response.create(
+        model="qwen3.8-flash", messages=messages, tools=tools, user="alice"
+    )
+    assert raw.headers["x-cuemem-level"] == "L1" and int(raw.headers["x-cuemem-recalled"]) >= 1
+    assert raw.parse().choices[0].message.content == "You live in Berlin: shop P01 is nearby."
+    sent = upstream.proxied[-1]["messages"]
+    assert sent[:2] == asked and has_memory(sent[1])
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool"]
 
 
 def test_the_proxy_expires_old_traces_when_it_starts(
@@ -1381,10 +2099,10 @@ def test_unknown_models_rejected_list_only_available_ones(
 def test_requests_with_keys_keep_their_auth_header(proxy: MemoryProxy) -> None:
     """默认配置、Key 都设了：鉴权头与以前相同；不需要 Key 的本地供应商照旧用占位 Key。"""
     body = {"model": "qwen3.8-flash", "messages": [SYSTEM]}
-    _, url, auth = proxy._upstream(body)
+    _, url, auth, _, _ = proxy._upstream(body)
     assert auth == {"Authorization": "Bearer sk-test-dashscope"}
     assert url == "https://maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
-    _, _, auth = proxy._upstream({**body, "model": "deepseek-flash"})
+    _, _, auth, _, _ = proxy._upstream({**body, "model": "deepseek-flash"})
     assert auth == {"Authorization": "Bearer sk-test-deepseek"}
     listed = {m["id"] for m in proxy.models()["data"]}
     assert set(proxy.system.settings.models) <= listed
@@ -1538,6 +2256,121 @@ def test_responses_input_becomes_chat_messages() -> None:
     }
 
 
+def respond(sdk: OpenAI, said: Any = "I live in Berlin", **extra: Any) -> Any:
+    """官方 SDK 的 responses.create：instructions 是 SYSTEM（Upstream 由此认出转发来的请求）。"""
+    return sdk.responses.create(
+        model="qwen3.8-flash", instructions=SYSTEM["content"], input=said, user="alice", **extra
+    )
+
+
+def test_responses_hints_are_accepted(client: TestClient, upstream: Upstream) -> None:
+    """只是提示的参数（prompt_cache_retention，truncation 的 auto）以前 501，官方 SDK 的常见
+    写法用不了。现在照收；代理不截断，响应里的 truncation 照实写 disabled。"""
+    sdk = sdk_for(client)
+    assert respond(sdk, prompt_cache_retention="24h").status == "completed"
+    assert respond(sdk, truncation="auto").truncation == "disabled"
+    respond(sdk)
+    assert len(upstream.proxied) == 3  # 都不转发给上游：与没写这两个参数的请求是同样的键
+    assert set(upstream.proxied[0]) == set(upstream.proxied[1]) == set(upstream.proxied[2])
+
+
+def test_responses_reasoning_and_verbosity_are_mapped(
+    client: TestClient, upstream: Upstream
+) -> None:
+    """reasoning.effort 与 text.verbosity（以前 501）换成 Chat Completions 的写法转发。"""
+    sdk = sdk_for(client)
+    assert respond(sdk, reasoning={"effort": "low"}).output_text == "Happy to help, Alice!"
+    assert upstream.proxied[-1]["reasoning_effort"] == "low"
+    assert "reasoning" not in upstream.proxied[-1]
+    answered = respond(sdk, text={"verbosity": "low"})
+    assert upstream.proxied[-1]["verbosity"] == "low" and "text" not in upstream.proxied[-1]
+    assert answered.text is not None and answered.text.verbosity == "low"
+    assert answered.text.format is not None and answered.text.format.type == "text"
+    respond(sdk, reasoning={}, text={"format": {"type": "text"}})  # 等于没给
+    assert not {"reasoning_effort", "verbosity", "response_format"} & set(upstream.proxied[-1])
+
+
+class Home(BaseModel):
+    city: str
+
+
+def test_responses_structured_output_becomes_response_format(
+    client: TestClient, upstream: Upstream
+) -> None:
+    """text.format 的 json_schema / json_object（以前 501）换成 response_format：Responses 里
+    平铺的 name / schema / strict 放进 json_schema 一层；官方 SDK 的 responses.parse 可用。"""
+    sdk = sdk_for(client)
+    upstream.reply = '{"city": "Berlin"}'
+    parsed = sdk.responses.parse(
+        model="qwen3.8-flash",
+        instructions=SYSTEM["content"],
+        input="I live in Berlin",
+        user="alice",
+        text_format=Home,
+    )
+    assert parsed.output_parsed == Home(city="Berlin")
+    sent = upstream.proxied[-1]["response_format"]
+    assert sent["type"] == "json_schema" and set(sent) == {"type", "json_schema"}
+    assert sent["json_schema"]["name"] == "Home" and sent["json_schema"]["strict"] is True
+    assert sent["json_schema"]["schema"]["properties"] == {
+        "city": {"title": "City", "type": "string"}
+    }
+    assert parsed.text is not None and parsed.text.format is not None
+    assert parsed.text.format.type == "json_schema"  # 响应里照抄回去
+
+    respond(sdk, text={"format": {"type": "json_object"}})
+    assert upstream.proxied[-1]["response_format"] == {"type": "json_object"}
+
+
+def test_responses_images_are_forwarded_and_stored_like_chat_images(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """用户消息里的 input_image（以前 501）换成 image_url 块：data URL 的图片转发并写进记忆，
+    网络图片只转发、不存（与 /v1/chat/completions 相同）。"""
+    shown = [
+        {"type": "input_text", "text": "Here is my red jacket"},
+        {"type": "input_image", "image_url": red_png_url(), "detail": "low"},
+        {"type": "input_image", "image_url": "https://example.test/a.png"},
+    ]
+    answered = respond(sdk_for(client), [{"role": "user", "content": shown}])
+    assert answered.output_text == "Happy to help, Alice!"
+    assert upstream.proxied[-1]["messages"][-1]["content"] == [
+        {"type": "text", "text": "Here is my red jacket"},
+        {"type": "image_url", "image_url": {"url": red_png_url(), "detail": "low"}},
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+    ]
+    turns = system.db.get_turns("alice")
+    assert turns[0].text == "Here is my red jacket <image>" and len(turns[0].media_ids) == 1
+    assert len(system.db.get_media("alice")) == 1
+
+
+def test_responses_images_only_in_user_messages() -> None:
+    image = {"type": "input_image", "image_url": red_png_url()}
+    body = {"model": "m", "input": [{"role": "system", "content": [image]}]}
+    with pytest.raises(ProxyError) as refused:
+        _responses_to_chat(body)
+    assert refused.value.status == 501 and "input_image" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"reasoning": "low"},
+        {"reasoning": {"effort": 3}},
+        {"text": "json"},
+        {"text": {"format": 1}},
+        {"text": {"verbosity": 2}},
+    ],
+)
+def test_responses_options_of_the_wrong_type_are_400(
+    client: TestClient, upstream: Upstream, extra: dict[str, Any]
+) -> None:
+    body = {"model": "qwen3.8-flash", "instructions": SYSTEM["content"], "input": "hi", **extra}
+    refused = client.post("/v1/responses", json=body)
+    assert refused.status_code == 400 and refused.json()["error"]["param"] in extra
+    assert upstream.proxied == []
+
+
 def test_a_truncated_answer_is_an_incomplete_response() -> None:
     data = {
         "model": "deepseek-flash",
@@ -1560,11 +2393,22 @@ def test_a_truncated_answer_is_an_incomplete_response() -> None:
 @pytest.mark.parametrize(
     ("extra", "named"),
     [
-        ({"stream": True}, "stream"),
+        ({"stream": "yes"}, "stream"),
+        ({"stream": True, "background": True}, "background"),
+        ({"stream": True, "stream_options": {"include_obfuscation": False}}, "stream_options"),
         ({"tools": [{"type": "function", "name": "f", "parameters": {}}]}, "tools"),
+        ({"stream": True, "tools": [{"type": "web_search"}]}, "tools"),
         ({"previous_response_id": "resp_1"}, "previous_response_id"),
-        ({"text": {"format": {"type": "json_object"}}}, "text"),
-        ({"input": [{"role": "user", "content": [{"type": "input_image"}]}]}, "input_image"),
+        ({"reasoning": {"summary": "auto"}}, "reasoning.summary"),
+        ({"reasoning": {"effort": "low", "generate_summary": "auto"}}, "generate_summary"),
+        ({"text": {"format": {"type": "grammar"}}}, "text.format of type 'grammar'"),
+        ({"text": {"format": {"type": "json_object", "schema": {}}}}, "text.format.schema"),
+        ({"text": {"logprobs": True}}, "text.logprobs"),
+        (
+            {"input": [{"role": "user", "content": [{"type": "input_image", "file_id": "f"}]}]},
+            "input_image with file_id",
+        ),
+        ({"input": [{"role": "user", "content": [{"type": "input_file"}]}]}, "input_file"),
         ({"input": [{"type": "function_call_output", "call_id": "c"}]}, "function_call_output"),
     ],
 )
@@ -1575,13 +2419,235 @@ def test_responses_outside_the_subset_are_501(
     extra: dict[str, Any],
     named: str,
 ) -> None:
-    """子集以外的（流式、工具、存下来的回答、结构化输出、图片与工具调用的输入）：501，OpenAI 格式
-    的出错写明哪一项，x-should-retry: false 让官方 SDK 不重试；不转发、不碰记忆。"""
+    """子集以外的（工具、后台运行、存下来的回答、推理的摘要、不认识的输出格式、file_id 的图片
+    与工具调用的输入；流式的也一样）：501，OpenAI 格式的出错写明哪一项，x-should-retry: false
+    让官方 SDK 不重试；不转发、不碰记忆。"""
     body = {"model": "qwen3.8-flash", "input": "I live in Berlin", "user": "alice", **extra}
     response = client.post("/v1/responses", json=body)
     assert response.status_code == 501 and response.headers["x-should-retry"] == "false"
     assert named in response.json()["error"]["message"]
     assert upstream.proxied == [] and system.db.list_spaces() == []
+
+
+# ---------- /v1/responses 的流式（第九轮体检 P12） ----------
+
+RESPOND_PIN = {
+    "model": "qwen3.8-flash",
+    "stream": True,
+    "user": "alice",
+    "input": "What is my PIN?",
+}
+STREAMED = [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+]
+
+
+def _last(*chunks: dict[str, Any]) -> bytes:
+    """上游的流收尾的几块，再加 [DONE]。"""
+    return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode() + b"data: [DONE]\n\n"
+
+
+def events_of(chunks: Iterator[bytes]) -> list[dict[str, Any]]:
+    """Responses 的事件流 → 各个事件的 data；顺带检查每个事件的写法与递增的序号。"""
+    events = []
+    for raw in chunks:
+        head, data = raw.decode().removesuffix("\n\n").split("\n", 1)
+        event = json.loads(data.removeprefix("data: "))
+        assert head == f"event: {event['type']}" and event["sequence_number"] == len(events)
+        events.append(event)
+    return events
+
+
+def kinds_of(events: list[Any]) -> list[str]:
+    """事件的类型，连着的 delta 算一个。"""
+    kinds = [e["type"] if isinstance(e, dict) else e.type for e in events]
+    return [kind for i, kind in enumerate(kinds) if i == 0 or kind != kinds[i - 1]]
+
+
+def test_responses_stream_with_the_openai_sdk(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """/v1/responses 的 stream: true 以前 501。现在换成流式的 Chat Completions，上游的块换成
+    Responses 的事件：官方 SDK 的 responses.stream() 与 create(stream=True) 照常可用，回答与
+    用户的话各写回一次，用量照上游最后一块记。"""
+    sdk = sdk_for(client)
+    upstream.reply = "Berlin has great coffee"
+    with sdk.responses.stream(
+        model="qwen3.8-flash",
+        instructions=SYSTEM["content"],
+        input="I live in Berlin",
+        user="alice",
+        max_output_tokens=200,
+    ) as stream:
+        events = list(stream)
+        final = stream.get_final_response()
+    assert kinds_of(events) == [*STREAMED, "response.completed"]
+    assert final.output_text == "Berlin has great coffee" and final.status == "completed"
+    assert final.usage is not None and final.usage.total_tokens == 13
+    assert (final.usage.input_tokens, final.usage.output_tokens) == (10, 3)
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "I live in Berlin"),
+        ("assistant", "Berlin has great coffee"),
+    ]
+    sent = upstream.proxied[-1]
+    assert sent["messages"] == [SYSTEM, {"role": "user", "content": "I live in Berlin"}]
+    assert sent["stream"] is True and sent["max_tokens"] == 200
+    # 只有这条路替调用方要用量（对话接口的见 test_streams_that_report_usage_are_metered）
+    assert sent["stream_options"] == {"include_usage": True}
+    (row,) = metered(system)
+    assert (row["role"], row["input_tokens"], row["output_tokens"]) == ("proxy", 10, 3)
+
+    raw = list(respond(sdk, "What do you know about my city?", stream=True))
+    assert raw[-1].type == "response.completed"
+    assert raw[-1].response.output_text == "Berlin has great coffee"
+    assert len(system.db.get_turns("alice")) == 4
+
+
+def test_responses_stream_events(client: TestClient, upstream: Upstream) -> None:
+    """事件流的样子：text/event-stream，X-CueMem-* 响应头，序号从 0 递增，响应与消息的 ID 每个
+    事件里相同（官方 SDK 见到 ID 变了会报错），没有 [DONE]。"""
+    upstream.reply = "你好 Alice"
+    body = {**RESPOND_PIN, "instructions": SYSTEM["content"], "metadata": {"app": "shop"}}
+    with client.stream("POST", "/v1/responses", json=body) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["x-cuemem-level"] == "none"  # 还没有记忆
+        assert response.headers["x-cuemem-model"] == "qwen3.8-flash"
+        assert response.headers["x-cuemem-session"]
+        text = response.read().decode()
+    assert "[DONE]" not in text and "你好" in text
+    events = events_of(f"{block}\n\n".encode() for block in text.split("\n\n") if block)
+    assert kinds_of(events) == [*STREAMED, "response.completed"]
+    created, completed = events[0]["response"], events[-1]["response"]
+    assert created["status"] == "in_progress" and created["output"] == []
+    assert created["usage"] is None and created["metadata"] == {"app": "shop"}
+    assert {e["response"]["id"] for e in events if "response" in e} == {created["id"]}
+    item = completed["output"][0]
+    assert {e["item_id"] for e in events if "item_id" in e} == {item["id"]}
+    assert [e["item"]["id"] for e in events if "item" in e] == [item["id"]] * 2
+    assert "".join(e["delta"] for e in events if "delta" in e) == "你好 Alice"
+    assert item["content"][0]["text"] == "你好 Alice" and item["status"] == "completed"
+    assert OpenAIResponse.model_validate(completed).output_text == "你好 Alice"
+    assert completed["created_at"] == created["created_at"]
+
+
+def test_a_truncated_responses_stream_is_incomplete(system: MemorySystem) -> None:
+    """finish_reason 为 length：结束事件是 response.incomplete；回答照常写回（与对话接口相同）。"""
+    cut = {"model": "qwen-x", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+    answer = Answer(["Your PIN is"], last=_last(cut))
+    _, chunks, _ = streaming(system, answer).respond_stream(RESPOND_PIN, {})
+    events = events_of(chunks)
+    assert kinds_of(events) == [*STREAMED, "response.incomplete"]
+    final = OpenAIResponse.model_validate(events[-1]["response"])
+    assert final.status == "incomplete" and final.incomplete_details is not None
+    assert final.incomplete_details.reason == "max_output_tokens"
+    assert final.model == "qwen-x" and final.usage is None  # 上游没报用量：不编一个
+    assert final.output[0].status == "incomplete" and final.output_text == "Your PIN is"
+    assert [t.text for t in system.db.get_turns("alice")] == ["What is my PIN?", "Your PIN is"]
+
+
+@pytest.mark.parametrize("how", ["in-stream", "reset"])
+def test_a_failed_responses_stream_is_not_remembered(system: MemorySystem, how: str) -> None:
+    """上游中途出错（流里的 {"error": ...}，或者连接断了）：发 response.failed 就结束，什么也
+    不写（与对话接口的流式相同）。"""
+    if how == "reset":
+        answer = Answer(["Your PIN is"], error=httpx2.ReadError("connection reset by peer"))
+    else:
+        error = {"error": {"message": "overloaded", "type": "server_error"}}
+        answer = Answer(["Your PIN is"], last=_last(error, json.loads(_sse(" 1234")[5:])))
+    with TestClient(create_proxy_app(streaming(system, answer))) as client:
+        events = list(sdk_for(client).responses.create(**RESPOND_PIN))
+    assert [e.type for e in events][4:] == ["response.output_text.delta", "response.failed"]
+    failed = events[-1].response
+    assert failed.status == "failed" and failed.error is not None and failed.output == []
+    assert failed.error.code == "server_error"
+    assert ("overloaded" if how == "in-stream" else "ReadError") in failed.error.message
+    assert answer.closed and system.db.get_turns("alice") == []
+
+
+@pytest.mark.parametrize("read", [0, 6])
+def test_a_stopped_responses_stream_keeps_only_the_user_message(
+    system: MemorySystem, read: int
+) -> None:
+    """调用方中途不要了（还没开始读的也是）：关掉上游，只写回用户的话。"""
+    answer = Answer(["Your PIN is"], endless=True)
+    relayed = streaming(system, answer)
+    _, chunks, _ = relayed.respond_stream(RESPOND_PIN, {})
+    for _ in range(read):
+        next(chunks)
+    chunks.close()
+    assert answer.closed and list(chunks) == []
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+    assert relayed._runs[("alice", None)].busy == 0
+
+
+def test_a_responses_stream_echoes_a_lone_surrogate(system: MemorySystem) -> None:
+    """请求里原样带回、不转发的字段（metadata）有落单的代理项（JSON 的 "\\ud800" 解析得出来，
+    写不成 UTF-8）：以前建事件流的时候抛 UnicodeEncodeError，上游已经开着的流没有人关，连接
+    不还给连接池，这一轮也一直算作进行中（会话停放不了）。现在这样的事件用 \\uXXXX 转义写。"""
+    answer = Answer(["Your PIN is 1234"])
+    relayed = streaming(system, answer)
+    body = {**RESPOND_PIN, "metadata": {"k": "\ud800"}}
+    status, chunks, _ = relayed.respond_stream(body, {})
+    events = events_of(chunks)
+    assert status == 200 and kinds_of(events) == [*STREAMED, "response.completed"]
+    assert {e["response"]["metadata"]["k"] for e in events if "response" in e} == {"\ud800"}
+    assert answer.closed and relayed._runs[("alice", None)].busy == 0
+    assert len(system.db.get_turns("alice")) == 2
+
+
+def test_a_responses_stream_that_cannot_start_closes_the_upstream(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """事件流没建成（不管什么原因）：上游的流关掉，这一轮放开，只写回用户的话。"""
+
+    def broken(self: Any, *args: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(proxy_module._ResponsesRelay, "__init__", broken)
+    answer = Answer(["Your PIN is 1234"])
+    relayed = streaming(system, answer)
+    with pytest.raises(RuntimeError, match="boom"):
+        relayed.respond_stream(RESPOND_PIN, {})
+    assert answer.closed and relayed._runs[("alice", None)].busy == 0
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [("user", "What is my PIN?")]
+
+
+def test_a_responses_stream_relays_a_split_surrogate_pair(system: MemorySystem) -> None:
+    """上游把一个字符的两半（"\\ud83d" 与 "\\ude00"）分在两块里：以前带着半个的那个 delta 写不成
+    UTF-8，事件流中途断掉、没有结束事件。现在这两个 delta 照上游的转义写，拼起来是原来的字。"""
+    answer = Answer(["Hi \ud83d", "\ude00 there"])
+    relayed = streaming(system, answer)
+    _, chunks, _ = relayed.respond_stream(RESPOND_PIN, {})
+    raw = list(chunks)
+    events = events_of(iter(raw))
+    assert kinds_of(events) == [*STREAMED, "response.completed"]
+    assert [e["delta"] for e in events if "delta" in e] == ["Hi \ud83d", "\ude00 there"]
+    assert rb"Hi \ud83d" in raw[4] and rb"\ude00 there" in raw[5]
+    # 拼起来的全文是一对完整的代理项：JSON 解析出来就是那个字
+    assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Hi \U0001f600 there"
+    assert answer.closed and relayed._runs[("alice", None)].busy == 0
+
+
+@pytest.mark.parametrize("reply", [REJECT, RATE_LIMIT, TIMEOUT])
+def test_a_responses_stream_refused_at_the_start_is_a_json_error(
+    client: TestClient, system: MemorySystem, upstream: Upstream, reply: str
+) -> None:
+    """上游一开始就出错（或连不上）：与非流式相同的 JSON 出错，不是事件流。"""
+    upstream.reply = reply
+    body = {**RESPOND_PIN, "instructions": SYSTEM["content"]}
+    refused = client.post("/v1/responses", json=body)
+    assert refused.status_code == {REJECT: 400, RATE_LIMIT: 429, TIMEOUT: 504}[reply]
+    assert refused.headers["content-type"] == "application/json"
+    assert refused.json()["error"]["message"]
+    assert system.db.get_turns("alice") == [] and metered(system) == []
 
 
 def test_responses_errors(client: TestClient, system: MemorySystem, upstream: Upstream) -> None:
@@ -1594,3 +2660,179 @@ def test_responses_errors(client: TestClient, system: MemorySystem, upstream: Up
     assert rejected.status_code == 400
     assert rejected.json()["error"]["code"] == "data_inspection_failed"
     assert system.db.get_turns("alice") == []
+
+
+# ---------- 转发的补全记进用量账本（第九轮体检 P10） ----------
+
+
+def metered(system: MemorySystem) -> list[dict[str, Any]]:
+    """账本里代理转发的补全（角色 proxy、proxy-unmetered），按 Ledger.summary 汇总。"""
+    assert system.ledger is not None
+    return [r for r in system.ledger.summary() if str(r["role"]).startswith("proxy")]
+
+
+def test_forwarded_completions_are_metered(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """转发出去的补全以前不进账本：cuemem usage 只有抽取与向量的行，看不出代理花了多少。现在
+    每次记一行，角色 proxy，token 数照上游的 usage，成本照目录的标价；没有用户的请求也记。"""
+    assert chat(client, "I live in Berlin", user="alice").status_code == 200
+    spec = system.settings.models["qwen3.8-flash"]
+    nominal = chat_cost(spec.price, Usage(input_tokens=120, output_tokens=30))[0]
+    (row,) = metered(system)
+    assert (row["kind"], row["role"], row["provider"]) == ("chat", "proxy", spec.provider)
+    assert (row["model"], row["calls"], row["cache_hits"]) == ("qwen3.8-flash", 1, 0)
+    assert (row["input_tokens"], row["output_tokens"]) == (120, 30)
+    assert row["nominal_cost"] == pytest.approx(nominal) and nominal > 0
+
+    assert chat(client, "What is the capital of France?").status_code == 200  # 不碰记忆的
+    (row,) = metered(system)
+    assert (row["calls"], row["input_tokens"]) == (2, 240)
+
+
+def test_a_forwarded_model_id_is_metered_under_its_alias(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """请求里写的是模型 ID 或不认识的模型：账本里记目录的别名，与内部调用的行同一个写法。"""
+    spec = system.settings.models["qwen3.8-flash"]
+    for model in (spec.model_id, "gpt-unknown"):
+        assert chat(client, "hi", model=model).status_code == 200
+    (row,) = metered(system)
+    assert system.settings.models[row["model"]] == spec and row["calls"] == 2
+
+
+def test_streams_that_report_usage_are_metered(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream
+) -> None:
+    """流式：上游发了带 usage 的块（调用方写了 stream_options.include_usage）时照它记。转发的
+    请求不变：代理不替调用方加 stream_options。"""
+    body = {
+        "model": "qwen3.8-flash",
+        "stream": True,
+        "messages": [SYSTEM, ask("hi")["messages"][0]],
+    }
+    with client.stream("POST", "/v1/chat/completions", json=body) as response:
+        assert response.status_code == 200
+        assert any("usage" in line for line in response.iter_lines())  # 原样转给调用方
+    (row,) = metered(system)
+    assert (row["role"], row["calls"]) == ("proxy", 1)
+    assert (row["input_tokens"], row["output_tokens"]) == (10, 3)
+    sent = upstream.proxied[-1]
+    assert "stream_options" not in sent
+    assert sent == proxy._upstream(body)[0]  # 只有目录里的模型 ID 与供应商的开关，与以前相同
+
+
+def test_streams_without_usage_are_counted_as_unmetered(system: MemorySystem) -> None:
+    """多数流式请求不带 include_usage，上游不报用量：记成 proxy-unmetered 的一行（0 个 token），
+    账本里看得出有多少次没计量；回答照常写回。中途停下的也算一次。"""
+    relayed = streaming(system, Answer(["Your PIN is", " 1234"]))
+    _, chunks, _ = relayed.stream(ASK_PIN, {})
+    list(chunks)
+    (row,) = metered(system)
+    assert (row["kind"], row["role"], row["model"]) == ("chat", "proxy-unmetered", "qwen3.8-flash")
+    assert (row["calls"], row["input_tokens"], row["output_tokens"]) == (1, 0, 0)
+    assert row["nominal_cost"] == 0 and row["spent"] == 0
+    assert [t.text for t in system.db.get_turns("alice")] == ["What is my PIN?", "Your PIN is 1234"]
+
+    _, chunks, _ = streaming(system, Answer(["Your PIN is"], endless=True)).stream(ASK_PIN, {})
+    next(chunks)
+    chunks.close()
+    assert metered(system)[0]["calls"] == 2
+
+
+def test_a_broken_stream_is_metered_only_with_usage(system: MemorySystem) -> None:
+    """上游中途出错的流：没见到 usage 的不记（多半没算钱），见到了的照它记。"""
+    reset = httpx2.ReadError("connection reset by peer")
+    _, chunks, _ = streaming(system, Answer(["Your PIN is"], error=reset)).stream(ASK_PIN, {})
+    with pytest.raises(httpx2.ReadError):
+        list(chunks)
+    assert metered(system) == []
+
+    usage = {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2}}
+    error = {"error": {"message": "overloaded", "type": "server_error"}}
+    last = f"data: {json.dumps(usage)}\n\ndata: {json.dumps(error)}\n\n".encode()
+    _, chunks, _ = streaming(system, Answer(["Your PIN is"], last=last)).stream(ASK_PIN, {})
+    list(chunks)
+    (row,) = metered(system)
+    assert (row["role"], row["input_tokens"], row["output_tokens"]) == ("proxy", 7, 2)
+    assert system.db.get_turns("alice") == []
+
+
+def test_the_responses_api_is_metered(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    answered = client.post(
+        "/v1/responses",
+        json={"model": "qwen3.8-flash", "instructions": SYSTEM["content"], "input": "hi"},
+    )
+    assert answered.status_code == 200 and answered.json()["usage"]["input_tokens"] == 120
+    (row,) = metered(system)
+    assert (row["role"], row["calls"], row["input_tokens"]) == ("proxy", 1, 120)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reply", [RATE_LIMIT, SERVER_ERROR, TIMEOUT])
+def test_upstream_errors_are_not_metered(
+    client: TestClient, system: MemorySystem, upstream: Upstream, reply: str, stream: bool
+) -> None:
+    upstream.reply = reply
+    assert chat(client, "I live in Berlin", user="alice", stream=stream).status_code >= 400
+    assert metered(system) == []
+
+
+def test_a_ledger_failure_does_not_fail_the_answer(
+    client: TestClient,
+    system: MemorySystem,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """账本被别的进程锁着（best_effort 也照样抛出）：回答已经付过钱，照样返回、照样写回，只记
+    一条警告。"""
+    assert system.ledger is not None
+    recorded = system.ledger.record
+
+    def record(rec: Any) -> None:
+        if rec.role == "proxy":
+            raise sqlite3.OperationalError("database is locked")
+        recorded(rec)
+
+    monkeypatch.setattr(system.ledger, "record", record)
+    with caplog.at_level(logging.WARNING, logger="cuemem.api.proxy"):
+        response = chat(client, "I live in Berlin", user="alice")
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Happy to help, Alice!"
+    assert [t.text for t in system.db.get_turns("alice")] == [
+        "I live in Berlin",
+        "Happy to help, Alice!",
+    ]
+    assert metered(system) == []
+    assert sum("database is locked" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_deepseek_cache_hits_are_metered(system: MemorySystem) -> None:
+    """DeepSeek 把前缀缓存命中写在 prompt_cache_hit_tokens：记进 cached_input_tokens，花费照
+    命中的价格算。"""
+    body = chat_completion_body("Paris", deepseek=True, cached_tokens=100)
+    request = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
+    status, _, _ = answering(system, body).complete(request, {})
+    assert status == 200
+    (row,) = metered(system)
+    assert (row["provider"], row["model"], row["role"]) == ("deepseek", "deepseek-flash", "proxy")
+    assert (row["input_tokens"], row["cached_input_tokens"]) == (120, 100)
+    assert 0 < row["spent"] < row["nominal_cost"]
+
+
+def test_usage_of_an_unknown_shape() -> None:
+    assert _usage({}) is None and _usage({"usage": None}) is None and _usage({"usage": []}) is None
+    odd = {"prompt_tokens": "12", "completion_tokens": True, "prompt_tokens_details": "x"}
+    assert _usage({"usage": odd}) == Usage()
+    reported = {
+        "prompt_tokens": 9,
+        "completion_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 5},
+        "completion_tokens_details": {"reasoning_tokens": 3},
+    }
+    assert _usage({"usage": reported}) == Usage(
+        input_tokens=9, output_tokens=4, cached_input_tokens=5, reasoning_tokens=3
+    )

@@ -70,9 +70,14 @@ def build_embedder(
     http_client: httpx2.Client | None = None,
     use_cache: bool = True,
     cache_best_effort: bool = False,
+    parallel: bool = False,
 ) -> TextEmbedder:
     """按配置构造向量器；默认外面包一层内容哈希缓存。cache_best_effort：缓存写不进去（磁盘满了、
-    只读）时只记警告（见 EmbeddingCache），MemorySystem.from_settings 打开，评测与脚本不打开。"""
+    只读）时只记警告（见 EmbeddingCache），MemorySystem.from_settings 打开，评测与脚本不打开。
+
+    parallel：一次调用要发几个请求时同时发（最多 embedding.max_concurrency 个在途，见
+    DashScopeTextEmbedder._send_all；本地的 hash、fastembed 后端没有请求，不受影响）。同样只有
+    MemorySystem.from_settings 打开：评测与脚本的请求一个接一个，顺序照旧。"""
     from cuemem.embed.cache import CachedEmbedder, EmbeddingCache
 
     cfg = settings.embedding
@@ -98,12 +103,19 @@ def build_embedder(
             from cuemem.embed.openai_compat import OpenAICompatibleEmbedder
 
             inner = OpenAICompatibleEmbedder(
-                cfg, api_key, provider.base_url, http_client=http_client, ledger=ledger
+                cfg,
+                api_key,
+                provider.base_url,
+                http_client=http_client,
+                ledger=ledger,
+                parallel=parallel,
             )
         else:
             from cuemem.embed.dashscope import DashScopeTextEmbedder
 
-            inner = DashScopeTextEmbedder(cfg, api_key, http_client=http_client, ledger=ledger)
+            inner = DashScopeTextEmbedder(
+                cfg, api_key, http_client=http_client, ledger=ledger, parallel=parallel
+            )
     if not use_cache:
         return inner
     from cuemem.store.files import opening

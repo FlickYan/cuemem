@@ -25,9 +25,13 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import math
 import mimetypes
 import os
+import random
 import threading
+import time
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -51,6 +55,12 @@ TOKEN_ENV = "CUEMEM_API_TOKEN"
 # wait() 让服务端比客户端的读超时早这么多秒放弃：先收到服务端的 504（TimeoutError），而不是
 # 客户端自己的读超时（见 MemoryClient.wait）
 WAIT_MARGIN_S = 5.0
+# max_retries > 0 时的自动重试（MemoryClient._send）：429、503 的 Retry-After 不超过这么多秒才等
+# 它再重发（会话数上限的 429 是 60 秒，不重试）；没有拿到响应时的退避从 RETRY_BASE_S 起每次翻倍、
+# 最多 RETRY_CAP_S 秒，再乘 0.5 到 1 之间的随机数
+RETRY_AFTER_MAX_S = 30.0
+RETRY_BASE_S = 0.5
+RETRY_CAP_S = 8.0
 _BUILTIN_ERRORS: dict[str, type[Exception]] = {
     "KeyError": KeyError,
     "ValueError": ValueError,
@@ -70,6 +80,20 @@ class MemoryClient:
     MemoryAPIError（status 403），别人的记忆 ID 与不存在的一样；timeout：单次请求的秒数
     （wait=True 的 add、update 要等抽取做完）；http_client：自带的 httpx2.Client（测试里传
     FastAPI 的 TestClient；超时照它自己的设置，timeout 不再起作用）。
+
+    max_retries（默认 0：每个调用只发一次，请求与以前逐字节相同）：大于 0 时一个调用最多再重发
+    这么多次（第九轮体检）。重发的情形只有三种：连不上（unreachable，请求没有送到）；429 或 503
+    带着不超过 30 秒的数字 Retry-After（限流、模型供应商限流、向量库暂时不可用），等这么久再
+    发；只读的调用（get_all、get、media、history、profile、status、export、spaces、search、
+    context）与 add 在超时、连接中途断开之后。add 没给 idempotency_key 时为这次调用生成一个
+    （uuid4），每次重发都带着它，服务端只写一次：重发得到的是 status 为 duplicate、results 为空
+    的结果（wait=True 时等那次的抽取做完），要事件的话再读 get_all；服务端要认 Idempotency-Key
+    头（第六轮体检之前的不认，会写两次）。update、delete、delete_many、delete_all、reset、
+    consolidate、open_run、end_run、load、answer、wait 在超时、断开之后不重发（可能已经做了）。
+    别的状态码都不重发：502、504（wait 的 TimeoutError）、409、4xx，没有 Retry-After 或超过
+    30 秒的 429、503（会话数上限、向量库满了）。没有拿到响应时的退避是 0.5 秒起每次翻倍、最多
+    8 秒，带随机抖动。最后抛出的是最后一次的异常，它的 attempts 是一共发了几次；一个调用最多
+    占 max_retries + 1 个读超时再加上等待的时间（wait=True 的 add 尤其要算上）。
     """
 
     def __init__(
@@ -80,7 +104,10 @@ class MemoryClient:
         host: str | None = None,
         timeout: float = 300.0,
         http_client: httpx2.Client | None = None,
+        max_retries: int = 0,
     ) -> None:
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError(f"max_retries must be a non-negative integer (got {max_retries!r}).")
         if base_url is not None and host is not None:
             raise ValueError("Give base_url or host (the same argument), not both.")
         url = base_url if base_url is not None else host if host is not None else DEFAULT_URL
@@ -99,6 +126,9 @@ class MemoryClient:
         self._http = http_client or httpx2.Client(timeout=timeout)
         self._runs: set[tuple[str, str | None, str | None]] = set()  # 这个客户端开始的 run
         self._runs_lock = threading.Lock()
+        self._max_retries = max_retries
+        self._sleep = time.sleep  # 测试里换掉这两个
+        self._random = random.random
 
     # ---------- 写入 ----------
 
@@ -119,7 +149,8 @@ class MemoryClient:
         """写入对话（见 Memory.add）。内容块里的本地图片先读成 data URL。idempotency_key 作为
         Idempotency-Key 头发送（不给时不发，请求与以前相同）：超时或连接断开（MemoryAPIError 的
         code 为 timeout、disconnected）之后用同一个键原样重发，服务端只写一次；wait=True 的
-        重发等那次的抽取做完再返回 duplicate（第七轮体检）。"""
+        重发等那次的抽取做完再返回 duplicate（第七轮体检）。max_retries 大于 0 时不给键的 add
+        在这里生成一个（uuid4），这次调用的每次重发都带着它，超时、断开之后自动重发。"""
         body = {
             "messages": _inline_images(messages),
             "user_id": user_id,
@@ -131,11 +162,13 @@ class MemoryClient:
             "infer": infer,
             "wait": wait,
         }
+        if idempotency_key is None and self._max_retries > 0:
+            idempotency_key = str(uuid.uuid4())
         if idempotency_key is None:
             return self._call("POST", "/memories", body=body)
         _check_key(idempotency_key)
         headers = {"Idempotency-Key": idempotency_key}
-        return self._call("POST", "/memories", body=body, headers=headers)
+        return self._call("POST", "/memories", body=body, headers=headers, retry_sent=True)
 
     def open_run(
         self, run_id: str | None = None, *, user_id: str | None = None, agent_id: str | None = None
@@ -225,7 +258,7 @@ class MemoryClient:
     def status(self, *, user_id: str | None = None, agent_id: str | None = None) -> dict[str, Any]:
         """抽取的状态：待处理与失败的会话、失败的原因（见 Memory.status）。"""
         params = {"user_id": user_id, "agent_id": agent_id}
-        return self._call("GET", "/status", params=params)
+        return self._call("GET", "/status", params=params, retry_sent=True)
 
     # ---------- 读取 ----------
 
@@ -264,7 +297,7 @@ class MemoryClient:
             "min_level": min_level,
             "show_expired": show_expired,
         }
-        return self._call("POST", "/memories/search", body=body)
+        return self._call("POST", "/memories/search", body=body, retry_sent=True)
 
     def context(
         self,
@@ -291,7 +324,7 @@ class MemoryClient:
             "min_level": min_level,
             "wrap": wrap,
         }
-        return self._call("POST", "/context", body=body)
+        return self._call("POST", "/context", body=body, retry_sent=True)
 
     def answer(
         self,
@@ -344,27 +377,27 @@ class MemoryClient:
             "top_k": top_k,
             "show_expired": show_expired,
         }
-        return self._call("GET", "/memories", params=params)
+        return self._call("GET", "/memories", params=params, retry_sent=True)
 
     def get(self, memory_id: str) -> dict[str, Any] | None:
         try:
-            return self._call("GET", f"/memories/{_id(memory_id)}")
+            return self._call("GET", f"/memories/{_id(memory_id)}", retry_sent=True)
         except KeyError:
             return None
 
     def media(self, media_id: str) -> bytes | None:
         """一张图片的原文件（见 Memory.media）：图片项里的 path 是服务器上的路径，读不到。"""
         try:
-            return self._send("GET", f"/media/{_id(media_id)}").content
+            return self._send("GET", f"/media/{_id(media_id)}", retry_sent=True).content
         except KeyError:
             return None
 
     def history(self, memory_id: str) -> list[dict[str, Any]]:
-        return self._call("GET", f"/memories/{_id(memory_id)}/history")
+        return self._call("GET", f"/memories/{_id(memory_id)}/history", retry_sent=True)
 
     def profile(self, *, user_id: str | None = None, agent_id: str | None = None) -> str:
         params = {"user_id": user_id, "agent_id": agent_id}
-        return str(self._call("GET", "/profile", params=params)["profile"])
+        return str(self._call("GET", "/profile", params=params, retry_sent=True)["profile"])
 
     # ---------- 遗忘 ----------
 
@@ -417,7 +450,7 @@ class MemoryClient:
         self, *, user_id: str | None = None, agent_id: str | None = None, derived: bool = True
     ) -> dict[str, Any]:
         params = {"user_id": user_id, "agent_id": agent_id, "derived": derived}
-        return self._call("GET", "/export", params=params)
+        return self._call("GET", "/export", params=params, retry_sent=True)
 
     def load(
         self,
@@ -448,7 +481,7 @@ class MemoryClient:
     # ---------- 其他 ----------
 
     def spaces(self) -> list[dict[str, Any]]:
-        return self._call("GET", "/spaces")
+        return self._call("GET", "/spaces", retry_sent=True)
 
     def close(self) -> None:
         """关闭。这个客户端开始、还没结束的 run 先结束（交给服务端抽取）；自己建的连接关掉。"""
@@ -481,8 +514,12 @@ class MemoryClient:
         body: Any = None,
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        retry_sent: bool = False,
     ) -> Any:
-        return self._send(method, path, body=body, params=params, headers=headers).json()
+        response = self._send(
+            method, path, body=body, params=params, headers=headers, retry_sent=retry_sent
+        )
+        return response.json()
 
     def _send(
         self,
@@ -492,22 +529,46 @@ class MemoryClient:
         body: Any = None,
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        retry_sent: bool = False,
     ) -> httpx2.Response:
-        """headers：这次请求另加的头（add 的 Idempotency-Key）；不给时与以前完全相同。"""
+        """headers：这次请求另加的头（add 的 Idempotency-Key）；不给时与以前完全相同。
+
+        max_retries 大于 0 时在这里重发（规则见类的说明）：看的是原始的响应，不是换算之后的
+        异常——会话数上限的 429 换成 SessionLimitError 之后就没有 Retry-After 了。retry_sent：
+        请求可能已经送到（超时、连接中途断开）之后也重发，只给只读的调用与带着幂等键的 add。"""
         query = {k: v for k, v in (params or {}).items() if v is not None}  # None 不发
-        try:
-            response = self._http.request(
-                method,
-                f"{self.base_url}/api/v1{path}",
-                json=body,
-                params=query,
-                headers={**self._headers, **headers} if headers else self._headers,
-            )
-        except httpx2.HTTPError as exc:
-            raise self._transport_error(exc) from exc
-        if response.status_code >= 400:
-            raise _error(response, self.base_url)
-        return response
+        for attempt in range(self._max_retries + 1):
+            last = attempt == self._max_retries
+            try:
+                response = self._http.request(
+                    method,
+                    f"{self.base_url}/api/v1{path}",
+                    json=body,
+                    params=query,
+                    headers={**self._headers, **headers} if headers else self._headers,
+                )
+            except httpx2.HTTPError as exc:
+                err = self._transport_error(exc)
+                resend = err.sent is False or (
+                    retry_sent and err.code in ("timeout", "disconnected")
+                )
+                if last or not resend:
+                    err.attempts = attempt + 1
+                    raise err from exc
+                self._sleep(
+                    min(RETRY_BASE_S * 2**attempt, RETRY_CAP_S) * (0.5 + self._random() / 2)
+                )
+                continue
+            if response.status_code < 400:
+                return response
+            pause = _retry_after(response) if response.status_code in (429, 503) else None
+            if last or pause is None:
+                error = _error(response, self.base_url)
+                # 也可能是 KeyError、cuemem.errors 里的类型：都记上一共发了几次
+                error.attempts = attempt + 1  # type: ignore[attr-defined]
+                raise error
+            self._sleep(pause)
+        raise AssertionError("unreachable")  # 最后一次不是返回就是抛出
 
     def _transport_error(self, exc: httpx2.HTTPError) -> MemoryAPIError:
         """没有拿到响应时的出错，按请求有没有送到服务端分开（code 与 sent）：连不上（unreachable，
@@ -548,7 +609,8 @@ class MemoryClient:
 class AsyncMemoryClient(AsyncMethods):
     """MemoryClient 的异步版本（与 AsyncMemory 对应）：同样的方法与参数，在线程池里执行
     （cuemem/_async.py）。self.sync 是包着的 MemoryClient；别的属性（.base_url）取它的。
-    取消一次调用停不下已经发出的请求，见 AsyncMethods。"""
+    取消一次调用停不下已经发出的请求，见 AsyncMethods。max_retries 的重试在线程池的那个线程里
+    等待，不占事件循环。"""
 
     sync: MemoryClient
 
@@ -560,10 +622,26 @@ class AsyncMemoryClient(AsyncMethods):
         host: str | None = None,
         timeout: float = 300.0,
         http_client: httpx2.Client | None = None,
+        max_retries: int = 0,
     ) -> None:
         self.sync = MemoryClient(
-            base_url, api_key=api_key, host=host, timeout=timeout, http_client=http_client
+            base_url,
+            api_key=api_key,
+            host=host,
+            timeout=timeout,
+            http_client=http_client,
+            max_retries=max_retries,
         )
+
+
+def _retry_after(response: httpx2.Response) -> float | None:
+    """429、503 的 Retry-After：不超过 RETRY_AFTER_MAX_S 的非负秒数才值得等（返回这个数）；没有
+    这个头、是 HTTP 日期、或者更长时返回 None（不重发，照旧抛出）。"""
+    try:
+        seconds = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and 0 <= seconds <= RETRY_AFTER_MAX_S else None
 
 
 def _check_key(key: str) -> None:

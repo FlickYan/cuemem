@@ -19,6 +19,13 @@ class StructuredOutputError(CueMemError):
     """多次重试后，模型仍未给出符合 Schema 的 JSON。"""
 
 
+class OutputTruncatedError(StructuredOutputError):
+    """模型的回复在输出上限处被截断（finish_reason 为 length），不是合法的 JSON。
+
+    只在调用方要求时抛出（LLMClient.structured 的 raise_on_truncation）：把截断的 JSON 发回去
+    要求改正，多半再被截断一次，调用方该做的是把输入分小。"""
+
+
 class EmbeddingAPIError(CueMemError):
     """向量化接口返回错误或格式异常。
 
@@ -78,8 +85,9 @@ class VectorStoreOpenError(CueMemError):
 class VectorStoreFullError(CueMemError):
     """本地模式的向量库没有余量建新的集合（新的记忆空间）了：集合数加上要建的，会占到打开文件数
     软上限里留给数据库、图片与连接的那部分（store.vector.reserved_files）。没有建，什么都没写；
-    已有的空间照常可用（HTTP 503，错误码 capacity）。collections、limit：集合数与软上限（客户端
-    还原的异常里是 None）。"""
+    已有的空间照常可用（HTTP 503，错误码 capacity）；一个空间的第一张图片也要另建一个集合，
+    记忆代理在转发之前同样先查、回 503。collections、limit：集合数与软上限（客户端还原的异常里
+    是 None）。"""
 
     def __init__(
         self, message: str, *, collections: int | None = None, limit: int | None = None
@@ -124,7 +132,13 @@ class MemoryAPIError(CueMemError):
     （sent=False：连不上，写入一定没做，可以重发）；timeout 与 disconnected（sent=True：超时、
     连接中途断开，写入可能已经提交：add 用同一个 idempotency_key 原样重发，服务端只写一次；没给键时
     不要盲目重发，用 export 核对）；transport（sent=True：别的传输出错）。
-    拿到了 HTTP 响应时 sent 是 None。"""
+    拿到了 HTTP 响应时 sent 是 None。
+
+    attempts 是这个调用一共发了几次请求：MemoryClient(max_retries=N) 自动重试时最多 N + 1，
+    默认（不重试）是 1。MemoryClient 抛出的别的异常（KeyError、cuemem.errors 里的类型）上也有
+    这个属性。"""
+
+    attempts: int = 1
 
     def __init__(
         self,

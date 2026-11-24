@@ -27,7 +27,12 @@ from cuemem.core.timeutil import to_epoch
 from cuemem.core.trace import span
 from cuemem.embed.base import EmbeddingBatch, TextEmbedder
 from cuemem.embed.multimodal import ImageEmbedder
-from cuemem.errors import ConcurrentWriteError, ContentFilteredError, EmbeddingAPIError
+from cuemem.errors import (
+    ConcurrentWriteError,
+    ContentFilteredError,
+    EmbeddingAPIError,
+    VectorStoreFullError,
+)
 from cuemem.store.media import MediaStore, StoredImage
 from cuemem.store.sqlite import MemoryDB
 from cuemem.store.vector import VectorStore
@@ -42,11 +47,15 @@ def worth_retrying(exc: BaseException) -> bool:
     数据库出错时有。没有的：向量接口拒绝了请求本身（别的 4xx）、内容审核、发言本身不合法（图片
     读不出来、像素太多等），留着它们，这个会话后面的写入都得排在它们后面；撞号
     （ConcurrentWriteError）时什么都没写（第七轮体检起），但这个会话另有一个写入者（别的进程），
-    自动重试会把发言排到它的发言之后，留给调用方决定。"""
+    自动重试会把发言排到它的发言之后，留给调用方决定；本地向量库没有余量建新的集合
+    （VectorStoreFullError，例如这个空间的第一张图片要建图片集合）：要运营者处理（删空间、调高
+    ulimit、换服务端模式），留着它这个会话后面的写入一直排在它后面，会话结束时一起丢掉
+    （第九轮体检 P3）。"""
     if isinstance(
         exc,
         ConcurrentWriteError
         | ContentFilteredError
+        | VectorStoreFullError
         | UnidentifiedImageError
         | ValueError
         | TypeError
@@ -195,6 +204,8 @@ class OnlineWriter:
         space_id: str,
         batches: Sequence[Sequence[tuple[SessionIn, int]]],
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+        *,
+        first_wins: bool = False,
     ) -> Iterator[IngestReport]:
         """写入这些会话的发言，要么全部写进去，要么什么都不留。每项是会话与第一句的序号（导入
         整段对话时从 0 起；Agent 追加新的一问一答时接着往下排）。with 块里调用方的写入（登记巩固
@@ -205,18 +216,23 @@ class OnlineWriter:
         发言，却没有"轮"、也没有巩固任务，调用方重试又把同样的话写一遍。现在出错时数据库里什么
         都没写，已经写进向量库的点尽量删掉，存进媒体库、别处没有用到的原图也删掉（见 _discard）。
 
-        每批向量化一次，与以前逐次写入时的请求相同：导入整段对话是一批，导入文件时每段连续的
-        发言一批。已有的发言不再处理；遗忘删掉的发言也不会被写回来。
+        每批向量化一次：导入整段对话是一批，一次追加是一批，导入文件时若干段合成一批（见
+        MemorySystem.appending）。已有的发言不再处理；遗忘删掉的发言也不会被写回来。
 
         meta：（会话，发言序号）→ 附加信息（SDK 的 metadata、过期时间与更正目标，导入的文件），
         与发言在同一个事务里写，只写给真正写进去的发言；不影响"轮"与向量化。
+
+        first_wins：一批里同一句出现不止一次时只写先出现的那个（见 _stage）。追加与导入文件时打开
+        （MemorySystem.appending）；导入整段对话（ingest，评测建库用它）不开，与以前逐字相同：
+        LongMemEval 里有 13 个样本同一个会话出现两次，那一"轮"照旧写两次向量（后一次的时间留在
+        向量库里）、在 units_added 里算两次。
         """
         started = time.perf_counter()
         staged = _Staged(space_id)
         try:
             try:
                 for pieces in batches:
-                    self._stage(staged, pieces, meta)
+                    self._stage(staged, pieces, meta, first_wins=first_wins)
                 with self.db.transaction():
                     report = self._commit(staged, started)
                     yield report
@@ -234,9 +250,12 @@ class OnlineWriter:
         staged: _Staged,
         pieces: Sequence[tuple[SessionIn, int]],
         meta: Mapping[tuple[str, int], TurnMeta | None] | None = None,
+        *,
+        first_wins: bool = False,
     ) -> None:
         """一批会话：建发言与"轮"、存原图，把这批里新的图片与"轮"向量化、写进向量库（不写数据库）。
-        前面几批已经要写的不算新的，与以前逐批提交时相同（导入的文件里序号重复时）。"""
+        前面几批已经要写的不算新的。first_wins：这一批里前面出现过的也不算新的，导入的文件里序号
+        重复时先出现的算，与发言的 INSERT OR IGNORE 一致（以前每段一批，只用管前面几批）。"""
         space_id = staged.space_id
         units: list[MemoryUnit] = []
         media: list[MediaItem] = []
@@ -256,7 +275,12 @@ class OnlineWriter:
         if media:  # 新图片：先写图片向量，再登记图片记录（数据库里有就说明向量已写入）
             known = {m.id for m in self.db.get_media(space_id, ids=[m.id for m in media])}
             known |= {m.id for m in staged.media}
-            new_media = [m for m in media if m.id not in known]
+            new_media = []
+            for m in media:
+                if m.id not in known:
+                    if first_wins:
+                        known.add(m.id)
+                    new_media.append(m)
             if new_media and self.image_embedder is not None:
                 with span("embed_images", images=len(new_media)):
                     vectors = self.image_embedder.embed_images([Path(m.path) for m in new_media])
@@ -274,7 +298,12 @@ class OnlineWriter:
 
         missing = set(self.db.missing_unit_ids(space_id, [u.id for u in units]))
         missing -= {u.id for u in staged.units}
-        new_units = [u for u in units if u.id in missing]
+        new_units = []
+        for u in units:
+            if u.id in missing:
+                if first_wins:
+                    missing.discard(u.id)
+                new_units.append(u)
         if new_units:
             embedded = self._embed(new_units)
             staged.units.extend(new_units)

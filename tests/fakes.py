@@ -36,8 +36,10 @@ def chat_completion_body(
     completion_tokens: int = 30,
     cached_tokens: int = 0,
     tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str | None = None,
 ) -> dict[str, Any]:
-    """按两家供应商各自的 usage 字段格式构造聊天补全响应。"""
+    """按两家供应商各自的 usage 字段格式构造聊天补全响应。finish_reason 没给时是 stop
+    （有工具调用时 tool_calls）；"length" 模拟回复在输出上限处被截断。"""
     usage: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -67,7 +69,7 @@ def chat_completion_body(
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": "tool_calls" if tool_calls else "stop",
+                "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
             }
         ],
         "usage": usage,

@@ -905,6 +905,7 @@ def test_proxy_identity_stays_in_scope(world: World) -> None:
         _chat(http, ALICE_TOKEN, user=["alice"]),
         _chat(http, ALICE_TOKEN, user="bob", stream=True),
         _chat(http, ALICE_TOKEN, path="/v1/responses", user="bob"),
+        _chat(http, ALICE_TOKEN, path="/v1/responses", user="bob", stream=True),
         _chat(http, SHOP_TOKEN, user="bob"),  # 用户本人的记忆
         _chat(http, SHOP_TOKEN, user="bob", headers={"X-CueMem-Agent": "bot"}),
     ]
@@ -1003,6 +1004,8 @@ def test_scoped_key_model_allowlist(limited: tuple[TestClient, MemoryProxy, Fake
         assert "qwen3.8-flash" in error["message"]
     responses = _chat(http, LIMITED_TOKEN, path="/v1/responses", model="qwen3.8-max", user="alice")
     assert responses.status_code == 403
+    streamed = _chat(http, LIMITED_TOKEN, path="/v1/responses", model="qwen3.8-max", stream=True)
+    assert streamed.status_code == 403 and streamed.json()["error"]["param"] == "model"
     assert fake_api.chat_requests == [] and proxy.open_runs() == 0
 
     ok = _chat(http, LIMITED_TOKEN, user="alice", model="qwen3.8-flash", enable_thinking=True)
@@ -1090,6 +1093,11 @@ def test_scoped_key_output_cap(limited: tuple[TestClient, MemoryProxy, FakeAPI])
     assert sent["max_tokens"] == 200 and sent["max_completion_tokens"] == 200
     responses = _chat(http, CAPPED_TOKEN, path="/v1/responses", max_output_tokens=9000)
     assert responses.status_code == 200 and fake_api.chat_requests[-1]["max_tokens"] == 1000
+    for given in ({"max_output_tokens": 9000}, {}):  # /v1/responses 的流式也一样
+        streamed = _chat(http, CAPPED_TOKEN, path="/v1/responses", stream=True, **given)
+        assert streamed.status_code == 200 and "response.completed" in streamed.text
+        assert fake_api.chat_requests[-1]["max_tokens"] == 1000
+        assert fake_api.chat_requests[-1]["stream"] is True
     seen = len(fake_api.chat_requests)
     for n in (2, 16):
         refused = _chat(http, CAPPED_TOKEN, n=n)

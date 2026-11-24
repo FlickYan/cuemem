@@ -698,6 +698,30 @@ class MemoryDB:
             rows.setdefault(r[0], r)
         return [_row_to_turn(r) for r in sorted(rows.values(), key=_turn_order)]
 
+    def turn_bounds(self, space_id: str) -> dict[str, int]:
+        """会话 ID → 现有发言里最大的序号（一条走 UNIQUE(space_id, session_id, idx) 索引的查询）：
+        导出开始时记下，之后写进来的发言不在这次导出里（portable.export_plan）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, MAX(idx) FROM turns WHERE space_id = ? GROUP BY session_id",
+                (space_id,),
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def export_rows(
+        self, space_id: str, session_id: str, max_idx: int
+    ) -> tuple[list[Turn], dict[str, TurnMeta], dict[str, MediaItem]]:
+        """导出一个会话要的三样：序号不超过 max_idx 的发言、它们的附加信息（轮 ID →）与图片记录
+        （图片 ID →），在同一次持锁里读出（写入的事务整个持着这把锁）：写出的每句发言都带着它
+        自己的 metadata、过期时间与图片，不会与另一个时刻的附加信息拼在一起。图片按 ID 查：同一张
+        图在媒体库里只有一行，source_turn_id 只是第一句用到它的发言。"""
+        with self._lock:
+            turns = [t for t in self.get_turns(space_id, session_id) if t.idx <= max_idx]
+            meta = self.get_turn_meta(space_id, [t.id for t in turns])
+            media_ids = list(dict.fromkeys(m for t in turns for m in t.media_ids))
+            media = {m.id: m for m in self.get_media(space_id, ids=media_ids)}
+        return turns, meta, media
+
     def _in_chunks(
         self, sql: str, args: list[Any], column: str, values: Sequence[Any], order: str = ""
     ) -> list[Sequence[Any]]:

@@ -157,6 +157,7 @@ class Consolidator:
         extractor_model: str | None = None,
         open_sessions: Callable[[str], Collection[str]] | None = None,
         holding_open: Callable[[str], AbstractContextManager[Collection[str]]] | None = None,
+        split_truncated: bool = False,
     ) -> None:
         self.db = db
         self.vectors = vectors
@@ -177,6 +178,8 @@ class Consolidator:
             max_chars=config.max_session_chars,
             fallback_model=config.fallback_model,
             instructions=config.instructions,
+            # 不是 ConsolidationConfig 的字段：那会进巩固指纹与冻结的配置
+            split_truncated=split_truncated,
         )
         self.resolver = EntityResolver(
             llm,

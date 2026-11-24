@@ -705,6 +705,43 @@ def test_a_local_store_keeps_headroom_below_the_open_file_limit(
     memory_only.close()
 
 
+def test_check_room_counts_the_image_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第九轮体检 P3：check_room(images=True) 把还没有的图片集合也算上（空间的第一张图片要另建
+    一个集合，新空间的第一句话带图片时要两个）。以前只看文字集合：已有的空间总是通过，写图片时
+    才 VectorStoreFullError。只在内存里时不查。"""
+    store = VectorStore(tmp_path / "qdrant", dim=4)
+    store.ensure_space("old")
+    image = l2_normalize(np.ones((1, 2), dtype=np.float32))
+    store.upsert_images("seen", ["m"], image, [{}])  # 有图片集合、没有文字集合
+    collections = len(store._client.get_collections().collections)
+    soft = next(s for s in range(collections, 10_000) if s - reserved_files(s) >= collections + 1)
+    small_open_file_limit(monkeypatch, soft)  # 还能建一个
+    store.check_room("old", images=True)
+    store.check_room("new")
+    store.check_room("seen", images=True)
+    with pytest.raises(VectorStoreFullError):  # 文字集合与图片集合：要两个
+        store.check_room("new", images=True)
+
+    small_open_file_limit(monkeypatch, soft - 1)  # 正好够已有的
+    store.check_room("old")
+    with pytest.raises(VectorStoreFullError):
+        store.check_room("old", images=True)
+    with pytest.raises(VectorStoreFullError):
+        store.check_room("seen", images=True)  # 文字集合还没有
+    assert len(store._client.get_collections().collections) == collections  # 只查，不建
+    monkeypatch.undo()
+    store.upsert_images("old", ["m"], image, [{}])
+    small_open_file_limit(monkeypatch, soft)  # 多了一个集合：这个上限现在正好够已有的
+    store.check_room("old", images=True)  # 图片集合已经有了
+    store.close()
+
+    memory_only = VectorStore(None, dim=4)
+    memory_only.check_room("new", images=True)
+    memory_only.close()
+
+
 def test_a_small_open_file_limit_still_leaves_room_for_collections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

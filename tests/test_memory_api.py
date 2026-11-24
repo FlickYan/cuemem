@@ -257,7 +257,7 @@ RETURNS: dict[str, Any] = {
     "media": b"image",
     "wait": None,
     # GET /api/v1/export 边读边写（第八轮体检 P7）：调用 Memory._export_plan，再写出这个计划
-    "_export_plan": ExportPlan(cast(MemoryDB, None), "alice", [], {}, {}, set(), None),
+    "_export_plan": ExportPlan(cast(MemoryDB, None), "alice", [], {}, set(), None),
 }
 
 
@@ -1204,6 +1204,84 @@ def test_an_export_holds_one_turn_of_images_at_a_time(
     assert streamed == JSONResponse(whole).body  # 一段一段编出的 base64 拼起来逐字节照旧
 
 
+def _two_sessions(system: MemorySystem) -> Memory:
+    """s1 的一句话比 EXPORT_CHUNK_BYTES 长：iter_export_json 的第一段在读 s2 之前写出。"""
+    local = Memory.from_system(system)
+    long_text = "I live in Berlin " + "x" * 70000
+    local.add(long_text, user_id="alice", run_id="s1", infer=False, timestamp=AUG)
+    local.add("I like tea", user_id="alice", run_id="s2", infer=False, timestamp="2026-08-02")
+    return local
+
+
+def test_a_turn_added_mid_stream_is_left_out(
+    system: MemorySystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """导出是开始那一刻的发言（第九轮体检 P6）。以前会话的发言在写到它时才读，附加信息与图片
+    记录却是开始时读的：下载途中写进来的发言也被导出，但没有图片、metadata 与过期时间（导回去
+    之后永远不过期），文件仍是合法的 JSON。现在它不在这次导出里，响应体与开始时的导出逐字节
+    相同。"""
+    from cuemem import portable
+
+    monkeypatch.setattr(portable, "_now", lambda: EXPORTED_AT)
+    local = _two_sessions(system)
+    before = JSONResponse(portable.export_space(system, "alice")).body
+    stream = portable.iter_export_json(portable.export_plan(system, "alice"))
+    first = next(stream)
+    assert b"I like tea" not in first  # s2 还没读
+    local.add(
+        _with_image("trip photo", _photo((9, 9), "green")),
+        user_id="alice",
+        run_id="s2",
+        metadata={"topic": "travel"},
+        expiration_date="2026-12-31",
+        infer=False,
+    )
+    local.add("a session started later", user_id="alice", run_id="s9", infer=False)
+    body = first + b"".join(stream)
+    assert [(s["session_id"], len(s["turns"])) for s in json.loads(body)["sessions"]] == [
+        ("s1", 1),
+        ("s2", 1),
+    ]
+    assert body == before
+    late = portable.export_space(system, "alice")["sessions"][1]["turns"][1]  # 下一次导出里完整
+    assert (len(late["images"]), late["metadata"], late["expires_at"][:10]) == (
+        1,
+        {"topic": "travel"},
+        "2026-12-31",
+    )
+
+
+def test_a_session_recreated_mid_stream_keeps_its_metadata(system: MemorySystem) -> None:
+    """下载途中整个空间被遗忘、又用同一个 run_id 写：新的发言序号从 0 重来、轮 ID 也相同，在
+    “开始时最大的序号”之内。每个会话的发言与附加信息在同一次持锁里读（MemoryDB.export_rows），
+    写出的发言带着它自己的 metadata 与过期时间；以前它与开始时读的附加信息（没有）拼在一起。"""
+    from cuemem import portable
+
+    local = _two_sessions(system)
+    stream = portable.iter_export_json(portable.export_plan(system, "alice"))
+    first = next(stream)
+    local.delete_all(user_id="alice")
+    local.add(
+        "secret new",
+        user_id="alice",
+        run_id="s2",
+        metadata={"topic": "x"},
+        expiration_date="2026-12-31",
+        infer=False,
+    )
+    streamed = json.loads(first + b"".join(stream))
+    fresh = {
+        (s["session_id"], t["idx"]): t
+        for s in portable.export_space(system, "alice")["sessions"]
+        for t in s["turns"]
+    }
+    assert set(fresh) == {("s2", 0)} and fresh["s2", 0]["metadata"] == {"topic": "x"}
+    seen = {(s["session_id"], t["idx"]): t for s in streamed["sessions"] for t in s["turns"]}
+    assert ("s2", 0) in seen  # 这一句在计划的范围之内
+    for key in seen.keys() & fresh.keys():
+        assert seen[key] == fresh[key], key
+
+
 def test_runs_scopes_export_and_load(mem: Mem) -> None:
     with mem.run(user_id="carol", wait=True) as run_id:
         mem.add("I live in Oslo", user_id="carol", run_id=run_id)
@@ -1542,6 +1620,210 @@ def test_transport_errors_say_whether_the_request_was_sent(
     assert ("Cannot reach" in str(raised.value)) == (code == "unreachable")
     if error is httpx2.ReadTimeout:
         assert "within 7s" in str(raised.value) and "may have been processed" in str(raised.value)
+
+
+# ---------- MemoryClient(max_retries=N)：自动重试（第九轮体检 P16） ----------
+
+Step = httpx2.Response | type[httpx2.TransportError]
+
+
+def _retrying(
+    steps: list[Step], max_retries: int = 2
+) -> tuple[MemoryClient, list[httpx2.Request], list[float]]:
+    """照 steps 依次回答（响应，或者抛出的传输出错）的客户端，连同收到的请求与睡了多久。"""
+    requests: list[httpx2.Request] = []
+    sleeps: list[float] = []
+    script = iter(steps)
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        step = next(script)
+        if isinstance(step, httpx2.Response):
+            return step
+        raise step("boom", request=request)
+
+    http = httpx2.Client(transport=httpx2.MockTransport(handle))
+    client = MemoryClient("http://127.0.0.1:9", http_client=http, max_retries=max_retries)
+    client._sleep = sleeps.append
+    client._random = lambda: 1.0  # 抖动取上限：退避正好是 0.5、1、2 … 秒
+    return client, requests, sleeps
+
+
+def _limited(retry_after: str | None, status: int = 429) -> httpx2.Response:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    error = {"message": "slow down", "type": "RateLimitError", "code": "rate_limited"}
+    return httpx2.Response(status, json={"error": error}, headers=headers)
+
+
+def test_retries_wait_out_a_short_retry_after() -> None:
+    """max_retries 大于 0：429、503 带着不超过 30 秒的 Retry-After 时等这么久再发一次，只读的
+    与写入的调用都是（请求没有被处理）。以前只发一次，调用方各自写重试。"""
+    ok = httpx2.Response(200, json={"results": []})
+    client, requests, sleeps = _retrying([_limited("1"), ok])
+    assert client.search("where?", user_id="alice") == {"results": []}
+    assert (len(requests), sleeps) == (2, [1.0])
+    assert requests[0].content == requests[1].content
+
+    client, requests, sleeps = _retrying([_limited("5", 503), _limited("0.5"), ok])
+    assert client.delete_all(user_id="alice") == {"results": []}
+    assert (len(requests), sleeps) == (3, [5.0, 0.5])
+
+    client, requests, sleeps = _retrying([_limited("1")] * 3)  # 用完了：抛出最后一次的
+    with pytest.raises(MemoryAPIError) as raised:
+        client.search("where?", user_id="alice")
+    assert (raised.value.status, raised.value.retry_after, raised.value.attempts) == (429, "1", 3)
+    assert (len(requests), sleeps) == (3, [1.0, 1.0])
+
+
+def test_a_retried_add_carries_one_generated_idempotency_key() -> None:
+    """add 没给 idempotency_key 时，max_retries 大于 0 的客户端为这次调用生成一个（uuid4），
+    超时、断开之后带着同一个键重发；自己给的键原样用。下一次调用是另一个键。"""
+    import uuid
+
+    ok = httpx2.Response(200, json={"status": "duplicate"})
+    client, requests, sleeps = _retrying(
+        [httpx2.ReadTimeout, httpx2.RemoteProtocolError, ok, ok, httpx2.ReadTimeout, ok]
+    )
+    assert client.add("I live in Berlin", user_id="alice") == {"status": "duplicate"}
+    keys = [r.headers["Idempotency-Key"] for r in requests]
+    assert len(keys) == 3 and len(set(keys)) == 1
+    assert str(uuid.UUID(keys[0])) == keys[0] and uuid.UUID(keys[0]).version == 4
+    assert len({r.content for r in requests}) == 1
+    assert sleeps == [0.5, 1.0]  # 没有拿到响应：0.5 秒起每次翻倍
+    client.add("I like tea", user_id="alice")
+    assert requests[3].headers["Idempotency-Key"] != keys[0]
+    client.add("I like jazz", user_id="alice", idempotency_key="mine-1")
+    assert [r.headers["Idempotency-Key"] for r in requests[4:]] == ["mine-1", "mine-1"]
+
+
+def test_a_retried_add_is_written_once(system: MemorySystem) -> None:
+    """对着真的服务：第一次的 add 已经写下，响应却没有回来（读超时）。重发带着同一个键，服务端
+    回 duplicate，日志里只有一句。"""
+    with TestClient(v1_app(system)) as http:
+        lost: list[int] = []
+
+        def forward(request: httpx2.Request) -> httpx2.Response:
+            inner = http.request(
+                request.method,
+                str(request.url),
+                content=request.content,
+                headers={k: v for k, v in request.headers.items() if k != "content-length"},
+            )
+            if not lost:
+                lost.append(inner.status_code)
+                raise httpx2.ReadTimeout("the response never arrived", request=request)
+            headers = {"content-type": inner.headers["content-type"]}
+            return httpx2.Response(inner.status_code, content=inner.content, headers=headers)
+
+        with httpx2.Client(transport=httpx2.MockTransport(forward)) as flaky:
+            client = MemoryClient("http://testserver", http_client=flaky, max_retries=1)
+            client._sleep = lambda seconds: None
+            out = client.add("I live in Berlin", user_id="alice", infer=False)
+        assert lost == [200]
+        assert (out["status"], out["replayed"]) == ("duplicate", True)
+        assert [t.text for t in system.db.get_turns("alice")] == ["I live in Berlin"]
+
+
+@pytest.mark.parametrize("call", ["delete", "update", "end_run", "answer"])
+def test_writes_are_not_resent_after_a_timeout(call: str) -> None:
+    """请求可能已经送到（超时、断开）时，没有幂等键的写入不重发：只发一次，照旧是 MemoryAPIError
+    timeout，attempts 为 1。连不上（请求没有送到）时重发。"""
+    calls: dict[str, Callable[[MemoryClient], Any]] = {
+        "delete": lambda c: c.delete("abc"),
+        "update": lambda c: c.update("abc", "I live in Rome"),
+        "end_run": lambda c: c.end_run("r1", user_id="alice"),
+        "answer": lambda c: c.answer("where?", user_id="alice"),
+    }
+    client, requests, sleeps = _retrying([httpx2.ReadTimeout])
+    with pytest.raises(MemoryAPIError) as raised:
+        calls[call](client)
+    assert (raised.value.code, raised.value.attempts) == ("timeout", 1)
+    assert (len(requests), sleeps) == (1, [])
+
+    ok = httpx2.Response(200, json={"results": []})
+    client, requests, sleeps = _retrying([httpx2.ConnectError, httpx2.ConnectTimeout, ok])
+    assert calls[call](client) == {"results": []}
+    assert (len(requests), sleeps) == (3, [0.5, 1.0])
+
+
+def test_reads_are_resent_after_a_timeout() -> None:
+    """只读的调用在超时、断开之后也重发；退避最多 8 秒，抖动的下限是一半。别的传输出错不重发。"""
+    ok = httpx2.Response(200, json={"results": []})
+    client, requests, sleeps = _retrying([httpx2.ReadTimeout] * 6 + [ok], max_retries=6)
+    assert client.get_all(user_id="alice") == {"results": []}
+    assert sleeps == [0.5, 1.0, 2.0, 4.0, 8.0, 8.0]
+    client, requests, sleeps = _retrying([httpx2.ReadError, httpx2.Response(200, content=b"x")])
+    client._random = lambda: 0.0
+    assert client.media("m1") == b"x" and sleeps == [0.25]
+    client, requests, sleeps = _retrying([httpx2.ProxyError])
+    with pytest.raises(MemoryAPIError) as raised:
+        client.spaces()
+    assert (raised.value.code, raised.value.attempts, len(requests)) == ("transport", 1, 1)
+
+
+def test_statuses_that_cannot_clear_in_time_are_not_retried() -> None:
+    """不重发的响应：Retry-After 超过 30 秒的 429（会话数上限是 60 秒，SessionLimitError 上没有
+    retry_after，所以看的是原始的响应）、没有 Retry-After 或者是 HTTP 日期的 429 与 503、502、
+    504（wait 的 TimeoutError）、404（KeyError）。每种只发一次。"""
+    session_limit = httpx2.Response(
+        429,
+        json={"error": {"message": "too many", "type": "SessionLimitError", "code": "x"}},
+        headers={"Retry-After": "60"},
+    )
+    client, requests, sleeps = _retrying([session_limit])
+    with pytest.raises(SessionLimitError) as limited:
+        client.open_run(user_id="alice")
+    assert getattr(limited.value, "attempts", None) == 1
+    assert (len(requests), sleeps) == (1, [])
+
+    for response in (
+        _limited(None),
+        _limited(None, 503),
+        _limited("Wed, 21 Oct 2026 07:28:00 GMT"),
+        _limited("-1"),
+        _limited("nan"),
+        _limited("31"),
+        _limited("1", 502),
+        _limited("1", 500),
+    ):
+        client, requests, sleeps = _retrying([response])
+        with pytest.raises(MemoryAPIError) as raised:
+            client.search("where?", user_id="alice")
+        assert (raised.value.status, raised.value.attempts) == (response.status_code, 1)
+        assert (len(requests), sleeps) == (1, [])
+
+    timed_out = {"error": {"message": "still busy", "type": "TimeoutError", "code": "timeout"}}
+    client, requests, sleeps = _retrying([httpx2.Response(504, json=timed_out)])
+    with pytest.raises(TimeoutError, match="still busy"):
+        client.wait(user_id="alice")
+    assert (len(requests), sleeps) == (1, [])
+
+    missing = {"error": {"message": "no such", "type": "KeyError", "code": "not_found"}}
+    client, requests, sleeps = _retrying([httpx2.Response(404, json=missing)])
+    assert client.get("abc") is None and len(requests) == 1
+
+
+def test_no_retries_by_default() -> None:
+    """默认 max_retries=0：add 不带 Idempotency-Key（请求与以前相同），429 只发一次；写错的
+    max_retries 在构造时 ValueError。AsyncMemoryClient 把它传下去。"""
+    ok = httpx2.Response(200, json={"status": "queued"})
+    client, requests, sleeps = _retrying([ok, _limited("1"), httpx2.ConnectError], max_retries=0)
+    client.add("I live in Berlin", user_id="alice")
+    assert "idempotency-key" not in requests[0].headers
+    with pytest.raises(MemoryAPIError) as raised:
+        client.search("where?", user_id="alice")
+    assert (raised.value.status, raised.value.attempts) == (429, 1)
+    with pytest.raises(MemoryAPIError, match="Cannot reach"):
+        client.spaces()
+    assert (len(requests), sleeps) == (3, [])
+    assert MemoryClient("http://127.0.0.1:9")._max_retries == 0
+
+    for bad in (-1, True, 1.5, "2", None):
+        with pytest.raises(ValueError, match="max_retries"):
+            MemoryClient("http://127.0.0.1:9", max_retries=cast(int, bad))
+        with pytest.raises(ValueError, match="max_retries"):
+            AsyncMemoryClient("http://127.0.0.1:9", max_retries=cast(int, bad))
+    assert AsyncMemoryClient("http://127.0.0.1:9", max_retries=3).sync._max_retries == 3
 
 
 def test_wait_gives_up_on_the_server_before_the_client_read_timeout() -> None:

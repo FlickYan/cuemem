@@ -45,6 +45,7 @@ from cuemem.errors import (
     CacheMissError,
     ContentFilteredError,
     MissingAPIKeyError,
+    OutputTruncatedError,
     StructuredOutputError,
 )
 from cuemem.llm.cache import ResponseCache, request_key
@@ -316,6 +317,7 @@ class LLMClient:
         max_attempts: int = 3,
         cache_scope: str | None = None,
         fallback_model: str | None = None,
+        raise_on_truncation: bool = False,
     ) -> Structured[T]:
         """让模型输出符合 schema 的 JSON 并解析；不合格时把校验错误反馈给模型重试。
 
@@ -326,6 +328,11 @@ class LLMClient:
         只读缓存（llm_cache_mode=read_only，--cache-only）下主模型未命中缓存时也换备用模型：
         构建时主模型被拒或超时的请求没有缓存，缓存里只有备用模型的回复，以前重放到这里就
         CacheMissError。两个都未命中时抛出 CacheMissError（写明两个模型）。
+
+        raise_on_truncation：回复不是合法的 JSON 且是在输出上限处被截断的（finish_reason 为
+        length）时，不再反馈重试，立即抛出 OutputTruncatedError：把截断的 JSON 发回去要求改正，
+        提示词越来越长，回复多半再被截断，三次都进了缓存，以后每次重试都重放同样的失败。
+        默认 False：请求与流程照旧（评测与冻结的方法都不传）。
         """
         primary = model or (
             self.settings.roles[role].model if role in self.settings.roles else None
@@ -341,6 +348,7 @@ class LLMClient:
                 max_attempts,
                 cache_scope,
                 retry_timeouts=fallback is None,
+                raise_on_truncation=raise_on_truncation,
             )
         except fallback_errors(self.settings) as exc:
             if fallback is None:
@@ -348,7 +356,14 @@ class LLMClient:
             record_event("llm_fallback", role=role, model=fallback, reason=type(exc).__name__)
             with replay_miss(exc, role, primary, fallback):
                 return self._structured(
-                    role, messages, schema, fallback, max_tokens, max_attempts, cache_scope
+                    role,
+                    messages,
+                    schema,
+                    fallback,
+                    max_tokens,
+                    max_attempts,
+                    cache_scope,
+                    raise_on_truncation=raise_on_truncation,
                 )
 
     def _structured[T: BaseModel](
@@ -362,6 +377,7 @@ class LLMClient:
         cache_scope: str | None,
         *,
         retry_timeouts: bool = True,
+        raise_on_truncation: bool = False,
     ) -> Structured[T]:
         msgs = _with_schema_instruction(messages, schema)
         last_error = ""
@@ -404,6 +420,11 @@ class LLMClient:
                     value=schema.model_validate_json(text), result=result, attempts=attempt
                 )
             except ValidationError as exc:
+                if raise_on_truncation and result.finish_reason == "length":
+                    # 消息里不带模型的输出（它是用户对话的转述，会进任务的错误与日志）
+                    raise OutputTruncatedError(
+                        f"模型的回复在输出上限处被截断（{len(text)} 个字符），不是合法的 JSON"
+                    ) from None
                 last_error = str(exc)
                 feedback = (
                     f"That JSON does not match the schema: {_brief_errors(exc)}. "
@@ -516,11 +537,31 @@ class LLMClient:
             self._sleep(min(remaining, 60.0))
 
     def _account(self, role: str, alias: str, spec: ModelSpec, result: ChatResult) -> None:
-        nominal, discounted = chat_cost(spec.price, result.usage)
+        self.account(
+            role,
+            alias,
+            spec,
+            result.usage,
+            latency_ms=result.latency_ms,
+            from_cache=result.from_cache,
+        )
+
+    def account(
+        self,
+        role: str,
+        alias: str,
+        spec: ModelSpec,
+        usage: Usage,
+        *,
+        latency_ms: float = 0.0,
+        from_cache: bool = False,
+    ) -> None:
+        """记一次聊天补全的用量：账本一行、trace 一条 llm 事件。chat / chat_stream 记自己的；
+        不经过这个客户端的调用（记忆代理转发的请求，api/proxy.py）也用它记，算法相同。"""
+        nominal, discounted = chat_cost(spec.price, usage)
         peak = self.settings.providers[spec.provider].peak_hours
-        if peak is not None and not result.from_cache and not in_peak(peak, self._now()):
+        if peak is not None and not from_cache and not in_peak(peak, self._now()):
             discounted *= peak.off_peak_factor  # 非高峰时段的实际价格（标价按高峰计）
-        usage = result.usage
         if self.ledger is not None:
             self.ledger.record(
                 UsageRecord(
@@ -536,21 +577,21 @@ class LLMClient:
                     cost=nominal,
                     cost_cached=discounted,
                     currency=spec.currency,
-                    from_cache=result.from_cache,
-                    latency_ms=result.latency_ms,
+                    from_cache=from_cache,
+                    latency_ms=latency_ms,
                 )
             )
         record_event(
             "llm",
             role=role,
             model=alias,
-            from_cache=result.from_cache,
+            from_cache=from_cache,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cached_input_tokens=usage.cached_input_tokens,
             cost=round(nominal, 6),
-            spent=0.0 if result.from_cache else round(discounted, 6),
-            latency_ms=round(result.latency_ms, 1),
+            spent=0.0 if from_cache else round(discounted, 6),
+            latency_ms=round(latency_ms, 1),
         )
 
 

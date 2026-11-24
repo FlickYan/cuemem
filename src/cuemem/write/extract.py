@@ -18,7 +18,8 @@ from pydantic import BaseModel, field_validator
 from cuemem.core.ids import content_hash
 from cuemem.core.models import Cardinality, EntityType, FactCategory, Turn
 from cuemem.core.timeutil import normalize_partial_date
-from cuemem.core.trace import span
+from cuemem.core.trace import record_event, span
+from cuemem.errors import OutputTruncatedError
 from cuemem.llm.client import LLMClient, Message
 from cuemem.write.caption import inline_images
 from cuemem.write.predicates import SUGGESTED
@@ -286,7 +287,10 @@ class Extractor:
         max_chars: int = 24_000,
         fallback_model: str | None = None,
         instructions: str | None = None,
+        split_truncated: bool = False,
     ) -> None:
+        # split_truncated：回复在输出上限处被截断时把窗口对半分开再抽（见 _extract_window）。
+        # 默认关：评测的构建与只读重放发出的请求照旧，包括当年就这样失败的会话
         self.llm = llm
         self.role = role
         self.model = model
@@ -294,6 +298,7 @@ class Extractor:
         self.max_chars = max_chars
         self.fallback_model = fallback_model
         self.instructions = instructions.strip() if instructions else None
+        self.split_truncated = split_truncated
 
     def extract(
         self,
@@ -319,14 +324,40 @@ class Extractor:
         deleted = gaps(turns)
         start = 0
         for window in self._windows(turns):
-            messages = self.messages(
+            self._extract_window(
                 window,
-                started_at,
+                start if deleted else None,
+                result,
+                summaries,
+                by_idx,
+                cache_scope=cache_scope,
                 image_notes=image_notes,
-                deleted_from=start if deleted else None,
             )
             start = window[-1].idx + 1
-            with span("extract", session=session_id, turns=len(window)):
+        result.summary = " ".join(summaries)
+        return result
+
+    def _extract_window(
+        self,
+        window: Sequence[Turn],
+        deleted_from: int | None,
+        result: SessionExtraction,
+        summaries: list[str],
+        by_idx: Mapping[int, str],
+        *,
+        cache_scope: str | None,
+        image_notes: Mapping[str, Sequence[str]] | None,
+    ) -> None:
+        """抽取一个窗口，结果并进 result 与 summaries。
+
+        split_truncated 打开时，回复在输出上限处被截断（很多句各带事实的短发言，输出比输入长得多）
+        就把窗口对半分开、依次各抽一次，像相邻的两个窗口那样合并；只剩一句发言还被截断时照旧失败
+        （一次调用，以前三次）。被截断的那次调用每分一层付一次。"""
+        messages = self.messages(
+            window, result.started_at, image_notes=image_notes, deleted_from=deleted_from
+        )
+        try:
+            with span("extract", session=result.session_id, turns=len(window)):
                 structured = self.llm.structured(
                     self.role,
                     messages,
@@ -334,20 +365,38 @@ class Extractor:
                     model=self.model,
                     cache_scope=cache_scope,
                     fallback_model=self.fallback_model,
+                    raise_on_truncation=self.split_truncated,
                 )
-            output = structured.value
-            result.attempts += structured.attempts
-            if output.summary:
-                summaries.append(output.summary)
-            result.entities.extend(output.entities)
-            for fact in output.facts:
-                if not fact.statement.strip():
-                    continue
-                ids = [by_idx[i] for i in dict.fromkeys(fact.turns) if i in by_idx]
-                result.dropped_turn_refs += len(set(fact.turns)) - len(ids)
-                result.facts.append(CandidateFact(raw=fact, source_turn_ids=ids))
-        result.summary = " ".join(summaries)
-        return result
+        except OutputTruncatedError:
+            if len(window) <= 1:
+                raise
+            record_event("extract_split", turns=len(window))
+            result.attempts += 1
+            middle = len(window) // 2
+            for half in (window[:middle], window[middle:]):
+                self._extract_window(
+                    half,
+                    deleted_from,
+                    result,
+                    summaries,
+                    by_idx,
+                    cache_scope=cache_scope,
+                    image_notes=image_notes,
+                )
+                if deleted_from is not None:
+                    deleted_from = half[-1].idx + 1
+            return
+        output = structured.value
+        result.attempts += structured.attempts
+        if output.summary:
+            summaries.append(output.summary)
+        result.entities.extend(output.entities)
+        for fact in output.facts:
+            if not fact.statement.strip():
+                continue
+            ids = [by_idx[i] for i in dict.fromkeys(fact.turns) if i in by_idx]
+            result.dropped_turn_refs += len(set(fact.turns)) - len(ids)
+            result.facts.append(CandidateFact(raw=fact, source_turn_ids=ids))
 
     def messages(
         self,

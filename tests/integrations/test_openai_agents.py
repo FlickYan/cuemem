@@ -138,9 +138,7 @@ def jobs(memory: Memory, space: str = "alice") -> list[str]:
 
 def test_tools_share_names_and_descriptions_with_mcp(memory: Memory) -> None:
     server = build_server(cast(Any, None), "alice")
-    mcp = {
-        t.name: " ".join((t.description or "").split()) for t in asyncio.run(server.list_tools())
-    }
+    mcp = {t.name: t.description for t in asyncio.run(server.list_tools())}  # 逐字相同
     tools = memory_tools(memory, user_id="alice")
     assert [t.name for t in tools] == ["recall", "remember", "forget"]
     for tool in tools:
