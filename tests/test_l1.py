@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime
@@ -15,7 +17,7 @@ from cuemem.core.models import Conversation
 from cuemem.memory import MemorySystem
 from cuemem.read.bm25 import BM25, tokenize
 from cuemem.read.l1 import L1Config
-from cuemem.read.query import analyze, parse_time
+from cuemem.read.query import _ZH_NUM_HEAD, analyze, parse_time
 from cuemem.read.reader import relative_days
 
 NOW = datetime(2023, 5, 30, 22, 0)  # 周二
@@ -53,6 +55,45 @@ def test_time_expressions(text: str, start: str, end: str) -> None:
 )
 def test_no_false_time_ranges(text: str) -> None:
     assert parse_time(text, NOW) is None
+
+
+@pytest.mark.parametrize("text", ["7" * 200_000, "７" * 200_000])
+def test_ago_zh_is_linear_on_long_digit_runs(text: str) -> None:
+    # 旧写法从一长串数字的每一位都重新试一遍，20 万位要几分钟，期间整个服务不响应
+    started = time.perf_counter()
+    assert parse_time(text, NOW) is None
+    assert time.perf_counter() - started < 5
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "三天前我买了什么",
+        "12天前",
+        "3个月以前",
+        "１２天前",
+        "abc123天前",
+        "2个星期前",
+        "几年前",
+        "2023年前",
+        "1 2天前",
+        "12 天前",  # 不匹配
+        "天前",  # 不匹配
+    ],
+)
+def test_ago_zh_matches_old_pattern(text: str) -> None:
+    # 加了 (?<!\d) 之后匹配到的位置与分组必须与原来的写法一样
+    old = re.search(r"(\d+|[一两二三四五六七八九十几])(个星期|星期|个月|天|周|月|年)(以)?前", text)
+    new = re.search(rf"{_ZH_NUM_HEAD}(个星期|星期|个月|天|周|月|年)(以)?前", text)
+    assert (old is None) == (new is None)
+    if old is not None and new is not None:
+        assert (new.span(), new.groups()) == (old.span(), old.groups())
+
+
+def test_ago_zh_keeps_the_whole_digit_run() -> None:
+    found = parse_time("12天前", NOW)  # 取整串 12，不是最后一位 2
+    assert found is not None
+    assert (f"{found.start:%Y-%m-%d}", f"{found.end:%Y-%m-%d}") == ("2023-05-17", "2023-05-20")
 
 
 def test_query_flags() -> None:

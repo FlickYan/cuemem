@@ -78,6 +78,8 @@ FIXED_HOLIDAYS = {
 
 _NUM = r"(\d+|a couple of|a few|several|an?|one|two|three|four|five|six|seven|eight|nine|ten)"
 _ZH_NUM = r"(\d+|[一两二三四五六七八九十几])"
+# 前面没有固定字面量的地方用这个：(?<!\d) 让一长串数字只从头试一次，匹配时间保持线性
+_ZH_NUM_HEAD = r"((?<!\d)\d+|[一两二三四五六七八九十几])"
 _UNIT_ZH = {"天": "day", "日": "day", "周": "week", "星期": "week", "个星期": "week",
             "个月": "month", "月": "month", "年": "year"}  # fmt: skip
 
@@ -205,7 +207,7 @@ def _ago(text: str, now: datetime, today: datetime) -> TimeRange | None:
     if match:
         n, unit = NUMBERS.get(match.group(1)) or int(match.group(1)), match.group(2)
     else:
-        zh = re.search(rf"{_ZH_NUM}(个星期|星期|个月|天|周|月|年)(以)?前", text)
+        zh = re.search(rf"{_ZH_NUM_HEAD}(个星期|星期|个月|天|周|月|年)(以)?前", text)
         if zh is None:
             return None
         raw = zh.group(1)
