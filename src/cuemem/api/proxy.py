@@ -7,10 +7,12 @@
 它们每一轮都检索；这里每一轮先过检索控制器（N7）：
 
 1. **想起**：对最后一句用户消息跑控制器，选 L0（不检索，只给画像）/ L1 / L2；当前会话里
-   已经写进记忆、并且原样还在请求里的轮，检索时排除。请求不是以用户消息结尾时（工具调用的
-   后续请求、用户消息之后还有系统消息）不再检索一次：这个会话上一次为同一句用户消息想起的
-   证据块原样再用（见 Kept），响应头照它写；没有留着的（重启、停放过的会话、用户消息改过）
-   或者之后这个空间遗忘过时，对那句用户消息重新想起；
+   已经写进记忆、并且原样还在请求里的轮，检索时排除。最后一句用户消息之后还有助手或工具的
+   消息时（工具调用的后续请求，见 _last_user）不再检索一次：这个会话上一次为同一句用户消息
+   想起的证据块原样再用（见 Kept），响应头照它写；没有留着的（重启、停放过的会话、用户消息
+   改过）或者之后这个空间遗忘过时，对那句用户消息重新想起。用户消息之后只有系统（system、
+   developer）消息的请求（有的框架每轮在末尾加提醒）是新的一轮，与以用户消息结尾的相同
+   （第十轮体检 Q4）；
 2. **注入**：取到的画像、带有效期的事实与对话片段排成和 reader 相同的证据块，放在最后一句
    用户消息的前面（与 Mem0 的 proxy 相同的位置）；系统提示与之前的消息不动，
    供应商的前缀缓存照常命中。Chat Completions 没有状态，工具调用的后续请求里调用方重发的
@@ -179,10 +181,13 @@ class Unsaved:
 
 @dataclass
 class Kept:
-    """一个会话最近一次想起的结果，留给这一轮里不以用户消息结尾的请求（工具调用的后续）再用。
+    """一个会话最近一次想起的结果，留给这一轮的后续请求（工具调用的后续，见 _last_user）再用。
 
     digest：注入的那句用户消息写回时的样子（stored_text(_storable(...))，与 _in_context 的
-    比对相同）的 SHA-256：调用方重发的还是这一句才再用。epoch：想起之前这个空间删过几次发言
+    比对相同）的 SHA-256：调用方重发的还是这一句才再用。anchor：这句用户消息在 messages 里的
+    位置，也要相同：一轮的工具循环里它不变；每个请求都以助手消息结尾的调用方（续写前缀）
+    之后一轮说了同样的话时位置不同，重新想起（第十轮体检 Q4；以前再用上一轮的证据块）。
+    epoch：想起之前这个空间删过几次发言
     （MemoryDB.turn_epoch）：之后遗忘过就不再用，重新想起。block 为空的也留着（没有画像的 L0
     不用再想一遍）。证据块里的相对时间与它一起不变：再放进去的要与第一次逐字节相同。期间后台
     抽取出的新事实、刚过期的事实不会进来，最多留到会话结束（idle_minutes）。"""
@@ -193,6 +198,7 @@ class Kept:
     reasons: list[str]
     recalled: int
     epoch: int
+    anchor: int
 
 
 @dataclass
@@ -242,7 +248,8 @@ class Turn:
     user_id: str | None = None
     agent_id: str | None = None
     run: Run | None = None
-    write_user: dict[str, Any] | None = None  # 要写回的用户消息（OpenAI 格式）
+    # 要写回的用户消息（OpenAI 格式）；后续请求（见 _last_user）没有，只写回回答
+    write_user: dict[str, Any] | None = None
     anchor: int | None = None  # 最后一句用户消息在 messages 里的位置：证据块放进这一句
     level: str = "none"
     reasons: list[str] = field(default_factory=list)
@@ -687,6 +694,7 @@ class MemoryProxy:
         if user_id is None or not messages:
             return Turn(space=None)
         space = space_for(user_id, agent_id)
+        anchor, follow_up = _last_user(messages)
         held = spaces_over_cap(principal, space, self.system.db.space_ids)
         if held is not None and principal is not None:  # 令牌的 max_spaces（api/auth.py）
             raise ProxyError(
@@ -697,9 +705,12 @@ class MemoryProxy:
                 headers={"x-should-retry": "false"},  # 等也没用：要删空间或调高上限
             )
         # 新的空间、本地向量库又没有余量建它：在开会话、转发之前 503，不让这一轮写不进去。空间的
-        # 第一张图片要另建图片集合，同样先查（第九轮体检 P3）：以前转发、回答之后写回才失败
+        # 第一张图片要另建图片集合，同样先查（第九轮体检 P3）：以前转发、回答之后写回才失败。
+        # 图片在要写回的那句用户消息里（后续请求不写用户消息）
         try:
-            self.system.vectors.check_room(space, images=self._stores_image(messages[-1]))
+            self.system.vectors.check_room(
+                space, images=not follow_up and self._stores_image(messages[anchor])
+            )
         except VectorStoreFullError as exc:
             raise ProxyError(
                 503,
@@ -710,7 +721,9 @@ class MemoryProxy:
             ) from exc
         explicit = headers.get("x-cuemem-session")
         session = _SESSION_ID.sub("_", explicit)[:80] if explicit else None
-        earlier = [m for m in messages[:-1] if m.get("role") in ("user", "assistant")]
+        # 之前的消息：新的一轮里是最后一句用户消息之前的（它后面的系统消息不算），后续请求照旧
+        before = messages[:-1] if follow_up else messages[:anchor]
+        earlier = [m for m in before if m.get("role") in ("user", "assistant")]
         run = self._run(space, session, fresh=not earlier, user_id=user_id, agent_id=agent_id)
         turn = Turn(space=space, user_id=user_id, agent_id=agent_id, run=run)
         try:
@@ -725,13 +738,12 @@ class MemoryProxy:
     ) -> None:
         """_recall 的后一半：给这次请求（turn）想起证据块，或者再用这一轮留着的。"""
         space = run.space
-        users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
-        if not users:
+        anchor, follow_up = _last_user(messages)
+        if anchor < 0:
             return
-        turn.anchor = users[-1]
-        asked = messages[turn.anchor]
-        # 不以用户消息结尾：工具调用的后续请求（或用户消息之后还有系统消息），只写回回答
-        follow_up = turn.anchor != len(messages) - 1
+        turn.anchor = anchor
+        asked = messages[anchor]
+        # 后续请求（用户消息之后有助手、工具的消息）只写回回答；后面只有系统消息的是新的一轮
         if not follow_up:
             turn.write_user = asked
             run.kept = None  # 新的一轮：上一轮想起的不再用（这次想不起来时也不用）
@@ -741,7 +753,13 @@ class MemoryProxy:
         digest = _digest(asked)
         epoch = self.system.db.turn_epoch(space)  # 在想起之前记：之后的遗忘都比得出来
         kept = run.kept
-        if follow_up and kept is not None and kept.digest == digest and kept.epoch == epoch:
+        if (
+            follow_up
+            and kept is not None
+            and kept.digest == digest
+            and kept.anchor == anchor
+            and kept.epoch == epoch
+        ):
             # 这一轮已经想起过、之后没有遗忘过：原样再用，不再检索
             turn.level, turn.reasons = kept.level, list(kept.reasons)
             turn.recalled, turn.block, turn.epoch = kept.recalled, kept.block, kept.epoch
@@ -764,7 +782,9 @@ class MemoryProxy:
             return
         turn.level, turn.reasons = evidence.level, evidence.reasons
         turn.recalled, turn.block = evidence.recalled, evidence.block
-        run.kept = Kept(digest, turn.block, turn.level, list(turn.reasons), turn.recalled, epoch)
+        run.kept = Kept(
+            digest, turn.block, turn.level, list(turn.reasons), turn.recalled, epoch, anchor
+        )
         record_event("proxy_recall", space=space, level=turn.level, recalled=turn.recalled)
 
     def _stores_image(self, message: Any) -> bool:
@@ -1318,6 +1338,22 @@ def _storable(message: dict[str, Any]) -> dict[str, Any]:
         if block.get("type") != "image_url" or _image_url(block).startswith("data:")
     ]
     return {**message, "content": kept}
+
+
+def _last_user(messages: list[Any]) -> tuple[int, bool]:
+    """最后一句用户消息的位置（没有时 -1），与这次请求是不是这一轮的后续请求。
+
+    它之后只有系统消息（system、developer：有的聊天前端与框架每轮在末尾加一条提醒）或者什么都
+    没有时是新的一轮：写回这句用户消息，上一轮留着的证据块不再用，请求里没有之前的消息时开新的
+    会话。之后有别的消息（助手的工具调用、工具的结果、续写用的助手前缀，以及不认识的角色）时是
+    后续请求：只写回回答。第十轮体检 Q4：以前凡是不以用户消息结尾的都算后续请求，每轮在末尾加
+    提醒的调用方说的话从来不写进记忆、几段对话并成一个会话。没有用户消息时也算后续请求。"""
+    anchor = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), -1
+    )
+    if anchor < 0:
+        return -1, True
+    return anchor, any(m.get("role") not in ("system", "developer") for m in messages[anchor + 1 :])
 
 
 def _digest(message: dict[str, Any]) -> str:

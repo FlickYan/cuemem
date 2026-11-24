@@ -1773,9 +1773,10 @@ def test_memory_goes_into_the_user_message_when_a_system_message_follows_it(
     client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, clock: Clock
 ) -> None:
     """用户消息之后还有一条系统消息（有的框架每轮在末尾加提醒）：以前这样的请求不想起；现在
-    证据块放进最后一句用户消息，不是最后一条消息。只写回回答（与工具调用的后续请求相同）。"""
+    证据块放进最后一句用户消息，不是最后一条消息。它是新的一轮：用户的话与回答都写回（第十轮
+    体检 Q4；第九轮只写回回答）。"""
     berlin_is_remembered(client, proxy, system, clock)
-    reminder = {"role": "system", "content": "Answer in one sentence."}
+    reminder = REMINDER
     messages = [SYSTEM, {"role": "user", "content": "Where do I live?"}, reminder]
     body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice"}
     response = client.post("/v1/chat/completions", json=body)
@@ -1785,7 +1786,184 @@ def test_memory_goes_into_the_user_message_when_a_system_message_follows_it(
     assert sent[1]["content"].startswith("<memory>\n") and "Berlin" in sent[1]["content"]
     assert sent[1]["content"].endswith("</memory>\n\nWhere do I live?")
     turns = system.db.get_turns("alice", response.headers["x-cuemem-session"])
-    assert [(t.role, t.text) for t in turns] == [("assistant", "Happy to help, Alice!")]
+    assert [(t.role, t.text) for t in turns] == [
+        ("user", "Where do I live?"),
+        ("assistant", "Happy to help, Alice!"),
+    ]
+
+
+# ---------- 用户消息之后只有系统消息的请求是新的一轮（第十轮体检 Q4） ----------
+
+REMINDER = {"role": "system", "content": "Answer in one sentence."}
+
+
+def post(client: TestClient, messages: list[dict[str, Any]], **headers: str) -> Any:
+    body = {"model": "qwen3.8-flash", "messages": messages, "user": "alice", "tools": TOOLS}
+    return client.post("/v1/chat/completions", json=body, headers=headers)
+
+
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_a_client_that_ends_every_request_with_a_reminder_is_remembered(
+    client: TestClient, system: MemorySystem, upstream: Upstream, role: str
+) -> None:
+    """每一轮都在用户消息之后加一条系统消息的调用方：以前每个请求都算工具调用的后续请求，用户
+    说的话一句也不写进记忆（只有回答），之后什么也抽取不出来。"""
+    reminder = {**REMINDER, "role": role}
+    said = ["I live in Berlin", "My cat is called Momo", "I am allergic to peanuts"]
+    history: list[dict[str, Any]] = [SYSTEM]
+    sessions = set()
+    for text in said:
+        history.append({"role": "user", "content": text})
+        response = post(client, [*history, reminder])
+        assert response.status_code == 200
+        assert upstream.proxied[-1]["messages"] == [*history, reminder]  # 还没有记忆：原样转发
+        sessions.add(response.headers["x-cuemem-session"])
+        history.append({"role": "assistant", "content": "Happy to help, Alice!"})
+    [session] = sessions  # 请求里有之前的消息：还是这段对话
+    turns = [(t.role, t.text) for t in system.db.get_turns("alice", session)]
+    assert turns == [
+        pair for text in said for pair in (("user", text), ("assistant", history[-1]["content"]))
+    ]
+
+
+def test_a_new_conversation_ending_with_a_reminder_starts_a_new_session(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream
+) -> None:
+    """请求里没有之前的消息、末尾有一条系统消息：与以用户消息结尾的相同，开新的会话、上一段交给
+    抽取。以前当前这句用户消息被算成“之前的消息”，几段对话全并进上一个会话。"""
+    first = chat(client, "I live in Berlin", user="alice").headers["x-cuemem-session"]
+    second = post(client, [SYSTEM, {"role": "user", "content": "three"}, REMINDER])
+    third = post(client, [SYSTEM, {"role": "user", "content": "four"}, REMINDER])
+    ids = [first, second.headers["x-cuemem-session"], third.headers["x-cuemem-session"]]
+    assert len(set(ids)) == 3
+    assert proxy.open_runs() == 1 and system.open_sessions("alice") == {ids[2]}
+    # 上一段的原话已经不在请求里，可以被想起来；这一轮自己的话不算
+    assert "I live in Berlin" in upstream.proxied[-2]["messages"][1]["content"]
+    assert [(t.role, t.text) for t in system.db.get_turns("alice", ids[1])] == [
+        ("user", "three"),
+        ("assistant", "Happy to help, Alice!"),
+    ]
+
+
+def test_a_repeated_question_ending_with_a_reminder_recalls_again(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一个会话里隔了一轮又问了同样的话，每个请求末尾都有系统消息：是新的一轮，重新想起。
+    以前算后续请求，再用上一轮留着的证据块（D-076 说新的一轮不再用，只对以用户消息结尾的请求
+    成立）：期间记下的新住址不在里面。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    session = {"X-CueMem-Session": "s1"}
+    ask = {"role": "user", "content": "Where do I live?"}
+    assert post(client, [SYSTEM, ask, REMINDER], **session).status_code == 200
+    block = upstream.proxied[-1]["messages"][1]["content"]
+    assert "Berlin" in block and "Paris" not in block
+    Memory.from_system(system).add("I moved to Paris", user_id="alice", wait=True)  # 另一段对话
+    queries = count_retrievals(system, monkeypatch)
+    answer = {"role": "assistant", "content": "Happy to help, Alice!"}
+    second = post(client, [SYSTEM, ask, answer, ask, REMINDER], **session)
+    assert second.status_code == 200 and queries == ["Where do I live?"]
+    sent = upstream.proxied[-1]["messages"]
+    assert [has_memory(m) for m in sent] == [False, False, False, True, False]
+    assert "Paris" in sent[3]["content"] and sent[3]["content"] != block
+
+
+@pytest.mark.parametrize("reminded", [False, True])
+def test_a_tool_follow_up_ending_with_a_reminder_reuses_the_block(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    reminded: bool,
+) -> None:
+    """真的工具循环、末尾又有系统消息：用户消息之后有助手与工具的消息，照旧是后续请求——再用
+    这一轮的证据块、不检索，只写回回答（与第九轮相同）。reminded：第一个请求末尾也有系统消息，
+    它是新的一轮，用户的话由它写回（以前不写）。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    ask = {"role": "user", "content": ASK}
+    upstream.reply = CALLS_FIND
+    first = post(client, [SYSTEM, ask, *([REMINDER] if reminded else [])])
+    asked = upstream.proxied[-1]["messages"]
+    assert first.headers["x-cuemem-level"] == "L1" and has_memory(asked[1])
+    queries = count_retrievals(system, monkeypatch)
+    upstream.reply = "final"
+    for tail in ([TOOL_CALL, TOOL_RESULT, REMINDER], [REMINDER, TOOL_CALL, TOOL_RESULT]):
+        second = post(client, [SYSTEM, ask, *tail])
+        assert second.status_code == 200
+        assert second.headers["x-cuemem-session"] == first.headers["x-cuemem-session"]
+        assert upstream.proxied[-1]["messages"] == [asked[0], asked[1], *tail]
+    assert queries == []
+    turns = system.db.get_turns("alice", first.headers["x-cuemem-session"])
+    assert [(t.role, t.text) for t in turns] == [
+        ("user", ASK),
+        ("assistant", "final"),
+        ("assistant", "final"),
+    ]
+
+
+def test_a_kept_block_is_not_reused_for_a_later_turn_with_the_same_text(
+    client: TestClient,
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """每个请求都以助手的续写前缀结尾的调用方（照旧算后续请求）：之后一轮说了同样的话时，那句
+    用户消息在请求里的位置不同，不再用上一轮留着的证据块；同一轮重发的（位置相同）照旧再用。"""
+    berlin_is_remembered(client, proxy, system, clock)
+    session = {"X-CueMem-Session": "s1"}
+    ask = {"role": "user", "content": "Where do I live?"}
+    prefill = {"role": "assistant", "content": "You live in", "prefix": True}
+    queries = count_retrievals(system, monkeypatch)
+    for _ in range(2):
+        assert post(client, [SYSTEM, ask, prefill], **session).status_code == 200
+    block = upstream.proxied[-1]["messages"][1]["content"]
+    assert queries == ["Where do I live?"] and "Berlin" in block
+    Memory.from_system(system).add("I moved to Paris", user_id="alice", wait=True)
+    answer = {"role": "assistant", "content": "You live in Berlin."}
+    second = post(client, [SYSTEM, ask, answer, ask, prefill], **session)
+    assert second.status_code == 200 and queries == ["Where do I live?"] * 2
+    sent = upstream.proxied[-1]["messages"]
+    assert "Paris" in sent[3]["content"] and not has_memory(sent[1])
+
+
+def test_a_photo_before_a_reminder_is_checked_for_room(
+    client: TestClient, system: MemorySystem, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """要存的图片在最后一句用户消息里，它后面还有系统消息：转发之前照样查图片集合的余量（以前
+    看的是最后一条消息）。工具调用的后续请求不写用户消息，不查。"""
+    asked: list[bool] = []
+    check_room = system.vectors.check_room
+
+    def checked(space: str, *, images: bool = False) -> None:
+        asked.append(images)
+        check_room(space, images=images)
+
+    monkeypatch.setattr(system.vectors, "check_room", checked)
+    look = {"role": "user", "content": photo("Look at my cat")}
+    assert post(client, [SYSTEM, look, REMINDER]).status_code == 200
+    assert post(client, [SYSTEM, look, TOOL_CALL, TOOL_RESULT]).status_code == 200
+    assert asked == [True, False]
+    assert len(system.db.get_media("alice")) == 1
+
+
+def test_a_responses_input_ending_with_a_developer_item_is_remembered(
+    client: TestClient, system: MemorySystem, upstream: Upstream
+) -> None:
+    """/v1/responses 走同一条路：input 以 developer 的一项结尾时，用户的话照样写回。"""
+    said = [{"role": "user", "content": "I live in Berlin"}, {**REMINDER, "role": "developer"}]
+    assert respond(sdk_for(client), said).output_text == "Happy to help, Alice!"
+    assert [(t.role, t.text) for t in system.db.get_turns("alice")] == [
+        ("user", "I live in Berlin"),
+        ("assistant", "Happy to help, Alice!"),
+    ]
 
 
 def test_the_openai_sdk_tool_loop_keeps_its_memory(
