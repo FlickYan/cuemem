@@ -41,6 +41,7 @@ from test_store import small_open_file_limit
 from cuemem import Memory
 from cuemem.api import proxy as proxy_module
 from cuemem.api.proxy import (
+    _SESSION_ID,
     MemoryProxy,
     ProxyError,
     _answer_text,
@@ -248,6 +249,41 @@ def test_sessions_left_open_by_a_crash_are_adopted(
         assert {f.statement for f in system.facts("alice")} == {"The user lives in Berlin."}
         assert system.open_sessions("alice") == {"kept"}
         assert system.adopt_open("alice") == 0  # 接手过的会话不再有标记
+
+
+def test_session_names_in_the_header_map_to_distinct_sessions(
+    proxy: MemoryProxy, system: MemorySystem, upstream: Upstream
+) -> None:
+    """第十轮体检 Q8：X-CueMem-Session 里不是 ASCII 的字符以前全换成 _、80 个字符之后的截掉，
+    '订单一' 与 '订单二' 都成了 '___'，两段对话并进同一个会话。现在这样的名字带上哈希后缀；原样
+    的 UTF-8（Starlette 按 Latin-1 解出来的样子）与 utf-8''<百分号编码> 是同一个会话；不超过 80
+    个字符的 ASCII 名字的 ID 不变。"""
+
+    def session(name: str) -> str:
+        body = {"model": "qwen3.8-flash", "messages": [SYSTEM, {"role": "user", "content": "hi"}]}
+        used = proxy.complete({**body, "user": "alice"}, {"x-cuemem-session": name})[2]
+        assert _SESSION_ID.fullmatch(used["X-CueMem-Session"]) is None  # 没有要换掉的字符
+        assert 1 <= len(used["X-CueMem-Session"]) <= 80
+        return str(used["X-CueMem-Session"])
+
+    for name, same in (("s1", "s1"), ("my session", "my_session"), ("a" * 80, "a" * 80)):
+        assert session(name) == same
+    unchanged = system.open_sessions("alice")
+    assert unchanged == {"s1", "my_session", "a" * 80}
+
+    one, two = session("订单一"), session("订单二")
+    assert one != two and one.startswith("___-") and session("订单一") == one
+    wire = [name.encode().decode("latin-1") for name in ("订单一", "订单二")]  # HTTP 上收到的
+    assert [session(name) for name in wire] == [one, two]
+    assert session("utf-8''%E8%AE%A2%E5%8D%95%E4%B8%80") == one
+    long = [session("a" * 80 + "X"), session("a" * 80 + "Y")]
+    assert len(set(long)) == 2 and all(name.startswith("a" * 64 + "-") for name in long)
+    assert session("utf-8''%zz") != session("utf-8''%zy")  # 写错的值：照原样算，不回 400
+    assert system.open_sessions("alice") - unchanged == {one, two, *long} | {
+        session("utf-8''%zz"),
+        session("utf-8''%zy"),
+    }
+    assert [t.text for t in system.db.get_turns("alice", one) if t.role == "user"] == ["hi"] * 4
 
 
 def red_png_url() -> str:

@@ -32,8 +32,10 @@
 
 身份：请求体里的 user 字段，或请求头 X-CueMem-User（可加 X-CueMem-Agent；不是 ASCII 的 ID 写成
 utf-8''%E5%BC%A0%E4%B8%89 这样的 UTF-8 百分号编码，见 auth.header_id，或者放进 user 字段）；
-会话：请求头 X-CueMem-Session，不给时自动切分：请求里没有之前的消息（调用方开始了新的一段对话）
-或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，否则会混进同一个会话。
+会话：请求头 X-CueMem-Session（不是 ASCII 的或超过 80 个字符的名字换成带哈希后缀的 ID，见
+_session_name；实际用的 ID 在响应头里），不给时自动切分：请求里没有之前的消息（调用方开始了
+新的一段对话）或者空闲超过 idle_minutes 时开新的会话。并行的多段对话要各带自己的会话头，
+否则会混进同一个会话。
 一个用户（记忆空间）内存里同时进行中的会话最多 CUEMEM_MAX_OPEN_SESSIONS 个（默认 64）：再开新的时
 先停放最久没有请求的那个（会话照旧进行中、不抽取，调用方回来时接着写，闲置太久时照常交给抽取；
 整个进程最多停放 PARKED_KEPT 个，再多时最早停放的交给抽取）；有请求还没答完（在等上游、流还
@@ -105,6 +107,7 @@ from cuemem.api.auth import (
     Keys,
     Principal,
     guard,
+    header_id,
     identity_headers,
     principal_of,
     space_cap_message,
@@ -134,6 +137,27 @@ from cuemem.write.online import worth_retrying
 logger = logging.getLogger(__name__)
 
 _SESSION_ID = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def _session_name(raw: str) -> str:
+    """请求头 X-CueMem-Session → 会话 ID（A-Za-z0-9_.:- 之外的字符换成 _，最多 80 个字符）。
+
+    不超过 80 个字符的 ASCII 名字与以前相同。不是 ASCII 的（原样的 UTF-8，或 utf-8''<百分号
+    编码>，见 auth.header_id：同一个名字的两种写法得到同一个 ID）与更长的：前 64 个字符加上
+    名字的 SHA-1 的前 8 位（第十轮体检 Q8，与集成里的做法相同）。以前不是 ASCII 的字符全成了
+    _、80 个字符之后的直接截掉：'订单一' 与 '订单二' 都是 '___'，两段对话并成一个会话。只差在
+    被换掉的 ASCII 标点上的名字（'a b' 与 'a_b'）照旧是同一个：已有的 ID 不变。"""
+    try:
+        name = header_id(raw) or raw
+    except ValueError:  # 写错的 utf-8'' 值、带控制字符：照原样的值算，不为此回 400
+        name = raw
+    safe = _SESSION_ID.sub("_", name)
+    if name == raw and raw.isascii() and len(safe) <= 80:
+        return safe
+    digest = hashlib.sha1(name.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{safe[:64]}-{digest}"
+
+
 MAX_EMBED_INPUTS = 2048  # 与 OpenAI 的上限相同
 # 一个会话写不进去、留着重试的写回最多这么多次、这么大（文字与图片 data URL 的字符数，
 # evidence.payload_size）：长时间故障而调用方一直在说话时，超出的丢掉最早的，不让内存一直长
@@ -720,7 +744,7 @@ class MemoryProxy:
                 headers={"x-should-retry": "false"},  # 要运营者处理，自动重试也一样
             ) from exc
         explicit = headers.get("x-cuemem-session")
-        session = _SESSION_ID.sub("_", explicit)[:80] if explicit else None
+        session = _session_name(explicit) if explicit else None
         # 之前的消息：新的一轮里是最后一句用户消息之前的（它后面的系统消息不算），后续请求照旧
         before = messages[:-1] if follow_up else messages[:anchor]
         earlier = [m for m in before if m.get("role") in ("user", "assistant")]
