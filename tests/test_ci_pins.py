@@ -105,6 +105,12 @@ def test_dependabot_watches_actions_the_lock_and_the_base_image() -> None:
     assert [group["update-types"] for group in updates["uv"]["groups"].values()] == [
         ["minor", "patch"]
     ]
+    # qdrant-client 的小版本与大版本不提议（见 test_lock_keeps_qdrant_client_on_1_19）
+    [qdrant] = [r for r in updates["uv"]["ignore"] if r["dependency-name"] == "qdrant-client"]
+    assert set(qdrant["update-types"]) == {
+        "version-update:semver-major",
+        "version-update:semver-minor",
+    }
     [python] = [rule for rule in updates["docker"]["ignore"] if rule["dependency-name"] == "python"]
     assert set(python["update-types"]) == {
         "version-update:semver-major",
@@ -113,6 +119,24 @@ def test_dependabot_watches_actions_the_lock_and_the_base_image() -> None:
     pinned = (PROJECT_ROOT / ".python-version").read_text("utf-8").strip()
     bases = re.findall(r"^FROM (\S+)", (PROJECT_ROOT / "Dockerfile").read_text("utf-8"), re.M)
     assert bases and all(base == f"python:{pinned}-slim" for base in bases), bases
+
+
+def test_lock_keeps_qdrant_client_on_1_19() -> None:
+    """uv.lock 里的 qdrant-client 停在 1.19.x（第十轮体检 Q21）：1.20 的本地模式倒着读回存下的点
+    （ORDER BY rowid DESC），关掉重开之后分数相同的点换了次序（tests/test_vector_ties.py），发表的
+    结果按 1.19.1 重放。D-072 说升级之前要先做检索比较，那只是文档里的一句话：2026-11-03
+    Dependabot 的小版本与补丁 PR 把锁文件带到了 1.20.0，四项必需检查都没有红。要升级，先做包含
+    关掉重开的检索比较，再改这里与 dependabot.yml 的 ignore。pyproject.toml 的下限不变。"""
+    lock = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text("utf-8"))
+    [package] = [p for p in lock["package"] if p["name"] == "qdrant-client"]
+    assert package["version"].startswith("1.19."), package["version"]
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text("utf-8"))
+    [floor] = [
+        r
+        for r in map(Requirement, pyproject["project"]["dependencies"])
+        if canonicalize_name(r.name) == "qdrant-client"
+    ]
+    assert floor.specifier.contains(package["version"]), floor
 
 
 def test_dependency_audit_reads_hashed_exports_and_is_not_required() -> None:

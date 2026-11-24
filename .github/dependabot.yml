@@ -25,6 +25,12 @@ updates:
       uv-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
+    # qdrant-client 停在 1.19.x（D-072）：1.20 的本地模式倒着读回存下的点，重启之后分数相同的点
+    # 换了次序，连前 k 个里有谁都变了（tests/test_vector_ties.py）。补丁版本照常提议；要升小版本，
+    # 先做包含关掉重开的检索比较，再一起改这条规则与 tests/test_ci_pins.py 核对的锁定版本
+    ignore:
+      - dependency-name: qdrant-client
+        update-types: [version-update:semver-minor, version-update:semver-major]
 
   # Dockerfile 的基础镜像。Python 停在 3.12（与 .python-version、CI 相同），不升小版本与大版本。
   # 两行 FROM 现在只写标签（python:3.12-slim）、没有摘要：Dependabot 只提议同样精度的标签
