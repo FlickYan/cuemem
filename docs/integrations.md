@@ -71,7 +71,7 @@ close_sessions(memory)  # 退出前、memory.close() 之前
 - 供应商那边的副本：Agents SDK 不设 `ModelSettings.store`，Responses API 保存每个响应（它的 instructions 与输入，两种位置的证据都在里面）至少 30 天，除非传 `ModelSettings(store=False)` 或组织开了零数据保留；这份副本在 `forget` 与 `delete_all` 之外。历史由客户端保存时（`CueMemSession`、`result.to_input_list()`）用 `RunConfig(model_settings=ModelSettings(store=False), call_model_input_filter=..., trace_include_sensitive_data=False)`，如上。服务端保存对话状态（`previous_response_id`、`conversation_id`）要靠存下的响应，这份副本避免不了，遗忘也管不到。（按 openai-agents 0.24 与 openai 3.40 核对；保留的期限以 OpenAI 的文档为准。）
 - 输入护栏拦下的、模型没有回应过的用户消息不写进长期记忆。
 - 写不进去的留着重试：一批写不进去时（向量接口或 Qdrant 故障），`CueMemSession` 留着它，下一批或 `end()` 时先按原来的时间写它。重试没有用的（大部分 4xx、内容审核拒绝、输入不合法，例如像素超过 Pillow 上限的图片，这一批单独丢掉；D-076 起还有本地向量库没有余量建新集合的 `VectorStoreFullError`），或这个空间之后遗忘过发言的，丢掉（trace 事件 `agents_mirror_dropped`），不把遗忘之前的消息写回去。留着的只在进程内存里：每个会话最多 100 批或 32 MiB（按文字与图片 data URL 的字符数算）；故障持续很久时丢掉更早的，记警告与 `agents_mirror_dropped` trace 事件（`reason=backlog`）。
-- 改走记忆代理：Agents SDK 缺省的模型类调用 Responses API，通常带工具，记忆代理对带工具的 Responses 调用回 501（D-076 起只有文字的 Responses 调用能用，流式与非流式都行）。用这里的集成，或者把 `OpenAIChatCompletionsModel` 指向记忆代理：这时经记忆代理的工具循环里，每次调用模型都带着这一轮的记忆（0.9.0 之前只有一轮的第一次调用带，后续请求不带），与这里的集成和 LangGraph 相同。
+- 改走记忆代理：Agents SDK 缺省的模型类调用 Responses API，通常带工具，记忆代理对带工具的 Responses 调用回 501（不带工具的 Responses 调用能用：文字与图片输入，D-076 起流式与非流式都行）。用这里的集成，或者把 `OpenAIChatCompletionsModel` 指向记忆代理：这时经记忆代理的工具循环里，每次调用模型都带着这一轮的记忆（0.9.0 之前只有一轮的第一次调用带，后续请求不带），与这里的集成和 LangGraph 相同。
 
 ## LangGraph / LangChain
 
