@@ -37,6 +37,7 @@ from cuemem.read.query import (
     ORDER_WORDS,
     QueryInfo,
     analyze,
+    cue_text,
 )
 from cuemem.store.sqlite import MemoryDB
 
@@ -118,15 +119,16 @@ def query_features(question: str, query: QueryInfo | None = None) -> dict[str, f
     """只看问题文本的线索（q_ 组），不检索。"""
     query = query or analyze(question, datetime.now())
     words = _WORD.findall(question)
+    cue = cue_text(question)
     width = query.time_range.days if query.time_range is not None else 0.0
     features = {
         "q_words": math.log1p(len(words)),
         "q_first_person": float(bool(_FIRST_PERSON.search(question))),
         "q_second_person": float(bool(_SECOND_PERSON.search(question))),
         "q_aggregation": float(query.aggregation),
-        "q_duration": float(bool(DURATION_WORDS.search(question))),
-        "q_order": float(bool(ORDER_WORDS.search(question))),
-        "q_compare": float(bool(COMPARE_WORDS.search(question))),
+        "q_duration": float(bool(DURATION_WORDS.search(cue))),
+        "q_order": float(bool(ORDER_WORDS.search(cue))),
+        "q_compare": float(bool(COMPARE_WORDS.search(cue))),
         "q_temporal": float(query.temporal),
         "q_time_range": float(query.time_range is not None),
         "q_time_width": math.log1p(width),

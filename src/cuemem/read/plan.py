@@ -22,7 +22,7 @@ from pydantic import BaseModel, field_validator
 from cuemem.core.trace import record_event, span
 from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient
-from cuemem.read.query import QueryInfo, TimeRange, analyze
+from cuemem.read.query import QueryInfo, TimeRange, analyze, cue_text
 
 AnswerType = Literal[
     "count",
@@ -206,17 +206,18 @@ def rule_plan(question: str, question_time: datetime) -> QueryPlan:
     """不调用 LLM 的计划：答案类型按关键词猜，没有子查询，时间区间来自规则解析。"""
     query = analyze(question, question_time)
     answer_type: AnswerType = "fact"
-    if _AGGREGATE_WORDS.search(question):
-        answer_type = "sum" if re.search(r"\bhow much\b|总共花|一共花", question, re.I) else "count"
-    elif _DURATION_WORDS.search(question):
+    cue = cue_text(question)
+    if _AGGREGATE_WORDS.search(cue):
+        answer_type = "sum" if re.search(r"\bhow much\b|总共花|一共花", cue, re.I) else "count"
+    elif _DURATION_WORDS.search(cue):
         answer_type = "duration"
-    elif _ORDER_WORDS.search(question):
+    elif _ORDER_WORDS.search(cue):
         answer_type = "order"
-    elif _DATE_WORDS.search(question):
+    elif _DATE_WORDS.search(cue):
         answer_type = "date"
-    elif _ADVICE_WORDS.search(question):
+    elif _ADVICE_WORDS.search(cue):
         answer_type = "advice"
-    elif _COMPARE_WORDS.search(question):
+    elif _COMPARE_WORDS.search(cue):
         answer_type = "compare"
     elif _YES_NO.search(question.strip()):
         answer_type = "yes_no"

@@ -74,12 +74,29 @@ FIXED_HOLIDAYS = {
     "情人节": (2, 14),
     "圣诞节": (12, 25),
     "平安夜": (12, 24),
+    "元旦": (1, 1),
 }
 
 _NUM = r"(\d+|a couple of|a few|several|an?|one|two|three|four|five|six|seven|eight|nine|ten)"
-_ZH_NUM = r"(\d+|[一两二三四五六七八九十几])"
-# 前面没有固定字面量的地方用这个：(?<!\d) 让一长串数字只从头试一次，匹配时间保持线性
-_ZH_NUM_HEAD = r"((?<!\d)\d+|[一两二三四五六七八九十几])"
+# 中文数量：最多三位数字，或"十二 / 二十 / 二十三"这样的两位数，或单个数字。
+# 前面的两个 (?<!…) 有两个用处：一长串数字只从第一位试一次（匹配时间保持线性）；
+# 不从"一百二十""2023""1.5"的中间截一段出来。"2023年以前""3000年前"因此不再当成"N 年前"
+_ZH_NUM = (
+    r"(?<![\d.十百千万])(?<![百千万][一二两三四五六七八九])"
+    r"(\d{1,3}|[二三四五六七八九]?十[一二三四五六七八九]?|[一两二三四五六七八九几])"
+)
+_ZH_MONTH = r"(1[0-2]|0?[1-9]|十[一二]?|[一二三四五六七八九])"
+_ZH_DOM = r"(\d{1,2}|[二三]?十[一二三四五六七八九]?|[一二三四五六七八九])"
+# 月、日、节日前面的年份：分组 1 是四位数字，分组 2 是"今年 / 去年 / 前年"
+_ZH_YEAR = r"(?:((?:19|20)\d{2})年|(今年|去年|(?<![以之大从目提])前年))"
+_ZH_DIGITS = "零一二三四五六七八九"
+_HAN = re.compile(r"[\u4e00-\u9fff]")
+# 只收线索词里用到的字，不做完整的繁简转换
+_ZH_FOLD = str.maketrans(
+    "週個兩幾過這聖誕節號禮後麼時長間總現還來經開種數較別從萬氣輕紀齡級０１２３４５６７８９\u3000",
+    "周个两几过这圣诞节号礼后么时长间总现还来经开种数较别从万气轻纪龄级0123456789 ",
+)
+_ZH_GAP = re.compile(r"(?<=\d)\s+(?=[年月日号天周个星])|(?<=[年月])\s+(?=\d)")
 _UNIT_ZH = {"天": "day", "日": "day", "周": "week", "星期": "week", "个星期": "week",
             "个月": "month", "月": "month", "年": "year"}  # fmt: skip
 
@@ -155,22 +172,34 @@ class QueryInfo:
     temporal: bool
 
 
+def cue_text(text: str) -> str:
+    """找线索词、解析时间表达时用的文本；不含汉字的文本原样返回。
+
+    含汉字时把线索词里用到的繁体字与全角数字换成简体与半角，"礼拜"换成"星期"，
+    去掉"5 月 3 日""3 天前"里数字与单位之间的空格。只用于匹配，不改写要检索的问题。
+    """
+    if not _HAN.search(text):
+        return text
+    return _ZH_GAP.sub("", text.translate(_ZH_FOLD).replace("礼拜", "星期"))
+
+
 def analyze(question: str, question_time: datetime) -> QueryInfo:
+    cue = cue_text(question)
     return QueryInfo(
         text=question,
         question_time=question_time,
         time_range=parse_time(question, question_time),
-        wants_first=bool(FIRST_WORDS.search(question)),
-        wants_latest=bool(LATEST_WORDS.search(question)),
-        wants_history=bool(HISTORY_WORDS.search(question)),
-        aggregation=bool(AGGREGATION_WORDS.search(question)),
-        temporal=bool(TEMPORAL_WORDS.search(question)),
+        wants_first=bool(FIRST_WORDS.search(cue)),
+        wants_latest=bool(LATEST_WORDS.search(cue)),
+        wants_history=bool(HISTORY_WORDS.search(cue)),
+        aggregation=bool(AGGREGATION_WORDS.search(cue)),
+        temporal=bool(TEMPORAL_WORDS.search(cue)),
     )
 
 
 def parse_time(text: str, now: datetime) -> TimeRange | None:
     """把时间表达换算成以 now（提问时间）为参照的区间 [start, end)；解析不了返回 None。"""
-    lowered = text.lower()
+    lowered = cue_text(text.lower())
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     for parser in _PARSERS:
         found = parser(lowered, now, today)
@@ -180,6 +209,25 @@ def parse_time(text: str, now: datetime) -> TimeRange | None:
 
 
 # ---------- 各类表达 ----------
+
+
+def _zh_int(raw: str) -> int:
+    if raw.isdigit():
+        return int(raw)
+    if "十" in raw:
+        tens, _, ones = raw.partition("十")
+        return (_ZH_DIGITS.index(tens) if tens else 1) * 10 + (
+            _ZH_DIGITS.index(ones) if ones else 0
+        )
+    return NUMBERS[raw]
+
+
+def _zh_year(digits: str | None, word: str | None, today: datetime) -> int | None:
+    if digits:
+        return int(digits)
+    if word:
+        return today.year - ("今年", "去年", "前年").index(word)
+    return None
 
 
 def _day(start: datetime, expr: str, days: int = 1) -> TimeRange:
@@ -192,13 +240,16 @@ def _relative_days(text: str, now: datetime, today: datetime) -> TimeRange | Non
         "the day before yesterday": 2,
         "yesterday": 1,
         "last night": 1,
-        "前天": 2,
         "昨天": 1,
         "昨晚": 1,
     }
     for expr, days in table.items():
         if expr in text:
             return _day(today - timedelta(days=days), expr)
+    # "以前天天""目前天气""提前天数"里的"前天"不是日期
+    zh = re.search(r"(?<![以之从目提])(大?)前天", text)
+    if zh is not None:
+        return _day(today - timedelta(days=3 if zh.group(1) else 2), zh.group(0))
     return None
 
 
@@ -207,11 +258,16 @@ def _ago(text: str, now: datetime, today: datetime) -> TimeRange | None:
     if match:
         n, unit = NUMBERS.get(match.group(1)) or int(match.group(1)), match.group(2)
     else:
-        zh = re.search(rf"{_ZH_NUM_HEAD}(个星期|星期|个月|天|周|月|年)(以)?前", text)
+        zh = re.search(rf"{_ZH_NUM}(个星期|星期|个月|天|周|月|年)(以)?前", text)
         if zh is None:
-            return None
-        raw = zh.group(1)
-        n = int(raw) if raw.isdigit() else NUMBERS[raw]
+            half = re.search(r"半(年|个月)(以)?前", text)
+            if half is None:
+                return None
+            days, tolerance = (182, 60) if half.group(1) == "年" else (15, 7)
+            center = today - timedelta(days=days)
+            slack = timedelta(days=tolerance)
+            return TimeRange(center - slack, center + slack + timedelta(days=1), half.group(0))
+        n = _zh_int(zh.group(1))
         unit = _UNIT_ZH[zh.group(2)]
         match = zh
     center = today - timedelta(days=n * UNIT_DAYS[unit])
@@ -227,8 +283,7 @@ def _past_window(text: str, now: datetime, today: datetime) -> TimeRange | None:
         zh = re.search(rf"(过去|最近|近){_ZH_NUM}(个星期|星期|个月|天|周|月|年)", text)
         if zh is None:
             return None
-        raw = zh.group(2)
-        n = int(raw) if raw.isdigit() else NUMBERS[raw]
+        n = _zh_int(zh.group(2))
         unit = _UNIT_ZH[zh.group(3)]
         match = zh
     return TimeRange(
@@ -240,7 +295,8 @@ def _last_weekday(text: str, now: datetime, today: datetime) -> TimeRange | None
     match = re.search(
         r"\blast (monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b", text
     )
-    zh = re.search(r"上(周|个?星期)([一二三四五六日天])", text)
+    # "上周天气""上周日本之行"说的是上周，不是上周日：留给 _calendar
+    zh = re.search(r"上(上?)个?(?:星期|周)([一二三四五六末]|日(?!本)|天(?!气))", text)
     if match is None and zh is None:
         return None
     if match is not None:
@@ -249,9 +305,12 @@ def _last_weekday(text: str, now: datetime, today: datetime) -> TimeRange | None
         target = 5 if name == "weekend" else WEEKDAYS_EN.index(name)
     else:
         assert zh is not None
+        # 中文的"上周三"按日历周算：上一个周一到周日里的周三，不是最近一个已经过去的周三
         name = zh.group(2)
-        expr = zh.group(0)
-        target = 6 if name in "日天" else WEEKDAYS_ZH.index(name)
+        target = 5 if name == "末" else 6 if name in "日天" else WEEKDAYS_ZH.index(name)
+        week_start = today - timedelta(days=today.weekday())
+        start = week_start - timedelta(days=14 if zh.group(1) else 7) + timedelta(days=target)
+        return _day(start, zh.group(0), days=2 if name == "末" else 1)
     back = (today.weekday() - target) % 7 or 7  # 最近一个已经过去的那天
     start = today - timedelta(days=back)
     return _day(start, expr, days=2 if match is not None and match.group(1) == "weekend" else 1)
@@ -261,7 +320,15 @@ def _calendar(text: str, now: datetime, today: datetime) -> TimeRange | None:
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
     previous_month = (month_start - timedelta(days=1)).replace(day=1)
+    two_months_ago = (previous_month - timedelta(days=1)).replace(day=1)
     table = [
+        (r"上上(?:周|个?星期)", week_start - timedelta(days=14), week_start - timedelta(days=7)),
+        (r"上上个?月", two_months_ago, previous_month),
+        (
+            r"(?<![以之大从目提])前年(?![轻纪龄代级])",
+            today.replace(year=today.year - 2, month=1, day=1),
+            today.replace(year=today.year - 1, month=1, day=1),
+        ),
         (r"\blast week\b|上周|上个星期|上星期", week_start - timedelta(days=7), week_start),
         (r"\bthis week\b|这周|本周|这个星期", week_start, now + timedelta(seconds=1)),
         (r"\blast month\b|上个月|上月", previous_month, month_start),
@@ -283,19 +350,39 @@ def _calendar(text: str, now: datetime, today: datetime) -> TimeRange | None:
 def _month_day(text: str, now: datetime, today: datetime) -> TimeRange | None:
     months = "|".join(MONTHS_EN)
     match = re.search(rf"\b({months}) (\d{{1,2}})(?:st|nd|rd|th)?(?:,? (\d{{4}}))?\b", text)
-    zh = re.search(r"(\d{1,2})月(\d{1,2})[日号]", text)
+    zh = re.search(rf"(?:{_ZH_YEAR}的?)?(?<![\d十])(?:{_ZH_MONTH})月(?:{_ZH_DOM})[日号]", text)
     if match is not None:
         month, dom = MONTHS_EN.index(match.group(1)) + 1, int(match.group(2))
         year = int(match.group(3)) if match.group(3) else None
         expr = match.group(0)
     elif zh is not None:
-        month, dom, year, expr = int(zh.group(1)), int(zh.group(2)), None, zh.group(0)
+        month, dom, expr = _zh_int(zh.group(3)), _zh_int(zh.group(4)), zh.group(0)
+        year = _zh_year(zh.group(1), zh.group(2), today)
     else:
         for name, (month, dom) in FIXED_HOLIDAYS.items():
             if name in text:
+                dated = (
+                    re.search(rf"{_ZH_YEAR}的?{re.escape(name)}", text)
+                    if _HAN.search(name)
+                    else None
+                )
+                if dated is not None:
+                    year = _zh_year(dated.group(1), dated.group(2), today)
+                    return _resolve_day(month, dom, year, today, dated.group(0))
                 return _resolve_day(month, dom, None, today, name)
         return None
     return _resolve_day(month, dom, year, today, expr)
+
+
+def _zh_dated_month(text: str, now: datetime, today: datetime) -> TimeRange | None:
+    # "2024年3月""去年十月"：带年份的月份，要排在"去年"之前
+    zh = re.search(rf"{_ZH_YEAR}的?(?:{_ZH_MONTH})月(?![\d日号])", text)
+    if zh is None:
+        return None
+    year = _zh_year(zh.group(1), zh.group(2), today)
+    assert year is not None
+    start = today.replace(year=year, month=_zh_int(zh.group(3)), day=1)
+    return TimeRange(start, (start + timedelta(days=32)).replace(day=1), zh.group(0))
 
 
 def _resolve_day(
@@ -317,12 +404,20 @@ def _month(text: str, now: datetime, today: datetime) -> TimeRange | None:
         rf"\b(?:in|during|since|of|early|late|mid-?)\s*({months})(?:,? (\d{{4}}))?\b", text
     )
     zh = re.search(r"(?<![\d月])(\d{1,2})月份?(?![\d日号])", text)
+    # 单独的"三月""十二月"；"三个月""每三月""五月天""十二月亮"之类不算
+    han = re.search(
+        r"(?<![\d个每这那几半多数第正腊一二三四五六七八九十])(十[一二]?|[一二三四五六七八九])月份?"
+        r"(?![\d日号亮球光天一二三四五六七八九十])",
+        text,
+    )
     if match is not None:
         month = MONTHS_EN.index(match.group(1)) + 1
         year = int(match.group(2)) if match.group(2) else None
         expr = match.group(0)
     elif zh is not None and 1 <= int(zh.group(1)) <= 12:
         month, year, expr = int(zh.group(1)), None, zh.group(0)
+    elif han is not None:
+        month, year, expr = _zh_int(han.group(1)), None, han.group(0)
     else:
         return None
     start = today.replace(year=year or today.year, month=month, day=1)
@@ -345,6 +440,7 @@ _PARSERS = (
     _ago,
     _last_weekday,
     _month_day,
+    _zh_dated_month,
     _relative_days,
     _past_window,
     _calendar,

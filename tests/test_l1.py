@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from fakes import TOY_CONVERSATION, FakeAPI
@@ -17,7 +19,9 @@ from cuemem.core.models import Conversation
 from cuemem.memory import MemorySystem
 from cuemem.read.bm25 import BM25, tokenize
 from cuemem.read.l1 import L1Config
-from cuemem.read.query import _ZH_NUM_HEAD, analyze, parse_time
+from cuemem.read.plan import rule_plan
+from cuemem.read.probe import query_features
+from cuemem.read.query import _ZH_NUM, analyze, cue_text, parse_time
 from cuemem.read.reader import relative_days
 
 NOW = datetime(2023, 5, 30, 22, 0)  # 周二
@@ -75,25 +79,179 @@ def test_ago_zh_is_linear_on_long_digit_runs(text: str) -> None:
         "abc123天前",
         "2个星期前",
         "几年前",
-        "2023年前",
         "1 2天前",
         "12 天前",  # 不匹配
         "天前",  # 不匹配
     ],
 )
 def test_ago_zh_matches_old_pattern(text: str) -> None:
-    # 加了 (?<!\d) 之后匹配到的位置与分组必须与原来的写法一样
+    # 数字前面加了 (?<!…) 之后，这些输入匹配到的位置与分组必须与原来的写法一样
     old = re.search(r"(\d+|[一两二三四五六七八九十几])(个星期|星期|个月|天|周|月|年)(以)?前", text)
-    new = re.search(rf"{_ZH_NUM_HEAD}(个星期|星期|个月|天|周|月|年)(以)?前", text)
+    new = re.search(rf"{_ZH_NUM}(个星期|星期|个月|天|周|月|年)(以)?前", text)
     assert (old is None) == (new is None)
     if old is not None and new is not None:
         assert (new.span(), new.groups()) == (old.span(), old.groups())
+
+
+def test_ago_zh_four_digits_are_not_a_count() -> None:
+    # 有意的改动："2023年前"原来读成"2023 年以前"（落在公元 5 年前后），现在读成 2023 年
+    found = parse_time("2023年前", NOW)
+    assert found is not None
+    assert (found.start.year, found.end.year, found.expr) == (2023, 2024, "2023年")
 
 
 def test_ago_zh_keeps_the_whole_digit_run() -> None:
     found = parse_time("12天前", NOW)  # 取整串 12，不是最后一位 2
     assert found is not None
     assert (f"{found.start:%Y-%m-%d}", f"{found.end:%Y-%m-%d}") == ("2023-05-17", "2023-05-20")
+
+
+NOW_2026 = datetime(2026, 11, 24, 10, 0)  # 周二
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        # 年份在月、日、节日前面
+        ("2023年5月12日我去了哪里", "2023-05-12", "2023-05-13"),
+        ("2024年3月我买了什么", "2024-03-01", "2024-04-01"),
+        ("2024年的5月", "2024-05-01", "2024-06-01"),
+        ("去年十月", "2025-10-01", "2025-11-01"),
+        ("去年3月", "2025-03-01", "2025-04-01"),
+        ("前年5月", "2024-05-01", "2024-06-01"),
+        ("去年元旦", "2025-01-01", "2025-01-02"),
+        # 多个字的数字
+        ("十二天前", "2026-11-11", "2026-11-14"),
+        ("二十天前", "2026-11-03", "2026-11-06"),
+        ("十一个月前", "2025-12-19", "2026-01-09"),
+        ("最近十二天", "2026-11-12", "2026-11-24"),
+        ("半年前", "2026-03-27", "2026-07-26"),
+        ("半个月前", "2026-11-02", "2026-11-17"),
+        # 相对的天、周、月、年
+        ("大前天", "2026-11-21", "2026-11-22"),
+        ("前天天气怎么样", "2026-11-22", "2026-11-23"),
+        ("上上周三", "2026-11-11", "2026-11-12"),
+        ("上上周", "2026-11-09", "2026-11-16"),
+        ("上上个月", "2026-09-01", "2026-10-01"),
+        ("上周末", "2026-11-21", "2026-11-23"),
+        ("上周日", "2026-11-22", "2026-11-23"),
+        ("上周天气怎么样", "2026-11-16", "2026-11-23"),  # 上周，不是"上周天"
+        ("上周日本之行", "2026-11-16", "2026-11-23"),
+        ("前年", "2024-01-01", "2025-01-01"),
+        # 繁体、全角、带空格
+        ("上週三", "2026-11-18", "2026-11-19"),
+        ("上礼拜三", "2026-11-18", "2026-11-19"),
+        ("上禮拜三", "2026-11-18", "2026-11-19"),
+        ("上週天氣怎麼樣", "2026-11-16", "2026-11-23"),
+        ("兩週前", "2026-11-07", "2026-11-14"),
+        ("三個星期前", "2026-10-31", "2026-11-07"),
+        ("過去三個月", "2026-08-26", "2026-11-24"),
+        ("這個月", "2026-11-01", "2026-11-24"),
+        ("聖誕節", "2025-12-25", "2025-12-26"),
+        ("5 月 3 日", "2026-05-03", "2026-05-04"),
+        ("3 天前", "2026-11-20", "2026-11-23"),
+        ("２０２４年", "2024-01-01", "2025-01-01"),
+        # 汉字写的月、日
+        ("三月五号", "2026-03-05", "2026-03-06"),
+        ("十二月", "2025-12-01", "2026-01-01"),
+        # 四位数字是年份，不是"N 年前"
+        ("2023年以前我住在哪", "2023-01-01", "2024-01-01"),
+    ],
+)
+def test_zh_time_expressions(text: str, start: str, end: str) -> None:
+    found = parse_time(text, NOW_2026)
+    assert found is not None
+    assert (f"{found.start:%Y-%m-%d}", f"{found.end:%Y-%m-%d}") == (start, end)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我以前天天跑步",  # 不是"前天"
+        "目前天气怎么样",
+        "二十几天前",  # 不截成"几天前"
+        "一百二十天前",  # 不截成"十天前"
+        "1.5天前",
+        "大前年",
+        "五月天的演唱会",
+        "三个月",
+        "每三月",
+        "3000年前的恐龙",  # 原来在这里抛 OverflowError
+    ],
+)
+def test_zh_no_false_time_ranges(text: str) -> None:
+    assert parse_time(text, NOW_2026) is None
+
+
+def test_zh_last_weekday_uses_the_calendar_week() -> None:
+    friday = datetime(2026, 11, 27, 10, 0)
+    found = parse_time("上周三", friday)  # 上一个日历周的周三，不是本周三（两天前）
+    assert found is not None
+    assert f"{found.start:%Y-%m-%d}" == "2026-11-18"
+    english = parse_time("last wednesday", friday)  # 英文的规则不变：最近一个已经过去的周三
+    assert english is not None
+    assert f"{english.start:%Y-%m-%d}" == "2026-11-25"
+
+
+def test_zh_holiday_takes_the_year_before_it() -> None:
+    found = parse_time("去年圣诞节", datetime(2026, 12, 28, 10, 0))
+    assert found is not None
+    assert (f"{found.start:%Y-%m-%d}", found.expr) == ("2025-12-25", "去年圣诞节")
+
+
+def test_zh_cues_in_traditional_characters() -> None:
+    assert analyze("我現在住在哪裡", NOW_2026).wants_latest
+    assert analyze("總共幾次", NOW_2026).aggregation
+    assert analyze("什麼時候", NOW_2026).temporal
+    info = analyze("之後我去了哪裡", NOW_2026)
+    assert info.temporal and info.text == "之後我去了哪裡"  # 要检索的问题不改写
+    assert query_features("花了多長時間", info)["q_duration"] == 1.0
+    assert rule_plan("總共幾次", NOW_2026).answer_type == "count"
+
+
+def test_cue_text_leaves_text_without_han_alone() -> None:
+    for text in ("What did I do 3 days ago?", "１２ days ago", "in 2023 ", ""):
+        assert cue_text(text) is text
+    assert cue_text("上週三 ５ 月 ３ 日") == "上周三 5月3日"
+    assert cue_text("我以前住在 Berlin 3 号楼") == "我以前住在 Berlin 3号楼"
+
+
+def test_zh_number_is_linear_on_long_digit_runs() -> None:
+    started = time.perf_counter()
+    assert parse_time("1" * 20_000 + "天", NOW) is None
+    assert parse_time("过去" + "1" * 20_000 + "天前", NOW) is None
+    assert time.perf_counter() - started < 2
+
+
+def test_english_questions_parse_as_before() -> None:
+    """不含汉字的问题：时间区间与线索标志与改动前逐条相同。
+
+    语料取自 tests/ 与 examples/ 里的英文问题与句子；期望值是改动前的 query.py
+    （fixture 里 base 那个提交）算出来的，写成字面量，不随现在的代码变。
+    """
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "parse_time_english.json").read_text("utf-8")
+    )
+    moments = [datetime.fromisoformat(text) for text in fixture["now"]]
+    flags = ("wants_first", "wants_latest", "wants_history", "aggregation", "temporal")
+    assert len(fixture["questions"]) >= 150
+    with_range = 0
+    for item in fixture["questions"]:
+        text = item["text"]
+        assert text.isascii()
+        for moment, expected in zip(moments, item["expected"], strict=True):
+            info = analyze(text, moment)
+            assert info.time_range == parse_time(text, moment)
+            found = info.time_range
+            got = (
+                None
+                if found is None
+                else [found.start.isoformat(sep=" "), found.end.isoformat(sep=" "), found.expr]
+            )
+            assert got == expected["range"], text
+            assert [name for name in flags if getattr(info, name)] == expected["flags"], text
+        with_range += item["expected"][0]["range"] is not None
+    assert with_range >= 30
 
 
 def test_query_flags() -> None:

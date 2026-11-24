@@ -28,7 +28,7 @@ from cuemem.core.trace import record_event
 from cuemem.core.types import Router as Router  # 原来定义在这里，各处照旧从这里导入
 from cuemem.errors import ContentFilteredError, StructuredOutputError
 from cuemem.llm.client import LLMClient, Message
-from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyze
+from cuemem.read.query import COMPARE_WORDS, DURATION_WORDS, ORDER_WORDS, analyze, cue_text
 
 Level = Literal["L0", "L1", "L2"]
 # 默认是 v3（N11 之后：v2 + 只在问到图时看图，D-058）；v2 是 N11 导出的那一版（有图的空间直接查
@@ -61,11 +61,12 @@ class RuleController:
         reasons: list[str] = []
         if query.aggregation:
             reasons.append("aggregation")
-        if DURATION_WORDS.search(question):
+        cue = cue_text(question)
+        if DURATION_WORDS.search(cue):
             reasons.append("duration")
-        if ORDER_WORDS.search(question):
+        if ORDER_WORDS.search(cue):
             reasons.append("order")
-        if COMPARE_WORDS.search(question):
+        if COMPARE_WORDS.search(cue):
             reasons.append("compare")
         return RouteDecision("L2" if reasons else "L1", reasons)
 
