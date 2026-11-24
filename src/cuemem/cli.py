@@ -20,6 +20,7 @@ cuemem serve [--port 7860]            启动 HTTP 接口与演示界面（FastAP
 cuemem demo SCRIPT [--until N]        按演示剧本回放对话并核对回答
 cuemem mcp --space S                  以 MCP Server（stdio）提供 remember / recall / forget
 cuemem proxy [--port 8787]            OpenAI 兼容的记忆代理：改 base_url 即接入（N12）
+cuemem hook profile|recall|capture    Claude Code 的钩子：自动想起、自动记下（要开着 serve）
 cuemem migrate-vectors --to URL       把本地向量库复制到 Qdrant 服务端（N11）
 """
 
@@ -43,7 +44,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, NoReturn, cast, get_args
 
 import typer
 from pydantic import ValidationError
@@ -51,6 +52,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+from typer.core import TyperGroup
 
 from cuemem.config import (
     Settings,
@@ -1759,6 +1761,154 @@ def keys_revoke(
             f"[yellow]注意：[/yellow]这是最后一个令牌，又没有设置 {TOKEN_ENV}：运行中的服务不会因此"
             "关掉鉴权，仍认原来的令牌（包括这一个），要停掉服务（或加一个令牌）"
         )
+
+
+class _FailOpenGroup(TyperGroup):
+    """cuemem hook 的命令组：写错的选项、不认识的子命令也是退出码 0、标准输出为空（原因在标准
+    错误写一行）。命令行解析出错的退出码是 2，而 Claude Code 把钩子的退出码 2 当作“拦下”：
+    UserPromptSubmit 上用户的每句话都发不出去，Stop 上助手停不下来。钩子只放行、不拦截
+    （见 cuemem/hooks.py），settings.json 里的一个错字不该让编码助手用不了。--help 照常。"""
+
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
+        try:
+            return super().parse_args(ctx, args)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            self._give_up(exc)
+
+    def invoke(self, ctx: Any) -> Any:
+        try:
+            return super().invoke(ctx)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            self._give_up(exc)
+
+    @staticmethod
+    def _give_up(exc: Exception) -> NoReturn:
+        message = getattr(exc, "format_message", None)
+        text = message() if callable(message) else str(exc)
+        typer.echo(f"cuemem hook：{text or type(exc).__name__}（钩子不拦截，退出码 0）", err=True)
+        raise typer.Exit(0)
+
+
+hook_app = typer.Typer(
+    cls=_FailOpenGroup,
+    help="Claude Code 的钩子：每句话之前自动想起、把对话记下。从标准输入读事件（JSON），经 "
+    "MemoryClient 调用正在运行的 cuemem serve；任何出错都是退出码 0、不输出，不妨碍编码助手。"
+    "配置见 examples/claude-code-hooks.json",
+)
+app.add_typer(hook_app, name="hook")
+HookUser = Annotated[
+    str | None,
+    typer.Option("--user", envvar="CUEMEM_HOOK_USER", help="记忆属于哪个用户（user_id），必填"),
+]
+HookAgent = Annotated[
+    str | None,
+    typer.Option("--agent", envvar="CUEMEM_HOOK_AGENT", help="可选的 agent_id（例如按项目分开）"),
+]
+HookUrl = Annotated[
+    str | None,
+    typer.Option(
+        "--url",
+        envvar="CUEMEM_URL",
+        help="cuemem serve 的地址，默认 http://127.0.0.1:7860；令牌取环境变量 CUEMEM_API_TOKEN",
+    ),
+]
+HookTimeout = Annotated[
+    float, typer.Option("--timeout", help="整个钩子最多用几秒，要比钩子配置里的 timeout 短")
+]
+HookDebug = Annotated[
+    bool, typer.Option("--debug", help="出错时在标准错误写一行原因（不含令牌）；退出码仍是 0")
+]
+HookTurnChars = Annotated[
+    int, typer.Option("--max-turn-chars", help="写进记忆的一句话最多这么多字符，超出的截掉")
+]
+
+
+@hook_app.command("profile")
+def hook_profile(
+    user: HookUser = None,
+    agent: HookAgent = None,
+    url: HookUrl = None,
+    timeout: HookTimeout = 8.0,
+    debug: HookDebug = False,
+) -> None:
+    """SessionStart 钩子：把用户画像放进上下文（<memory> 块，最多 4,000 个字符）。"""
+    from cuemem import hooks
+
+    hooks.profile(hooks.HookOptions(user, agent, url, timeout, debug))
+
+
+@hook_app.command("recall")
+def hook_recall(
+    user: HookUser = None,
+    agent: HookAgent = None,
+    url: HookUrl = None,
+    timeout: HookTimeout = 8.0,
+    debug: HookDebug = False,
+    capture: Annotated[
+        bool, typer.Option("--capture", help="想起之后把用户这句话写进记忆（这个会话的 run）")
+    ] = False,
+    max_chars: Annotated[
+        int,
+        typer.Option(
+            "--max-chars", help="证据块最多这么多字符（1000 到 9999；Claude Code 的上限是 10,000）"
+        ),
+    ] = 8000,
+    mode: Annotated[str, typer.Option("--mode", help="auto（控制器选档）| l0 | l1 | l2")] = "auto",
+    min_level: Annotated[
+        str,
+        typer.Option(
+            "--min-level", help="l0：控制器认为不用回忆的话只给画像；l1：每句话都至少查一次"
+        ),
+    ] = "l0",
+    max_turn_chars: HookTurnChars = 8000,
+) -> None:
+    """UserPromptSubmit 钩子：按用户这句话想起一次，把 <memory> 证据块放进上下文。
+
+    本次会话自己的话不给（它们已经在上下文里）；空的话与 "/" 开头的命令跳过。"""
+    from cuemem import hooks
+
+    hooks.recall(
+        hooks.HookOptions(user, agent, url, timeout, debug),
+        capture=capture,
+        max_chars=max_chars,
+        mode=mode,
+        min_level=min_level,
+        max_turn_chars=max_turn_chars,
+    )
+
+
+@hook_app.command("capture")
+def hook_capture(
+    user: HookUser = None,
+    agent: HookAgent = None,
+    url: HookUrl = None,
+    timeout: HookTimeout = 8.0,
+    debug: HookDebug = False,
+    end: Annotated[
+        bool, typer.Option("--end", help="SessionEnd 时结束这个会话的 run，整段交给抽取")
+    ] = False,
+    assistant: Annotated[
+        bool,
+        typer.Option(
+            "--assistant/--no-assistant",
+            help="Stop 时把助手的最后一段回答写进记忆（回答里可能有仓库里的代码与密钥）",
+        ),
+    ] = True,
+    max_turn_chars: HookTurnChars = 8000,
+) -> None:
+    """Stop 与 SessionEnd 钩子：记下助手的回答；--end 时在会话结束时交给抽取。从不输出。"""
+    from cuemem import hooks
+
+    hooks.capture(
+        hooks.HookOptions(user, agent, url, timeout, debug),
+        end=end,
+        assistant=assistant,
+        max_turn_chars=max_turn_chars,
+    )
 
 
 @app.command()
