@@ -137,6 +137,25 @@ def lossy(text: str) -> bool:
     )
 
 
+# 元音符号、virama、声调是字的一部分的文字区块：天城文到藏文（含泰文、老挝文）、缅文、
+# 他加禄文到高棉文、林布文到老傣文、巴厘文到雷布查文、锡尔赫特文到天城文扩展、爪哇文到傣越文、
+# 曼尼普尔文、辅助平面的婆罗米系文字。按区块放行而不是按“除了哪些”排除：表情符号的变体
+# 选择符（U+FE0F）、表意文字变体选择符等其它附加符号照旧去掉，没有这些文字的文本键不变
+_SCRIPT_MARKS = re.compile(
+    "[\u0900-\u0fff\u1000-\u109f\u1700-\u17ff\u1900-\u1aaf\u1b00-\u1c4f"
+    "\ua800-\ua8ff\ua900-\uaaff\uabc0-\uabff\U00011000-\U00011fff]"
+)
+
+
+def _script_mark(ch: str) -> bool:
+    return bool(_SCRIPT_MARKS.match(ch)) and unicodedata.category(ch)[0] == "M"
+
+
+def _words(text: str) -> list[str]:
+    """按非字母数字切词，但留着 _SCRIPT_MARKS 里的附加符号；没有这类符号时与 [\\W_]+ 相同。"""
+    return "".join(ch if ch.isalnum() or _script_mark(ch) else " " for ch in text).split()
+
+
 def unicode_key(text: str) -> str:
     """不限文字的规范形式：NFKC、casefold，连续的非字母数字换成一个空格。"""
     return re.sub(r"[\W_]+", " ", unicodedata.normalize("NFKC", text).casefold()).strip()
@@ -147,7 +166,7 @@ def normalize_predicate(predicate: str) -> str:
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", predicate.strip().lower()).strip("_")
     if not text or lossy(predicate):  # 'живёт_в'、'사는_곳' 原来都成了 related_to
         folded = unicodedata.normalize("NFKC", predicate).casefold()
-        text = re.sub(r"[\W_]+", "_", folded).strip("_")
+        text = "_".join(_words(folded))  # 留着元音符号：'पति' 与 'पता' 原来都成了 'पत'
     text = text or "related_to"
     return _CANONICAL.get(text, text)
 
@@ -179,12 +198,15 @@ def strict_key(text: str) -> str:
     NFKC（全角数字变成 '8000'）、casefold，再 NFKD 去掉附加符号：重音折叠而不是保留，
     'Café'、'Cafe'、'cafè' 都是 'cafe'，原来就合并的照旧合并。只有 ASCII 与汉字的文本
     （绝大多数）与 normalize_value 相同。原来的键与由它派生的 ID 都不变。
+
+    印度与东南亚文字的元音符号、virama、声调（_SCRIPT_MARKS）留着：原来的键与这里以前都把
+    它们换成空格或删掉，'राम' 与 'रीमा' 都成了 'र म'，'கமல்' 与 'கமலா' 都成了 'கமல'。
     """
     if not _BEYOND.search(text):
         return normalize_value(text)
     folded = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", text).casefold())
-    bare = "".join(ch for ch in folded if not unicodedata.combining(ch))
-    return re.sub(r"^(the|a|an|my) ", "", re.sub(r"[\W_]+", " ", bare).strip())
+    bare = "".join(ch for ch in folded if _script_mark(ch) or not unicodedata.combining(ch))
+    return re.sub(r"^(the|a|an|my) ", "", " ".join(_words(bare)))
 
 
 def legacy_value_key(text: str) -> str:

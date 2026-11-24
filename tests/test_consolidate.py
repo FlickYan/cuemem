@@ -1204,6 +1204,65 @@ def test_accented_letters_and_fullwidth_digits(n3_settings: Settings, fake_api: 
         assert zoe.id == stable_id("de", "fact", "b", "user has a friend named zo")  # 原来的 ID
 
 
+VOWEL_SIGNS: dict[str, Any] = {
+    "2026-01-10": {
+        "summary": "",
+        "facts": [
+            said("राम lives in Delhi.", "राम", "lives_in", "Delhi", 0),
+            said("रीमा lives in Mumbai.", "रीमा", "lives_in", "Mumbai", 1),
+        ],
+        "entities": [],
+    },
+    "2026-02-01": {
+        "summary": "",
+        "facts": [
+            said("The user has a friend named मीना.", "User", "has_friend", "मीना", 0, "multi"),
+            said("The user has a friend named मोना.", "User", "has_friend", "मोना", 0, "multi"),
+        ],
+        "entities": [],
+    },
+}
+
+
+def test_names_that_differ_only_in_vowel_signs(n3_settings: Settings, fake_api: FakeAPI) -> None:
+    """印地文等文字的元音符号以前在两个键里都丢了：说话人 'राम' 与 'रीमा' 成了一个实体，
+    'रीमा 住在孟买' 记到 राम 名下并取代了 'राम 住在德里'；同一会话里的朋友 'मीना' 与 'मोना'
+    事实 ID 相同，后一个被丢掉。现在都分开，राम 的 ID 不变。"""
+    model = ScriptedModel(
+        VOWEL_SIGNS,
+        reconcile=lambda prompt: {"decisions": [{"new": 1, "action": "update", "target": "e1"}]},
+    )
+    fake_api.chat_replies = [model]
+    speakers = SessionIn(
+        session_id="a",
+        started_at=datetime(2026, 1, 10),
+        turns=[
+            TurnIn(role="user", speaker="राम", text="मैं दिल्ली में रहता हूँ।"),
+            TurnIn(role="user", speaker="रीमा", text="मैं मुंबई में रहती हूँ।"),
+        ],
+    )
+    friends = SessionIn(
+        session_id="b",
+        started_at=datetime(2026, 2, 1),
+        turns=[TurnIn(role="user", text="मेरी दोस्त मीना और मोना हैं।")],
+    )
+    with MemorySystem.from_settings(n3_settings, http_client=fake_api.client()) as memory:
+        memory.ingest(Conversation(space_id="hi", sessions=[speakers]), consolidate=True)
+        people = {e.name: e.id for e in memory.entities("hi") if e.type == "person"}
+        assert set(people) == {"राम", "रीमा"} and people["राम"] != people["रीमा"]
+        assert people["राम"] == stable_id("hi", "entity", "र म", "person")  # 原来的 ID
+        facts = memory.facts("hi")
+        delhi, mumbai = by_statement(facts, "Delhi"), by_statement(facts, "Mumbai")
+        assert delhi.subject_id == people["राम"] and mumbai.subject_id == people["रीमा"]
+        assert delhi.is_current and mumbai.is_current
+        assert model.calls["reconcile"] == 0
+
+        memory.ingest(Conversation(space_id="hi2", sessions=[friends]), consolidate=True)
+        kept = [f for f in memory.facts("hi2") if f.predicate == "has_friend" and f.is_current]
+        assert sorted(f.object for f in kept) == ["मीना", "मोना"]
+        assert model.calls["reconcile"] == 0
+
+
 # ---------- 跨巩固复用载入的状态（R6） ----------
 
 

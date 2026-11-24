@@ -21,6 +21,8 @@ from cuemem.write.predicates import (
     normalize_predicate,
     normalize_value,
     registered_cardinality,
+    strict_key,
+    unicode_key,
 )
 
 WHEN = datetime(2023, 5, 20, 9, 0)
@@ -227,6 +229,68 @@ def test_normalization_keeps_other_scripts() -> None:
     assert normalize_predicate("—") == "related_to"
     # 派生事实 ID 用的旧键不变
     assert legacy_value_key("The user has a dog named 초코.") == "user has a dog named"
+
+
+def test_strict_key_keeps_vowel_signs_of_indic_and_southeast_asian_scripts() -> None:
+    """元音符号、virama、声调以前被换成空格或删掉：'राम' 与 'रीमा' 的两个键都是 'र म'，不同的
+    人成了同一个实体；'पति'（丈夫）与 'पता'（地址）是同一个谓词。strict_key 与谓词现在留着
+    这些符号；第一个键（与由它派生的 ID）不变，仍然相同。"""
+    pairs = [
+        ("राम", "रीमा"),  # 印地文
+        ("मीना", "मोना"),
+        ("রিমা", "রীমা"),  # 孟加拉文
+        ("கமல்", "கமலா"),  # 泰米尔文
+        ("សុខ", "សុខា"),  # 高棉文
+        ("สิดา", "สีดา"),  # 泰文
+        ("မောင်", "မိုင်"),  # 缅文
+    ]
+    for one, other in pairs:
+        assert strict_key(one) != strict_key(other), (one, other)
+        assert unicode_key(one) == unicode_key(other)  # 第一个键照旧
+        assert normalize_name(one) == normalize_name(other)
+        assert normalize_value(one) == normalize_value(other)
+    assert unicode_key("राम") == "र म" and strict_key("राम") == "राम"
+    assert strict_key("สมชัย") == "สมชัย" and strict_key("Sri राम!") == "sri राम"
+    assert normalize_predicate("पति") == "पति" != normalize_predicate("पता")
+    assert normalize_predicate("ที่ อยู่") == "ที่_อยู่"
+
+
+def test_strict_key_and_predicates_without_script_marks_are_unchanged() -> None:
+    """没有这些文字的文本，键与原来逐字相同：重音照旧折叠，阿拉伯文与希伯来文的音符、假名的
+    浊点、表情符号与表意文字的变体选择符照旧去掉（按区块放行，而不是留下所有附加符号）。"""
+    keys = {
+        "Müller": "muller",
+        "Zoë": "zoe",
+        "Café": "cafe",
+        "８０００円": "8000円",
+        "がく": "かく",
+        "ﾊﾟﾝ": "ハン",
+        "Йван": "иван",
+        "مُحَمَّد": "محمد",
+        "שָׁלוֹם": "שלום",
+        "王芳": "王芳",
+        "서울": "\u1109\u1165\u110b\u116e\u11af",  # NFKD：拆成字母
+        "The Hague": "hague",
+        "My dog Max (golden retriever)": "dog max golden retriever",
+        "The user loves pizza ❤️": "user loves pizza",
+        "葛\U000e0100城": "葛 城",
+        "ꙗ꙯": "ꙗ",
+    }
+    for text, key in keys.items():
+        assert strict_key(text) == key, text
+    predicates = {
+        "Lives In": "lives_in",
+        "employer": "works_at",
+        "5K personal-best": "5k_personal_best",
+        "живёт в": "живёт_в",
+        "사는 곳": "사는_곳",
+        "_住んでいる 場所_": "住んでいる_場所",
+        "مُقِيم في": "م_ق_يم_في",
+        "最喜欢的颜色": "最喜欢的颜色",
+        "—": "related_to",
+    }
+    for text, key in predicates.items():
+        assert normalize_predicate(text) == key, text
 
 
 def test_normalization_of_latin_and_chinese_is_unchanged() -> None:
