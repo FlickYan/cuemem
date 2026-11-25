@@ -72,6 +72,7 @@ MEMORY_NOTE = (
 )
 _TAG = re.compile(r"<(\s*+/?\s*+memory)", re.IGNORECASE)
 _USERINFO = re.compile(r"(?<=://)[^/@\s]+@")
+_LONE = re.compile("[\ud800-\udfff]")  # str 里的代理项都是落单的（成对的已经是一个字符）
 
 
 @dataclass(frozen=True)
@@ -129,8 +130,11 @@ class _Session:
         return value if isinstance(value, str) else ""
 
     def text(self, key: str) -> str:
+        """事件里的一段文字（不是字符串时是空的）。落单的代理项（Claude Code 的 JSON 里的
+        \\ud83d：从表情符号中间截断的文字）换成 U+FFFD：带着它的请求体编不成 UTF-8，这一句既
+        想不起来也写不进去，钩子又不出声。"""
         value = self.event.get(key)
-        return value if isinstance(value, str) else ""
+        return _LONE.sub("\ufffd", value) if isinstance(value, str) else ""
 
     def call(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """在剩下的时间里调用一次；时间用完了就不再发请求（TimeoutError）。"""

@@ -367,6 +367,32 @@ def _closed_port() -> int:
         return int(probe.getsockname()[1])
 
 
+def test_lone_surrogates_in_the_event_do_not_silence_the_hook(
+    served: tuple[Memory, _Wire],
+) -> None:
+    """第十轮复审（Q14）：用户的话、助手的回答里有落单的代理项（JSON 里的 \\ud83d，从表情符号
+    中间截断的文字）时换成 U+FFFD，照常想起、照常写入。以前请求体编不成 UTF-8，这一句既没有
+    证据块也没写进去，钩子不出声（--debug 才有一行 UnicodeEncodeError）。"""
+    memory, _ = served
+    memory.add("I live in Berlin", user_id="dev", timestamp=AUG, wait=True)
+    asked = json.dumps({**USER_PROMPT, "prompt": "Where do I live \ud83d now?"})
+    assert "\\ud83d" in asked
+    out = runner.invoke(
+        app, ["hook", "recall", "--capture", "--debug", "--user", "dev", "--url", URL], input=asked
+    )
+    assert out.exit_code == 0 and out.stderr == "", out.stderr
+    assert "Berlin" in out.stdout
+    answered = json.dumps({**STOP, "last_assistant_message": "In Berlin \udc00 still."})
+    done = runner.invoke(
+        app, ["hook", "capture", "--debug", "--user", "dev", "--url", URL], input=answered
+    )
+    assert done.exit_code == 0 and done.stderr == "", done.stderr
+    assert turns(memory) == [
+        ("user", "Where do I live \ufffd now?"),
+        ("assistant", "In Berlin \ufffd still."),
+    ]
+
+
 @pytest.mark.parametrize("command", ["profile", "recall", "capture"])
 def test_hooks_fail_open(
     served: tuple[Memory, _Wire], monkeypatch: pytest.MonkeyPatch, command: str
