@@ -1438,12 +1438,12 @@ def test_a_session_that_is_writing_back_is_not_ended_to_make_room(
     s1, s2 = proxy._runs[("alice", "s1")], proxy._runs[("alice", "s2")]
     with s1.lock:  # s1 最久没有请求，但正在写回
         with proxy._lock:
-            assert proxy._make_room("alice") is None
+            assert proxy._make_room("alice", ("space", "alice")) is None
         assert list(proxy._parked) == [("alice", "s2")]  # 停放的是 s2（第八轮体检 P1）
         proxy._parked.clear()
         proxy._runs[("alice", "s2")] = s2  # 放回去：只看选了哪个
         with s2.lock, proxy._lock, pytest.raises(ProxyError) as refused:
-            proxy._make_room("alice")
+            proxy._make_room("alice", ("space", "alice"))
     assert refused.value.status == 429
     assert sorted(sid for _, sid in proxy._runs) == ["s1", "s2"]
 
