@@ -747,6 +747,26 @@ def test_a_user_that_is_not_a_string_is_a_400(
     assert upstream.proxied == [] and system.db.space_ids() == []
 
 
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+def test_a_user_with_an_unpaired_surrogate_is_a_400(
+    client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, path: str
+) -> None:
+    """第十轮复审（Q7）：user 是字符串、但有落单的代理项（JSON 里的 \\ud83d）时编不成 UTF-8：
+    400。以前 space_for 放行，查向量库的余量时算空间的散列才 UnicodeEncodeError，500。"""
+    body: dict[str, Any] = {"model": "qwen3.8-flash", "user": "bo\ud83d"}
+    if path == "/v1/responses":
+        body["input"] = "hello there"
+    else:
+        body["messages"] = [{"role": "user", "content": "hello there"}]
+    raw = json.dumps(body)  # ensure_ascii：请求体里是 \ud83d 的转义
+    assert "\\ud83d" in raw
+    refused = client.post(path, content=raw, headers={"Content-Type": "application/json"})
+    assert refused.status_code == 400, refused.text
+    error = refused.json()["error"]
+    assert error["param"] == "user" and "well-formed Unicode" in error["message"]
+    assert upstream.proxied == [] and system.db.space_ids() == [] and proxy.open_runs() == 0
+
+
 @pytest.mark.parametrize("messages", [["hi"], "hi", {"role": "user"}, [SYSTEM, None]])
 def test_messages_of_the_wrong_shape_are_a_400(
     client: TestClient, proxy: MemoryProxy, system: MemorySystem, upstream: Upstream, messages: Any

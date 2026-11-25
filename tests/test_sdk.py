@@ -2876,6 +2876,14 @@ def test_ids_have_a_length_limit(memory: Memory) -> None:
     ):
         with pytest.raises(ValueError, match="at most 256 characters"):
             call()
+    # 第十轮复审：落单的代理项编不成 UTF-8，同样在这里拒绝（以前到算空间的散列时才出错）
+    for args in (("bo\ud83d",), ("alice", "a\udc00")):
+        with pytest.raises(ValueError, match="well-formed Unicode") as caught:
+            space_for(*args)
+        assert "\\ud" not in str(caught.value) and str(caught.value).isascii()
+    with pytest.raises(ValueError, match="well-formed Unicode"):
+        memory.add("hi", user_id="bo\ud83d")
+    assert space_for("张三😀") == "张三😀"
     assert memory.system.db.space_ids() == []
     added = memory.add("I live in Berlin", user_id=fits, run_id="r" * 256, infer=False)
     assert added["session_id"] == "r" * 256

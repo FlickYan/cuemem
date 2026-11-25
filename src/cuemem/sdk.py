@@ -119,7 +119,8 @@ def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
 
     "/" 是分隔符，所以 ID 里的 "/" 与 "%" 先转义（URL 的百分号编码）：否则 user_id="agent/x"
     与 agent_id="x" 会落进同一个空间。不含这两个字符的 ID 原样保留（"alice" 还是 "alice"）。
-    超过 MAX_ID_CHARS 个字符的 ID 报 ValueError（各个接口上是 400），出错里不写 ID 本身。"""
+    超过 MAX_ID_CHARS 个字符的、有落单代理项（编不成 UTF-8）的 ID 报 ValueError（各个接口上是
+    400），出错里不写 ID 本身。"""
     # 别的类型（user_id=42）以前在 _part 里 AttributeError；/api/v1 的请求校验报 ValueError
     for name, value in (("user_id", user_id), ("agent_id", agent_id)):
         if value is not None and not isinstance(value, str):
@@ -128,6 +129,14 @@ def space_for(user_id: str | None = None, agent_id: str | None = None) -> str:
             raise ValueError(
                 f"{name} must be at most {MAX_ID_CHARS} characters (got {len(value)})."
             )
+        if value is not None and not value.isascii():
+            try:  # 落单的代理项（JSON 里的 \ud83d）：之后算空间的散列时才出错，记忆代理上是 500
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError(
+                    f"{name} must be a string of well-formed Unicode text (it has an unpaired "
+                    "surrogate)."
+                ) from None
     if user_id and agent_id:
         return f"{_part(agent_id)}/{_part(user_id)}"
     if user_id:
