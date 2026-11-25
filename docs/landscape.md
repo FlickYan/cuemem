@@ -39,7 +39,7 @@
 
 ## 3. 能力对照
 
-"未见"指在核对的源码与文档里没有找到，不代表一定没有。CueMem 一列按第九轮体检（D-076）之后的代码更新。
+"未见"指在核对的源码与文档里没有找到，不代表一定没有。CueMem 一列按第十轮体检（D-077）之后的代码更新。
 
 | 能力 | CueMem（N12 与几轮体检） | Mem0 | Letta | Graphiti / Zep | Cognee | Supermemory |
 |---|---|---|---|---|---|---|
@@ -50,7 +50,7 @@
 | 两条时间轴 | 事件时间与记录时间分开回放：`valid_at`（那时现实中成立的）、`known_at`（系统那时相信的）；过期时间 `expiration_date`（召回、回答、记忆代理、MCP、画像、对话 Agent、各集成、浏览的接口与 `cuemem ask` 都排除，要了才给；`cuemem inspect` 标出来，`get`、`history` 与导出仍给出；可选：过期 N 天之后真的删掉） | 记录时间；过期时间 `expiration_date` | 未见 | 有：边上记 `valid_at` / `invalid_at` 与 `created_at` / `expired_at` | 未见 | 未见 |
 | 图片 | 存原图、上下文感知描述、以图搜图、回答时再看原图 | 视觉模型转成文字（`enable_vision`） | 未见 | 不支持（文本与 JSON） | 视觉或转写模型（细节未核实） | OCR |
 | 遗忘 | 删日志 + 重放，沿引用扩散，找没有引用的转述；**可预演**；批量删除（`delete_many`、`batch_delete`）；`reset()` | `delete` / `delete_all` / `reset`；过期时间 | 编辑记忆 | `remove_episode` | `forget` | `forget_matching(dry_run)` |
-| 导出 / 导入 | `export` / `load`（原始日志 + 原图，派生记忆重建），可导入 Mem0 的导出 | 只在付费平台 | Agent File（已从 Letta Code 去掉） | 未见 | COGX，可导入 Mem0 / Zep / Letta | 未见 |
+| 导出 / 导入 | `export` / `load`（原始日志 + 原图，派生记忆重建），可导入 Mem0 的导出与 ChatGPT、Claude 的数据导出（`cuemem import`） | 只在付费平台 | Agent File（已从 Letta Code 去掉） | 未见 | COGX，可导入 Mem0 / Zep / Letta | 未见 |
 | 自定义抽取 | `consolidation.instructions` | `custom_instructions` | 记忆块的标签与上限 | Pydantic 实体 / 边类型、`custom_extraction_instructions` | 自定义数据模型、本体 | 未见 |
 | 本地模型、不要 Key | 预设 `ollama` | Ollama、LM Studio、vLLM | 未核实 | Ollama 等兼容接口 | Ollama、llama.cpp，本地抽取器 | 本地模式 |
 | 部署 | Docker 镜像、compose（+ Qdrant 服务端）、MCP（stdio，以及 HTTP 上的 `/mcp`）、HTTP（`/api` 与 Mem0 形状的 `/api/v1`）；管理令牌与限定作用域的令牌；请求的大小上限与闲置结束 | docker compose、托管平台、托管 MCP | `letta server` | REST、MCP 镜像 | Docker、云服务 | 本地模式、Docker、托管 MCP |
@@ -180,7 +180,7 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 | 补上的能力 | 照着谁 | CueMem 的做法与不同 | 位置 | 决策 |
 |---|---|---|---|---|
 | 批量删除 | Mem0 的 `MemoryClient.batch_delete` | 四个类都有 `delete_many(ids, dry_run=False)` 与 Mem0 写法的 `batch_delete(memories=[{"memory_id": ...}])`，HTTP 是 `POST /api/v1/memories/batch-delete`：最多 100 个事实、对话片段或图片的 ID，先全部认出，每个用户遗忘一次、重建一次；不认识的 ID 列在 `missing` 里。`delete_all(run_id=..., dry_run=True)` 预演遗忘一段 run | `sdk.py`、`api/memories.py` | D-074 |
-| 删掉过期的记忆 | Mem0 的 `expiration_date` | `CUEMEM_EXPIRED_RETENTION_DAYS`（缺省不设）让 `cuemem serve` 与 `cuemem proxy` 在过期 N 天之后遗忘这些发言，连同由它们派生的一切，启动时与之后每天一次；`cuemem forget --expired` 手动做。在那之前过期的记忆只是不给出 | `memory.py`、`api/app.py`、`cli.py` | D-074 |
+| 删掉过期的记忆 | Mem0 的 `expiration_date` | `CUEMEM_EXPIRED_RETENTION_DAYS`（缺省不设）让 `cuemem serve` 与 `cuemem proxy`（D-077 起还有 `cuemem mcp`）在过期 N 天之后遗忘这些发言，连同由它们派生的一切，启动时与之后每天一次；`cuemem forget --expired` 手动做。在那之前过期的记忆只是不给出 | `memory.py`、`api/app.py`、`cli.py` | D-074 |
 
 第八轮体检又补上一项（D-075）：
 
@@ -189,6 +189,18 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 | 导入 Mem0 的导出 | Cognee 从 Mem0 / Zep / Letta 的导入 | `cuemem import FILE --from mem0`、`load(data, format="mem0")` 与带 `"format": "mem0"` 的 `POST /api/v1/import` 读 Mem0 `get_all` 的结果：一条记忆一个会话，ID 由 Mem0 的 ID 与更新时间算出，每个空间一个事务，所以重复导入什么都不加，改过的记忆取代旧的事实。事实由 CueMem 重新抽取（每条记忆一次调用）；Mem0 的历史版本不导入 | `portable.py`、`cli.py`、`sdk.py`、`api/memories.py` | D-075 |
 
 第九轮体检（D-076）没有加新的接口，把已有的补宽了：经记忆代理的工具调用后续请求带着这一轮的记忆，转发的补全记进用量账本（`cuemem usage` 的 `proxy` 角色）；`/v1/responses` 收图片、`reasoning.effort`、`text.verbosity` 与 JSON 的输出格式，文字可以流式；`/mcp` 报出版本号、工具的标题与只读、破坏性的提示；`MemoryClient` 可以自己重试（`max_retries`，`add` 带生成的幂等键）；导出是开始那一刻的空间；导入时按最多 256 句发言一批向量化；抽取的回复在供应商的输出上限处被截断时对半分开再抽，不再一直失败。
+
+第十轮体检又补上五项（D-077）：
+
+| 补上的能力 | 照着谁 | CueMem 的做法与不同 | 位置 | 决策 |
+|---|---|---|---|---|
+| 导入聊天记录 | ChatGPT 与 Claude 的数据导出 | `cuemem import --from chatgpt\|claude` 读导出的 zip、解压出的目录或 `conversations.json`：一个对话一个会话（ID 由对话的 ID 算出），只要用户与助手说的文字（图片、附件、工具调用与思考过程只计数、不导入），重复导入只加新的发言，改写过的对话报告出来。`--url` 经正在运行的服务导入，`--batch` 让大的导入可以续传。两家都没有公布导出的格式，测试只用了合成的样例 | `portable.py`、`cli.py` | D-077 |
+| 编码助手的钩子 | Claude Code 的钩子 | `cuemem hook profile \| recall \| capture`：每句话由控制器想起一次，输出带引用说明的 `<memory>` 块，不超过 Claude Code 的 10,000 个字符（`context(max_chars=)`，排除当前会话），用户的话与最后的回答写进一个 run，任何出错都是退出码 0、没有输出 | `hooks.py`、`cli.py`、`examples/claude-code-hooks.json` | D-077 |
+| 运行指标 | Prometheus 的文本格式 | 要显式打开的 `GET /metrics`，只给管理令牌：请求数、耗时、按原因分的拒绝次数、会话、写回、抽取任务与 LLM 调用，标签的取值出自封闭的集合（没有用户、空间、令牌名与路径），没有新的依赖 | `api/metrics.py` | D-077 |
+| 按令牌的每日预算 | — | 限定作用域的令牌上的 `max_daily_tokens`：记忆代理替这个令牌转发的 token 按天累计，超出预算的请求得到 429 `budget_exceeded`。数的是 token 不是钱，只数经 `/v1/chat/completions` 与 `/v1/responses` 的 | `api/proxy.py`、`llm/ledger.py`、`api/auth.py` | D-077 |
+| 记忆用什么语言写 | — | `Memory(language=…)` / `consolidation.language`：`"auto"` 让抽取模型跟用户的语言，或者写一个语言名；缺省的规则（按汉字比例写成中文或英文）与它的请求不变。模型是否照做没有实测 | `write/extract.py`、`config.py`、`sdk.py` | D-077 |
+
+同一轮还把已有的补宽了：用户、Agent 与 run 的 ID 最多 256 个字符；最后一句用户消息之后只有系统消息的请求，记忆代理当作新的一轮；不是 ASCII 的与很长的会话名不再并成一个会话；记忆代理与几个集成的出错事件写进了 trace 文件；`/health` 里看得到留着的写回；带年份的、几个字的数字的、繁体与全角写法的中文时间表达认得了；印度与东南亚文字的名字留着元音符号；另有一页[配置参考](configuration.md)与一节 MCP 客户端的配置文件（[集成](integrations.md#mcp-客户端的配置文件)）。
 
 ## 6. 刻意没有照搬的
 
@@ -202,9 +214,9 @@ N12 之后的第二轮体检补上了 Mem0 兼容的其余部分与多租户（D
 按"用户最先会碰到"的顺序：
 
 1. **更多框架集成**：已经有 OpenAI Agents SDK、LangGraph / LangChain 与 Claude 的 memory tool（[框架集成](integrations.md)）；还缺手写的 TypeScript 客户端（别的语言经 HTTP 的 `/api/v1`，它的 OpenAPI 快照可以生成 TypeScript 的类型）与 Vercel AI SDK 中间件、LangGraph 的 `BaseStore`、CrewAI、AutoGen 等。Claude 的 memory tool 没有在真实的 Claude 上跑过。
-2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070），可选的按令牌上限（`rate_per_minute`、`models`、`max_output_tokens`）是第四轮（D-071）。第六轮（D-073）起，`cuemem keys` 生成与吊销令牌，令牌文件改了不用重启，每个令牌同时处理的请求有上限。第七轮（D-074）起，一把锁让一个数据库只由一个进程打开（用 Qdrant 服务端时也一样），每个用户进行中的对话会话、代理会话与 `/api/v1` 的 run 都有上限。第八轮（D-075）起，本地模式在打开文件数的上限之前就不再建新空间（回 503 `capacity`，而不是让所有请求都出错），令牌可以限定自己最多几个空间（`max_spaces`）。还缺：按令牌的每日花费预算；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
+2. **多租户与多实例**：有了限定作用域的令牌，每个令牌只能访问列出的用户与 Agent（第二轮体检，D-069）。HTTP 上的 MCP（`/mcp`）与限定作用域的令牌自己的 `/api/v1/reset` 是第三轮补上的（D-070），可选的按令牌上限（`rate_per_minute`、`models`、`max_output_tokens`）是第四轮（D-071）。第六轮（D-073）起，`cuemem keys` 生成与吊销令牌，令牌文件改了不用重启，每个令牌同时处理的请求有上限。第七轮（D-074）起，一把锁让一个数据库只由一个进程打开（用 Qdrant 服务端时也一样），每个用户进行中的对话会话、代理会话与 `/api/v1` 的 run 都有上限。第八轮（D-075）起，本地模式在打开文件数的上限之前就不再建新空间（回 503 `capacity`，而不是让所有请求都出错），令牌可以限定自己最多几个空间（`max_spaces`）。第十轮（D-077）起，令牌可以写经记忆代理的每日 token 预算（`max_daily_tokens`），ID 最多 256 个字符。还缺：按钱算的预算，以及把抽取与向量化也算进去的预算；Qdrant 本地模式每个用户空间一直开着一个文件，用户多时要换服务端；多实例部署需要把 SQLite 换成 Postgres。
 3. **更多外部基线**：Graphiti、LangMem、Cognee、A-MEM 已在同一协议下跑过（LoCoMo，只用 DeepSeek 与只用通义两个协议，见 §4）。还没跑的：Letta、MemOS、Supermemory 等。Graphiti、LangMem、Cognee、A-MEM 只跑了 LoCoMo（Mem0 另在 LongMemEval test100r 上跑过：N11 与泄漏对照）：它们在 LongMemEval 上写入太贵、太慢（Graphiti 每条消息一个 episode，A-MEM 在通义下每轮约 15 秒）。每个配置只跑了一次。
 4. **预设的验证**：OpenAI 与 Ollama 预设只做了离线测试，没有在真实模型上跑评测；巩固的相似度阈值是按通义向量调的，换向量模型后可能要重调。
 5. **记忆的过期**：Mem0 的 `metadata`、filters 与 `expiration_date` 已经补上（第二轮体检，D-069）；第五轮体检起（D-072）过期也在 `answer()`、记忆代理、MCP 与 HTTP 的 recall、画像、对话 Agent 与各集成里生效，第七轮（D-074）起浏览的接口与 `cuemem ask` 也不给（`cuemem inspect` 标出来）；在这些召回的地方过期的记忆不再占召回的名额（SDK 的 `search` 仍在检索之后过滤），`CUEMEM_EXPIRED_RETENTION_DAYS` 可以把它们真的删掉。第八轮（D-075）起实体列表不再给出只有过期的事实提到的实体；Supermemory 那样自动认出临时事实、让它过期的还没有。
 6. **面向开发者的英文文字**：命令行的提示、核心模块抛出的大部分异常（包括 `/api` 的报错）与 SDK 的大部分文档字符串是中文，这一点有意不改；另写了一份英文的接口参考（[docs/en/api.md](en/api.md)，中文版 [docs/api.md](api.md)，D-069）。SDK 自己的报错、`/api/v1`、记忆代理、MCP 工具与界面是英文（N12 之后的体检，D-068）。
-7. **正式发布**：CueMem 还没有发布到 PyPI，从 GitHub 安装（`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"`）；PyPI 上名叫 cuemem 的包不是这个项目（D-071）。第八轮体检起每合入一轮升一次版本号（那一轮是 0.8.0，第九轮之后是 0.9.0，D-076），合并之后在 GitHub 上打 `vX.Y.Z` 标签，安装时可以固定在审过的版本上；这一轮的决策记录就是发布说明（D-075）。
+7. **正式发布**：CueMem 还没有发布到 PyPI，从 GitHub 安装（`pip install "cuemem @ git+https://github.com/FlickYan/cuemem"`）；PyPI 上名叫 cuemem 的包不是这个项目（D-071）。第八轮体检起每合入一轮升一次版本号（那一轮是 0.8.0，第九轮之后是 0.9.0，D-076，第十轮之后是 0.10.0，D-077），合并之后在 GitHub 上打 `vX.Y.Z` 标签，安装时可以固定在审过的版本上；这一轮的决策记录就是发布说明（D-075）。
