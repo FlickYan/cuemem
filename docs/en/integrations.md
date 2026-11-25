@@ -125,7 +125,7 @@ cuemem.close()  # at shutdown, before memory.close(); async: aend_thread / aclos
 
 - **Read-only generated files:** `/memories/profile.md` (the profile) and `/memories/facts.md` (current facts with dates, ids and validity). Writes to them are rejected with an explanation.
 - **Claude's own files:**
-  - They are stored per user in a small side store, `claude_memory.sqlite` in the data directory (a SQLite database in WAL mode). Back it up with the data directory, including its `-wal` and `-shm` files; see [Backup and recovery](../../README.md#backup-and-recovery).
+  - They are stored per user in a small side store, `claude_memory.sqlite` in the data directory (a SQLite database in WAL mode). Back it up with the data directory, including its `-wal` and `-shm` files; see [Backup and recovery](deployment.md#backup-and-recovery).
   - Every change is also written as a note into CueMem's raw log, which consolidation turns into facts.
   - Deleting a file forgets what it contributed.
   - `Memory.delete_all`, `reset` and `delete` (and the `/api/v1` delete routes) delete the matching files in this store at once: all of a deleted user's files, or the files whose notes a forget removed. The module's own `delete_all` is needed only for a store at a custom `store=` path; it also returns `memory_files_deleted`.

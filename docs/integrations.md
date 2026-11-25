@@ -105,7 +105,7 @@ cuemem.close()  # 应用退出时，memory.close() 之前；异步用 aend_threa
 `cuemem.integrations.claude`（anthropic 1.14，工具类型 `memory_20250818`）。Claude 的 memory tool 在客户端执行：模型对 `/memories` 目录做 view、create、str_replace、insert、delete、rename。`CueMemMemoryTool` 把这个目录接到 CueMem 上：
 
 - 只读的生成文件：`/memories/profile.md`（画像）、`/memories/facts.md`（当前事实，带日期、ID 与有效状态），写入时报错说明；
-- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`，WAL 模式的 SQLite；随数据目录一起备份，连同它的 `-wal` 与 `-shm`，见[备份与恢复](../README.zh-CN.md#备份与恢复)），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；`Memory.delete_all`、`reset` 与 `delete`（以及 `/api/v1` 的删除接口）当场删掉这个小库里对应的文件：删掉的用户的全部文件，或笔记被遗忘了的文件。这个模块自己的 `delete_all` 只在 `store=` 指到别处时才需要，它还返回 `memory_files_deleted`；
+- Claude 自己建的文件存在每个用户的小库里（数据目录下的 `claude_memory.sqlite`，WAL 模式的 SQLite；随数据目录一起备份，连同它的 `-wal` 与 `-shm`，见[备份与恢复](deployment.md#备份与恢复)），每次改动同时作为一条笔记写进 CueMem 的原始日志，由巩固抽成事实；删掉文件就遗忘它写进去的内容；`Memory.delete_all`、`reset` 与 `delete`（以及 `/api/v1` 的删除接口）当场删掉这个小库里对应的文件：删掉的用户的全部文件，或笔记被遗忘了的文件。这个模块自己的 `delete_all` 只在 `store=` 指到别处时才需要，它还返回 `memory_files_deleted`；
 - 路径严格校验（不能出 `/memories`），有大小上限；`with_recall` / `awith_recall` 在发给 Claude 之前先过控制器、注入证据。
 
 先设 `export ANTHROPIC_MODEL=<模型 ID>`（支持 memory tool 的 Claude 模型）；没设时 `examples/integrations/claude_example.py` 一行说明后退出。
