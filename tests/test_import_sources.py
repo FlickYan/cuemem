@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import FakeAPI
+from fakes import NO_BALANCE, FakeAPI
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from scripted import ScriptedModel, echo_extraction
@@ -28,7 +28,7 @@ from cuemem import Memory, MemoryClient
 from cuemem.api.auth import Keys, guard
 from cuemem.api.memories import install_error_format, memories_router
 from cuemem.cli import app
-from cuemem.config import Settings, load_settings
+from cuemem.config import PathsConfig, Settings, load_settings
 from cuemem.core.timeutil import naive_local
 from cuemem.embed.base import EmbedKind
 from cuemem.embed.hashing import HashEmbedder
@@ -411,6 +411,36 @@ def test_consolidate_over_url_waits_for_the_server(
         assert [path for path, _ in sent] == ["/import", "/import", "/wait", "/status"]
         assert [body["wait"] for path, body in sent if path == "/import"] == [False, False]
         assert len(memory.get_all(user_id="alice")["results"]) == 3
+
+
+def test_consolidate_over_url_exits_1_when_extraction_is_not_done(
+    n3_settings: Settings, fake_api: FakeAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第十轮复审（Q17）：--url --consolidate 之后服务端有会话抽取失败，或者服务端没有后台线程、
+    会话还排着：写出来、退出码 1（发言已经写入）。以前是 0，而本地的 --consolidate 抽取失败时
+    是 1，脚本没法照退出码判断。"""
+    monkeypatch.setenv("CUEMEM_HOME", str(tmp_path / "cli-home"))
+    path = _write(tmp_path / "mem0.json", _mem0(3))
+    args = ["import", str(path), "--from", "mem0", "--url", URL, "--consolidate"]
+    fake_api.chat_replies = [NO_BALANCE]  # 抽取的每个请求 402
+    for background, said in ((True, "alice：3个会话抽取失败"), (False, "服务端没有后台线程")):
+        paths = PathsConfig().resolve_against(tmp_path / f"server-{background}")
+        home = n3_settings.model_copy(update={"paths": paths})
+        with Memory(home, http_client=fake_api.client(), background=background) as memory:
+            api = FastAPI()
+            api.include_router(memories_router(memory, dependencies=guard(Keys())))
+            install_error_format(api)
+            with TestClient(api) as http:
+                monkeypatch.setattr(
+                    cli,
+                    "_memory_client",
+                    lambda url, http=http: MemoryClient(url, http_client=http),
+                )
+                result = runner.invoke(app, args)
+            assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+            assert said in _flat(result.output), result.output
+            assert "Traceback" not in result.output
+            assert len(memory.system.db.get_turns("alice")) == 3  # 发言已经写入
 
 
 # ---------- 本地：--batch 与数据库被占用时的提示 ----------

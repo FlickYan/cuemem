@@ -639,10 +639,13 @@ def import_cmd(
             _print_mem0_notes(source, docs, reports)
             if not reports:
                 console.print("文件里没有记忆。")
-            elif consolidate:
+            elif consolidate:  # 与本地的 --consolidate 相同：没抽取完的退出码 1（第十轮复审）
+                undone = False
                 for target in dict.fromkeys(str(r["space_id"]) for r in reports):
                     owner = (user, agent) if user or agent else space_owner(target)
-                    _remote_wait(client, target, owner)
+                    undone |= _remote_wait(client, target, owner)
+                if undone:
+                    raise typer.Exit(1)
             else:
                 console.print(
                     "[dim]提示：服务端的后台线程会抽取这些会话（需要 LLM）；加 --consolidate "
@@ -950,14 +953,18 @@ def _remote_forget(
 
 def _remote_wait(
     client: MemoryClient, space: str, owner: tuple[str | None, str | None] | None
-) -> None:
+) -> bool:
     """--url --consolidate：等服务端的后台线程把这个空间登记的抽取做完。每个请求最多等到客户端
-    的读超时之前（MemoryClient.wait），没做完就看一眼进度再等；两次之间没有进展时不再等。"""
+    的读超时之前（MemoryClient.wait），没做完就看一眼进度再等；两次之间没有进展时不再等。
+
+    返回这个空间是不是没抽取完：有会话抽取失败、服务端没有后台线程而会话还排着、等到没有进展
+    而不再等（调用方最后退出码 1，与本地的 --consolidate 抽取失败时相同；以前这几种都是 0）。
+    等不了的空间（owner 是 None）不算。"""
     if owner is None:  # 空间不是 user_id、agent_id 得来的：/api/v1/wait 指不到它
         console.print(
             f"[dim]{escape(space)}：服务端的后台线程在抽取，进度见 GET /api/v1/status。[/dim]"
         )
-        return
+        return False
     user, agent = owner
     console.print(
         f"[dim]等服务端抽取 {escape(space)}（Ctrl-C 只是不再等，抽取在服务端继续）…[/dim]"
@@ -975,7 +982,7 @@ def _remote_wait(
                         f"[yellow]{escape(space)}：还有 {pending} 个会话没抽取完、这段时间没有"
                         "进展，不再等；进度见 GET /api/v1/status。[/yellow]"
                     )
-                    return
+                    return True
                 left = pending
                 console.print(f"[dim]还有 {pending} 个会话…[/dim]")
         status = client.status(user_id=user, agent_id=agent)
@@ -995,6 +1002,8 @@ def _remote_wait(
         )
     else:
         console.print(f"{escape(space)}：抽取完成。")
+        return False
+    return True
 
 
 @app.command("consolidate")
