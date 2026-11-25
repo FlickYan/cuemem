@@ -35,8 +35,8 @@ The sections (`paths`, `providers`, …) each have a table below.
 |---|---|---|
 | `llm_cache_mode` | `read_write` | The local LLM response cache: `read_write`; `read_only` (a miss is an error, for strict reproduction); `off` |
 | `peak_policy` | `wait` | What a call that needs a real request does inside a provider's peak hours (`providers.<name>.peak_hours`): `wait` pauses until they end, `warn` calls and records a reminder, `allow` calls. This value applies to batch jobs (evaluations); the SDK and the interactive commands (`ask`, `serve`, `proxy`, `mcp`) use `warn` regardless, and the SDK's `peak_policy` argument overrides it |
-| `traces_retention_days` | `null` | Keep daily trace files this many days (an integer ≥ 1); `null` keeps them forever. `cuemem serve` and `cuemem proxy` delete older files at start-up and then daily |
-| `expired_retention_days` | `null` | Delete memories this many days after their `expiration_date` (an integer ≥ 0); `null` never deletes them (they are only left out when reading). Applied by `cuemem serve` and `cuemem proxy` at start-up and then daily |
+| `traces_retention_days` | `null` | Keep daily trace files this many days (an integer ≥ 1); `null` keeps them forever. `cuemem serve`, `cuemem proxy` and `cuemem mcp` delete older files at start-up and then daily |
+| `expired_retention_days` | `null` | Delete memories this many days after their `expiration_date` (an integer ≥ 0); `null` never deletes them (they are only left out when reading). Applied by `cuemem serve`, `cuemem proxy` and `cuemem mcp` at start-up and then daily |
 
 ### `paths`
 

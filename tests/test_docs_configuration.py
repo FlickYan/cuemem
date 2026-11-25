@@ -150,3 +150,17 @@ def test_the_worked_preset_loads_cleanly(clean_env: None, tmp_path: Path) -> Non
     assert settings.rerank.provider is None
     assert settings.consolidation.fallback_model is None
     assert settings.consolidation.caption_images is False
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_the_retention_rows_name_every_command_that_sweeps(language: str) -> None:
+    """第十轮复审（Q15）：两个保留期限由 cuemem serve、cuemem proxy 与（Q12 之后）stdio 的
+    cuemem mcp 执行，页面里的两行要都写上。"""
+    rows = [
+        line
+        for line in PAGES[language].read_text(encoding="utf-8").splitlines()
+        if line.startswith(("| `traces_retention_days`", "| `expired_retention_days`"))
+    ]
+    assert len(rows) == 2
+    for row in rows:
+        assert all(f"`cuemem {name}`" in row for name in ("serve", "proxy", "mcp")), row

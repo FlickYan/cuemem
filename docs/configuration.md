@@ -35,8 +35,8 @@ API Key 不属于配置：它们放在环境变量或数据目录的 `.env` 里�
 |---|---|---|
 | `llm_cache_mode` | `read_write` | 本地的 LLM 响应缓存：`read_write`；`read_only`（未命中就报错，用于严格复现）；`off` |
 | `peak_policy` | `wait` | 供应商的高峰时段（`providers.<name>.peak_hours`）里遇到需要真实调用的请求：`wait` 暂停到高峰结束，`warn` 照常调用并记一条提醒，`allow` 照常调用。这个值管批量任务（评测）；SDK 与交互式命令（`ask`、`serve`、`proxy`、`mcp`）不看它、用 `warn`，SDK 的 `peak_policy` 参数可以另行指定 |
-| `traces_retention_days` | `null` | trace 文件保留几天（≥ 1 的整数）；`null` 一直留着。`cuemem serve` 与 `cuemem proxy` 启动时与之后每天删掉更早的文件 |
-| `expired_retention_days` | `null` | 记忆过期（`expiration_date`）之后再留几天就真的删掉（≥ 0 的整数）；`null` 不删（只是读取时不给出）。`cuemem serve` 与 `cuemem proxy` 启动时与之后每天执行 |
+| `traces_retention_days` | `null` | trace 文件保留几天（≥ 1 的整数）；`null` 一直留着。`cuemem serve`、`cuemem proxy` 与 `cuemem mcp` 启动时与之后每天删掉更早的文件 |
+| `expired_retention_days` | `null` | 记忆过期（`expiration_date`）之后再留几天就真的删掉（≥ 0 的整数）；`null` 不删（只是读取时不给出）。`cuemem serve`、`cuemem proxy` 与 `cuemem mcp` 启动时与之后每天执行 |
 
 ### `paths`
 
