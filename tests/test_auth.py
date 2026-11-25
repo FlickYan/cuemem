@@ -1386,6 +1386,58 @@ def test_a_budgeted_stream_is_counted_without_showing_the_usage_chunk(
     ]
 
 
+def test_a_budgeted_stream_the_caller_stops_is_charged_an_estimate(budgeted: Budgeted) -> None:
+    """第十轮复审（Q19）：用量的块排在回答的最后一块之后。读完回答就断开的调用方以前一个 token
+    也不记（unmetered、0 个），每日预算拦不住它。现在这样的流按估计数记（转发的请求体与已经收到
+    的回答里的文字），到了预算照样 429；读完的流照旧按上游报的数。没有预算的令牌不估计。"""
+    _, proxy, fake_api, system = budgeted
+    today = datetime.now().date().isoformat()
+    question = "What is my PIN? " + "Please answer in one short sentence. " * 12
+    body = {"model": "qwen3.8-flash", "stream": True, "user": "alice"}
+    body["messages"] = [{"role": "user", "content": question}]
+
+    def stop_after_the_answer(principal: Principal | None) -> str:
+        status, chunks, _ = proxy.stream(dict(body), {"x-cuemem-session": "s1"}, principal)
+        assert status == 200
+        seen = b""
+        for line in chunks:
+            seen += line
+            if b"1234" in line:  # 回答的最后一块：不等用量的块就断开
+                break
+        chunks.close()  # type: ignore[attr-defined]
+        return seen.decode()
+
+    assert "usage" not in stop_after_the_answer(_metered())
+    [row] = system.ledger.key_usage(today)
+    assert (row["calls"], row["unmetered"]) == (1, 1)
+    # 请求体里 450 来个 ASCII 字符的问题、回答 16 个：三个字符一个 token
+    assert len(question) // 3 <= row["tokens"] <= len(question) // 3 + 40
+    assert proxy._spent == {("metered", today): row["tokens"]}
+    sent = len(fake_api.chat_requests)
+    stop_after_the_answer(_metered())  # 第二次开始之前还没到 200
+    with pytest.raises(ProxyError) as caught:
+        proxy.stream(dict(body), {"x-cuemem-session": "s1"}, _metered())
+    assert caught.value.status == 429 and caught.value.body["error"]["code"] == "budget_exceeded"
+    assert len(fake_api.chat_requests) == sent + 1
+    usage = [r for r in system.ledger.summary() if r["role"].startswith("proxy")]
+    assert [(r["role"], r["calls"], r["input_tokens"]) for r in usage] == [
+        ("proxy-unmetered", 2, 0)  # 成本的账本照旧：没计量的记 0，估计数只进预算
+    ]
+
+    # 没有预算的令牌：停下的流不估计、不建这个令牌的行
+    stop_after_the_answer(Keys.parse(BUDGETS).resolve(PLAIN_TOKEN))
+    assert [r["key"] for r in system.ledger.key_usage(today)] == ["metered"]
+
+
+def test_rough_tokens_counts_text_and_not_image_bytes() -> None:
+    """估计 token 数：ASCII 三个字符一个，别的字符一个算一个，data URL 的图片算固定的数。"""
+    rough = proxy_module._rough_tokens
+    assert rough("abcdef") == 2 and rough("你好吗") == 3 and rough("") == 0
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 90000}}
+    body = {"model": "m", "n": 1, "messages": [{"role": "user", "content": [image]}]}
+    assert rough(body) == 1 + 2 + 3 + proxy_module.IMAGE_TOKENS  # "m"、"user"、"image_url"
+
+
 def test_keys_without_a_daily_budget_forward_the_same_bytes_and_keep_no_table(
     budgeted: Budgeted,
 ) -> None:

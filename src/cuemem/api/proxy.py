@@ -71,7 +71,11 @@ max_completion_tokens 不超过它，并且总按这个模型在目录里的写�
 账本写不进去时只按这个进程自己记的数算。这种令牌的流式请求由代理加上 stream_options:
 {"include_usage": true}（不然数不了），上游多发的那个只有用量的块不转给没要它的调用方；不认
 stream_options 的上游会因此回 400。管不到的：/v1/embeddings、/api、/api/v1、/mcp，与这个令牌
-写进去的内容之后抽取、向量化的花费；上游没报用量的 200 只数次数（unmetered）。
+写进去的内容之后抽取、向量化的花费；上游没报用量的 200 只数次数（unmetered）。调用方中途停下
+的流除外（第十轮复审）：用量的块排在回答的最后一块之后，读到 finish_reason 就断开的调用方拿到了
+整个回答、却一个 token 也不记，预算就拦不住它。这样的流按估计数记（_rough_tokens：转发的请求体
+与已经收到的回答里的文字，汉字等一个字一个 token，别的三个字符一个，一张 data URL 的图片算
+IMAGE_TOKENS 个），同样算一次 unmetered；偏高偏低都有，读完的流照旧按上游报的数。
 
 另外两个 OpenAI 兼容的接口：
 - /v1/responses：Responses API 的一个子集——输入是文字（字符串或 input_text 的消息）与用户
@@ -197,6 +201,8 @@ MAX_UNSAVED_BYTES = 32 * 1024 * 1024
 # 停放的会话照旧进行中（数据库里的进行中标记与 MemorySystem 的登记都留着），每个只占一个键与
 # 一个时间
 PARKED_KEPT = 4096
+# 估计 token 数（_rough_tokens）时一张 data URL 的图片算这么多个：各家按分辨率算，几百到两千多
+IMAGE_TOKENS = 1000
 # 不认识的模型名在警告、400 的出错与 MemoryProxy._warned 里最多写这么多个字符（见 _short）
 MODEL_NAME_SHOWN = 200
 MODEL_NAMES_WARNED = 1000  # 记过警告的模型名最多这么多个，之后的新名字不再警告
@@ -337,6 +343,7 @@ class Turn:
     # 令牌写了 max_daily_tokens 时它的名字与预算（_meter 按名字累计，见模块说明）；否则 None
     key: str | None = None
     budget: int | None = None
+    rough: int = 0  # 转发的请求体估计的 token 数（_rough_tokens），流被调用方停下时用（_Relay）
     # 这次请求的 trace（见模块说明的"trace 与日志"）：不放进 start_trace 的上下文变量（检索与
     # 写入照旧各写各的 retrieve、append），由 _release 写；forget0 是开始时的 forget_epoch
     trace: Trace | None = None
@@ -376,9 +383,9 @@ class MemoryProxy:
         self._clock = clock
         self._runs: dict[tuple[str, str | None], Run] = {}
         # 停放的会话（_make_room）：键 -> (会话 ID, 最后一次请求的时间, 算在谁头上)，按停放的先后
-        self._parked: OrderedDict[
-            tuple[str, str | None], tuple[str, float, tuple[str, str]]
-        ] = OrderedDict()
+        self._parked: OrderedDict[tuple[str, str | None], tuple[str, float, tuple[str, str]]] = (
+            OrderedDict()
+        )
         self._adopted: set[str] = set()  # 接手过崩溃前留下的会话的空间
         self._warned: set[str] = set()  # 已经警告过的不认识的模型名
         # （令牌的名字，日期）-> 这个进程替它转发的 token 数（只有写了 max_daily_tokens 的令牌）
@@ -464,6 +471,8 @@ class MemoryProxy:
             if asked:
                 kept = options if isinstance(options, dict) else {}
                 upstream["stream_options"] = {**kept, "include_usage": True}
+            if turn.budget is not None:
+                turn.rough = _rough_tokens(upstream)
             request = self._http.build_request("POST", url, json=upstream, headers=auth)
             extra = _headers(turn, upstream["model"])
             started = time.perf_counter()
@@ -1186,15 +1195,18 @@ class MemoryProxy:
             },
         )
 
-    def _meter(self, turn: Turn, usage: Usage | None, latency_ms: float) -> None:
+    def _meter(
+        self, turn: Turn, usage: Usage | None, latency_ms: float, *, estimate: int = 0
+    ) -> None:
         """转发出去的一次补全记进用量账本（见模块说明）：角色 proxy；上游没报用量（usage 是
         None）时记 proxy-unmetered 的一行，token 数与成本都是 0。记不进去（账本被别的进程锁着
         等）只记一条警告：回答已经付过钱，照样返回、照样写回。令牌有每日预算（turn.key）时另外
-        按令牌累计输入加输出的 token 数：先记在这个进程里，再记进账本的 key_usage。"""
+        按令牌累计输入加输出的 token 数：先记在这个进程里，再记进账本的 key_usage；没有用量时
+        加 estimate（调用方停下的流的估计数，别的是 0）。"""
         if turn.spec is None:
             return
         if turn.key is not None:
-            tokens = usage.input_tokens + usage.output_tokens if usage is not None else 0
+            tokens = usage.input_tokens + usage.output_tokens if usage is not None else estimate
             day = _now().date().isoformat()
             with self._lock:
                 for stale in [k for k in self._spent if k[1] != day]:  # 昨天的不用留
@@ -1353,7 +1365,9 @@ class _Relay(Iterator[bytes]):
 
     用量（MemoryProxy._meter）：流里最后一个带 usage 的块是这次补全的用量。读完与中途停下的
     都记（停下之前的输出也算钱），没见到 usage 的记成没计量的；上游中途出错的只有见到 usage
-    才记。drop_usage_chunk：include_usage 是代理替有每日预算的令牌加的（MemoryProxy.stream），
+    才记。有每日预算的令牌中途停下、还没见到 usage 的流按估计数算进预算（见模块说明：用量的块
+    在回答之后，不然读完回答就断开的调用方不花预算）。
+    drop_usage_chunk：include_usage 是代理替有每日预算的令牌加的（MemoryProxy.stream），
     调用方没要：只有用量的那个块（choices 是空的）照常记，但不转给它，后面的空行也不转。
 
     写成类而不是生成器：还没开始读就 close() 的生成器不执行收尾，上游的连接一直占着。"""
@@ -1417,10 +1431,13 @@ class _Relay(Iterator[bytes]):
         self._ended = ended
         try:
             self._response.close()
+            answer = "".join(self._pieces)
             if ended != "failed" or self._usage is not None:
                 latency_ms = (time.perf_counter() - self._started) * 1000
-                self._proxy._meter(self._turn, self._usage, latency_ms)
-            answer = "".join(self._pieces)
+                rough = 0
+                if ended == "stopped" and self._usage is None and self._turn.key is not None:
+                    rough = self._turn.rough + _rough_tokens(answer)
+                self._proxy._meter(self._turn, self._usage, latency_ms, estimate=rough)
             if ended == "done":
                 self._proxy._write_back(self._turn, answer)
                 return
@@ -1624,6 +1641,22 @@ def _cap_output(upstream: dict[str, Any], spec: ModelSpec, cap: int) -> None:
             upstream[key] = cap
     if spec.max_tokens_param not in upstream:
         upstream[spec.max_tokens_param] = min((upstream[key] for key in given), default=cap)
+
+
+def _rough_tokens(value: Any) -> int:
+    """value（转发的请求体，或回答的文字）里的文字大约多少个 token：不是 ASCII 的字符一个算一个
+    （汉字大约如此），别的三个字符一个；data URL（图片本身）不按长度，算 IMAGE_TOKENS 个。只给
+    每日预算用（调用方停下、上游没来得及报用量的流），不进成本。"""
+    if isinstance(value, str):
+        if value.startswith("data:"):
+            return IMAGE_TOKENS
+        wide = sum(1 for ch in value if ch > "\x7f")
+        return wide + (len(value) - wide + 2) // 3
+    if isinstance(value, Mapping):
+        return sum(_rough_tokens(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return sum(_rough_tokens(item) for item in value)
+    return 0
 
 
 def _well_formed(text: str) -> str:

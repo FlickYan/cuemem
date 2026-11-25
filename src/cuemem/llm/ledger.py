@@ -125,8 +125,9 @@ class Ledger:
 
     def add_key_usage(self, key: str, day: str, tokens: int, *, unmetered: bool = False) -> None:
         """记忆代理替令牌 key 在 day（服务器本地的日期，ISO 写法）转发的一次补全：tokens（输入加
-        输出）加进这一天的合计，calls 加一；unmetered：上游没报用量的一次（tokens 是 0）。表在
-        第一次调用时才建。磁盘写不进去时与 record 相同（best_effort 时记警告、不抛出）。"""
+        输出）加进这一天的合计，calls 加一；unmetered：上游没报用量的一次（tokens 是 0，调用方
+        中途停下的流是代理估计的数）。表在第一次调用时才建。磁盘写不进去时与 record 相同
+        （best_effort 时记警告、不抛出）。"""
         with self._lock:
             try:
                 self._conn.execute(
