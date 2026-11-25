@@ -6,6 +6,31 @@
  ],
  "questions": [
   {
+   "text": "A few weeks ago I started running.",
+   "expected": [
+    {
+     "range": [
+      "2023-05-06 00:00:00",
+      "2023-05-13 00:00:00",
+      "a few weeks ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-11-03 00:00:00",
+      "2026-11-10 00:00:00",
+      "a few weeks ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
    "text": "Ana moved to Berlin in late July 2026.",
    "expected": [
     {
@@ -56,6 +81,27 @@
     },
     {
      "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "Any plans from Valentine's Day?",
+   "expected": [
+    {
+     "range": [
+      "2023-02-14 00:00:00",
+      "2023-02-15 00:00:00",
+      "valentine's day"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2026-02-14 00:00:00",
+      "2026-02-15 00:00:00",
+      "valentine's day"
+     ],
      "flags": []
     }
    ]
@@ -262,6 +308,27 @@
     },
     {
      "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "Did I mention anything on New Year's Eve?",
+   "expected": [
+    {
+     "range": [
+      "2022-12-31 00:00:00",
+      "2023-01-01 00:00:00",
+      "new year's eve"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2025-12-31 00:00:00",
+      "2026-01-01 00:00:00",
+      "new year's eve"
+     ],
      "flags": []
     }
    ]
@@ -695,6 +762,33 @@
    ]
   },
   {
+   "text": "How much did I spend in the last 2 months?",
+   "expected": [
+    {
+     "range": [
+      "2023-03-31 00:00:00",
+      "2023-05-30 22:00:01",
+      "last 2 months"
+     ],
+     "flags": [
+      "aggregation",
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-09-28 00:00:00",
+      "2026-11-27 10:00:01",
+      "last 2 months"
+     ],
+     "flags": [
+      "aggregation",
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
    "text": "How much did I spend on groceries in total?",
    "expected": [
     {
@@ -964,6 +1058,27 @@
      "flags": [
       "aggregation"
      ]
+    }
+   ]
+  },
+  {
+   "text": "I signed the lease on March 5th, 2024.",
+   "expected": [
+    {
+     "range": [
+      "2024-03-05 00:00:00",
+      "2024-03-06 00:00:00",
+      "march 5th, 2024"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2024-03-05 00:00:00",
+      "2024-03-06 00:00:00",
+      "march 5th, 2024"
+     ],
+     "flags": []
     }
    ]
   },
@@ -1381,6 +1496,19 @@
    ]
   },
   {
+   "text": "The invoice is dated 3/14/2024.",
+   "expected": [
+    {
+     "range": null,
+     "flags": []
+    },
+    {
+     "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
    "text": "Traceback (most recent call last):",
    "expected": [
     {
@@ -1531,6 +1659,31 @@
    ]
   },
   {
+   "text": "We met a couple of months ago, remember?",
+   "expected": [
+    {
+     "range": [
+      "2023-03-21 00:00:00",
+      "2023-04-11 00:00:00",
+      "a couple of months ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-09-18 00:00:00",
+      "2026-10-09 00:00:00",
+      "a couple of months ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
    "text": "Weather in Berlin, Paris and Rome?",
    "expected": [
     {
@@ -1599,6 +1752,27 @@
     },
     {
      "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "What changed in 2022?",
+   "expected": [
+    {
+     "range": [
+      "2022-01-01 00:00:00",
+      "2023-01-01 00:00:00",
+      "in 2022"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2022-01-01 00:00:00",
+      "2023-01-01 00:00:00",
+      "in 2022"
+     ],
      "flags": []
     }
    ]
@@ -1691,6 +1865,31 @@
     {
      "range": null,
      "flags": []
+    }
+   ]
+  },
+  {
+   "text": "What did I buy 3 days ago?",
+   "expected": [
+    {
+     "range": [
+      "2023-05-26 00:00:00",
+      "2023-05-29 00:00:00",
+      "3 days ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-11-23 00:00:00",
+      "2026-11-26 00:00:00",
+      "3 days ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
     }
    ]
   },
@@ -1810,6 +2009,27 @@
    ]
   },
   {
+   "text": "What did I do this week?",
+   "expected": [
+    {
+     "range": [
+      "2023-05-29 00:00:00",
+      "2023-05-30 22:00:01",
+      "this week"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2026-11-23 00:00:00",
+      "2026-11-27 10:00:01",
+      "this week"
+     ],
+     "flags": []
+    }
+   ]
+  },
+  {
    "text": "What did I do two weeks ago?",
    "expected": [
     {
@@ -1835,6 +2055,40 @@
    ]
   },
   {
+   "text": "What did I note on 2023-05-12?",
+   "expected": [
+    {
+     "range": null,
+     "flags": []
+    },
+    {
+     "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "What did I read in the past 10 days?",
+   "expected": [
+    {
+     "range": [
+      "2023-05-20 00:00:00",
+      "2023-05-30 22:00:01",
+      "past 10 days"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2026-11-17 00:00:00",
+      "2026-11-27 10:00:01",
+      "past 10 days"
+     ],
+     "flags": []
+    }
+   ]
+  },
+  {
    "text": "What did the sign say?",
    "expected": [
     {
@@ -1856,6 +2110,52 @@
     },
     {
      "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "What did we cook last night?",
+   "expected": [
+    {
+     "range": [
+      "2023-05-29 00:00:00",
+      "2023-05-30 00:00:00",
+      "last night"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-11-26 00:00:00",
+      "2026-11-27 00:00:00",
+      "last night"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
+   "text": "What did we do at Christmas?",
+   "expected": [
+    {
+     "range": [
+      "2022-12-25 00:00:00",
+      "2022-12-26 00:00:00",
+      "christmas"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2025-12-25 00:00:00",
+      "2025-12-26 00:00:00",
+      "christmas"
+     ],
      "flags": []
     }
    ]
@@ -1900,6 +2200,31 @@
    ]
   },
   {
+   "text": "What happened 12 years ago?",
+   "expected": [
+    {
+     "range": [
+      "2011-04-03 00:00:00",
+      "2011-08-02 00:00:00",
+      "12 years ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2014-10-01 00:00:00",
+      "2015-01-30 00:00:00",
+      "12 years ago"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
    "text": "What happened on May 5th?",
    "expected": [
     {
@@ -1915,6 +2240,27 @@
       "2026-05-05 00:00:00",
       "2026-05-06 00:00:00",
       "may 5th"
+     ],
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "What have I finished this year?",
+   "expected": [
+    {
+     "range": [
+      "2023-01-01 00:00:00",
+      "2023-05-30 22:00:01",
+      "this year"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2026-01-01 00:00:00",
+      "2026-11-27 10:00:01",
+      "this year"
      ],
      "flags": []
     }
@@ -2082,6 +2428,19 @@
   },
   {
    "text": "What tea do I like?",
+   "expected": [
+    {
+     "range": null,
+     "flags": []
+    },
+    {
+     "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "What was I working on in early 2025?",
    "expected": [
     {
      "range": null,
@@ -2354,6 +2713,31 @@
    ]
   },
   {
+   "text": "Where did we go last Friday?",
+   "expected": [
+    {
+     "range": [
+      "2023-05-26 00:00:00",
+      "2023-05-27 00:00:00",
+      "last friday"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-11-20 00:00:00",
+      "2026-11-21 00:00:00",
+      "last friday"
+     ],
+     "flags": [
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
    "text": "Where do I hike?",
    "expected": [
     {
@@ -2522,6 +2906,33 @@
    ]
   },
   {
+   "text": "Where was I the day before yesterday?",
+   "expected": [
+    {
+     "range": [
+      "2023-05-28 00:00:00",
+      "2023-05-29 00:00:00",
+      "the day before yesterday"
+     ],
+     "flags": [
+      "wants_history",
+      "temporal"
+     ]
+    },
+    {
+     "range": [
+      "2026-11-25 00:00:00",
+      "2026-11-26 00:00:00",
+      "the day before yesterday"
+     ],
+     "flags": [
+      "wants_history",
+      "temporal"
+     ]
+    }
+   ]
+  },
+  {
    "text": "Which city do I live in?",
    "expected": [
     {
@@ -2650,6 +3061,27 @@
     },
     {
      "range": null,
+     "flags": []
+    }
+   ]
+  },
+  {
+   "text": "Who came over on Halloween?",
+   "expected": [
+    {
+     "range": [
+      "2022-10-31 00:00:00",
+      "2022-11-01 00:00:00",
+      "halloween"
+     ],
+     "flags": []
+    },
+    {
+     "range": [
+      "2026-10-31 00:00:00",
+      "2026-11-01 00:00:00",
+      "halloween"
+     ],
      "flags": []
     }
    ]

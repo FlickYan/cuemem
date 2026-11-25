@@ -85,6 +85,9 @@ _ZH_NUM = (
     r"(?<![\d.十百千万])(?<![百千万][一二两三四五六七八九])"
     r"(\d{1,3}|[二三四五六七八九]?十[一二三四五六七八九]?|[一两二三四五六七八九几])"
 )
+# 四位数字的数量只和不会是年份的单位连用（"1000天前""过去1000天"）；"2023年前""2023月"不算，
+# 五位以上的不收（"N 个月"乘出来的天数不会早于公元元年）
+_ZH_LONG = r"(?<![\d.])(\d{4})(个星期|星期|个月|天|周(?!年))"
 _ZH_MONTH = r"(1[0-2]|0?[1-9]|十[一二]?|[一二三四五六七八九])"
 _ZH_DOM = r"(\d{1,2}|[二三]?十[一二三四五六七八九]?|[一二三四五六七八九])"
 # 月、日、节日前面的年份：分组 1 是四位数字，分组 2 是"今年 / 去年 / 前年"
@@ -236,20 +239,17 @@ def _day(start: datetime, expr: str, days: int = 1) -> TimeRange:
 
 def _relative_days(text: str, now: datetime, today: datetime) -> TimeRange | None:
     # 只收指向过去的表达："今天 / 今晚"在提问里通常指当下（"今晚看什么电影"），不是检索线索
-    table = {
-        "the day before yesterday": 2,
-        "yesterday": 1,
-        "last night": 1,
-        "昨天": 1,
-        "昨晚": 1,
-    }
-    for expr, days in table.items():
+    for expr, days in (("the day before yesterday", 2), ("yesterday", 1), ("last night", 1)):
         if expr in text:
             return _day(today - timedelta(days=days), expr)
-    # "以前天天""目前天气""提前天数"里的"前天"不是日期
+    # "以前天天""目前天气""提前天数"里的"前天"不是日期。排在"昨天"之前：两个都说到时取前天
+    # （与以前按表的顺序相同）
     zh = re.search(r"(?<![以之从目提])(大?)前天", text)
     if zh is not None:
         return _day(today - timedelta(days=3 if zh.group(1) else 2), zh.group(0))
+    for expr in ("昨天", "昨晚"):
+        if expr in text:
+            return _day(today - timedelta(days=1), expr)
     return None
 
 
@@ -258,7 +258,9 @@ def _ago(text: str, now: datetime, today: datetime) -> TimeRange | None:
     if match:
         n, unit = NUMBERS.get(match.group(1)) or int(match.group(1)), match.group(2)
     else:
-        zh = re.search(rf"{_ZH_NUM}(个星期|星期|个月|天|周|月|年)(以)?前", text)
+        zh = re.search(rf"{_ZH_NUM}(个星期|星期|个月|天|周|月|年)(以)?前", text) or re.search(
+            rf"{_ZH_LONG}(以)?前", text
+        )
         if zh is None:
             half = re.search(r"半(年|个月)(以)?前", text)
             if half is None:
@@ -280,7 +282,9 @@ def _past_window(text: str, now: datetime, today: datetime) -> TimeRange | None:
     if match:
         n, unit = NUMBERS.get(match.group(1)) or int(match.group(1)), match.group(2)
     else:
-        zh = re.search(rf"(过去|最近|近){_ZH_NUM}(个星期|星期|个月|天|周|月|年)", text)
+        zh = re.search(
+            rf"(过去|最近|近){_ZH_NUM}(个星期|星期|个月|天|周|月|年)", text
+        ) or re.search(rf"(过去|最近|近){_ZH_LONG}", text)
         if zh is None:
             return None
         n = _zh_int(zh.group(2))

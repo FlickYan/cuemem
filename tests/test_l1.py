@@ -130,6 +130,11 @@ NOW_2026 = datetime(2026, 11, 24, 10, 0)  # 周二
         # 相对的天、周、月、年
         ("大前天", "2026-11-21", "2026-11-22"),
         ("前天天气怎么样", "2026-11-22", "2026-11-23"),
+        # 前天、昨天都说到时取前天，与改动前按表的顺序相同（第十轮复审）
+        ("昨天和前天我都去了哪", "2026-11-22", "2026-11-23"),
+        ("前天和昨天我都去了哪", "2026-11-22", "2026-11-23"),
+        ("昨天我去了哪", "2026-11-23", "2026-11-24"),
+        ("昨晚吃了什么", "2026-11-23", "2026-11-24"),
         ("上上周三", "2026-11-11", "2026-11-12"),
         ("上上周", "2026-11-09", "2026-11-16"),
         ("上上个月", "2026-09-01", "2026-10-01"),
@@ -156,6 +161,12 @@ NOW_2026 = datetime(2026, 11, 24, 10, 0)  # 周二
         ("十二月", "2025-12-01", "2026-01-01"),
         # 四位数字是年份，不是"N 年前"
         ("2023年以前我住在哪", "2023-01-01", "2024-01-01"),
+        ("最近2024年的计划", "2024-01-01", "2025-01-01"),
+        # 四位数字的天、周、个月照旧是数量（第十轮复审：不会是年份的单位）
+        ("1000天前我在做什么", "2024-02-27", "2024-03-01"),
+        ("1500个星期以前", "1998-02-21", "1998-02-28"),
+        ("过去1000天", "2024-02-28", "2026-11-24"),
+        ("最近1200周", "2003-11-25", "2026-11-24"),
     ],
 )
 def test_zh_time_expressions(text: str, start: str, end: str) -> None:
@@ -177,6 +188,11 @@ def test_zh_time_expressions(text: str, start: str, end: str) -> None:
         "三个月",
         "每三月",
         "3000年前的恐龙",  # 原来在这里抛 OverflowError
+        "10000天前",  # 五位以上的数量不收
+        "12345个月前",
+        "1.2345天前",
+        "1000月前",
+        "最近2024周年庆",
     ],
 )
 def test_zh_no_false_time_ranges(text: str) -> None:
@@ -226,8 +242,10 @@ def test_zh_number_is_linear_on_long_digit_runs() -> None:
 def test_english_questions_parse_as_before() -> None:
     """不含汉字的问题：时间区间与线索标志与改动前逐条相同。
 
-    语料取自 tests/ 与 examples/ 里的英文问题与句子；期望值是改动前的 query.py
-    （fixture 里 base 那个提交）算出来的，写成字面量，不随现在的代码变。
+    语料取自 tests/ 与 examples/ 里的英文问题与句子，另加二十句补上它们没有碰到的写法（数字的
+    "N days ago"、the day before yesterday、last night、节日、past N days、带年份的日期等；
+    第十轮复审）；期望值是改动前的 query.py（fixture 里 base 那个提交）算出来的，写成字面量，
+    不随现在的代码变。
     """
     fixture = json.loads(
         (Path(__file__).parent / "fixtures" / "parse_time_english.json").read_text("utf-8")
@@ -236,6 +254,7 @@ def test_english_questions_parse_as_before() -> None:
     flags = ("wants_first", "wants_latest", "wants_history", "aggregation", "temporal")
     assert len(fixture["questions"]) >= 150
     with_range = 0
+    exprs: set[str] = set()
     for item in fixture["questions"]:
         text = item["text"]
         assert text.isascii()
@@ -251,7 +270,10 @@ def test_english_questions_parse_as_before() -> None:
             assert got == expected["range"], text
             assert [name for name in flags if getattr(info, name)] == expected["flags"], text
         with_range += item["expected"][0]["range"] is not None
+        exprs.update(e["range"][2] for e in item["expected"] if e["range"] is not None)
     assert with_range >= 30
+    assert len(exprs) >= 30  # 不同的时间表达：语料不能只是同几种写法的重复
+    assert {"3 days ago", "the day before yesterday", "last night", "christmas"} <= exprs
 
 
 def test_query_flags() -> None:
