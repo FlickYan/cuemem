@@ -41,6 +41,7 @@ from test_store import small_open_file_limit
 
 from cuemem import Memory, __version__
 from cuemem.api import proxy as proxy_module
+from cuemem.api.auth import Keys, Principal
 from cuemem.api.proxy import (
     _SESSION_ID,
     MemoryProxy,
@@ -1315,6 +1316,47 @@ def test_a_full_parked_set_does_not_end_a_small_users_sessions(
     ]
     held = [space for space, _ in proxy._parked]
     assert (held.count("victim"), held.count("mallory")) == (4, 4)
+
+
+def test_parked_sessions_are_counted_per_key_not_per_space(
+    proxy: MemoryProxy,
+    system: MemorySystem,
+    upstream: Upstream,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第十轮复审（Q6）：停放的会话算在开它的令牌头上。用户写成通配的令牌把停放的会话摊在
+    许多空间里、每个空间一个：以前按空间数，最多的是只有三个停放会话的 victim，她的会话被别的
+    令牌的请求一个个结束。管理令牌、不鉴权时照旧按空间数（前面两条测试）。"""
+    keys = Keys.parse(
+        "keys:\n"
+        "  - {name: tenant, token: tenant-token-0123456789, scopes: [{user: '*'}]}\n"
+        "  - {name: solo, token: solo-token-0123456789abc, scopes: [{user: victim}]}\n"
+    )
+    tenant, solo = keys.resolve("tenant-token-0123456789"), keys.resolve("solo-token-0123456789abc")
+    assert tenant is not None and solo is not None
+    monkeypatch.setattr(proxy_module, "PARKED_KEPT", 8)
+    proxy.max_open_runs = 2
+    ended = ended_by(system, monkeypatch)
+
+    def say(principal: Principal, user: str, session: str) -> None:
+        clock.now += 1.0
+        body = {"model": "qwen3.8-flash", "user": user}
+        body["messages"] = [{"role": "user", "content": f"note {session}"}]
+        assert proxy.complete(body, {"x-cuemem-session": session}, principal)[0] == 200
+
+    for i in range(5):
+        say(solo, "victim", f"v{i}")
+    assert list(proxy._parked) == [("victim", "v0"), ("victim", "v1"), ("victim", "v2")]
+    for space in range(8):  # 每个空间三个会话：停放一个
+        for i in range(3):
+            say(tenant, f"m{space}", f"s{i}")
+    assert ended == [("m0", "s0"), ("m1", "s0"), ("m2", "s0")]  # 以前是 victim 的 v0、v1……
+    assert [k for k in proxy._parked if k[0] == "victim"] == [("victim", f"v{i}") for i in range(3)]
+    assert system.db.get_jobs("victim") == [] and proxy.parked_runs() == 8
+    # 停放的会话换了令牌接着用：名额跟着算到那个令牌头上
+    say(tenant, "victim", "v0")
+    assert proxy._runs[("victim", "v0")].holder == ("key", "tenant")
 
 
 def test_a_parked_implicit_session_keeps_its_id(
