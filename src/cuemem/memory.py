@@ -770,11 +770,17 @@ class MemorySystem:
         self, space_id: str, session_id: str, *, wait: bool = False, submit: bool = True
     ) -> ConsolidationReport | None:
         """会话结束：登记巩固任务；wait=True 时同步巩固并返回报告，否则交给后台线程
-        （submit=False 时只登记，下次巩固或后台线程启动时完成）。"""
+        （submit=False 时只登记，下次巩固或后台线程启动时完成）。
+
+        空间里一个会话也没有时（没写过，或者删掉、重置之后还开着的会话在这时收尾）只去掉进行中的
+        登记，不登记任务、不巩固，返回空的报告（wait=True）：没有可抽取的，以前这里的巩固还会
+        给已经删掉的空间写下一行带着空间 ID 的 consolidate trace（第十轮复审 Q13）。"""
         with self._open_lock:
             self._open.discard((space_id, session_id))
             self._handed_over.pop((space_id, session_id), None)  # 见 open_session
             self.db.delete_meta(_open_mark(space_id, session_id))
+        if not self.db.has_sessions(space_id):
+            return ConsolidationReport(space_id) if wait else None
         self.consolidator.enqueue(space_id, [session_id])
         if wait:
             return self.consolidate(space_id)

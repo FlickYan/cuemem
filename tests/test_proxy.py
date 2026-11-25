@@ -3595,10 +3595,11 @@ def test_write_backs_dropped_when_a_session_ends_are_traced(
     assert [{k: v for k, v in e.items() if k != "t_ms"} for e in line["events"]] == [
         {"kind": "proxy_write_failed", "error": "EmbeddingAPIError", "status": 503, "kept": False}
     ]
-    # 只看代理自己的行：收尾把 bob 的会话交给后台巩固，那个（已经删掉的）空间的 consolidate 行
-    # 什么时候写下不一定，以前查全部文件的原文，约八次里有一次碰上它而失败
-    assert "bob" not in json.dumps(trace_lines(system))
-    assert "Berlin" not in json.dumps(trace_lines(system))
+    # 查全部文件的原文：收尾不把已经删掉、还空着的空间交给后台巩固，没有它的 consolidate 行
+    # （第十轮复审；以前那一行什么时候写下不一定）
+    if system.worker is not None:
+        system.worker.wait()
+    assert "bob" not in raw_traces(system) and "Berlin" not in json.dumps(trace_lines(system))
     proxy.close_all()
     assert len(trace_lines(system, "proxy_close")) == 1
 
